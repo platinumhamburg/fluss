@@ -25,7 +25,6 @@ import org.apache.fluss.exception.UnknownWriterIdException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
 import org.apache.fluss.rpc.protocol.Errors;
@@ -182,10 +181,10 @@ public class IdempotenceManager {
      */
     synchronized int firstInFlightBatchSequence(TableBucket tableBucket) {
         if (!hasInflightBatches(tableBucket)) {
-            return LogRecordBatch.NO_BATCH_SEQUENCE;
+            return NO_BATCH_SEQUENCE;
         }
         WriteBatch batch = nextBatchBySequence(tableBucket);
-        return batch == null ? LogRecordBatch.NO_BATCH_SEQUENCE : batch.batchSequence();
+        return batch == null ? NO_BATCH_SEQUENCE : batch.batchSequence();
     }
 
     synchronized void handleCompletedBatch(ReadyWriteBatch readyWriteBatch) {
