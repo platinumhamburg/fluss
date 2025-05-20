@@ -40,7 +40,6 @@ import com.alibaba.fluss.server.testutils.FlussClusterExtension;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableEnvironment;
-import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.test.util.AbstractTestBase;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CollectionUtil;
@@ -83,11 +82,12 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
 
     static final String CATALOG_NAME = "testcatalog";
     static final String DEFAULT_DB = FlinkCatalogOptions.DEFAULT_DATABASE.defaultValue();
-    static TableEnvironment tEnv;
-    static TableEnvironment tBatchEnv;
     static Admin rootAdmin;
     static Connection rootConn;
     static FlussPrincipal guest = new FlussPrincipal("guest", "USER");
+
+    private TableEnvironment tEnv;
+    private TableEnvironment tBatchEnv;
 
     @BeforeAll
     static void beforeAll() {
@@ -98,9 +98,21 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
         rootConf.setString("client.security.username_password.password", "password");
         rootConn = ConnectionFactory.createConnection(rootConf);
         rootAdmin = rootConn.getAdmin();
+    }
 
-        // open a catalog so that we can get table from the catalog
-        String bootstrapServers = String.join(",", conf.get(ConfigOptions.BOOTSTRAP_SERVERS));
+    @AfterAll
+    static void afterAll() throws Exception {
+        if (rootAdmin != null) {
+            rootAdmin.close();
+        }
+
+        if (rootConn != null) {
+            rootConn.close();
+        }
+    }
+
+    @BeforeEach
+    void before() {
         // create table environment
         tEnv = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
         tBatchEnv = TableEnvironment.create(EnvironmentSettings.inBatchMode());
@@ -114,29 +126,9 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
                                 + "'client.security.username_password.username' = 'guest', \n"
                                 + "'client.security.username_password.password' = 'password2' \n"
                                 + ")",
-                        CATALOG_NAME, bootstrapServers);
+                        CATALOG_NAME, FLUSS_CLUSTER_EXTENSION.getBootstrapServers());
         tEnv.executeSql(createCatalogDDL);
         tBatchEnv.executeSql(createCatalogDDL);
-    }
-
-    @AfterAll
-    static void afterAll() throws Exception {
-        tEnv.executeSql("use catalog " + TableConfigOptions.TABLE_CATALOG_NAME.defaultValue());
-        tEnv.executeSql("DROP CATALOG IF EXISTS " + CATALOG_NAME);
-        tBatchEnv.executeSql("use catalog " + TableConfigOptions.TABLE_CATALOG_NAME.defaultValue());
-        tBatchEnv.executeSql("DROP CATALOG IF EXISTS " + CATALOG_NAME);
-
-        if (rootAdmin != null) {
-            rootAdmin.close();
-        }
-
-        if (rootConn != null) {
-            rootConn.close();
-        }
-    }
-
-    @BeforeEach
-    void before() {
         tEnv.executeSql("use catalog " + CATALOG_NAME);
         tBatchEnv.executeSql("use catalog " + CATALOG_NAME);
     }
