@@ -106,7 +106,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         "create catalog %s with ('type' = 'fluss', '%s' = '%s')",
                         CATALOG_NAME, BOOTSTRAP_SERVERS.key(), bootstrapServers));
         tEnv.executeSql("use catalog " + CATALOG_NAME);
-        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 4);
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 2);
 
         // create batch table environment
         tBatchEnv =
@@ -118,7 +118,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
         tBatchEnv.executeSql("use catalog " + CATALOG_NAME);
         tBatchEnv
                 .getConfig()
-                .set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 4);
+                .set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 2);
         // create database
         tEnv.executeSql("create database " + DEFAULT_DB);
         tEnv.useDatabase(DEFAULT_DB);

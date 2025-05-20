@@ -85,15 +85,16 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
     static Admin rootAdmin;
     static Connection rootConn;
     static FlussPrincipal guest = new FlussPrincipal("guest", "USER");
+    static Configuration clientConf;
 
     private TableEnvironment tEnv;
     private TableEnvironment tBatchEnv;
 
     @BeforeAll
     static void beforeAll() {
-        Configuration conf = FLUSS_CLUSTER_EXTENSION.getClientConfig("CLIENT");
-        conf.set(ConfigOptions.CLIENT_SECURITY_PROTOCOL, "username_password");
-        Configuration rootConf = new Configuration(conf);
+        clientConf = FLUSS_CLUSTER_EXTENSION.getClientConfig("CLIENT");
+        clientConf.set(ConfigOptions.CLIENT_SECURITY_PROTOCOL, "username_password");
+        Configuration rootConf = new Configuration(clientConf);
         rootConf.setString("client.security.username_password.username", "root");
         rootConf.setString("client.security.username_password.password", "password");
         rootConn = ConnectionFactory.createConnection(rootConf);
@@ -113,6 +114,7 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
 
     @BeforeEach
     void before() {
+        String bootstrapServers = String.join(",", clientConf.get(ConfigOptions.BOOTSTRAP_SERVERS));
         // create table environment
         tEnv = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
         tBatchEnv = TableEnvironment.create(EnvironmentSettings.inBatchMode());
@@ -126,7 +128,7 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
                                 + "'client.security.username_password.username' = 'guest', \n"
                                 + "'client.security.username_password.password' = 'password2' \n"
                                 + ")",
-                        CATALOG_NAME, FLUSS_CLUSTER_EXTENSION.getBootstrapServers());
+                        CATALOG_NAME, bootstrapServers);
         tEnv.executeSql(createCatalogDDL);
         tBatchEnv.executeSql(createCatalogDDL);
         tEnv.executeSql("use catalog " + CATALOG_NAME);
