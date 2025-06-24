@@ -1,0 +1,169 @@
+services:
+  jobmanager:
+    image: fluss/flink:local
+    ports:
+      - "8083:8081"
+    command: jobmanager
+    container_name: fonebox-jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=jobmanager.rpc.address: jobmanager
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/lakehouse/paimon:/tmp/paimon
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/logs/jobmanager:/opt/flink/log
+  taskmanager:
+    image: fluss/flink:local
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    container_name: fonebox-taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 2048m
+        taskmanager.memory.framework.off-heap.size: 256m
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9250
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/lakehouse/paimon:/tmp/paimon
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/logs/taskmanager:/opt/flink/log
+
+  zookeeper:
+    restart: always
+    image: zookeeper:3.9.2
+    container_name: fonebox-zookeeper
+    environment:
+      - |
+        ZOO_LOG4J_PROP=log4j.rootLogger=INFO,CONSOLE,FILE
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/data/zookeeper/data:/data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/data/zookeeper/datalog:/datalog
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/logs/zookeeper:/logs
+
+  coordinator-server:
+    image: fluss/fluss:local
+    command: coordinatorServer
+    container_name: fonebox-fluss-coordinator-server
+    depends_on:
+      - zookeeper
+    environment:
+      - |
+        FLUSS_PROPERTIES=zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://coordinator-server:9123
+        remote.data.dir: /Users/wangyang/Documents/workspace/fluss/.fluss/remote-data
+        datalake.format: paimon
+        datalake.paimon.metastore: filesystem
+        datalake.paimon.warehouse: /tmp/paimon
+        metrics.reporters: prometheus
+        metrics.reporter.prometheus.port: 9250
+        logback.configurationFile: logback-loki-console.xml
+      - APP_NAME=coordinator-server
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/lakehouse/paimon:/tmp/paimon
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/data/coordinator-server:/tmp/fluss/data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/remote-data:/tmp/fluss/remote-data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/logs/coordinator-server:/opt/fluss/log
+
+  tablet-server-0:
+    image: fluss/fluss:local
+    command: tabletServer
+    container_name: fonebox-fluss-tablet-server-0
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server-0:9123
+        tablet-server.id: 0
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+        metrics.reporters: prometheus
+        metrics.reporter.prometheus.port: 9250
+        logback.configurationFile: logback-loki-console.xml
+      - APP_NAME=tablet-server
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/lakehouse/paimon:/tmp/paimon
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/data/tablet-server-0:/tmp/fluss/data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/remote-data:/tmp/fluss/remote-data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/logs/tablet-server-0:/opt/fluss/log
+
+  tablet-server-1:
+    image: fluss/fluss:local
+    command: tabletServer
+    container_name: fonebox-fluss-tablet-server-1
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server-1:9123
+        tablet-server.id: 1
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+        metrics.reporters: prometheus
+        metrics.reporter.prometheus.port: 9250
+        logback.configurationFile: logback-loki-console.xml
+      - APP_NAME=tablet-server
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/lakehouse/paimon:/tmp/paimon
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/data/tablet-server-1:/tmp/fluss/data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/remote-data:/tmp/fluss/remote-data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/logs/tablet-server-1:/opt/fluss/log
+
+  tablet-server-2:
+    image: fluss/fluss:local
+    command: tabletServer
+    container_name: fonebox-fluss-tablet-server-2
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server-2:9123
+        tablet-server.id: 2
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+        metrics.reporters: prometheus
+        metrics.reporter.prometheus.port: 9250
+        logback.configurationFile: logback-loki-console.xml
+      - APP_NAME=tablet-server
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/lakehouse/paimon:/tmp/paimon
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/data/tablet-server-2:/tmp/fluss/data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/remote-data:/tmp/fluss/remote-data
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/logs/tablet-server-2:/opt/fluss/log
+
+  prometheus:
+    image: bitnami/prometheus:2.55.1-debian-12-r0
+    container_name: fonebox-prometheus
+    ports:
+      - "9092:9090"
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/assets/observability/fluss-quickstart-observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: fonebox-loki
+    ports:
+      - "3102:3100"
+  grafana:
+    image:
+      grafana/grafana:11.4.0
+    container_name: fonebox-grafana
+    ports:
+      - "3002:3000"
+    depends_on:
+      - prometheus
+      - loki
+    volumes:
+      - /Users/wangyang/Documents/workspace/fluss/.fluss/assets/observability/fluss-quickstart-observability/grafana:/etc/grafana:ro
+

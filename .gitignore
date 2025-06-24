@@ -14,6 +14,7 @@ target
 *.jar
 *.log
 *.pyc
+.java-version
 build-target
 *.ipr
 *.iws
