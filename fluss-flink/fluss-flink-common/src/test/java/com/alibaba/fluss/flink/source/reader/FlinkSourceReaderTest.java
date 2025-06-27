@@ -42,14 +42,7 @@ import org.apache.flink.table.data.RowData;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static com.alibaba.fluss.testutils.common.CommonTestUtils.retry;
@@ -75,7 +68,7 @@ class FlinkSourceReaderTest extends FlinkTestBase {
             partitionWrittenRows.put(
                     partitionIdAndName.getKey(),
                     writeRowsToPartition(
-                            conn, tablePath, Collections.singleton(partitionIdAndName.getValue())));
+                            conn, tablePath, Collections.singleton(partitionIdAndName.getValue()), 10));
         }
 
         // try to write some rows to the table
@@ -154,6 +147,102 @@ class FlinkSourceReaderTest extends FlinkTestBase {
             assertThat(actualRows).containsExactlyInAnyOrderElementsOf(expectRows);
         }
     }
+
+    @Test
+    void testHandleExceptionWhenPartitionsRemovedDuringRead() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "test_partitioned_table");
+
+        TableDescriptor tableDescriptor = DEFAULT_AUTO_PARTITIONED_PK_TABLE_DESCRIPTOR;
+        long tableId = createTable(tablePath, tableDescriptor);
+
+        // wait util partitions are created
+        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        Map<Long, String> partitionNameByIds = waitUntilPartitions(zooKeeperClient, tablePath);
+
+        // now, write rows to the table
+        Map<Long, List<String>> partitionWrittenRows = new HashMap<>();
+        for (Map.Entry<Long, String> partitionIdAndName : partitionNameByIds.entrySet()) {
+            partitionWrittenRows.put(
+                    partitionIdAndName.getKey(),
+                    writeRowsToPartition(
+                            conn, tablePath, Collections.singleton(partitionIdAndName.getValue()), 100000));
+        }
+
+        Map<Long, String> removedPartitions = new HashMap<>();
+        Set<Long> removedPartitionIds = new HashSet<>();
+        int numberOfRemovedPartitions = 1;
+        Iterator<Long> partitionIdIterator = partitionNameByIds.keySet().iterator();
+
+        removedPartitionIds.add(1L);
+        removedPartitions.put(1L, partitionNameByIds.get(1L));
+//        for (int i = 0; i < numberOfRemovedPartitions; i++) {
+//            long partitionId = partitionIdIterator.next();
+//            removedPartitions.put(partitionId, partitionNameByIds.get(partitionId));
+//            removedPartitionIds.add(partitionId);
+//        }
+
+        // shouldn't read the rows from the partition that is removed
+        List<String> expectRows = new ArrayList<>();
+        for (Map.Entry<Long, List<String>> partitionIdAndWrittenRows :
+                partitionWrittenRows.entrySet()) {
+            // isn't removed, should read the rows
+            if (!removedPartitionIds.contains(partitionIdAndWrittenRows.getKey())) {
+                expectRows.addAll(partitionIdAndWrittenRows.getValue());
+            }
+        }
+
+        // try to write some rows to the table
+        TestingReaderContext readerContext = new TestingReaderContext();
+        try (final FlinkSourceReader reader =
+                     createReader(
+                             clientConf,
+                             tablePath,
+                             tableDescriptor.getSchema().getRowType(),
+                             readerContext)) {
+            dropPartitions(zooKeeperClient, tablePath, new HashSet<>(removedPartitions.values()));
+
+            // first of all, add all splits of all partitions to the reader
+            Map<Long, Set<TableBucket>> assignedBuckets = new HashMap<>();
+            for (Long partitionId : partitionNameByIds.keySet()) {
+                for (int i = 0; i < DEFAULT_BUCKET_NUM; i++) {
+                    TableBucket tableBucket = new TableBucket(tableId, partitionId, i);
+                    reader.addSplits(
+                            Collections.singletonList(
+                                    new LogSplit(
+                                            tableBucket, partitionNameByIds.get(partitionId), 0)));
+                    assignedBuckets
+                            .computeIfAbsent(partitionId, k -> new HashSet<>())
+                            .add(tableBucket);
+                }
+            }
+
+            TestingReaderOutput<RowData> output = new TestingReaderOutput<>();
+
+            boolean partitionDropped = false;
+            while (output.getEmittedRecords().size() < expectRows.size()) {
+                reader.pollNext(output);
+                if (output.getEmittedRecords().size() > 0 && !partitionDropped)
+                {
+                    dropPartitions(zooKeeperClient, tablePath, new HashSet<>(Arrays.asList("2025")));
+                    partitionDropped=true;
+                }
+//                if (output.getEmittedRecords().size() > 0 && !partitionDropped){
+//                    dropPartitions(zooKeeperClient, tablePath, new HashSet<>(removedPartitions.values()));
+//                    partitionDropped = true;
+//                }
+            }
+
+            // get the actual rows, the row format will be +I(x,x,x)
+            // we need to convert to +I[x, x, x] to match the expected rows format
+            List<String> actualRows =
+                    output.getEmittedRecords().stream()
+                            .map(Object::toString)
+                            .map(row -> row.replace("(", "[").replace(")", "]").replace(",", ", "))
+                            .collect(Collectors.toList());
+            assertThat(actualRows).containsExactlyInAnyOrderElementsOf(expectRows);
+        }
+    }
+
 
     private FlinkSourceReader createReader(
             Configuration flussConf,

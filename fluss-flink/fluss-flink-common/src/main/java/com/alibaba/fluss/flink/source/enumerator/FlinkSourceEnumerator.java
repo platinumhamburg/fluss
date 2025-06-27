@@ -145,8 +145,8 @@ public class FlinkSourceEnumerator
         this(
                 tablePath,
                 flussConf,
-                hasPrimaryKey,
                 isPartitioned,
+                hasPrimaryKey,
                 context,
                 Collections.emptySet(),
                 Collections.emptyMap(),
@@ -159,8 +159,8 @@ public class FlinkSourceEnumerator
     public FlinkSourceEnumerator(
             TablePath tablePath,
             Configuration flussConf,
-            boolean hasPrimaryKey,
             boolean isPartitioned,
+            boolean hasPrimaryKey,
             SplitEnumeratorContext<SourceSplitBase> context,
             Set<TableBucket> assignedTableBuckets,
             Map<Long, String> assignedPartitions,

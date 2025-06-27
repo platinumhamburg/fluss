@@ -30,6 +30,8 @@ import com.alibaba.fluss.client.table.writer.Upsert;
 import com.alibaba.fluss.metadata.TableInfo;
 import com.alibaba.fluss.metadata.TablePath;
 
+import java.io.Serializable;
+
 import static com.alibaba.fluss.utils.Preconditions.checkState;
 
 /**
@@ -38,7 +40,7 @@ import static com.alibaba.fluss.utils.Preconditions.checkState;
  * @since 0.1
  */
 @PublicEvolving
-public class FlussTable implements Table {
+public class FlussTable implements Table, Serializable {
 
     private final FlussConnection conn;
     private final TablePath tablePath;

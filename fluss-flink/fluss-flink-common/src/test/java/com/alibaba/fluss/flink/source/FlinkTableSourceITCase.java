@@ -644,7 +644,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         }
 
         List<String> expectedRowValues =
-                writeRowsToPartition(conn, tablePath, partitionNameById.values());
+                writeRowsToPartition(conn, tablePath, partitionNameById.values(), 10);
         waitUtilAllBucketFinishSnapshot(admin, tablePath, partitionNameById.values());
 
         org.apache.flink.util.CloseableIterator<Row> rowIter =
@@ -655,7 +655,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         tEnv.executeSql(String.format("alter table %s add partition (c = '2000')", tableName));
         tEnv.executeSql(String.format("alter table %s add partition (c = '2001')", tableName));
         // write data to the new partitions
-        expectedRowValues = writeRowsToPartition(conn, tablePath, Arrays.asList("2000", "2001"));
+        expectedRowValues = writeRowsToPartition(conn, tablePath, Arrays.asList("2000", "2001"), 10);
         assertResultsIgnoreOrder(rowIter, expectedRowValues, true);
     }
 
@@ -988,7 +988,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         tEnv.executeSql("alter table partitioned_table add partition (c=2026)");
 
         List<String> expectedRowValues =
-                writeRowsToPartition(conn, tablePath, Arrays.asList("2025", "2026")).stream()
+                writeRowsToPartition(conn, tablePath, Arrays.asList("2025", "2026"), 10).stream()
                         .filter(s -> s.contains("2025"))
                         .collect(Collectors.toList());
         waitUtilAllBucketFinishSnapshot(admin, tablePath, Arrays.asList("2025", "2026"));
@@ -1120,7 +1120,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         tEnv.executeSql("alter table partitioned_table_no_filter add partition (c=2026)");
 
         List<String> expectedRowValues =
-                writeRowsToPartition(conn, tablePath, Arrays.asList("2025", "2026"));
+                writeRowsToPartition(conn, tablePath, Arrays.asList("2025", "2026"), 10);
         waitUtilAllBucketFinishSnapshot(admin, tablePath, Arrays.asList("2025", "2026"));
 
         org.apache.flink.util.CloseableIterator<Row> rowIter =
@@ -1162,7 +1162,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         tEnv.executeSql("alter table partitioned_table_in add partition (c=2027)");
 
         List<String> expectedRowValues =
-                writeRowsToPartition(conn, tablePath, Arrays.asList("2025", "2026", "2027"))
+                writeRowsToPartition(conn, tablePath, Arrays.asList("2025", "2026", "2027"), 10)
                         .stream()
                         .filter(s -> s.contains("2025") || s.contains("2026"))
                         .collect(Collectors.toList());

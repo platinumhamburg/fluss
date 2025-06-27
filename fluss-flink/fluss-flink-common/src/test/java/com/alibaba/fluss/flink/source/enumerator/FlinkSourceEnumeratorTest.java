@@ -17,10 +17,12 @@
 
 package com.alibaba.fluss.flink.source.enumerator;
 
+import com.alibaba.fluss.client.admin.Admin;
 import com.alibaba.fluss.client.table.Table;
 import com.alibaba.fluss.client.table.writer.UpsertWriter;
 import com.alibaba.fluss.client.write.HashBucketAssigner;
 import com.alibaba.fluss.config.Configuration;
+import com.alibaba.fluss.exception.UnknownTableOrBucketException;
 import com.alibaba.fluss.flink.FlinkConnectorOptions;
 import com.alibaba.fluss.flink.source.enumerator.initializer.OffsetsInitializer;
 import com.alibaba.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
@@ -43,25 +45,22 @@ import org.apache.flink.api.connector.source.ReaderInfo;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SplitsAssignment;
 import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.alibaba.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
 
 /** Unit tests for {@link FlinkSourceEnumerator}. */
 class FlinkSourceEnumeratorTest extends FlinkTestBase {
@@ -495,6 +494,163 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
 
             // check the assigned partitions, should equal to the assignment with removed partition
             assertThat(enumerator.getAssignedPartitions()).isEqualTo(assignedPartitions);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testDiscoverPartitionsPeriodicallyWhenBucketUnreadyThenReady(boolean isPrimaryKeyTable) throws Throwable {
+        int numSubtasks = 3;
+        TableDescriptor tableDescriptor =
+                isPrimaryKeyTable
+                        ? DEFAULT_AUTO_PARTITIONED_PK_TABLE_DESCRIPTOR
+                        : DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR;
+        long tableId = createTable(DEFAULT_TABLE_PATH, tableDescriptor);
+        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+
+        AtomicBoolean partitionBucketsReadyFlag = new AtomicBoolean(true);
+
+        OffsetsInitializer faultInjectedOffsetsInitializer = mock(OffsetsInitializer.class);
+        doAnswer(invocation -> {
+            if (!partitionBucketsReadyFlag.get()) {
+                throw new FlinkRuntimeException("Fault Inject: Not all buckets of partition ready!");
+            }
+            return OffsetsInitializer.full().getBucketOffsets(
+                    invocation.getArgument(0),
+                    invocation.getArgument(1),
+                    invocation.getArgument(2)
+            );
+        }).when(faultInjectedOffsetsInitializer).getBucketOffsets(anyString(), anyCollection(), any(OffsetsInitializer.BucketOffsetsRetriever.class));
+
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                     new MockSplitEnumeratorContext<>(numSubtasks);
+             FlinkSourceEnumerator enumerator =
+                     new FlinkSourceEnumerator(
+                             DEFAULT_TABLE_PATH,
+                             flussConf,
+                             isPrimaryKeyTable,
+                             true,
+                             context,
+                             faultInjectedOffsetsInitializer,
+                             DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                             streaming,
+                             null)) {
+            Map<Long, String> partitionNameByIds =
+                    waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
+            enumerator.start();
+
+            // invoke partition discovery callable again and there should be pending assignments.
+            runPeriodicPartitionDiscovery(context);
+
+            // register two readers
+            registerReader(context, enumerator, 0);
+            registerReader(context, enumerator, 1);
+
+            // invoke partition discovery callable again, shouldn't produce RemovePartitionEvent.
+            runPeriodicPartitionDiscovery(context);
+            assertThat(context.getSentSourceEvent()).isEmpty();
+
+            // now, register the third reader
+            registerReader(context, enumerator, 2);
+
+            // check the assignments
+            Map<Integer, List<SourceSplitBase>> expectedAssignment =
+                    expectAssignments(enumerator, tableId, partitionNameByIds);
+            Map<Integer, List<SourceSplitBase>> actualAssignments = getReadersAssignments(context);
+            checkAssignmentIgnoreOrder(actualAssignments, expectedAssignment);
+
+            // now, create a new partition and runPeriodicPartitionDiscovery again,
+            // there should be new assignments
+            List<String> newPartitions = Arrays.asList("newPartition1", "newPartition2");
+
+            Map<Long, String> newPartitionNameIds =
+                    createPartitions(zooKeeperClient, DEFAULT_TABLE_PATH, newPartitions);
+
+            /// invoke partition discovery callable again.
+            partitionBucketsReadyFlag.set(false);
+            runPeriodicPartitionDiscovery(context);
+
+            partitionBucketsReadyFlag.set(true);
+            runPeriodicPartitionDiscovery(context);
+
+            expectedAssignment = expectAssignments(enumerator, tableId, newPartitionNameIds);
+            actualAssignments = getLastReadersAssignments(context);
+            checkAssignmentIgnoreOrder(actualAssignments, expectedAssignment);
+
+            // drop + create partitions;
+            Set<String> dropPartitions = new HashSet<>(newPartitions);
+            Map<Long, String> expectedRemovedPartitions = newPartitionNameIds;
+            newPartitions = Collections.singletonList("newPartition3");
+
+            dropPartitions(zooKeeperClient, DEFAULT_TABLE_PATH, dropPartitions);
+            newPartitionNameIds =
+                    createPartitions(zooKeeperClient, DEFAULT_TABLE_PATH, newPartitions);
+
+            // invoke partition discovery callable again
+            runPeriodicPartitionDiscovery(context);
+
+            // there should be partition removed events
+            Map<Integer, List<SourceEvent>> sentSourceEvents = context.getSentSourceEvent();
+            assertThat(sentSourceEvents).hasSize(numSubtasks);
+            for (int subtask = 0; subtask < numSubtasks; subtask++) {
+                // get the source event send to reader
+                List<SourceEvent> sourceEvents = sentSourceEvents.get(subtask);
+                assertThat(sourceEvents).hasSize(1);
+                SourceEvent sourceEvent = sourceEvents.get(0);
+                PartitionsRemovedEvent partitionsRemovedEvent =
+                        (PartitionsRemovedEvent) sourceEvent;
+
+                // get the partition infos in the event
+                Map<Long, String> removedPartitions = partitionsRemovedEvent.getRemovedPartitions();
+                assertThat(removedPartitions).isEqualTo(expectedRemovedPartitions);
+            }
+
+            // check new assignments.
+            expectedAssignment = expectAssignments(enumerator, tableId, newPartitionNameIds);
+            actualAssignments = getLastReadersAssignments(context);
+            checkAssignmentIgnoreOrder(actualAssignments, expectedAssignment);
+
+            Map<Long, String> assignedPartitions =
+                    new HashMap<>(enumerator.getAssignedPartitions());
+
+            // mock enumerator receive PartitionBucketsUnsubscribedEvent,
+            // partitions should be removed from the enumerator's assigned partition
+            int removedPartitionsCount = 2;
+            Set<Long> removedPartitions = new HashSet<>();
+            Iterator<Long> partitionIdIterator = assignedPartitions.keySet().iterator();
+            for (int i = 0; i < removedPartitionsCount; i++) {
+                removedPartitions.add(partitionIdIterator.next());
+                partitionIdIterator.remove();
+            }
+
+            Set<TableBucket> tableBuckets = new HashSet<>();
+            for (long removedPartition : removedPartitions) {
+                for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
+                    tableBuckets.add(new TableBucket(tableId, removedPartition, bucket));
+                }
+            }
+
+            enumerator.handleSourceEvent(0, new PartitionBucketsUnsubscribedEvent(tableBuckets));
+
+            // check the assigned partitions, should equal to the assignment with removed partition
+            assertThat(enumerator.getAssignedPartitions()).isEqualTo(assignedPartitions);
+
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+            runPeriodicPartitionDiscovery(context);
+
         }
     }
 

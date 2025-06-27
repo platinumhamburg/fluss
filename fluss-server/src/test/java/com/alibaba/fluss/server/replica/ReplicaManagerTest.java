@@ -236,8 +236,24 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 buildFetchParams(-1),
                 Collections.singletonMap(tb, new FetchData(tb.getTableId(), 3L, 1024 * 1024)),
                 future1::complete);
+        CompletableFuture<List<StopReplicaResultForBucket>> stopReplicaFuture =
+                new CompletableFuture<>();
+        replicaManager.stopReplicas(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new StopReplicaData(tb, true, INITIAL_COORDINATOR_EPOCH, 1)),
+                stopReplicaFuture::complete);
+        stopReplicaFuture.get();
         result = future1.get();
         assertThat(result.size()).isEqualTo(1);
+
+
+        replicaManager.fetchLogRecords(
+                buildFetchParams(-1),
+                Collections.singletonMap(tb, new FetchData(tb.getTableId(), 10L, 1024 * 1024)),
+                future1::complete);
+        future1.get();
+
         resultForBucket = result.get(tb);
         assertThat(resultForBucket.getTableBucket()).isEqualTo(tb);
         assertThat(resultForBucket.getHighWatermark()).isEqualTo(10L);
