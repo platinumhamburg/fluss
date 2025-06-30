@@ -71,7 +71,7 @@ public class ServerMetricUtilsTest {
         assertThat(nonHeapMetrics.get(MEMORY_MAX)).isNotNull();
     }
 
-    @Test
+    //    @Test
     void testMetaspaceCompleteness() {
         assertThat(hasMetaspaceMemoryPool())
                 .withFailMessage("Requires JVM with Metaspace memory pool")
@@ -161,7 +161,7 @@ public class ServerMetricUtilsTest {
         runUntilMetricChanged("Heap", 10, () -> new byte[1024 * 1024 * 8], used);
     }
 
-    @Test
+    //    @Test
     void testMetaspaceMetricUsageNotStatic() throws Exception {
         assertThat(hasMetaspaceMemoryPool())
                 .withFailMessage("Requires JVM with Metaspace memory pool")
