@@ -17,6 +17,8 @@
 
 package org.apache.fluss.client.table.scanner.log;
 
+import org.apache.fluss.client.metadata.MetadataUpdater;
+import org.apache.fluss.client.metadata.TestingMetadataUpdater;
 import org.apache.fluss.client.metrics.ScannerMetricGroup;
 import org.apache.fluss.client.metrics.TestingScannerMetricGroup;
 import org.apache.fluss.client.table.scanner.RemoteFileDownloader;
@@ -52,6 +54,7 @@ import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_INFO;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.testutils.DataTestUtils.genRemoteLogSegmentFile;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
@@ -68,6 +71,7 @@ class RemoteLogDownloaderTest {
     private FsPath remoteLogDir;
     private Configuration conf;
     private ScannerMetricGroup scannerMetricGroup;
+    private MetadataUpdater metadataUpdater;
 
     @BeforeEach
     void beforeEach() {
@@ -77,6 +81,9 @@ class RemoteLogDownloaderTest {
         conf.set(ConfigOptions.CLIENT_SCANNER_REMOTE_LOG_PREFETCH_NUM, 4);
         remoteLogDir = remoteLogDir(conf);
         scannerMetricGroup = TestingScannerMetricGroup.newInstance();
+        metadataUpdater =
+                new TestingMetadataUpdater(
+                        Collections.singletonMap(DATA1_TABLE_PATH, DATA1_TABLE_INFO));
     }
 
     @Test
@@ -84,7 +91,12 @@ class RemoteLogDownloaderTest {
         RemoteFileDownloader remoteFileDownloader = new RemoteFileDownloader(1);
         RemoteLogDownloader remoteLogDownloader =
                 new RemoteLogDownloader(
-                        DATA1_TABLE_PATH, conf, remoteFileDownloader, scannerMetricGroup, 10L);
+                        DATA1_TABLE_PATH,
+                        conf,
+                        remoteFileDownloader,
+                        scannerMetricGroup,
+                        metadataUpdater,
+                        10L);
         try {
             // trigger auto download.
             remoteLogDownloader.start();
@@ -166,6 +178,7 @@ class RemoteLogDownloaderTest {
                         conf, // max 4 pre-fetch num
                         fileDownloader,
                         scannerMetricGroup,
+                        metadataUpdater,
                         10L);
         TableBucket bucket1 = new TableBucket(DATA1_TABLE_ID, 1);
         TableBucket bucket2 = new TableBucket(DATA1_TABLE_ID, 2);
