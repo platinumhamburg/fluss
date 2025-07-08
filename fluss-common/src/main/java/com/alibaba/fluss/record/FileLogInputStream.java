@@ -19,6 +19,8 @@ package com.alibaba.fluss.record;
 
 import com.alibaba.fluss.exception.FlussRuntimeException;
 import com.alibaba.fluss.memory.MemorySegment;
+import com.alibaba.fluss.record.bytesview.BytesView;
+import com.alibaba.fluss.record.bytesview.FileRegionBytesView;
 import com.alibaba.fluss.utils.CloseableIterator;
 import com.alibaba.fluss.utils.FileUtils;
 
@@ -27,6 +29,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Objects;
+import java.util.Optional;
 
 import static com.alibaba.fluss.record.LogRecordBatchFormat.BASE_OFFSET_OFFSET;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
@@ -122,6 +125,10 @@ public class FileLogInputStream
 
         public int position() {
             return position;
+        }
+
+        public BytesView getBytesView() {
+            return new FileRegionBytesView(fileRecords.channel(), position, sizeInBytes());
         }
 
         @Override
@@ -272,6 +279,11 @@ public class FileLogInputStream
                     + ", size: "
                     + batchSize
                     + ")";
+        }
+
+        @Override
+        public Optional<LogRecordBatchStatistics> getStatistics() {
+            return Optional.empty();
         }
     }
 }

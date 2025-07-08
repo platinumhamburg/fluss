@@ -33,6 +33,7 @@ import com.alibaba.fluss.utils.crc.Crc32C;
 
 import java.nio.ByteBuffer;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 
 import static com.alibaba.fluss.record.LogRecordBatchFormat.BASE_OFFSET_OFFSET;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
@@ -409,5 +410,10 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         public void remove() {
             throw new UnsupportedOperationException();
         }
+    }
+
+    @Override
+    public Optional<LogRecordBatchStatistics> getStatistics() {
+        return Optional.empty();
     }
 }

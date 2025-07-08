@@ -30,6 +30,7 @@ import com.alibaba.fluss.flink.utils.PushdownUtils;
 import com.alibaba.fluss.flink.utils.PushdownUtils.FieldEqual;
 import com.alibaba.fluss.metadata.MergeEngineType;
 import com.alibaba.fluss.metadata.TablePath;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.types.RowType;
 
 import org.apache.flink.annotation.VisibleForTesting;
@@ -129,6 +130,8 @@ public class FlinkTableSource
     private long limit = -1;
 
     private List<FieldEqual> partitionFilters = Collections.emptyList();
+
+    private Predicate logRecordBatchFilter;
 
     public FlinkTableSource(
             TablePath tablePath,
@@ -270,7 +273,8 @@ public class FlinkTableSource
                         scanPartitionDiscoveryIntervalMs,
                         new RowDataDeserializationSchema(),
                         streaming,
-                        partitionFilters);
+                        partitionFilters,
+                        logRecordBatchFilter);
 
         if (!streaming) {
             // return a bounded source provide to make planner happy,

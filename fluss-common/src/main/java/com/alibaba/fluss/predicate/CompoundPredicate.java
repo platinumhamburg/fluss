@@ -17,6 +17,7 @@
 
 package com.alibaba.fluss.predicate;
 
+import com.alibaba.fluss.row.InternalArray;
 import com.alibaba.fluss.row.InternalRow;
 
 import java.io.Serializable;
@@ -56,6 +57,12 @@ public class CompoundPredicate implements Predicate {
     }
 
     @Override
+    public boolean test(
+            long rowCount, InternalRow minValues, InternalRow maxValues, InternalArray nullCounts) {
+        return function.test(rowCount, minValues, maxValues, nullCounts, children);
+    }
+
+    @Override
     public Optional<Predicate> negate() {
         return function.negate(children);
     }
@@ -88,6 +95,13 @@ public class CompoundPredicate implements Predicate {
     public abstract static class Function implements Serializable {
 
         public abstract boolean test(InternalRow row, List<Predicate> children);
+
+        public abstract boolean test(
+                long rowCount,
+                InternalRow minValues,
+                InternalRow maxValues,
+                InternalArray nullCounts,
+                List<Predicate> children);
 
         public abstract Optional<Predicate> negate(List<Predicate> children);
 

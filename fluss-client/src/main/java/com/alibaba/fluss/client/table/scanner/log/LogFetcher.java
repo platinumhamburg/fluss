@@ -35,6 +35,7 @@ import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TableInfo;
 import com.alibaba.fluss.metadata.TablePartition;
 import com.alibaba.fluss.metadata.TablePath;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.record.LogRecordReadContext;
 import com.alibaba.fluss.record.LogRecords;
 import com.alibaba.fluss.record.MemoryLogRecords;
@@ -51,6 +52,7 @@ import com.alibaba.fluss.rpc.messages.PbFetchLogReqForTable;
 import com.alibaba.fluss.rpc.messages.PbFetchLogRespForBucket;
 import com.alibaba.fluss.rpc.messages.PbFetchLogRespForTable;
 import com.alibaba.fluss.rpc.protocol.Errors;
+import com.alibaba.fluss.rpc.util.PredicateMessageUtils;
 import com.alibaba.fluss.utils.IOUtils;
 import com.alibaba.fluss.utils.Projection;
 
@@ -91,6 +93,7 @@ public class LogFetcher implements Closeable {
     //  bytes from remote file.
     private final LogRecordReadContext remoteReadContext;
     @Nullable private final Projection projection;
+    @Nullable private final Predicate recordBatchFilter;
     private final RpcClient rpcClient;
     private final int maxFetchBytes;
     private final int maxBucketFetchBytes;
@@ -114,6 +117,7 @@ public class LogFetcher implements Closeable {
     public LogFetcher(
             TableInfo tableInfo,
             @Nullable Projection projection,
+            @Nullable Predicate recordBatchFilter,
             RpcClient rpcClient,
             LogScannerStatus logScannerStatus,
             Configuration conf,
@@ -126,6 +130,7 @@ public class LogFetcher implements Closeable {
         this.remoteReadContext =
                 LogRecordReadContext.createReadContext(tableInfo, true, projection);
         this.projection = projection;
+        this.recordBatchFilter = recordBatchFilter;
         this.rpcClient = rpcClient;
         this.logScannerStatus = logScannerStatus;
         this.maxFetchBytes =
@@ -460,6 +465,10 @@ public class LogFetcher implements Closeable {
                                     .setProjectedFields(projection.getProjectionInOrder());
                         } else {
                             reqForTable.setProjectionPushdownEnabled(false);
+                        }
+                        if (null != recordBatchFilter) {
+                            reqForTable.setRecordBatchFilter(
+                                    PredicateMessageUtils.toPbPredicate(recordBatchFilter));
                         }
                         reqForTable.addAllBucketsReqs(reqForBuckets);
                         fetchLogRequest.addAllTablesReqs(Collections.singletonList(reqForTable));
