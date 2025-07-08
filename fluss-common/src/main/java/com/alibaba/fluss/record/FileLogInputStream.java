@@ -27,6 +27,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Objects;
+import java.util.Optional;
 
 import static com.alibaba.fluss.record.DefaultLogRecordBatch.BASE_OFFSET_OFFSET;
 import static com.alibaba.fluss.record.DefaultLogRecordBatch.LENGTH_OFFSET;
@@ -270,6 +271,11 @@ public class FileLogInputStream
                     + ", size: "
                     + batchSize
                     + ")";
+        }
+
+        @Override
+        public Optional<LogRecordBatchStatistics> getStatistics() {
+            return Optional.empty();
         }
     }
 }

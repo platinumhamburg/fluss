@@ -29,6 +29,7 @@ import com.alibaba.fluss.config.ConfigOptions;
 import com.alibaba.fluss.exception.FlussRuntimeException;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TableInfo;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.types.RowType;
 
 import javax.annotation.Nullable;
@@ -43,27 +44,32 @@ public class TableScan implements Scan {
 
     /** The projected fields to do projection. No projection if is null. */
     @Nullable private final int[] projectedColumns;
+
+    @Nullable private final Predicate looseFilter;
+
     /** The limited row number to read. No limit if is null. */
     @Nullable private final Integer limit;
 
     public TableScan(FlussConnection conn, TableInfo tableInfo) {
-        this(conn, tableInfo, null, null);
+        this(conn, tableInfo, null, null, null);
     }
 
     private TableScan(
             FlussConnection conn,
             TableInfo tableInfo,
             @Nullable int[] projectedColumns,
+            @Nullable Predicate looseFilter,
             @Nullable Integer limit) {
         this.conn = conn;
         this.tableInfo = tableInfo;
         this.projectedColumns = projectedColumns;
+        this.looseFilter = looseFilter;
         this.limit = limit;
     }
 
     @Override
     public Scan project(@Nullable int[] projectedColumns) {
-        return new TableScan(conn, tableInfo, projectedColumns, limit);
+        return new TableScan(conn, tableInfo, projectedColumns, looseFilter, limit);
     }
 
     @Override
@@ -78,12 +84,17 @@ public class TableScan implements Scan {
             }
             columnIndexes[i] = index;
         }
-        return new TableScan(conn, tableInfo, columnIndexes, limit);
+        return new TableScan(conn, tableInfo, columnIndexes, looseFilter, limit);
+    }
+
+    @Override
+    public Scan lossyFilter(Predicate looseFilter) {
+        return new TableScan(conn, tableInfo, projectedColumns, looseFilter, limit);
     }
 
     @Override
     public Scan limit(int rowNumber) {
-        return new TableScan(conn, tableInfo, projectedColumns, rowNumber);
+        return new TableScan(conn, tableInfo, projectedColumns, looseFilter, rowNumber);
     }
 
     @Override
@@ -98,7 +109,8 @@ public class TableScan implements Scan {
                 conn.getMetadataUpdater(),
                 conn.getClientMetricGroup(),
                 conn.getOrCreateRemoteFileDownloader(),
-                projectedColumns);
+                projectedColumns,
+                looseFilter);
     }
 
     @Override

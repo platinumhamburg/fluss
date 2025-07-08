@@ -35,6 +35,7 @@ import com.alibaba.fluss.flink.source.split.SnapshotSplit;
 import com.alibaba.fluss.flink.source.split.SourceSplitBase;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TablePath;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.utils.CloseableIterator;
 import com.alibaba.fluss.utils.ExceptionUtils;
@@ -88,6 +89,9 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
     private final Map<TableBucket, String> subscribedBuckets;
 
     @Nullable private final int[] projectedFields;
+
+    @Nullable private final Predicate looseFilter;
+
     private final FlinkSourceReaderMetrics flinkSourceReaderMetrics;
 
     @Nullable private BoundedSplitReader currentBoundedSplitReader;
@@ -114,6 +118,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
             TablePath tablePath,
             RowType sourceOutputType,
             @Nullable int[] projectedFields,
+            @Nullable Predicate looseFilter,
             FlinkSourceReaderMetrics flinkSourceReaderMetrics) {
         this.flinkMetricRegistry =
                 new FlinkMetricRegistry(flinkSourceReaderMetrics.getSourceReaderMetricGroup());
@@ -124,6 +129,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
         this.boundedSplits = new ArrayDeque<>();
         this.subscribedBuckets = new HashMap<>();
         this.projectedFields = projectedFields;
+        this.looseFilter = looseFilter;
         this.flinkSourceReaderMetrics = flinkSourceReaderMetrics;
         sanityCheck(table.getTableInfo().getRowType(), projectedFields);
         this.logScanner = table.newScan().project(projectedFields).createLogScanner();

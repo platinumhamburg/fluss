@@ -21,6 +21,7 @@ import com.alibaba.fluss.annotation.PublicEvolving;
 import com.alibaba.fluss.client.table.scanner.batch.BatchScanner;
 import com.alibaba.fluss.client.table.scanner.log.LogScanner;
 import com.alibaba.fluss.metadata.TableBucket;
+import com.alibaba.fluss.predicate.Predicate;
 
 import javax.annotation.Nullable;
 
@@ -50,6 +51,8 @@ public interface Scan {
      * @param projectedColumnNames the selected column names
      */
     Scan project(List<String> projectedColumnNames);
+
+    Scan lossyFilter(Predicate looseFilter);
 
     /**
      * Returns a new scan from this that will read the given limited row number.
