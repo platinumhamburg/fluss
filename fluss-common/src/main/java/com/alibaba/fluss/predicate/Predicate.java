@@ -17,6 +17,7 @@
 
 package com.alibaba.fluss.predicate;
 
+import com.alibaba.fluss.row.InternalArray;
 import com.alibaba.fluss.row.InternalRow;
 
 import java.io.Serializable;
@@ -42,6 +43,15 @@ public interface Predicate extends Serializable {
      * @return return true when hit, false when not hit.
      */
     boolean test(InternalRow row);
+
+    /**
+     * Test based on the statistical information to determine whether a hit is possible.
+     *
+     * @return return true is likely to hit (there may also be false positives), return false is
+     *     absolutely not possible to hit.
+     */
+    boolean test(
+            long rowCount, InternalRow minValues, InternalRow maxValues, InternalArray nullCounts);
 
     /** @return the negation predicate of this predicate if possible. */
     Optional<Predicate> negate();

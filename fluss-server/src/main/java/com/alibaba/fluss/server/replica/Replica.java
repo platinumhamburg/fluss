@@ -1180,6 +1180,7 @@ public final class Replica {
                                         Integer.MAX_VALUE,
                                         FetchIsolation.HIGH_WATERMARK,
                                         true,
+                                        null,
                                         null);
                         return dataInfo.getRecords();
                     } catch (IOException e) {
@@ -1330,7 +1331,8 @@ public final class Replica {
                         fetchParams.maxFetchBytes(),
                         fetchParams.isolation(),
                         fetchParams.minOneMessage(),
-                        fetchParams.projection());
+                        fetchParams.projection(),
+                        fetchParams.gatTableRecordBatchFilter(tableBucket.getTableId()));
         return new LogReadInfo(fetchDataInfo, initialHighWatermark, initialLogEndOffset);
     }
 

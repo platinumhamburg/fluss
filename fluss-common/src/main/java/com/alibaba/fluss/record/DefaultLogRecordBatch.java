@@ -34,6 +34,7 @@ import com.alibaba.fluss.utils.crc.Crc32C;
 
 import java.nio.ByteBuffer;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
@@ -433,5 +434,10 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         public void remove() {
             throw new UnsupportedOperationException();
         }
+    }
+
+    @Override
+    public Optional<LogRecordBatchStatistics> getStatistics() {
+        return Optional.empty();
     }
 }

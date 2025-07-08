@@ -25,6 +25,7 @@ import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.utils.CloseableIterator;
 
 import java.util.Iterator;
+import java.util.Optional;
 
 /**
  * A record batch is a container for {@link LogRecord LogRecords}.
@@ -51,6 +52,13 @@ public interface LogRecordBatch {
      * @return true If so, false otherwise
      */
     boolean isValid();
+
+    /**
+     * Get the statistics of this record batch.
+     *
+     * @return
+     */
+    Optional<LogRecordBatchStatistics> getStatistics();
 
     /** Raise an exception if the checksum is not valid. */
     void ensureValid();
