@@ -1092,9 +1092,7 @@ public class ReplicaManager {
                 if (tb.getPartitionId() != null) {
                     PartitionMetadata partitionMetadata =
                             metadataCache.getPartitionMetadata(replica.getPhysicalTablePath());
-                    if (partitionMetadata == null
-                            || partitionMetadata.getPartitionId()
-                                    == PartitionMetadata.DELETED_PARTITION_ID) {
+                    if (partitionMetadata == null) {
                         return new FetchLogResultForBucket(
                                 tb,
                                 ApiError.fromThrowable(
