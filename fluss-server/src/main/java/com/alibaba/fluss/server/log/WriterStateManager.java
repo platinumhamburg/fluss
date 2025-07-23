@@ -56,6 +56,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static com.alibaba.fluss.server.log.WriterStateEntry.BATCH_SEQUENCE_AFTER_EXPIRE;
 import static com.alibaba.fluss.utils.FlussPaths.WRITER_SNAPSHOT_FILE_SUFFIX;
 import static com.alibaba.fluss.utils.FlussPaths.writerSnapshotFile;
 
@@ -352,8 +353,13 @@ public class WriterStateManager {
     }
 
     private void removeWriterIds(List<Long> keys) {
-        keys.forEach(writers::remove);
-        writerIdCount = writers.size();
+        for (long writerId : keys) {
+            WriterStateEntry writerStateEntry = writers.get(writerId);
+            writerStateEntry.removeAllBatches();
+            // For writer id expiration, we add a batch with sequence BATCH_SEQUENCE_AFTER_EXPIRE to
+            // identify.
+            writerStateEntry.addBath(BATCH_SEQUENCE_AFTER_EXPIRE, -1L, 0, -1L);
+        }
     }
 
     private void clearWriterIds() {

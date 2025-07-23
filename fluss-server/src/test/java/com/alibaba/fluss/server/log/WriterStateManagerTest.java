@@ -345,18 +345,16 @@ public class WriterStateManagerTest {
         append(stateManager1, writerId, 0, 1L);
         stateManager1.removeExpiredWriters(System.currentTimeMillis() + 4000L);
 
-        assertThatThrownBy(() -> append(stateManager1, writerId, 2, 2L))
-                .isInstanceOf(OutOfOrderSequenceException.class)
-                .hasMessageContaining(
-                        "Out of order batch sequence for writer 1 at offset 2 in "
-                                + "table-bucket TableBucket{tableId=1001, bucket=0}"
-                                + " : 2 (incoming batch seq.), -1 (current batch seq.)");
+        // Even if the writerId has expired, we must ensure that new data with the same writerId can
+        // still be written to avoid data inconsistencies during recovery and follower
+        // synchronization.
+        append(stateManager1, writerId, 1, 2L);
 
-        append(stateManager1, writerId, 0, 2L);
+        append(stateManager1, writerId, 2, 3L);
         assertThat(stateManager1.activeWriters().size()).isEqualTo(1);
         assertThat(stateManager1.activeWriters().values().iterator().next().lastBatchSequence())
-                .isEqualTo(0);
-        assertThat(stateManager1.mapEndOffset()).isEqualTo(3L);
+                .isEqualTo(2);
+        assertThat(stateManager1.mapEndOffset()).isEqualTo(4L);
     }
 
     @Test
