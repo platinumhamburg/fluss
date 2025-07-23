@@ -19,6 +19,8 @@ package com.alibaba.fluss.record;
 
 import com.alibaba.fluss.exception.FlussRuntimeException;
 import com.alibaba.fluss.memory.MemorySegment;
+import com.alibaba.fluss.record.bytesview.BytesView;
+import com.alibaba.fluss.record.bytesview.FileRegionBytesView;
 import com.alibaba.fluss.utils.CloseableIterator;
 import com.alibaba.fluss.utils.FileUtils;
 
@@ -27,6 +29,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Objects;
+import java.util.Optional;
 
 import static com.alibaba.fluss.record.LogRecordBatchFormat.BASE_OFFSET_OFFSET;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
@@ -122,6 +125,10 @@ public class FileLogInputStream
 
         public int position() {
             return position;
+        }
+
+        public BytesView getBytesView() {
+            return new FileRegionBytesView(fileRecords.channel(), position, sizeInBytes());
         }
 
         @Override
@@ -272,6 +279,26 @@ public class FileLogInputStream
                     + ", size: "
                     + batchSize
                     + ")";
+        }
+
+        @Override
+        public Optional<LogRecordBatchStatistics> getStatistics() {
+            if (magic < LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+                // Statistics are only available in V2 and later
+                return Optional.empty();
+            }
+
+            try {
+                // Load the batch header to read statistics
+                LogRecordBatch headerBatch = loadBatchHeader();
+                if (headerBatch instanceof DefaultLogRecordBatch) {
+                    return headerBatch.getStatistics();
+                }
+            } catch (Exception e) {
+                // If loading header fails, return empty
+            }
+
+            return Optional.empty();
         }
     }
 }

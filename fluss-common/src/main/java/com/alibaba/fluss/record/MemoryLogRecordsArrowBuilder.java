@@ -36,7 +36,9 @@ import static com.alibaba.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
+import static com.alibaba.fluss.record.LogRecordBatchFormat.STATISTICS_FLAG_MASK;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffset;
+import static com.alibaba.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffsetWithStats;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.crcOffset;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.schemaIdOffset;
@@ -56,6 +58,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
     private final MemorySegment firstSegment;
     private final AbstractPagedOutputView pagedOutputView;
     private final boolean appendOnly;
+    private final LogRecordBatchStatisticsCollector statisticsCollector;
 
     private volatile MultiBytesView bytesView = null;
 
@@ -91,6 +94,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
 
         this.pagedOutputView = pagedOutputView;
         this.firstSegment = pagedOutputView.getCurrentSegment();
+        // For V2, we use the minimal arrow change type offset (without statistics)
         int arrowChangeTypeOffset = arrowChangeTypeOffset(magic);
         checkArgument(
                 firstSegment.size() >= arrowChangeTypeOffset,
@@ -100,6 +104,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         this.changeTypeWriter = new ChangeTypeVectorWriter(firstSegment, arrowChangeTypeOffset);
         this.estimatedSizeInBytes = recordBatchHeaderSize(magic);
         this.recordCount = 0;
+        this.statisticsCollector = new LogRecordBatchStatisticsCollector(arrowWriter.getSchema());
     }
 
     @VisibleForTesting
@@ -142,8 +147,31 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         }
 
         // serialize the arrow batch to dynamically allocated memory segments
-        arrowWriter.serializeToOutputView(
-                pagedOutputView, arrowChangeTypeOffset(magic) + changeTypeWriter.sizeInBytes());
+        // For V2, we need to calculate the arrow offset based on statistics length
+        int arrowOffset;
+        if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+            // For V2, we need to calculate statistics data length first
+            LogRecordBatchStatistics statistics = statisticsCollector.getStatistics();
+            int statisticsLength = 0;
+            if (statistics != null) {
+                try {
+                    byte[] statisticsData =
+                            LogRecordBatchStatisticsSerializer.serialize(
+                                    statistics, arrowWriter.getSchema());
+                    statisticsLength = statisticsData.length;
+                } catch (Exception e) {
+                    // If serialization fails, continue without statistics
+                    statisticsLength = 0;
+                }
+            }
+            arrowOffset =
+                    arrowChangeTypeOffsetWithStats(magic, statisticsLength)
+                            + changeTypeWriter.sizeInBytes();
+        } else {
+            arrowOffset = arrowChangeTypeOffset(magic) + changeTypeWriter.sizeInBytes();
+        }
+
+        arrowWriter.serializeToOutputView(pagedOutputView, arrowOffset);
         recordCount = arrowWriter.getRecordsCount();
         bytesView =
                 MultiBytesView.builder()
@@ -184,6 +212,8 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         if (!appendOnly) {
             changeTypeWriter.writeChangeType(changeType);
         }
+        // Collect statistics for the row
+        statisticsCollector.processRow(row);
         reCalculateSizeInBytes = true;
     }
 
@@ -240,10 +270,27 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
 
         if (reCalculateSizeInBytes) {
             // make size in bytes up-to-date
-            estimatedSizeInBytes =
+            int baseSize =
                     arrowChangeTypeOffset(magic)
                             + changeTypeWriter.sizeInBytes()
                             + arrowWriter.estimatedSizeInBytes();
+
+            // For V2, add estimated statistics size
+            if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+                LogRecordBatchStatistics statistics = statisticsCollector.getStatistics();
+                if (statistics != null) {
+                    try {
+                        byte[] statisticsData =
+                                LogRecordBatchStatisticsSerializer.serialize(
+                                        statistics, arrowWriter.getSchema());
+                        baseSize += statisticsData.length;
+                    } catch (Exception e) {
+                        // If serialization fails, continue without statistics
+                    }
+                }
+            }
+
+            estimatedSizeInBytes = baseSize;
         }
 
         reCalculateSizeInBytes = false;
@@ -273,8 +320,32 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         outputView.writeUnsignedInt(0);
         // write schema id
         outputView.writeShort((short) schemaId);
-        // write attributes (currently only appendOnly flag)
-        outputView.writeBoolean(appendOnly);
+
+        // write attributes (appendOnly flag and statistics flag)
+        byte attributes = 0;
+        if (appendOnly) {
+            attributes |= 0x01; // set appendOnly flag
+        }
+
+        // Get statistics and serialize them
+        LogRecordBatchStatistics statistics = statisticsCollector.getStatistics();
+        byte[] statisticsData = new byte[0];
+        if (statistics != null) {
+            try {
+                statisticsData =
+                        LogRecordBatchStatisticsSerializer.serialize(
+                                statistics, arrowWriter.getSchema());
+                if (statisticsData.length > 0) {
+                    attributes |= STATISTICS_FLAG_MASK; // set statistics flag
+                }
+            } catch (Exception e) {
+                // If serialization fails, we'll continue without statistics
+                statisticsData = new byte[0];
+            }
+        }
+
+        outputView.writeByte(attributes);
+
         // write lastOffsetDelta
         if (recordCount > 0) {
             outputView.writeInt(recordCount - 1);
@@ -286,6 +357,14 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         outputView.writeLong(writerId);
         outputView.writeInt(batchSequence);
         outputView.writeInt(recordCount);
+
+        // For V2, write statistics length and data
+        if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+            outputView.writeInt(statisticsData.length);
+            if (statisticsData.length > 0) {
+                outputView.write(statisticsData);
+            }
+        }
 
         // Update crc.
         long crc = Crc32C.compute(pagedOutputView.getWrittenSegments(), schemaIdOffset(magic));

@@ -19,10 +19,15 @@ package com.alibaba.fluss.record;
 
 import com.alibaba.fluss.exception.CorruptMessageException;
 import com.alibaba.fluss.exception.FlussRuntimeException;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.utils.AbstractIterator;
+
+import javax.annotation.Nullable;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.util.Iterator;
+import java.util.Optional;
 
 /**
  * LogRecordBatchIterator is a subclass of AbstractIterator, which can iterate through instances of
@@ -30,11 +35,20 @@ import java.io.IOException;
  */
 public class LogRecordBatchIterator<T extends LogRecordBatch> extends AbstractIterator<T> {
 
-    private final LogInputStream<T> logInputStream;
+    private LogInputStream<T> logInputStream;
+
+    private @Nullable Long targetOffset;
 
     public LogRecordBatchIterator(LogInputStream<T> logInputStream) {
         this.logInputStream = logInputStream;
     }
+
+    public LogRecordBatchIterator(LogInputStream<T> logInputStream, long targetOffset) {
+        this.logInputStream = logInputStream;
+        this.targetOffset = targetOffset;
+    }
+
+    private LogRecordBatchIterator() {}
 
     @Override
     protected T makeNext() {
@@ -43,12 +57,53 @@ public class LogRecordBatchIterator<T extends LogRecordBatch> extends AbstractIt
             if (batch == null) {
                 return allDone();
             }
+            if (null == targetOffset || batch.lastLogOffset() >= targetOffset) {
+                return batch;
+            }
             return batch;
         } catch (EOFException e) {
             throw new CorruptMessageException(
                     "Unexpected EOF while attempting to read the next batch", e);
         } catch (IOException e) {
             throw new FlussRuntimeException(e);
+        }
+    }
+
+    public LogRecordBatchIterator<T> filter(Predicate recordBatchFilter) {
+        return new FilteredLogRecordBatchIterator<>(this, recordBatchFilter);
+    }
+
+    private class FilteredLogRecordBatchIterator<T extends LogRecordBatch>
+            extends LogRecordBatchIterator<T> {
+
+        private final Iterator<T> innerIter;
+
+        private final Predicate recordBatchFilter;
+
+        private FilteredLogRecordBatchIterator(
+                LogRecordBatchIterator<T> innerIter, Predicate recordBatchFilter) {
+            super();
+            this.innerIter = innerIter;
+            this.recordBatchFilter = recordBatchFilter;
+        }
+
+        @Override
+        protected T makeNext() {
+            while (innerIter.hasNext()) {
+                T batch = innerIter.next();
+                Optional<LogRecordBatchStatistics> statisticsOpt = batch.getStatistics();
+                if (!statisticsOpt.isPresent()) {
+                    return batch;
+                }
+                if (recordBatchFilter.test(
+                        statisticsOpt.get().getRowCount(),
+                        statisticsOpt.get().getMinValues(),
+                        statisticsOpt.get().getMaxValues(),
+                        statisticsOpt.get().getNullCounts())) {
+                    return batch;
+                }
+            }
+            return allDone();
         }
     }
 }
