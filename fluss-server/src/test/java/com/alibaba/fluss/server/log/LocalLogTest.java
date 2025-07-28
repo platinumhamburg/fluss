@@ -393,7 +393,7 @@ final class LocalLogTest extends LogTestBase {
 
     private FetchDataInfo readLog(LocalLog log, long startOffset, int maxLength) throws Exception {
         return log.read(
-                startOffset, maxLength, false, localLog.getLocalLogEndOffsetMetadata(), null);
+                startOffset, maxLength, false, localLog.getLocalLogEndOffsetMetadata(), null, null);
     }
 
     private LocalLog createLocalLogWithActiveSegment(

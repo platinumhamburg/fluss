@@ -28,6 +28,7 @@ import com.alibaba.fluss.metrics.Counter;
 import com.alibaba.fluss.metrics.DescriptiveStatisticsHistogram;
 import com.alibaba.fluss.metrics.Histogram;
 import com.alibaba.fluss.metrics.SimpleCounter;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.record.FileLogProjection;
 import com.alibaba.fluss.record.MemoryLogRecords;
 import com.alibaba.fluss.utils.FileUtils;
@@ -346,7 +347,7 @@ public final class LocalLog {
      * offset is out of range, throw an OffsetOutOfRangeException.
      */
     LogOffsetMetadata convertToOffsetMetadataOrThrow(long offset) throws IOException {
-        FetchDataInfo fetchDataInfo = read(offset, 1, false, nextOffsetMetadata, null);
+        FetchDataInfo fetchDataInfo = read(offset, 1, false, nextOffsetMetadata, null, null);
         return fetchDataInfo.getFetchOffsetMetadata();
     }
 
@@ -367,7 +368,8 @@ public final class LocalLog {
             int maxLength,
             boolean minOneMessage,
             LogOffsetMetadata maxOffsetMetadata,
-            @Nullable FileLogProjection projection)
+            @Nullable FileLogProjection projection,
+            @Nullable Predicate recordBatchFilter)
             throws IOException {
         if (LOG.isTraceEnabled()) {
             LOG.trace(
@@ -414,7 +416,13 @@ public final class LocalLog {
                                 ? maxOffsetMetadata.getRelativePositionInSegment()
                                 : segment.getSizeInBytes();
                 fetchDataInfo =
-                        segment.read(readOffset, maxLength, maxPosition, minOneMessage, projection);
+                        segment.read(
+                                readOffset,
+                                maxLength,
+                                maxPosition,
+                                minOneMessage,
+                                projection,
+                                recordBatchFilter);
                 if (fetchDataInfo == null) {
                     segmentOpt = segments.higherSegment(baseOffset);
                 }

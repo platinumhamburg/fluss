@@ -96,7 +96,7 @@ public class MemoryLogRecordsArrowBuilderTest {
         assertThat(iterator.hasNext()).isTrue();
         LogRecordBatch batch = iterator.next();
         assertThat(batch.getRecordCount()).isEqualTo(0);
-        assertThat(batch.sizeInBytes()).isEqualTo(52);
+        assertThat(batch.sizeInBytes()).isEqualTo(56);
         assertThat(iterator.hasNext()).isFalse();
     }
 
@@ -202,7 +202,7 @@ public class MemoryLogRecordsArrowBuilderTest {
                         })
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage(
-                        "The size of first segment of pagedOutputView is too small, need at least 52 bytes.");
+                        "The size of first segment of pagedOutputView is too small, need at least 56 bytes.");
     }
 
     @Test
@@ -255,7 +255,7 @@ public class MemoryLogRecordsArrowBuilderTest {
                 createMemoryLogRecordsArrowBuilder(0, writer, 10, 1024 * 10);
         MemoryLogRecords memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         // only contains batch header.
-        assertThat(memoryLogRecords.sizeInBytes()).isEqualTo(52);
+        assertThat(memoryLogRecords.sizeInBytes()).isEqualTo(56);
         Iterator<LogRecordBatch> iterator = memoryLogRecords.batches().iterator();
         assertThat(iterator.hasNext()).isTrue();
         LogRecordBatch logRecordBatch = iterator.next();
@@ -280,7 +280,7 @@ public class MemoryLogRecordsArrowBuilderTest {
         builder = createMemoryLogRecordsArrowBuilder(100, writer2, 10, 1024 * 10);
         memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         // only contains batch header.
-        assertThat(memoryLogRecords.sizeInBytes()).isEqualTo(52);
+        assertThat(memoryLogRecords.sizeInBytes()).isEqualTo(56);
         iterator = memoryLogRecords.batches().iterator();
         assertThat(iterator.hasNext()).isTrue();
         logRecordBatch = iterator.next();

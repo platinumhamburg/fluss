@@ -33,13 +33,13 @@ import com.alibaba.fluss.utils.crc.Crc32C;
 
 import java.nio.ByteBuffer;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 
 import static com.alibaba.fluss.record.LogRecordBatchFormat.BASE_OFFSET_OFFSET;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
-import static com.alibaba.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffset;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.batchSequenceOffset;
 import static com.alibaba.fluss.record.LogRecordBatchFormat.commitTimestampOffset;
@@ -282,7 +282,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         if (isAppendOnly) {
             // append only batch, no change type vector,
             // the start of the arrow data is the beginning of the batch records
-            int recordBatchHeaderSize = recordBatchHeaderSize(magic);
+            int recordBatchHeaderSize = getActualRecordBatchHeaderSize(magic);
             int arrowOffset = position + recordBatchHeaderSize;
             int arrowLength = sizeInBytes() - recordBatchHeaderSize;
             ArrowReader reader =
@@ -297,12 +297,14 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         } else {
             // with change type, decode the change type vector first,
             // the arrow data starts after the change type vector
-            int changeTypeOffset = position + arrowChangeTypeOffset(magic);
+            int changeTypeOffset = position + getActualArrowChangeTypeOffset(magic);
             ChangeTypeVector changeTypeVector =
                     new ChangeTypeVector(segment, changeTypeOffset, getRecordCount());
             int arrowOffset = changeTypeOffset + changeTypeVector.sizeInBytes();
             int arrowLength =
-                    sizeInBytes() - arrowChangeTypeOffset(magic) - changeTypeVector.sizeInBytes();
+                    sizeInBytes()
+                            - getActualArrowChangeTypeOffset(magic)
+                            - changeTypeVector.sizeInBytes();
             ArrowReader reader =
                     ArrowUtils.createArrowReader(
                             segment, arrowOffset, arrowLength, root, allocator, rowType);
@@ -409,5 +411,99 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         public void remove() {
             throw new UnsupportedOperationException();
         }
+    }
+
+    @Override
+    public Optional<LogRecordBatchStatistics> getStatistics(ReadContext context) {
+        if (context == null) {
+            return Optional.empty();
+        }
+
+        byte magic = magic();
+        if (magic < LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+            // Statistics are only available in V2 and later
+            return Optional.empty();
+        }
+
+        // Check if statistics flag is set
+        byte attributes = attributes();
+        if ((attributes & LogRecordBatchFormat.STATISTICS_FLAG_MASK) == 0) {
+            // No statistics available
+            return Optional.empty();
+        }
+
+        try {
+            // Get row type from context
+            RowType rowType = context.getRowType(schemaId());
+            if (rowType == null) {
+                return Optional.empty();
+            }
+
+            // Read statistics length
+            int statisticsLength =
+                    segment.getInt(position + LogRecordBatchFormat.statisticsLengthOffset(magic));
+            if (statisticsLength <= 0) {
+                return Optional.empty();
+            }
+
+            // Read statistics data
+            int statisticsDataOffset = position + LogRecordBatchFormat.statisticsDataOffset(magic);
+            byte[] statisticsData = new byte[statisticsLength];
+            segment.get(statisticsDataOffset, statisticsData, 0, statisticsLength);
+
+            // Deserialize statistics using the row type from context
+            LogRecordBatchStatistics statistics =
+                    LogRecordBatchStatisticsSerializer.deserialize(statisticsData, rowType);
+            return Optional.ofNullable(statistics);
+        } catch (Exception e) {
+            // If reading or deserializing statistics fails, return empty
+            return Optional.empty();
+        }
+    }
+
+    /** Get the actual record batch header size including statistics for V2 format. */
+    private int getActualRecordBatchHeaderSize(byte magic) {
+        if (magic < LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+            return LogRecordBatchFormat.recordBatchHeaderSize(magic);
+        }
+
+        // For V2, we need to add statistics length
+        int statisticsLength = 0;
+        byte attributes = attributes();
+        if ((attributes & LogRecordBatchFormat.STATISTICS_FLAG_MASK) != 0) {
+            try {
+                statisticsLength =
+                        segment.getInt(
+                                position + LogRecordBatchFormat.statisticsLengthOffset(magic));
+            } catch (Exception e) {
+                // If reading statistics length fails, use 0
+                statisticsLength = 0;
+            }
+        }
+
+        return LogRecordBatchFormat.recordBatchHeaderSizeWithStats(magic, statisticsLength);
+    }
+
+    /** Get the actual arrow change type offset including statistics for V2 format. */
+    private int getActualArrowChangeTypeOffset(byte magic) {
+        if (magic < LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+            return LogRecordBatchFormat.arrowChangeTypeOffset(magic);
+        }
+
+        // For V2, we need to add statistics length
+        int statisticsLength = 0;
+        byte attributes = attributes();
+        if ((attributes & LogRecordBatchFormat.STATISTICS_FLAG_MASK) != 0) {
+            try {
+                statisticsLength =
+                        segment.getInt(
+                                position + LogRecordBatchFormat.statisticsLengthOffset(magic));
+            } catch (Exception e) {
+                // If reading statistics length fails, use 0
+                statisticsLength = 0;
+            }
+        }
+
+        return LogRecordBatchFormat.arrowChangeTypeOffsetWithStats(magic, statisticsLength);
     }
 }
