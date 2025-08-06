@@ -22,6 +22,7 @@ on:
       - main
       - release-**
       - ci-**
+      - logfilter
   pull_request:
     paths-ignore:
       - 'website/**'
