@@ -27,6 +27,7 @@ import com.alibaba.fluss.exception.WakeupException;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TableInfo;
 import com.alibaba.fluss.metadata.TablePath;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.rpc.RpcClient;
 import com.alibaba.fluss.rpc.metrics.ClientMetricGroup;
 import com.alibaba.fluss.types.RowType;
@@ -84,7 +85,8 @@ public class LogScannerImpl implements LogScanner {
             MetadataUpdater metadataUpdater,
             ClientMetricGroup clientMetricGroup,
             RemoteFileDownloader remoteFileDownloader,
-            @Nullable int[] projectedFields) {
+            @Nullable int[] projectedFields,
+            @Nullable Predicate recordBatchFilter) {
         this.tablePath = tableInfo.getTablePath();
         this.tableId = tableInfo.getTableId();
         this.isPartitionedTable = tableInfo.isPartitioned();
@@ -98,6 +100,7 @@ public class LogScannerImpl implements LogScanner {
                 new LogFetcher(
                         tableInfo,
                         projection,
+                        recordBatchFilter,
                         rpcClient,
                         logScannerStatus,
                         conf,
