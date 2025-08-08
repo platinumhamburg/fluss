@@ -31,6 +31,9 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.MeterView;
+import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
@@ -44,6 +47,7 @@ import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.TruncateReason;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
+import org.apache.fluss.server.kv.rocksdb.RocksDBMetricsCollector;
 import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.kv.snapshot.KvFileHandleAndLocalPath;
@@ -54,6 +58,7 @@ import org.apache.fluss.server.kv.wal.IndexWalBuilder;
 import org.apache.fluss.server.kv.wal.WalBuilder;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
@@ -77,6 +82,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -117,6 +123,8 @@ public final class KvTablet {
 
     @GuardedBy("kvLock")
     private volatile boolean isClosed = false;
+
+    private volatile RocksDBMetricsCollector rocksDBMetricsCollector;
 
     private KvTablet(
             PhysicalTablePath physicalPath,
@@ -245,6 +253,52 @@ public final class KvTablet {
 
     public long getFlushedLogOffset() {
         return flushedLogOffset;
+    }
+
+    public void registerMetrics(BucketMetricGroup bucketMetricGroup) {
+        MetricGroup metricGroup = bucketMetricGroup.addGroup("kv");
+
+        // about pre-write buffer.
+        metricGroup.meter(
+                MetricNames.KV_FLUSH_RATE, new MeterView(kvPreWriteBuffer.getFlushCount()));
+        metricGroup.histogram(
+                MetricNames.KV_FLUSH_LATENCY_MS, kvPreWriteBuffer.getFlushLatencyHistogram());
+        metricGroup.meter(
+                MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE,
+                new MeterView(kvPreWriteBuffer.getTruncateAsDuplicatedCount()));
+        metricGroup.meter(
+                MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_ERROR_RATE,
+                new MeterView(kvPreWriteBuffer.getTruncateAsErrorCount()));
+
+        // Initialize RocksDB metrics reporter
+        inWriteLock(
+                kvLock,
+                () -> {
+                    if (rocksDBMetricsCollector == null && !isClosed) {
+                        try {
+                            // Get RocksDB Statistics from options container
+                            org.rocksdb.Statistics statistics =
+                                    rocksDBKv.getOptionsContainer().getStatistics();
+                            if (statistics != null) {
+                                rocksDBMetricsCollector =
+                                        new RocksDBMetricsCollector(
+                                                rocksDBKv.getDb(),
+                                                statistics,
+                                                bucketMetricGroup,
+                                                tableBucket,
+                                                physicalPath.getTablePath(),
+                                                physicalPath.getPartitionName(),
+                                                rocksDBKv.getOptionsContainer());
+                            }
+                        } catch (Exception e) {
+                            LOG.warn(
+                                    "Failed to initialize RocksDB metrics reporter for table {} bucket {}",
+                                    physicalPath,
+                                    tableBucket.getBucket(),
+                                    e);
+                        }
+                    }
+                });
     }
 
     /**
@@ -511,10 +565,44 @@ public final class KvTablet {
                     if (isClosed) {
                         return;
                     }
-                    if (rocksDBKv != null) {
-                        rocksDBKv.close();
-                    }
+
+                    // Set closed flag first to prevent new operations
                     isClosed = true;
+
+                    // Close RocksDB metrics reporter first with proper error handling
+                    if (rocksDBMetricsCollector != null) {
+                        try {
+                            rocksDBMetricsCollector.close();
+                            // Wait for cleanup to complete with timeout
+                            if (!rocksDBMetricsCollector.waitForCleanup(10, TimeUnit.SECONDS)) {
+                                LOG.warn(
+                                        "Timeout waiting for RocksDB metrics collector cleanup for table {} bucket {}",
+                                        physicalPath,
+                                        tableBucket.getBucket());
+                            }
+                        } catch (Exception e) {
+                            LOG.warn(
+                                    "Failed to close RocksDB metrics reporter for table {} bucket {}",
+                                    physicalPath,
+                                    tableBucket.getBucket(),
+                                    e);
+                        } finally {
+                            rocksDBMetricsCollector = null;
+                        }
+                    }
+
+                    // Close RocksDB instance last
+                    if (rocksDBKv != null) {
+                        try {
+                            rocksDBKv.close();
+                        } catch (Exception e) {
+                            LOG.warn(
+                                    "Failed to close RocksDB instance for table {} bucket {}",
+                                    physicalPath,
+                                    tableBucket.getBucket(),
+                                    e);
+                        }
+                    }
                 });
     }
 
