@@ -79,8 +79,6 @@ public final class CoordinatorEventManager implements EventManager {
     }
 
     private void registerMetrics() {
-        coordinatorMetricGroup.gauge(MetricNames.EVENT_QUEUE_SIZE, queue::size);
-
         eventQueueTime =
                 coordinatorMetricGroup.histogram(
                         MetricNames.EVENT_QUEUE_TIME_MS,
