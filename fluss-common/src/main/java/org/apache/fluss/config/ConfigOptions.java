@@ -1487,7 +1487,7 @@ public class ConfigOptions {
                                     + "Note: If the List size is smaller than the level number, the undefined lower level uses the last Compression Type in the List. "
                                     + "The optional values include NO, SNAPPY, LZ4, ZSTD. "
                                     + "For more information about compression type, please refer to doc https://github.com/facebook/rocksdb/wiki/Compression. "
-                                    + "The default value is ‘LZ4,LZ4,LZ4,LZ4,LZ4,ZSTD,ZSTD', indicates there is lz4 compaction of level0 and level4，"
+                                    + "The default value is ‘LZ4,LZ4,LZ4,LZ4,LZ4,ZSTD,ZSTD’, indicates there is lz4 compaction of level0 and level4，"
                                     + "ZSTD compaction algorithm is used from level5 to level6. "
                                     + "LZ4 is a lightweight compression algorithm so it usually strikes a good balance between space and CPU usage.  "
                                     + "ZSTD is more space save than LZ4, but it is more CPU-intensive. "
