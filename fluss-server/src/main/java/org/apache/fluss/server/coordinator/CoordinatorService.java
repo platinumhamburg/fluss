@@ -674,13 +674,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             // This is a KV table (Primary Key Table)
             if (!kvTableAllowCreation) {
                 throw new InvalidTableException(
-                        String.format(
                         "Creation of Primary Key Tables is disallowed in the cluster.");
             }
         } else {
             // This is a Log table
             if (!logTableAllowCreation) {
-               throw new InvalidTableException(
+                throw new InvalidTableException(
                         "Creation of Log Tables is disallowed in the cluster.");
             }
         }

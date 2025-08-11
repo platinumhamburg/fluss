@@ -122,6 +122,24 @@ public class ConfigOptions {
                             "The interval of auto partition check. "
                                     + "The default value is 10 minutes.");
 
+    public static final ConfigOption<Boolean> LOG_TABLE_ALLOW_CREATION =
+            key("allow.create.log.tables")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether to allow creation of log tables. When set to false, "
+                                    + "attempts to create log tables (tables without primary key) will be rejected. "
+                                    + "The default value is true.");
+
+    public static final ConfigOption<Boolean> KV_TABLE_ALLOW_CREATION =
+            key("allow.create.kv.tables")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether to allow creation of kv tables (primary key tables). When set to false, "
+                                    + "attempts to create kv tables (tables with primary key) will be rejected. "
+                                    + "The default value is true.");
+
     public static final ConfigOption<Integer> MAX_PARTITION_NUM =
             key("max.partition.num")
                     .intType()
@@ -261,7 +279,7 @@ public class ConfigOptions {
      * <p>Like {@link ConfigOptions#COORDINATOR_HOST}, if the coordinator server is used as a
      * bootstrap server (discover all the servers in the cluster), the value of this config option
      * should be a static port. Otherwise, the value can be set to "0" for a dynamic service name
-     * resolution. The value accepts a list of ports ("50100,50101"), ranges ("50100-50200") or a
+     * resolution. The value accepts a list of ports (“50100,50101”), ranges (“50100-50200”) or a
      * combination of both.
      *
      * @deprecated This option is deprecated. Please use {@link ConfigOptions#BIND_LISTENERS}
@@ -282,7 +300,7 @@ public class ConfigOptions {
                                     + " this config option should be a static port. Otherwise,"
                                     + " the value can be set to \"0\" for a dynamic service name"
                                     + " resolution. The value accepts a list of ports"
-                                    + " (\"50100,50101\"), ranges (\"50100-50200\") or a combination of both."
+                                    + " (“50100,50101”), ranges (“50100-50200”) or a combination of both."
                                     + "This option is deprecated. Please use bind.listeners instead, which provides a more flexible configuration for multiple ports");
 
     public static final ConfigOption<Integer> COORDINATOR_IO_POOL_SIZE =
@@ -1315,24 +1333,6 @@ public class ConfigOptions {
                     .withDescription(
                             "The column name of the version column for the `versioned` merge engine. "
                                     + "If the merge engine is set to `versioned`, the version column must be set.");
-
-    public static final ConfigOption<Boolean> LOG_TABLE_ALLOW_CREATION =
-            key("log.table.allow-creation")
-                    .booleanType()
-                    .defaultValue(true)
-                    .withDescription(
-                            "Whether to allow creation of log tables. When set to false, "
-                                    + "attempts to create log tables (tables without primary key) will be rejected. "
-                                    + "The default value is true.");
-
-    public static final ConfigOption<Boolean> KV_TABLE_ALLOW_CREATION =
-            key("kv.table.allow-creation")
-                    .booleanType()
-                    .defaultValue(true)
-                    .withDescription(
-                            "Whether to allow creation of kv tables (primary key tables). When set to false, "
-                                    + "attempts to create kv tables (tables with primary key) will be rejected. "
-                                    + "The default value is true.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv
