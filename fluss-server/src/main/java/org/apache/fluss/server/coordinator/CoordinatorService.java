@@ -680,11 +680,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         } else {
             // This is a Log table
             if (!logTableAllowCreation) {
-                throw new InvalidTableException(
-                        String.format(
-                                "Creation of Log tables is not allowed. "
-                                        + "Table: %s. Please set '%s' to true to enable Log table creation.",
-                                tablePath, ConfigOptions.LOG_TABLE_ALLOW_CREATION.key()));
+               throw new InvalidTableException(
+                        "Creation of Log Tables is disallowed in the cluster.");
             }
         }
     }
