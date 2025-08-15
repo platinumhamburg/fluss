@@ -540,7 +540,11 @@ public final class Replica {
             // resister the closeable registry for kv
             closeableRegistry.registerCloseable(closeableRegistryForKv);
         } catch (IOException e) {
-            LOG.warn("Failed to register CloseableRegistry for KV (table={}, bucket={}). Resources may leak.", physicalPath, tableBucket, e);
+            LOG.warn(
+                    "Failed to register CloseableRegistry for KV (table={}, bucket={}). Resources may leak.",
+                    physicalPath,
+                    tableBucket,
+                    e);
         }
 
         // init kv tablet and get the snapshot it uses to init if have any
@@ -550,7 +554,13 @@ public final class Replica {
                 snapshotUsed = initKvTablet();
                 break;
             } catch (Exception e) {
-                LOG.warn("Failed to init KV tablet for table {} bucket {} (attempt {}/{}). Retrying...", physicalPath, tableBucket, i, INIT_KV_TABLET_MAX_RETRY_TIMES, e);
+                LOG.warn(
+                        "Failed to init KV tablet for table {} bucket {} (attempt {}/{}). Retrying...",
+                        physicalPath,
+                        tableBucket,
+                        i,
+                        INIT_KV_TABLET_MAX_RETRY_TIMES,
+                        e);
             }
         }
         // start periodic kv snapshot
@@ -676,14 +686,19 @@ public final class Replica {
                 try {
                     snapshotContext.handleSnapshotBroken(completedSnapshot);
                 } catch (Exception t) {
-                    LOG.error("Failed to handle broken snapshot {} for table {} bucket {}.", completedSnapshot, physicalPath, tableBucket, t);
+                    LOG.error(
+                            "Failed to handle broken snapshot {} for table {} bucket {}.",
+                            completedSnapshot,
+                            physicalPath,
+                            tableBucket,
+                            t);
                 }
             }
             throw new IOException(
-                                String.format(
-                                        "Failed to download KV snapshot for table %s bucket %s to directory %s. snapshot=%s",
-                                        physicalPath, tableBucket, kvDbPath, completedSnapshot),
-                                e);
+                    String.format(
+                            "Failed to download KV snapshot for table %s bucket %s to directory %s. snapshot=%s",
+                            physicalPath, tableBucket, kvDbPath, completedSnapshot),
+                    e);
         }
         long end = clock.milliseconds();
         LOG.info(
@@ -820,7 +835,14 @@ public final class Replica {
             kvSnapshotManager.start();
             closeableRegistryForKv.registerCloseable(kvSnapshotManager);
         } catch (Exception e) {
-            LOG.error("Failed to initialize KV periodic snapshot for table {} bucket {} (leaderEpoch={}, coordinatorEpoch={}, completedSnapshot={}).", physicalPath, tableBucket, leaderEpoch, coordinatorEpoch, completedSnapshot, e);
+            LOG.error(
+                    "Failed to initialize KV periodic snapshot for table {} bucket {} (leaderEpoch={}, coordinatorEpoch={}, completedSnapshot={}).",
+                    physicalPath,
+                    tableBucket,
+                    leaderEpoch,
+                    coordinatorEpoch,
+                    completedSnapshot,
+                    e);
         }
     }
 
