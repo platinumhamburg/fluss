@@ -27,7 +27,6 @@ import com.alibaba.fluss.record.LogRecordBatch;
 import com.alibaba.fluss.record.LogRecordReadContext;
 import com.alibaba.fluss.row.GenericRow;
 import com.alibaba.fluss.row.InternalRow;
-import com.alibaba.fluss.rpc.messages.FetchLogRequest;
 import com.alibaba.fluss.rpc.protocol.ApiError;
 import com.alibaba.fluss.utils.CloseableIterator;
 
@@ -178,6 +177,8 @@ abstract class CompletedFetch {
                 ScanRecord record = toScanRecord(lastRecord);
                 scanRecords.add(record);
                 recordsRead++;
+                // Update nextFetchOffset based on the current record
+                // This will be overridden by batch-level nextLogOffset when batch is complete
                 nextFetchOffset = lastRecord.logOffset() + 1;
                 cachedRecordException = null;
             }

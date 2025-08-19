@@ -156,7 +156,10 @@ public class LogFetchCollector {
                     tb,
                     nextInLineFetch.nextFetchOffset());
         } else {
-            if (nextInLineFetch.nextFetchOffset() == offset) {
+            // Accept non-continuous batches from server (e.g., due to filtering)
+            // The server may return batches with gaps, but we should process them
+            // and start the next fetch from the last batch's nextLogOffset
+            if (nextInLineFetch.nextFetchOffset() >= offset) {
                 List<ScanRecord> records = nextInLineFetch.fetchRecords(maxRecords);
                 LOG.trace(
                         "Returning {} fetched records at offset {} for assigned bucket {}.",
@@ -175,8 +178,7 @@ public class LogFetchCollector {
                 }
                 return records;
             } else {
-                // these records aren't next in line based on the last consumed offset, ignore them
-                // they must be from an obsolete request
+                // these records are from an obsolete request (offset is behind current position)
                 LOG.debug(
                         "Ignoring fetched records for {} at offset {} since the current offset is {}",
                         nextInLineFetch.tableBucket,
