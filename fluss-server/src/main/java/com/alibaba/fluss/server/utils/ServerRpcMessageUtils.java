@@ -749,6 +749,12 @@ public class ServerRpcMessageUtils {
             FetchLogResultForBucket bucketResult = entry.getValue();
             PbFetchLogRespForBucket fetchLogRespForBucket =
                     new PbFetchLogRespForBucket().setBucketId(tb.getBucket());
+            if (bucketResult.getSkipToNextFetchOffset() > 0) {
+                fetchLogRespForBucket.setSkipToNextFetchOffset(
+                        bucketResult.getSkipToNextFetchOffset());
+            } else {
+                fetchLogRespForBucket.setSkipToNextFetchOffset(-1);
+            }
             if (tb.getPartitionId() != null) {
                 fetchLogRespForBucket.setPartitionId(tb.getPartitionId());
             }

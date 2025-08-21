@@ -41,8 +41,9 @@ import java.util.List;
 
 /**
  * {@link CompletedFetch} represents the result that was returned from the tablet server via a
- * {@link FetchLogRequest}, which can be a {@link LogRecordBatch} or remote log segments path. It
- * contains logic to maintain state between calls to {@link #fetchRecords(int)}.
+ * {@link com.alibaba.fluss.rpc.messages.FetchLogRequest}, which can be a {@link LogRecordBatch} or
+ * remote log segments path. It contains logic to maintain state between calls to {@link
+ * #fetchRecords(int)}.
  */
 @Internal
 abstract class CompletedFetch {

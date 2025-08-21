@@ -46,6 +46,8 @@ class DefaultCompletedFetch extends CompletedFetch {
                 readContext,
                 logScannerStatus,
                 isCheckCrc,
-                fetchOffset);
+                fetchLogResultForBucket.getSkipToNextFetchOffset() > 0
+                        ? fetchLogResultForBucket.getSkipToNextFetchOffset()
+                        : fetchOffset);
     }
 }
