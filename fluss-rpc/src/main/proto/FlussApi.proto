@@ -644,6 +644,7 @@ message PbFetchLogRespForBucket {
   optional int64 log_start_offset = 6; // TODO now we don't introduce log start offset, but remain it in protobuf
   optional PbRemoteLogFetchInfo remote_log_fetch_info = 7;
   optional bytes records = 8;
+  optional int64 skip_to_next_fetch_offset = 9; // Will be set when all bathes filtered out
 }
 
 message PbPutKvReqForBucket {

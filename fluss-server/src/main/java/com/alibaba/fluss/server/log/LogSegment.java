@@ -568,18 +568,38 @@ public final class LogSegment {
 
         FileLogRecords.LogOffsetPosition startOffsetAndSize = translateOffset(startOffset, 0);
         if (startOffsetAndSize == null) {
+            LOG.debug(
+                    "No valid position found for startOffset {} in segment {}", startOffset, this);
             return null;
         }
+
         int startPosition = startOffsetAndSize.getPosition();
+        LOG.debug(
+                "readWithoutFilter: startOffset={}, translated position={}, expected offset={}, segment={}",
+                startOffset,
+                startPosition,
+                startOffsetAndSize.getOffset(),
+                this);
+
         LogOffsetMetadata offsetMetadata =
                 new LogOffsetMetadata(startOffset, this.baseOffset, startPosition);
         int adjustedMaxSize =
                 minOneMessage ? Math.max(maxSize, startOffsetAndSize.getSize()) : maxSize;
         if (adjustedMaxSize <= HEADER_SIZE_UP_TO_MAGIC) {
+            LOG.debug(
+                    "Adjusted max size {} is too small for startOffset {} in segment {}",
+                    adjustedMaxSize,
+                    startOffset,
+                    this);
             return new FetchDataInfo(offsetMetadata, MemoryLogRecords.EMPTY);
         }
         if (projection == null) {
             int fetchSize = Math.min((int) (maxPosition - startPosition), adjustedMaxSize);
+            LOG.debug(
+                    "readWithoutFilter: returning {} bytes for startOffset {} in segment {}",
+                    fetchSize,
+                    startOffset,
+                    this);
             return new FetchDataInfo(
                     offsetMetadata, fileLogRecords.slice(startPosition, fetchSize));
         } else {
@@ -596,6 +616,10 @@ public final class LogSegment {
                             chunk.getPosition(),
                             chunk.getPosition() + chunk.getSize(),
                             adjustedMaxSize);
+            LOG.debug(
+                    "readWithoutFilter: returning projected records for startOffset {} in segment {}",
+                    startOffset,
+                    this);
             return new FetchDataInfo(offsetMetadata, projectedRecords);
         }
     }
@@ -612,9 +636,35 @@ public final class LogSegment {
             @Nullable LogRecordBatch.ReadContext readContext)
             throws IOException {
 
+        // Use translateOffset to precisely locate the starting position, same as readWithoutFilter
+        FileLogRecords.LogOffsetPosition startOffsetAndSize = translateOffset(startOffset, 0);
+        if (startOffsetAndSize == null) {
+            return null;
+        }
+        int startPosition = startOffsetAndSize.getPosition();
+
+        // Use the translated position instead of starting from position 0
         LogRecordBatchIterator<FileChannelLogRecordBatch> iter =
-                fileLogRecords.batchIterator(startOffset, 0).filter(recordBatchFilter, readContext);
+                fileLogRecords
+                        .batchIterator(startOffset, startPosition)
+                        .filter(recordBatchFilter, readContext);
+
+        // If no batches found after filtering, fallback to unfiltered iterator to avoid infinite
+        // loop
         if (!iter.hasNext()) {
+            Optional<TabletServerMetricGroup> metricGroupOpt =
+                    ServerMetricUtils.getTabletServerMetricGroup();
+            if (metricGroupOpt.isPresent()) {
+                LogRecordBatchIterator.Statistics statistics = iter.getStatistics();
+                metricGroupOpt
+                        .get()
+                        .logRecordBatchStatisticsProcessCount()
+                        .inc(statistics.getProcessedStatisticCount());
+                metricGroupOpt
+                        .get()
+                        .logRecordBatchStatisticsFilterOutCount()
+                        .inc(statistics.getFilteredOutRecordBatchCount());
+            }
             return null;
         }
 
@@ -697,6 +747,7 @@ public final class LogSegment {
         if (builder.isEmpty()) {
             return new FetchDataInfo(offsetMetadata, MemoryLogRecords.EMPTY);
         }
+
         return new FetchDataInfo(offsetMetadata, new BytesViewLogRecords(builder.build()));
     }
 

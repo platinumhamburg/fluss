@@ -451,7 +451,14 @@ public final class LocalLog {
                 // start offset is in range, this can happen when all messages with offset larger
                 // than start offsets have been deleted. In this case, we will return the empty set
                 // with log end offset metadata
-                return new FetchDataInfo(nextOffsetMetadata, MemoryLogRecords.EMPTY);
+                // When using filter, we should create a filtered empty response to notify client
+                // about the correct offset to continue fetching from
+                if (recordBatchFilter != null) {
+                    return FetchDataInfo.createFilteredEmptyResponse(
+                            nextOffsetMetadata, nextOffsetMetadata.getMessageOffset());
+                } else {
+                    return new FetchDataInfo(nextOffsetMetadata, MemoryLogRecords.EMPTY);
+                }
             }
         }
     }
