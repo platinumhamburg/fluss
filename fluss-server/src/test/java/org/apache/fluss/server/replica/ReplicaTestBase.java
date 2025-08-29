@@ -643,8 +643,10 @@ public class ReplicaTestBase {
 
         @Override
         public void handleSnapshotBroken(CompletedSnapshot snapshot) throws Exception {
-            // TODO Auto-generated method stub
-            throw new UnsupportedOperationException("Unimplemented method 'handleSnapshotBroken'");
+            // Remove the broken snapshot from the snapshot store (simulating ZK metadata removal)
+            testKvSnapshotStore.removeSnapshot(snapshot.getTableBucket(), snapshot.getSnapshotID());
+            // Discard the snapshot files async (similar to DefaultSnapshotContext implementation)
+            snapshot.discardAsync(executorService);
         }
     }
 }
