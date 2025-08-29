@@ -33,7 +33,7 @@ import static org.apache.fluss.metrics.utils.MetricGroupUtils.makeScope;
 
 /**
  * Metric group for coordinator event types. This group adds an additional dimension "event_type" to
- * the metrics and manages event-specific metrics like queue size and processing time.
+ * the metrics and manages event-specific metrics.
  */
 public class CoordinatorEventMetricGroup extends AbstractMetricGroup {
 
