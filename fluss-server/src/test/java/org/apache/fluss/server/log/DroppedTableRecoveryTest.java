@@ -18,7 +18,6 @@
 package org.apache.fluss.server.log;
 
 import org.apache.fluss.config.ConfigOptions;
-import org.apache.fluss.exception.SchemaNotExistException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -48,7 +47,6 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for handling recovery from residual data of already dropped tables. */
 final class DroppedTableRecoveryTest extends LogTestBase {
@@ -215,7 +213,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         // Remove ALL metadata from ZooKeeper to simulate table drop
         zkClient.deleteTable(tablePath);
-        
+
         // Start LogManager again
         LogManager newLogManager =
                 LogManager.create(conf, zkClient, new FlussScheduler(1), SystemClock.getInstance());
@@ -257,5 +255,4 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         newLogManager.shutdown();
     }
-    
 }
