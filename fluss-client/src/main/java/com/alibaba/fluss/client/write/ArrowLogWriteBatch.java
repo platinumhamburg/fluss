@@ -23,6 +23,7 @@ import com.alibaba.fluss.memory.AbstractPagedOutputView;
 import com.alibaba.fluss.memory.MemorySegment;
 import com.alibaba.fluss.metadata.PhysicalTablePath;
 import com.alibaba.fluss.record.ChangeType;
+import com.alibaba.fluss.record.LogRecordBatchStatisticsCollector;
 import com.alibaba.fluss.record.MemoryLogRecordsArrowBuilder;
 import com.alibaba.fluss.record.bytesview.BytesView;
 import com.alibaba.fluss.row.InternalRow;
@@ -55,11 +56,13 @@ public class ArrowLogWriteBatch extends WriteBatch {
             int schemaId,
             ArrowWriter arrowWriter,
             AbstractPagedOutputView outputView,
-            long createdMs) {
+            long createdMs,
+            LogRecordBatchStatisticsCollector statisticsCollector) {
         super(bucketId, physicalTablePath, createdMs);
         this.outputView = outputView;
         this.recordsBuilder =
-                MemoryLogRecordsArrowBuilder.builder(schemaId, arrowWriter, outputView, true);
+                MemoryLogRecordsArrowBuilder.builder(
+                        schemaId, arrowWriter, outputView, true, statisticsCollector);
     }
 
     @Override

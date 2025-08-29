@@ -38,6 +38,7 @@ import com.alibaba.fluss.record.FileLogRecords;
 import com.alibaba.fluss.record.KvRecordBatch;
 import com.alibaba.fluss.record.LogRecords;
 import com.alibaba.fluss.record.MemoryLogRecords;
+import com.alibaba.fluss.record.RecordBatchFilter;
 import com.alibaba.fluss.remote.RemoteLogFetchInfo;
 import com.alibaba.fluss.remote.RemoteLogSegment;
 import com.alibaba.fluss.rpc.entity.FetchLogResultForBucket;
@@ -129,6 +130,7 @@ import com.alibaba.fluss.rpc.messages.StopReplicaResponse;
 import com.alibaba.fluss.rpc.messages.UpdateMetadataRequest;
 import com.alibaba.fluss.rpc.protocol.ApiError;
 import com.alibaba.fluss.rpc.protocol.Errors;
+import com.alibaba.fluss.rpc.util.PredicateMessageUtils;
 import com.alibaba.fluss.security.acl.AclBinding;
 import com.alibaba.fluss.server.authorizer.AclCreateResult;
 import com.alibaba.fluss.server.authorizer.AclDeleteResult;
@@ -159,6 +161,7 @@ import com.alibaba.fluss.server.zk.data.LeaderAndIsr;
 import javax.annotation.Nullable;
 
 import java.nio.ByteBuffer;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -688,6 +691,19 @@ public class ServerRpcMessageUtils {
         return produceResponse;
     }
 
+    public static Map<Long, RecordBatchFilter> getTableRecordBatchFilterMap(
+            FetchLogRequest request) {
+        return request.getTablesReqsList().stream()
+                .filter(PbFetchLogReqForTable::hasRecordBatchFilter)
+                .map(
+                        tableReq ->
+                                new AbstractMap.SimpleEntry<>(
+                                        tableReq.getTableId(),
+                                        PredicateMessageUtils.toRecordBatchFilter(
+                                                tableReq.getRecordBatchFilter())))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+    }
+
     public static Map<TableBucket, FetchReqInfo> getFetchLogData(FetchLogRequest request) {
         Map<TableBucket, FetchReqInfo> fetchDataMap = new HashMap<>();
         for (PbFetchLogReqForTable fetchLogReqForTable : request.getTablesReqsList()) {
@@ -734,6 +750,12 @@ public class ServerRpcMessageUtils {
             FetchLogResultForBucket bucketResult = entry.getValue();
             PbFetchLogRespForBucket fetchLogRespForBucket =
                     new PbFetchLogRespForBucket().setBucketId(tb.getBucket());
+            if (bucketResult.getSkipToNextFetchOffset() > 0) {
+                fetchLogRespForBucket.setSkipToNextFetchOffset(
+                        bucketResult.getSkipToNextFetchOffset());
+            } else {
+                fetchLogRespForBucket.setSkipToNextFetchOffset(-1);
+            }
             if (tb.getPartitionId() != null) {
                 fetchLogRespForBucket.setPartitionId(tb.getPartitionId());
             }

@@ -20,6 +20,7 @@ package com.alibaba.fluss.flink.source.reader;
 import com.alibaba.fluss.client.Connection;
 import com.alibaba.fluss.client.ConnectionFactory;
 import com.alibaba.fluss.client.table.Table;
+import com.alibaba.fluss.client.table.scanner.Scan;
 import com.alibaba.fluss.client.table.scanner.ScanRecord;
 import com.alibaba.fluss.client.table.scanner.batch.BatchScanner;
 import com.alibaba.fluss.client.table.scanner.log.LogScanner;
@@ -35,6 +36,7 @@ import com.alibaba.fluss.flink.source.split.SnapshotSplit;
 import com.alibaba.fluss.flink.source.split.SourceSplitBase;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TablePath;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.utils.CloseableIterator;
 import com.alibaba.fluss.utils.ExceptionUtils;
@@ -88,6 +90,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
     private final Map<TableBucket, String> subscribedBuckets;
 
     @Nullable private final int[] projectedFields;
+
     private final FlinkSourceReaderMetrics flinkSourceReaderMetrics;
 
     @Nullable private BoundedSplitReader currentBoundedSplitReader;
@@ -116,6 +119,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
             TablePath tablePath,
             RowType sourceOutputType,
             @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
             FlinkSourceReaderMetrics flinkSourceReaderMetrics) {
         this.flinkMetricRegistry =
                 new FlinkMetricRegistry(flinkSourceReaderMetrics.getSourceReaderMetricGroup());
@@ -128,7 +132,11 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
         this.projectedFields = projectedFields;
         this.flinkSourceReaderMetrics = flinkSourceReaderMetrics;
         sanityCheck(table.getTableInfo().getRowType(), projectedFields);
-        this.logScanner = table.newScan().project(projectedFields).createLogScanner();
+        Scan tableScan = table.newScan().project(projectedFields);
+        if (logRecordBatchFilter != null) {
+            tableScan = tableScan.filter(logRecordBatchFilter);
+        }
+        this.logScanner = tableScan.createLogScanner();
         this.stoppingOffsets = new HashMap<>();
         this.emptyLogSplits = new HashSet<>();
     }

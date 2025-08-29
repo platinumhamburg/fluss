@@ -34,6 +34,7 @@ import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TableInfo;
 import com.alibaba.fluss.metadata.TablePartition;
 import com.alibaba.fluss.metadata.TablePath;
+import com.alibaba.fluss.predicate.Predicate;
 import com.alibaba.fluss.record.LogRecordReadContext;
 import com.alibaba.fluss.record.LogRecords;
 import com.alibaba.fluss.record.MemoryLogRecords;
@@ -48,6 +49,7 @@ import com.alibaba.fluss.rpc.messages.PbFetchLogReqForTable;
 import com.alibaba.fluss.rpc.messages.PbFetchLogRespForBucket;
 import com.alibaba.fluss.rpc.messages.PbFetchLogRespForTable;
 import com.alibaba.fluss.rpc.protocol.Errors;
+import com.alibaba.fluss.rpc.util.PredicateMessageUtils;
 import com.alibaba.fluss.utils.IOUtils;
 import com.alibaba.fluss.utils.Projection;
 
@@ -88,6 +90,7 @@ public class LogFetcher implements Closeable {
     //  bytes from remote file.
     private final LogRecordReadContext remoteReadContext;
     @Nullable private final Projection projection;
+    @Nullable private final Predicate recordBatchFilter;
     private final int maxFetchBytes;
     private final int maxBucketFetchBytes;
     private final int minFetchBytes;
@@ -110,6 +113,7 @@ public class LogFetcher implements Closeable {
     public LogFetcher(
             TableInfo tableInfo,
             @Nullable Projection projection,
+            @Nullable Predicate recordBatchFilter,
             LogScannerStatus logScannerStatus,
             Configuration conf,
             MetadataUpdater metadataUpdater,
@@ -117,10 +121,14 @@ public class LogFetcher implements Closeable {
             RemoteFileDownloader remoteFileDownloader) {
         this.tablePath = tableInfo.getTablePath();
         this.isPartitioned = tableInfo.isPartitioned();
-        this.readContext = LogRecordReadContext.createReadContext(tableInfo, false, projection);
+        this.readContext =
+                LogRecordReadContext.createReadContext(
+                        tableInfo, false, projection, recordBatchFilter != null);
         this.remoteReadContext =
-                LogRecordReadContext.createReadContext(tableInfo, true, projection);
+                LogRecordReadContext.createReadContext(
+                        tableInfo, true, projection, recordBatchFilter != null);
         this.projection = projection;
+        this.recordBatchFilter = recordBatchFilter;
         this.logScannerStatus = logScannerStatus;
         this.maxFetchBytes =
                 (int) conf.get(ConfigOptions.CLIENT_SCANNER_LOG_FETCH_MAX_BYTES).getBytes();
@@ -325,7 +333,8 @@ public class LogFetcher implements Closeable {
                         } else {
                             LogRecords logRecords = fetchResultForBucket.recordsOrEmpty();
                             if (!MemoryLogRecords.EMPTY.equals(logRecords)
-                                    || fetchResultForBucket.getErrorCode() != Errors.NONE.code()) {
+                                    || fetchResultForBucket.getErrorCode() != Errors.NONE.code()
+                                    || fetchResultForBucket.getSkipToNextFetchOffset() > 0) {
                                 // In oder to not signal notEmptyCondition, add completed fetch to
                                 // buffer until log records is not empty.
                                 DefaultCompletedFetch completedFetch =
@@ -451,6 +460,11 @@ public class LogFetcher implements Closeable {
                                     .setProjectedFields(projection.getProjectionInOrder());
                         } else {
                             reqForTable.setProjectionPushdownEnabled(false);
+                        }
+                        if (null != recordBatchFilter) {
+                            reqForTable.setRecordBatchFilter(
+                                    PredicateMessageUtils.toPbRecordBatchFilter(
+                                            recordBatchFilter, readContext.getSchemaId()));
                         }
                         reqForTable.addAllBucketsReqs(reqForBuckets);
                         fetchLogRequest.addAllTablesReqs(Collections.singletonList(reqForTable));

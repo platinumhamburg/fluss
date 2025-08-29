@@ -39,6 +39,7 @@ import com.alibaba.fluss.record.FileLogRecords;
 import com.alibaba.fluss.record.LogRecordBatch;
 import com.alibaba.fluss.record.LogRecords;
 import com.alibaba.fluss.record.MemoryLogRecords;
+import com.alibaba.fluss.record.RecordBatchFilter;
 import com.alibaba.fluss.server.log.LocalLog.SegmentDeletionReason;
 import com.alibaba.fluss.server.metrics.group.BucketMetricGroup;
 import com.alibaba.fluss.utils.FlussPaths;
@@ -368,13 +369,14 @@ public final class LogTablet {
         return append(records, false);
     }
 
-    /** Read messages from the local log. */
     public FetchDataInfo read(
             long readOffset,
             int maxLength,
             FetchIsolation fetchIsolation,
             boolean minOneMessage,
-            @Nullable FileLogProjection projection)
+            @Nullable FileLogProjection projection,
+            @Nullable RecordBatchFilter recordBatchFilter,
+            @Nullable LogRecordBatch.ReadContext readContext)
             throws IOException {
         LogOffsetMetadata maxOffsetMetadata = null;
         if (fetchIsolation == FetchIsolation.LOG_END) {
@@ -383,7 +385,14 @@ public final class LogTablet {
             maxOffsetMetadata = fetchHighWatermarkMetadata();
         }
 
-        return localLog.read(readOffset, maxLength, minOneMessage, maxOffsetMetadata, projection);
+        return localLog.read(
+                readOffset,
+                maxLength,
+                minOneMessage,
+                maxOffsetMetadata,
+                projection,
+                recordBatchFilter,
+                readContext);
     }
 
     /**
