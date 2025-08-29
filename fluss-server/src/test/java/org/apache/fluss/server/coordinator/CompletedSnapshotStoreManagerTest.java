@@ -22,6 +22,7 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandleStore;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore;
+import org.apache.fluss.server.kv.snapshot.TestingCompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
@@ -53,8 +54,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /** Test for {@link CompletedSnapshotStoreManager}. */
 class CompletedSnapshotStoreManagerTest {
@@ -187,28 +186,19 @@ class CompletedSnapshotStoreManagerTest {
         TableBucket tableBucket = new TableBucket(1, 1);
         CompletedSnapshot validSnapshot =
                 KvTestUtils.mockCompletedSnapshot(tempDir, tableBucket, 1L);
-        CompletedSnapshotHandle validSnapshotHandle = mock(CompletedSnapshotHandle.class);
-        when(validSnapshotHandle.getSnapshotId()).thenReturn(validSnapshot.getSnapshotID());
-        when(validSnapshotHandle.getMetadataFilePath())
-                .thenReturn(validSnapshot.getMetadataFilePath());
-        when(validSnapshotHandle.retrieveCompleteSnapshot()).thenReturn(validSnapshot);
+        TestingCompletedSnapshotHandle validSnapshotHandle =
+                new TestingCompletedSnapshotHandle(validSnapshot);
 
         CompletedSnapshot invalidSnapshot =
                 KvTestUtils.mockCompletedSnapshot(tempDir, tableBucket, 2L);
-        CompletedSnapshotHandle invalidSnapshotHandle = mock(CompletedSnapshotHandle.class);
-        when(invalidSnapshotHandle.getSnapshotId()).thenReturn(invalidSnapshot.getSnapshotID());
-        when(invalidSnapshotHandle.getMetadataFilePath())
-                .thenReturn(invalidSnapshot.getMetadataFilePath());
-        when(invalidSnapshotHandle.retrieveCompleteSnapshot())
-                .thenThrow(
-                        new FileNotFoundException(
-                                CompletedSnapshot.SNAPSHOT_DATA_NOT_EXISTS_ERROR_MESSAGE));
+        TestingCompletedSnapshotHandle invalidSnapshotHandle =
+                new TestingCompletedSnapshotHandleWithFileNotFound(invalidSnapshot);
 
-        // mock CompletedSnapshotHandleStore
-        CompletedSnapshotHandleStore mockCompletedSnapshotStore =
+        // create CompletedSnapshotHandleStore with real implementations
+        CompletedSnapshotHandleStore completedSnapshotHandleStore =
                 new InMemoryCompletedSnapshotHandleStore();
-        mockCompletedSnapshotStore.add(tableBucket, 1L, validSnapshotHandle);
-        mockCompletedSnapshotStore.add(tableBucket, 2L, invalidSnapshotHandle);
+        completedSnapshotHandleStore.add(tableBucket, 1L, validSnapshotHandle);
+        completedSnapshotHandleStore.add(tableBucket, 2L, invalidSnapshotHandle);
 
         // CompletedSnapshotStoreManager
         CompletedSnapshotStoreManager completedSnapshotStoreManager =
@@ -216,7 +206,7 @@ class CompletedSnapshotStoreManagerTest {
                         10,
                         ioExecutor,
                         zookeeperClient,
-                        zooKeeperClient -> mockCompletedSnapshotStore);
+                        zooKeeperClient -> completedSnapshotHandleStore);
 
         // Verify that only the valid snapshot remains
         CompletedSnapshotStore completedSnapshotStore =
@@ -272,6 +262,24 @@ class CompletedSnapshotStoreManagerTest {
             }
         }
         return tableBuckets;
+    }
+
+    /**
+     * A test-specific implementation of CompletedSnapshotHandle that throws FileNotFoundException
+     * with the specific error message expected by CompletedSnapshotStoreManager.
+     */
+    private static class TestingCompletedSnapshotHandleWithFileNotFound
+            extends TestingCompletedSnapshotHandle {
+
+        public TestingCompletedSnapshotHandleWithFileNotFound(CompletedSnapshot snapshot) {
+            super(snapshot, false);
+        }
+
+        @Override
+        public CompletedSnapshot retrieveCompleteSnapshot() throws IOException {
+            throw new FileNotFoundException(
+                    CompletedSnapshot.SNAPSHOT_DATA_NOT_EXISTS_ERROR_MESSAGE);
+        }
     }
 
     private static class InMemoryCompletedSnapshotHandleStore
