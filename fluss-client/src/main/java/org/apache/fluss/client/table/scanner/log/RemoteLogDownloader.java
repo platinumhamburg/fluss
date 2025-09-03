@@ -187,6 +187,65 @@ public class RemoteLogDownloader implements Closeable {
                                             ExceptionUtils.stripExecutionException(throwable));
                                     // release the semaphore for the failed request
                                     prefetchSemaphore.release();
+
+                                    // check if the partition is already deleted
+                                    // TODO: Standardize FileSystem exceptions to handle "No such
+                                    // file or directory"
+                                    // generically and distinguish partition deletion from other
+                                    // causes.
+                                    TableBucket requestTableBucket = request.segment.tableBucket();
+                                    if (request.segment.tableBucket().getPartitionId() != null) {
+                                        Optional<Long> partitionIdOpt =
+                                                metadataUpdater.getPartitionId(
+                                                        request.segment.physicalTablePath());
+                                        if (!partitionIdOpt.isPresent()) {
+                                            LOG.warn(
+                                                    "The partition {} of table {} does not exist when downloading remote log segment, it maybe already deleted, "
+                                                            + "skip the download request.",
+                                                    requestTableBucket.getPartitionId(),
+                                                    requestTableBucket.getTableId());
+                                            request.future.completeExceptionally(
+                                                    new PartitionNotExistException(
+                                                            "The partition "
+                                                                    + requestTableBucket
+                                                                            .getPartitionId()
+                                                                    + " of table "
+                                                                    + requestTableBucket
+                                                                            .getTableId()
+                                                                    + " does not exist when downloading remote log segment, it maybe already deleted."));
+                                            return;
+                                        } else {
+                                            if (!partitionIdOpt
+                                                    .get()
+                                                    .equals(
+                                                            request.segment
+                                                                    .tableBucket()
+                                                                    .getPartitionId())) {
+                                                LOG.warn(
+                                                        "The partition {} of table {} does not match the actual partition id {} in the request, the origin partition maybe already deleted, "
+                                                                + "skip the download request.",
+                                                        requestTableBucket.getPartitionId(),
+                                                        requestTableBucket.getTableId(),
+                                                        partitionIdOpt.get());
+                                                request.future.completeExceptionally(
+                                                        new PartitionNotExistException(
+                                                                "The request partition "
+                                                                        + requestTableBucket
+                                                                                .getPartitionId()
+                                                                        + " of table "
+                                                                        + requestTableBucket
+                                                                                .getTableId()
+                                                                        + " in the request does not match the actual partition id "
+                                                                        + partitionIdOpt.get()
+                                                                        + " with same physical table path "
+                                                                        + request.segment
+                                                                                .physicalTablePath()
+                                                                        + ", the origin partition maybe already deleted."));
+                                                return;
+                                            }
+                                        }
+                                    }
+
                                     // add back the request to the queue,
                                     // so we do not complete the request.future here
                                     segmentsToFetch.add(request);
@@ -207,53 +266,6 @@ public class RemoteLogDownloader implements Closeable {
         } catch (Throwable t) {
             prefetchSemaphore.release();
             scannerMetricGroup.remoteFetchErrorCount().inc();
-
-            // check if the partition is already deleted
-            // TODO: Standardize FileSystem exceptions to handle "No such file or directory"
-            // generically and distinguish partition deletion from other causes.
-            TableBucket requestTableBucket = request.segment.tableBucket();
-            if (request.segment.tableBucket().getPartitionId() != null) {
-                Optional<Long> partitionIdOpt =
-                        metadataUpdater.getPartitionId(request.segment.physicalTablePath());
-                if (!partitionIdOpt.isPresent()) {
-                    LOG.warn(
-                            "The partition {} of table {} does not exist when downloading remote log segment, it maybe already deleted, "
-                                    + "skip the download request.",
-                            requestTableBucket.getPartitionId(),
-                            requestTableBucket.getTableId());
-                    request.future.completeExceptionally(
-                            new PartitionNotExistException(
-                                    "The partition "
-                                            + requestTableBucket.getPartitionId()
-                                            + " of table "
-                                            + requestTableBucket.getTableId()
-                                            + " does not exist when downloading remote log segment, it maybe already deleted."));
-                    return;
-                } else {
-                    if (!partitionIdOpt
-                            .get()
-                            .equals(request.segment.tableBucket().getPartitionId())) {
-                        LOG.warn(
-                                "The partition {} of table {} does not match the actual partition id {} in the request, the origin partition maybe already deleted, "
-                                        + "skip the download request.",
-                                requestTableBucket.getPartitionId(),
-                                requestTableBucket.getTableId(),
-                                partitionIdOpt.get());
-                        request.future.completeExceptionally(
-                                new PartitionNotExistException(
-                                        "The request partition "
-                                                + requestTableBucket.getPartitionId()
-                                                + " of table "
-                                                + requestTableBucket.getTableId()
-                                                + " in the request does not match the actual partition id "
-                                                + partitionIdOpt.get()
-                                                + " with same physical table path "
-                                                + request.segment.physicalTablePath()
-                                                + ", the origin partition maybe already deleted."));
-                        return;
-                    }
-                }
-            }
 
             // add back the request to the queue
             segmentsToFetch.add(request);

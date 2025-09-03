@@ -25,6 +25,7 @@ import org.apache.fluss.client.table.scanner.RemoteFileDownloader;
 import org.apache.fluss.client.table.scanner.log.RemoteLogDownloader.RemoteLogDownloadRequest;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -364,5 +365,106 @@ class RemoteLogDownloaderTest {
                                                         .getPath())
                                         .length())
                 .sum();
+    }
+
+    @Test
+    void testDownloadRemoteLogWithDeletedPartition() throws Exception {
+        // Create a metadata updater without partition information to simulate deleted partition
+        MetadataUpdater emptyMetadataUpdater = new TestingMetadataUpdater(Collections.emptyMap());
+
+        RemoteFileDownloader remoteFileDownloader = new RemoteFileDownloader(1);
+        RemoteLogDownloader remoteLogDownloader =
+                new RemoteLogDownloader(
+                        DATA1_TABLE_PATH,
+                        conf,
+                        remoteFileDownloader,
+                        scannerMetricGroup,
+                        emptyMetadataUpdater,
+                        10L);
+
+        try {
+            remoteLogDownloader.start();
+
+            // Create a table bucket with partition (partition should not exist in metadata updater)
+            TableBucket tableBucketWithPartition = new TableBucket(DATA1_TABLE_ID, 1L, 0);
+
+            // Create remote log segment with partition
+            PhysicalTablePath physicalTablePath =
+                    PhysicalTablePath.of(DATA1_TABLE_PATH, "partition_1");
+            RemoteLogSegment remoteLogSegment =
+                    RemoteLogSegment.Builder.builder()
+                            .tableBucket(tableBucketWithPartition)
+                            .physicalTablePath(physicalTablePath)
+                            .remoteLogSegmentId(UUID.randomUUID())
+                            .remoteLogStartOffset(0L)
+                            .remoteLogEndOffset(9L)
+                            .maxTimestamp(System.currentTimeMillis())
+                            .segmentSizeInBytes(1024)
+                            .build();
+
+            // Don't create the remote log segment file to simulate download failure
+            // This will cause the download to fail and trigger partition checking logic
+
+            FsPath remoteLogTabletDir =
+                    remoteLogTabletDir(
+                            remoteLogDir,
+                            remoteLogSegment.physicalTablePath(),
+                            tableBucketWithPartition);
+
+            // Request download of remote log segment for deleted partition
+            RemoteLogDownloadFuture future =
+                    remoteLogDownloader.requestRemoteLog(remoteLogTabletDir, remoteLogSegment);
+
+            // Wait for the future to complete and verify it throws PartitionNotExistException
+            // Since download will fail and partition doesn't exist, it should complete
+            // exceptionally
+            Exception caughtException = null;
+
+            // Wait up to 10 seconds for the download to fail and trigger partition check
+            long startTime = System.currentTimeMillis();
+            while (System.currentTimeMillis() - startTime < 10000) {
+                if (future.isDone()) {
+                    try {
+                        future.getFileLogRecords(0);
+                        // If we get here, download succeeded unexpectedly
+                        break;
+                    } catch (Exception e) {
+                        caughtException = e;
+                        break;
+                    }
+                }
+                Thread.sleep(100);
+            }
+
+            // Print the caught exception for debugging
+            if (caughtException != null) {
+                System.out.println(
+                        "DEBUG: Caught exception: " + caughtException.getClass().getName());
+                System.out.println("DEBUG: Message: " + caughtException.getMessage());
+                Throwable cause = caughtException;
+                while (cause.getCause() != null) {
+                    cause = cause.getCause();
+                    System.out.println(
+                            "DEBUG: Cause: "
+                                    + cause.getClass().getName()
+                                    + " - "
+                                    + cause.getMessage());
+                }
+            }
+
+            assertThat(caughtException).as("Expected an exception to be thrown").isNotNull();
+
+            // Check if the root cause is PartitionNotExistException
+            Throwable rootCause = caughtException;
+            while (rootCause.getCause() != null) {
+                rootCause = rootCause.getCause();
+            }
+
+            assertThat(rootCause).isInstanceOf(PartitionNotExistException.class);
+            assertThat(rootCause.getMessage()).contains("does not exist");
+        } finally {
+            IOUtils.closeQuietly(remoteLogDownloader);
+            IOUtils.closeQuietly(remoteFileDownloader);
+        }
     }
 }
