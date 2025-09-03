@@ -436,22 +436,6 @@ class RemoteLogDownloaderTest {
                 Thread.sleep(100);
             }
 
-            // Print the caught exception for debugging
-            if (caughtException != null) {
-                System.out.println(
-                        "DEBUG: Caught exception: " + caughtException.getClass().getName());
-                System.out.println("DEBUG: Message: " + caughtException.getMessage());
-                Throwable cause = caughtException;
-                while (cause.getCause() != null) {
-                    cause = cause.getCause();
-                    System.out.println(
-                            "DEBUG: Cause: "
-                                    + cause.getClass().getName()
-                                    + " - "
-                                    + cause.getMessage());
-                }
-            }
-
             assertThat(caughtException).as("Expected an exception to be thrown").isNotNull();
 
             // Check if the root cause is PartitionNotExistException
