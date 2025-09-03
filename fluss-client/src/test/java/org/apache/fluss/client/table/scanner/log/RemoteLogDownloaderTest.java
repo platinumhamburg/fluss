@@ -436,7 +436,9 @@ class RemoteLogDownloaderTest {
                 Thread.sleep(100);
             }
 
-            assertThat(caughtException).as("Expected an exception to be thrown").isNotNull();
+            assertThat(caughtException)
+                    .as("Expected an PartitionNotExistException to be thrown")
+                    .isNotNull();
 
             // Check if the root cause is PartitionNotExistException
             Throwable rootCause = caughtException;
