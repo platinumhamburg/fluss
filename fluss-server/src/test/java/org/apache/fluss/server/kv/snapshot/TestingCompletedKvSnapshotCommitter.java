@@ -88,7 +88,7 @@ public class TestingCompletedKvSnapshotCommitter implements CompletedKvSnapshotC
 
     /**
      * Remove a snapshot with the given snapshot ID from the store. This simulates the cleanup of
-     * broken snapshot metadata from ZooKeeper.
+     * broken snapshot (metadata from ZooKeeper exists, but data was corrupted).
      */
     public void removeSnapshot(TableBucket tableBucket, long snapshotId) {
         Deque<CompletedSnapshot> bucketSnapshots = snapshots.get(tableBucket);
