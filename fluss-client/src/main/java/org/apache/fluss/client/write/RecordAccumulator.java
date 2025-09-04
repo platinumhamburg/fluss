@@ -32,6 +32,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.record.LogRecordBatchStatisticsCollector;
 import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
@@ -83,8 +84,15 @@ public final class RecordAccumulator {
 
     /**
      * An artificial delay time to add before declaring a records instance that isn't full ready for
+     * sending. This allows time for more records to arrive. Setting a non-zero lingerMs will trade
      * off some latency for potentially better throughput due to more batching (and hence fewer,
-     * larger requests). ArrowLogWriteBatch}.
+     * larger requests).
+     */
+    private final int batchTimeoutMs;
+
+    /**
+     * The memory segment pool to allocate/deallocate {@link MemorySegment}s for {@link
+     * ArrowLogWriteBatch}.
      */
     private final LazyMemorySegmentPool writerBufferPool;
 
@@ -598,6 +606,12 @@ public final class RecordAccumulator {
                             outputView.getPreAllocatedSize(),
                             tableInfo.getRowType(),
                             tableInfo.getTableConfig().getArrowCompressionInfo());
+            LogRecordBatchStatisticsCollector statisticsCollector = null;
+            if (tableInfo.isStatisticsEnabled()) {
+                statisticsCollector =
+                        new LogRecordBatchStatisticsCollector(
+                                tableInfo.getRowType(), tableInfo.getStatsIndexMapping());
+            }
             batch =
                     new ArrowLogWriteBatch(
                             bucketId,
@@ -605,7 +619,8 @@ public final class RecordAccumulator {
                             schemaId,
                             arrowWriter,
                             outputView,
-                            clock.milliseconds());
+                            clock.milliseconds(),
+                            statisticsCollector);
         } else {
             batch =
                     new IndexedLogWriteBatch(
