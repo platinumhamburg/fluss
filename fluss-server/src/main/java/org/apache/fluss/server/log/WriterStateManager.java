@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.UnknownWriterIdException;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.fluss.utils.json.JsonDeserializer;

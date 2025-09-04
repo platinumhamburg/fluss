@@ -32,7 +32,7 @@ import org.apache.fluss.utils.types.Tuple2;
 import java.util.Arrays;
 import java.util.List;
 
-import static com.alibaba.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
+import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 
 /** utils to create test data. */
 public final class TestData {
