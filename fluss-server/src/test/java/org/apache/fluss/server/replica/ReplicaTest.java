@@ -31,7 +31,6 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
-import org.apache.fluss.server.kv.snapshot.KvFileHandleAndLocalPath;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
@@ -494,9 +493,10 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(kvSnapshotStore.getLatestCompletedSnapshot(tableBucket).getSnapshotID())
                 .isEqualTo(2);
 
-        // now simulate the latest snapshot (snapshot2) being broken by deleting its metadata file
+        // now simulate the latest snapshot (snapshot2) being broken by
+        // deleting its metadata files and unshared SST files
         // This simulates file corruption while ZK metadata remains intact
-        simulateBrokenSnapshot(snapshot2);
+        snapshot2.getKvSnapshotHandle().discard();
 
         // ZK metadata should still show snapshot2 as latest (file corruption hasn't been detected
         // yet)
@@ -702,39 +702,6 @@ final class ReplicaTest extends ReplicaTestBase {
             expectValues.add(expectedKeyValue.f1);
         }
         assertThat(kvTablet.multiGet(keys)).containsExactlyElementsOf(expectValues);
-    }
-
-    /**
-     * Simulate a broken snapshot by deleting its local metadata file while keeping ZK metadata.
-     * This simulates the scenario where snapshot files are corrupted or accidentally deleted but
-     * ZooKeeper still has the snapshot metadata.
-     */
-    private void simulateBrokenSnapshot(CompletedSnapshot snapshot) throws Exception {
-        // Delete the snapshot metadata file (_METADATA) to simulate file corruption
-        File metadataFile = new File(snapshot.getMetadataFilePath().getPath());
-        if (metadataFile.exists()) {
-            boolean deleted = metadataFile.delete();
-            if (!deleted) {
-                throw new IOException("Failed to delete snapshot metadata file: " + metadataFile);
-            }
-        }
-
-        // Also delete all SST files to ensure the snapshot is completely broken
-        for (KvFileHandleAndLocalPath fileHandle :
-                snapshot.getKvSnapshotHandle().getSharedKvFileHandles()) {
-            File sstFile = new File(fileHandle.getLocalPath());
-            if (sstFile.exists()) {
-                boolean deleted = sstFile.delete();
-                if (!deleted) {
-                    throw new IOException("Failed to delete SST file: " + sstFile);
-                }
-            }
-        }
-
-        // Verify files are actually deleted
-        if (metadataFile.exists()) {
-            throw new IOException("Metadata file still exists after deletion: " + metadataFile);
-        }
     }
 
     /** A scheduledExecutorService that will execute the scheduled task immediately. */
