@@ -18,6 +18,7 @@
 package org.apache.fluss.row;
 
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
@@ -25,6 +26,7 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Random;
 import java.util.Set;
@@ -473,5 +475,254 @@ class BinaryRowDataTest {
         assertThat(copiedRow.getBytes(0)).isEqualTo(smallBytes);
         assertThat(copiedRow.getBytes(1)).isEqualTo(largeBytes);
         assertThat(copiedRow.getBytes(2)).isEqualTo(emptyBytes);
+    }
+
+    @Test
+    public void testMemoryGrowth() {
+        // Test automatic memory growth when initial size is small
+        BinaryRowData row = new BinaryRowData(3);
+        BinaryRowWriter writer = new BinaryRowWriter(row, 10); // small initial size
+
+        // Write data that exceeds initial capacity
+        String largeString =
+                "This is a very long string that should cause memory growth in the binary row writer implementation when written to the row";
+        byte[] largeBytes = new byte[200];
+        for (int i = 0; i < largeBytes.length; i++) {
+            largeBytes[i] = (byte) (i % 127);
+        }
+
+        writer.writeString(0, BinaryString.fromString(largeString));
+        writer.writeBinary(1, largeBytes);
+        writer.writeInt(2, 42);
+        writer.complete();
+
+        // Verify data integrity after growth
+        assertThat(row.getString(0).toString()).isEqualTo(largeString);
+        assertThat(row.getBytes(1)).isEqualTo(largeBytes);
+        assertThat(row.getInt(2)).isEqualTo(42);
+
+        // Verify the segment has grown
+        assertThat(row.getSizeInBytes()).isGreaterThan(10);
+    }
+
+    @Test
+    public void testGetSegments() {
+        BinaryRowData row = new BinaryRowData(2);
+        BinaryRowWriter writer = new BinaryRowWriter(row, 50);
+
+        writer.writeString(0, BinaryString.fromString("test"));
+        writer.writeInt(1, 123);
+        writer.complete();
+
+        // Test getSegments method
+        MemorySegment segment = writer.getSegments();
+        assertThat(segment).isNotNull();
+        assertThat(segment).isSameAs(row.getSegments()[0]);
+
+        // Verify we can read data from the segment
+        assertThat(row.getString(0).toString()).isEqualTo("test");
+        assertThat(row.getInt(1)).isEqualTo(123);
+    }
+
+    @Test
+    public void testStaticWriteMethod() {
+        BinaryRowData row = new BinaryRowData(10);
+        BinaryRowWriter writer = new BinaryRowWriter(row);
+
+        // Test static write method for different data types
+        BinaryRowWriter.write(writer, 0, true, DataTypes.BOOLEAN());
+        BinaryRowWriter.write(writer, 1, (byte) 100, DataTypes.TINYINT());
+        BinaryRowWriter.write(writer, 2, (short) 1000, DataTypes.SMALLINT());
+        BinaryRowWriter.write(writer, 3, 100000, DataTypes.INT());
+        BinaryRowWriter.write(writer, 4, 100000000L, DataTypes.BIGINT());
+        BinaryRowWriter.write(writer, 5, 3.14f, DataTypes.FLOAT());
+        BinaryRowWriter.write(writer, 6, 3.14159, DataTypes.DOUBLE());
+        BinaryRowWriter.write(writer, 7, BinaryString.fromString("hello"), DataTypes.STRING());
+        BinaryRowWriter.write(writer, 8, new byte[] {1, 2, 3}, DataTypes.BINARY(3));
+
+        // Test decimal
+        Decimal decimal = Decimal.fromUnscaledLong(314, 3, 2);
+        BinaryRowWriter.write(writer, 9, decimal, DataTypes.DECIMAL(3, 2));
+
+        writer.complete();
+
+        // Verify all written data
+        assertThat(row.getBoolean(0)).isTrue();
+        assertThat(row.getByte(1)).isEqualTo((byte) 100);
+        assertThat(row.getShort(2)).isEqualTo((short) 1000);
+        assertThat(row.getInt(3)).isEqualTo(100000);
+        assertThat(row.getLong(4)).isEqualTo(100000000L);
+        assertThat(row.getFloat(5)).isEqualTo(3.14f);
+        assertThat(row.getDouble(6)).isEqualTo(3.14159);
+        assertThat(row.getString(7).toString()).isEqualTo("hello");
+        assertThat(row.getBytes(8)).isEqualTo(new byte[] {1, 2, 3});
+        assertThat(row.getDecimal(9, 3, 2).toString()).isEqualTo("3.14");
+    }
+
+    @Test
+    public void testEdgeCases() {
+        // Test with zero fields
+        BinaryRowData emptyRow = new BinaryRowData(0);
+        BinaryRowWriter emptyWriter = new BinaryRowWriter(emptyRow);
+        emptyWriter.complete();
+        assertThat(emptyRow.getFieldCount()).isEqualTo(0);
+
+        // Test with single field
+        BinaryRowData singleRow = new BinaryRowData(1);
+        BinaryRowWriter singleWriter = new BinaryRowWriter(singleRow);
+        singleWriter.writeInt(0, 42);
+        singleWriter.complete();
+        assertThat(singleRow.getInt(0)).isEqualTo(42);
+
+        // Test with maximum fixed-length data (7 bytes)
+        BinaryRowData maxFixedRow = new BinaryRowData(1);
+        BinaryRowWriter maxFixedWriter = new BinaryRowWriter(maxFixedRow);
+        byte[] maxFixedBytes = new byte[7];
+        Arrays.fill(maxFixedBytes, (byte) 0xFF);
+        maxFixedWriter.writeBinary(0, maxFixedBytes);
+        maxFixedWriter.complete();
+        assertThat(maxFixedRow.getBytes(0)).isEqualTo(maxFixedBytes);
+
+        // Test with 8 bytes (should go to variable length part)
+        BinaryRowData varLenRow = new BinaryRowData(1);
+        BinaryRowWriter varLenWriter = new BinaryRowWriter(varLenRow);
+        byte[] varLenBytes = new byte[8];
+        Arrays.fill(varLenBytes, (byte) 0xAA);
+        varLenWriter.writeBinary(0, varLenBytes);
+        varLenWriter.complete();
+        assertThat(varLenRow.getBytes(0)).isEqualTo(varLenBytes);
+    }
+
+    @Test
+    public void testLargeFieldCount() {
+        // Test with many fields (80 fields as used in anyNullTest)
+        int fieldCount = 80;
+        BinaryRowData row = new BinaryRowData(fieldCount);
+        BinaryRowWriter writer = new BinaryRowWriter(row);
+
+        // Write different types to different fields
+        for (int i = 0; i < fieldCount; i++) {
+            switch (i % 5) {
+                case 0:
+                    writer.writeInt(i, i);
+                    break;
+                case 1:
+                    writer.writeString(i, BinaryString.fromString("field_" + i));
+                    break;
+                case 2:
+                    writer.writeDouble(i, i * 1.5);
+                    break;
+                case 3:
+                    writer.writeBoolean(i, i % 2 == 0);
+                    break;
+                case 4:
+                    writer.writeLong(i, (long) i * 1000);
+                    break;
+            }
+        }
+        writer.complete();
+
+        // Verify data integrity
+        for (int i = 0; i < fieldCount; i++) {
+            switch (i % 5) {
+                case 0:
+                    assertThat(row.getInt(i)).isEqualTo(i);
+                    break;
+                case 1:
+                    assertThat(row.getString(i).toString()).isEqualTo("field_" + i);
+                    break;
+                case 2:
+                    assertThat(row.getDouble(i)).isEqualTo(i * 1.5);
+                    break;
+                case 3:
+                    assertThat(row.getBoolean(i)).isEqualTo(i % 2 == 0);
+                    break;
+                case 4:
+                    assertThat(row.getLong(i)).isEqualTo((long) i * 1000);
+                    break;
+            }
+        }
+    }
+
+    @Test
+    public void testResetAndReusability() {
+        BinaryRowData row = new BinaryRowData(3);
+        BinaryRowWriter writer = new BinaryRowWriter(row);
+
+        // First write
+        writer.writeInt(0, 100);
+        writer.writeString(1, BinaryString.fromString("first"));
+        writer.setNullAt(2);
+        writer.complete();
+
+        assertThat(row.getInt(0)).isEqualTo(100);
+        assertThat(row.getString(1).toString()).isEqualTo("first");
+        assertThat(row.isNullAt(2)).isTrue();
+
+        // Reset and write again
+        writer.reset();
+        writer.writeInt(0, 200);
+        writer.writeString(1, BinaryString.fromString("second"));
+        writer.writeDouble(2, 3.14);
+        writer.complete();
+
+        assertThat(row.getInt(0)).isEqualTo(200);
+        assertThat(row.getString(1).toString()).isEqualTo("second");
+        assertThat(row.getDouble(2)).isEqualTo(3.14);
+        assertThat(row.isNullAt(2)).isFalse();
+
+        // Reset multiple times
+        for (int i = 0; i < 5; i++) {
+            writer.reset();
+            writer.writeInt(0, i);
+            writer.writeString(1, BinaryString.fromString("iteration_" + i));
+            writer.writeBoolean(2, i % 2 == 0);
+            writer.complete();
+
+            assertThat(row.getInt(0)).isEqualTo(i);
+            assertThat(row.getString(1).toString()).isEqualTo("iteration_" + i);
+            assertThat(row.getBoolean(2)).isEqualTo(i % 2 == 0);
+        }
+    }
+
+    @Test
+    public void testComplexDataMix() {
+        // Test mixing all supported data types in one row
+        BinaryRowData row = new BinaryRowData(12);
+        BinaryRowWriter writer = new BinaryRowWriter(row);
+
+        // Write various types including null values
+        writer.writeBoolean(0, true);
+        writer.writeByte(1, (byte) -128);
+        writer.writeShort(2, Short.MAX_VALUE);
+        writer.writeInt(3, Integer.MIN_VALUE);
+        writer.writeLong(4, Long.MAX_VALUE);
+        writer.writeFloat(5, Float.MIN_VALUE);
+        writer.writeDouble(6, Double.MAX_VALUE);
+        writer.writeString(7, BinaryString.fromString("复杂测试字符串with special chars !@#$%"));
+        writer.writeBinary(8, new byte[] {-1, 0, 1, 127, -128});
+
+        // Test compact decimal
+        writer.writeDecimal(9, Decimal.fromUnscaledLong(12345, 5, 2), 5);
+
+        // Test non-compact timestamp
+        writer.writeTimestampNtz(10, TimestampNtz.fromMillis(1609459200000L, 123456), 9);
+
+        writer.setNullAt(11);
+        writer.complete();
+
+        // Verify all data
+        assertThat(row.getBoolean(0)).isTrue();
+        assertThat(row.getByte(1)).isEqualTo((byte) -128);
+        assertThat(row.getShort(2)).isEqualTo(Short.MAX_VALUE);
+        assertThat(row.getInt(3)).isEqualTo(Integer.MIN_VALUE);
+        assertThat(row.getLong(4)).isEqualTo(Long.MAX_VALUE);
+        assertThat(row.getFloat(5)).isEqualTo(Float.MIN_VALUE);
+        assertThat(row.getDouble(6)).isEqualTo(Double.MAX_VALUE);
+        assertThat(row.getString(7).toString()).isEqualTo("复杂测试字符串with special chars !@#$%");
+        assertThat(row.getBytes(8)).isEqualTo(new byte[] {-1, 0, 1, 127, -128});
+        assertThat(row.getDecimal(9, 5, 2).toString()).isEqualTo("123.45");
+        assertThat(row.getTimestampNtz(10, 9).toString()).contains("2021-01-01T00:00:00.000123456");
+        assertThat(row.isNullAt(11)).isTrue();
     }
 }
