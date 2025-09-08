@@ -126,55 +126,9 @@ class TableManagerITCase {
                     .setClusterConf(initConf())
                     .build();
 
-    // Extension for testing log table creation restriction
-    @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_LOG_RESTRICTED_EXTENSION =
-            FlussClusterExtension.builder()
-                    .setNumOfTabletServers(3)
-                    .setCoordinatorServerListeners(
-                            String.format(
-                                    "%s://localhost:0, %s://localhost:0",
-                                    DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
-                    .setTabletServerListeners(
-                            String.format(
-                                    "%s://localhost:0, %s://localhost:0",
-                                    DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
-                    .setClusterConf(initLogRestrictedConf())
-                    .build();
-
-    // Extension for testing kv table creation restriction
-    @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_KV_RESTRICTED_EXTENSION =
-            FlussClusterExtension.builder()
-                    .setNumOfTabletServers(3)
-                    .setCoordinatorServerListeners(
-                            String.format(
-                                    "%s://localhost:0, %s://localhost:0",
-                                    DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
-                    .setTabletServerListeners(
-                            String.format(
-                                    "%s://localhost:0, %s://localhost:0",
-                                    DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
-                    .setClusterConf(initKvRestrictedConf())
-                    .build();
-
     private static Configuration initConf() {
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.AUTO_PARTITION_CHECK_INTERVAL, Duration.ofSeconds(1));
-        return conf;
-    }
-
-    private static Configuration initLogRestrictedConf() {
-        Configuration conf = new Configuration();
-        conf.set(ConfigOptions.AUTO_PARTITION_CHECK_INTERVAL, Duration.ofSeconds(1));
-        conf.set(ConfigOptions.LOG_TABLE_ALLOW_CREATION, false);
-        return conf;
-    }
-
-    private static Configuration initKvRestrictedConf() {
-        Configuration conf = new Configuration();
-        conf.set(ConfigOptions.AUTO_PARTITION_CHECK_INTERVAL, Duration.ofSeconds(1));
-        conf.set(ConfigOptions.KV_TABLE_ALLOW_CREATION, false);
         return conf;
     }
 
@@ -850,96 +804,131 @@ class TableManagerITCase {
     @Test
     void testLogTableCreationRestriction() throws Exception {
         // Test with cluster that disallows log table creation
-        ZooKeeperClient logRestrictedZkClient =
-                FLUSS_CLUSTER_LOG_RESTRICTED_EXTENSION.getZooKeeperClient();
-        Configuration logRestrictedClientConf =
-                FLUSS_CLUSTER_LOG_RESTRICTED_EXTENSION.getClientConfig();
-        AdminGateway logRestrictedAdminGateway =
-                FLUSS_CLUSTER_LOG_RESTRICTED_EXTENSION.newCoordinatorClient();
+        FlussClusterExtension kvCluster =
+                FlussClusterExtension.builder()
+                        .setNumOfTabletServers(3)
+                        .setCoordinatorServerListeners(
+                                String.format(
+                                        "%s://localhost:0, %s://localhost:0",
+                                        DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
+                        .setTabletServerListeners(
+                                String.format(
+                                        "%s://localhost:0, %s://localhost:0",
+                                        DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
+                        .setClusterConf(initLogRestrictedConf())
+                        .build();
 
-        String db1 = "db1";
-        String tb1 = "log_table";
-        TablePath tablePath = TablePath.of(db1, tb1);
+        try {
+            kvCluster.start();
 
-        // Create database first
-        logRestrictedAdminGateway.createDatabase(newCreateDatabaseRequest(db1, false)).get();
+            AdminGateway kvClusterGateway = kvCluster.newCoordinatorClient();
 
-        // Try to create a log table (table without primary key), should fail
-        TableDescriptor logTableDescriptor = newLogTable();
-        assertThatThrownBy(
-                        () ->
-                                logRestrictedAdminGateway
-                                        .createTable(
-                                                newCreateTableRequest(
-                                                        tablePath, logTableDescriptor, false))
-                                        .get())
-                .cause()
-                .isInstanceOf(InvalidTableException.class)
-                .hasMessageContaining("Creation of Log Tables is disallowed in the cluster.");
+            String tb1 = "log_table";
+            TablePath tablePath = TablePath.of("fluss", tb1);
 
-        // Try to create a kv table (table with primary key), should succeed
-        String tb2 = "kv_table";
-        TablePath kvTablePath = TablePath.of(db1, tb2);
-        TableDescriptor kvTableDescriptor = newPkTable();
-        logRestrictedAdminGateway
-                .createTable(newCreateTableRequest(kvTablePath, kvTableDescriptor, false))
-                .get();
+            // Try to create a log table (table without primary key), should fail
+            TableDescriptor logTableDescriptor = newLogTable();
+            assertThatThrownBy(
+                            () ->
+                                    kvClusterGateway
+                                            .createTable(
+                                                    newCreateTableRequest(
+                                                            tablePath, logTableDescriptor, false))
+                                            .get())
+                    .cause()
+                    .isInstanceOf(InvalidTableException.class)
+                    .hasMessageContaining("Creation of Log Tables is disallowed in the cluster.");
 
-        // Verify the kv table was created successfully
-        assertThat(
-                        logRestrictedAdminGateway
-                                .tableExists(newTableExistsRequest(kvTablePath))
-                                .get()
-                                .isExists())
-                .isTrue();
+            // Try to create a kv table (table with primary key), should succeed
+            String tb2 = "kv_table";
+            TablePath kvTablePath = TablePath.of("fluss", tb2);
+            TableDescriptor kvTableDescriptor = newPkTable();
+            kvClusterGateway
+                    .createTable(newCreateTableRequest(kvTablePath, kvTableDescriptor, false))
+                    .get();
+
+            // Verify the kv table was created successfully
+            assertThat(
+                            kvClusterGateway
+                                    .tableExists(newTableExistsRequest(kvTablePath))
+                                    .get()
+                                    .isExists())
+                    .isTrue();
+        } finally {
+            kvCluster.close();
+        }
     }
 
     @Test
     void testKvTableCreationRestriction() throws Exception {
         // Test with cluster that disallows kv table creation
-        ZooKeeperClient kvRestrictedZkClient =
-                FLUSS_CLUSTER_KV_RESTRICTED_EXTENSION.getZooKeeperClient();
-        Configuration kvRestrictedClientConf =
-                FLUSS_CLUSTER_KV_RESTRICTED_EXTENSION.getClientConfig();
-        AdminGateway kvRestrictedAdminGateway =
-                FLUSS_CLUSTER_KV_RESTRICTED_EXTENSION.newCoordinatorClient();
+        FlussClusterExtension logCluster =
+                FlussClusterExtension.builder()
+                        .setNumOfTabletServers(3)
+                        .setCoordinatorServerListeners(
+                                String.format(
+                                        "%s://localhost:0, %s://localhost:0",
+                                        DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
+                        .setTabletServerListeners(
+                                String.format(
+                                        "%s://localhost:0, %s://localhost:0",
+                                        DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
+                        .setClusterConf(initKvRestrictedConf())
+                        .build();
 
-        String db1 = "db1";
-        String tb1 = "kv_table";
-        TablePath tablePath = TablePath.of(db1, tb1);
+        try {
+            logCluster.start();
+            AdminGateway logClusterGateway = logCluster.newCoordinatorClient();
 
-        // Create database first
-        kvRestrictedAdminGateway.createDatabase(newCreateDatabaseRequest(db1, false)).get();
+            String tb1 = "kv_table";
+            TablePath tablePath = TablePath.of("fluss", tb1);
 
-        // Try to create a kv table (table with primary key), should fail
-        TableDescriptor kvTableDescriptor = newPkTable();
-        assertThatThrownBy(
-                        () ->
-                                kvRestrictedAdminGateway
-                                        .createTable(
-                                                newCreateTableRequest(
-                                                        tablePath, kvTableDescriptor, false))
-                                        .get())
-                .cause()
-                .isInstanceOf(InvalidTableException.class)
-                .hasMessageContaining(
-                        "Creation of Primary Key Tables is disallowed in the cluster.");
+            // Try to create a kv table (table with primary key), should fail
+            TableDescriptor kvTableDescriptor = newPkTable();
+            assertThatThrownBy(
+                            () ->
+                                    logClusterGateway
+                                            .createTable(
+                                                    newCreateTableRequest(
+                                                            tablePath, kvTableDescriptor, false))
+                                            .get())
+                    .cause()
+                    .isInstanceOf(InvalidTableException.class)
+                    .hasMessageContaining(
+                            "Creation of Primary Key Tables is disallowed in the cluster.");
 
-        // Try to create a log table (table without primary key), should succeed
-        String tb2 = "log_table";
-        TablePath logTablePath = TablePath.of(db1, tb2);
-        TableDescriptor logTableDescriptor = newLogTable();
-        kvRestrictedAdminGateway
-                .createTable(newCreateTableRequest(logTablePath, logTableDescriptor, false))
-                .get();
+            // Try to create a log table (table without primary key), should succeed
+            String tb2 = "log_table";
+            TablePath logTablePath = TablePath.of("fluss", tb2);
+            TableDescriptor logTableDescriptor = newLogTable();
+            logClusterGateway
+                    .createTable(newCreateTableRequest(logTablePath, logTableDescriptor, false))
+                    .get();
 
-        // Verify the log table was created successfully
-        assertThat(
-                        kvRestrictedAdminGateway
-                                .tableExists(newTableExistsRequest(logTablePath))
-                                .get()
-                                .isExists())
-                .isTrue();
+            // Verify the log table was created successfully
+            assertThat(
+                            logClusterGateway
+                                    .tableExists(newTableExistsRequest(logTablePath))
+                                    .get()
+                                    .isExists())
+                    .isTrue();
+        } finally {
+            logCluster.close();
+        }
+    }
+
+    private static Configuration initLogRestrictedConf() {
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.AUTO_PARTITION_CHECK_INTERVAL, Duration.ofSeconds(1));
+        conf.set(ConfigOptions.LOG_TABLE_ALLOW_CREATION, false);
+        return conf;
+    }
+
+    private static Configuration initKvRestrictedConf() {
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.AUTO_PARTITION_CHECK_INTERVAL, Duration.ofSeconds(1));
+        conf.set(ConfigOptions.KV_TABLE_ALLOW_CREATION, false);
+        return conf;
     }
 
     // Helper methods for creating different table types
