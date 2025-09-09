@@ -26,6 +26,7 @@ import org.apache.fluss.exception.IllegalConfigurationException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 
@@ -203,7 +204,7 @@ public final class ClientUtils {
                                 String partitionName =
                                         cluster.getPartitionNameOrElseThrow(partitionId);
                                 // Get table info to extract partition keys
-                                var tableInfo = cluster.getTableOrElseThrow(tablePath);
+                                TableInfo tableInfo = cluster.getTableOrElseThrow(tablePath);
                                 List<String> partitionKeys = tableInfo.getPartitionKeys();
                                 ResolvedPartitionSpec partitionSpec =
                                         ResolvedPartitionSpec.fromPartitionName(

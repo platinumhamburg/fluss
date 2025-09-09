@@ -81,7 +81,7 @@ class MultiPartitionPrefixLookupITCase extends ClientToServerITCaseBase {
         upsertWriter.flush();
 
         // Test prefix lookup without partition column
-        // This should search across all partitions
+        // This should search across all partitions.
         Lookuper prefixLookuper = table.newLookup().lookupBy("a", "b").createLookuper();
 
         CompletableFuture<LookupResult> result = prefixLookuper.lookup(row(1, "a"));
