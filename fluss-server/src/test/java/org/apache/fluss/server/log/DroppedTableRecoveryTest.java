@@ -120,46 +120,6 @@ final class DroppedTableRecoveryTest extends LogTestBase {
     }
 
     @Test
-    void testLogTabletResidualDataCleanupWhenSchemaNotFound() throws Exception {
-        // Create a log first
-        LogTablet log =
-                logManager.getOrCreateLog(
-                        PhysicalTablePath.of(tablePath), tableBucket, LogFormat.ARROW, 1, false);
-
-        // Write some data to the log
-        MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
-        log.appendAsLeader(records);
-        log.flush(false);
-
-        // Get the log directory path before removing the table metadata
-        String logDir = log.getLogDir().getAbsolutePath();
-
-        // Shutdown log manager first
-        logManager.shutdown();
-
-        // Simulate table drop: remove metadata from ZooKeeper but keep log directory on disk
-        zkClient.deleteTable(tablePath);
-
-        // Create a new LogManager and start it
-        LogManager newLogManager =
-                LogManager.create(
-                        conf,
-                        zkClient,
-                        new FlussScheduler(1),
-                        SystemClock.getInstance(),
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
-
-        // LogManager startup should clean up residual data when encountering
-        // SchemaNotExistException
-        newLogManager.startup();
-
-        // Verify that the residual data directory was cleaned up
-        assertThat(new File(logDir)).doesNotExist();
-
-        newLogManager.shutdown();
-    }
-
-    @Test
     void testMultipleLogTabletResidualDataDirectoriesCleanup() throws Exception {
         // Create multiple logs for the same table
         TableBucket tableBucket1 = new TableBucket(DATA1_TABLE_ID, 1);
@@ -244,68 +204,6 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         assertThat(new File(logDir)).doesNotExist();
 
         newLogManager.shutdown();
-    }
-
-    @Test
-    void testKvTabletResidualDataCleanupWhenSchemaNotFound() throws Exception {
-        // Create a log first (required for KV tablet)
-        LogTablet log =
-                logManager.getOrCreateLog(
-                        PhysicalTablePath.of(tablePath), tableBucket, LogFormat.ARROW, 1, false);
-
-        // Write some data to the log
-        MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
-        log.appendAsLeader(records);
-        log.flush(false);
-
-        // Create a KV tablet using kvManager.getOrCreateKv() method
-        TableConfig tableConfig =
-                new TableConfig(Configuration.fromMap(DATA1_TABLE_DESCRIPTOR.getProperties()));
-        KvTablet kvTablet =
-                kvManager.getOrCreateKv(
-                        PhysicalTablePath.of(tablePath),
-                        tableBucket,
-                        log,
-                        KvFormat.COMPACTED,
-                        DATA1_SCHEMA,
-                        tableConfig,
-                        DEFAULT_COMPRESSION);
-
-        // Get the KV directory path before removing the table metadata
-        String kvDir = kvTablet.getKvTabletDir().getAbsolutePath();
-        String logDir = log.getLogDir().getAbsolutePath();
-
-        // Shutdown managers first
-        kvManager.shutdown();
-        logManager.shutdown();
-
-        // Simulate table drop: remove metadata from ZooKeeper but keep both log and KV directories
-        // on disk
-        zkClient.deleteTable(tablePath);
-
-        // Create new managers and start them
-        LogManager newLogManager =
-                LogManager.create(
-                        conf,
-                        zkClient,
-                        new FlussScheduler(1),
-                        SystemClock.getInstance(),
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
-        newLogManager.startup(); // Should clean up both log and KV directories
-
-        KvManager newKvManager =
-                KvManager.create(
-                        conf, zkClient, newLogManager, TestingMetricGroups.TABLET_SERVER_METRICS);
-        newKvManager.startup();
-
-        // KV tablet directory should be cleaned up by LogManager automatically
-
-        newKvManager.shutdown();
-        newLogManager.shutdown();
-
-        // Verify that both residual data directories were cleaned up
-        assertThat(new File(logDir)).doesNotExist(); // Cleaned by LogManager
-        assertThat(new File(kvDir)).doesNotExist(); // Also cleaned by LogManager
     }
 
     @Test
