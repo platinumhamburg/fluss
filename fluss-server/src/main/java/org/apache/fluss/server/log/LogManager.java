@@ -212,7 +212,7 @@ public final class LogManager extends TabletManagerBase {
                                                                     instanceof
                                                                     SchemaNotExistException) {
                                                                 LOG.error(
-                                                                        "schema not exist, table for {} has already been dropped, the residual deta will be removed.",
+                                                                        "schema not exist, table for {} has already been dropped, the residual data will be removed.",
                                                                         tabletDir,
                                                                         e);
                                                                 FileUtils.deleteDirectoryQuietly(
