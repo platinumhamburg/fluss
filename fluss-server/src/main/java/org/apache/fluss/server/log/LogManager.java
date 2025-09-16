@@ -492,6 +492,26 @@ public final class LogManager extends TabletManagerBase {
                                 tabletDir,
                                 e);
                         FileUtils.deleteDirectoryQuietly(tabletDir);
+
+                        // Also delete corresponding KV tablet directory if it exists
+                        try {
+                            Tuple2<PhysicalTablePath, TableBucket> pathAndBucket =
+                                    FlussPaths.parseTabletDir(tabletDir);
+                            File kvTabletDir =
+                                    FlussPaths.kvTabletDir(
+                                            dataDir, pathAndBucket.f0, pathAndBucket.f1);
+                            if (kvTabletDir.exists()) {
+                                LOG.info(
+                                        "Also removing corresponding KV tablet directory: {}",
+                                        kvTabletDir);
+                                FileUtils.deleteDirectoryQuietly(kvTabletDir);
+                            }
+                        } catch (Exception kvDeleteException) {
+                            LOG.warn(
+                                    "Failed to delete corresponding KV tablet directory for log {}: {}",
+                                    tabletDir,
+                                    kvDeleteException.getMessage());
+                        }
                         return;
                     }
                     throw new FlussRuntimeException(e);

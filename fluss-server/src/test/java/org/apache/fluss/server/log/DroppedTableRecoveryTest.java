@@ -137,22 +137,8 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         // Shutdown log manager first
         logManager.shutdown();
 
-        // The key insight: we need to simulate a scenario where:
-        // 1. Log directories exist on disk (residual data from before table drop)
-        // 2. But table metadata (including schema) has been removed from ZooKeeper
-        // 3. LogManager tries to load these logs during startup and encounters
-        // SchemaNotExistException
-
-        // Remove ALL table metadata from ZooKeeper to simulate table has been dropped
-        // But keep the log directory on disk to simulate residual data
+        // Simulate table drop: remove metadata from ZooKeeper but keep log directory on disk
         zkClient.deleteTable(tablePath);
-
-        // At this point:
-        // - Log directory exists on disk: logDir
-        // - No table metadata exists in ZooKeeper
-        // - When LogManager starts, it will try to load from logDir
-        // - loadLog() will call getTableInfo() -> getSchemaById() -> SchemaNotExistException
-        // - The new logic should catch this and delete the directory
 
         // Create a new LogManager and start it
         LogManager newLogManager =
@@ -163,9 +149,8 @@ final class DroppedTableRecoveryTest extends LogTestBase {
                         SystemClock.getInstance(),
                         TestingMetricGroups.TABLET_SERVER_METRICS);
 
-        // This should not throw an exception but should handle the SchemaNotExistException
-        // internally
-        // and clean up the residual data directory
+        // LogManager startup should clean up residual data when encountering
+        // SchemaNotExistException
         newLogManager.startup();
 
         // Verify that the residual data directory was cleaned up
@@ -201,7 +186,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         // Shutdown log manager first
         logManager.shutdown();
 
-        // Remove ALL metadata from ZooKeeper to simulate table drop
+        // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start LogManager again
@@ -242,7 +227,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         // Shutdown log manager first
         logManager.shutdown();
 
-        // Remove ALL metadata from ZooKeeper to simulate table drop
+        // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start LogManager again
@@ -294,22 +279,9 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         kvManager.shutdown();
         logManager.shutdown();
 
-        // The key insight: we need to simulate a scenario where:
-        // 1. Both log and KV directories exist on disk (residual data from before table drop)
-        // 2. But table metadata (including schema) has been removed from ZooKeeper
-        // 3. When we try to load KV tablets, KvManager.loadKv() encounters
-        // SchemaNotExistException
-
-        // Remove ALL table metadata from ZooKeeper to simulate table has been dropped
-        // But keep both log and KV directories on disk to simulate residual data
+        // Simulate table drop: remove metadata from ZooKeeper but keep both log and KV directories
+        // on disk
         zkClient.deleteTable(tablePath);
-
-        // At this point:
-        // - Log directory exists on disk: logDir
-        // - KV directory exists on disk: kvDir
-        // - No table metadata exists in ZooKeeper
-        // - When we try to load KV tablet via loadKv(), it will call getTableInfo() ->
-        // getSchemaById() -> SchemaNotExistException
 
         // Create new managers and start them
         LogManager newLogManager =
@@ -319,45 +291,21 @@ final class DroppedTableRecoveryTest extends LogTestBase {
                         new FlussScheduler(1),
                         SystemClock.getInstance(),
                         TestingMetricGroups.TABLET_SERVER_METRICS);
-        newLogManager
-                .startup(); // This should clean up the log directory as tested in previous tests
+        newLogManager.startup(); // Should clean up both log and KV directories
 
         KvManager newKvManager =
                 KvManager.create(
                         conf, zkClient, newLogManager, TestingMetricGroups.TABLET_SERVER_METRICS);
         newKvManager.startup();
 
-        // Try to load the KV tablet explicitly - this should handle SchemaNotExistException
-        // and clean up the residual KV data directory
-        try {
-            File kvTabletDir = new File(kvDir);
-            if (kvTabletDir.exists()) {
-                // This should catch SchemaNotExistException and delete the directory
-                try {
-                    newKvManager.loadKv(kvTabletDir);
-                    // If we reach here without exception, the schema was found (unexpected)
-                    assertThat(false)
-                            .as("Expected SchemaNotExistException to be thrown and handled")
-                            .isTrue();
-                } catch (Exception e) {
-                    // We expect the KvManager.loadKv() to throw exception since table schema
-                    // doesn't exist
-                    // But the current implementation may not handle this correctly
-                    // For now, we'll manually clean up to demonstrate the expected behavior
-                    if (kvTabletDir.exists()) {
-                        org.apache.fluss.utils.FileUtils.deleteDirectoryQuietly(kvTabletDir);
-                    }
-                }
-            }
-        } finally {
-            newKvManager.shutdown();
-            newLogManager.shutdown();
-        }
+        // KV tablet directory should be cleaned up by LogManager automatically
+
+        newKvManager.shutdown();
+        newLogManager.shutdown();
 
         // Verify that both residual data directories were cleaned up
-        assertThat(new File(logDir)).doesNotExist(); // This should be cleaned by LogManager
-        assertThat(new File(kvDir))
-                .doesNotExist(); // This should be cleaned by KvManager or our manual cleanup
+        assertThat(new File(logDir)).doesNotExist(); // Cleaned by LogManager
+        assertThat(new File(kvDir)).doesNotExist(); // Also cleaned by LogManager
     }
 
     @Test
@@ -412,7 +360,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         kvManager.shutdown();
         logManager.shutdown();
 
-        // Remove ALL metadata from ZooKeeper to simulate table drop
+        // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start managers again
@@ -430,24 +378,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
                         conf, zkClient, newLogManager, TestingMetricGroups.TABLET_SERVER_METRICS);
         newKvManager.startup();
 
-        // Try to load both KV tablets - should handle SchemaNotExistException
-        File[] kvDirs = {new File(kvDir1), new File(kvDir2)};
-        for (File kvTabletDir : kvDirs) {
-            if (kvTabletDir.exists()) {
-                try {
-                    newKvManager.loadKv(kvTabletDir);
-                    // If we reach here without exception, the schema was found (unexpected)
-                    assertThat(false)
-                            .as("Expected SchemaNotExistException to be thrown and handled")
-                            .isTrue();
-                } catch (Exception e) {
-                    // Clean up manually to demonstrate expected behavior
-                    if (kvTabletDir.exists()) {
-                        org.apache.fluss.utils.FileUtils.deleteDirectoryQuietly(kvTabletDir);
-                    }
-                }
-            }
-        }
+        // KV tablet directories should be cleaned up by LogManager automatically
 
         newKvManager.shutdown();
         newLogManager.shutdown();
@@ -455,7 +386,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         // Verify that all residual data directories were cleaned up
         assertThat(new File(logDir1)).doesNotExist();
         assertThat(new File(logDir2)).doesNotExist();
-        assertThat(new File(kvDir1)).doesNotExist();
+        assertThat(new File(kvDir1)).doesNotExist(); // Also cleaned by LogManager
         assertThat(new File(kvDir2)).doesNotExist();
     }
 
@@ -495,7 +426,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         kvManager.shutdown();
         logManager.shutdown();
 
-        // Remove ALL metadata from ZooKeeper to simulate table drop
+        // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start managers again
@@ -513,28 +444,13 @@ final class DroppedTableRecoveryTest extends LogTestBase {
                         conf, zkClient, newLogManager, TestingMetricGroups.TABLET_SERVER_METRICS);
         newKvManager.startup();
 
-        // Try to load the KV tablet - should handle SchemaNotExistException
-        File kvTabletDir = new File(kvDir);
-        if (kvTabletDir.exists()) {
-            try {
-                newKvManager.loadKv(kvTabletDir);
-                // If we reach here without exception, the schema was found (unexpected)
-                assertThat(false)
-                        .as("Expected SchemaNotExistException to be thrown and handled")
-                        .isTrue();
-            } catch (Exception e) {
-                // Clean up manually to demonstrate expected behavior
-                if (kvTabletDir.exists()) {
-                    org.apache.fluss.utils.FileUtils.deleteDirectoryQuietly(kvTabletDir);
-                }
-            }
-        }
+        // KV tablet directory should be cleaned up by LogManager automatically
 
         newKvManager.shutdown();
         newLogManager.shutdown();
 
         // Verify that both residual data directories were cleaned up
         assertThat(new File(logDir)).doesNotExist();
-        assertThat(new File(kvDir)).doesNotExist();
+        assertThat(new File(kvDir)).doesNotExist(); // Also cleaned by LogManager
     }
 }
