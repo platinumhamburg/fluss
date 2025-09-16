@@ -190,39 +190,8 @@ public final class LogManager extends TabletManagerBase {
             final boolean cleanShutdown = isCleanShutdown;
             // set runnable job.
             Runnable[] jobsForDir =
-                    tabletsToLoad.stream()
-                            .map(
-                                    tabletDir ->
-                                            (Runnable)
-                                                    () -> {
-                                                        LOG.debug("Loading log {}", tabletDir);
-                                                        try {
-                                                            loadLog(
-                                                                    tabletDir,
-                                                                    cleanShutdown,
-                                                                    finalRecoveryPoints,
-                                                                    conf,
-                                                                    clock);
-                                                        } catch (Exception e) {
-                                                            LOG.error(
-                                                                    "Fail to loadLog from {}",
-                                                                    tabletDir,
-                                                                    e);
-                                                            if (e
-                                                                    instanceof
-                                                                    SchemaNotExistException) {
-                                                                LOG.error(
-                                                                        "schema not exist, table for {} has already been dropped, the residual data will be removed.",
-                                                                        tabletDir,
-                                                                        e);
-                                                                FileUtils.deleteDirectoryQuietly(
-                                                                        tabletDir);
-                                                                return;
-                                                            }
-                                                            throw new FlussRuntimeException(e);
-                                                        }
-                                                    })
-                            .toArray(Runnable[]::new);
+                    createLogLoadingJobs(
+                            tabletsToLoad, cleanShutdown, finalRecoveryPoints, conf, clock);
 
             long startTime = System.currentTimeMillis();
 
@@ -485,6 +454,50 @@ public final class LogManager extends TabletManagerBase {
         }
 
         LOG.info("Shut down LogManager complete.");
+    }
+
+    /** Create runnable jobs for loading logs from tablet directories. */
+    private Runnable[] createLogLoadingJobs(
+            List<File> tabletsToLoad,
+            boolean cleanShutdown,
+            Map<TableBucket, Long> recoveryPoints,
+            Configuration conf,
+            Clock clock) {
+        Runnable[] jobs = new Runnable[tabletsToLoad.size()];
+        for (int i = 0; i < tabletsToLoad.size(); i++) {
+            final File tabletDir = tabletsToLoad.get(i);
+            jobs[i] = createLogLoadingJob(tabletDir, cleanShutdown, recoveryPoints, conf, clock);
+        }
+        return jobs;
+    }
+
+    /** Create a runnable job for loading log from a single tablet directory. */
+    private Runnable createLogLoadingJob(
+            File tabletDir,
+            boolean cleanShutdown,
+            Map<TableBucket, Long> recoveryPoints,
+            Configuration conf,
+            Clock clock) {
+        return new Runnable() {
+            @Override
+            public void run() {
+                LOG.debug("Loading log {}", tabletDir);
+                try {
+                    loadLog(tabletDir, cleanShutdown, recoveryPoints, conf, clock);
+                } catch (Exception e) {
+                    LOG.error("Fail to loadLog from {}", tabletDir, e);
+                    if (e instanceof SchemaNotExistException) {
+                        LOG.error(
+                                "schema not exist, table for {} has already been dropped, the residual data will be removed.",
+                                tabletDir,
+                                e);
+                        FileUtils.deleteDirectoryQuietly(tabletDir);
+                        return;
+                    }
+                    throw new FlussRuntimeException(e);
+                }
+            }
+        };
     }
 
     @VisibleForTesting

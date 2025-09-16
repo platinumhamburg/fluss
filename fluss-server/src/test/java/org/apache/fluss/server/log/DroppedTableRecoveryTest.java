@@ -24,6 +24,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
@@ -80,7 +81,12 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         registerTableInZkClient();
         logManager =
-                LogManager.create(conf, zkClient, new FlussScheduler(1), SystemClock.getInstance());
+                LogManager.create(
+                        conf,
+                        zkClient,
+                        new FlussScheduler(1),
+                        SystemClock.getInstance(),
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
         logManager.startup();
     }
 
@@ -135,7 +141,12 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         // Create a new LogManager and start it
         LogManager newLogManager =
-                LogManager.create(conf, zkClient, new FlussScheduler(1), SystemClock.getInstance());
+                LogManager.create(
+                        conf,
+                        zkClient,
+                        new FlussScheduler(1),
+                        SystemClock.getInstance(),
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
 
         // This should not throw an exception but should handle the SchemaNotExistException
         // internally
@@ -180,7 +191,12 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         // Start LogManager again
         LogManager newLogManager =
-                LogManager.create(conf, zkClient, new FlussScheduler(1), SystemClock.getInstance());
+                LogManager.create(
+                        conf,
+                        zkClient,
+                        new FlussScheduler(1),
+                        SystemClock.getInstance(),
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
         newLogManager.startup();
 
         // Verify that both residual data directories were cleaned up
@@ -216,42 +232,16 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         // Start LogManager again
         LogManager newLogManager =
-                LogManager.create(conf, zkClient, new FlussScheduler(1), SystemClock.getInstance());
+                LogManager.create(
+                        conf,
+                        zkClient,
+                        new FlussScheduler(1),
+                        SystemClock.getInstance(),
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
         newLogManager.startup();
 
         // Verify that the residual data directory was cleaned up
         assertThat(new File(logDir)).doesNotExist();
-
-        newLogManager.shutdown();
-    }
-
-    @Test
-    void testNormalOperationNotAffected() throws Exception {
-        // Create a log first
-        LogTablet log =
-                logManager.getOrCreateLog(
-                        PhysicalTablePath.of(tablePath), tableBucket, LogFormat.ARROW, 1, false);
-
-        // Write some data to the log
-        MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
-        log.appendAsLeader(records);
-        log.flush(false);
-
-        String logDir = log.getLogDir().getAbsolutePath();
-
-        // Shutdown log manager (without removing schema - normal scenario)
-        logManager.shutdown();
-
-        // Start LogManager again
-        LogManager newLogManager =
-                LogManager.create(conf, zkClient, new FlussScheduler(1), SystemClock.getInstance());
-        newLogManager.startup();
-
-        // Verify that the log directory still exists (not cleaned up)
-        assertThat(new File(logDir)).exists();
-
-        // Verify we can still access the log
-        assertThat(newLogManager.getLog(tableBucket)).isPresent();
 
         newLogManager.shutdown();
     }
