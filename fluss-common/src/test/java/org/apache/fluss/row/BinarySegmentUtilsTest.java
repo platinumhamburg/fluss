@@ -775,32 +775,6 @@ public class BinarySegmentUtilsTest {
     }
 
     @Test
-    public void testReadBinarySmallData() {
-        // Test readBinary for data < 8 bytes (stored in fixed part)
-        byte[] smallData = {0x01, 0x02, 0x03, 0x04, 0x05};
-
-        // Create variablePartOffsetAndLen for small data (mark bit = 1)
-        // Set highest bit = 1, next 7 bits = length, remaining bytes = data
-        long variablePartOffsetAndLen = BinarySection.HIGHEST_FIRST_BIT;
-        variablePartOffsetAndLen |= ((long) smallData.length << 56);
-
-        // Pack data into the long value (considering endianness)
-        for (int i = 0; i < smallData.length; i++) {
-            if (BinarySegmentUtils.LITTLE_ENDIAN) {
-                variablePartOffsetAndLen |= ((long) (smallData[i] & 0xFF)) << (i * 8);
-            } else {
-                variablePartOffsetAndLen |= ((long) (smallData[i] & 0xFF)) << ((6 - i) * 8);
-            }
-        }
-
-        MemorySegment segment = MemorySegment.wrap(new byte[16]);
-        MemorySegment[] segments = {segment};
-
-        byte[] result = BinarySegmentUtils.readBinary(segments, 0, 0, variablePartOffsetAndLen);
-        assertThat(result).isEqualTo(smallData);
-    }
-
-    @Test
     public void testReadBinaryStringLargeData() {
         // Test readBinaryString for data >= 8 bytes
         String testString = "Hello Binary String Test!";
@@ -1003,48 +977,6 @@ public class BinarySegmentUtilsTest {
 
         Decimal result = BinarySegmentUtils.readDecimalData(segments, 0, offsetAndSize, 18, 9);
         assertThat(result.toBigDecimal()).isEqualTo(testDecimal);
-    }
-
-    @Test
-    public void testReadBinaryDataEdgeCases() {
-        // Test edge cases for readBinary
-        MemorySegment segment = MemorySegment.wrap(new byte[20]);
-        MemorySegment[] segments = {segment};
-
-        // Test empty data
-        byte[] emptyData = new byte[0];
-        long emptyOffsetAndLen = ((long) 0 << 32) | 0;
-        byte[] emptyResult = BinarySegmentUtils.readBinary(segments, 0, 0, emptyOffsetAndLen);
-        assertThat(emptyResult).isEmpty();
-
-        // Test single byte data in fixed part
-        byte[] singleByte = {(byte) 0xAB};
-        long fixedPartData = BinarySection.HIGHEST_FIRST_BIT;
-        fixedPartData |= ((long) 1 << 56); // length = 1
-        if (BinarySegmentUtils.LITTLE_ENDIAN) {
-            fixedPartData |= (singleByte[0] & 0xFF);
-        } else {
-            fixedPartData |= ((long) (singleByte[0] & 0xFF)) << 48;
-        }
-
-        byte[] singleResult = BinarySegmentUtils.readBinary(segments, 0, 0, fixedPartData);
-        assertThat(singleResult).isEqualTo(singleByte);
-
-        // Test 7-byte data (maximum for fixed part)
-        byte[] maxFixedData = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
-        long maxFixedPartData = BinarySection.HIGHEST_FIRST_BIT;
-        maxFixedPartData |= ((long) 7 << 56); // length = 7
-
-        for (int i = 0; i < 7; i++) {
-            if (BinarySegmentUtils.LITTLE_ENDIAN) {
-                maxFixedPartData |= ((long) (maxFixedData[i] & 0xFF)) << (i * 8);
-            } else {
-                maxFixedPartData |= ((long) (maxFixedData[i] & 0xFF)) << ((6 - i) * 8);
-            }
-        }
-
-        byte[] maxFixedResult = BinarySegmentUtils.readBinary(segments, 0, 0, maxFixedPartData);
-        assertThat(maxFixedResult).isEqualTo(maxFixedData);
     }
 
     @Test

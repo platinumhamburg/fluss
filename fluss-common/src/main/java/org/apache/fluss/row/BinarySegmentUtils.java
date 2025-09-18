@@ -570,29 +570,15 @@ public final class BinarySegmentUtils {
         if (mark == 0) {
             final int subOffset = (int) (variablePartOffsetAndLen >> 32);
             final int len = (int) variablePartOffsetAndLen;
-            return BinarySegmentUtils.copyToBytes(segments, baseOffset + subOffset, len);
+            return copyToBytes(segments, baseOffset + subOffset, len);
         } else {
-            // Data is stored in fixed-length part (≤7 bytes)
             int len = (int) ((variablePartOffsetAndLen & HIGHEST_SECOND_TO_EIGHTH_BIT) >>> 56);
-            byte[] result = new byte[len];
-
-            // Extract the actual data bytes from the low 7 bytes of the long value
-            long dataBytes =
-                    variablePartOffsetAndLen & 0x00FFFFFFFFFFFFFFL; // Mask out the header byte
-
-            if (BinarySegmentUtils.LITTLE_ENDIAN) {
-                // For little endian: byte[i] was stored at position (i * 8)
-                for (int i = 0; i < len; i++) {
-                    result[i] = (byte) ((dataBytes >>> (i * 8)) & 0xFF);
-                }
+            if (LITTLE_ENDIAN) {
+                return copyToBytes(segments, fieldOffset, len);
             } else {
-                // For big endian: byte[i] was stored at position ((6 - i) * 8)
-                for (int i = 0; i < len; i++) {
-                    result[i] = (byte) ((dataBytes >>> ((6 - i) * 8)) & 0xFF);
-                }
+                // fieldOffset + 1 to skip header.
+                return copyToBytes(segments, fieldOffset + 1, len);
             }
-
-            return result;
         }
     }
 
