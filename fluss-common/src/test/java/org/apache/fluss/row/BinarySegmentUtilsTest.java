@@ -19,6 +19,8 @@ package org.apache.fluss.row;
 
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentOutputView;
+import org.apache.fluss.row.aligned.AlignedRow;
+import org.apache.fluss.row.aligned.AlignedRowWriter;
 
 import org.junit.jupiter.api.Test;
 
@@ -466,44 +468,58 @@ public class BinarySegmentUtilsTest {
 
     @Test
     public void testReadBinaryData() {
-        // Test readBinary - small data stored inline (< 8 bytes)
+        // Test readBinary with complete write-read cycle
+        // Test small binary data (inline storage, < 8 bytes)
         byte[] smallBinary = {1, 2, 3, 4};
+        AlignedRow smallRow = new AlignedRow(1);
+        AlignedRowWriter smallWriter = new AlignedRowWriter(smallRow);
+        smallWriter.writeBinary(0, smallBinary);
+        smallWriter.complete();
 
-        // For inline storage, we use the highest bit to mark inline data
-        // and the next 7 bits for length
-        long inlineData = 0x8000000000000000L; // highest bit set for inline
-        inlineData |= ((long) smallBinary.length << 56); // length in bits 56-62
+        // Calculate field offset based on AlignedRow structure
+        int arity = 1;
+        int headerSizeInBits = 8; // AlignedRow.HEADER_SIZE_IN_BITS
+        int nullBitsSizeInBytes = ((arity + 63 + headerSizeInBits) / 64) * 8;
+        int fieldOffset = smallRow.getOffset() + nullBitsSizeInBytes + 0 * 8; // pos = 0
 
-        // Store the actual data in the lower bytes
-        if (BinarySegmentUtils.LITTLE_ENDIAN) {
-            for (int i = 0; i < smallBinary.length; i++) {
-                inlineData |= ((long) (smallBinary[i] & 0xFF)) << (i * 8);
-            }
-        } else {
-            for (int i = 0; i < smallBinary.length; i++) {
-                inlineData |= ((long) (smallBinary[i] & 0xFF)) << ((6 - i) * 8);
-            }
-        }
+        // Get the offset and length information stored at field offset
+        long offsetAndLen = smallRow.getSegments()[0].getLong(fieldOffset);
 
-        MemorySegment[] segments = new MemorySegment[1];
-        segments[0] = MemorySegment.wrap(new byte[16]);
+        // Use BinarySegmentUtils.readBinary to read the data
+        byte[] readSmallBinary =
+                BinarySegmentUtils.readBinary(
+                        smallRow.getSegments(), smallRow.getOffset(), fieldOffset, offsetAndLen);
 
-        byte[] readSmallBinary = BinarySegmentUtils.readBinary(segments, 0, 0, inlineData);
+        // Verify the read data matches original data
         assertThat(readSmallBinary).isEqualTo(smallBinary);
+        // Also verify it matches AlignedRow's built-in method
+        assertThat(readSmallBinary).isEqualTo(smallRow.getBytes(0));
 
-        // Test readBinary - large data stored externally (>= 8 bytes)
+        // Test large binary data (external storage, >= 8 bytes)
         byte[] largeBinary = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
-        MemorySegment[] largeSegments = new MemorySegment[1];
-        largeSegments[0] = MemorySegment.wrap(new byte[20]);
+        AlignedRow largeRow = new AlignedRow(1);
+        AlignedRowWriter largeWriter = new AlignedRowWriter(largeRow);
+        largeWriter.writeBinary(0, largeBinary);
+        largeWriter.complete();
 
-        // Store large binary at offset 4
-        largeSegments[0].put(4, largeBinary, 0, largeBinary.length);
+        // Calculate field offset for the large row
+        int largeFieldOffset = largeRow.getOffset() + nullBitsSizeInBytes + 0 * 8; // pos = 0
 
-        // For external storage, highest bit is 0, offset in high 32 bits, size in low 32 bits
-        long externalData = ((long) 4 << 32) | largeBinary.length;
+        // Get the offset and length information
+        long largeOffsetAndLen = largeRow.getSegments()[0].getLong(largeFieldOffset);
 
-        byte[] readLargeBinary = BinarySegmentUtils.readBinary(largeSegments, 0, 0, externalData);
+        // Use BinarySegmentUtils.readBinary to read the large data
+        byte[] readLargeBinary =
+                BinarySegmentUtils.readBinary(
+                        largeRow.getSegments(),
+                        largeRow.getOffset(),
+                        largeFieldOffset,
+                        largeOffsetAndLen);
+
+        // Verify the read data matches original data
         assertThat(readLargeBinary).isEqualTo(largeBinary);
+        // Also verify it matches AlignedRow's built-in method
+        assertThat(readLargeBinary).isEqualTo(largeRow.getBytes(0));
     }
 
     @Test
