@@ -15,9 +15,13 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.row;
+package org.apache.fluss.row.aligned;
 
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.Decimal;
+import org.apache.fluss.row.TimestampLtz;
+import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
@@ -26,27 +30,27 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Random;
 import java.util.Set;
-import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Test for {@link BinaryRowData}. */
-class BinaryRowDataTest {
+/** Test for {@link AlignedRow}. */
+class AlignedRowTest {
 
     @Test
     public void testBasic() {
         // consider header 1 byte.
-        assertThat(new BinaryRowData(0).getFixedLengthPartSize()).isEqualTo(8);
-        assertThat(new BinaryRowData(1).getFixedLengthPartSize()).isEqualTo(16);
-        assertThat(new BinaryRowData(65).getFixedLengthPartSize()).isEqualTo(536);
-        assertThat(new BinaryRowData(128).getFixedLengthPartSize()).isEqualTo(1048);
+        assertThat(new AlignedRow(0).getFixedLengthPartSize()).isEqualTo(8);
+        assertThat(new AlignedRow(1).getFixedLengthPartSize()).isEqualTo(16);
+        assertThat(new AlignedRow(65).getFixedLengthPartSize()).isEqualTo(536);
+        assertThat(new AlignedRow(128).getFixedLengthPartSize()).isEqualTo(1048);
 
         MemorySegment segment = MemorySegment.wrap(new byte[100]);
-        BinaryRowData row = new BinaryRowData(2);
+        AlignedRow row = new AlignedRow(2);
         row.pointTo(segment, 10, 48);
         assertThat(segment).isSameAs(row.getSegments()[0]);
         row.setInt(0, 5);
@@ -54,9 +58,9 @@ class BinaryRowDataTest {
     }
 
     @Test
-    public void testSetAndGet() throws IOException, ClassNotFoundException {
+    public void testSetAndGet() throws IOException {
         MemorySegment segment = MemorySegment.wrap(new byte[100]);
-        BinaryRowData row = new BinaryRowData(9);
+        AlignedRow row = new AlignedRow(9);
         row.pointTo(segment, 20, 80);
         row.setNullAt(0);
         row.setInt(1, 11);
@@ -67,27 +71,22 @@ class BinaryRowDataTest {
         row.setByte(6, (byte) 66);
         row.setFloat(7, 77f);
 
-        Consumer<BinaryRow> assertConsumer =
-                assertRow -> {
-                    assertThat((long) assertRow.getDouble(3)).isEqualTo(33L);
-                    assertThat(assertRow.getInt(1)).isEqualTo(11);
-                    assertThat(assertRow.isNullAt(0)).isTrue();
-                    assertThat(assertRow.getShort(5)).isEqualTo((short) 55);
-                    assertThat(assertRow.getLong(2)).isEqualTo(22L);
-                    assertThat(assertRow.getBoolean(4)).isTrue();
-                    assertThat(assertRow.getByte(6)).isEqualTo((byte) 66);
-                    assertThat(assertRow.getFloat(7)).isEqualTo(77f);
-                };
-
-        assertConsumer.accept(row);
+        assertThat((long) row.getDouble(3)).isEqualTo(33L);
+        assertThat(row.getInt(1)).isEqualTo(11);
+        assertThat(row.isNullAt(0)).isTrue();
+        assertThat(row.getShort(5)).isEqualTo((short) 55);
+        assertThat(row.getLong(2)).isEqualTo(22L);
+        assertThat(row.getBoolean(4)).isTrue();
+        assertThat(row.getByte(6)).isEqualTo((byte) 66);
+        assertThat(row.getFloat(7)).isEqualTo(77f);
     }
 
     @Test
     public void testWriter() {
 
         int arity = 13;
-        BinaryRowData row = new BinaryRowData(arity);
-        BinaryRowWriter writer = new BinaryRowWriter(row, 20);
+        AlignedRow row = new AlignedRow(arity);
+        AlignedRowWriter writer = new AlignedRowWriter(row, 20);
 
         writer.writeString(0, BinaryString.fromString("1"));
         writer.writeString(3, BinaryString.fromString("1234567"));
@@ -116,19 +115,19 @@ class BinaryRowDataTest {
         row.getSegments()[0].copyTo(0, subMs1, 0, subSize);
         row.getSegments()[0].copyTo(subSize, subMs2, 0, row.getSizeInBytes() - subSize);
 
-        BinaryRowData toCopy = new BinaryRowData(arity);
+        AlignedRow toCopy = new AlignedRow(arity);
         toCopy.pointTo(new MemorySegment[] {subMs1, subMs2}, 0, row.getSizeInBytes());
         assertThat(toCopy).isEqualTo(row);
         assertTestWriterRow(toCopy);
-        assertTestWriterRow(toCopy.copy(new BinaryRowData(arity)));
+        assertTestWriterRow(toCopy.copy(new AlignedRow(arity)));
     }
 
     @Test
     public void testWriteString() {
         {
             // litter byte[]
-            BinaryRowData row = new BinaryRowData(1);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+            AlignedRow row = new AlignedRow(1);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             char[] chars = new char[2];
             chars[0] = 0xFFFF;
             chars[1] = 0;
@@ -143,8 +142,8 @@ class BinaryRowDataTest {
         {
             // big byte[]
             String str = "God in his heaven, alls right with the world";
-            BinaryRowData row = new BinaryRowData(2);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+            AlignedRow row = new AlignedRow(2);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             writer.writeString(0, BinaryString.fromString(str));
             writer.writeString(1, BinaryString.fromBytes(str.getBytes(StandardCharsets.UTF_8)));
             writer.complete();
@@ -154,7 +153,7 @@ class BinaryRowDataTest {
         }
     }
 
-    private void assertTestWriterRow(BinaryRowData row) {
+    private void assertTestWriterRow(AlignedRow row) {
         assertThat(row.getString(0).toString()).isEqualTo("1");
         assertThat(row.getInt(8)).isEqualTo(88);
         assertThat(row.getShort(11)).isEqualTo((short) 292);
@@ -176,8 +175,8 @@ class BinaryRowDataTest {
 
     @Test
     public void testReuseWriter() {
-        BinaryRowData row = new BinaryRowData(2);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(2);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
         writer.writeString(0, BinaryString.fromString("01234567"));
         writer.writeString(1, BinaryString.fromString("012345678"));
         writer.complete();
@@ -195,8 +194,8 @@ class BinaryRowDataTest {
     @Test
     public void anyNullTest() {
         {
-            BinaryRowData row = new BinaryRowData(3);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+            AlignedRow row = new AlignedRow(3);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             assertThat(row.anyNull()).isFalse();
 
             // test header should not compute by anyNull
@@ -215,8 +214,8 @@ class BinaryRowDataTest {
 
         int numFields = 80;
         for (int i = 0; i < numFields; i++) {
-            BinaryRowData row = new BinaryRowData(numFields);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+            AlignedRow row = new AlignedRow(numFields);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             assertThat(row.anyNull()).isFalse();
             writer.setNullAt(i);
             assertThat(row.anyNull()).isTrue();
@@ -227,8 +226,8 @@ class BinaryRowDataTest {
     public void testSingleSegmentBinaryRowHashCode() {
         final Random rnd = new Random(System.currentTimeMillis());
         // test hash stabilization
-        BinaryRowData row = new BinaryRowData(13);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(13);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
         for (int i = 0; i < 99; i++) {
             writer.reset();
             writer.writeString(0, BinaryString.fromString("" + rnd.nextInt()));
@@ -245,7 +244,7 @@ class BinaryRowDataTest {
             writer.writeShort(11, (short) 292);
             writer.setNullAt(12);
             writer.complete();
-            BinaryRowData copy = row.copy();
+            AlignedRow copy = row.copy();
             assertThat(copy.hashCode()).isEqualTo(row.hashCode());
         }
 
@@ -258,8 +257,8 @@ class BinaryRowDataTest {
         }
         assertThat(hashCodes).hasSize(count);
         hashCodes.clear();
-        row = new BinaryRowData(1);
-        writer = new BinaryRowWriter(row);
+        row = new AlignedRow(1);
+        writer = new AlignedRowWriter(row);
         for (int i = 0; i < count; i++) {
             writer.reset();
             writer.writeString(
@@ -272,22 +271,22 @@ class BinaryRowDataTest {
 
     @Test
     public void testHeaderSize() {
-        assertThat(BinaryRowData.calculateBitSetWidthInBytes(56)).isEqualTo(8);
-        assertThat(BinaryRowData.calculateBitSetWidthInBytes(57)).isEqualTo(16);
-        assertThat(BinaryRowData.calculateBitSetWidthInBytes(120)).isEqualTo(16);
-        assertThat(BinaryRowData.calculateBitSetWidthInBytes(121)).isEqualTo(24);
+        assertThat(AlignedRow.calculateBitSetWidthInBytes(56)).isEqualTo(8);
+        assertThat(AlignedRow.calculateBitSetWidthInBytes(57)).isEqualTo(16);
+        assertThat(AlignedRow.calculateBitSetWidthInBytes(120)).isEqualTo(16);
+        assertThat(AlignedRow.calculateBitSetWidthInBytes(121)).isEqualTo(24);
     }
 
     @Test
     public void testHeader() {
-        BinaryRowData row = new BinaryRowData(2);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(2);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         writer.writeInt(0, 10);
         writer.setNullAt(1);
         writer.complete();
 
-        BinaryRowData newRow = row.copy();
+        AlignedRow newRow = row.copy();
         assertThat(newRow).isEqualTo(row);
     }
 
@@ -297,8 +296,8 @@ class BinaryRowDataTest {
         {
             int precision = 4;
             int scale = 2;
-            BinaryRowData row = new BinaryRowData(2);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+            AlignedRow row = new AlignedRow(2);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             writer.writeDecimal(0, Decimal.fromUnscaledLong(5, precision, scale), precision);
             writer.setNullAt(1);
             writer.complete();
@@ -316,8 +315,8 @@ class BinaryRowDataTest {
             Decimal decimal1 = Decimal.fromBigDecimal(BigDecimal.valueOf(5.55), precision, scale);
             Decimal decimal2 = Decimal.fromBigDecimal(BigDecimal.valueOf(6.55), precision, scale);
 
-            BinaryRowData row = new BinaryRowData(2);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+            AlignedRow row = new AlignedRow(2);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             writer.writeDecimal(0, decimal1, precision);
             writer.writeDecimal(1, null, precision);
             writer.complete();
@@ -331,8 +330,8 @@ class BinaryRowDataTest {
 
     @Test
     public void testBinary() {
-        BinaryRowData row = new BinaryRowData(2);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(2);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
         byte[] bytes1 = new byte[] {1, -1, 5};
         byte[] bytes2 = new byte[] {1, -1, 5, 5, 1, 5, 1, 5};
         writer.writeBinary(0, bytes1);
@@ -349,8 +348,8 @@ class BinaryRowDataTest {
         Random random = new Random();
         byte[] bytes = new byte[1024];
 
-        BinaryRowData row = new BinaryRowData(1);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(1);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         writer.reset();
         random.nextBytes(bytes);
@@ -372,12 +371,12 @@ class BinaryRowDataTest {
     }
 
     @Test
-    public void testTimestampData() {
+    public void testTimestamp() {
         // 1. compact
         {
             final int precision = 3;
-            BinaryRowData row = new BinaryRowData(2);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+            AlignedRow row = new AlignedRow(2);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             writer.writeTimestampNtz(0, TimestampNtz.fromMillis(123L), precision);
             writer.setNullAt(1);
             writer.complete();
@@ -392,13 +391,15 @@ class BinaryRowDataTest {
         {
             final int precision = 9;
             TimestampLtz timestamp1 =
-                    TimestampLtz.fromLocalDateTime(
-                            LocalDateTime.of(1969, 1, 1, 0, 0, 0, 123456789));
+                    TimestampLtz.fromInstant(
+                            LocalDateTime.of(1969, 1, 1, 0, 0, 0, 123456789)
+                                    .toInstant(ZoneOffset.UTC));
             TimestampLtz timestamp2 =
-                    TimestampLtz.fromLocalDateTime(
-                            LocalDateTime.of(1970, 1, 1, 0, 0, 0, 123456789));
-            BinaryRowData row = new BinaryRowData(2);
-            BinaryRowWriter writer = new BinaryRowWriter(row);
+                    TimestampLtz.fromInstant(
+                            LocalDateTime.of(1970, 1, 1, 0, 0, 0, 123456789)
+                                    .toInstant(ZoneOffset.UTC));
+            AlignedRow row = new AlignedRow(2);
+            AlignedRowWriter writer = new AlignedRowWriter(row);
             writer.writeTimestampLtz(0, timestamp1, precision);
             writer.writeTimestampLtz(1, null, precision);
             writer.complete();
@@ -419,8 +420,8 @@ class BinaryRowDataTest {
 
     @Test
     public void testGetChar() {
-        BinaryRowData row = new BinaryRowData(3);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(3);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         String shortString = "hello";
         String longString = "This is a longer string for testing getChar method";
@@ -448,8 +449,8 @@ class BinaryRowDataTest {
 
     @Test
     public void testGetBytes() {
-        BinaryRowData row = new BinaryRowData(3);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(3);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         byte[] smallBytes = new byte[] {1, 2, 3};
         byte[] largeBytes = new byte[] {1, -1, 5, 10, -10, 127, -128, 0, 50, -50};
@@ -471,7 +472,7 @@ class BinaryRowDataTest {
         assertThat(row.getBytes(2)).isEqualTo(row.getBinary(2, emptyBytes.length));
 
         // Test with copied row
-        BinaryRowData copiedRow = row.copy();
+        AlignedRow copiedRow = row.copy();
         assertThat(copiedRow.getBytes(0)).isEqualTo(smallBytes);
         assertThat(copiedRow.getBytes(1)).isEqualTo(largeBytes);
         assertThat(copiedRow.getBytes(2)).isEqualTo(emptyBytes);
@@ -480,8 +481,8 @@ class BinaryRowDataTest {
     @Test
     public void testMemoryGrowth() {
         // Test automatic memory growth when initial size is small
-        BinaryRowData row = new BinaryRowData(3);
-        BinaryRowWriter writer = new BinaryRowWriter(row, 10); // small initial size
+        AlignedRow row = new AlignedRow(3);
+        AlignedRowWriter writer = new AlignedRowWriter(row, 10); // small initial size
 
         // Write data that exceeds initial capacity
         String largeString =
@@ -507,8 +508,8 @@ class BinaryRowDataTest {
 
     @Test
     public void testGetSegments() {
-        BinaryRowData row = new BinaryRowData(2);
-        BinaryRowWriter writer = new BinaryRowWriter(row, 50);
+        AlignedRow row = new AlignedRow(2);
+        AlignedRowWriter writer = new AlignedRowWriter(row, 50);
 
         writer.writeString(0, BinaryString.fromString("test"));
         writer.writeInt(1, 123);
@@ -526,23 +527,23 @@ class BinaryRowDataTest {
 
     @Test
     public void testStaticWriteMethod() {
-        BinaryRowData row = new BinaryRowData(10);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(10);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         // Test static write method for different data types
-        BinaryRowWriter.write(writer, 0, true, DataTypes.BOOLEAN());
-        BinaryRowWriter.write(writer, 1, (byte) 100, DataTypes.TINYINT());
-        BinaryRowWriter.write(writer, 2, (short) 1000, DataTypes.SMALLINT());
-        BinaryRowWriter.write(writer, 3, 100000, DataTypes.INT());
-        BinaryRowWriter.write(writer, 4, 100000000L, DataTypes.BIGINT());
-        BinaryRowWriter.write(writer, 5, 3.14f, DataTypes.FLOAT());
-        BinaryRowWriter.write(writer, 6, 3.14159, DataTypes.DOUBLE());
-        BinaryRowWriter.write(writer, 7, BinaryString.fromString("hello"), DataTypes.STRING());
-        BinaryRowWriter.write(writer, 8, new byte[] {1, 2, 3}, DataTypes.BINARY(3));
+        AlignedRowWriter.write(writer, 0, true, DataTypes.BOOLEAN());
+        AlignedRowWriter.write(writer, 1, (byte) 100, DataTypes.TINYINT());
+        AlignedRowWriter.write(writer, 2, (short) 1000, DataTypes.SMALLINT());
+        AlignedRowWriter.write(writer, 3, 100000, DataTypes.INT());
+        AlignedRowWriter.write(writer, 4, 100000000L, DataTypes.BIGINT());
+        AlignedRowWriter.write(writer, 5, 3.14f, DataTypes.FLOAT());
+        AlignedRowWriter.write(writer, 6, 3.14159, DataTypes.DOUBLE());
+        AlignedRowWriter.write(writer, 7, BinaryString.fromString("hello"), DataTypes.STRING());
+        AlignedRowWriter.write(writer, 8, new byte[] {1, 2, 3}, DataTypes.BINARY(3));
 
         // Test decimal
         Decimal decimal = Decimal.fromUnscaledLong(314, 3, 2);
-        BinaryRowWriter.write(writer, 9, decimal, DataTypes.DECIMAL(3, 2));
+        AlignedRowWriter.write(writer, 9, decimal, DataTypes.DECIMAL(3, 2));
 
         writer.complete();
 
@@ -562,21 +563,21 @@ class BinaryRowDataTest {
     @Test
     public void testEdgeCases() {
         // Test with zero fields
-        BinaryRowData emptyRow = new BinaryRowData(0);
-        BinaryRowWriter emptyWriter = new BinaryRowWriter(emptyRow);
+        AlignedRow emptyRow = new AlignedRow(0);
+        AlignedRowWriter emptyWriter = new AlignedRowWriter(emptyRow);
         emptyWriter.complete();
         assertThat(emptyRow.getFieldCount()).isEqualTo(0);
 
         // Test with single field
-        BinaryRowData singleRow = new BinaryRowData(1);
-        BinaryRowWriter singleWriter = new BinaryRowWriter(singleRow);
+        AlignedRow singleRow = new AlignedRow(1);
+        AlignedRowWriter singleWriter = new AlignedRowWriter(singleRow);
         singleWriter.writeInt(0, 42);
         singleWriter.complete();
         assertThat(singleRow.getInt(0)).isEqualTo(42);
 
         // Test with maximum fixed-length data (7 bytes)
-        BinaryRowData maxFixedRow = new BinaryRowData(1);
-        BinaryRowWriter maxFixedWriter = new BinaryRowWriter(maxFixedRow);
+        AlignedRow maxFixedRow = new AlignedRow(1);
+        AlignedRowWriter maxFixedWriter = new AlignedRowWriter(maxFixedRow);
         byte[] maxFixedBytes = new byte[7];
         Arrays.fill(maxFixedBytes, (byte) 0xFF);
         maxFixedWriter.writeBinary(0, maxFixedBytes);
@@ -584,8 +585,8 @@ class BinaryRowDataTest {
         assertThat(maxFixedRow.getBytes(0)).isEqualTo(maxFixedBytes);
 
         // Test with 8 bytes (should go to variable length part)
-        BinaryRowData varLenRow = new BinaryRowData(1);
-        BinaryRowWriter varLenWriter = new BinaryRowWriter(varLenRow);
+        AlignedRow varLenRow = new AlignedRow(1);
+        AlignedRowWriter varLenWriter = new AlignedRowWriter(varLenRow);
         byte[] varLenBytes = new byte[8];
         Arrays.fill(varLenBytes, (byte) 0xAA);
         varLenWriter.writeBinary(0, varLenBytes);
@@ -597,8 +598,8 @@ class BinaryRowDataTest {
     public void testLargeFieldCount() {
         // Test with many fields (80 fields as used in anyNullTest)
         int fieldCount = 80;
-        BinaryRowData row = new BinaryRowData(fieldCount);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(fieldCount);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         // Write different types to different fields
         for (int i = 0; i < fieldCount; i++) {
@@ -646,8 +647,8 @@ class BinaryRowDataTest {
 
     @Test
     public void testResetAndReusability() {
-        BinaryRowData row = new BinaryRowData(3);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(3);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         // First write
         writer.writeInt(0, 100);
@@ -688,8 +689,8 @@ class BinaryRowDataTest {
     @Test
     public void testComplexDataMix() {
         // Test mixing all supported data types in one row
-        BinaryRowData row = new BinaryRowData(12);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+        AlignedRow row = new AlignedRow(12);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
 
         // Write various types including null values
         writer.writeBoolean(0, true);

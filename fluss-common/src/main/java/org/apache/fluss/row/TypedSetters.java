@@ -21,7 +21,7 @@ package org.apache.fluss.row;
  * Provide type specialized setters to reduce if/else and eliminate box and unbox. This is mainly
  * used on the binary format such as {@link BinaryRow}.
  */
-public interface DataSetters {
+public interface TypedSetters {
 
     void setNullAt(int pos);
 

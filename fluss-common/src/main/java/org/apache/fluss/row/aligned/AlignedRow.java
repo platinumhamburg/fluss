@@ -15,10 +15,20 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.row;
+package org.apache.fluss.row.aligned;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.row.BinaryRow;
+import org.apache.fluss.row.BinarySection;
+import org.apache.fluss.row.BinarySegmentUtils;
+import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.Decimal;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.NullAwareGetters;
+import org.apache.fluss.row.TimestampLtz;
+import org.apache.fluss.row.TimestampNtz;
+import org.apache.fluss.row.TypedSetters;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DecimalType;
 import org.apache.fluss.types.LocalZonedTimestampType;
@@ -29,6 +39,10 @@ import javax.annotation.Nullable;
 import java.nio.ByteOrder;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
+
+/* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
+ * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
 
 /**
  * An implementation of {@link InternalRow} which is backed by {@link MemorySegment} instead of
@@ -51,8 +65,8 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  * <p>Variable-length part may fall into multiple MemorySegments.
  */
 @Internal
-public final class BinaryRowData extends BinarySection
-        implements BinaryRow, NullAwareGetters, DataSetters {
+public final class AlignedRow extends BinarySection
+        implements BinaryRow, NullAwareGetters, TypedSetters {
 
     private static final long serialVersionUID = 1L;
 
@@ -61,7 +75,7 @@ public final class BinaryRowData extends BinarySection
     private static final long FIRST_BYTE_ZERO = LITTLE_ENDIAN ? ~0xFFL : ~(0xFFL << 56L);
     public static final int HEADER_SIZE_IN_BITS = 8;
 
-    public static final BinaryRowData EMPTY_ROW = new BinaryRowData(0);
+    public static final AlignedRow EMPTY_ROW = new AlignedRow(0);
 
     static {
         int size = EMPTY_ROW.getFixedLengthPartSize();
@@ -80,7 +94,7 @@ public final class BinaryRowData extends BinarySection
     private final int arity;
     private final int nullBitsSizeInBytes;
 
-    public BinaryRowData(int arity) {
+    public AlignedRow(int arity) {
         checkArgument(arity >= 0);
         this.arity = arity;
         this.nullBitsSizeInBytes = calculateBitSetWidthInBytes(arity);
@@ -394,15 +408,15 @@ public final class BinaryRowData extends BinarySection
         return false;
     }
 
-    public BinaryRowData copy() {
-        return copy(new BinaryRowData(arity));
+    public AlignedRow copy() {
+        return copy(new AlignedRow(arity));
     }
 
-    public BinaryRowData copy(BinaryRowData reuse) {
+    public AlignedRow copy(AlignedRow reuse) {
         return copyInternal(reuse);
     }
 
-    private BinaryRowData copyInternal(BinaryRowData reuse) {
+    private AlignedRow copyInternal(AlignedRow reuse) {
         byte[] bytes = BinarySegmentUtils.copyToBytes(segments, offset, sizeInBytes);
         reuse.pointTo(MemorySegment.wrap(bytes), 0, sizeInBytes);
         return reuse;
@@ -424,9 +438,9 @@ public final class BinaryRowData extends BinarySection
             return false;
         }
         final BinarySection that = (BinarySection) o;
-        return sizeInBytes == that.sizeInBytes
+        return sizeInBytes == that.getSizeInBytes()
                 && BinarySegmentUtils.equals(
-                        segments, offset, that.segments, that.offset, sizeInBytes);
+                        segments, offset, that.getSegments(), that.getOffset(), sizeInBytes);
     }
 
     @Override
@@ -434,9 +448,9 @@ public final class BinaryRowData extends BinarySection
         return BinarySegmentUtils.hashByWords(segments, offset, sizeInBytes);
     }
 
-    public static BinaryRowData singleColumn(@Nullable Integer i) {
-        BinaryRowData row = new BinaryRowData(1);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+    public static AlignedRow singleColumn(@Nullable Integer i) {
+        AlignedRow row = new AlignedRow(1);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
         writer.reset();
         if (i == null) {
             writer.setNullAt(0);
@@ -447,14 +461,14 @@ public final class BinaryRowData extends BinarySection
         return row;
     }
 
-    public static BinaryRowData singleColumn(@Nullable String string) {
+    public static AlignedRow singleColumn(@Nullable String string) {
         BinaryString binaryString = string == null ? null : BinaryString.fromString(string);
         return singleColumn(binaryString);
     }
 
-    public static BinaryRowData singleColumn(@Nullable BinaryString string) {
-        BinaryRowData row = new BinaryRowData(1);
-        BinaryRowWriter writer = new BinaryRowWriter(row);
+    public static AlignedRow singleColumn(@Nullable BinaryString string) {
+        AlignedRow row = new AlignedRow(1);
+        AlignedRowWriter writer = new AlignedRowWriter(row);
         writer.reset();
         if (string == null) {
             writer.setNullAt(0);

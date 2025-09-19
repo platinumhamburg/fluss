@@ -31,7 +31,7 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** Describe a section of memory. */
 @Internal
-abstract class BinarySection implements MemoryAwareGetters, Serializable {
+public abstract class BinarySection implements MemoryAwareGetters, Serializable {
 
     private static final long serialVersionUID = 1L;
 

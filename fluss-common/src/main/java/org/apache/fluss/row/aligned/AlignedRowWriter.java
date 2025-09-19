@@ -15,9 +15,14 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.row;
+package org.apache.fluss.row.aligned;
 
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.row.BinarySegmentUtils;
+import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.Decimal;
+import org.apache.fluss.row.TimestampLtz;
+import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DecimalType;
 import org.apache.fluss.types.LocalZonedTimestampType;
@@ -28,8 +33,12 @@ import java.util.Arrays;
 
 import static org.apache.fluss.row.BinarySection.MAX_FIX_PART_DATA_SIZE;
 
+/* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
+ * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
+
 /**
- * Writer for {@link BinaryRowData}.
+ * Writer for {@link AlignedRow}.
  *
  * <p>Use the special format to write data to a {@link MemorySegment} (its capacity grows
  * automatically).
@@ -39,21 +48,21 @@ import static org.apache.fluss.row.BinarySection.MAX_FIX_PART_DATA_SIZE;
  *
  * <p>If want to reuse this writer, please invoke {@link #reset()} first.
  */
-public final class BinaryRowWriter {
+public final class AlignedRowWriter {
 
     private final int nullBitsSizeInBytes;
-    private final BinaryRowData row;
+    private final AlignedRow row;
     private final int fixedSize;
 
-    protected MemorySegment segment;
-    protected int cursor;
+    private MemorySegment segment;
+    private int cursor;
 
-    public BinaryRowWriter(BinaryRowData row) {
+    public AlignedRowWriter(AlignedRow row) {
         this(row, 0);
     }
 
-    public BinaryRowWriter(BinaryRowData row, int initialSize) {
-        this.nullBitsSizeInBytes = BinaryRowData.calculateBitSetWidthInBytes(row.getFieldCount());
+    public AlignedRowWriter(AlignedRow row, int initialSize) {
+        this.nullBitsSizeInBytes = AlignedRow.calculateBitSetWidthInBytes(row.getFieldCount());
         this.fixedSize = row.getFixedLengthPartSize();
         this.cursor = fixedSize;
 
@@ -77,7 +86,7 @@ public final class BinaryRowWriter {
     }
 
     public void setNullBit(int pos) {
-        BinarySegmentUtils.bitSet(segment, 0, pos + BinaryRowData.HEADER_SIZE_IN_BITS);
+        BinarySegmentUtils.bitSet(segment, 0, pos + AlignedRow.HEADER_SIZE_IN_BITS);
     }
 
     public void writeBoolean(int pos, boolean value) {
@@ -334,7 +343,7 @@ public final class BinaryRowWriter {
             MemorySegment segment, int fieldOffset, byte[] bytes, int len) {
         long firstByte = len | 0x80; // first bit is 1, other bits is len
         long sevenBytes = 0L; // real data
-        if (BinaryRowData.LITTLE_ENDIAN) {
+        if (AlignedRow.LITTLE_ENDIAN) {
             for (int i = 0; i < len; i++) {
                 sevenBytes |= ((0x00000000000000FFL & bytes[i]) << (i * 8L));
             }
@@ -360,7 +369,7 @@ public final class BinaryRowWriter {
      *     runtime.
      */
     @Deprecated
-    public static void write(BinaryRowWriter writer, int pos, Object o, DataType type) {
+    public static void write(AlignedRowWriter writer, int pos, Object o, DataType type) {
         switch (type.getTypeRoot()) {
             case BOOLEAN:
                 writer.writeBoolean(pos, (boolean) o);
