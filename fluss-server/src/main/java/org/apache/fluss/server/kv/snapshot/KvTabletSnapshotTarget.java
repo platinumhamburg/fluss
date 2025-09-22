@@ -23,6 +23,8 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.SequenceIDCounter;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
@@ -55,6 +57,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
 
     private final CompletedKvSnapshotCommitter completedKvSnapshotCommitter;
 
+    private final ZooKeeperClient zooKeeperClient;
+
     private final RocksIncrementalSnapshot rocksIncrementalSnapshot;
     private final FsPath remoteKvTabletDir;
     private final FsPath remoteSnapshotSharedDir;
@@ -82,6 +86,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     KvTabletSnapshotTarget(
             TableBucket tableBucket,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
+            ZooKeeperClient zooKeeperClient,
             RocksIncrementalSnapshot rocksIncrementalSnapshot,
             FsPath remoteKvTabletDir,
             Executor ioExecutor,
@@ -97,6 +102,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         this(
                 tableBucket,
                 completedKvSnapshotCommitter,
+                zooKeeperClient,
                 rocksIncrementalSnapshot,
                 remoteKvTabletDir,
                 (int) ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE.defaultValue().getBytes(),
@@ -114,6 +120,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     public KvTabletSnapshotTarget(
             TableBucket tableBucket,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
+            ZooKeeperClient zooKeeperClient,
             RocksIncrementalSnapshot rocksIncrementalSnapshot,
             FsPath remoteKvTabletDir,
             int snapshotWriteBufferSize,
@@ -129,6 +136,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             throws IOException {
         this.tableBucket = tableBucket;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
+        this.zooKeeperClient = zooKeeperClient;
         this.rocksIncrementalSnapshot = rocksIncrementalSnapshot;
         this.remoteKvTabletDir = remoteKvTabletDir;
         this.remoteSnapshotSharedDir = FlussPaths.remoteKvSharedDir(remoteKvTabletDir);
@@ -219,8 +227,56 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             updateMinRetainOffset.accept(snapshotResult.getLogOffset());
         } catch (Exception e) {
             Throwable t = ExceptionUtils.stripExecutionException(e);
-            snapshotsCleaner.cleanSnapshot(completedSnapshot, () -> {}, ioExecutor);
-            handleSnapshotFailure(snapshotId, snapshotLocation, t);
+
+            // Fix for issue: https://github.com/apache/fluss/issues/1304
+            // Tablet server try to commit kv snapshot to coordinator server,
+            // coordinator server commit the kv snapshot to zk, then failover.
+            // Tablet server will got exception from coordinator server, but mistake it as a fail
+            // commit although coordinator server has committed to zk, then discard the commited kv
+            // snapshot.
+            //
+            // Idempotent check: Double check ZK to verify if the snapshot actually exists before
+            // cleanup
+            boolean shouldCleanSnapshot = true;
+            try {
+                if (zooKeeperClient != null) {
+                    Optional<BucketSnapshot> zkSnapshot =
+                            zooKeeperClient.getTableBucketSnapshot(tableBucket, snapshotId);
+                    if (zkSnapshot.isPresent()) {
+                        // Snapshot exists in ZK, indicating the commit was actually successful,
+                        // just response was lost
+                        LOG.warn(
+                                "Snapshot {} for TableBucket {} already exists in ZK. "
+                                        + "The commit was successful but response was lost due to coordinator failover. "
+                                        + "Skipping cleanup and treating as successful.",
+                                snapshotId,
+                                tableBucket);
+
+                        // Update local state as if the commit was successful
+                        rocksIncrementalSnapshot.notifySnapshotComplete(snapshotId);
+                        logOffsetOfLatestSnapshot = snapshotResult.getLogOffset();
+                        snapshotSize = snapshotResult.getSnapshotSize();
+                        updateMinRetainOffset.accept(snapshotResult.getLogOffset());
+
+                        shouldCleanSnapshot = false;
+                        return; // Snapshot commit succeeded, return directly
+                    }
+                }
+            } catch (Exception zkException) {
+                LOG.warn(
+                        "Failed to query ZK for snapshot {} of TableBucket {}. "
+                                + "Assuming commit failed and proceeding with cleanup.",
+                        snapshotId,
+                        tableBucket,
+                        zkException);
+            }
+
+            // Only execute cleanup when the snapshot truly does not exist in ZK
+            if (shouldCleanSnapshot) {
+                snapshotsCleaner.cleanSnapshot(completedSnapshot, () -> {}, ioExecutor);
+                handleSnapshotFailure(snapshotId, snapshotLocation, t);
+            }
+
             // throw the exception to make PeriodicSnapshotManager can catch the exception
             throw t;
         }
