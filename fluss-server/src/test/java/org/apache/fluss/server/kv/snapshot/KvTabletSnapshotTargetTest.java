@@ -29,9 +29,12 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.utils.ResourceGuard;
+import org.apache.fluss.server.zk.CuratorFrameworkWithUnhandledErrorListener;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
+import org.apache.fluss.shaded.curator5.org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.utils.CloseableRegistry;
@@ -55,15 +58,19 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
+import static org.apache.fluss.server.zk.ZooKeeperUtils.startZookeeperClient;
+import static org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFrameworkFactory.Builder;
+import static org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFrameworkFactory.builder;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -396,8 +403,8 @@ class KvTabletSnapshotTargetTest {
         // Test case: ZK query fails - should fall back to cleanup (conservative approach)
         FsPath remoteKvTabletDir = FsPath.fromLocalFile(kvTabletDir.toFile());
 
-        // Use null as ZK client to simulate ZK query failure
-        ZooKeeperClient failingZkClient = null;
+        // Create a failing ZK client that throws exception to simulate ZK query failure
+        ZooKeeperClient failingZkClient = createFailingZooKeeperClient();
 
         CompletedKvSnapshotCommitter failingCommitter =
                 (snapshot, coordinatorEpoch, bucketLeaderEpoch) -> {
@@ -552,10 +559,41 @@ class KvTabletSnapshotTargetTest {
                 snapshotFailType);
     }
 
+    private ZooKeeperClient createFailingZooKeeperClient() {
+        // Create a ZooKeeperClient that throws exception on getTableBucketSnapshot
+        return new FailingZooKeeperClient();
+    }
+
+    private static class FailingZooKeeperClient extends ZooKeeperClient {
+
+        public FailingZooKeeperClient() {
+            // Create a new ZooKeeperClient using ZooKeeperUtils.startZookeeperClient
+            super(createCuratorFrameworkWrapper(), new Configuration());
+        }
+
+        private static CuratorFrameworkWithUnhandledErrorListener createCuratorFrameworkWrapper() {
+            Builder builder =
+                    builder()
+                            .connectString(
+                                    ZOO_KEEPER_EXTENSION_WRAPPER
+                                            .getCustomExtension()
+                                            .getConnectString())
+                            .retryPolicy(new ExponentialBackoffRetry(1000, 3));
+
+            return startZookeeperClient(builder, NOPErrorHandler.INSTANCE);
+        }
+
+        @Override
+        public Optional<BucketSnapshot> getTableBucketSnapshot(
+                TableBucket tableBucket, long snapshotId) throws Exception {
+            throw new Exception("ZK query failed");
+        }
+    }
+
     private static final class TestRocksIncrementalSnapshot extends RocksIncrementalSnapshot {
 
-        private final Set<Long> abortedSnapshots = new HashSet<>();
-        private final Set<Long> completedSnapshots = new HashSet<>();
+        private final Set<Long> abortedSnapshots = ConcurrentHashMap.newKeySet();
+        private final Set<Long> completedSnapshots = ConcurrentHashMap.newKeySet();
         private final SnapshotFailType snapshotFailType;
 
         public TestRocksIncrementalSnapshot(
