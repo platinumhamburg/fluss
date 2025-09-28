@@ -58,7 +58,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
 
     private final CompletedKvSnapshotCommitter completedKvSnapshotCommitter;
 
-    @Nonnull private final ZooKeeperClient zooKeeperClient;
+    private final ZooKeeperClient zooKeeperClient;
 
     private final RocksIncrementalSnapshot rocksIncrementalSnapshot;
     private final FsPath remoteKvTabletDir;
@@ -87,7 +87,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     KvTabletSnapshotTarget(
             TableBucket tableBucket,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
-            @Nonnull ZooKeeperClient zooKeeperClient,
+            ZooKeeperClient zooKeeperClient,
             RocksIncrementalSnapshot rocksIncrementalSnapshot,
             FsPath remoteKvTabletDir,
             Executor ioExecutor,
@@ -289,7 +289,6 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         //
         // Idempotent check: Double check ZK to verify if the snapshot actually exists before
         // cleanup
-        boolean shouldCleanSnapshot = true;
         try {
             Optional<BucketSnapshot> zkSnapshot =
                     zooKeeperClient.getTableBucketSnapshot(tableBucket, snapshotId);
@@ -305,23 +304,30 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
 
                 // Update local state as if the commit was successful
                 updateStateOnCommitSuccess(snapshotId, snapshotResult);
-
-                shouldCleanSnapshot = false;
                 return; // Snapshot commit succeeded, return directly
+            } else {
+                // Snapshot does not exist in ZK, indicating the commit truly failed
+                LOG.warn(
+                        "Snapshot {} for TableBucket {} does not exist in ZK. "
+                                + "The commit truly failed, proceeding with cleanup.",
+                        snapshotId,
+                        tableBucket);
+                snapshotsCleaner.cleanSnapshot(completedSnapshot, () -> {}, ioExecutor);
+                handleSnapshotFailure(snapshotId, snapshotLocation, t);
             }
         } catch (Exception zkException) {
             LOG.warn(
                     "Failed to query ZK for snapshot {} of TableBucket {}. "
-                            + "Assuming commit failed and proceeding with cleanup.",
+                            + "Cannot determine actual snapshot status, keeping snapshot in current state "
+                            + "to avoid potential data loss.",
                     snapshotId,
                     tableBucket,
                     zkException);
-        }
-
-        // Only execute cleanup when the snapshot truly does not exist in ZK
-        if (shouldCleanSnapshot) {
-            snapshotsCleaner.cleanSnapshot(completedSnapshot, () -> {}, ioExecutor);
-            handleSnapshotFailure(snapshotId, snapshotLocation, t);
+            // When ZK query fails, we cannot determine the actual status.
+            // The snapshot might have succeeded or failed on the ZK side.
+            // Therefore, we must not clean up the snapshot files and not update local state.
+            // This avoids the risk of discarding a successfully committed snapshot that
+            // connectors may already be reading, which would cause data loss or job failure.
         }
 
         // throw the exception to make PeriodicSnapshotManager can catch the exception

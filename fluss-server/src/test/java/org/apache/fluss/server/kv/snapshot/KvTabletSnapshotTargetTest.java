@@ -400,7 +400,7 @@ class KvTabletSnapshotTargetTest {
 
     @Test
     void testIdempotentCheckWhenZKQueryFails(@TempDir Path kvTabletDir) throws Exception {
-        // Test case: ZK query fails - should fall back to cleanup (conservative approach)
+        // Test case: ZK query fails - should keep snapshot in current state to avoid data loss
         FsPath remoteKvTabletDir = FsPath.fromLocalFile(kvTabletDir.toFile());
 
         // Create a failing ZK client that throws exception to simulate ZK query failure
@@ -426,14 +426,25 @@ class KvTabletSnapshotTargetTest {
         TestRocksIncrementalSnapshot rocksIncrementalSnapshot =
                 (TestRocksIncrementalSnapshot) kvTabletSnapshotTarget.getRocksIncrementalSnapshot();
 
-        // Since ZK query failed, should fall back to cleanup (conservative approach)
+        // Wait for snapshot processing to complete
+        // The snapshot should be created but commit will fail, then ZK query will fail
+        // In this case, the new logic should preserve the snapshot files (no cleanup)
         retry(
                 Duration.ofMinutes(1),
-                () -> assertThat(rocksIncrementalSnapshot.abortedSnapshots).contains(snapshotId1));
+                () -> {
+                    // Verify that snapshot creation happened but neither completion nor abortion
+                    // occurred
+                    // Since both commit and ZK query failed, snapshot should remain in limbo state
+                    FsPath snapshotPath1 =
+                            FlussPaths.remoteKvSnapshotDir(remoteKvTabletDir, snapshotId1);
+                    assertThat(snapshotPath1.getFileSystem().exists(snapshotPath1)).isTrue();
+                    assertThat(rocksIncrementalSnapshot.abortedSnapshots)
+                            .doesNotContain(snapshotId1);
+                    assertThat(rocksIncrementalSnapshot.completedSnapshots)
+                            .doesNotContain(snapshotId1);
+                });
 
-        // Verify cleanup occurred
-        FsPath snapshotPath1 = FlussPaths.remoteKvSnapshotDir(remoteKvTabletDir, snapshotId1);
-        assertThat(snapshotPath1.getFileSystem().exists(snapshotPath1)).isFalse();
+        // Verify local state was not updated (remain unchanged)
         assertThat(updateMinRetainOffsetConsumer.get()).isEqualTo(Long.MAX_VALUE);
     }
 
