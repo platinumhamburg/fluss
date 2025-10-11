@@ -31,12 +31,14 @@ import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.LakeTableAlreadyExistException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.lake.lakestorage.LakeCatalog;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DeleteBehavior;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -151,6 +153,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     private final Supplier<EventManager> eventManagerSupplier;
     private final Supplier<Integer> coordinatorEpochSupplier;
     private final CoordinatorMetadataCache metadataCache;
+    private final IndexTableHelper indexTableHelper;
 
     private final LakeTableTieringManager lakeTableTieringManager;
     private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
@@ -184,6 +187,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         this.lakeTableTieringManager = lakeTableTieringManager;
         this.metadataCache = metadataCache;
         this.lakeCatalogDynamicLoader = lakeCatalogDynamicLoader;
+        this.indexTableHelper = new IndexTableHelper(metadataManager, metadataCache, conf);
     }
 
     @Override
@@ -194,6 +198,15 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public void shutdown() {
         IOUtils.closeQuietly(lakeCatalogDynamicLoader, "lake catalog");
+    }
+
+    /**
+     * Returns the IndexTableHelper instance for managing index tables.
+     *
+     * @return the IndexTableHelper instance
+     */
+    public IndexTableHelper getIndexTableManager() {
+        return indexTableHelper;
     }
 
     @Override
@@ -307,6 +320,27 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         // then create table;
         metadataManager.createTable(
                 tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+
+        // create index tables if the main table has indexes and creation was successful
+        if (!tableDescriptor.getSchema().getIndexes().isEmpty()) {
+            try {
+                indexTableHelper.createIndexTables(tablePath, tableDescriptor);
+            } catch (Exception e) {
+                // rollback main table creation if index table creation fails
+                try {
+                    metadataManager.dropTable(tablePath, true);
+                } catch (Exception rollbackException) {
+                    // log rollback failure but throw original exception
+                    throw new RuntimeException(
+                            "Failed to create index tables and failed to rollback main table creation: "
+                                    + e.getMessage()
+                                    + ". Rollback error: "
+                                    + rollbackException.getMessage(),
+                            e);
+                }
+                throw new RuntimeException("Failed to create index tables: " + e.getMessage(), e);
+            }
+        }
 
         return CompletableFuture.completedFuture(new CreateTableResponse());
     }
@@ -446,6 +480,47 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         DropTableResponse response = new DropTableResponse();
+
+        // Check if the table being dropped is an index table
+        String tableName = tablePath.getTableName();
+        if (IndexTableUtils.isIndexTable(tableName)) {
+            // This is an index table - check if the main table still exists
+            String mainTableName = IndexTableUtils.extractMainTableName(tableName);
+            if (mainTableName != null) {
+                TablePath mainTablePath = new TablePath(tablePath.getDatabaseName(), mainTableName);
+                boolean mainTableExists = metadataManager.tableExists(mainTablePath);
+                if (mainTableExists) {
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Cannot drop index table %s while main table %s still exists. "
+                                            + "Index tables are automatically managed and can only be dropped when the main table is dropped.",
+                                    tablePath, mainTablePath));
+                }
+            }
+            // If main table doesn't exist, allow dropping the index table (cleanup scenario)
+        }
+
+        // first check if the main table exists to ensure proper exception handling
+        boolean tableExists = metadataManager.tableExists(tablePath);
+        if (!tableExists) {
+            if (!request.isIgnoreIfNotExists()) {
+                throw new TableNotExistException("Table " + tablePath + " does not exist.");
+            }
+            // if ignoreIfNotExists is true and table doesn't exist, return success
+            return CompletableFuture.completedFuture(response);
+        }
+
+        // drop index tables first if the main table has indexes
+        try {
+            indexTableHelper.dropIndexTables(tablePath, request.isIgnoreIfNotExists());
+        } catch (Exception e) {
+            if (!request.isIgnoreIfNotExists()) {
+                throw new RuntimeException("Failed to drop index tables: " + e.getMessage(), e);
+            }
+            // if ignoreIfNotExists is true, we continue even if dropping index tables fails
+        }
+
+        // then drop the main table
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
         return CompletableFuture.completedFuture(response);
     }
@@ -483,6 +558,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         PartitionAssignment partitionAssignment =
                 new PartitionAssignment(table.tableId, bucketAssignments);
 
+        // then create main table partition
         metadataManager.createPartition(
                 tablePath,
                 table.tableId,
@@ -503,6 +579,18 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         DropPartitionResponse response = new DropPartitionResponse();
+
+        // Check if trying to drop partition from an index table - this is not allowed
+        String tableName = tablePath.getTableName();
+        if (IndexTableUtils.isIndexTable(tableName)) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Cannot drop partition from index table %s. "
+                                    + "Index table partitions are automatically managed and can only be dropped "
+                                    + "when the corresponding main table partition is dropped.",
+                            tablePath));
+        }
+
         TableRegistration table = metadataManager.getTableRegistration(tablePath);
         if (!table.isPartitioned()) {
             throw new TableNotPartitionedException(
@@ -540,6 +628,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         return metadataResponseAccessContextEvent.getResultFuture();
     }
 
+    @Override
     public CompletableFuture<AdjustIsrResponse> adjustIsr(AdjustIsrRequest request) {
         CompletableFuture<AdjustIsrResponse> response = new CompletableFuture<>();
         eventManagerSupplier

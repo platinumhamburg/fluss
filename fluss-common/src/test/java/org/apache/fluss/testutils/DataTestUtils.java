@@ -81,6 +81,7 @@ import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DEFAULT_MAGIC;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
+import static org.apache.fluss.record.TestData.INDEXED_ROW_TYPE;
 import static org.apache.fluss.testutils.LogRecordBatchAssert.assertThatLogRecordBatch;
 import static org.apache.fluss.utils.FlussPaths.remoteLogDir;
 import static org.apache.fluss.utils.FlussPaths.remoteLogSegmentDir;
@@ -166,6 +167,22 @@ public class DataTestUtils {
     public static MemoryLogRecords genMemoryLogRecordsByObject(List<Object[]> objects)
             throws Exception {
         return genMemoryLogRecordsByObject(CURRENT_LOG_MAGIC_VALUE, objects);
+    }
+
+    /**
+     * Generate MemoryLogRecords using the indexed table schema (id, name, email). This is
+     * specifically for tests using INDEXED_DATA.
+     */
+    public static MemoryLogRecords genIndexedMemoryLogRecordsByObject(List<Object[]> objects)
+            throws Exception {
+        return createRecordsWithoutBaseLogOffset(
+                INDEXED_ROW_TYPE,
+                DEFAULT_SCHEMA_ID,
+                0,
+                System.currentTimeMillis(),
+                CURRENT_LOG_MAGIC_VALUE,
+                objects,
+                LogFormat.ARROW);
     }
 
     public static MemoryLogRecords genMemoryLogRecordsWithWriterId(
@@ -280,6 +297,47 @@ public class DataTestUtils {
         KvRecordTestUtils.KvRecordBatchFactory kvRecordBatchFactory =
                 KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
         return kvRecordBatchFactory.ofRecords(records);
+    }
+
+    /**
+     * Generate a KvRecordBatch based on provided Schema and key-value data pairs. This method
+     * extracts key and row types from the schema and generates the batch accordingly.
+     *
+     * @param schema the schema containing table definition with primary keys
+     * @param keyAndValues list of key-value pairs
+     * @return generated KvRecordBatch
+     */
+    public static KvRecordBatch genKvRecordBatchBySchema(
+            Schema schema, List<Tuple2<Object[], Object[]>> keyAndValues) throws Exception {
+        RowType rowType = schema.getRowType();
+        int[] pkIndexes = schema.getPrimaryKeyIndexes();
+        RowType keyType = Schema.getKeyRowType(schema, pkIndexes);
+        return genKvRecordBatch(keyType, rowType, keyAndValues);
+    }
+
+    /**
+     * Generate a KvRecordBatch based on provided Schema and data values. Keys are extracted from
+     * the values using the schema's primary key definition.
+     *
+     * @param schema the schema containing table definition with primary keys
+     * @param values list of complete row values
+     * @return generated KvRecordBatch
+     */
+    public static KvRecordBatch genKvRecordBatchFromValues(Schema schema, List<Object[]> values)
+            throws Exception {
+        int[] pkIndexes = schema.getPrimaryKeyIndexes();
+
+        List<Tuple2<Object[], Object[]>> keyAndValues = new ArrayList<>();
+        for (Object[] value : values) {
+            // Extract key from value using primary key indexes
+            Object[] key = new Object[pkIndexes.length];
+            for (int i = 0; i < pkIndexes.length; i++) {
+                key[i] = value[pkIndexes[i]];
+            }
+            keyAndValues.add(Tuple2.of(key, value));
+        }
+
+        return genKvRecordBatchBySchema(schema, keyAndValues);
     }
 
     @SafeVarargs

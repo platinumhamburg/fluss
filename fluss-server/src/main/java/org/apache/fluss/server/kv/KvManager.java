@@ -33,6 +33,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.TabletManagerBase;
+import org.apache.fluss.server.index.IndexCache;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
@@ -48,6 +49,7 @@ import org.apache.fluss.utils.types.Tuple2;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
@@ -163,7 +165,8 @@ public final class KvManager extends TabletManagerBase {
             KvFormat kvFormat,
             Schema schema,
             TableConfig tableConfig,
-            ArrowCompressionInfo arrowCompressionInfo)
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable IndexCache indexCache)
             throws Exception {
         return inLock(
                 tabletCreationOrDeletionLock,
@@ -186,7 +189,8 @@ public final class KvManager extends TabletManagerBase {
                                     kvFormat,
                                     schema,
                                     merger,
-                                    arrowCompressionInfo);
+                                    arrowCompressionInfo,
+                                    indexCache);
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -256,7 +260,7 @@ public final class KvManager extends TabletManagerBase {
         }
     }
 
-    public KvTablet loadKv(File tabletDir) throws Exception {
+    public KvTablet loadKv(File tabletDir, @Nullable IndexCache indexCache) throws Exception {
         Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TableBucket tableBucket = pathAndBucket.f1;
@@ -295,7 +299,8 @@ public final class KvManager extends TabletManagerBase {
                         tableInfo.getTableConfig().getKvFormat(),
                         tableInfo.getSchema(),
                         rowMerger,
-                        tableInfo.getTableConfig().getArrowCompressionInfo());
+                        tableInfo.getTableConfig().getArrowCompressionInfo(),
+                        indexCache);
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(

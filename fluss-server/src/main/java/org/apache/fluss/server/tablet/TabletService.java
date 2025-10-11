@@ -30,6 +30,8 @@ import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.entity.PrefixLookupResultForBucket;
 import org.apache.fluss.rpc.entity.ResultForBucket;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
+import org.apache.fluss.rpc.messages.FetchIndexResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
@@ -68,8 +70,11 @@ import org.apache.fluss.server.DynamicConfigManager;
 import org.apache.fluss.server.RpcServiceBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.entity.DataBucketIndexFetchResult;
+import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.index.FetchIndexParams;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.ListOffsetsParam;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
@@ -95,6 +100,7 @@ import static org.apache.fluss.security.acl.OperationType.WRITE;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.log.FetchParams.DEFAULT_MAX_WAIT_MS_WHEN_MIN_BYTES_ENABLE;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getFetchLogData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getIndexReqMap;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getListOffsetsData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyLakeTableOffset;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyLeaderAndIsrRequestData;
@@ -105,6 +111,7 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getPutKvData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getStopReplicaData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getTargetColumns;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getUpdateMetadataRequestData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeFetchIndexResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeFetchLogResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeInitWriterResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeLimitScanResponse;
@@ -209,6 +216,35 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                                     : DEFAULT_MAX_WAIT_MS_WHEN_MIN_BYTES_ENABLE);
         } else {
             fetchParams = new FetchParams(request.getFollowerServerId(), request.getMaxBytes());
+        }
+        return fetchParams;
+    }
+
+    @Override
+    public CompletableFuture<FetchIndexResponse> fetchIndex(FetchIndexRequest request) {
+        Map<TableBucket, DataBucketIndexFetchResult> errorResponseMap = new HashMap<>();
+        Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> dataBucketIndexFetchInfo =
+                getIndexReqMap(request);
+
+        CompletableFuture<FetchIndexResponse> responseFuture = new CompletableFuture<>();
+        FetchIndexParams fetchIndexParams = getFetchIndexParams(request);
+
+        replicaManager.fetchIndexRecords(
+                fetchIndexParams,
+                dataBucketIndexFetchInfo,
+                fetchIndexResultMap -> {
+                    FetchIndexResponse response = makeFetchIndexResponse(fetchIndexResultMap);
+                    responseFuture.complete(response);
+                });
+        return responseFuture;
+    }
+
+    private static FetchIndexParams getFetchIndexParams(FetchIndexRequest request) {
+        FetchIndexParams fetchParams;
+        if (request.hasMaxWaitMs()) {
+            fetchParams = new FetchIndexParams(request.getMaxRecords(), request.getMaxWaitMs());
+        } else {
+            fetchParams = new FetchIndexParams(request.getMaxRecords());
         }
         return fetchParams;
     }

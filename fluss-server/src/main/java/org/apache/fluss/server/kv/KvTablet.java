@@ -40,6 +40,7 @@ import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.server.index.IndexCache;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.TruncateReason;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
@@ -109,6 +110,9 @@ public final class KvTablet {
     private final RowMerger rowMerger;
     private final ArrowCompressionInfo arrowCompressionInfo;
 
+    // IndexCache for real-time hot data indexing (nullable for tables without indexes)
+    private final @Nullable IndexCache indexCache;
+
     /**
      * The kv data in pre-write buffer whose log offset is less than the flushedLogOffset has been
      * flushed into kv.
@@ -132,7 +136,8 @@ public final class KvTablet {
             KvFormat kvFormat,
             Schema schema,
             RowMerger rowMerger,
-            ArrowCompressionInfo arrowCompressionInfo) {
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable IndexCache indexCache) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
@@ -147,6 +152,7 @@ public final class KvTablet {
         this.schema = schema;
         this.rowMerger = rowMerger;
         this.arrowCompressionInfo = arrowCompressionInfo;
+        this.indexCache = indexCache;
     }
 
     public static KvTablet create(
@@ -159,7 +165,8 @@ public final class KvTablet {
             KvFormat kvFormat,
             Schema schema,
             RowMerger rowMerger,
-            ArrowCompressionInfo arrowCompressionInfo)
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable IndexCache indexCache)
             throws IOException {
         Tuple2<PhysicalTablePath, TableBucket> tablePathAndBucket =
                 FlussPaths.parseTabletDir(kvTabletDir);
@@ -175,7 +182,8 @@ public final class KvTablet {
                 kvFormat,
                 schema,
                 rowMerger,
-                arrowCompressionInfo);
+                arrowCompressionInfo,
+                indexCache);
     }
 
     public static KvTablet create(
@@ -190,7 +198,8 @@ public final class KvTablet {
             KvFormat kvFormat,
             Schema schema,
             RowMerger rowMerger,
-            ArrowCompressionInfo arrowCompressionInfo)
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable IndexCache indexCache)
             throws IOException {
         RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir);
         return new KvTablet(
@@ -207,7 +216,8 @@ public final class KvTablet {
                 kvFormat,
                 schema,
                 rowMerger,
-                arrowCompressionInfo);
+                arrowCompressionInfo,
+                indexCache);
     }
 
     private static RocksDBKv buildRocksDBKv(Configuration configuration, File kvDir)
@@ -366,6 +376,25 @@ public final class KvTablet {
                         if (logAppendInfo.duplicated()) {
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
+                        } else {
+                            // NEW: Write hot data to IndexCache for real-time index caching
+                            // Only process hot data writing if the batch is not duplicated
+                            IndexCache cache = this.indexCache;
+                            if (cache != null && !schema.getIndexes().isEmpty()) {
+                                try {
+                                    // Use the WAL LogRecords and appendInfo to process hot data
+                                    cache.writeHotDataFromWAL(walBuilder.build(), logAppendInfo);
+                                    LOG.debug(
+                                            "Successfully processed hot data via IndexCache for {}",
+                                            tableBucket);
+                                } catch (Exception e) {
+                                    LOG.warn(
+                                            "Error while writing hot data to IndexCache for {}",
+                                            tableBucket,
+                                            e);
+                                    // Don't fail the main write operation due to index cache issues
+                                }
+                            }
                         }
                         return logAppendInfo;
                     } catch (Throwable t) {
@@ -442,8 +471,17 @@ public final class KvTablet {
                 });
     }
 
-    /** put key,value,logOffset into pre-write buffer directly. */
-    void putToPreWriteBuffer(byte[] key, @Nullable byte[] value, long logOffset) {
+    /**
+     * Put key,value,logOffset into pre-write buffer directly.
+     *
+     * <p>This method is intended for use only in recovery operations and index updates. It bypasses
+     * the normal write flow and should not be used for regular client writes.
+     *
+     * @param key the key bytes
+     * @param value the value bytes, null for deletion
+     * @param logOffset the log offset for this record
+     */
+    public void putToPreWriteBuffer(byte[] key, @Nullable byte[] value, long logOffset) {
         KvPreWriteBuffer.Key wrapKey = KvPreWriteBuffer.Key.of(key);
         if (value == null) {
             kvPreWriteBuffer.delete(wrapKey, logOffset);

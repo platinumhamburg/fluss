@@ -22,6 +22,7 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
+import org.apache.fluss.client.lookup.SecondaryIndexLookuper;
 import org.apache.fluss.client.table.scanner.Scan;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
@@ -44,6 +45,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.TestData;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
@@ -64,6 +66,7 @@ import javax.annotation.Nullable;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -78,6 +81,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA3_SCHEMA_PK;
+import static org.apache.fluss.record.TestData.PARTITIONED_INDEXED_TABLE_DESCRIPTOR;
 import static org.apache.fluss.testutils.DataTestUtils.assertRowValueEquals;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.keyRow;
@@ -1177,6 +1181,230 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             assertThat(filesystemConf.toMap())
                     .containsExactlyEntriesOf(
                             Collections.singletonMap("client.fs.test.key", "fs_test_value"));
+        }
+    }
+
+    @Test
+    void testSecondaryIndexLookup() throws Exception {
+        // Step 1: Create a table with global secondary index definitions
+        Schema schema = TestData.INDEXED_SCHEMA;
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        createTable(TestData.INDEXED_TABLE_PATH, tableDescriptor, false);
+
+        // Step 2: Verify both table and index tables are created correctly
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Table mainTable = conn.getTable(TestData.INDEXED_TABLE_PATH);
+
+            // Check main table exists
+            assertThat(mainTable).isNotNull();
+
+            // Check index tables exist
+            Table nameIndexTable = conn.getTable(TestData.IDX_NAME_TABLE_PATH);
+            assertThat(nameIndexTable).isNotNull();
+            Table emailIndexTable = conn.getTable(TestData.IDX_EMAIL_TABLE_PATH);
+            assertThat(emailIndexTable).isNotNull();
+
+            // Check index tables exist by trying to create SecondaryIndexLookupers
+            Lookuper nameIndexLookuper = mainTable.newLookup().lookupBy("name").createLookuper();
+            Lookuper emailIndexLookuper = mainTable.newLookup().lookupBy("email").createLookuper();
+
+            assertThat(nameIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+            assertThat(emailIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+
+            // Step 3: Write data to main table
+            UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
+
+            // Insert test data
+            upsertWriter.upsert(row(1, "Alice", "alice@example.com")).get();
+            upsertWriter.upsert(row(2, "Bob", "bob@example.com")).get();
+            upsertWriter.upsert(row(3, "Charlie", "charlie@example.com")).get();
+            upsertWriter.upsert(row(4, "Diana", "diana@example.com")).get();
+            upsertWriter.upsert(row(5, "Eve", "eve@example.com")).get();
+
+            // Step 4: Create SecondaryIndexLookupers and test lookup functionality
+
+            // Test name index lookup
+            CompletableFuture<LookupResult> nameLookupFuture =
+                    nameIndexLookuper.lookup(row("Alice"));
+            LookupResult nameLookupResult = nameLookupFuture.get();
+            assertThat(nameLookupResult).isNotNull();
+            assertThat(nameLookupResult.getRowList()).hasSize(1);
+            InternalRow nameResultRow = nameLookupResult.getRowList().get(0);
+            assertThat(nameResultRow.getInt(0)).isEqualTo(1); // id
+            assertThat(nameResultRow.getString(1).toString()).isEqualTo("Alice"); // name
+            assertThat(nameResultRow.getString(2).toString())
+                    .isEqualTo("alice@example.com"); // email
+
+            // Test email index lookup
+            CompletableFuture<LookupResult> emailLookupFuture =
+                    emailIndexLookuper.lookup(row("bob@example.com"));
+            LookupResult emailLookupResult = emailLookupFuture.get();
+            assertThat(emailLookupResult).isNotNull();
+            assertThat(emailLookupResult.getRowList()).hasSize(1);
+            InternalRow emailResultRow = emailLookupResult.getRowList().get(0);
+            assertThat(emailResultRow.getInt(0)).isEqualTo(2); // id
+            assertThat(emailResultRow.getString(1).toString()).isEqualTo("Bob"); // name
+            assertThat(emailResultRow.getString(2).toString())
+                    .isEqualTo("bob@example.com"); // email
+
+            // Test lookup with non-existent values
+            CompletableFuture<LookupResult> nonExistentNameLookup =
+                    nameIndexLookuper.lookup(row("NonExistent"));
+            LookupResult nonExistentNameResult = nonExistentNameLookup.get();
+            assertThat(nonExistentNameResult.getRowList()).isEmpty();
+
+            CompletableFuture<LookupResult> nonExistentEmailLookup =
+                    emailIndexLookuper.lookup(row("nonexistent@example.com"));
+            LookupResult nonExistentEmailResult = nonExistentEmailLookup.get();
+            assertThat(nonExistentEmailResult.getRowList()).isEmpty();
+        }
+    }
+
+    @Test
+    void testPartitionedTableSecondaryIndexLookup() throws Exception {
+        // This test verifies that global secondary indexes work correctly with partitioned tables.
+        // Key design points:
+        // 1. Index tables are never partitioned, regardless of main table partitioning
+        // 2. Index tables dynamically track and adjust indexing targets when partitions are
+        // added/dropped
+
+        // Step 1: Create a partitioned table with global secondary index definitions
+        createTable(
+                TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                PARTITIONED_INDEXED_TABLE_DESCRIPTOR,
+                false);
+
+        // Step 2: Verify both main table and index tables are created correctly
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Table mainTable = conn.getTable(TestData.PARTITIONED_INDEXED_TABLE_PATH);
+
+            // Check main table exists
+            assertThat(mainTable).isNotNull();
+
+            // Check index tables exist
+            Table nameIndexTable = conn.getTable(TestData.PARTITIONED_IDX_NAME_TABLE_PATH);
+            assertThat(nameIndexTable).isNotNull();
+            Table emailIndexTable = conn.getTable(TestData.PARTITIONED_IDX_EMAIL_TABLE_PATH);
+            assertThat(emailIndexTable).isNotNull();
+
+            // Step 3: Create partitions and add test data
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2023"),
+                            false)
+                    .get();
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2024"),
+                            false)
+                    .get();
+
+            // Wait for partitions to be ready
+            FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 2);
+
+            // Step 4: Write data to the partitioned main table
+            UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
+
+            // Insert test data across different partitions
+            upsertWriter.upsert(row(1, "Alice", "alice@example.com", "2023")).get();
+            upsertWriter.upsert(row(2, "Bob", "bob@example.com", "2023")).get();
+            upsertWriter.upsert(row(3, "Charlie", "charlie@example.com", "2024")).get();
+            upsertWriter.upsert(row(4, "Diana", "diana@example.com", "2024")).get();
+
+            // Step 5: Create SecondaryIndexLookupers and test lookup functionality
+            Lookuper nameIndexLookuper = mainTable.newLookup().lookupBy("name").createLookuper();
+            Lookuper emailIndexLookuper = mainTable.newLookup().lookupBy("email").createLookuper();
+
+            assertThat(nameIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+            assertThat(emailIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+
+            // Test name index lookup across partitions
+            CompletableFuture<LookupResult> nameLookupFuture =
+                    nameIndexLookuper.lookup(row("Alice"));
+            LookupResult nameLookupResult = nameLookupFuture.get();
+            assertThat(nameLookupResult).isNotNull();
+            assertThat(nameLookupResult.getRowList()).hasSize(1);
+            InternalRow nameResultRow = nameLookupResult.getRowList().get(0);
+            assertThat(nameResultRow.getInt(0)).isEqualTo(1); // id
+            assertThat(nameResultRow.getString(1).toString()).isEqualTo("Alice"); // name
+            assertThat(nameResultRow.getString(2).toString())
+                    .isEqualTo("alice@example.com"); // email
+            assertThat(nameResultRow.getString(3).toString()).isEqualTo("2023"); // year
+
+            // Test email index lookup across partitions
+            CompletableFuture<LookupResult> emailLookupFuture =
+                    emailIndexLookuper.lookup(row("charlie@example.com"));
+            LookupResult emailLookupResult = emailLookupFuture.get();
+            assertThat(emailLookupResult).isNotNull();
+            assertThat(emailLookupResult.getRowList()).hasSize(1);
+            InternalRow emailResultRow = emailLookupResult.getRowList().get(0);
+            assertThat(emailResultRow.getInt(0)).isEqualTo(3); // id
+            assertThat(emailResultRow.getString(1).toString()).isEqualTo("Charlie"); // name
+            assertThat(emailResultRow.getString(2).toString())
+                    .isEqualTo("charlie@example.com"); // email
+            assertThat(emailResultRow.getString(3).toString()).isEqualTo("2024"); // year
+
+            // Step 6: Test partition addition and index adaptation
+            // Note: Index tables are not partitioned, they adapt to main table partition changes
+            // through TabletServerMetadataCache and dynamically track indexing targets
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2025"),
+                            false)
+                    .get();
+
+            // Wait for new partition to be ready
+            FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 3);
+
+            // Add data to the new partition
+            upsertWriter.upsert(row(5, "Eve", "eve@example.com", "2025")).get();
+
+            // Test lookup can find data in the new partition
+            CompletableFuture<LookupResult> eveLookupFuture = nameIndexLookuper.lookup(row("Eve"));
+            LookupResult eveLookupResult = eveLookupFuture.get();
+            assertThat(eveLookupResult).isNotNull();
+            assertThat(eveLookupResult.getRowList()).hasSize(1);
+            InternalRow eveResultRow = eveLookupResult.getRowList().get(0);
+            assertThat(eveResultRow.getInt(0)).isEqualTo(5); // id
+            assertThat(eveResultRow.getString(1).toString()).isEqualTo("Eve"); // name
+            assertThat(eveResultRow.getString(3).toString()).isEqualTo("2025"); // year
+
+            // Step 7: Test partition deletion and index adaptation
+            // Index tables will automatically stop tracking the dropped partition data
+            admin.dropPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2023"),
+                            false)
+                    .get();
+
+            // Wait for partition to be dropped
+            FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsDropped(
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, Arrays.asList("2023"));
+
+            // Test lookup for data that was in the dropped partition should return empty
+            CompletableFuture<LookupResult> aliceLookupFuture =
+                    nameIndexLookuper.lookup(row("Alice"));
+            LookupResult aliceLookupResult = aliceLookupFuture.get();
+            assertThat(aliceLookupResult.getRowList()).isEmpty();
+
+            // Test lookup for data in remaining partitions should still work
+            CompletableFuture<LookupResult> charlieLookupFuture =
+                    nameIndexLookuper.lookup(row("Charlie"));
+            LookupResult charlieLookupResult = charlieLookupFuture.get();
+            assertThat(charlieLookupResult).isNotNull();
+            assertThat(charlieLookupResult.getRowList()).hasSize(1);
+            InternalRow charlieResultRow = charlieLookupResult.getRowList().get(0);
+            assertThat(charlieResultRow.getString(3).toString()).isEqualTo("2024"); // year
+
+            // Test lookup with non-existent values
+            CompletableFuture<LookupResult> nonExistentLookup =
+                    nameIndexLookuper.lookup(row("NonExistent"));
+            LookupResult nonExistentResult = nonExistentLookup.get();
+            assertThat(nonExistentResult.getRowList()).isEmpty();
         }
     }
 }

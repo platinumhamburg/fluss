@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.GatewayClientProxy;
 import org.apache.fluss.rpc.RpcClient;
@@ -40,6 +41,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.utils.function.ThrowingConsumer.unchecked;
@@ -59,6 +61,9 @@ public class ReplicaFetcherManager {
     // map of (source tablet_server_id, fetcher_id per source tablet server) => fetcher.
     @GuardedBy("lock")
     private final Map<ServerIdAndFetcherId, ReplicaFetcherThread> fetcherThreadMap =
+            new HashMap<>();
+
+    private final Map<ServerIdAndFetcherId, IndexFetcherThread> indexFetcherThreadMap =
             new HashMap<>();
 
     private final Configuration conf;
@@ -128,6 +133,70 @@ public class ReplicaFetcherManager {
         }
     }
 
+    public void addIndexFetcher(
+            Map<DataIndexTableBucket, IndexInitialFetchStatus> bucketAndStatus) {
+
+        synchronized (lock) {
+            Map<ServerAndFetcherId, Map<DataIndexTableBucket, IndexInitialFetchStatus>>
+                    replicasPerFetcher =
+                            bucketAndStatus.entrySet().stream()
+                                    .collect(
+                                            Collectors.groupingBy(
+                                                    entry ->
+                                                            new ServerAndFetcherId(
+                                                                    entry.getValue()
+                                                                            .dataTableLeader(),
+                                                                    getFetcherId(
+                                                                            entry.getKey()
+                                                                                    .getDataBucket())),
+                                                    Collectors.toMap(
+                                                            Map.Entry::getKey,
+                                                            Map.Entry::getValue)));
+            replicasPerFetcher.forEach(
+                    (serverAndFetcherId, initialFetchStatusMap) -> {
+                        ServerIdAndFetcherId serverIdAndFetcherId =
+                                new ServerIdAndFetcherId(
+                                        serverAndFetcherId.leaderId, serverAndFetcherId.fetcherId);
+                        IndexFetcherThread fetcherThread =
+                                indexFetcherThreadMap.get(serverIdAndFetcherId);
+                        if (fetcherThread == null) {
+                            fetcherThread =
+                                    addAndStartIndexFetcherThread(
+                                            serverAndFetcherId, serverIdAndFetcherId);
+                            LOG.info(
+                                    "Created new IndexFetcherThread for leader {} with {} index buckets",
+                                    serverAndFetcherId.leaderId,
+                                    initialFetchStatusMap.size());
+                        } else if (fetcherThread.getLeader().leaderServerId()
+                                != serverAndFetcherId.leaderId) {
+                            try {
+                                fetcherThread.shutdown();
+                                LOG.info(
+                                        "Restarted IndexFetcherThread due to leader change: {} -> {}",
+                                        fetcherThread.getLeader().leaderServerId(),
+                                        serverAndFetcherId.leaderId);
+                            } catch (InterruptedException e) {
+                                LOG.error("Interrupted while shutting down fetcher threads.", e);
+                            }
+                            fetcherThread =
+                                    addAndStartIndexFetcherThread(
+                                            serverAndFetcherId, serverIdAndFetcherId);
+                        }
+                        addIndexBucketsToFetcherThread(fetcherThread, initialFetchStatusMap);
+                    });
+        }
+    }
+
+    private void addIndexBucketsToFetcherThread(
+            IndexFetcherThread fetcherThread,
+            Map<DataIndexTableBucket, IndexInitialFetchStatus> initialFetchStatusMap) {
+        try {
+            fetcherThread.addIndexBuckets(initialFetchStatusMap);
+        } catch (InterruptedException e) {
+            LOG.error("Interrupted while adding index buckets to fetcher threads.", e);
+        }
+    }
+
     public void removeFetcherForBuckets(Set<TableBucket> tableBuckets) {
         synchronized (lock) {
             fetcherThreadMap
@@ -144,13 +213,38 @@ public class ReplicaFetcherManager {
         }
 
         if (!tableBuckets.isEmpty()) {
-            LOG.info("Remove fetcher for buckets: {}", tableBuckets);
+            LOG.info("Removed fetcher for {} buckets: {}", tableBuckets.size(), tableBuckets);
+        }
+    }
+
+    public void removeFetcherForIndexBuckets(Set<TableBucket> indexBuckets) {
+        synchronized (lock) {
+            indexFetcherThreadMap
+                    .values()
+                    .forEach(
+                            fetcher -> {
+                                fetcher.removeIndexBuckets(indexBuckets);
+                            });
+        }
+        if (!indexBuckets.isEmpty()) {
+            LOG.info("Removed index fetcher for {} buckets: {}", indexBuckets.size(), indexBuckets);
+        }
+    }
+
+    public void removeIndexFetcherIf(Predicate<DataIndexTableBucket> predicate) {
+        synchronized (lock) {
+            indexFetcherThreadMap
+                    .values()
+                    .forEach(
+                            fetcher -> {
+                                fetcher.removeIf(predicate);
+                            });
         }
     }
 
     public void shutdownIdleFetcherThreads() {
         synchronized (lock) {
-            Set<ServerIdAndFetcherId> keysToBeRemoved = new HashSet<>();
+            Set<ServerIdAndFetcherId> fetcherThreadsToBeRemoved = new HashSet<>();
             fetcherThreadMap.forEach(
                     (serverIdAndFetcherId, fetcher) -> {
                         if (fetcher.getBucketCount() <= 0) {
@@ -159,11 +253,24 @@ public class ReplicaFetcherManager {
                             } catch (InterruptedException e) {
                                 LOG.error("Interrupted while shutting down fetcher threads.", e);
                             }
-                            keysToBeRemoved.add(serverIdAndFetcherId);
+                            fetcherThreadsToBeRemoved.add(serverIdAndFetcherId);
                         }
                     });
 
-            keysToBeRemoved.forEach(fetcherThreadMap::remove);
+            fetcherThreadsToBeRemoved.forEach(fetcherThreadMap::remove);
+            Set<ServerIdAndFetcherId> indexFetcherThreadsToBeRemoved = new HashSet<>();
+            indexFetcherThreadMap.forEach(
+                    (serverIdAndFetcherId, fetcher) -> {
+                        if (fetcher.getBucketCount() <= 0) {
+                            try {
+                                fetcher.shutdown();
+                            } catch (InterruptedException e) {
+                                LOG.error("Interrupted while shutting down fetcher threads.", e);
+                            }
+                            indexFetcherThreadsToBeRemoved.add(serverIdAndFetcherId);
+                        }
+                    });
+            indexFetcherThreadsToBeRemoved.forEach(indexFetcherThreadMap::remove);
         }
     }
 
@@ -180,10 +287,29 @@ public class ReplicaFetcherManager {
         return fetcherThread;
     }
 
+    private IndexFetcherThread addAndStartIndexFetcherThread(
+            ServerAndFetcherId serverAndFetcherId, ServerIdAndFetcherId serverIdAndFetcherId) {
+        IndexFetcherThread fetcherThread =
+                createIndexFetcherThread(serverAndFetcherId.fetcherId, serverAndFetcherId.leaderId);
+        indexFetcherThreadMap.put(serverIdAndFetcherId, fetcherThread);
+        fetcherThread.start();
+        return fetcherThread;
+    }
+
     ReplicaFetcherThread createFetcherThread(int fetcherId, int leaderId) {
         String threadName = "ReplicaFetcherThread-" + fetcherId + "-" + leaderId;
         LeaderEndpoint leaderEndpoint = buildRemoteLogEndpoint(leaderId);
         return new ReplicaFetcherThread(
+                threadName,
+                replicaManager,
+                leaderEndpoint,
+                (int) conf.get(ConfigOptions.LOG_REPLICA_FETCH_BACKOFF_INTERVAL).toMillis());
+    }
+
+    IndexFetcherThread createIndexFetcherThread(int fetcherId, int leaderId) {
+        String threadName = "IndexFetcherThread-" + fetcherId + "-" + leaderId;
+        LeaderEndpoint leaderEndpoint = buildRemoteLogEndpoint(leaderId);
+        return new IndexFetcherThread(
                 threadName,
                 replicaManager,
                 leaderEndpoint,
@@ -221,9 +347,9 @@ public class ReplicaFetcherManager {
         try {
             fetcherThread.addBuckets(initialFetchStatusMap);
             LOG.info(
-                    "Added fetcher to server {} with initial fetch status {}",
+                    "Added fetcher to server {} for {} data buckets",
                     fetcherThread.getLeader().leaderServerId(),
-                    initialFetchStatusMap);
+                    initialFetchStatusMap.size());
         } catch (InterruptedException e) {
             LOG.error("Interrupted while add buckets to fetcher threads.", e);
         }
