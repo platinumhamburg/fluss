@@ -38,6 +38,7 @@ import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.server.index.IndexCache;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -96,6 +97,9 @@ public final class LogTablet {
 
     @GuardedBy("lock")
     private final WriterStateManager writerStateManager;
+
+    // IndexCache for index visibility control, null if no indexes exist for the table
+    private volatile IndexCache indexCache;
 
     private final Scheduler scheduler;
     private final ScheduledFuture<?> writerExpireCheck;
@@ -241,6 +245,16 @@ public final class LogTablet {
 
     public long getLakeTableSnapshotId() {
         return lakeTableSnapshotId;
+    }
+
+    /**
+     * Set the IndexCache for index visibility control. This is called by Replica when IndexCache is
+     * created.
+     *
+     * @param indexCache the IndexCache instance, can be null if no indexes exist
+     */
+    public void setIndexCache(@Nullable IndexCache indexCache) {
+        this.indexCache = indexCache;
     }
 
     public long getLakeLogStartOffset() {
@@ -397,7 +411,36 @@ public final class LogTablet {
         if (fetchIsolation == FetchIsolation.LOG_END) {
             maxOffsetMetadata = localLog.getLocalLogEndOffsetMetadata();
         } else if (fetchIsolation == FetchIsolation.HIGH_WATERMARK) {
-            maxOffsetMetadata = fetchHighWatermarkMetadata();
+            // Get base high watermark first
+            LogOffsetMetadata highWatermarkMetadata = fetchHighWatermarkMetadata();
+
+            // Apply index visibility control if IndexCache exists
+            IndexCache cache = this.indexCache;
+            if (cache != null) {
+                long indexCommitHorizon = cache.getIndexCommitHorizon();
+                long highWatermark = highWatermarkMetadata.getMessageOffset();
+
+                // Use minimum of HW and indexCommitHorizon for visibility control
+                long maxOffset = Math.min(highWatermark, indexCommitHorizon);
+
+                if (maxOffset < highWatermark) {
+                    // Need to create offset metadata for the maxOffset
+                    try {
+                        maxOffsetMetadata = convertToOffsetMetadataOrThrow(maxOffset);
+                    } catch (LogOffsetOutOfRangeException e) {
+                        LOG.warn(
+                                "Index commit horizon {} is out of range, falling back to base HW {} for bucket {}",
+                                maxOffset,
+                                highWatermark,
+                                getTableBucket());
+                        maxOffsetMetadata = highWatermarkMetadata;
+                    }
+                } else {
+                    maxOffsetMetadata = highWatermarkMetadata;
+                }
+            } else {
+                maxOffsetMetadata = highWatermarkMetadata;
+            }
         }
 
         return localLog.read(readOffset, maxLength, minOneMessage, maxOffsetMetadata, projection);

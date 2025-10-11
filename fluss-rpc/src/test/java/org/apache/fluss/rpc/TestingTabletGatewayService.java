@@ -23,6 +23,8 @@ import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsResponse;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
+import org.apache.fluss.rpc.messages.FetchIndexResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
@@ -112,6 +114,11 @@ public class TestingTabletGatewayService extends TestingGatewayService
 
     @Override
     public CompletableFuture<FetchLogResponse> fetchLog(FetchLogRequest request) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<FetchIndexResponse> fetchIndex(FetchIndexRequest request) {
         return null;
     }
 

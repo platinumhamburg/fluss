@@ -23,11 +23,14 @@ import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentOutputView;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.utils.crc.Crc32C;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_LENGTH;
@@ -65,6 +68,8 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
     private volatile boolean isClosed;
     private boolean aborted = false;
 
+    private List<MemorySegmentBytesView> writtenBytesView;
+
     private MemoryLogRecordsIndexedBuilder(
             long baseLogOffset,
             int schemaId,
@@ -91,6 +96,41 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
         // we'll skip it first.
         this.pagedOutputView.setPosition(recordBatchHeaderSize(magic));
         this.sizeInBytes = recordBatchHeaderSize(magic);
+        this.writtenBytesView = null;
+    }
+
+    private MemoryLogRecordsIndexedBuilder(
+            long baseLogOffset,
+            int schemaId,
+            byte magic,
+            List<MemorySegmentBytesView> preWrittenBytesView,
+            int preWrittenRecordsNumber,
+            boolean appendOnly) {
+        this.appendOnly = appendOnly;
+        checkArgument(
+                schemaId <= Short.MAX_VALUE,
+                "schemaId shouldn't be greater than the max value of short: " + Short.MAX_VALUE);
+        this.baseLogOffset = baseLogOffset;
+        this.schemaId = schemaId;
+        this.writeLimit = Integer.MAX_VALUE;
+        this.magic = magic;
+        int headSize = recordBatchHeaderSize(magic);
+        this.firstSegment = MemorySegment.allocateHeapMemory(headSize + 1);
+        this.writerId = NO_WRITER_ID;
+        this.batchSequence = NO_BATCH_SEQUENCE;
+        this.currentRecordNumber = preWrittenRecordsNumber;
+        this.isClosed = false;
+
+        this.writtenBytesView = new ArrayList<>(preWrittenBytesView.size() + 1);
+        this.writtenBytesView.add(new MemorySegmentBytesView(firstSegment, 0, headSize));
+        this.writtenBytesView.addAll(preWrittenBytesView);
+
+        this.sizeInBytes =
+                writtenBytesView.stream()
+                        .map(MemorySegmentBytesView::getBytesLength)
+                        .reduce(Integer::sum)
+                        .get();
+        this.pagedOutputView = null;
     }
 
     public static MemoryLogRecordsIndexedBuilder builder(
@@ -101,6 +141,20 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
                 writeLimit,
                 CURRENT_LOG_MAGIC_VALUE,
                 outputView,
+                appendOnly);
+    }
+
+    public static MemoryLogRecordsIndexedBuilder builder(
+            int schemaId,
+            List<MemorySegmentBytesView> preWrittenByteViews,
+            int preWrittenRecordsNumber,
+            boolean appendOnly) {
+        return new MemoryLogRecordsIndexedBuilder(
+                BUILDER_DEFAULT_OFFSET,
+                schemaId,
+                CURRENT_LOG_MAGIC_VALUE,
+                preWrittenByteViews,
+                preWrittenRecordsNumber,
                 appendOnly);
     }
 
@@ -158,11 +212,13 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
             return builtBuffer;
         }
 
+        if (pagedOutputView != null) {
+            this.writtenBytesView = pagedOutputView.getWrittenSegments();
+        }
         writeBatchHeader();
         builtBuffer =
-                MultiBytesView.builder()
-                        .addMemorySegmentByteViewList(pagedOutputView.getWrittenSegments())
-                        .build();
+                MultiBytesView.builder().addMemorySegmentByteViewList(writtenBytesView).build();
+
         return builtBuffer;
     }
 
@@ -247,7 +303,12 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
         outputView.writeInt(currentRecordNumber);
 
         // Update crc.
-        long crc = Crc32C.compute(pagedOutputView.getWrittenSegments(), schemaIdOffset(magic));
+        long crc = 0;
+        if (pagedOutputView != null) {
+            crc = Crc32C.compute(pagedOutputView.getWrittenSegments(), schemaIdOffset(magic));
+        } else {
+            crc = Crc32C.compute(writtenBytesView, schemaIdOffset(magic));
+        }
         outputView.setPosition(crcOffset(magic));
         outputView.writeUnsignedInt(crc);
     }

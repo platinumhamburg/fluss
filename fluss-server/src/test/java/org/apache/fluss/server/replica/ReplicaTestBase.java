@@ -23,15 +23,17 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
-import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
+import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
@@ -106,6 +108,7 @@ import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
 import static org.apache.fluss.record.TestData.DATA2_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA2_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA2_TABLE_PATH;
+import static org.apache.fluss.record.TestData.INDEXED_TABLE_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.replica.ReplicaManager.HIGH_WATERMARK_CHECKPOINT_FILE_NAME;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_BUCKET_EPOCH;
@@ -203,7 +206,11 @@ public class ReplicaTestBase {
                                 new LakeCatalogDynamicLoader(new Configuration(), null, true)));
         initMetadataCache(serverMetadataCache);
 
-        rpcClient = RpcClient.create(conf, TestingClientMetricGroup.newInstance(), false);
+        rpcClient =
+                RpcClient.create(
+                        conf,
+                        new ClientMetricGroup(NOPMetricRegistry.INSTANCE, "test-client"),
+                        false);
 
         snapshotReporter = new TestingCompletedKvSnapshotCommitter();
 
@@ -347,6 +354,10 @@ public class ReplicaTestBase {
         makeLogTableAsLeader(new TableBucket(DATA1_TABLE_ID, bucketId), false);
     }
 
+    protected void makeIndexedTableAsLeader(int bucketId) {
+        makeLogTableAsLeader(new TableBucket(INDEXED_TABLE_ID, bucketId), false);
+    }
+
     /** If partitionTable is true, the partitionId of input TableBucket tb can not be null. */
     protected void makeLogTableAsLeader(TableBucket tb, boolean partitionTable) {
         makeLogTableAsLeader(
@@ -473,7 +484,9 @@ public class ReplicaTestBase {
                 NOPErrorHandler.INSTANCE,
                 metricGroup,
                 DATA1_TABLE_INFO,
-                manualClock);
+                manualClock,
+                remoteLogManager,
+                new TestingMemorySegmentPool(64 * 1024));
     }
 
     private void initRemoteLogEnv() throws Exception {

@@ -19,11 +19,16 @@ package org.apache.fluss.server.replica.fetcher;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
+import org.apache.fluss.rpc.messages.PbFetchIndexRespForIndexTableBucket;
+import org.apache.fluss.rpc.messages.PbFetchIndexRespForTableBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForTable;
@@ -38,6 +43,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.getFetchIndexLogResultForBucket;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.getFetchLogResultForBucket;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeListOffsetsRequest;
 
@@ -122,6 +128,48 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                             }
 
                             return new FetchData(fetchLogResponse, fetchLogResultMap);
+                        });
+    }
+
+    public CompletableFuture<FetchIndexData> fetchIndex(FetchIndexContext fetchIndexContext) {
+        FetchIndexRequest fetchIndexRequest = fetchIndexContext.getFetchIndexRequest();
+        return tabletServerGateway
+                .fetchIndex(fetchIndexRequest)
+                .thenApply(
+                        fetchIndexResponse -> {
+                            Map<DataIndexTableBucket, FetchIndexLogResultForBucket>
+                                    fetchIndexResultMap = new HashMap<>();
+                            List<PbFetchIndexRespForIndexTableBucket> indexBucketResponseList =
+                                    fetchIndexResponse.getRespForIndexTableBucketsList();
+                            for (PbFetchIndexRespForIndexTableBucket indexBucketResponse :
+                                    indexBucketResponseList) {
+                                TableBucket indexTableBucket =
+                                        new TableBucket(
+                                                indexBucketResponse.getTableId(),
+                                                indexBucketResponse.hasPartitionId()
+                                                        ? indexBucketResponse.getPartitionId()
+                                                        : null,
+                                                indexBucketResponse.getBucketId());
+                                List<PbFetchIndexRespForTableBucket> tableBucketsResponseList =
+                                        indexBucketResponse.getRespForTablesList();
+                                for (PbFetchIndexRespForTableBucket tableBucketResponse :
+                                        tableBucketsResponseList) {
+                                    TableBucket dataTableBucket =
+                                            new TableBucket(
+                                                    tableBucketResponse.getTableId(),
+                                                    tableBucketResponse.hasPartitionId()
+                                                            ? tableBucketResponse.getPartitionId()
+                                                            : null,
+                                                    tableBucketResponse.getBucketId());
+                                    FetchIndexLogResultForBucket fetchIndexLogResultForBucket =
+                                            getFetchIndexLogResultForBucket(tableBucketResponse);
+                                    fetchIndexResultMap.put(
+                                            new DataIndexTableBucket(
+                                                    dataTableBucket, indexTableBucket),
+                                            fetchIndexLogResultForBucket);
+                                }
+                            }
+                            return new FetchIndexData(fetchIndexResponse, fetchIndexResultMap);
                         });
     }
 

@@ -193,6 +193,9 @@ public class FlinkConversions {
             schemBuilder.primaryKey(resolvedSchema.getPrimaryKey().get().getColumns());
         }
 
+        // parse global secondary indexes from options
+        parseGlobalSecondaryIndexes(flinkTableConf, schemBuilder);
+
         // first build schema with physical columns
         Schema schema =
                 schemBuilder
@@ -245,6 +248,14 @@ public class FlinkConversions {
 
         // convert some flink options to fluss table configs.
         Map<String, String> properties = convertFlinkOptionsToFlussTableProperties(flinkTableConf);
+
+        // add index bucket num configuration if present
+        String indexBucketNumKey = org.apache.fluss.config.ConfigOptions.TABLE_INDEX_BUCKET_NUM.key();
+        if (flinkTableConf.containsKey(indexBucketNumKey)) {
+            properties.put(
+                    org.apache.fluss.config.ConfigOptions.TABLE_INDEX_BUCKET_NUM.key(),
+                    flinkTableConf.toMap().get(indexBucketNumKey));
+        }
 
         // then set distributed by information
         List<String> bucketKey;
@@ -580,5 +591,101 @@ public class FlinkConversions {
                 .refreshHandlerDescription(refreshHandlerDesc)
                 .serializedRefreshHandler(refreshHandlerBytes);
         return builder.build();
+    }
+
+    /**
+     * Parse global secondary indexes from Flink table options.
+     *
+     * <p>Supports configuration format:
+     *
+     * <ul>
+     *   <li>indexes.columns: semicolon-separated indexes, comma-separated columns within each index
+     * </ul>
+     *
+     * <p>Additional option: - index.bucket.num: bucket count for index tables (default: 3)
+     *
+     * @param options Flink table configuration options
+     * @param schemaBuilder Schema builder to add indexes to
+     */
+    private static void parseGlobalSecondaryIndexes(
+            Configuration options, Schema.Builder schemaBuilder) {
+        Map<String, List<String>> indexColumns = new HashMap<>();
+
+        // Parse the table.indexes.columns format - use the correct key from ConfigOptions
+        String indexesColumnsKey = org.apache.fluss.config.ConfigOptions.TABLE_INDEXES_COLUMNS.key();
+        if (options.containsKey(indexesColumnsKey)) {
+            parseIndexesColumns(options.getString(indexesColumnsKey, ""), indexColumns);
+        }
+
+        // Add indexes to schema builder
+        for (Map.Entry<String, List<String>> entry : indexColumns.entrySet()) {
+            schemaBuilder.index(entry.getKey(), entry.getValue());
+        }
+    }
+
+    /**
+     * Parse indexes using the indexes.columns format. Format: 'col1,col2;col3,col4' - multiple
+     * indexes separated by ';', columns within each index separated by ','
+     *
+     * @param configValue the configuration value
+     * @param indexColumns output map to store parsed index configurations
+     */
+    private static void parseIndexesColumns(
+            String configValue, Map<String, List<String>> indexColumns) {
+        if (StringUtils.isNullOrWhitespaceOnly(configValue)) {
+            return;
+        }
+
+        String[] indexConfigs = configValue.split(";");
+        for (String indexConfig : indexConfigs) {
+            indexConfig = indexConfig.trim();
+            if (StringUtils.isNullOrWhitespaceOnly(indexConfig)) {
+                continue;
+            }
+
+            List<String> columns =
+                    Arrays.stream(indexConfig.split(","))
+                            .map(String::trim)
+                            .filter(col -> !StringUtils.isNullOrWhitespaceOnly(col))
+                            .collect(Collectors.toList());
+
+            if (columns.isEmpty()) {
+                throw new CatalogException(
+                        "Index configuration '"
+                                + indexConfig
+                                + "' must define at least one column");
+            }
+
+            // Check for duplicate columns within the same index
+            if (columns.size() != columns.stream().distinct().count()) {
+                throw new CatalogException(
+                        "Index configuration '" + indexConfig + "' contains duplicate columns");
+            }
+
+            // Generate index name automatically: idx_{sorted_column_names}
+            String indexName = generateIndexName(columns);
+
+            // Check for duplicate index configurations
+            if (indexColumns.containsKey(indexName)) {
+                throw new CatalogException(
+                        "Duplicate index configuration found for columns: "
+                                + String.join(",", columns));
+            }
+
+            indexColumns.put(indexName, columns);
+        }
+    }
+
+    /**
+     * Generate index name automatically based on column names. Format:
+     * idx_{sorted_column_names_joined_by_underscore}
+     *
+     * @param columns list of column names for the index
+     * @return generated index name
+     */
+    private static String generateIndexName(List<String> columns) {
+        List<String> sortedColumns = new ArrayList<>(columns);
+        sortedColumns.sort(String::compareTo);
+        return "idx_" + String.join("_", sortedColumns);
     }
 }

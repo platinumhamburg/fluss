@@ -794,4 +794,127 @@ abstract class FlinkCatalogITCase {
         actualOptions.remove(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);
     }
+
+    /** Test creating a table with global secondary index through Flink catalog. */
+    @Test
+    void testCreateTableWithGlobalSecondaryIndex() throws Exception {
+        // create table with global secondary index using Flink SQL
+        tEnv.executeSql(
+                "create table test_table_with_index ("
+                        + " id int not null primary key not enforced,"
+                        + " name string not null,"
+                        + " age int,"
+                        + " city string"
+                        + ") with ("
+                        + " 'table.indexes.columns' = 'name;age,city',"
+                        + " 'table.index.bucket.num' = '3'"
+                        + ")");
+
+        // verify main table exists and has correct schema
+        CatalogTable mainTable =
+                (CatalogTable)
+                        catalog.getTable(new ObjectPath(DEFAULT_DB, "test_table_with_index"));
+        assertThat(mainTable).isNotNull();
+
+        // verify index tables were created with correct naming
+        // index table name format: "__" + mainTableName + "__" + "index" + "__" + indexName
+        // (auto-generated)
+        String nameIndexTableName = "__test_table_with_index__index__idx_name";
+        String ageCityIndexTableName = "__test_table_with_index__index__idx_age_city";
+
+        // check name index table exists
+        assertThat(catalog.tableExists(new ObjectPath(DEFAULT_DB, nameIndexTableName))).isTrue();
+        CatalogTable nameIndexTable =
+                (CatalogTable) catalog.getTable(new ObjectPath(DEFAULT_DB, nameIndexTableName));
+
+        // verify name index table schema - should have name and id columns
+        Schema nameIndexSchema = nameIndexTable.getUnresolvedSchema();
+        assertThat(nameIndexSchema.getPrimaryKey()).isPresent();
+        assertThat(nameIndexSchema.getPrimaryKey().get().getColumnNames())
+                .containsExactly("name", "id"); // index columns + primary key columns
+
+        // check age_city index table exists
+        assertThat(catalog.tableExists(new ObjectPath(DEFAULT_DB, ageCityIndexTableName))).isTrue();
+        CatalogTable ageCityIndexTable =
+                (CatalogTable) catalog.getTable(new ObjectPath(DEFAULT_DB, ageCityIndexTableName));
+
+        // verify age_city index table schema - should have age, city, and id columns
+        Schema ageCityIndexSchema = ageCityIndexTable.getUnresolvedSchema();
+        assertThat(ageCityIndexSchema.getPrimaryKey()).isPresent();
+        assertThat(ageCityIndexSchema.getPrimaryKey().get().getColumnNames())
+                .containsExactly("age", "city", "id"); // index columns + primary key columns
+
+        // verify bucket configuration
+        Map<String, String> nameIndexOptions = nameIndexTable.getOptions();
+        Map<String, String> ageCityIndexOptions = ageCityIndexTable.getOptions();
+        assertThat(nameIndexOptions.get(BUCKET_NUMBER.key())).isEqualTo("3");
+        assertThat(ageCityIndexOptions.get(BUCKET_NUMBER.key())).isEqualTo("3");
+    }
+
+    /** Test creating a partitioned table with global secondary index through Flink catalog. */
+    @Test
+    void testCreatePartitionedTableWithGlobalSecondaryIndex() throws Exception {
+        // create partitioned table with global secondary index using Flink SQL
+        tEnv.executeSql(
+                "create table test_partitioned_table_with_index ("
+                        + " id int not null,"
+                        + " name string not null,"
+                        + " age int,"
+                        + " region string not null,"
+                        + " primary key (id, region) not enforced"
+                        + ") partitioned by (region) with ("
+                        + " 'indexes.columns' = 'name',"
+                        + " 'index.bucket.num' = '3'"
+                        + ")");
+
+        // verify main partitioned table exists and has correct schema
+        CatalogTable mainTable =
+                (CatalogTable)
+                        catalog.getTable(
+                                new ObjectPath(DEFAULT_DB, "test_partitioned_table_with_index"));
+        assertThat(mainTable).isNotNull();
+        assertThat(mainTable.getPartitionKeys()).containsExactly("region");
+
+        // verify index table was created and is also partitioned
+        String nameIndexTableName = "__test_partitioned_table_with_index__index__idx_name";
+        assertThat(catalog.tableExists(new ObjectPath(DEFAULT_DB, nameIndexTableName))).isTrue();
+
+        CatalogTable nameIndexTable =
+                (CatalogTable) catalog.getTable(new ObjectPath(DEFAULT_DB, nameIndexTableName));
+
+        // index table should also be partitioned with the same partition keys
+        assertThat(nameIndexTable.getPartitionKeys()).isEmpty();
+
+        // verify index table schema includes all necessary columns: index columns + primary key
+        // columns + partition columns
+        Schema nameIndexSchema = nameIndexTable.getUnresolvedSchema();
+        List<String> columnNames =
+                nameIndexSchema.getColumns().stream()
+                        .map(Schema.UnresolvedColumn::getName)
+                        .collect(Collectors.toList());
+        assertThat(columnNames).containsExactlyInAnyOrder("name", "id", "region", "__offset");
+
+        // verify primary key consists of index columns + primary key columns
+        assertThat(nameIndexSchema.getPrimaryKey()).isPresent();
+        assertThat(nameIndexSchema.getPrimaryKey().get().getColumnNames())
+                .containsExactly("name", "id", "region");
+    }
+
+    /** Test creating table with invalid index configuration should fail. */
+    @Test
+    void testCreateTableWithInvalidIndexConfiguration() {
+        // test index on non-existent column
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "create table test_table_invalid_index ("
+                                                + " id int not null primary key not enforced,"
+                                                + " name string"
+                                                + ") with ("
+                                                + " 'indexes.columns' = 'non_existent_column'"
+                                                + ")"))
+                .cause()
+                .hasMessageContaining(
+                        "Index idx_non_existent_column references non-existent columns. Index columns [non_existent_column] should be a subset of table columns [id, name]");
+    }
 }
