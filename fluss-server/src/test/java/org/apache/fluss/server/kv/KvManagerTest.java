@@ -279,7 +279,8 @@ final class KvManagerTest {
                 KvFormat.COMPACTED,
                 DATA1_SCHEMA_PK,
                 new TableConfig(new Configuration()),
-                DEFAULT_COMPRESSION);
+                DEFAULT_COMPRESSION,
+                null); // IndexCache can be null for testing
     }
 
     private byte[] valueOf(KvRecord kvRecord) {

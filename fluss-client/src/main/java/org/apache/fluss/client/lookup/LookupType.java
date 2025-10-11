@@ -23,5 +23,6 @@ import org.apache.fluss.annotation.Internal;
 @Internal
 public enum LookupType {
     LOOKUP,
-    PREFIX_LOOKUP;
+    PREFIX_LOOKUP,
+    SECONDARY_INDEX_LOOKUP;
 }

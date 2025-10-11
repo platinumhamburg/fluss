@@ -67,6 +67,19 @@ public class TableDescriptorValidation {
 
     /** Validate table descriptor to create is valid and contain all necessary information. */
     public static void validateTableDescriptor(TableDescriptor tableDescriptor, int maxBucketNum) {
+        validateTableDescriptor(tableDescriptor, maxBucketNum, false);
+    }
+
+    /**
+     * Validate table descriptor to create is valid and contain all necessary information.
+     *
+     * @param tableDescriptor the table descriptor to validate
+     * @param maxBucketNum the maximum bucket number allowed
+     * @param isIndexTable whether this is an index table (index tables are allowed to use __offset
+     *     system column)
+     */
+    public static void validateTableDescriptor(
+            TableDescriptor tableDescriptor, int maxBucketNum, boolean isIndexTable) {
         boolean hasPrimaryKey = tableDescriptor.getSchema().getPrimaryKey().isPresent();
         RowType schema = tableDescriptor.getSchema().getRowType();
         Configuration tableConf = Configuration.fromMap(tableDescriptor.getProperties());
@@ -102,7 +115,7 @@ public class TableDescriptorValidation {
         checkMergeEngine(tableConf, hasPrimaryKey, schema);
         checkTieredLog(tableConf);
         checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema);
-        checkSystemColumns(schema);
+        checkSystemColumns(schema, isIndexTable);
     }
 
     public static void validateAlterTableProperties(
@@ -130,10 +143,19 @@ public class TableDescriptorValidation {
         }
     }
 
-    private static void checkSystemColumns(RowType schema) {
+    private static void checkSystemColumns(RowType schema, boolean isIndexTable) {
         List<String> fieldNames = schema.getFieldNames();
         List<String> unsupportedColumns =
                 fieldNames.stream().filter(SYSTEM_COLUMNS::contains).collect(Collectors.toList());
+
+        // For index tables, allow __offset system column as it's required for storing logOffset
+        if (isIndexTable
+                && unsupportedColumns.size() == 1
+                && OFFSET_COLUMN_NAME.equals(unsupportedColumns.get(0))) {
+            // Index tables are allowed to have __offset system column
+            return;
+        }
+
         if (!unsupportedColumns.isEmpty()) {
             throw new InvalidTableException(
                     String.format(

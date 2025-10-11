@@ -121,6 +121,16 @@ public class LazyMemorySegmentPool implements MemorySegmentPool, Closeable {
         return new LazyMemorySegmentPool(segmentCount, pageSize, waitTimeout, perRequestMemorySize);
     }
 
+    public static LazyMemorySegmentPool createIndexCacheBufferPool(Configuration conf) {
+        long totalBytes = conf.get(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE).getBytes();
+        int pageSize = (int) conf.get(ConfigOptions.SERVER_INDEX_CACHE_PAGE_SIZE).getBytes();
+        long perRequestMemorySize =
+                conf.get(ConfigOptions.SERVER_INDEX_CACHE_PER_REQUEST_MEMORY_SIZE).getBytes();
+        int segmentCount = (int) (totalBytes / pageSize);
+        long waitTimeout = conf.get(ConfigOptions.SERVER_INDEX_CACHE_POOL_WAIT_TIMEOUT).toMillis();
+        return new LazyMemorySegmentPool(segmentCount, pageSize, waitTimeout, perRequestMemorySize);
+    }
+
     @Override
     public MemorySegment nextSegment() throws IOException {
         return inLock(lock, () -> allocatePages(1).get(0));

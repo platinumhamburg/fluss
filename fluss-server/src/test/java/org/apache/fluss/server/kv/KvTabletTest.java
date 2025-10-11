@@ -181,7 +181,8 @@ class KvTabletTest {
                 KvFormat.COMPACTED,
                 schema,
                 rowMerger,
-                DEFAULT_COMPRESSION);
+                DEFAULT_COMPRESSION,
+                null); // IndexCache can be null for testing
     }
 
     @Test
