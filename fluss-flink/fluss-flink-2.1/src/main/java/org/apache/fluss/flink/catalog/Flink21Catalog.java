@@ -20,6 +20,7 @@ package org.apache.fluss.flink.catalog;
 
 import org.apache.fluss.metadata.TableInfo;
 
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogTable;
@@ -70,17 +71,32 @@ public class Flink21Catalog extends FlinkCatalog {
         // For partition table, the physical primary key is the primary key that excludes the
         // partition key
         List<String> physicalPrimaryKeys = tableInfo.getPhysicalPrimaryKeys();
-        List<String> indexKeys = new ArrayList<>();
+        List<String> defaultIndexKeys = new ArrayList<>();
         if (isPrefixList(physicalPrimaryKeys, bucketKeys)) {
-            indexKeys.addAll(bucketKeys);
+            defaultIndexKeys.addAll(bucketKeys);
             if (tableInfo.isPartitioned()) {
-                indexKeys.addAll(tableInfo.getPartitionKeys());
+                defaultIndexKeys.addAll(tableInfo.getPartitionKeys());
             }
         }
 
-        if (!indexKeys.isEmpty()) {
-            newSchemaBuilder.index(indexKeys);
+        List<Tuple2<String, List<String>>> allIndexes = new ArrayList<>();
+        // add default index
+        if (!defaultIndexKeys.isEmpty()) {
+            allIndexes.add(Tuple2.of("index0", defaultIndexKeys));
         }
+        // add all secondary indexes
+        tableInfo
+                .getSchema()
+                .getIndexes()
+                .forEach(
+                        index ->
+                                allIndexes.add(
+                                        Tuple2.of(index.getIndexName(), index.getColumnNames())));
+
+        for (Tuple2<String, List<String>> index : allIndexes) {
+            newSchemaBuilder.indexNamed(index.f0, index.f1);
+        }
+
         return CatalogTable.newBuilder()
                 .schema(newSchemaBuilder.build())
                 .comment(table.getComment())

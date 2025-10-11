@@ -18,6 +18,7 @@
 package org.apache.fluss.server.tablet;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.metadata.LogFormat;
@@ -25,6 +26,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.DefaultValueRecordBatch;
@@ -44,9 +46,13 @@ import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrReqForBucket;
 import org.apache.fluss.rpc.messages.PbPrefixLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
+import org.apache.fluss.rpc.messages.PbValueList;
+import org.apache.fluss.rpc.messages.PrefixLookupResponse;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
+import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.log.ListOffsetsParam;
@@ -71,8 +77,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.Random;
 import java.util.Set;
@@ -92,6 +100,11 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA_1_WITH_KEY_AND_VALUE;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
+import static org.apache.fluss.record.TestData.INDEXED_DATA_WITH_KEY_AND_VALUE;
+import static org.apache.fluss.record.TestData.INDEXED_KEY_TYPE;
+import static org.apache.fluss.record.TestData.INDEXED_ROW_TYPE;
+import static org.apache.fluss.record.TestData.INDEXED_TABLE_DESCRIPTOR;
+import static org.apache.fluss.record.TestData.INDEXED_TABLE_PATH;
 import static org.apache.fluss.server.testutils.KvTestUtils.assertLookupResponse;
 import static org.apache.fluss.server.testutils.KvTestUtils.assertPrefixLookupResponse;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.assertFetchLogResponse;
@@ -904,6 +917,253 @@ public class TabletServiceITCase {
         result = getNotifyLeaderAndIsrResponseData(notifyLeaderAndIsrResponse);
         assertThat(result.size()).isEqualTo(1);
         assertThat(result.get(0).getError().error()).isEqualTo(Errors.NONE);
+    }
+
+    @Test
+    void testIndexReplicationEndToEnd() throws Exception {
+        // Comprehensive end-to-end test for index table replication chain
+        // This test verifies the complete flow: data table -> index fetcher -> index applier ->
+        // index table
+
+        // Step 1: Create data table with indexes using TestData
+        long dataTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, INDEXED_TABLE_PATH, INDEXED_TABLE_DESCRIPTOR);
+        TableBucket dataTableBucket = new TableBucket(dataTableId, 0);
+
+        // Wait for data table replica ready
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(dataTableBucket);
+
+        // Step 2: Verify index tables were automatically created and get their info
+        List<String> indexNames = Arrays.asList("idx_name", "idx_email");
+        Map<String, TableInfo> indexTables = new HashMap<>();
+        Map<String, TableBucket> indexTableBuckets = new HashMap<>();
+
+        for (String indexName : indexNames) {
+            // Get index table path using the naming convention
+            TablePath indexTablePath =
+                    TablePath.of(
+                            INDEXED_TABLE_PATH.getDatabaseName(),
+                            "__" + INDEXED_TABLE_PATH.getTableName() + "__index__" + indexName);
+
+            // Verify index table exists and get its information
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        try {
+                            MetadataManager metadataManager =
+                                    new MetadataManager(
+                                            FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(),
+                                            new Configuration(),
+                                            new LakeCatalogDynamicLoader(
+                                                    new Configuration(), null, true));
+                            TableInfo indexTableInfo = metadataManager.getTable(indexTablePath);
+                            assertThat(indexTableInfo).isNotNull();
+                            assertThat(indexTableInfo.getSchema().getIndexes())
+                                    .isEmpty(); // index table should not have nested indexes
+                            indexTables.put(indexName, indexTableInfo);
+
+                            // Wait for index table replica ready
+                            TableBucket indexTableBucket =
+                                    new TableBucket(indexTableInfo.getTableId(), 0);
+                            FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(indexTableBucket);
+                            indexTableBuckets.put(indexName, indexTableBucket);
+
+                        } catch (Exception e) {
+                            throw new AssertionError("Index table not ready: " + indexName, e);
+                        }
+                    });
+        }
+
+        // Step 3: Get data table leader and write test data
+        int dataTableLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(dataTableBucket);
+        TabletServerGateway dataTableLeaderGateway =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(dataTableLeader);
+
+        // Write data to data table
+        assertPutKvResponse(
+                dataTableLeaderGateway
+                        .putKv(
+                                newPutKvRequest(
+                                        dataTableId,
+                                        0,
+                                        -1,
+                                        genKvRecordBatch(
+                                                INDEXED_KEY_TYPE,
+                                                INDEXED_ROW_TYPE,
+                                                INDEXED_DATA_WITH_KEY_AND_VALUE)))
+                        .get());
+
+        // Step 4: Wait for index replication to complete by checking high watermarks
+        // Index tables should eventually replicate data from data table
+        for (String indexName : indexNames) {
+            TableBucket indexTableBucket = indexTableBuckets.get(indexName);
+            long indexTableId = indexTables.get(indexName).getTableId();
+            int indexTableLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(indexTableBucket);
+            TabletServerGateway indexTableLeaderGateway =
+                    FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(indexTableLeader);
+
+            // Wait for index table high watermark to advance, indicating successful replication
+            retry(
+                    Duration.ofMinutes(2),
+                    () -> {
+                        try {
+                            ListOffsetsResponse listOffsetsResponse =
+                                    indexTableLeaderGateway
+                                            .listOffsets(
+                                                    newListOffsetsRequest(
+                                                            -1,
+                                                            ListOffsetsParam.LATEST_OFFSET_TYPE,
+                                                            indexTableId,
+                                                            0))
+                                            .get();
+
+                            // Check if response has buckets and get the first bucket response
+                            if (listOffsetsResponse.getBucketsRespsCount() > 0) {
+                                PbListOffsetsRespForBucket respForBucket =
+                                        listOffsetsResponse.getBucketsRespsList().get(0);
+                                if (!respForBucket.hasErrorCode()
+                                        || respForBucket.getErrorCode() == 0) {
+                                    // High watermark should be greater than 0, indicating index
+                                    // data was replicated
+                                    long highWatermark = respForBucket.getOffset();
+                                    assertThat(highWatermark).isGreaterThan(0L);
+                                } else {
+                                    throw new AssertionError(
+                                            "ListOffsets returned error: "
+                                                    + respForBucket.getErrorMessage());
+                                }
+                            } else {
+                                throw new AssertionError("No bucket response received");
+                            }
+                        } catch (Exception e) {
+                            throw new AssertionError(
+                                    "Failed to check high watermark for index " + indexName, e);
+                        }
+                    });
+        }
+
+        // Step 5: Verify index table contains expected data using prefix lookup
+        for (String indexName : indexNames) {
+            TableBucket indexTableBucket = indexTableBuckets.get(indexName);
+            long indexTableId = indexTables.get(indexName).getTableId();
+            int indexTableLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(indexTableBucket);
+            TabletServerGateway indexTableLeaderGateway =
+                    FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(indexTableLeader);
+
+            // Use prefix lookup to verify index table contains expected index data
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        try {
+                            // Prepare prefix key based on index type
+                            Object prefixKeyValue;
+                            RowType indexTableRowType =
+                                    indexTables.get(indexName).getSchema().getRowType();
+                            if ("idx_name".equals(indexName)) {
+                                // For name index, use name column value as prefix key
+                                prefixKeyValue = "Alice"; // From first test record
+                            } else if ("idx_email".equals(indexName)) {
+                                // For email index, use email column value as prefix key
+                                prefixKeyValue = "alice@example.com"; // From first test record
+                            } else {
+                                throw new AssertionError("Unknown index: " + indexName);
+                            }
+
+                            // Encode prefix key for the index table
+                            CompactedKeyEncoder prefixKeyEncoder =
+                                    new CompactedKeyEncoder(
+                                            indexTableRowType,
+                                            new int[] {0}); // First column is the index column
+                            byte[] prefixKeyBytes =
+                                    prefixKeyEncoder.encodeKey(row(new Object[] {prefixKeyValue}));
+
+                            // Perform prefix lookup on index table
+                            PrefixLookupResponse prefixLookupResponse =
+                                    indexTableLeaderGateway
+                                            .prefixLookup(
+                                                    newPrefixLookupRequest(
+                                                            indexTableId,
+                                                            0,
+                                                            Collections.singletonList(
+                                                                    prefixKeyBytes)))
+                                            .get();
+
+                            // Verify we got results from the index table
+                            assertThat(prefixLookupResponse.getBucketsRespsCount()).isEqualTo(1);
+                            PbPrefixLookupRespForBucket bucketResp =
+                                    prefixLookupResponse.getBucketsRespAt(0);
+                            assertThat(bucketResp.hasErrorCode()).isFalse();
+                            assertThat(bucketResp.getValueListsCount()).isEqualTo(1);
+
+                            // Verify the returned value list contains at least one record (the
+                            // indexed record)
+                            PbValueList valueList = bucketResp.getValueListsList().get(0);
+                            assertThat(valueList.getValuesCount()).isGreaterThan(0);
+
+                        } catch (Exception e) {
+                            throw new AssertionError(
+                                    "Failed to verify index table data for " + indexName, e);
+                        }
+                    });
+        }
+
+        // Step 6: Write additional data and verify continued replication
+        List<Tuple2<Object[], Object[]>> additionalData =
+                Arrays.asList(
+                        Tuple2.of(new Object[] {6}, new Object[] {6, "Frank", "frank@example.com"}),
+                        Tuple2.of(
+                                new Object[] {7}, new Object[] {7, "Grace", "grace@example.com"}));
+
+        assertPutKvResponse(
+                dataTableLeaderGateway
+                        .putKv(
+                                newPutKvRequest(
+                                        dataTableId, 0, -1, genKvRecordBatch(additionalData)))
+                        .get());
+
+        // Verify additional data is replicated to index tables by checking increased high watermark
+        for (String indexName : indexNames) {
+            TableBucket indexTableBucket = indexTableBuckets.get(indexName);
+            long indexTableId = indexTables.get(indexName).getTableId();
+            int indexTableLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(indexTableBucket);
+            TabletServerGateway indexTableLeaderGateway =
+                    FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(indexTableLeader);
+
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        try {
+                            ListOffsetsResponse listOffsetsResponse =
+                                    indexTableLeaderGateway
+                                            .listOffsets(
+                                                    newListOffsetsRequest(
+                                                            -1,
+                                                            ListOffsetsParam.LATEST_OFFSET_TYPE,
+                                                            indexTableId,
+                                                            0))
+                                            .get();
+
+                            PbListOffsetsRespForBucket respForBucket =
+                                    listOffsetsResponse.getBucketsRespsList().get(0);
+                            if (!respForBucket.hasErrorCode()
+                                    || respForBucket.getErrorCode() == 0) {
+                                // High watermark should advance further after additional data
+                                long highWatermark = respForBucket.getOffset();
+                                assertThat(highWatermark)
+                                        .isGreaterThanOrEqualTo(
+                                                10L); // Should contain data from both writes
+                            } else {
+                                throw new AssertionError(
+                                        "ListOffsets returned error: "
+                                                + respForBucket.getErrorMessage());
+                            }
+                        } catch (Exception e) {
+                            throw new AssertionError(
+                                    "Failed to verify continued replication for index " + indexName,
+                                    e);
+                        }
+                    });
+        }
     }
 
     private static void assertPutKvResponse(PutKvResponse putKvResponse) {

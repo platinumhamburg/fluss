@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client.lookup;
 
+import org.apache.fluss.client.metrics.TestingLookuperMetricGroup;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TableBucket;
 
@@ -34,7 +35,7 @@ class LookupQueueTest {
         Configuration conf = new Configuration();
         conf.set(CLIENT_LOOKUP_MAX_BATCH_SIZE, 10);
         conf.setString(CLIENT_LOOKUP_BATCH_TIMEOUT.key(), "1ms");
-        LookupQueue queue = new LookupQueue(conf);
+        LookupQueue queue = new LookupQueue(conf, TestingLookuperMetricGroup.newInstance());
 
         // drain empty
         assertThat(queue.drain()).hasSize(0);

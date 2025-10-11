@@ -28,6 +28,8 @@ import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsResponse;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
+import org.apache.fluss.rpc.messages.FetchIndexResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
@@ -173,6 +175,11 @@ public class TestTabletServerGateway implements TabletServerGateway {
                     resultForBucketMap.put(tableBucket, fetchLogResultForBucket);
                 });
         return CompletableFuture.completedFuture(makeFetchLogResponse(resultForBucketMap));
+    }
+
+    @Override
+    public CompletableFuture<FetchIndexResponse> fetchIndex(FetchIndexRequest request) {
+        throw new UnsupportedOperationException();
     }
 
     @Override

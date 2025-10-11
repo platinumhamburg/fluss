@@ -19,9 +19,11 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.metadata.MetadataUpdater;
+import org.apache.fluss.client.metrics.LookuperMetricGroup;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 
 import org.slf4j.Logger;
@@ -56,12 +58,17 @@ public class LookupClient {
     public static final String LOOKUP_THREAD_PREFIX = "fluss-lookup-sender";
 
     private final LookupQueue lookupQueue;
+    private final LookuperMetricGroup lookuperMetricGroup;
 
     private final ExecutorService lookupSenderThreadPool;
     private final LookupSender lookupSender;
 
-    public LookupClient(Configuration conf, MetadataUpdater metadataUpdater) {
-        this.lookupQueue = new LookupQueue(conf);
+    public LookupClient(
+            Configuration conf,
+            MetadataUpdater metadataUpdater,
+            ClientMetricGroup clientMetricGroup) {
+        this.lookuperMetricGroup = new LookuperMetricGroup(clientMetricGroup);
+        this.lookupQueue = new LookupQueue(conf, lookuperMetricGroup);
         this.lookupSenderThreadPool = createThreadPool();
         this.lookupSender =
                 new LookupSender(
@@ -87,6 +94,11 @@ public class LookupClient {
         PrefixLookupQuery prefixLookup = new PrefixLookupQuery(tableBucket, keyBytes);
         lookupQueue.appendLookup(prefixLookup);
         return prefixLookup.future();
+    }
+
+    /** Get the lookuper metric group for external usage. */
+    public LookuperMetricGroup getLookuperMetricGroup() {
+        return lookuperMetricGroup;
     }
 
     public void close(Duration timeout) {

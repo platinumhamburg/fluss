@@ -25,8 +25,9 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
 
 import java.util.Iterator;
+import java.util.Optional;
 
-import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
 
 /**
@@ -37,14 +38,11 @@ import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
 @PublicEvolving
 public interface LogRecordBatch {
     /**
-     * The current "magic" value. Even though we already support LOG_MAGIC_VALUE_V1, for
-     * compatibility reasons — specifically, a higher-version Fluss Client (which supports
-     * LOG_MAGIC_VALUE_V1) cannot write to a lower-version Fluss Server (which only supports
-     * LOG_MAGIC_VALUE_V0) — we are unable to guarantee compatibility at this time. Therefore, we
-     * will keep the current log magic value set to LOG_MAGIC_VALUE_V0 for now, and only upgrade it
-     * to LOG_MAGIC_VALUE_V1 once the compatibility issue is resolved.
+     * The current "magic" value. We now support V3 format with extend properties. V3 format
+     * includes all features from V1 and adds extend properties support. For compatibility with
+     * older versions, the actual magic value used should be determined by the system configuration.
      */
-    byte CURRENT_LOG_MAGIC_VALUE = LOG_MAGIC_VALUE_V0;
+    byte CURRENT_LOG_MAGIC_VALUE = LOG_MAGIC_VALUE_V1;
 
     /**
      * Check whether the checksum of this batch is correct.
@@ -161,6 +159,13 @@ public interface LogRecordBatch {
      * @see ReadContext
      */
     CloseableIterator<LogRecord> records(ReadContext context);
+
+    /**
+     * Get extend properties of this record batch.
+     *
+     * @return extend properties
+     */
+    Optional<StateChangeLogs> stateChangeLogs();
 
     /** The read context of a {@link LogRecordBatch} to read records. */
     interface ReadContext {

@@ -129,7 +129,7 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  * CoordinatorService} and {@link TabletService}.
  */
 public abstract class RpcServiceBase extends RpcGatewayService implements AdminReadOnlyGateway {
-    private static final Logger LOG = LoggerFactory.getLogger(RpcServiceBase.class);
+    protected static final Logger LOG = LoggerFactory.getLogger(RpcServiceBase.class);
 
     private static final long TOKEN_EXPIRATION_TIME_MS = 60 * 1000;
 
