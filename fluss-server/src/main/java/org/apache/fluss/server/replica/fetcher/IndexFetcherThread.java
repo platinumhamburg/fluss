@@ -607,6 +607,10 @@ final class IndexFetcherThread extends ShutdownableThread {
                         .computeIfAbsent(dataIndexBucket.getDataBucket(), key -> Maps.newHashMap())
                         .put(dataIndexBucket.getIndexBucket(), fetchIndexReqForIndexBucket);
                 reqDataIndexBuckets.add(dataIndexBucket);
+            } else {
+                LOG.info(
+                        "Index bucket {} is not ready for fetch, skipping",
+                        dataIndexTableBucketDataBucketIndexFetchStatusEntry.getKey());
             }
         }
 

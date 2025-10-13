@@ -588,12 +588,11 @@ public class ReplicaManager {
                             dataBucket, new DataBucketIndexFetchResult(indexBucketResults));
                 }
             } catch (Exception e) {
-                LOG.error("Failed to fetch index for data bucket {}", dataBucket, e);
+                LOG.debug("Failed to fetch index for data bucket {}", dataBucket, e);
+                ApiError error = ApiError.fromThrowable(e);
                 // Return error result
                 for (TableBucket indexBucket : indexBucketFetchRequests.keySet()) {
-                    indexBucketResults.put(
-                            indexBucket,
-                            new FetchIndexLogResultForBucket(ApiError.fromThrowable(e)));
+                    indexBucketResults.put(indexBucket, new FetchIndexLogResultForBucket(error));
                 }
                 completeFetches.put(dataBucket, new DataBucketIndexFetchResult(indexBucketResults));
             }
@@ -1102,18 +1101,8 @@ public class ReplicaManager {
         for (int bucketId = 0; bucketId < dataBucketCount; bucketId++) {
             TableBucket dataBucket = new TableBucket(dataTableId, partitionId, bucketId);
 
-            // Get data bucket leader info using ZooKeeper
-            Optional<LeaderAndIsr> optLeaderAndIsr = zkClient.getLeaderAndIsr(dataBucket);
-            int dataLeader =
-                    optLeaderAndIsr
-                            .orElseThrow(
-                                    () ->
-                                            new IllegalStateException(
-                                                    "Failed to get leader for data bucket: "
-                                                            + dataBucket
-                                                            + " when init fetcher for index bucket "
-                                                            + indexBucket))
-                            .leader();
+            // Wait for data bucket to be ready with valid leader
+            int dataLeader = waitForDataBucketReady(dataBucket, indexBucket);
 
             // Create DataIndexTableBucket mapping
             DataIndexTableBucket dataIndexBucket =
@@ -1144,6 +1133,70 @@ public class ReplicaManager {
                     indexBucket,
                     initFetchOffset,
                     indexCommitOffset);
+        }
+    }
+
+    /**
+     * Wait for a data bucket to be ready with a valid leader. This method will retry indefinitely
+     * until the data bucket has a valid leader assigned.
+     *
+     * @param dataBucket the data bucket to wait for
+     * @param indexBucket the index bucket that depends on this data bucket
+     * @return the leader id of the data bucket
+     * @throws InterruptedException if the thread is interrupted while waiting
+     */
+    private int waitForDataBucketReady(TableBucket dataBucket, TableBucket indexBucket)
+            throws InterruptedException {
+        long retryIntervalMs = conf.get(ConfigOptions.ZOOKEEPER_RETRY_WAIT).toMillis();
+        int retryCount = 0;
+
+        while (true) {
+            try {
+                Optional<LeaderAndIsr> optLeaderAndIsr = zkClient.getLeaderAndIsr(dataBucket);
+                if (optLeaderAndIsr.isPresent()) {
+                    int dataLeader = optLeaderAndIsr.get().leader();
+                    if (dataLeader >= 0) {
+                        if (retryCount > 0) {
+                            LOG.info(
+                                    "Data bucket {} is now ready with leader {} after {} retries for index bucket {}",
+                                    dataBucket,
+                                    dataLeader,
+                                    retryCount,
+                                    indexBucket);
+                        }
+                        return dataLeader;
+                    } else {
+                        LOG.debug(
+                                "Data bucket {} has invalid leader {}, retrying... (retry count: {})",
+                                dataBucket,
+                                dataLeader,
+                                retryCount);
+                    }
+                } else {
+                    LOG.debug(
+                            "Data bucket {} leader info not available, retrying... (retry count: {})",
+                            dataBucket,
+                            retryCount);
+                }
+            } catch (Exception e) {
+                LOG.debug(
+                        "Error getting leader info for data bucket {}, retrying... (retry count: {})",
+                        dataBucket,
+                        retryCount,
+                        e);
+            }
+
+            retryCount++;
+            if (retryCount % 10 == 0) {
+                LOG.info(
+                        "Still waiting for data bucket {} to be ready for index bucket {}, retry count: {}",
+                        dataBucket,
+                        indexBucket,
+                        retryCount);
+            }
+
+            // Sleep before next retry
+            Thread.sleep(retryIntervalMs);
         }
     }
 
