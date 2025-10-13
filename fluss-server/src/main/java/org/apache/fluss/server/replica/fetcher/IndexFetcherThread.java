@@ -223,7 +223,21 @@ final class IndexFetcherThread extends ShutdownableThread {
         } catch (Throwable t) {
             if (isRunning()) {
                 LOG.warn("Error in response for fetch index request {}", fetchIndexRequest, t);
-                indexBucketsWithError.addAll(fetchIndexContext.getRequestDataIndexBuckets());
+                Set<DataIndexTableBucket> bucketsToRetry = new HashSet<>();
+                for (DataIndexTableBucket bucket : fetchIndexContext.getRequestDataIndexBuckets()) {
+                    // Only retry if the bucket still exists in our status map (not deleted)
+                    if (fairIndexBucketStatusMap.statusValue(bucket) != null) {
+                        bucketsToRetry.add(bucket);
+                    } else {
+                        LOG.debug("Skipping retry for deleted index bucket: {}", bucket);
+                    }
+                }
+                if (!bucketsToRetry.isEmpty()) {
+                    LOG.info(
+                            "Retrying {} index buckets after ServerNode not available error",
+                            bucketsToRetry.size());
+                    indexBucketsWithError.addAll(bucketsToRetry);
+                }
             }
         }
 
