@@ -705,10 +705,11 @@ public final class Replica {
                     new IndexCache.IndexCacheFetchParam(
                             indexBucket.getTableId(),
                             reqInfo.getFetchOffset(),
+                            hotDataOnly ? params.minBucketFetchRecords() : -1,
                             reqInfo.getIndexCommitOffset());
             indexCacheFetchParams.put(indexBucket, fetchParam);
         }
-        return indexCache.fetchIndexLogData(indexCacheFetchParams, hotDataOnly);
+        return indexCache.fetchIndex(indexCacheFetchParams, hotDataOnly);
     }
 
     private void createKv() {
@@ -816,7 +817,13 @@ public final class Replica {
         checkNotNull(registry, "CloseableRegistry should not be null");
 
         // This replica is for index table
-        indexApplier = new IndexApplier(kvTablet, logTablet, fatalErrorHandler, schema);
+        indexApplier =
+                new IndexApplier(
+                        kvTablet,
+                        logTablet,
+                        fatalErrorHandler,
+                        schema,
+                        bucketMetricGroup.getTableMetricGroup().getServerMetricGroup());
 
         try {
             registry.registerCloseable(indexApplier);

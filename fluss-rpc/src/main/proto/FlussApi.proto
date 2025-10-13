@@ -220,6 +220,7 @@ message FetchLogResponse {
 message FetchIndexRequest {
   required int32 max_records = 1;
   optional int32 max_wait_ms = 2;
+  optional int32 min_bucket_fetch_records = 3;
   repeated PbFetchIndexReqForTableBucket req_for_table_buckets = 4;
 }
 

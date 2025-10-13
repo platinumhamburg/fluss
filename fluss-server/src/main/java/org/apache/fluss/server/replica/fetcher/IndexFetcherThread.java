@@ -70,8 +70,9 @@ final class IndexFetcherThread extends ShutdownableThread {
     private final int fetchBackOffMs;
 
     private final int timeoutSeconds = 30;
-    private final int maxFetchRecords = 10000;
-    private final int maxFetchWaitMs = 30000;
+    private final int maxFetchRecords = 5000;
+    private final int minBucketFetchRecords = 200;
+    private final int maxFetchWaitMs = 500;
 
     /**
      * A fair status map to store index bucket fetch status. {@link DataIndexTableBucket} -> {@link
@@ -223,7 +224,18 @@ final class IndexFetcherThread extends ShutdownableThread {
         } catch (Throwable t) {
             if (isRunning()) {
                 LOG.warn("Error in response for fetch index request {}", fetchIndexRequest, t);
-                indexBucketsWithError.addAll(fetchIndexContext.getRequestDataIndexBuckets());
+                Set<DataIndexTableBucket> bucketsToRetry = new HashSet<>();
+                for (DataIndexTableBucket bucket : fetchIndexContext.getRequestDataIndexBuckets()) {
+                    // Only retry if the bucket still exists in our status map (not deleted)
+                    if (fairIndexBucketStatusMap.statusValue(bucket) != null) {
+                        bucketsToRetry.add(bucket);
+                    } else {
+                        LOG.debug("Skipping retry for deleted index bucket: {}", bucket);
+                    }
+                }
+                if (!bucketsToRetry.isEmpty()) {
+                    indexBucketsWithError.addAll(bucketsToRetry);
+                }
             }
         }
 
@@ -366,17 +378,15 @@ final class IndexFetcherThread extends ShutdownableThread {
                         startOffset,
                         endOffset,
                         fetchBackOffMs);
-                // Use internal method since we're already holding the lock
                 delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
                 return;
             } else if (startOffset == endOffset) {
-                LOG.debug(
-                        "No new index data available for data bucket {} -> index bucket {} at offset {}, retrying after {} ms delay",
+                LOG.trace(
+                        "Received empty index segment for data bucket {} -> index bucket {} at offset {}, delayed for retry after {} ms delay",
                         dataBucket,
                         indexBucket,
                         startOffset,
                         fetchBackOffMs);
-                // Use internal method since we're already holding the lock
                 delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
                 return;
             }
@@ -580,7 +590,10 @@ final class IndexFetcherThread extends ShutdownableThread {
             Map<DataIndexTableBucket, DataBucketIndexFetchStatus> indexBucketFetchStatusMap) {
         Map<Long, TablePath> tableIdToTablePath = new HashMap<>();
         FetchIndexRequest fetchRequest =
-                new FetchIndexRequest().setMaxRecords(maxFetchRecords).setMaxWaitMs(maxFetchWaitMs);
+                new FetchIndexRequest()
+                        .setMaxRecords(maxFetchRecords)
+                        .setMinBucketFetchRecords(minBucketFetchRecords)
+                        .setMaxWaitMs(maxFetchWaitMs);
         Set<DataIndexTableBucket> reqDataIndexBuckets = new HashSet<>();
 
         Map<TableBucket, Map<TableBucket, PbFetchIndexReqForIndexTableBucket>> indexBucketReqMap =
@@ -608,7 +621,7 @@ final class IndexFetcherThread extends ShutdownableThread {
                         .put(dataIndexBucket.getIndexBucket(), fetchIndexReqForIndexBucket);
                 reqDataIndexBuckets.add(dataIndexBucket);
             } else {
-                LOG.info(
+                LOG.trace(
                         "Index bucket {} is not ready for fetch, skipping",
                         dataIndexTableBucketDataBucketIndexFetchStatusEntry.getKey());
             }

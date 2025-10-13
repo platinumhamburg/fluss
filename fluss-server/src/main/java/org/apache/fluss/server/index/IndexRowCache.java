@@ -238,6 +238,80 @@ public final class IndexRowCache implements Closeable {
     }
 
     /**
+     * Checks if the specified IndexBucket has sufficient hot data records to satisfy the
+     * minBucketFetchRecords requirement without loading additional data from WAL.
+     *
+     * <p>This method is used in hotDataOnly mode to determine if a fetch request can be satisfied
+     * immediately with cached data, or if it should return empty to trigger DelayedFetchIndex
+     * processing.
+     *
+     * @param indexBucket the index bucket to check
+     * @param startOffset the fetch start offset (inclusive)
+     * @param minBucketFetchRecords the minimum number of records required
+     * @return true if there are enough hot data records, false otherwise
+     */
+    public boolean hasSufficientHotData(
+            TableBucket indexBucket, long startOffset, int minBucketFetchRecords) {
+        if (closed || minBucketFetchRecords <= 0) {
+            return true; // No minimum requirement
+        }
+
+        TablePartitionId tablePartitionId = TablePartitionId.from(indexBucket);
+        IndexBucketRowCache bucketCache =
+                getBucketRowCache(tablePartitionId, indexBucket.getBucket());
+        if (bucketCache == null) {
+            return false;
+        }
+
+        long highWatermark = logTablet.getHighWatermark();
+        if (startOffset >= highWatermark) {
+            return false;
+        }
+
+        int hotDataRecords = bucketCache.getHotDataRecordsInRange(startOffset, highWatermark);
+        return hotDataRecords >= minBucketFetchRecords;
+    }
+
+    /**
+     * Checks if all specified IndexBuckets have sufficient hot data records to satisfy the
+     * minBucketFetchRecords requirement.
+     *
+     * <p>This batch method is optimized for checking multiple buckets efficiently and is used to
+     * determine whether a hotDataOnly fetch request should proceed or return empty to trigger
+     * DelayedFetchIndex.
+     *
+     * @param fetchRequests Map of IndexBucket to fetch parameters
+     * @return true if all buckets have sufficient hot data, false otherwise
+     */
+    public boolean hasSufficientHotDataForAll(
+            Map<TableBucket, IndexCacheFetchParam> fetchRequests) {
+        if (closed || fetchRequests == null || fetchRequests.isEmpty()) {
+            return true;
+        }
+
+        for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
+            TableBucket indexBucket = entry.getKey();
+            IndexCacheFetchParam param = entry.getValue();
+
+            // Only check if minFetchHotDataRecords is set (> 0)
+            if (param.getMinFetchHotDataRecords() > 0) {
+                if (!hasSufficientHotData(
+                        indexBucket,
+                        param.getFetchOffset(),
+                        (int) param.getMinFetchHotDataRecords())) {
+                    LOG.debug(
+                            "IndexBucket {} does not have sufficient hot data for minBucketFetchRecords={}",
+                            indexBucket,
+                            param.getMinFetchHotDataRecords());
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
      * Gets unloaded ranges for multiple IndexBuckets in a batch, optimized for efficient WAL
      * processing.
      *
@@ -261,18 +335,14 @@ public final class IndexRowCache implements Closeable {
 
         Map<TableBucket, List<OffsetRangeInfo>> batchRanges = new HashMap<>();
 
-        long startOffset =
-                fetchRequests.values().stream()
-                        .map(IndexCacheFetchParam::getFetchOffset)
-                        .min(Long::compareTo)
-                        .orElse(0L);
         long endOffset = logTablet.getHighWatermark();
 
         for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
             TableBucket indexBucket = entry.getKey();
+            IndexCacheFetchParam param = entry.getValue();
 
             List<OffsetRangeInfo> offsetRangeInfos =
-                    getUnloadedRanges(indexBucket, startOffset, endOffset);
+                    getUnloadedRanges(indexBucket, param.getFetchOffset(), endOffset);
 
             if (offsetRangeInfos.isEmpty()) {
                 continue;

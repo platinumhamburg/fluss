@@ -123,6 +123,7 @@ public class MetricNames {
     public static final String INDEX_APPLY_REQUESTS_RATE = "indexApplyRequestsPerSecond";
     public static final String INDEX_APPLY_ERRORS_RATE = "indexApplyErrorsPerSecond";
     public static final String INDEX_APPLY_LATENCY_MS = "indexApplyLatencyMs";
+    public static final String INDEX_APPLY_BATCH_SIZE = "indexApplyBatchSize";
 
     // for log tablet
     public static final String LOG_FLUSH_RATE = "logFlushPerSecond";

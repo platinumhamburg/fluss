@@ -36,6 +36,7 @@ import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvResponse;
+import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.index.IndexApplier;
@@ -390,7 +391,11 @@ public class ReplicaFetcherITCase {
         TablePath indexTablePath =
                 IndexTableUtils.generateIndexTablePath(INDEXED_TABLE_PATH, "idx_name");
 
-        MetadataManager metadataManager = new MetadataManager(zkClient, new Configuration(), null);
+        MetadataManager metadataManager =
+                new MetadataManager(
+                        zkClient,
+                        new Configuration(),
+                        new LakeCatalogDynamicLoader(new Configuration(), null, true));
         TableInfo indexTableInfo = metadataManager.getTable(indexTablePath);
         TableBucket indexTableBucket = new TableBucket(indexTableInfo.getTableId(), 0);
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(indexTableBucket);
@@ -472,7 +477,11 @@ public class ReplicaFetcherITCase {
         TableBucket dataTableBucket = new TableBucket(dataTableId, 0);
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(dataTableBucket);
 
-        MetadataManager metadataManager = new MetadataManager(zkClient, new Configuration(), null);
+        MetadataManager metadataManager =
+                new MetadataManager(
+                        zkClient,
+                        new Configuration(),
+                        new LakeCatalogDynamicLoader(new Configuration(), null, true));
 
         // Verify both index tables were created using TestData predefined paths
         TableInfo idxNameTableInfo = metadataManager.getTable(IDX_NAME_TABLE_PATH);

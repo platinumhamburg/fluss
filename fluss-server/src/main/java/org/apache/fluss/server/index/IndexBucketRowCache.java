@@ -43,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static java.util.Collections.emptyList;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
@@ -65,6 +66,9 @@ import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
 public class IndexBucketRowCache implements Closeable {
 
     private static final Logger LOG = LoggerFactory.getLogger(IndexBucketRowCache.class);
+
+    /** ReadWrite lock to protect concurrent operations. */
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private final MemorySegmentPool memoryPool;
     private final TreeMap<Long, OffsetRange> offsetRanges = new TreeMap<>();
@@ -105,43 +109,48 @@ public class IndexBucketRowCache implements Closeable {
             throw new IllegalStateException("IndexBucketRowCache is closed");
         }
 
-        // Check if logOffset already exists in any range - ignore if found
-        if (containsOffset(logOffset)) {
-            LOG.trace(
-                    "Ignoring range expansion for existing logOffset {} in IndexBucketRowCache",
-                    logOffset);
-            return;
-        }
-
-        // Find appropriate range using TreeMap floor entry (largest range <= logOffset)
-        Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
-        OffsetRange targetRange = null;
-
-        if (floorEntry != null) {
-            OffsetRange candidateRange = floorEntry.getValue();
-            // Check if the offset is adjacent to the range's right boundary
-            if (candidateRange.canAcceptOffset(logOffset)) {
-                targetRange = candidateRange;
+        lock.readLock().lock();
+        try {
+            // Check if logOffset already exists in any range - ignore if found
+            if (containsOffset(logOffset)) {
+                LOG.trace(
+                        "Ignoring range expansion for existing logOffset {} in IndexBucketRowCache",
+                        logOffset);
+                return;
             }
+
+            // Find appropriate range using TreeMap floor entry (largest range <= logOffset)
+            Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
+            OffsetRange targetRange = null;
+
+            if (floorEntry != null) {
+                OffsetRange candidateRange = floorEntry.getValue();
+                // Check if the offset is adjacent to the range's right boundary
+                if (candidateRange.canAcceptOffset(logOffset)) {
+                    targetRange = candidateRange;
+                }
+            }
+
+            // Create new range if no suitable range found
+            if (targetRange == null) {
+                targetRange = createNewRange(logOffset);
+            }
+
+            // Expand range boundary without writing actual data
+            targetRange.expandRangeBoundary(logOffset);
+
+            // Check for auto-merging with the next range
+            checkAndMergeWithNextRange(targetRange);
+
+            LOG.trace(
+                    "Expanded range for logOffset {} to range [{}, {}), total ranges: {}",
+                    logOffset,
+                    targetRange.getStartOffset(),
+                    targetRange.getEndOffset(),
+                    offsetRanges.size());
+        } finally {
+            lock.readLock().unlock();
         }
-
-        // Create new range if no suitable range found
-        if (targetRange == null) {
-            targetRange = createNewRange(logOffset);
-        }
-
-        // Expand range boundary without writing actual data
-        targetRange.expandRangeBoundary(logOffset);
-
-        // Check for auto-merging with the next range
-        checkAndMergeWithNextRange(targetRange);
-
-        LOG.trace(
-                "Expanded range for logOffset {} to range [{}, {}), total ranges: {}",
-                logOffset,
-                targetRange.getStartOffset(),
-                targetRange.getEndOffset(),
-                offsetRanges.size());
     }
 
     /**
@@ -166,41 +175,48 @@ public class IndexBucketRowCache implements Closeable {
             throw new IllegalStateException("IndexBucketRowCache is closed");
         }
 
-        // Check if logOffset already exists across all ranges - ignore if found
-        if (containsOffset(logOffset)) {
-            LOG.trace("Ignoring write for existing logOffset {} in IndexBucketRowCache", logOffset);
-            return;
-        }
-
-        // Find appropriate range using TreeMap floor entry (largest range <= logOffset)
-        Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
-        OffsetRange targetRange = null;
-
-        if (floorEntry != null) {
-            OffsetRange candidateRange = floorEntry.getValue();
-            // Check if the offset is adjacent to the range's right boundary
-            if (candidateRange.canAcceptOffset(logOffset)) {
-                targetRange = candidateRange;
+        lock.readLock().lock();
+        try {
+            // Check if logOffset already exists across all ranges - ignore if found
+            if (containsOffset(logOffset)) {
+                LOG.trace(
+                        "Ignoring write for existing logOffset {} in IndexBucketRowCache",
+                        logOffset);
+                return;
             }
+
+            // Find appropriate range using TreeMap floor entry (largest range <= logOffset)
+            Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
+            OffsetRange targetRange = null;
+
+            if (floorEntry != null) {
+                OffsetRange candidateRange = floorEntry.getValue();
+                // Check if the offset is adjacent to the range's right boundary
+                if (candidateRange.canAcceptOffset(logOffset)) {
+                    targetRange = candidateRange;
+                }
+            }
+
+            // Create new range if no suitable range found
+            if (targetRange == null) {
+                targetRange = createNewRange(logOffset);
+            }
+
+            // Write data to the target range
+            totalSize += targetRange.writeIndexedRow(logOffset, changeType, indexedRow);
+
+            // Check for auto-merging with the next range
+            checkAndMergeWithNextRange(targetRange);
+
+            LOG.trace(
+                    "Wrote IndexedRow for logOffset {} to range [{}, {}), total ranges: {}",
+                    logOffset,
+                    targetRange.getStartOffset(),
+                    targetRange.getEndOffset(),
+                    offsetRanges.size());
+        } finally {
+            lock.readLock().unlock();
         }
-
-        // Create new range if no suitable range found
-        if (targetRange == null) {
-            targetRange = createNewRange(logOffset);
-        }
-
-        // Write data to the target range
-        totalSize += targetRange.writeIndexedRow(logOffset, changeType, indexedRow);
-
-        // Check for auto-merging with the next range
-        checkAndMergeWithNextRange(targetRange);
-
-        LOG.trace(
-                "Wrote IndexedRow for logOffset {} to range [{}, {}), total ranges: {}",
-                logOffset,
-                targetRange.getStartOffset(),
-                targetRange.getEndOffset(),
-                offsetRanges.size());
     }
 
     /**
@@ -226,26 +242,31 @@ public class IndexBucketRowCache implements Closeable {
             return createEmptyLogRecords();
         }
 
-        // Find the range containing the start offset
-        OffsetRange containingRange = findRangeContaining(startOffset);
-        if (containingRange == null) {
-            return createEmptyLogRecords();
-        }
+        lock.readLock().lock();
+        try {
+            // Find the range containing the start offset
+            OffsetRange containingRange = findRangeContaining(startOffset);
+            if (containingRange == null) {
+                return createEmptyLogRecords();
+            }
 
-        // Enforce single range constraint
-        if (!containingRange.containsRange(startOffset, endOffset)) {
-            throw new IllegalArgumentException(
-                    String.format(
-                            "Query range [%d, %d) spans multiple ranges or exceeds range boundary. "
-                                    + "Found range [%d, %d). Single range queries only.",
-                            startOffset,
-                            endOffset,
-                            containingRange.getStartOffset(),
-                            containingRange.getEndOffset()));
-        }
+            // Enforce single range constraint
+            if (!containingRange.containsRange(startOffset, endOffset)) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Query range [%d, %d) spans multiple ranges or exceeds range boundary. "
+                                        + "Found range [%d, %d). Single range queries only.",
+                                startOffset,
+                                endOffset,
+                                containingRange.getStartOffset(),
+                                containingRange.getEndOffset()));
+            }
 
-        // Get LogRecords from the single range with accurate metadata
-        return containingRange.getRangeLogRecords(startOffset, endOffset, schemaId);
+            // Get LogRecords from the single range with accurate metadata
+            return containingRange.getRangeLogRecords(startOffset, endOffset, schemaId);
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**
@@ -258,12 +279,18 @@ public class IndexBucketRowCache implements Closeable {
         if (closed) {
             return false;
         }
-        OffsetRange containingRange = findRangeContaining(offset);
-        if (containingRange == null) {
-            return false;
+
+        lock.readLock().lock();
+        try {
+            OffsetRange containingRange = findRangeContaining(offset);
+            if (containingRange == null) {
+                return false;
+            }
+            // Check if there's actual IndexedRow data at this offset, not just range boundary
+            return containingRange.hasDataAtOffset(offset);
+        } finally {
+            lock.readLock().unlock();
         }
-        // Check if there's actual IndexedRow data at this offset, not just range boundary
-        return containingRange.hasDataAtOffset(offset);
     }
 
     /**
@@ -275,7 +302,57 @@ public class IndexBucketRowCache implements Closeable {
         if (closed) {
             return 0;
         }
-        return offsetRanges.values().stream().mapToInt(OffsetRange::size).sum();
+
+        lock.readLock().lock();
+        try {
+            return offsetRanges.values().stream().mapToInt(OffsetRange::size).sum();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Gets the number of cached hot data records in the specified range. This method counts actual
+     * IndexedRow entries that are already cached (hot data), excluding any gaps that would need to
+     * be loaded from WAL.
+     *
+     * <p>This method is used to determine if there are enough hot records to satisfy a
+     * minBucketFetchRecords requirement without loading additional data from WAL.
+     *
+     * @param startOffset the start offset (inclusive)
+     * @param endOffset the end offset (exclusive)
+     * @return the number of hot data records in the range
+     */
+    public int getHotDataRecordsInRange(long startOffset, long endOffset) {
+        if (closed || startOffset >= endOffset) {
+            return 0;
+        }
+
+        lock.readLock().lock();
+        try {
+            int totalRecords = 0;
+
+            // Find all ranges that intersect with the query range
+            for (OffsetRange range : offsetRanges.values()) {
+                if (range.getStartOffset() < endOffset && range.getEndOffset() > startOffset) {
+                    // Calculate the intersection range
+                    long intersectionStart = Math.max(range.getStartOffset(), startOffset);
+                    long intersectionEnd = Math.min(range.getEndOffset(), endOffset);
+
+                    // Count records in the intersection range
+                    if (intersectionStart < intersectionEnd) {
+                        NavigableMap<Long, RowCacheIndexEntry> entriesInRange =
+                                range.localIndex.getEntriesInRange(
+                                        intersectionStart, intersectionEnd);
+                        totalRecords += entriesInRange.size();
+                    }
+                }
+            }
+
+            return totalRecords;
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**
@@ -293,7 +370,12 @@ public class IndexBucketRowCache implements Closeable {
      * @return the count of active ranges
      */
     public int getRangeCount() {
-        return offsetRanges.size();
+        lock.readLock().lock();
+        try {
+            return offsetRanges.size();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**
@@ -302,7 +384,12 @@ public class IndexBucketRowCache implements Closeable {
      * @return total size in bytes
      */
     public long getTotalSize() {
-        return totalSize;
+        lock.readLock().lock();
+        try {
+            return totalSize;
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**
@@ -328,61 +415,67 @@ public class IndexBucketRowCache implements Closeable {
             return emptyList();
         }
 
-        List<OffsetRangeInfo> unloadedRanges = new ArrayList<>();
+        lock.readLock().lock();
+        try {
+            List<OffsetRangeInfo> unloadedRanges = new ArrayList<>();
 
-        if (offsetRanges.isEmpty()) {
-            // No ranges exist, entire query range is unloaded
-            unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
-            return unloadedRanges;
-        }
-
-        // Find all ranges that might intersect with the query range
-        List<OffsetRange> intersectingRanges = new ArrayList<>();
-        for (OffsetRange range : offsetRanges.values()) {
-            // Check if range intersects with [startOffset, endOffset)
-            if (range.getStartOffset() < endOffset && range.getEndOffset() > startOffset) {
-                intersectingRanges.add(range);
-            }
-        }
-
-        if (intersectingRanges.isEmpty()) {
-            // No existing ranges intersect with query range, entire range is unloaded
-            unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
-            return unloadedRanges;
-        }
-
-        // Sort ranges by start offset (should already be sorted, but ensure)
-        intersectingRanges.sort((r1, r2) -> Long.compare(r1.getStartOffset(), r2.getStartOffset()));
-
-        // Find gaps within the query range
-        long currentOffset = startOffset;
-
-        for (OffsetRange range : intersectingRanges) {
-            long rangeStart = Math.max(range.getStartOffset(), startOffset);
-            long rangeEnd = Math.min(range.getEndOffset(), endOffset);
-
-            // Check for gap before this range
-            if (currentOffset < rangeStart) {
-                unloadedRanges.add(new OffsetRangeInfo(currentOffset, rangeStart));
+            if (offsetRanges.isEmpty()) {
+                // No ranges exist, entire query range is unloaded
+                unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
+                return unloadedRanges;
             }
 
-            // Move current offset past this range
-            currentOffset = Math.max(currentOffset, rangeEnd);
+            // Find all ranges that might intersect with the query range
+            List<OffsetRange> intersectingRanges = new ArrayList<>();
+            for (OffsetRange range : offsetRanges.values()) {
+                // Check if range intersects with [startOffset, endOffset)
+                if (range.getStartOffset() < endOffset && range.getEndOffset() > startOffset) {
+                    intersectingRanges.add(range);
+                }
+            }
+
+            if (intersectingRanges.isEmpty()) {
+                // No existing ranges intersect with query range, entire range is unloaded
+                unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
+                return unloadedRanges;
+            }
+
+            // Sort ranges by start offset (should already be sorted, but ensure)
+            intersectingRanges.sort(
+                    (r1, r2) -> Long.compare(r1.getStartOffset(), r2.getStartOffset()));
+
+            // Find gaps within the query range
+            long currentOffset = startOffset;
+
+            for (OffsetRange range : intersectingRanges) {
+                long rangeStart = Math.max(range.getStartOffset(), startOffset);
+                long rangeEnd = Math.min(range.getEndOffset(), endOffset);
+
+                // Check for gap before this range
+                if (currentOffset < rangeStart) {
+                    unloadedRanges.add(new OffsetRangeInfo(currentOffset, rangeStart));
+                }
+
+                // Move current offset past this range
+                currentOffset = Math.max(currentOffset, rangeEnd);
+            }
+
+            // Check for gap after all ranges
+            if (currentOffset < endOffset) {
+                unloadedRanges.add(new OffsetRangeInfo(currentOffset, endOffset));
+            }
+
+            LOG.trace(
+                    "Found {} unloaded ranges within [{}, {}) with {} existing ranges",
+                    unloadedRanges.size(),
+                    startOffset,
+                    endOffset,
+                    intersectingRanges.size());
+
+            return unloadedRanges;
+        } finally {
+            lock.readLock().unlock();
         }
-
-        // Check for gap after all ranges
-        if (currentOffset < endOffset) {
-            unloadedRanges.add(new OffsetRangeInfo(currentOffset, endOffset));
-        }
-
-        LOG.trace(
-                "Found {} unloaded ranges within [{}, {}) with {} existing ranges",
-                unloadedRanges.size(),
-                startOffset,
-                endOffset,
-                intersectingRanges.size());
-
-        return unloadedRanges;
     }
 
     /**
@@ -396,35 +489,40 @@ public class IndexBucketRowCache implements Closeable {
             return;
         }
 
-        List<Long> rangesToRemove = new ArrayList<>();
-        int totalRemovedSize = 0;
-        for (Map.Entry<Long, OffsetRange> entry : offsetRanges.entrySet()) {
-            OffsetRange range = entry.getValue();
-            int removedSize = range.cleanupBelowHorizon(horizonOffset);
-            totalRemovedSize += removedSize;
+        lock.writeLock().lock();
+        try {
+            List<Long> rangesToRemove = new ArrayList<>();
+            int totalRemovedSize = 0;
+            for (Map.Entry<Long, OffsetRange> entry : offsetRanges.entrySet()) {
+                OffsetRange range = entry.getValue();
+                int removedSize = range.cleanupBelowHorizon(horizonOffset);
+                totalRemovedSize += removedSize;
 
-            if (range.isEmpty()) {
-                rangesToRemove.add(entry.getKey());
+                if (range.isEmpty()) {
+                    rangesToRemove.add(entry.getKey());
+                }
             }
-        }
 
-        // Update total size
-        totalSize -= totalRemovedSize;
+            // Update total size
+            totalSize -= totalRemovedSize;
 
-        // Remove empty ranges
-        for (Long rangeKey : rangesToRemove) {
-            OffsetRange range = offsetRanges.remove(rangeKey);
-            if (range != null) {
-                range.close();
+            // Remove empty ranges
+            for (Long rangeKey : rangesToRemove) {
+                OffsetRange range = offsetRanges.remove(rangeKey);
+                if (range != null) {
+                    range.close();
+                }
             }
-        }
 
-        LOG.debug(
-                "Cleaned up data below horizon {}, reclaimed {} bytes, removed {} empty ranges. Current ranges: {}",
-                horizonOffset,
-                totalRemovedSize,
-                rangesToRemove.size(),
-                offsetRanges.size());
+            LOG.debug(
+                    "Cleaned up data below horizon {}, reclaimed {} bytes, removed {} empty ranges. Current ranges: {}",
+                    horizonOffset,
+                    totalRemovedSize,
+                    rangesToRemove.size(),
+                    offsetRanges.size());
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     @Override
@@ -433,21 +531,31 @@ public class IndexBucketRowCache implements Closeable {
             return;
         }
 
-        closed = true;
-
-        // Close all ranges
-        for (OffsetRange range : offsetRanges.values()) {
-            try {
-                range.close();
-            } catch (Exception e) {
-                LOG.warn("Error closing offset range", e);
+        lock.writeLock().lock();
+        try {
+            if (closed) {
+                // Double check after acquiring lock
+                return;
             }
+
+            closed = true;
+
+            // Close all ranges
+            for (OffsetRange range : offsetRanges.values()) {
+                try {
+                    range.close();
+                } catch (Exception e) {
+                    LOG.warn("Error closing offset range", e);
+                }
+            }
+
+            offsetRanges.clear();
+            totalSize = 0;
+
+            LOG.debug("IndexBucketRowCache closed successfully");
+        } finally {
+            lock.writeLock().unlock();
         }
-
-        offsetRanges.clear();
-        totalSize = 0;
-
-        LOG.debug("IndexBucketRowCache closed successfully");
     }
 
     // Internal helper methods
@@ -528,6 +636,7 @@ public class IndexBucketRowCache implements Closeable {
         private final List<MemorySegment> memorySegments = new ArrayList<>();
         private final List<SegmentMetadata> segmentMetadataList = new ArrayList<>();
         private final RowCacheIndex localIndex;
+        private volatile boolean closed = false;
 
         OffsetRange(long startOffset, MemorySegmentPool memoryPool) {
             this.startOffset = startOffset;
@@ -793,7 +902,7 @@ public class IndexBucketRowCache implements Closeable {
         }
 
         public int cleanupBelowHorizon(long horizonOffset) {
-            if (memorySegments.isEmpty()) {
+            if (closed || memorySegments.isEmpty()) {
                 return 0;
             }
 
@@ -835,18 +944,26 @@ public class IndexBucketRowCache implements Closeable {
             Collections.reverse(segmentsToRemove);
 
             for (int segmentIndex : segmentsToRemove) {
-                // Return memory segment to pool
-                MemorySegment segmentToRemove = memorySegments.get(segmentIndex);
-                memoryPool.returnPage(segmentToRemove);
+                // Return memory segment to pool only if not closed
+                if (!closed) {
+                    MemorySegment segmentToRemove = memorySegments.get(segmentIndex);
+                    try {
+                        memoryPool.returnPage(segmentToRemove);
+                        LOG.trace(
+                                "Returned MemorySegment {} from OffsetRange to pool, maxOffset was < horizon {}",
+                                segmentIndex,
+                                horizonOffset);
+                    } catch (Exception e) {
+                        LOG.warn(
+                                "Failed to return MemorySegment {} to pool: {}",
+                                segmentIndex,
+                                e.getMessage());
+                    }
+                }
 
                 // Remove from lists
                 memorySegments.remove(segmentIndex);
                 segmentMetadataList.remove(segmentIndex);
-
-                LOG.trace(
-                        "Removed MemorySegment {} from OffsetRange, maxOffset was < horizon {}",
-                        segmentIndex,
-                        horizonOffset);
             }
 
             // Update index after segment removal
@@ -888,11 +1005,36 @@ public class IndexBucketRowCache implements Closeable {
 
         @Override
         public void close() throws IOException {
-            // Release memory segments back to the pool
-            memoryPool.returnAll(memorySegments);
-            memorySegments.clear();
-            segmentMetadataList.clear();
-            localIndex.clear();
+            if (closed) {
+                return;
+            }
+
+            synchronized (this) {
+                if (closed) {
+                    // Double check after acquiring lock
+                    return;
+                }
+
+                closed = true;
+
+                // Release memory segments back to the pool
+                try {
+                    if (!memorySegments.isEmpty()) {
+                        memoryPool.returnAll(memorySegments);
+                        LOG.trace(
+                                "Returned {} MemorySegments to pool during OffsetRange close",
+                                memorySegments.size());
+                    }
+                } catch (Exception e) {
+                    LOG.warn(
+                            "Failed to return memory segments to pool during close: {}",
+                            e.getMessage());
+                } finally {
+                    memorySegments.clear();
+                    segmentMetadataList.clear();
+                    localIndex.clear();
+                }
+            }
         }
 
         private SegmentMetadata findOrAllocateSegment(int requiredSize) throws IOException {

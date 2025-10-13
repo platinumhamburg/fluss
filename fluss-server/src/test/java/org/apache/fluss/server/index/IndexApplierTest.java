@@ -129,7 +129,13 @@ class IndexApplierTest {
         createKvTablet();
 
         // Create IndexApplier with null DataLakeFormat (for testing)
-        indexApplier = new IndexApplier(kvTablet, logTablet, fatalErrorHandler, indexSchema);
+        indexApplier =
+                new IndexApplier(
+                        kvTablet,
+                        logTablet,
+                        fatalErrorHandler,
+                        indexSchema,
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
 
         // Setup test data buckets - these represent upstream data table buckets
         dataBucket1 = new TableBucket(DATA1_TABLE_ID, 0L, 0);

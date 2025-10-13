@@ -31,6 +31,7 @@ import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Maps;
 import org.apache.fluss.types.RowType;
@@ -90,6 +91,7 @@ public final class IndexApplier implements Closeable {
     private final FatalErrorHandler fatalErrorHandler;
     private final RowType indexRowType;
     private final KeyEncoder indexKeyEncoder;
+    private final TabletServerMetricGroup serverMetricGroup;
 
     // Lock for protecting internal state
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
@@ -117,17 +119,21 @@ public final class IndexApplier implements Closeable {
      * @param logTablet the log tablet for WAL operations
      * @param fatalErrorHandler the fatal error handler
      * @param indexTableSchema the schema of the index table
+     * @param serverMetricGroup the server metric group for metrics recording
      */
     public IndexApplier(
             KvTablet kvTablet,
             LogTablet logTablet,
             FatalErrorHandler fatalErrorHandler,
-            Schema indexTableSchema) {
+            Schema indexTableSchema,
+            TabletServerMetricGroup serverMetricGroup) {
         this.kvTablet = checkNotNull(kvTablet, "kvTablet cannot be null");
         this.logTablet = checkNotNull(logTablet, "logTablet cannot be null");
         this.fatalErrorHandler =
                 checkNotNull(fatalErrorHandler, "fatalErrorHandler cannot be null");
         checkNotNull(indexTableSchema, "indexTableSchema cannot be null");
+        this.serverMetricGroup =
+                checkNotNull(serverMetricGroup, "serverMetricGroup cannot be null");
 
         // Extract RowType from Schema
         this.indexRowType = indexTableSchema.getRowType();
@@ -441,6 +447,7 @@ public final class IndexApplier implements Closeable {
     private void processIndexRecordsToPreWriteBuffer(
             MemoryLogRecords records, LogAppendInfo appendInfo) throws Exception {
         long currentIndexOffset = appendInfo.firstOffset();
+        int totalRecordCount = 0;
 
         // Create read context for processing index records
         LogRecordReadContext readContext =
@@ -456,9 +463,18 @@ public final class IndexApplier implements Closeable {
                     processIndexRecordToPreWriteBuffer(
                             batch.schemaId(), record, currentIndexOffset);
                     currentIndexOffset++;
+                    totalRecordCount++;
                 }
             }
         }
+
+        // Record the batch size metric
+        serverMetricGroup.indexApplyBatchSizeHistogram().update(totalRecordCount);
+
+        LOG.debug(
+                "Processed {} index records in batch for index bucket {}",
+                totalRecordCount,
+                kvTablet.getTableBucket());
     }
 
     /**

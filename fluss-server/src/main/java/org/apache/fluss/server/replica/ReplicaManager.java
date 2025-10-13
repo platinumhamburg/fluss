@@ -18,6 +18,7 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FencedLeaderEpochException;
@@ -1137,8 +1138,9 @@ public class ReplicaManager {
     }
 
     /**
-     * Wait for a data bucket to be ready with a valid leader. This method will retry indefinitely
-     * until the data bucket has a valid leader assigned.
+     * Wait for a data bucket to be ready with a valid leader and ensure the leader's server node is
+     * available in metadata cache. This method will retry indefinitely until both conditions are
+     * met.
      *
      * @param dataBucket the data bucket to wait for
      * @param indexBucket the index bucket that depends on this data bucket
@@ -1156,15 +1158,26 @@ public class ReplicaManager {
                 if (optLeaderAndIsr.isPresent()) {
                     int dataLeader = optLeaderAndIsr.get().leader();
                     if (dataLeader >= 0) {
-                        if (retryCount > 0) {
-                            LOG.info(
-                                    "Data bucket {} is now ready with leader {} after {} retries for index bucket {}",
+                        // Check if the leader server node is available in metadata cache
+                        Optional<ServerNode> serverNode =
+                                metadataCache.getTabletServer(dataLeader, internalListenerName);
+                        if (serverNode.isPresent()) {
+                            if (retryCount > 0) {
+                                LOG.info(
+                                        "Data bucket {} is now ready with leader {} and server node cached after {} retries for index bucket {}",
+                                        dataBucket,
+                                        dataLeader,
+                                        retryCount,
+                                        indexBucket);
+                            }
+                            return dataLeader;
+                        } else {
+                            LOG.debug(
+                                    "Data bucket {} has valid leader {} but server node not yet cached, retrying... (retry count: {})",
                                     dataBucket,
                                     dataLeader,
-                                    retryCount,
-                                    indexBucket);
+                                    retryCount);
                         }
-                        return dataLeader;
                     } else {
                         LOG.debug(
                                 "Data bucket {} has invalid leader {}, retrying... (retry count: {})",
@@ -1180,7 +1193,7 @@ public class ReplicaManager {
                 }
             } catch (Exception e) {
                 LOG.debug(
-                        "Error getting leader info for data bucket {}, retrying... (retry count: {})",
+                        "Error getting leader info or server node for data bucket {}, retrying... (retry count: {})",
                         dataBucket,
                         retryCount,
                         e);
@@ -1189,7 +1202,7 @@ public class ReplicaManager {
             retryCount++;
             if (retryCount % 10 == 0) {
                 LOG.info(
-                        "Still waiting for data bucket {} to be ready for index bucket {}, retry count: {}",
+                        "Still waiting for data bucket {} to be ready with cached server node for index bucket {}, retry count: {}",
                         dataBucket,
                         indexBucket,
                         retryCount);
@@ -1727,7 +1740,9 @@ public class ReplicaManager {
             Consumer<Map<TableBucket, DataBucketIndexFetchResult>> responseCallback) {
         if (!delayedIndexFetchRequired(params, dataBucketIndexFetchInfo, completeFetches)) {
             responseCallback.accept(completeFetches);
+            return;
         }
+
         DelayedFetchIndex delayedFetchIndex =
                 new DelayedFetchIndex(
                         params,

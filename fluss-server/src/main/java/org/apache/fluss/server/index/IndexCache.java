@@ -64,7 +64,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *
  * <p>Architecture Changes: - Replaced CachedIndexSegments with IndexRowCache for row-level
  * management - Integrated IndexCacheWriter for enhanced cold data loading - Added support for
- * hot/cold data fusion with consistent data integrity - Enhanced fetchIndexLogData with three-stage
+ * hot/cold data fusion with consistent data integrity - Enhanced fetchIndex with three-stage
  * processing: cache analysis → cold loading → dynamic assembly
  *
  * <p>Thread Safety: This class provides concurrent read access with exclusive write operations
@@ -182,7 +182,7 @@ public final class IndexCache implements Closeable {
      * @return Map of index bucket to IndexSegment with dynamically assembled data
      * @throws Exception if an error occurs during fetch operation
      */
-    public Optional<Map<TableBucket, IndexSegment>> fetchIndexLogData(
+    public Optional<Map<TableBucket, IndexSegment>> fetchIndex(
             Map<TableBucket, IndexCacheFetchParam> fetchRequests, boolean hotDataOnly)
             throws Exception {
         if (closed) {
@@ -203,14 +203,31 @@ public final class IndexCache implements Closeable {
         lock.readLock().lock();
         try {
 
-            // Stage 1: Collect all unloaded ranges from all IndexBuckets in batch
+            // Stage 1: For hotDataOnly mode, check if we have sufficient hot data first
+            if (hotDataOnly) {
+                boolean hasSufficientHotData =
+                        indexRowCache.hasSufficientHotDataForAll(fetchRequests);
+                if (!hasSufficientHotData) {
+                    LOG.debug(
+                            "DataBucket {}: Insufficient hot data for minBucketFetchRecords requirement, returning empty to trigger DelayedFetch",
+                            this.logTablet.getTableBucket());
+                    return Optional.empty();
+                }
+                LOG.debug(
+                        "DataBucket {}: Sufficient hot data available, proceeding with hot data fetch",
+                        this.logTablet.getTableBucket());
+            }
+
+            // Stage 2: Collect all unloaded ranges from all IndexBuckets in batch
             unloadedRanges = indexRowCache.getUnloadedRanges(fetchRequests);
 
+            // Stage 3: For hotDataOnly mode, if there are unloaded ranges, return empty
+            // This preserves the existing behavior for cases where data needs WAL loading
             if (!unloadedRanges.isEmpty() && hotDataOnly) {
                 for (Map.Entry<TableBucket, List<OffsetRangeInfo>> entry :
                         unloadedRanges.entrySet()) {
-                    LOG.info(
-                            "DataBucket {}: Index bucket {} has unloaded ranges: {}",
+                    LOG.debug(
+                            "DataBucket {}: Index bucket {} has unloaded ranges: {}, returning empty for hotDataOnly mode",
                             this.logTablet.getTableBucket(),
                             entry.getKey(),
                             entry.getValue());
@@ -218,12 +235,12 @@ public final class IndexCache implements Closeable {
                 return Optional.empty();
             }
 
-            // Stage 2: Batch load cold data if needed (single WAL read for all IndexBuckets)
+            // Stage 4: Batch load cold data if needed (single WAL read for all IndexBuckets)
             if (!unloadedRanges.isEmpty()) {
                 loadColdDataForRanges(unloadedRanges);
             }
 
-            // Stage 3: Assemble IndexSegments for each IndexBucket
+            // Stage 5: Assemble IndexSegments for each IndexBucket
             for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
                 TableBucket indexBucket = entry.getKey();
                 IndexCacheFetchParam param = entry.getValue();
@@ -477,11 +494,17 @@ public final class IndexCache implements Closeable {
     public static final class IndexCacheFetchParam {
         private final long indexTableId;
         private final long fetchOffset;
+        private final long minFetchHotDataRecords;
         private final long indexCommitOffset;
 
-        public IndexCacheFetchParam(long indexTableId, long fetchOffset, long indexCommitOffset) {
+        public IndexCacheFetchParam(
+                long indexTableId,
+                long fetchOffset,
+                long minFetchHotDataRecords,
+                long indexCommitOffset) {
             this.indexTableId = indexTableId;
             this.fetchOffset = fetchOffset;
+            this.minFetchHotDataRecords = minFetchHotDataRecords;
             this.indexCommitOffset = indexCommitOffset;
         }
 
@@ -491,6 +514,10 @@ public final class IndexCache implements Closeable {
 
         public long getFetchOffset() {
             return fetchOffset;
+        }
+
+        public long getMinFetchHotDataRecords() {
+            return minFetchHotDataRecords;
         }
 
         public long getIndexCommitOffset() {
