@@ -250,7 +250,8 @@ public class FlinkConversions {
         Map<String, String> properties = convertFlinkOptionsToFlussTableProperties(flinkTableConf);
 
         // add index bucket num configuration if present
-        String indexBucketNumKey = org.apache.fluss.config.ConfigOptions.TABLE_INDEX_BUCKET_NUM.key();
+        String indexBucketNumKey =
+                org.apache.fluss.config.ConfigOptions.TABLE_INDEX_BUCKET_NUM.key();
         if (flinkTableConf.containsKey(indexBucketNumKey)) {
             properties.put(
                     org.apache.fluss.config.ConfigOptions.TABLE_INDEX_BUCKET_NUM.key(),
@@ -612,7 +613,8 @@ public class FlinkConversions {
         Map<String, List<String>> indexColumns = new HashMap<>();
 
         // Parse the table.indexes.columns format - use the correct key from ConfigOptions
-        String indexesColumnsKey = org.apache.fluss.config.ConfigOptions.TABLE_INDEXES_COLUMNS.key();
+        String indexesColumnsKey =
+                org.apache.fluss.config.ConfigOptions.TABLE_INDEXES_COLUMNS.key();
         if (options.containsKey(indexesColumnsKey)) {
             parseIndexesColumns(options.getString(indexesColumnsKey, ""), indexColumns);
         }

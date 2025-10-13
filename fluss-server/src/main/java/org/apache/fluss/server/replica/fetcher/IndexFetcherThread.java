@@ -174,8 +174,8 @@ final class IndexFetcherThread extends ShutdownableThread {
     }
 
     /**
-     * Internal method to delay index buckets without acquiring lock.
-     * Should only be called when indexBucketStatusMapLock is already held.
+     * Internal method to delay index buckets without acquiring lock. Should only be called when
+     * indexBucketStatusMapLock is already held.
      */
     private void delayIndexBucketsInternal(Set<DataIndexTableBucket> indexBuckets, long delay) {
         for (DataIndexTableBucket dataIndexBucket : indexBuckets) {

@@ -32,8 +32,8 @@ import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
-
 import org.apache.fluss.utils.CloseableIterator;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -249,7 +249,7 @@ public final class IndexCacheWriter implements Closeable {
             try (LogRecordReadContext readContext =
                             LogRecordReadContext.createArrowReadContext(
                                     tableSchema.getRowType(), schemaId);
-                 CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
+                    CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
                 while (recordIterator.hasNext()) {
                     LogRecord walRecord = recordIterator.next();
                     for (CacheWriterForIndexTable indexWriter : cacheWriterForIndexTableTables) {

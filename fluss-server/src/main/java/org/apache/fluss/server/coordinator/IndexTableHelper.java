@@ -27,8 +27,8 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
-
 import org.apache.fluss.server.zk.data.TableAssignment;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -142,7 +142,8 @@ public class IndexTableHelper {
         int bucketCount = indexTableDescriptor.getTableDistribution().get().getBucketCount().get();
         int replicaFactor = indexTableDescriptor.getReplicationFactor();
         TabletServerInfo[] servers = metadataCache.getLiveServers();
-        TableAssignment indexTableAssignment = generateAssignment(bucketCount, replicaFactor, servers);
+        TableAssignment indexTableAssignment =
+                generateAssignment(bucketCount, replicaFactor, servers);
 
         // create the index table (mark as index table to allow __offset system column)
         metadataManager.createTable(
