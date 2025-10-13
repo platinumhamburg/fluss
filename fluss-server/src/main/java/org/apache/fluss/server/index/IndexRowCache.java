@@ -261,18 +261,18 @@ public final class IndexRowCache implements Closeable {
 
         Map<TableBucket, List<OffsetRangeInfo>> batchRanges = new HashMap<>();
 
-        long startOffset =
-                fetchRequests.values().stream()
-                        .map(IndexCacheFetchParam::getFetchOffset)
-                        .min(Long::compareTo)
-                        .orElse(0L);
-        long endOffset = logTablet.getHighWatermark();
-
         for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
             TableBucket indexBucket = entry.getKey();
+            IndexCacheFetchParam param = entry.getValue();
+            long endOffset =
+                    param.getMinFetchHotDataRecords() > 0
+                            ? Math.min(
+                                    param.getFetchOffset() + param.getMinFetchHotDataRecords(),
+                                    logTablet.getHighWatermark())
+                            : logTablet.getHighWatermark();
 
             List<OffsetRangeInfo> offsetRangeInfos =
-                    getUnloadedRanges(indexBucket, startOffset, endOffset);
+                    getUnloadedRanges(indexBucket, param.getFetchOffset(), endOffset);
 
             if (offsetRangeInfos.isEmpty()) {
                 continue;

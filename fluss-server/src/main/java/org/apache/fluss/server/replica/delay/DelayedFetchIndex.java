@@ -97,6 +97,9 @@ public class DelayedFetchIndex extends DelayedOperation {
             try {
                 Replica dataReplica = replicaManager.getReplicaOrException(dataBucket);
                 if (accumulatedRecords.get() < params.maxFetchRecords()) {
+                    // In onComplete, use hotDataOnly=false to allow cold data loading
+                    // This ensures unconditional fetch when DelayedFetchIndex times out or is force
+                    // completed
                     Optional<Map<TableBucket, IndexSegment>> fetchResultForDataBucketOpt =
                             dataReplica.fetchIndex(params, indexBucketFetchRequests, false);
                     checkArgument(fetchResultForDataBucketOpt.isPresent(), "Fetch result is null");
@@ -156,7 +159,8 @@ public class DelayedFetchIndex extends DelayedOperation {
      *   <li>Case C: This server doesn't know of some data buckets it tries to fetch from
      *   <li>Case D: The accumulated index records from all the fetching buckets exceeds the minimum
      *       records
-     *   <li>Case E: The accumulated bytes from all the fetching buckets exceeds the minimum bytes
+     *   <li>Case E: The accumulated index records from all the fetching buckets exceeds the maximum
+     *       records
      * </ul>
      *
      * <p>Upon completion, should return whatever index data is available for each valid data
@@ -183,6 +187,47 @@ public class DelayedFetchIndex extends DelayedOperation {
                 Replica dataReplica = replicaManager.getReplicaOrException(dataBucket);
                 checkArgument(
                         dataReplica.isLeader(), "Data bucket " + dataBucket + " is not leader");
+
+                // In tryComplete, use hotDataOnly=true to only check hot data availability
+                // This follows the same pattern as ReplicaManager.fetchIndexFromCache
+                Optional<Map<TableBucket, IndexSegment>> fetchResultForDataBucketOpt =
+                        dataReplica.fetchIndex(params, indexBucketFetchRequests, true);
+
+                if (fetchResultForDataBucketOpt.isPresent()) {
+                    Map<TableBucket, IndexSegment> fetchResults = fetchResultForDataBucketOpt.get();
+                    for (TableBucket indexBucket : indexBucketFetchRequests.keySet()) {
+                        IndexSegment segment = fetchResults.get(indexBucket);
+                        if (segment != null) {
+                            // Update accumulated records count
+                            if (segment.size() > 0
+                                    && segment.getRecords() != null
+                                    && segment.getRecords() != MemoryLogRecords.EMPTY) {
+                                for (LogRecordBatch batch : segment.getRecords().batches()) {
+                                    accumulatedRecords.addAndGet(batch.getRecordCount());
+                                }
+                            }
+                            indexBucketResults.put(
+                                    indexBucket,
+                                    new FetchIndexLogResultForBucket(
+                                            segment.getRecords(),
+                                            segment.getStartOffset(),
+                                            segment.getEndOffset()));
+                        } else {
+                            // If segment is null, don't add to completeFetches yet
+                            // This allows the operation to continue waiting
+                            continue;
+                        }
+                    }
+                    // Only add to completeFetches if we have valid results for all requested
+                    // buckets
+                    if (indexBucketResults.size() == indexBucketFetchRequests.size()) {
+                        completeFetches.put(
+                                dataBucket, new DataBucketIndexFetchResult(indexBucketResults));
+                    }
+                }
+                // If fetchIndex returns empty optional or partial results, don't add to
+                // completeFetches
+                // This allows the delayed operation to continue waiting
             } catch (Exception e) {
                 LOG.error("Failed to get data replica for data bucket {}", dataBucket, e);
                 // Return error result

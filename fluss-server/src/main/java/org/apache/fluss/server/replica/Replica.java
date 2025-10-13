@@ -705,10 +705,11 @@ public final class Replica {
                     new IndexCache.IndexCacheFetchParam(
                             indexBucket.getTableId(),
                             reqInfo.getFetchOffset(),
+                            hotDataOnly ? params.minBucketFetchRecords() : -1,
                             reqInfo.getIndexCommitOffset());
             indexCacheFetchParams.put(indexBucket, fetchParam);
         }
-        return indexCache.fetchIndexLogData(indexCacheFetchParams, hotDataOnly);
+        return indexCache.fetchIndex(indexCacheFetchParams, hotDataOnly);
     }
 
     private void createKv() {

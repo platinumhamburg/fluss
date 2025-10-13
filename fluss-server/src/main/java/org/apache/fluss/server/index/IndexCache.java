@@ -64,7 +64,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *
  * <p>Architecture Changes: - Replaced CachedIndexSegments with IndexRowCache for row-level
  * management - Integrated IndexCacheWriter for enhanced cold data loading - Added support for
- * hot/cold data fusion with consistent data integrity - Enhanced fetchIndexLogData with three-stage
+ * hot/cold data fusion with consistent data integrity - Enhanced fetchIndex with three-stage
  * processing: cache analysis → cold loading → dynamic assembly
  *
  * <p>Thread Safety: This class provides concurrent read access with exclusive write operations
@@ -182,7 +182,7 @@ public final class IndexCache implements Closeable {
      * @return Map of index bucket to IndexSegment with dynamically assembled data
      * @throws Exception if an error occurs during fetch operation
      */
-    public Optional<Map<TableBucket, IndexSegment>> fetchIndexLogData(
+    public Optional<Map<TableBucket, IndexSegment>> fetchIndex(
             Map<TableBucket, IndexCacheFetchParam> fetchRequests, boolean hotDataOnly)
             throws Exception {
         if (closed) {
@@ -477,11 +477,17 @@ public final class IndexCache implements Closeable {
     public static final class IndexCacheFetchParam {
         private final long indexTableId;
         private final long fetchOffset;
+        private final long minFetchHotDataRecords;
         private final long indexCommitOffset;
 
-        public IndexCacheFetchParam(long indexTableId, long fetchOffset, long indexCommitOffset) {
+        public IndexCacheFetchParam(
+                long indexTableId,
+                long fetchOffset,
+                long minFetchHotDataRecords,
+                long indexCommitOffset) {
             this.indexTableId = indexTableId;
             this.fetchOffset = fetchOffset;
+            this.minFetchHotDataRecords = minFetchHotDataRecords;
             this.indexCommitOffset = indexCommitOffset;
         }
 
@@ -495,6 +501,10 @@ public final class IndexCache implements Closeable {
 
         public long getIndexCommitOffset() {
             return indexCommitOffset;
+        }
+
+        public long getMinFetchHotDataRecords() {
+            return minFetchHotDataRecords;
         }
     }
 }
