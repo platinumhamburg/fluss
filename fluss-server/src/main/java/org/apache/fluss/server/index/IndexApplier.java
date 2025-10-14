@@ -18,6 +18,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.LogRecord;
@@ -488,19 +489,68 @@ public final class IndexApplier implements Closeable {
             short schemaId, LogRecord record, long indexLogOffset) throws Exception {
         // Extract key and value from the index record
         IndexedRow indexedRow = (IndexedRow) record.getRow();
-        // For index table, the key should be: [index columns] + [primary key columns]
-        byte[] key = indexKeyEncoder.encodeKey(indexedRow);
-        // For index table, the value is the complete IndexedRow
-        byte[] valueBytes = ValueEncoder.encodeValue(schemaId, indexedRow);
-        // Apply to KV pre-write buffer using the allocated index bucket offset
-        // This leverages the fact that index records contain UB records and can be directly applied
-        kvTablet.putToPreWriteBuffer(key, valueBytes, indexLogOffset);
 
-        LOG.debug(
-                "Index record applied to pre-write buffer: indexLogOffset={}, keySize={}, valueSize={}",
-                indexLogOffset,
-                key.length,
-                valueBytes.length);
+        // Validate IndexedRow before processing
+        if (indexedRow == null) {
+            LOG.warn(
+                    "Null IndexedRow encountered at index log offset {}, skipping", indexLogOffset);
+            return;
+        }
+
+        // Validate row segment bounds before encoding
+        try {
+            int sizeInBytes = indexedRow.getSizeInBytes();
+            MemorySegment segment = indexedRow.getSegment();
+            int offset = indexedRow.getOffset();
+
+            if (segment == null) {
+                throw new IllegalStateException("IndexedRow has null MemorySegment");
+            }
+            if (offset < 0 || sizeInBytes <= 0) {
+                throw new IllegalStateException(
+                        String.format(
+                                "Invalid IndexedRow dimensions: offset=%d, sizeInBytes=%d",
+                                offset, sizeInBytes));
+            }
+            if (offset + sizeInBytes > segment.size()) {
+                throw new IllegalStateException(
+                        String.format(
+                                "IndexedRow exceeds segment bounds: offset=%d, sizeInBytes=%d, segment.size=%d",
+                                offset, sizeInBytes, segment.size()));
+            }
+
+            // For index table, the key should be: [index columns] + [primary key columns]
+            byte[] key = indexKeyEncoder.encodeKey(indexedRow);
+            // For index table, the value is the complete IndexedRow
+            byte[] valueBytes = ValueEncoder.encodeValue(schemaId, indexedRow);
+            // Apply to KV pre-write buffer using the allocated index bucket offset
+            // This leverages the fact that index records contain UB records and can be directly
+            // applied
+            kvTablet.putToPreWriteBuffer(key, valueBytes, indexLogOffset);
+
+            LOG.debug(
+                    "Index record applied to pre-write buffer: indexLogOffset={}, keySize={}, valueSize={}",
+                    indexLogOffset,
+                    key.length,
+                    valueBytes.length);
+        } catch (IndexOutOfBoundsException e) {
+            LOG.error(
+                    "Memory bounds error while encoding IndexedRow at index log offset {}. "
+                            + "Row details: offset={}, sizeInBytes={}, segment.size={}. Error: {}",
+                    indexLogOffset,
+                    indexedRow.getOffset(),
+                    indexedRow.getSizeInBytes(),
+                    indexedRow.getSegment() != null ? indexedRow.getSegment().size() : "null",
+                    e.getMessage());
+            throw new Exception("Failed to process IndexedRow due to memory bounds violation", e);
+        } catch (Exception e) {
+            LOG.error(
+                    "Error processing IndexedRow at index log offset {}: {}",
+                    indexLogOffset,
+                    e.getMessage(),
+                    e);
+            throw e;
+        }
     }
 
     // ================================================================================================

@@ -103,10 +103,50 @@ public class IndexedRow implements BinaryRow, NullAwareGetters {
      */
     @Override
     public void copyTo(byte[] dst, int dstOffset) {
+        // Add defensive checks before memory copy
+        if (dst == null) {
+            throw new IllegalArgumentException("Destination array cannot be null");
+        }
+        if (dstOffset < 0) {
+            throw new IndexOutOfBoundsException(
+                    "Destination offset cannot be negative: " + dstOffset);
+        }
+        if (dstOffset + sizeInBytes > dst.length) {
+            throw new IndexOutOfBoundsException(
+                    String.format(
+                            "Copy would exceed destination array: dstOffset=%d, sizeInBytes=%d, dst.length=%d",
+                            dstOffset, sizeInBytes, dst.length));
+        }
+
+        // Double check segment bounds before copy
+        if (offset + sizeInBytes > segment.size()) {
+            throw new IndexOutOfBoundsException(
+                    String.format(
+                            "IndexedRow data exceeds segment bounds: offset=%d, sizeInBytes=%d, segment.size=%d",
+                            offset, sizeInBytes, segment.size()));
+        }
+
         segment.get(offset, dst, dstOffset, sizeInBytes);
     }
 
     public void pointTo(MemorySegment segment, int offset, int sizeInBytes) {
+        // Validate segment bounds to prevent IndexOutOfBoundsException
+        if (segment == null) {
+            throw new IllegalArgumentException("MemorySegment cannot be null");
+        }
+        if (offset < 0) {
+            throw new IndexOutOfBoundsException("Offset cannot be negative: " + offset);
+        }
+        if (sizeInBytes < 0) {
+            throw new IndexOutOfBoundsException("Size cannot be negative: " + sizeInBytes);
+        }
+        if (offset + sizeInBytes > segment.size()) {
+            throw new IndexOutOfBoundsException(
+                    String.format(
+                            "IndexedRow bounds exceed segment: offset=%d, sizeInBytes=%d, segment.size=%d",
+                            offset, sizeInBytes, segment.size()));
+        }
+
         this.segment = segment;
         this.segments = new MemorySegment[] {segment};
         this.offset = offset;

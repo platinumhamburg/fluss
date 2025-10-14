@@ -33,9 +33,38 @@ public class ValueEncoder {
      * @param row the row to encode
      */
     public static byte[] encodeValue(short schemaId, BinaryRow row) {
-        byte[] values = new byte[SCHEMA_ID_LENGTH + row.getSizeInBytes()];
+        // Validate inputs before encoding
+        if (row == null) {
+            throw new IllegalArgumentException("BinaryRow cannot be null");
+        }
+
+        int rowSizeInBytes = row.getSizeInBytes();
+        if (rowSizeInBytes < 0) {
+            throw new IllegalArgumentException("Row size cannot be negative: " + rowSizeInBytes);
+        }
+
+        // Check for potential integer overflow
+        if (rowSizeInBytes > Integer.MAX_VALUE - SCHEMA_ID_LENGTH) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Row size too large: %d bytes (max allowed: %d)",
+                            rowSizeInBytes, Integer.MAX_VALUE - SCHEMA_ID_LENGTH));
+        }
+
+        byte[] values = new byte[SCHEMA_ID_LENGTH + rowSizeInBytes];
         UnsafeUtils.putShort(values, 0, schemaId);
-        row.copyTo(values, SCHEMA_ID_LENGTH);
+
+        // Safely copy row data with bounds checking
+        try {
+            row.copyTo(values, SCHEMA_ID_LENGTH);
+        } catch (IndexOutOfBoundsException e) {
+            throw new RuntimeException(
+                    String.format(
+                            "Failed to copy row data: rowSize=%d, arrayLength=%d, schemaIdLength=%d. Error: %s",
+                            rowSizeInBytes, values.length, SCHEMA_ID_LENGTH, e.getMessage()),
+                    e);
+        }
+
         return values;
     }
 }
