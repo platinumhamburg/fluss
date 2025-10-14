@@ -196,7 +196,6 @@ public final class IndexApplier implements Closeable {
                                 startOffset,
                                 endOffset,
                                 e);
-                        fatalErrorHandler.onFatalError(e);
                         throw e;
                     }
                 });

@@ -416,12 +416,26 @@ final class IndexFetcherThread extends ShutdownableThread {
             }
             fairIndexBucketStatusMap.moveToEnd(dataIndexBucket);
             // Remove this redundant log as it duplicates information already logged above
+        } catch (IndexOutOfBoundsException e) {
+            LOG.error(
+                    "Memory bounds error while processing index data for data-index bucket {}. This indicates corrupted index data or memory segment issues. "
+                            + "Delaying for retry after {} ms. Error details: {}",
+                    dataIndexBucket,
+                    fetchBackOffMs,
+                    e.getMessage(),
+                    e);
+            // Increment error metrics for memory-related index fetch failures
+            serverMetricGroup.indexFetchErrors().inc();
+            // Use internal method since we're already holding the lock
+            delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
         } catch (Exception e) {
             LOG.error(
                     "Error while processing index data for data-index bucket {}, delayed for retry after {} ms.",
                     dataIndexBucket,
                     fetchBackOffMs,
                     e);
+            // Increment error metrics for index fetch failures
+            serverMetricGroup.indexFetchErrors().inc();
             // Use internal method since we're already holding the lock
             delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
         }
@@ -429,7 +443,7 @@ final class IndexFetcherThread extends ShutdownableThread {
 
     private void handleIndexBucketWithError(Set<DataIndexTableBucket> indexBuckets) {
         if (!indexBuckets.isEmpty()) {
-            LOG.info(
+            LOG.debug(
                     "Index fetch failed for {} buckets, retrying after {} ms delay: {}",
                     indexBuckets.size(),
                     fetchBackOffMs,
