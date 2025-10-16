@@ -59,7 +59,8 @@ public class ArrowLogWriteBatch extends WriteBatch {
         super(bucketId, physicalTablePath, createdMs);
         this.outputView = outputView;
         this.recordsBuilder =
-                MemoryLogRecordsArrowBuilder.builder(schemaId, arrowWriter, outputView, true);
+                MemoryLogRecordsArrowBuilder.builder(
+                        schemaId, arrowWriter, outputView, new byte[0], true);
     }
 
     @Override

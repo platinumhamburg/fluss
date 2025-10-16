@@ -40,7 +40,8 @@ public class ArrowWalBuilder implements WalBuilder {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         this.recordsBuilder =
-                MemoryLogRecordsArrowBuilder.builder(schemaId, writer, outputView, false);
+                MemoryLogRecordsArrowBuilder.builder(
+                        schemaId, writer, outputView, new byte[0], false);
     }
 
     @Override

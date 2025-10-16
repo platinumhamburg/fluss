@@ -15,20 +15,15 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.server.log.state.transitions;
 
-import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.server.log.state.RecordStateTransition;
 
 import java.util.Map;
 
-/** Converter interface for extracting state key-value pairs from LogRecordBatch. */
-public interface StateConverter {
-
-    /**
-     * Converts a LogRecordBatch into state key-value pairs.
-     *
-     * @param batch the log record batch to convert
-     * @return map of state key-value pairs, both key and value can be any Object type
-     */
-    Map<Object, Object> convert(LogRecordBatch batch);
+/** IndexApplyStateTransition. */
+public class IndexApplyStateTransition implements RecordStateTransition {
+    @Override
+    public void apply(Map<String, String> currentState, LogRecord record) {}
 }

@@ -313,7 +313,8 @@ public class ReplicaFetcherManager {
                 threadName,
                 replicaManager,
                 leaderEndpoint,
-                (int) conf.get(ConfigOptions.LOG_REPLICA_FETCH_BACKOFF_INTERVAL).toMillis());
+                (int) conf.get(ConfigOptions.LOG_REPLICA_FETCH_BACKOFF_INTERVAL).toMillis(),
+                conf);
     }
 
     @VisibleForTesting

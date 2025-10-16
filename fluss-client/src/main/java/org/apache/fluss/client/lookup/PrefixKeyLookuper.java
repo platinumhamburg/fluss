@@ -30,6 +30,7 @@ import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
 
@@ -146,37 +147,43 @@ class PrefixKeyLookuper implements Lookuper {
     }
 
     @Override
-    public CompletableFuture<LookupResult> lookup(InternalRow prefixKey) {
-        byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(prefixKey);
-        int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
+    public synchronized CompletableFuture<LookupResult> lookup(InternalRow prefixKey) {
+        try {
+            byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(prefixKey);
+            int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
 
-        Long partitionId = null;
-        if (partitionGetter != null) {
-            try {
-                partitionId =
-                        getPartitionId(
-                                prefixKey,
-                                partitionGetter,
-                                tableInfo.getTablePath(),
-                                metadataUpdater);
-            } catch (PartitionNotExistException e) {
-                return CompletableFuture.completedFuture(new LookupResult(Collections.emptyList()));
+            Long partitionId = null;
+            if (partitionGetter != null) {
+                try {
+                    partitionId =
+                            getPartitionId(
+                                    prefixKey,
+                                    partitionGetter,
+                                    tableInfo.getTablePath(),
+                                    metadataUpdater);
+                } catch (PartitionNotExistException e) {
+                    return CompletableFuture.completedFuture(
+                            new LookupResult(Collections.emptyList()));
+                }
             }
-        }
 
-        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-        return lookupClient
-                .prefixLookup(tableBucket, bucketKeyBytes)
-                .thenApply(
-                        result -> {
-                            List<InternalRow> rowList = new ArrayList<>(result.size());
-                            for (byte[] valueBytes : result) {
-                                if (valueBytes == null) {
-                                    continue;
+            TableBucket tableBucket =
+                    new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
+            return lookupClient
+                    .prefixLookup(tableBucket, bucketKeyBytes)
+                    .thenApply(
+                            result -> {
+                                List<InternalRow> rowList = new ArrayList<>(result.size());
+                                for (byte[] valueBytes : result) {
+                                    if (valueBytes == null) {
+                                        continue;
+                                    }
+                                    rowList.add(kvValueDecoder.decodeValue(valueBytes).row);
                                 }
-                                rowList.add(kvValueDecoder.decodeValue(valueBytes).row);
-                            }
-                            return new LookupResult(rowList);
-                        });
+                                return new LookupResult(rowList);
+                            });
+        } catch (Exception e) {
+            return FutureUtils.failedCompletableFuture(e);
+        }
     }
 }

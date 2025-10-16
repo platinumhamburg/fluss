@@ -794,8 +794,17 @@ public final class RecordAccumulator {
      * Cluster later on.
      */
     private List<BucketLocation> getAllBucketsInCurrentNode(Integer currentNode, Cluster cluster) {
-        List<BucketLocation> buckets = new ArrayList<>();
-        Set<PhysicalTablePath> physicalTablePaths = cluster.getBucketLocationsByPath().keySet();
+        Map<PhysicalTablePath, List<BucketLocation>> bucketLocationsByPath =
+                cluster.getBucketLocationsByPath();
+
+        int totalSizeEstimate = 0;
+        for (List<BucketLocation> bucketsForTable : bucketLocationsByPath.values()) {
+            totalSizeEstimate += bucketsForTable.size();
+        }
+
+        List<BucketLocation> buckets = new ArrayList<>(Math.min(totalSizeEstimate, 1024));
+
+        Set<PhysicalTablePath> physicalTablePaths = bucketLocationsByPath.keySet();
         for (PhysicalTablePath path : physicalTablePaths) {
             List<BucketLocation> bucketsForTable =
                     cluster.getAvailableBucketsForPhysicalTablePath(path);

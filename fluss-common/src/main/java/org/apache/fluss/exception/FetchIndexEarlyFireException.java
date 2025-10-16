@@ -15,33 +15,19 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.exception;
 
-import java.io.IOException;
-import java.util.concurrent.ConcurrentSkipListMap;
+import org.apache.fluss.annotation.PublicEvolving;
 
-/** ImmemoryRawStateStore. */
-public class ImmemoryRawStateStore implements RawStateStore {
+/**
+ * Thrown when the tabletServer is not available.
+ *
+ * @since 0.8
+ */
+@PublicEvolving
+public class FetchIndexEarlyFireException extends ApiException {
 
-    private final ConcurrentSkipListMap<byte[], byte[]> map = new ConcurrentSkipListMap<>();
-
-    @Override
-    public void put(byte[] key, byte[] value) throws IOException {
-        map.put(key, value);
-    }
-
-    @Override
-    public byte[] get(byte[] key) throws IOException {
-        return map.get(key);
-    }
-
-    @Override
-    public void delete(byte[] key) throws IOException {
-        map.remove(key);
-    }
-
-    @Override
-    public long checkpoint(long recoverLogOffset) throws IOException {
-        throw new UnsupportedOperationException();
+    public FetchIndexEarlyFireException(String message) {
+        super(message);
     }
 }

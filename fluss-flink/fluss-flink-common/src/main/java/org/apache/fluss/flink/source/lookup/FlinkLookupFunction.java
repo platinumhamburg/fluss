@@ -24,6 +24,7 @@ import org.apache.fluss.client.lookup.LookupType;
 import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
@@ -84,7 +85,9 @@ public class FlinkLookupFunction extends LookupFunction {
     @Override
     public void open(FunctionContext context) {
         LOG.info("start open ...");
-        connection = ConnectionFactory.createConnection(flussConfig);
+        connection =
+                ConnectionFactory.createConnection(
+                        flussConfig, new FlinkMetricRegistry(context.getMetricGroup()));
         table = connection.getTable(tablePath);
         lookupRow = new FlinkAsFlussRow();
 
@@ -101,7 +104,8 @@ public class FlinkLookupFunction extends LookupFunction {
                 new FlussRowToFlinkRowConverter(FlinkConversions.toFlussRowType(outputRowType));
 
         Lookup lookup = table.newLookup();
-        if (lookupNormalizer.getLookupType() == LookupType.PREFIX_LOOKUP) {
+        if (lookupNormalizer.getLookupType() == LookupType.PREFIX_LOOKUP
+                || lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP) {
             int[] lookupKeyIndexes = lookupNormalizer.getLookupKeyIndexes();
             RowType lookupKeyRowType = FlinkUtils.projectRowType(flinkRowType, lookupKeyIndexes);
             lookup = lookup.lookupBy(lookupKeyRowType.getFieldNames());

@@ -28,6 +28,7 @@ import org.apache.fluss.client.table.writer.Append;
 import org.apache.fluss.client.table.writer.TableAppend;
 import org.apache.fluss.client.table.writer.TableUpsert;
 import org.apache.fluss.client.table.writer.Upsert;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -46,12 +47,15 @@ public class FlussTable implements Table {
     private final TablePath tablePath;
     private final TableInfo tableInfo;
     private final boolean hasPrimaryKey;
+    private final Configuration conf;
 
-    public FlussTable(FlussConnection conn, TablePath tablePath, TableInfo tableInfo) {
+    public FlussTable(
+            FlussConnection conn, TablePath tablePath, TableInfo tableInfo, Configuration conf) {
         this.conn = conn;
         this.tablePath = tablePath;
         this.tableInfo = tableInfo;
         this.hasPrimaryKey = tableInfo.hasPrimaryKey();
+        this.conf = conf;
     }
 
     /**
@@ -78,7 +82,7 @@ public class FlussTable implements Table {
     @Override
     public Lookup newLookup() {
         return new TableLookup(
-                tableInfo, conn.getMetadataUpdater(), conn.getOrCreateLookupClient());
+                tableInfo, conn.getMetadataUpdater(), conn.getOrCreateLookupClient(), conf);
     }
 
     @Override

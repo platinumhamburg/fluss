@@ -17,15 +17,12 @@
 
 package org.apache.fluss.server.log.state;
 
-import java.io.IOException;
+import org.apache.fluss.record.LogRecordBatch;
 
-/** TODO StateCheckpointManager. */
-public interface RawStateStore {
-    void put(byte[] key, byte[] value) throws IOException;
+import java.util.Map;
 
-    byte[] get(byte[] key) throws IOException;
+/** A transition of a batch state. */
+public interface BatchStateTransition extends StateTransition {
 
-    void delete(byte[] key) throws IOException;
-
-    long checkpoint(long recoverLogOffset) throws IOException;
+    void apply(Map<String, String> currentState, LogRecordBatch batch);
 }

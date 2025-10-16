@@ -30,6 +30,7 @@ import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
 
@@ -101,39 +102,46 @@ class PrimaryKeyLookuper implements Lookuper {
     }
 
     @Override
-    public CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
-        // encoding the key row using a compacted way consisted with how the key is encoded when put
-        // a row
-        byte[] pkBytes = primaryKeyEncoder.encodeKey(lookupKey);
-        byte[] bkBytes =
-                bucketKeyEncoder == primaryKeyEncoder
-                        ? pkBytes
-                        : bucketKeyEncoder.encodeKey(lookupKey);
-        Long partitionId = null;
-        if (partitionGetter != null) {
-            try {
-                partitionId =
-                        getPartitionId(
-                                lookupKey,
-                                partitionGetter,
-                                tableInfo.getTablePath(),
-                                metadataUpdater);
-            } catch (PartitionNotExistException e) {
-                return CompletableFuture.completedFuture(new LookupResult(Collections.emptyList()));
+    public synchronized CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
+        try {
+            // encoding the key row using a compacted way consisted with how the key is encoded when
+            // put
+            // a row
+            byte[] pkBytes = primaryKeyEncoder.encodeKey(lookupKey);
+            byte[] bkBytes =
+                    bucketKeyEncoder == primaryKeyEncoder
+                            ? pkBytes
+                            : bucketKeyEncoder.encodeKey(lookupKey);
+            Long partitionId = null;
+            if (partitionGetter != null) {
+                try {
+                    partitionId =
+                            getPartitionId(
+                                    lookupKey,
+                                    partitionGetter,
+                                    tableInfo.getTablePath(),
+                                    metadataUpdater);
+                } catch (PartitionNotExistException e) {
+                    return CompletableFuture.completedFuture(
+                            new LookupResult(Collections.emptyList()));
+                }
             }
-        }
 
-        int bucketId = bucketingFunction.bucketing(bkBytes, numBuckets);
-        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-        return lookupClient
-                .lookup(tableBucket, pkBytes)
-                .thenApply(
-                        valueBytes -> {
-                            InternalRow row =
-                                    valueBytes == null
-                                            ? null
-                                            : kvValueDecoder.decodeValue(valueBytes).row;
-                            return new LookupResult(row);
-                        });
+            int bucketId = bucketingFunction.bucketing(bkBytes, numBuckets);
+            TableBucket tableBucket =
+                    new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
+            return lookupClient
+                    .lookup(tableBucket, pkBytes)
+                    .thenApply(
+                            valueBytes -> {
+                                InternalRow row =
+                                        valueBytes == null
+                                                ? null
+                                                : kvValueDecoder.decodeValue(valueBytes).row;
+                                return new LookupResult(row);
+                            });
+        } catch (Exception e) {
+            return FutureUtils.failedCompletableFuture(e);
+        }
     }
 }

@@ -36,6 +36,7 @@ import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_LENGTH;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
@@ -70,12 +71,16 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
 
     private List<MemorySegmentBytesView> writtenBytesView;
 
+    // V3 extend properties
+    private byte[] extendPropertiesData = new byte[0];
+
     private MemoryLogRecordsIndexedBuilder(
             long baseLogOffset,
             int schemaId,
             int writeLimit,
             byte magic,
             AbstractPagedOutputView pagedOutputView,
+            byte[] extendPropertiesData,
             boolean appendOnly) {
         this.appendOnly = appendOnly;
         checkArgument(
@@ -91,11 +96,16 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
         this.batchSequence = NO_BATCH_SEQUENCE;
         this.currentRecordNumber = 0;
         this.isClosed = false;
+        this.extendPropertiesData = extendPropertiesData;
 
         // We don't need to write header information while the builder creating,
         // we'll skip it first.
-        this.pagedOutputView.setPosition(recordBatchHeaderSize(magic));
-        this.sizeInBytes = recordBatchHeaderSize(magic);
+        this.pagedOutputView.setPosition(
+                recordBatchHeaderSize(magic)
+                        + (extendPropertiesData == null ? 0 : extendPropertiesData.length));
+        this.sizeInBytes =
+                recordBatchHeaderSize(magic)
+                        + (extendPropertiesData == null ? 0 : extendPropertiesData.length);
         this.writtenBytesView = null;
     }
 
@@ -141,6 +151,7 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
                 writeLimit,
                 CURRENT_LOG_MAGIC_VALUE,
                 outputView,
+                new byte[0],
                 appendOnly);
     }
 
@@ -167,7 +178,26 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
             AbstractPagedOutputView outputView)
             throws IOException {
         return new MemoryLogRecordsIndexedBuilder(
-                baseLogOffset, schemaId, writeLimit, magic, outputView, false);
+                baseLogOffset, schemaId, writeLimit, magic, outputView, new byte[0], false);
+    }
+
+    @VisibleForTesting
+    public static MemoryLogRecordsIndexedBuilder builder(
+            long baseLogOffset,
+            int schemaId,
+            int writeLimit,
+            byte magic,
+            AbstractPagedOutputView outputView,
+            byte[] extendPropertiesData)
+            throws IOException {
+        return new MemoryLogRecordsIndexedBuilder(
+                baseLogOffset,
+                schemaId,
+                writeLimit,
+                magic,
+                outputView,
+                extendPropertiesData,
+                false);
     }
 
     /**
@@ -302,8 +332,16 @@ public class MemoryLogRecordsIndexedBuilder implements AutoCloseable {
         outputView.writeInt(batchSequence);
         outputView.writeInt(currentRecordNumber);
 
+        // Write extend properties for V3 format
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            outputView.writeInt(extendPropertiesData.length);
+            if (extendPropertiesData.length > 0) {
+                outputView.write(extendPropertiesData);
+            }
+        }
+
         // Update crc.
-        long crc = 0;
+        long crc;
         if (pagedOutputView != null) {
             crc = Crc32C.compute(pagedOutputView.getWrittenSegments(), schemaIdOffset(magic));
         } else {

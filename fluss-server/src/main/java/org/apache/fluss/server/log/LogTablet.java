@@ -40,6 +40,7 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.server.index.IndexCache;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
+import org.apache.fluss.server.log.state.BucketStateManager;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.utils.FlussPaths;
@@ -108,6 +109,8 @@ public final class LogTablet {
     private final Clock clock;
     private final boolean isChangeLog;
 
+    private final BucketStateManager bucketStateManager;
+
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
 
@@ -149,6 +152,8 @@ public final class LogTablet {
                 (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_CHECK_INTERVAL).toMillis();
         this.writerStateManager = writerStateManager;
         this.highWatermarkMetadata = new LogOffsetMetadata(0L);
+
+        this.bucketStateManager = null;
 
         this.scheduler = scheduler;
         // scheduler the writer expiration interval check.
@@ -763,6 +768,8 @@ public final class LogTablet {
                 writerStateManager.updateMapEndOffset(appendInfo.lastOffset() + 1);
 
                 // todo update the first unstable offset (which is used to compute lso)
+
+                bucketStateManager.apply(validRecords.batches(), appendInfo.firstOffset());
 
                 LOG.trace(
                         "Appended message set with last offset: {}, first offset {}, next offset: {} "

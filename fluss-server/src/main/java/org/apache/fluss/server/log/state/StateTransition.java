@@ -17,10 +17,5 @@
 
 package org.apache.fluss.server.log.state;
 
-/** Merge policy for handling state conflicts when the same key is updated multiple times. */
-public enum StateMergePolicy {
-    /** Use the last (most recent) value when keys conflict. */
-    LAST_VALUE,
-    /** Keep the first value when keys conflict, ignore subsequent updates. */
-    FIRST_VALUE,
-}
+/** A transition of a state. */
+public interface StateTransition {}

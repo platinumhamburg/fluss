@@ -17,65 +17,70 @@
 
 package org.apache.fluss.server.log.state;
 
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
-import org.apache.fluss.server.utils.FatalErrorHandler;
+import org.apache.fluss.record.LogRecordReadContext;
+import org.apache.fluss.utils.CloseableIterator;
 
-import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
-import static org.apache.fluss.utils.Preconditions.checkNotNull;
-
-/** TODO StateCheckpointManager. */
+/** BucketStateManager. */
 public class BucketStateManager {
 
-    private RawStateStore rawStateStore;
+    private final TableInfo tableInfo;
 
-    private long lastAppliedOffset;
+    private static final List<StateDef> HEADER_STATE_DEF_LIST = new ArrayList<>(4);
 
-    private long lastCheckpointOffset;
+    private static final List<StateDef> RECORD_STATE_DEF_LIST = new ArrayList<>(4);
 
-    private FatalErrorHandler fatalErrorHandler;
-
-    public void checkPoint() {}
-
-    public void apply(LogRecordBatch batch) {
-        StateDefs[] stateDefs = StateDefs.values();
-        for (StateDefs stateDef : stateDefs) {
-            try {
-                checkNotNull(stateDef.getConverter());
-                checkNotNull(stateDef.getKeySerde());
-                checkNotNull(stateDef.getValueSerde());
-
-                Map<Object, Object> stateMap = stateDef.getConverter().convert(batch);
-                for (Map.Entry<Object, Object> entry : stateMap.entrySet()) {
-                    // Encode composite key: version + state_id + separator + state_key_bytes
-                    byte[] compositeKey =
-                            CompositeStateKeyEncoder.encode(
-                                    stateDef, entry.getKey(), stateDef.getKeySerde());
-
-                    // Encode value
-                    byte[] valueBytes = stateDef.getValueSerde().serialize(entry.getValue());
-
-                    // Apply merge policy
-                    switch (stateDef.getStateMergePolicy()) {
-                        case LAST_VALUE:
-                            rawStateStore.put(compositeKey, valueBytes);
-                            break;
-                        case FIRST_VALUE:
-                            // Only put if key doesn't exist
-                            byte[] existingValue = rawStateStore.get(compositeKey);
-                            if (existingValue == null) {
-                                rawStateStore.put(compositeKey, valueBytes);
-                            }
-                            break;
-                        default:
-                            throw new UnsupportedOperationException(
-                                    "Unsupported merge policy: " + stateDef.getStateMergePolicy());
-                    }
-                }
-            } catch (IOException e) {
-                fatalErrorHandler.onFatalError(e);
+    static {
+        for (StateDef def : StateDef.values()) {
+            if (def.headerOnly()) {
+                HEADER_STATE_DEF_LIST.add(def);
+            } else {
+                RECORD_STATE_DEF_LIST.add(def);
             }
         }
     }
+
+    public BucketStateManager(TableInfo tableInfo) {
+        this.tableInfo = tableInfo;
+    }
+
+    private Map<String, String> currentState(StateDef def) {
+        return new HashMap<>();
+    }
+
+    public Object getState(StateDef stateDef, String key) {
+        return currentState(stateDef).get(key);
+    }
+
+    public void apply(Iterable<LogRecordBatch> batches, long firstOffset) {
+        LogRecordReadContext readContext =
+                LogRecordReadContext.createReadContext(tableInfo, false, null);
+        long currentOffset = firstOffset;
+        for (LogRecordBatch batch : batches) {
+            for (StateDef stateDef : HEADER_STATE_DEF_LIST) {
+                ((BatchStateTransition) (stateDef.transition()))
+                        .apply(currentState(stateDef), batch);
+            }
+
+            try (CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
+                while (recordIterator.hasNext()) {
+                    LogRecord record = recordIterator.next();
+                    for (StateDef stateDef : RECORD_STATE_DEF_LIST) {
+                        ((RecordStateTransition) (stateDef.transition()))
+                                .apply(currentState(stateDef), record);
+                    }
+                    currentOffset++;
+                }
+            }
+        }
+    }
+
+    public void commit(long offset) {}
 }

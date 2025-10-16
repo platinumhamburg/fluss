@@ -17,30 +17,12 @@
 
 package org.apache.fluss.server.log.state;
 
-import java.io.IOException;
+import org.apache.fluss.record.LogRecord;
 
-/**
- * Generic serializer and deserializer interface for state keys and values.
- *
- * @param <T> the type of objects to serialize/deserialize
- */
-public interface StateSerde<T> {
+import java.util.Map;
 
-    /**
-     * Serializes an object to byte array.
-     *
-     * @param data the object to serialize
-     * @return serialized byte array
-     * @throws IOException if serialization fails
-     */
-    byte[] serialize(T data) throws IOException;
+/** A transition of a record state. */
+public interface RecordStateTransition extends StateTransition {
 
-    /**
-     * Deserializes byte array to object.
-     *
-     * @param bytes the byte array to deserialize
-     * @return deserialized object
-     * @throws IOException if deserialization fails
-     */
-    T deserialize(byte[] bytes) throws IOException;
+    void apply(Map<String, String> currentState, LogRecord record);
 }
