@@ -114,7 +114,9 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
                 getIndexReqMap(fetchIndexRequest);
         replicaManager.fetchIndexRecords(
                 new FetchIndexParams(
-                        fetchIndexRequest.getMaxRecords(), fetchIndexRequest.getMaxWaitMs()),
+                        fetchIndexRequest.getMaxRecords(),
+                        fetchIndexRequest.getMinBucketFetchRecords(),
+                        fetchIndexRequest.getMaxWaitMs()),
                 fetchIndexReqMap,
                 result ->
                         response.complete(

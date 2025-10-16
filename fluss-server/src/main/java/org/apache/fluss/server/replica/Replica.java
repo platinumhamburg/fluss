@@ -22,6 +22,7 @@ import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.IndexReplicatePressureException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.InvalidUpdateVersionException;
@@ -32,7 +33,6 @@ import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.memory.MemorySegmentPool;
-import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -157,6 +157,7 @@ public final class Replica {
     private final LogManager logManager;
     private final LogTablet logTablet;
     private final long replicaMaxLagTime;
+    private final long indexCommitHorizonMaxLagOffset;
     /** A closeable registry to register all registered {@link Closeable}s. */
     private final CloseableRegistry closeableRegistry;
 
@@ -228,6 +229,7 @@ public final class Replica {
             LogManager logManager,
             @Nullable KvManager kvManager,
             long replicaMaxLagTime,
+            long indexCommitHorizonMaxLagOffset,
             int minInSyncReplicas,
             int localTabletServerId,
             OffsetCheckpointFile.LazyOffsetCheckpoints lazyHighWatermarkCheckpoint,
@@ -249,6 +251,7 @@ public final class Replica {
         this.kvManager = kvManager;
         this.metadataCache = metadataCache;
         this.replicaMaxLagTime = replicaMaxLagTime;
+        this.indexCommitHorizonMaxLagOffset = indexCommitHorizonMaxLagOffset;
         this.minInSyncReplicas = minInSyncReplicas;
         this.localTabletServerId = localTabletServerId;
         this.delayedWriteManager = delayedWriteManager;
@@ -585,6 +588,8 @@ public final class Replica {
             } catch (Exception e) {
                 LOG.error("Failed to create IndexCache for bucket {}", tableBucket, e);
                 resetIndexComponent();
+                throw new RuntimeException(
+                        "Failed to create IndexCache for bucket " + tableBucket, e);
             }
         }
 
@@ -607,6 +612,8 @@ public final class Replica {
             } catch (Exception e) {
                 LOG.error("Failed to create IndexApplier for index bucket {}", tableBucket, e);
                 resetIndexComponent();
+                throw new RuntimeException(
+                        "Failed to create IndexApplier for bucket " + tableBucket, e);
             }
         }
     }
@@ -690,6 +697,16 @@ public final class Replica {
         return isIndexTable;
     }
 
+    /**
+     * Gets the IndexCache for this replica.
+     *
+     * @return the IndexCache, or null if not available
+     */
+    @Nullable
+    public IndexCache getIndexCache() {
+        return indexCache;
+    }
+
     public Optional<Map<TableBucket, IndexSegment>> fetchIndex(
             FetchIndexParams params,
             Map<TableBucket, FetchIndexReqInfo> indexBucketFetchInfo,
@@ -705,10 +722,11 @@ public final class Replica {
                     new IndexCache.IndexCacheFetchParam(
                             indexBucket.getTableId(),
                             reqInfo.getFetchOffset(),
+                            hotDataOnly ? params.minBucketFetchRecords() : -1,
                             reqInfo.getIndexCommitOffset());
             indexCacheFetchParams.put(indexBucket, fetchParam);
         }
-        return indexCache.fetchIndexLogData(indexCacheFetchParams, hotDataOnly);
+        return indexCache.fetchIndex(indexCacheFetchParams, hotDataOnly);
     }
 
     private void createKv() {
@@ -743,11 +761,6 @@ public final class Replica {
     }
 
     private void createIndexCache() {
-        // Use unified index cache memory pool from ReplicaManager
-
-        // Get data lake format for IndexCache creation
-        DataLakeFormat dataLakeFormat = tableConfig.getDataLakeFormat().orElse(null);
-
         // Create callback for index commit horizon changes
         IndexCache.IndexCommitHorizonCallback horizonCallback =
                 (newHorizon) -> {
@@ -816,7 +829,12 @@ public final class Replica {
         checkNotNull(registry, "CloseableRegistry should not be null");
 
         // This replica is for index table
-        indexApplier = new IndexApplier(kvTablet, logTablet, fatalErrorHandler, schema);
+        indexApplier =
+                new IndexApplier(
+                        kvTablet,
+                        logTablet,
+                        schema,
+                        bucketMetricGroup.getTableMetricGroup().getServerMetricGroup());
 
         try {
             registry.registerCloseable(indexApplier);
@@ -1175,6 +1193,7 @@ public final class Replica {
                     }
 
                     validateInSyncReplicaSize(requiredAcks);
+                    validateIndexReplicateLag();
                     KvTablet kv = this.kvTablet;
                     checkNotNull(
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
@@ -2119,6 +2138,27 @@ public final class Replica {
                             "The size of the current ISR %s is insufficient to satisfy "
                                     + "the required acks %s for table bucket %s.",
                             isrState.isr(), requiredAcks, tableBucket));
+        }
+    }
+
+    private void validateIndexReplicateLag() {
+        if (!this.isTableWithIndexes || !this.isLeader()) {
+            return;
+        }
+        IndexCache indexCache = this.indexCache;
+        if (indexCache == null) {
+            return;
+        }
+        long commitHorizon = indexCache.getIndexCommitHorizon();
+        long currentLogEndOffset = logTablet.localLogEndOffset();
+        if (currentLogEndOffset - commitHorizon > indexCommitHorizonMaxLagOffset) {
+            throw new IndexReplicatePressureException(
+                    String.format(
+                            "Index commit horizon %d is more than %d offset from the leader end offset %d for bucket %s",
+                            commitHorizon,
+                            indexCommitHorizonMaxLagOffset,
+                            currentLogEndOffset,
+                            tableBucket));
         }
     }
 

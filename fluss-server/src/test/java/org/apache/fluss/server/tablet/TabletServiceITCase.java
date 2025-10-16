@@ -51,6 +51,7 @@ import org.apache.fluss.rpc.messages.PrefixLookupResponse;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
@@ -953,7 +954,8 @@ public class TabletServiceITCase {
                                     new MetadataManager(
                                             FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(),
                                             new Configuration(),
-                                            null);
+                                            new LakeCatalogDynamicLoader(
+                                                    new Configuration(), null, true));
                             TableInfo indexTableInfo = metadataManager.getTable(indexTablePath);
                             assertThat(indexTableInfo).isNotNull();
                             assertThat(indexTableInfo.getSchema().getIndexes())

@@ -18,6 +18,7 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FencedLeaderEpochException;
@@ -210,7 +211,7 @@ public class ReplicaManager {
     /** Unified index cache memory pool shared by all index components. */
     private final MemorySegmentPool indexCacheMemoryPool;
 
-    private Map<TableBucket, PartitionListenerHandle> partitionListenerHandleMap =
+    private final Map<TableBucket, PartitionListenerHandle> partitionListenerHandleMap =
             MapUtils.newConcurrentHashMap();
 
     public ReplicaManager(
@@ -325,19 +326,15 @@ public class ReplicaManager {
                 this::maybeShrinkIsr,
                 0L,
                 conf.get(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME).toMillis() / 2);
+
+        // start up under-replicated watchdog thread.
+        // Check and log under-replicated replicas every 30 seconds.
+        scheduler.schedule(
+                "under-replicated-watchdog", this::logUnderReplicatedReplicas, 0L, 30000L);
     }
 
     public RemoteLogManager getRemoteLogManager() {
         return remoteLogManager;
-    }
-
-    /**
-     * Get the unified index cache memory pool shared by all index components.
-     *
-     * @return the index cache memory pool
-     */
-    public MemorySegmentPool getIndexCacheMemoryPool() {
-        return indexCacheMemoryPool;
     }
 
     private void registerMetrics() {
@@ -351,6 +348,10 @@ public class ReplicaManager {
                 MetricNames.DELAYED_FETCH_COUNT, delayedFetchLogManager::numDelayed);
         serverMetricGroup.gauge(
                 MetricNames.DELAYED_INDEX_FETCH_COUNT, delayedFetchIndexManager::numDelayed);
+
+        // index cache memory metrics
+        serverMetricGroup.gauge(
+                MetricNames.INDEX_CACHE_MEMORY_USAGE_PERCENT, this::indexCacheMemoryUsagePercent);
 
         serverMetricGroup.gauge(MetricNames.UNDER_REPLICATED, this::underReplicatedCount);
         serverMetricGroup.gauge(MetricNames.UNDER_MIN_ISR, this::underMinIsrCount);
@@ -408,6 +409,10 @@ public class ReplicaManager {
         return onlineReplicas().map(Replica::logicalStorageKvSize).reduce(0L, Long::sum);
     }
 
+    public MemorySegmentPool getIndexCacheMemoryPool() {
+        return indexCacheMemoryPool;
+    }
+
     private long physicalStorageLocalSize() {
         return onlineReplicas()
                 .mapToLong(
@@ -423,6 +428,19 @@ public class ReplicaManager {
 
     private long physicalStorageRemoteLogSize() {
         return remoteLogManager.getRemoteLogSize();
+    }
+
+    private double indexCacheMemoryUsagePercent() {
+        if (indexCacheMemoryPool == null) {
+            return 0.0;
+        }
+        long totalSize = indexCacheMemoryPool.totalSize();
+        if (totalSize == 0) {
+            return 0.0;
+        }
+        long availableMemory = indexCacheMemoryPool.availableMemory();
+        long usedMemory = totalSize - availableMemory;
+        return (double) usedMemory / totalSize * 100.0;
     }
 
     /**
@@ -534,9 +552,9 @@ public class ReplicaManager {
     /**
      * Fetch index records from a replica.
      *
-     * @param params
-     * @param dataBucketIndexFetchInfo
-     * @param responseCallback
+     * @param params fetch index params
+     * @param dataBucketIndexFetchInfo data bucket index fetch info
+     * @param responseCallback callback function
      */
     public void fetchIndexRecords(
             FetchIndexParams params,
@@ -588,12 +606,13 @@ public class ReplicaManager {
                             dataBucket, new DataBucketIndexFetchResult(indexBucketResults));
                 }
             } catch (Exception e) {
-                LOG.error("Failed to fetch index for data bucket {}", dataBucket, e);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Failed to fetch index for data bucket {}", dataBucket, e);
+                }
+                ApiError error = ApiError.fromThrowable(e);
                 // Return error result
                 for (TableBucket indexBucket : indexBucketFetchRequests.keySet()) {
-                    indexBucketResults.put(
-                            indexBucket,
-                            new FetchIndexLogResultForBucket(ApiError.fromThrowable(e)));
+                    indexBucketResults.put(indexBucket, new FetchIndexLogResultForBucket(error));
                 }
                 completeFetches.put(dataBucket, new DataBucketIndexFetchResult(indexBucketResults));
             }
@@ -1102,18 +1121,8 @@ public class ReplicaManager {
         for (int bucketId = 0; bucketId < dataBucketCount; bucketId++) {
             TableBucket dataBucket = new TableBucket(dataTableId, partitionId, bucketId);
 
-            // Get data bucket leader info using ZooKeeper
-            Optional<LeaderAndIsr> optLeaderAndIsr = zkClient.getLeaderAndIsr(dataBucket);
-            int dataLeader =
-                    optLeaderAndIsr
-                            .orElseThrow(
-                                    () ->
-                                            new IllegalStateException(
-                                                    "Failed to get leader for data bucket: "
-                                                            + dataBucket
-                                                            + " when init fetcher for index bucket "
-                                                            + indexBucket))
-                            .leader();
+            // Wait for data bucket to be ready with valid leader
+            int dataLeader = waitForDataBucketReady(dataBucket, indexBucket);
 
             // Create DataIndexTableBucket mapping
             DataIndexTableBucket dataIndexBucket =
@@ -1138,12 +1147,98 @@ public class ReplicaManager {
                             indexApplier);
 
             dataIndexBucketAndStatus.put(dataIndexBucket, fetchStatus);
-            LOG.debug(
-                    "Created index fetch status for data bucket {} -> index bucket {}, initFetchOffset: {}, indexCommitOffset: {}",
-                    dataBucket,
-                    indexBucket,
-                    initFetchOffset,
-                    indexCommitOffset);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Created index fetch status for data bucket {} -> index bucket {}, initFetchOffset: {}, indexCommitOffset: {}",
+                        dataBucket,
+                        indexBucket,
+                        initFetchOffset,
+                        indexCommitOffset);
+            }
+        }
+    }
+
+    /**
+     * Wait for a data bucket to be ready with a valid leader and ensure the leader's server node is
+     * available in metadata cache. This method will retry indefinitely until both conditions are
+     * met.
+     *
+     * @param dataBucket the data bucket to wait for
+     * @param indexBucket the index bucket that depends on this data bucket
+     * @return the leader id of the data bucket
+     * @throws InterruptedException if the thread is interrupted while waiting
+     */
+    private int waitForDataBucketReady(TableBucket dataBucket, TableBucket indexBucket)
+            throws InterruptedException {
+        long retryIntervalMs = conf.get(ConfigOptions.ZOOKEEPER_RETRY_WAIT).toMillis();
+        int retryCount = 0;
+
+        while (true) {
+            try {
+                Optional<LeaderAndIsr> optLeaderAndIsr = zkClient.getLeaderAndIsr(dataBucket);
+                if (optLeaderAndIsr.isPresent()) {
+                    int dataLeader = optLeaderAndIsr.get().leader();
+                    if (dataLeader >= 0) {
+                        // Check if the leader server node is available in metadata cache
+                        Optional<ServerNode> serverNode =
+                                metadataCache.getTabletServer(dataLeader, internalListenerName);
+                        if (serverNode.isPresent()) {
+                            if (retryCount > 0) {
+                                LOG.info(
+                                        "Data bucket {} is now ready with leader {} and server node cached after {} retries for index bucket {}",
+                                        dataBucket,
+                                        dataLeader,
+                                        retryCount,
+                                        indexBucket);
+                            }
+                            return dataLeader;
+                        } else {
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug(
+                                        "Data bucket {} has valid leader {} but server node not yet cached, retrying... (retry count: {})",
+                                        dataBucket,
+                                        dataLeader,
+                                        retryCount);
+                            }
+                        }
+                    } else {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug(
+                                    "Data bucket {} has invalid leader {}, retrying... (retry count: {})",
+                                    dataBucket,
+                                    dataLeader,
+                                    retryCount);
+                        }
+                    }
+                } else {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug(
+                                "Data bucket {} leader info not available, retrying... (retry count: {})",
+                                dataBucket,
+                                retryCount);
+                    }
+                }
+            } catch (Exception e) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Error getting leader info or server node for data bucket {}, retrying... (retry count: {})",
+                            dataBucket,
+                            retryCount,
+                            e);
+                }
+            }
+
+            retryCount++;
+            if (retryCount % 10 == 0) {
+                LOG.info(
+                        "Still waiting for data bucket {} to be ready with cached server node for index bucket {}, retry count: {}",
+                        dataBucket,
+                        indexBucket,
+                        retryCount);
+            }
+
+            // Sleep before next retry
+            Thread.sleep(retryIntervalMs);
         }
     }
 
@@ -1216,7 +1311,7 @@ public class ReplicaManager {
             Integer leaderId = replica.getLeaderId();
             TableBucket tb = replica.getTableBucket();
             LogTablet logTablet = replica.getLogTablet();
-            if (leaderId == null) {
+            if (leaderId == null || leaderId < 0) {
                 result.put(
                         tb,
                         new NotifyLeaderAndIsrResultForBucket(
@@ -1674,7 +1769,9 @@ public class ReplicaManager {
             Consumer<Map<TableBucket, DataBucketIndexFetchResult>> responseCallback) {
         if (!delayedIndexFetchRequired(params, dataBucketIndexFetchInfo, completeFetches)) {
             responseCallback.accept(completeFetches);
+            return;
         }
+
         DelayedFetchIndex delayedFetchIndex =
                 new DelayedFetchIndex(
                         params,
@@ -1808,6 +1905,24 @@ public class ReplicaManager {
         }
     }
 
+    private void logUnderReplicatedReplicas() {
+        LOG.trace("Checking for under-replicated replicas.");
+        List<Replica> underReplicatedReplicas =
+                getOnlineReplicaList().stream()
+                        .filter(Replica::isUnderReplicated)
+                        .collect(Collectors.toList());
+
+        if (!underReplicatedReplicas.isEmpty()) {
+            LOG.warn("Found {} under-replicated replica(s):", underReplicatedReplicas.size());
+            for (Replica replica : underReplicatedReplicas) {
+                LOG.warn(
+                        "Under-replicated replica - TablePath: {}, TableBucket: {}",
+                        replica.getTablePath(),
+                        replica.getTableBucket());
+            }
+        }
+    }
+
     /** Stop the given replica. */
     private StopReplicaResultForBucket stopReplica(
             TableBucket tb,
@@ -1911,6 +2026,7 @@ public class ReplicaManager {
                                 logManager,
                                 isKvTable ? kvManager : null,
                                 conf.get(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME).toMillis(),
+                                conf.get(ConfigOptions.INDEX_COMMIT_HORIZON_MAX_LAG_OFFSET),
                                 conf.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER),
                                 serverId,
                                 new OffsetCheckpointFile.LazyOffsetCheckpoints(

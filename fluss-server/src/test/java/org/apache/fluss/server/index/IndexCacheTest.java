@@ -125,10 +125,10 @@ final class IndexCacheTest {
 
         fetchRequests.put(
                 indexBucket,
-                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, 0L));
+                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, -1, 0L));
 
         Optional<Map<TableBucket, IndexSegment>> result =
-                indexCache.fetchIndexLogData(fetchRequests, false);
+                indexCache.fetchIndex(fetchRequests, false);
 
         assertThat(result).isPresent();
         assertThat(result.get()).hasSize(1);
@@ -141,17 +141,17 @@ final class IndexCacheTest {
     }
 
     @Test
-    void testFetchIndexLogDataHotDataOnly() throws Exception {
+    void testFetchIndexOnly() throws Exception {
         // Test hot data only mode with empty cache should return empty
         Map<TableBucket, IndexCache.IndexCacheFetchParam> fetchRequests = new HashMap<>();
         TableBucket indexBucket = new TableBucket(IDX_NAME_TABLE_INFO.getTableId(), BUCKET_ID);
 
         fetchRequests.put(
                 indexBucket,
-                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, 0L));
+                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, -1, 0L));
 
         Optional<Map<TableBucket, IndexSegment>> result =
-                indexCache.fetchIndexLogData(fetchRequests, true);
+                indexCache.fetchIndex(fetchRequests, true);
 
         assertThat(result).isPresent();
         boolean isEmpty = true;
@@ -164,7 +164,7 @@ final class IndexCacheTest {
     }
 
     @Test
-    void testWriteHotDataFromWAL() throws Exception {
+    void testCacheIndexDataByHotData() throws Exception {
         // Create test WAL data using indexed data
         List<Object[]> testData = INDEX_CACHE_DATA.subList(0, 2);
         MemoryLogRecords walRecords = DataTestUtils.genIndexedMemoryLogRecordsByObject(testData);
@@ -172,14 +172,14 @@ final class IndexCacheTest {
         LogAppendInfo appendInfo = createLogAppendInfo(0L, 2L);
 
         // Write hot data to cache
-        indexCache.writeHotDataFromWAL(walRecords, appendInfo);
+        indexCache.cacheIndexDataByHotData(null, walRecords, appendInfo);
 
         // Verify the data was written (this test verifies the method doesn't throw)
         // More detailed verification would require access to internal cache state
     }
 
     @Test
-    void testWriteHotDataFromWALWhenClosed() throws Exception {
+    void testCacheIndexDataByHotDataWhenClosed() throws Exception {
         // Close the cache first
         indexCache.close();
 
@@ -189,11 +189,11 @@ final class IndexCacheTest {
         LogAppendInfo appendInfo = createLogAppendInfo(0L, 1L);
 
         // Should not throw exception, but log warning
-        indexCache.writeHotDataFromWAL(walRecords, appendInfo);
+        indexCache.cacheIndexDataByHotData(null, walRecords, appendInfo);
     }
 
     @Test
-    void testFetchIndexLogDataWhenClosed() throws Exception {
+    void testFetchIndexWhenClosed() throws Exception {
         // Close the cache
         indexCache.close();
 
@@ -202,10 +202,10 @@ final class IndexCacheTest {
 
         fetchRequests.put(
                 indexBucket,
-                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, 0L));
+                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, -1, 0L));
 
         Optional<Map<TableBucket, IndexSegment>> result =
-                indexCache.fetchIndexLogData(fetchRequests, false);
+                indexCache.fetchIndex(fetchRequests, false);
 
         // Should return empty when cache is closed
         assertThat(result).isEmpty();
@@ -220,17 +220,17 @@ final class IndexCacheTest {
         TableBucket nameIndexBucket = new TableBucket(IDX_NAME_TABLE_INFO.getTableId(), BUCKET_ID);
         fetchRequests.put(
                 nameIndexBucket,
-                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, 0L));
+                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, -1, 0L));
 
         // Add fetch request for email index
         TableBucket emailIndexBucket =
                 new TableBucket(IDX_EMAIL_TABLE_INFO.getTableId(), BUCKET_ID);
         fetchRequests.put(
                 emailIndexBucket,
-                new IndexCache.IndexCacheFetchParam(IDX_EMAIL_TABLE_INFO.getTableId(), 0L, 0L));
+                new IndexCache.IndexCacheFetchParam(IDX_EMAIL_TABLE_INFO.getTableId(), 0L, -1, 0L));
 
         Optional<Map<TableBucket, IndexSegment>> result =
-                indexCache.fetchIndexLogData(fetchRequests, false);
+                indexCache.fetchIndex(fetchRequests, false);
 
         assertThat(result).isPresent();
         assertThat(result.get()).hasSize(2);
@@ -248,10 +248,11 @@ final class IndexCacheTest {
         // Request data from offset that is beyond high watermark
         fetchRequests.put(
                 indexBucket,
-                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 100L, 0L));
+                new IndexCache.IndexCacheFetchParam(
+                        IDX_NAME_TABLE_INFO.getTableId(), 100L, -1, 0L));
 
         Optional<Map<TableBucket, IndexSegment>> result =
-                indexCache.fetchIndexLogData(fetchRequests, false);
+                indexCache.fetchIndex(fetchRequests, false);
 
         assertThat(result).isPresent();
         assertThat(result.get()).hasSize(1);
@@ -276,10 +277,10 @@ final class IndexCacheTest {
 
         fetchRequests.put(
                 indexBucket,
-                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, 0L));
+                new IndexCache.IndexCacheFetchParam(IDX_NAME_TABLE_INFO.getTableId(), 0L, -1, 0L));
 
         Optional<Map<TableBucket, IndexSegment>> result =
-                indexCache.fetchIndexLogData(fetchRequests, false);
+                indexCache.fetchIndex(fetchRequests, false);
 
         assertThat(result).isEmpty();
 
@@ -295,7 +296,7 @@ final class IndexCacheTest {
         long commitOffset = 99L;
 
         IndexCache.IndexCacheFetchParam param =
-                new IndexCache.IndexCacheFetchParam(tableId, fetchOffset, commitOffset);
+                new IndexCache.IndexCacheFetchParam(tableId, fetchOffset, -1, commitOffset);
 
         assertThat(param.getIndexTableId()).isEqualTo(tableId);
         assertThat(param.getFetchOffset()).isEqualTo(fetchOffset);
