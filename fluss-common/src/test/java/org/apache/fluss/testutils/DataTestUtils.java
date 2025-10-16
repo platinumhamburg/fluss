@@ -530,19 +530,20 @@ public class DataTestUtils {
             List<IndexedRow> rows)
             throws Exception {
         UnmanagedPagedOutputView outputView = new UnmanagedPagedOutputView(100);
-        MemoryLogRecordsIndexedBuilder builder =
+        MemoryLogRecords memoryLogRecords;
+        try (MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.builder(
-                        baseLogOffset, schemaId, Integer.MAX_VALUE, DEFAULT_MAGIC, outputView);
-        for (int i = 0; i < changeTypes.size(); i++) {
-            builder.append(changeTypes.get(i), rows.get(i));
+                        baseLogOffset, schemaId, Integer.MAX_VALUE, DEFAULT_MAGIC, outputView)) {
+            for (int i = 0; i < changeTypes.size(); i++) {
+                builder.append(changeTypes.get(i), rows.get(i));
+            }
+            builder.setWriterState(writerId, batchSequence);
+            memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         }
-        builder.setWriterState(writerId, batchSequence);
-        MemoryLogRecords memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         memoryLogRecords.ensureValid(DEFAULT_MAGIC);
 
         ((DefaultLogRecordBatch) memoryLogRecords.batches().iterator().next())
                 .setCommitTimestamp(maxTimestamp);
-        builder.close();
         return memoryLogRecords;
     }
 

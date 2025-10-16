@@ -211,10 +211,17 @@ public final class IndexTableUtils {
                         .schema(indexTableSchema)
                         .kvFormat(KvFormat.INDEXED)
                         .logFormat(LogFormat.INDEXED)
-                        .property(
-                                ConfigOptions.TABLE_REPLICATION_FACTOR.key(),
-                                String.valueOf(indexBucketCount))
                         .distributedBy(indexBucketCount, indexColumns);
+
+        // inherit replication factor from main table if it's set
+        String mainTableReplicationFactor =
+                mainTableDescriptor
+                        .getProperties()
+                        .get(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
+        if (mainTableReplicationFactor != null) {
+            builder.property(
+                    ConfigOptions.TABLE_REPLICATION_FACTOR.key(), mainTableReplicationFactor);
+        }
 
         return builder.build();
     }

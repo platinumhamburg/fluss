@@ -123,6 +123,10 @@ public class MetricNames {
     public static final String INDEX_APPLY_REQUESTS_RATE = "indexApplyRequestsPerSecond";
     public static final String INDEX_APPLY_ERRORS_RATE = "indexApplyErrorsPerSecond";
     public static final String INDEX_APPLY_LATENCY_MS = "indexApplyLatencyMs";
+    public static final String INDEX_APPLY_BATCH_SIZE = "indexApplyBatchSize";
+
+    // for index cache memory
+    public static final String INDEX_CACHE_MEMORY_USAGE_PERCENT = "indexCacheMemoryUsagePercent";
 
     // for log tablet
     public static final String LOG_FLUSH_RATE = "logFlushPerSecond";
@@ -187,6 +191,17 @@ public class MetricNames {
     public static final String SCANNER_REMOTE_FETCH_BYTES_RATE = "remoteFetchBytesPerSecond";
     public static final String SCANNER_REMOTE_FETCH_RATE = "remoteFetchRequestsPerSecond";
     public static final String SCANNER_REMOTE_FETCH_ERROR_RATE = "remoteFetchErrorPerSecond";
+
+    // for lookuper
+    public static final String LOOKUPER_QUEUE_SIZE = "lookupQueueSize";
+    public static final String LOOKUPER_SECONDARY_INDEX_REQUESTS_RATE =
+            "secondaryIndexLookupRequestsPerSecond";
+    public static final String LOOKUPER_SECONDARY_INDEX_ERRORS_RATE =
+            "secondaryIndexLookupErrorsPerSecond";
+    public static final String LOOKUPER_SECONDARY_INDEX_LATENCY_MS =
+            "secondaryIndexLookupLatencyMs";
+    public static final String LOOKUPER_SECONDARY_INDEX_PK_MAPPING_COUNT =
+            "secondaryIndexLookupPkMappingCount";
 
     // for netty
     public static final String NETTY_USED_DIRECT_MEMORY = "usedDirectMemory";

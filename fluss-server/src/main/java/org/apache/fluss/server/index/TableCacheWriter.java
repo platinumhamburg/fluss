@@ -19,7 +19,6 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.metadata.Schema;
-import org.apache.fluss.metadata.TablePartitionId;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.IndexedRowEncoder;
@@ -37,32 +36,32 @@ import java.util.List;
  * intermediate IndexSegments. This provides the core functionality for the unified hot/cold data
  * processing pipeline.
  */
-public final class CacheWriterForIndexTable implements Closeable {
+public final class TableCacheWriter implements Closeable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(CacheWriterForIndexTable.class);
+    private static final Logger LOG = LoggerFactory.getLogger(TableCacheWriter.class);
 
-    private TablePartitionId indexTablePartitionId;
-    private Schema indexSchema;
-    private int indexBucketCount;
+    private final long indexTableId;
+    private final Schema indexSchema;
+    private final int indexBucketCount;
     private final BucketingFunction bucketingFunction;
     private final IndexRowCache indexRowCache;
 
     // For building IndexedRow
-    private IndexedRowEncoder indexedRowEncoder;
-    private InternalRow.FieldGetter[] fieldGetters;
-    private KeyEncoder bucketKeyEncoder;
+    private final IndexedRowEncoder indexedRowEncoder;
+    private final InternalRow.FieldGetter[] fieldGetters;
+    private final KeyEncoder bucketKeyEncoder;
 
-    private int[] indexFieldIndicesOfDataRow;
+    private final int[] indexFieldIndicesOfDataRow;
 
-    public CacheWriterForIndexTable(
-            TablePartitionId indexTablePartitionId,
+    public TableCacheWriter(
+            long indexTableId,
             Schema tableSchema,
             Schema indexSchema,
             int indexBucketCount,
             List<String> bucketKeys,
             BucketingFunction bucketingFunction,
             IndexRowCache indexRowCache) {
-        this.indexTablePartitionId = indexTablePartitionId;
+        this.indexTableId = indexTableId;
         this.indexSchema = indexSchema;
         this.indexBucketCount = indexBucketCount;
         this.bucketingFunction = bucketingFunction;
@@ -83,20 +82,46 @@ public final class CacheWriterForIndexTable implements Closeable {
                 tableSchema.getColumnIndexes(indexSchema.getPrimaryKeyColumnNames());
     }
 
-    public void writeRecord(LogRecord walRecord, long offset) throws Exception {
+    /**
+     * Writes a record in batch mode, only targeting the specific bucket without writing empty rows
+     * to other buckets. This method is used during batch processing to reduce empty row writes.
+     *
+     * @param walRecord the WAL record to process
+     * @param offset the log offset
+     * @param batchStartOffset the minimum offset for gap filling
+     * @throws Exception if an error occurs during writing
+     */
+    public void writeRecordInBatch(LogRecord walRecord, long offset, long batchStartOffset)
+            throws Exception {
         if (null != walRecord.getRow()) {
             IndexedRow indexedRow = createIndexedRow(walRecord, offset);
             byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(indexedRow);
             int targetBucketId = bucketingFunction.bucketing(bucketKeyBytes, indexBucketCount);
-            indexRowCache.writeIndexedRow(
-                    indexTablePartitionId,
+
+            // Only write to target bucket, do not write empty rows to other buckets
+            indexRowCache.writeIndexedRowToTargetBucket(
+                    indexTableId,
                     targetBucketId,
                     offset,
                     walRecord.getChangeType(),
-                    indexedRow);
-        } else {
-            indexRowCache.writeEmptyRows(indexTablePartitionId, offset);
+                    indexedRow,
+                    batchStartOffset);
         }
+    }
+
+    /**
+     * Finalizes batch processing by synchronizing all buckets to the same offset level. This method
+     * ensures that all buckets have consistent offset progression while minimizing the number of
+     * empty row writes.
+     *
+     * @param lastOffset the last offset in the batch
+     * @param batchStartOffset the start offset of the batch
+     * @throws Exception if an error occurs during finalization
+     */
+    public void finalizeBatch(long lastOffset, long batchStartOffset) throws Exception {
+        // Write empty rows to all buckets to ensure they are synchronized to the same offset level
+        // This single write per batch replaces multiple empty row writes during batch processing
+        indexRowCache.synchronizeAllBucketsToOffset(indexTableId, lastOffset, batchStartOffset);
     }
 
     private IndexedRow createIndexedRow(LogRecord walRecord, long offset) {

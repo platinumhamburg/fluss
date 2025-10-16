@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client.table;
 
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -77,37 +78,39 @@ class FlussTableTest {
     void testIndexTableDetection() throws Exception {
         // Test index table name detection
         TablePath indexTablePath1 = new TablePath("test", "__pk_table__index__name_idx");
-        try (FlussTable indexTable1 = new FlussTable(null, indexTablePath1, primaryKeyTableInfo)) {
+        try (FlussTable indexTable1 =
+                new FlussTable(null, indexTablePath1, primaryKeyTableInfo, new Configuration())) {
             assertThat(indexTable1.isIndexTable()).isTrue();
         }
 
         TablePath indexTablePath2 = new TablePath("db", "__users__index__email_status_idx");
-        try (FlussTable indexTable2 = new FlussTable(null, indexTablePath2, primaryKeyTableInfo)) {
+        try (FlussTable indexTable2 =
+                new FlussTable(null, indexTablePath2, primaryKeyTableInfo, new Configuration())) {
             assertThat(indexTable2.isIndexTable()).isTrue();
         }
 
         // Test regular table names (should not be detected as index tables)
         TablePath regularTablePath1 = new TablePath("test", "regular_table");
         try (FlussTable regularTable1 =
-                new FlussTable(null, regularTablePath1, primaryKeyTableInfo)) {
+                new FlussTable(null, regularTablePath1, primaryKeyTableInfo, new Configuration())) {
             assertThat(regularTable1.isIndexTable()).isFalse();
         }
 
         TablePath regularTablePath2 = new TablePath("test", "__not_index_table__something");
         try (FlussTable regularTable2 =
-                new FlussTable(null, regularTablePath2, primaryKeyTableInfo)) {
+                new FlussTable(null, regularTablePath2, primaryKeyTableInfo, new Configuration())) {
             assertThat(regularTable2.isIndexTable()).isFalse();
         }
 
         TablePath regularTablePath3 = new TablePath("test", "table__index");
         try (FlussTable regularTable3 =
-                new FlussTable(null, regularTablePath3, primaryKeyTableInfo)) {
+                new FlussTable(null, regularTablePath3, primaryKeyTableInfo, new Configuration())) {
             assertThat(regularTable3.isIndexTable()).isFalse();
         }
 
         TablePath regularTablePath4 = new TablePath("test", "index__table");
         try (FlussTable regularTable4 =
-                new FlussTable(null, regularTablePath4, primaryKeyTableInfo)) {
+                new FlussTable(null, regularTablePath4, primaryKeyTableInfo, new Configuration())) {
             assertThat(regularTable4.isIndexTable()).isFalse();
         }
     }
@@ -115,7 +118,8 @@ class FlussTableTest {
     @Test
     void testIndexTableNewUpsertThrowsException() throws Exception {
         TablePath indexTablePath = new TablePath("test", "__pk_table__index__name_idx");
-        try (FlussTable indexTable = new FlussTable(null, indexTablePath, primaryKeyTableInfo)) {
+        try (FlussTable indexTable =
+                new FlussTable(null, indexTablePath, primaryKeyTableInfo, new Configuration())) {
             // Should throw exception when trying to create upsert writer for index table
             assertThatThrownBy(() -> indexTable.newUpsert())
                     .isInstanceOf(IllegalStateException.class)
@@ -128,7 +132,8 @@ class FlussTableTest {
     @Test
     void testIndexTableNewAppendThrowsException() throws Exception {
         TablePath indexTablePath = new TablePath("test", "__log_table__index__name_idx");
-        try (FlussTable indexTable = new FlussTable(null, indexTablePath, logTableInfo)) {
+        try (FlussTable indexTable =
+                new FlussTable(null, indexTablePath, logTableInfo, new Configuration())) {
             // Should throw exception when trying to create append writer for index table
             assertThatThrownBy(() -> indexTable.newAppend())
                     .isInstanceOf(IllegalStateException.class)
