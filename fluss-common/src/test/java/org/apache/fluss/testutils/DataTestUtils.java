@@ -41,6 +41,7 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.MemoryLogRecordsArrowBuilder;
 import org.apache.fluss.record.MemoryLogRecordsIndexedBuilder;
+import org.apache.fluss.record.StateChangeLogs;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
@@ -530,19 +531,20 @@ public class DataTestUtils {
             List<IndexedRow> rows)
             throws Exception {
         UnmanagedPagedOutputView outputView = new UnmanagedPagedOutputView(100);
-        MemoryLogRecordsIndexedBuilder builder =
+        MemoryLogRecords memoryLogRecords;
+        try (MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.builder(
-                        baseLogOffset, schemaId, Integer.MAX_VALUE, DEFAULT_MAGIC, outputView);
-        for (int i = 0; i < changeTypes.size(); i++) {
-            builder.append(changeTypes.get(i), rows.get(i));
+                        baseLogOffset, schemaId, Integer.MAX_VALUE, DEFAULT_MAGIC, outputView)) {
+            for (int i = 0; i < changeTypes.size(); i++) {
+                builder.append(changeTypes.get(i), rows.get(i));
+            }
+            builder.setWriterState(writerId, batchSequence);
+            memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         }
-        builder.setWriterState(writerId, batchSequence);
-        MemoryLogRecords memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         memoryLogRecords.ensureValid(DEFAULT_MAGIC);
 
         ((DefaultLogRecordBatch) memoryLogRecords.batches().iterator().next())
                 .setCommitTimestamp(maxTimestamp);
-        builder.close();
         return memoryLogRecords;
     }
 
@@ -558,6 +560,33 @@ public class DataTestUtils {
             List<InternalRow> rows,
             ArrowCompressionInfo arrowCompressionInfo)
             throws Exception {
+        return createArrowMemoryLogRecordsWithStateChangeLogs(
+                rowType,
+                baseLogOffset,
+                maxTimestamp,
+                magic,
+                schemaId,
+                writerId,
+                batchSequence,
+                changeTypes,
+                rows,
+                arrowCompressionInfo,
+                null);
+    }
+
+    private static MemoryLogRecords createArrowMemoryLogRecordsWithStateChangeLogs(
+            RowType rowType,
+            long baseLogOffset,
+            long maxTimestamp,
+            byte magic,
+            int schemaId,
+            long writerId,
+            int batchSequence,
+            List<ChangeType> changeTypes,
+            List<InternalRow> rows,
+            ArrowCompressionInfo arrowCompressionInfo,
+            StateChangeLogs stateChangeLogs)
+            throws Exception {
         try (BufferAllocator allocator = new RootAllocator(Integer.MAX_VALUE);
                 ArrowWriterPool provider = new ArrowWriterPool(allocator)) {
             ArrowWriter writer =
@@ -569,7 +598,8 @@ public class DataTestUtils {
                             magic,
                             schemaId,
                             writer,
-                            new ManagedPagedOutputView(new TestingMemorySegmentPool(10 * 1024)));
+                            new ManagedPagedOutputView(new TestingMemorySegmentPool(10 * 1024)),
+                            stateChangeLogs);
             for (int i = 0; i < changeTypes.size(); i++) {
                 builder.append(changeTypes.get(i), rows.get(i));
             }

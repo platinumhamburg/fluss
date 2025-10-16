@@ -15,20 +15,19 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.exception;
 
-import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.annotation.PublicEvolving;
 
-import java.util.Map;
+/**
+ * Thrown when the tabletServer is not available.
+ *
+ * @since 0.8
+ */
+@PublicEvolving
+public class FetchIndexEarlyFireException extends ApiException {
 
-/** Converter interface for extracting state key-value pairs from LogRecordBatch. */
-public interface StateConverter {
-
-    /**
-     * Converts a LogRecordBatch into state key-value pairs.
-     *
-     * @param batch the log record batch to convert
-     * @return map of state key-value pairs, both key and value can be any Object type
-     */
-    Map<Object, Object> convert(LogRecordBatch batch);
+    public FetchIndexEarlyFireException(String message) {
+        super(message);
+    }
 }

@@ -23,22 +23,24 @@ import java.util.Objects;
 public final class FetchIndexParams {
 
     /** Default max wait ms, which means the fetch request will be satisfied immediately. */
-    public static final long DEFAULT_MAX_WAIT_MS = 15000L;
+    public static final long DEFAULT_MAX_WAIT_MS = 500L;
 
-    private final int maxFetchRecords;
+    private final int maxBytes;
+    private final int minAdvanceOffset;
     private final long maxWaitMs;
 
-    public FetchIndexParams(int maxFetchRecords) {
-        this(maxFetchRecords, DEFAULT_MAX_WAIT_MS);
-    }
-
-    public FetchIndexParams(int maxFetchRecords, long maxWaitMs) {
-        this.maxFetchRecords = (int) maxFetchRecords;
+    public FetchIndexParams(int maxBytes, int minAdvanceOffset, long maxWaitMs) {
+        this.maxBytes = maxBytes;
+        this.minAdvanceOffset = minAdvanceOffset;
         this.maxWaitMs = maxWaitMs;
     }
 
-    public int maxFetchRecords() {
-        return maxFetchRecords;
+    public int maxBytes() {
+        return maxBytes;
+    }
+
+    public int minAdvancedOffset() {
+        return minAdvanceOffset;
     }
 
     public long maxWaitMs() {
@@ -54,19 +56,23 @@ public final class FetchIndexParams {
             return false;
         }
         FetchIndexParams that = (FetchIndexParams) o;
-        return maxFetchRecords == that.maxFetchRecords && maxWaitMs == that.maxWaitMs;
+        return maxBytes == that.maxBytes
+                && minAdvanceOffset == that.minAdvanceOffset
+                && maxWaitMs == that.maxWaitMs;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(maxFetchRecords, maxWaitMs);
+        return Objects.hash(maxBytes, minAdvanceOffset, maxWaitMs);
     }
 
     @Override
     public String toString() {
         return "FetchIndexParams("
-                + ", maxFetchRecords="
-                + maxFetchRecords
+                + "maxFetchRecords="
+                + maxBytes
+                + ", minFetchRecords="
+                + minAdvanceOffset
                 + ", maxWaitMs="
                 + maxWaitMs
                 + ')';

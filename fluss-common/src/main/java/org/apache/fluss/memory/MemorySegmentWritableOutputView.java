@@ -15,17 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.memory;
 
-import java.io.IOException;
-
-/** TODO StateCheckpointManager. */
-public interface RawStateStore {
-    void put(byte[] key, byte[] value) throws IOException;
-
-    byte[] get(byte[] key) throws IOException;
-
-    void delete(byte[] key) throws IOException;
-
-    long checkpoint(long recoverLogOffset) throws IOException;
-}
+/** A view over a {@link MemorySegment} that can be written to. */
+public interface MemorySegmentWritableOutputView extends OutputView, MemorySegmentWritable {}

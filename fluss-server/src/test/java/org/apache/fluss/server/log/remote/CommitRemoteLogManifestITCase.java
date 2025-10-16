@@ -105,7 +105,7 @@ class CommitRemoteLogManifestITCase {
                 new Configuration()
                         .set(
                                 ConfigOptions.REMOTE_LOG_TASK_INTERVAL_DURATION,
-                                Duration.ofMillis(1)));
+                                Duration.ofMillis(10)));
         FLUSS_CLUSTER_EXTENSION.waitUntilSomeLogSegmentsCopyToRemote(tb);
 
         // check only has two remote log segments for the stopped replicas

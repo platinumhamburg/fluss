@@ -24,6 +24,7 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -94,9 +95,13 @@ public final class LogSegments {
         return segments.size();
     }
 
+    /**
+     * @return the base offsets of all segments in base offset descending order.
+     */
     public List<Long> baseOffsets() {
         return segments.values().stream()
                 .map(LogSegment::getBaseOffset)
+                .sorted(Comparator.reverseOrder())
                 .collect(Collectors.toList());
     }
 

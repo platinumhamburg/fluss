@@ -15,12 +15,16 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.record;
 
-/** Merge policy for handling state conflicts when the same key is updated multiple times. */
-public enum StateMergePolicy {
-    /** Use the last (most recent) value when keys conflict. */
-    LAST_VALUE,
-    /** Keep the first value when keys conflict, ignore subsequent updates. */
-    FIRST_VALUE,
+/** A state change log. */
+public interface StateChangeLog {
+
+    ChangeType getChangeType();
+
+    StateDefs getStateDef();
+
+    Object getKey();
+
+    Object getValue();
 }

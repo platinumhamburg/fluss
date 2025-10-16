@@ -55,6 +55,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 import static org.apache.fluss.utils.FlussPaths.INDEX_FILE_SUFFIX;
+import static org.apache.fluss.utils.FlussPaths.STATE_SNAPSHOT_FILE_SUFFIX;
 import static org.apache.fluss.utils.FlussPaths.TIME_INDEX_FILE_SUFFIX;
 import static org.apache.fluss.utils.FlussPaths.WRITER_SNAPSHOT_FILE_SUFFIX;
 import static org.apache.fluss.utils.FlussPaths.remoteLogIndexFile;
@@ -95,6 +96,7 @@ public class DefaultRemoteLogStorage implements RemoteLogStorage {
      * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_start_offset}.index
      * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_start_offset}.timeindex
      * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_end_offset}.writer_snapshot
+     * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_end_offset}.state_snapshot
      * </pre>
      */
     @Override
@@ -135,6 +137,7 @@ public class DefaultRemoteLogStorage implements RemoteLogStorage {
      * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_start_offset}.index
      * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_start_offset}.timeindex
      * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_end_offset}.writer_snapshot
+     * {$remote.data.dir}/log/{db}/{tableName}_{tableId}/{bucketId}/{segment_uuid}/{remote_log_end_offset}.state_snapshot
      * </pre>
      *
      * <p>Note: We need to delete specify remote file instead of delete the whole directory
@@ -155,9 +158,20 @@ public class DefaultRemoteLogStorage implements RemoteLogStorage {
                             segmentDir,
                             remoteLogSegment.remoteLogEndOffset(),
                             WRITER_SNAPSHOT_FILE_SUFFIX);
+            FsPath stateSnapshot =
+                    remoteLogIndexFile(
+                            segmentDir,
+                            remoteLogSegment.remoteLogEndOffset(),
+                            STATE_SNAPSHOT_FILE_SUFFIX);
             // delete dir at last
             for (FsPath path :
-                    Arrays.asList(logFile, offsetIndex, timeIndex, writerSnapshot, segmentDir)) {
+                    Arrays.asList(
+                            logFile,
+                            offsetIndex,
+                            timeIndex,
+                            writerSnapshot,
+                            stateSnapshot,
+                            segmentDir)) {
                 fileSystem.delete(path, false);
             }
             LOG.debug("Successful delete log segment and indexes for : {}", remoteLogSegment);
@@ -174,6 +188,10 @@ public class DefaultRemoteLogStorage implements RemoteLogStorage {
         if (indexType == IndexType.WRITER_ID_SNAPSHOT) {
             remoteLogSegmentIndexFile =
                     FlussPaths.remoteWriterSnapshotFile(
+                            remoteLogDir, remoteLogSegment, IndexType.getFileSuffix(indexType));
+        } else if (indexType == IndexType.BUCKET_STATE_SNAPSHOT) {
+            remoteLogSegmentIndexFile =
+                    FlussPaths.remoteStateSnapshotFile(
                             remoteLogDir, remoteLogSegment, IndexType.getFileSuffix(indexType));
         } else {
             remoteLogSegmentIndexFile =

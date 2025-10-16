@@ -15,33 +15,18 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.client.metrics;
 
-import java.io.IOException;
-import java.util.concurrent.ConcurrentSkipListMap;
+import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 
-/** ImmemoryRawStateStore. */
-public class ImmemoryRawStateStore implements RawStateStore {
+/** The testing metric group for lookuper. */
+public class TestingLookuperMetricGroup extends LookuperMetricGroup {
 
-    private final ConcurrentSkipListMap<byte[], byte[]> map = new ConcurrentSkipListMap<>();
-
-    @Override
-    public void put(byte[] key, byte[] value) throws IOException {
-        map.put(key, value);
+    public TestingLookuperMetricGroup() {
+        super(TestingClientMetricGroup.newInstance());
     }
 
-    @Override
-    public byte[] get(byte[] key) throws IOException {
-        return map.get(key);
-    }
-
-    @Override
-    public void delete(byte[] key) throws IOException {
-        map.remove(key);
-    }
-
-    @Override
-    public long checkpoint(long recoverLogOffset) throws IOException {
-        throw new UnsupportedOperationException();
+    public static TestingLookuperMetricGroup newInstance() {
+        return new TestingLookuperMetricGroup();
     }
 }

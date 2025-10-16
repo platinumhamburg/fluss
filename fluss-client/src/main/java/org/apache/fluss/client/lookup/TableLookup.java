@@ -18,6 +18,8 @@
 package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.client.metadata.MetadataUpdater;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
@@ -38,25 +40,32 @@ public class TableLookup implements Lookup {
 
     @Nullable private final List<String> lookupColumnNames;
 
+    private final Configuration conf;
+
     public TableLookup(
-            TableInfo tableInfo, MetadataUpdater metadataUpdater, LookupClient lookupClient) {
-        this(tableInfo, metadataUpdater, lookupClient, null);
+            TableInfo tableInfo,
+            MetadataUpdater metadataUpdater,
+            LookupClient lookupClient,
+            Configuration conf) {
+        this(tableInfo, metadataUpdater, lookupClient, conf, null);
     }
 
     private TableLookup(
             TableInfo tableInfo,
             MetadataUpdater metadataUpdater,
             LookupClient lookupClient,
+            Configuration conf,
             @Nullable List<String> lookupColumnNames) {
         this.tableInfo = tableInfo;
         this.metadataUpdater = metadataUpdater;
         this.lookupClient = lookupClient;
+        this.conf = conf;
         this.lookupColumnNames = lookupColumnNames;
     }
 
     @Override
     public Lookup lookupBy(List<String> lookupColumnNames) {
-        return new TableLookup(tableInfo, metadataUpdater, lookupClient, lookupColumnNames);
+        return new TableLookup(tableInfo, metadataUpdater, lookupClient, conf, lookupColumnNames);
     }
 
     @Override
@@ -71,15 +80,18 @@ public class TableLookup implements Lookup {
                 TablePath indexTablePath =
                         IndexTableUtils.generateIndexTablePath(
                                 tableInfo.getTablePath(), matchedIndex.getIndexName());
+                // Ensure metadata cache is updated before getting index table info
+                metadataUpdater.checkAndUpdateTableMetadata(Set.of(indexTablePath));
                 TableInfo indexTableInfo = metadataUpdater.getTableInfoOrElseThrow(indexTablePath);
 
                 return new SecondaryIndexLookuper(
                         tableInfo,
                         indexTableInfo,
-                        matchedIndex,
                         metadataUpdater,
                         lookupClient,
-                        lookupColumnNames);
+                        lookupColumnNames,
+                        lookupClient.getLookuperMetricGroup(),
+                        conf.getInt(ConfigOptions.CLIENT_LOOKUP_MAX_BATCH_SIZE));
             } else {
                 // Use PrefixKeyLookuper for prefix lookup
                 return new PrefixKeyLookuper(
