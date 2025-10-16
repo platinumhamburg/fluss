@@ -29,22 +29,41 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 /** Result of index fetch request for each index table bucket. */
 @Internal
 public class FetchIndexLogResultForBucket {
+
+    /** Status of the index data in this fetch result. */
+    public enum DataStatus {
+        /** Data is loaded and available (may be empty but range is loaded). */
+        LOADED,
+        /** The range has no index data (normal empty). */
+        EMPTY,
+        /** Data not yet loaded from WAL (needs cold loading). */
+        NOT_READY
+    }
+
     private final @Nullable LogRecords records;
     private final long startOffset;
     private final long endOffset;
+    private final DataStatus dataStatus;
     protected final ApiError error;
 
-    public FetchIndexLogResultForBucket(LogRecords records, long startOffset, long endOffset) {
+    public FetchIndexLogResultForBucket(
+            LogRecords records, long startOffset, long endOffset, DataStatus dataStatus) {
         this.records = checkNotNull(records, "records can not be null");
         this.startOffset = startOffset;
         this.endOffset = endOffset;
+        this.dataStatus = checkNotNull(dataStatus, "dataStatus can not be null");
         this.error = ApiError.NONE;
+    }
+
+    public FetchIndexLogResultForBucket(LogRecords records, long startOffset, long endOffset) {
+        this(records, startOffset, endOffset, DataStatus.LOADED);
     }
 
     public FetchIndexLogResultForBucket(ApiError error) {
         this.records = null;
         this.startOffset = -1L;
         this.endOffset = -1L;
+        this.dataStatus = DataStatus.EMPTY;
         this.error = checkNotNull(error, "error can not be null");
     }
 
@@ -66,6 +85,10 @@ public class FetchIndexLogResultForBucket {
 
     public long getEndOffset() {
         return endOffset;
+    }
+
+    public DataStatus getDataStatus() {
+        return dataStatus;
     }
 
     public ApiError getError() {

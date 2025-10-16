@@ -488,7 +488,7 @@ public class ConfigOptions {
     public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_MEMORY_SIZE =
             key("server.index-cache.memory-size")
                     .memoryType()
-                    .defaultValue(MemorySize.parse("128mb"))
+                    .defaultValue(MemorySize.parse("512mb"))
                     .withDescription(
                             "The total bytes of memory the server can use for index cache, used by IndexLogCache and IndexLogBuildHelper components.");
 
@@ -504,7 +504,7 @@ public class ConfigOptions {
     public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_PER_REQUEST_MEMORY_SIZE =
             key("server.index-cache.per-request-memory-size")
                     .memoryType()
-                    .defaultValue(MemorySize.parse("8mb"))
+                    .defaultValue(MemorySize.parse("4mb"))
                     .withDescription(
                             "The minimum number of bytes that will be allocated by the index cache writer rounded down to the closest multiple of "
                                     + SERVER_INDEX_CACHE_PAGE_SIZE.key()
@@ -513,12 +513,22 @@ public class ConfigOptions {
                                     + ". "
                                     + "This option allows to allocate memory in batches to have better CPU-cached friendliness due to contiguous segments.");
 
-    public static final ConfigOption<Duration> SERVER_INDEX_CACHE_POOL_WAIT_TIMEOUT =
+    public static final ConfigOption<Duration> SERVER_INDEX_CACHE_WAIT_TIMEOUT =
             key("server.index-cache.wait-timeout")
                     .durationType()
-                    .defaultValue(Duration.ofNanos(Long.MAX_VALUE))
+                    .defaultValue(Duration.ofMillis(10L))
                     .withDescription(
-                            "Defines how long the index cache buffer pool will block when waiting for segments to become available.");
+                            "Defines how long the buffer pool will block when waiting for segments to become available.");
+
+    public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_COLD_LOAD_BATCH_SIZE =
+            key("server.index-cache.cold-load-batch-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("16mb"))
+                    .withDescription(
+                            "The maximum amount of data to load in a single batch when performing cold data loading from WAL. "
+                                    + "Cold data loading occurs when an index replica needs to catch up with historical data after a failover. "
+                                    + "By limiting the batch size, memory pressure can be controlled during cold data loading. "
+                                    + "The next batch will only be loaded after the current batch is consumed (indexCommitHorizon advances).");
 
     // ------------------------------------------------------------------
     // ZooKeeper Settings
@@ -686,6 +696,46 @@ public class ConfigOptions {
                             "If a follower replica hasn't sent any fetch log requests or hasn't "
                                     + "consumed up the leaders log end offset for at least this time, "
                                     + "the leader will remove the follower replica form isr");
+
+    public static final ConfigOption<Long> INDEX_COMMIT_HORIZON_MAX_LAG_OFFSET =
+            key("index.commit-horizon.max-lag-offset")
+                    .longType()
+                    .defaultValue(32768L)
+                    .withDescription(
+                            "The maximum lag offset of the index commit horizon. "
+                                    + "If the index commit horizon is more than this offset, "
+                                    + "the index commit horizon will be updated to the max lag offset.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICA_FETCH_MAX_BYTES =
+            key("index.replica.fetch.max-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("32mb"))
+                    .withDescription(
+                            "The maximum amount of data the server should return for an index fetch request from follower. "
+                                    + "Records are fetched in batches, and if the first record batch in the first "
+                                    + "non-empty bucket of the fetch is larger than this value, the record batch "
+                                    + "will still be returned to ensure that the fetch can make progress. As such, "
+                                    + "this is not a absolute maximum. Note that the index fetcher performs multiple fetches "
+                                    + "in parallel.");
+
+    public static final ConfigOption<Integer> INDEX_REPLICA_FETCH_MIN_ADVANCE_OFFSET =
+            key("index.replica.fetch.min-advance-offset")
+                    .intType()
+                    .defaultValue(1024)
+                    .withDescription(
+                            "The minimum offset to advance for index fetch requests when the current offset "
+                                    + "does not have sufficient data. This parameter helps to avoid frequent small "
+                                    + "fetch requests by ensuring that the fetcher advances by at least this amount "
+                                    + "when seeking forward in the index log.");
+
+    public static final ConfigOption<Duration> INDEX_REPLICA_FETCH_WAIT_MAX_TIME =
+            key("index.replica.fetch.wait-max-time")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(128))
+                    .withDescription(
+                            "The maximum time to wait for enough data to be available for an index fetch request "
+                                    + "from follower to response. This value should be tuned based on the expected "
+                                    + "index update frequency and latency requirements.");
 
     public static final ConfigOption<Integer> LOG_REPLICA_WRITE_OPERATION_PURGE_NUMBER =
             key("log.replica.write-operation-purge-number")

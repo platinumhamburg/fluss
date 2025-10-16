@@ -218,8 +218,9 @@ message FetchLogResponse {
 
 // fetch log request and response
 message FetchIndexRequest {
-  required int32 max_records = 1;
+  required int32 max_bytes = 1;
   optional int32 max_wait_ms = 2;
+  optional int32 min_advance_offset = 3;
   repeated PbFetchIndexReqForTableBucket req_for_table_buckets = 4;
 }
 

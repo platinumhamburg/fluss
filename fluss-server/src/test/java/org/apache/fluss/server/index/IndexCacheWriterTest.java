@@ -113,10 +113,15 @@ class IndexCacheWriterTest {
 
         bucketingFunction = BucketingFunction.of(null); // Use default FlussBucketingFunction
 
-        // Create IndexCacheWriter
+        // Create IndexCacheWriter (null mainTableInfo for non-partitioned test table)
         indexCacheWriter =
                 new IndexCacheWriter(
-                        logTablet, indexRowCache, bucketingFunction, tableSchema, indexTableInfos);
+                        logTablet,
+                        indexRowCache,
+                        bucketingFunction,
+                        tableSchema,
+                        indexTableInfos,
+                        null);
     }
 
     @AfterEach
@@ -148,7 +153,12 @@ class IndexCacheWriterTest {
         // Test constructor with empty index table list
         IndexCacheWriter emptyWriter =
                 new IndexCacheWriter(
-                        logTablet, indexRowCache, bucketingFunction, tableSchema, Arrays.asList());
+                        logTablet,
+                        indexRowCache,
+                        bucketingFunction,
+                        tableSchema,
+                        Arrays.asList(),
+                        null);
 
         assertThat(emptyWriter).isNotNull();
         emptyWriter.close();
@@ -163,7 +173,8 @@ class IndexCacheWriterTest {
                         indexRowCache,
                         bucketingFunction,
                         tableSchema,
-                        Arrays.asList(IDX_NAME_TABLE_INFO));
+                        Arrays.asList(IDX_NAME_TABLE_INFO),
+                        null);
 
         assertThat(singleWriter).isNotNull();
         singleWriter.close();
@@ -174,21 +185,21 @@ class IndexCacheWriterTest {
     // ===============================================================================================
 
     @Test
-    void testWriteHotDataFromWALSuccess() throws Exception {
+    void testCacheIndexDataByHotDataSuccess() throws Exception {
         // Prepare Arrow format WAL records using TestData
         List<Object[]> testData = INDEXED_DATA.subList(0, 3);
         MemoryLogRecords walRecords = createArrowLogRecords(testData, INDEXED_ROW_TYPE);
         LogAppendInfo appendInfo = createValidLogAppendInfo(100L, testData.size());
 
         // Execute
-        indexCacheWriter.writeHotDataFromWAL(walRecords, appendInfo);
+        indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo);
 
         // Verify data was written to cache
         assertThat(indexRowCache.getTotalEntries()).isGreaterThan(0);
     }
 
     @Test
-    void testWriteHotDataFromWALWithLargeDataset() throws Exception {
+    void testCacheIndexDataByHotDataWithLargeDataset() throws Exception {
         // Test with large dataset from TestData
         List<Object[]> largeData = INDEX_CACHE_COLD_WAL_DATA.subList(0, 100);
         MemoryLogRecords walRecords = createArrowLogRecords(largeData, INDEXED_ROW_TYPE);
@@ -196,7 +207,7 @@ class IndexCacheWriterTest {
 
         // Execute
         long startTime = System.currentTimeMillis();
-        indexCacheWriter.writeHotDataFromWAL(walRecords, appendInfo);
+        indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo);
         long duration = System.currentTimeMillis() - startTime;
 
         // Verify performance and correctness
@@ -205,26 +216,26 @@ class IndexCacheWriterTest {
     }
 
     @Test
-    void testWriteHotDataFromWALWithNullRecords() throws Exception {
+    void testCacheIndexDataByHotDataWithNullRecords() throws Exception {
         LogAppendInfo appendInfo = createValidLogAppendInfo(100L, 1);
 
         // Should handle null records gracefully
-        assertThatCode(() -> indexCacheWriter.writeHotDataFromWAL(null, appendInfo))
+        assertThatCode(() -> indexCacheWriter.cacheIndexDataByHotData(null, appendInfo))
                 .doesNotThrowAnyException();
     }
 
     @Test
-    void testWriteHotDataFromWALWithNullAppendInfo() throws Exception {
+    void testCacheIndexDataByHotDataWithNullAppendInfo() throws Exception {
         List<Object[]> testData = INDEXED_DATA.subList(0, 2);
         MemoryLogRecords walRecords = createArrowLogRecords(testData, INDEXED_ROW_TYPE);
 
         // Should handle null appendInfo gracefully
-        assertThatCode(() -> indexCacheWriter.writeHotDataFromWAL(walRecords, null))
+        assertThatCode(() -> indexCacheWriter.cacheIndexDataByHotData(walRecords, null))
                 .doesNotThrowAnyException();
     }
 
     @Test
-    void testWriteHotDataFromWALWithInvalidAppendInfo() throws Exception {
+    void testCacheIndexDataByHotDataWithInvalidAppendInfo() throws Exception {
         List<Object[]> testData = INDEXED_DATA.subList(0, 2);
         MemoryLogRecords walRecords = createArrowLogRecords(testData, INDEXED_ROW_TYPE);
 
@@ -232,12 +243,15 @@ class IndexCacheWriterTest {
         LogAppendInfo invalidAppendInfo = createInvalidLogAppendInfo();
 
         // Should handle invalid appendInfo gracefully
-        assertThatCode(() -> indexCacheWriter.writeHotDataFromWAL(walRecords, invalidAppendInfo))
+        assertThatCode(
+                        () ->
+                                indexCacheWriter.cacheIndexDataByHotData(
+                                        walRecords, invalidAppendInfo))
                 .doesNotThrowAnyException();
     }
 
     @Test
-    void testWriteHotDataFromWALAfterClose() throws Exception {
+    void testCacheIndexDataByHotDataAfterClose() throws Exception {
         // Close the writer first
         indexCacheWriter.close();
 
@@ -246,7 +260,7 @@ class IndexCacheWriterTest {
         LogAppendInfo appendInfo = createValidLogAppendInfo(100L, testData.size());
 
         // Should handle gracefully when closed
-        assertThatCode(() -> indexCacheWriter.writeHotDataFromWAL(walRecords, appendInfo))
+        assertThatCode(() -> indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo))
                 .doesNotThrowAnyException();
     }
 
@@ -316,8 +330,8 @@ class IndexCacheWriterTest {
         LogAppendInfo appendInfo = createValidLogAppendInfo(100L, testData.size());
 
         // Execute multiple times with same data (simulating duplicates)
-        indexCacheWriter.writeHotDataFromWAL(walRecords, appendInfo);
-        indexCacheWriter.writeHotDataFromWAL(walRecords, appendInfo);
+        indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo);
+        indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo);
 
         // Should handle duplicates gracefully without error
         assertThat(indexRowCache.getTotalEntries()).isGreaterThan(0);
@@ -331,7 +345,7 @@ class IndexCacheWriterTest {
         LogAppendInfo appendInfo = createValidLogAppendInfo(100L, 0);
 
         // Should handle empty data gracefully
-        assertThatCode(() -> indexCacheWriter.writeHotDataFromWAL(walRecords, appendInfo))
+        assertThatCode(() -> indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo))
                 .doesNotThrowAnyException();
     }
 
@@ -385,16 +399,10 @@ class IndexCacheWriterTest {
     }
 
     private void createIndexRowCache() {
-        Map<org.apache.fluss.metadata.TablePartitionId, Integer> indexBucketDistribution =
-                new HashMap<>();
-        indexBucketDistribution.put(
-                org.apache.fluss.metadata.TablePartitionId.of(
-                        IDX_NAME_TABLE_INFO.getTableId(), null),
-                DEFAULT_BUCKET_COUNT);
-        indexBucketDistribution.put(
-                org.apache.fluss.metadata.TablePartitionId.of(
-                        IDX_EMAIL_TABLE_INFO.getTableId(), null),
-                DEFAULT_BUCKET_COUNT);
+        Map<Long, Integer> indexBucketDistribution = new HashMap<>();
+        indexBucketDistribution.put(IDX_NAME_TABLE_INFO.getTableId(), DEFAULT_BUCKET_COUNT);
+
+        indexBucketDistribution.put(IDX_EMAIL_TABLE_INFO.getTableId(), DEFAULT_BUCKET_COUNT);
 
         indexRowCache = new IndexRowCache(memoryPool, logTablet, indexBucketDistribution);
     }

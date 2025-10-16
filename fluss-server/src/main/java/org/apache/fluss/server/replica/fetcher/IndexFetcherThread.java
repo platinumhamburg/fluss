@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.replica.fetcher;
 
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -31,6 +32,7 @@ import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Maps;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.concurrent.ShutdownableThread;
 import org.apache.fluss.utils.log.FairDataIndexTableBucketStatusMap;
 
@@ -48,13 +50,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 
-import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.config.ConfigOptions.INDEX_REPLICA_FETCH_MAX_BYTES;
+import static org.apache.fluss.config.ConfigOptions.INDEX_REPLICA_FETCH_MIN_ADVANCE_OFFSET;
+import static org.apache.fluss.config.ConfigOptions.INDEX_REPLICA_FETCH_WAIT_MAX_TIME;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
@@ -69,9 +75,9 @@ final class IndexFetcherThread extends ShutdownableThread {
     private final LeaderEndpoint leader;
     private final int fetchBackOffMs;
 
-    private final int timeoutSeconds = 30;
-    private final int maxFetchRecords = 10000;
-    private final int maxFetchWaitMs = 30000;
+    private final int maxFetchBytes;
+    private final int minAdvanceOffset;
+    private final int maxFetchWaitMs;
 
     /**
      * A fair status map to store index bucket fetch status. {@link DataIndexTableBucket} -> {@link
@@ -87,14 +93,29 @@ final class IndexFetcherThread extends ShutdownableThread {
     private final Lock indexBucketStatusMapLock = new ReentrantLock();
     private final Condition indexBucketStatusMapCondition = indexBucketStatusMapLock.newCondition();
 
+    /**
+     * Thread-safe map to store failed data-index buckets and their failure reasons. This map is
+     * polled by IndexFetcherManager during reconciliation to update goal states. Using a
+     * ConcurrentHashMap allows the fetcher thread to record failures without blocking on
+     * IndexFetcherManager's lock, avoiding deadlock.
+     */
+    private final Map<DataIndexTableBucket, String> invalidBuckets = new HashMap<>();
+
     private final TabletServerMetricGroup serverMetricGroup;
 
     public IndexFetcherThread(
-            String name, ReplicaManager replicaManager, LeaderEndpoint leader, int fetchBackOffMs) {
+            String name,
+            ReplicaManager replicaManager,
+            LeaderEndpoint leader,
+            int fetchBackOffMs,
+            Configuration config) {
         super(name, false);
         this.replicaManager = replicaManager;
         this.leader = leader;
         this.fetchBackOffMs = fetchBackOffMs;
+        this.maxFetchBytes = (int) config.get(INDEX_REPLICA_FETCH_MAX_BYTES).getBytes();
+        this.minAdvanceOffset = config.get(INDEX_REPLICA_FETCH_MIN_ADVANCE_OFFSET);
+        this.maxFetchWaitMs = (int) config.get(INDEX_REPLICA_FETCH_WAIT_MAX_TIME).toMillis();
         this.serverMetricGroup = replicaManager.getServerMetricGroup();
     }
 
@@ -104,6 +125,25 @@ final class IndexFetcherThread extends ShutdownableThread {
 
     public int getBucketCount() {
         return fairIndexBucketStatusMap.size();
+    }
+
+    /**
+     * Poll and clear failed buckets. This method is called by IndexFetcherManager during goal
+     * reconciliation. Returns a snapshot of failed buckets and clears the internal map.
+     *
+     * @return map of failed data-index buckets to their failure reasons
+     */
+    public Map<DataIndexTableBucket, String> pollInvalidBuckets() {
+        return inLock(
+                indexBucketStatusMapLock,
+                () -> {
+                    if (invalidBuckets.isEmpty()) {
+                        return Collections.emptyMap();
+                    }
+                    Map<DataIndexTableBucket, String> snapshot = new HashMap<>(invalidBuckets);
+                    invalidBuckets.clear();
+                    return snapshot;
+                });
     }
 
     @Override
@@ -122,9 +162,11 @@ final class IndexFetcherThread extends ShutdownableThread {
                                         buildFetchIndexContext(
                                                 fairIndexBucketStatusMap.bucketStatusMap());
                                 if (!fetchLogContext.isPresent()) {
-                                    LOG.debug(
-                                            "No active index buckets available for fetching, backing off for {} ms",
-                                            fetchBackOffMs);
+                                    if (LOG.isDebugEnabled()) {
+                                        LOG.debug(
+                                                "No active index buckets available for fetching, backing off for {} ms",
+                                                fetchBackOffMs);
+                                    }
                                     indexBucketStatusMapCondition.await(
                                             fetchBackOffMs, TimeUnit.MILLISECONDS);
                                 }
@@ -166,7 +208,9 @@ final class IndexFetcherThread extends ShutdownableThread {
                         fairIndexBucketStatusMap.removeIf(
                                 dataIndexBucket ->
                                         indexBuckets.contains(dataIndexBucket.getIndexBucket())));
-        LOG.debug("Removed fetcher for index buckets {}", indexBuckets);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Removed fetcher for index buckets {}", indexBuckets);
+        }
     }
 
     public void removeIf(Predicate<DataIndexTableBucket> predicate) {
@@ -192,10 +236,12 @@ final class IndexFetcherThread extends ShutdownableThread {
                                 currentIndexFetchStatus.indexApplier());
                 fairIndexBucketStatusMap.updateAndMoveToEnd(
                         dataIndexBucket, updatedIndexFetchStatus);
-                LOG.debug(
-                        "Index fetch delayed for data-index bucket {} for {} ms",
-                        dataIndexBucket,
-                        delay);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Index fetch delayed for data-index bucket {} for {} ms",
+                            dataIndexBucket,
+                            delay);
+                }
             }
         }
         indexBucketStatusMapCondition.signalAll();
@@ -207,31 +253,81 @@ final class IndexFetcherThread extends ShutdownableThread {
         FetchIndexRequest fetchIndexRequest = fetchIndexContext.getFetchIndexRequest();
         long fetchStartTime = System.nanoTime();
         try {
-            LOG.debug(
-                    "Sending fetch index request with {} buckets to leader {}",
-                    fetchIndexRequest.getReqForTableBucketsCount(),
-                    leader.leaderServerId());
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Sending fetch index request with {} buckets to leader {}",
+                        fetchIndexRequest.getReqForTableBucketsCount(),
+                        leader.leaderServerId());
+            }
             long startTime = System.currentTimeMillis();
-            responseData = leader.fetchIndex(fetchIndexContext).get(60, TimeUnit.SECONDS);
+            responseData = leader.fetchIndex(fetchIndexContext).get();
             long fetchLatencyMs = (System.nanoTime() - fetchStartTime) / 1_000_000;
             serverMetricGroup.indexFetchLatencyHistogram().update(fetchLatencyMs);
-            LOG.debug(
-                    "Received fetch index response from leader {} in {} ms, {} buckets processed",
-                    leader.leaderServerId(),
-                    System.currentTimeMillis() - startTime,
-                    responseData.getFetchIndexLogResultMap().size());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Received fetch index response from leader {} in {} ms, {} buckets processed",
+                        leader.leaderServerId(),
+                        System.currentTimeMillis() - startTime,
+                        responseData.getFetchIndexLogResultMap().size());
+            }
         } catch (Throwable t) {
             if (isRunning()) {
-                LOG.warn("Error in response for fetch index request {}", fetchIndexRequest, t);
-                indexBucketsWithError.addAll(fetchIndexContext.getRequestDataIndexBuckets());
+                Throwable e = ExceptionUtils.stripException(t, ExecutionException.class);
+                if (e instanceof TimeoutException) {
+                    LOG.warn("fetch index timeout from leader {}", leader.leaderServerId());
+                } else {
+                    LOG.warn(
+                            "Error in response for fetch index request from leader {}",
+                            leader.leaderServerId(),
+                            t);
+                }
+
+                Set<DataIndexTableBucket> bucketsToRetry = new HashSet<>();
+                for (DataIndexTableBucket bucket : fetchIndexContext.getRequestDataIndexBuckets()) {
+                    // Only retry if the bucket still exists in our status map (not deleted)
+                    if (fairIndexBucketStatusMap.statusValue(bucket) != null) {
+                        bucketsToRetry.add(bucket);
+                    } else {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("Skipping retry for deleted index bucket: {}", bucket);
+                        }
+                    }
+                }
+                if (!bucketsToRetry.isEmpty()) {
+                    indexBucketsWithError.addAll(bucketsToRetry);
+                }
             }
         }
 
         if (responseData != null) {
             indexBucketStatusMapLock.lock();
             try {
+                // Collect buckets that need to be marked as failed
+                // These will be polled by IndexFetcherManager during reconciliation
+                Map<DataIndexTableBucket, String> bucketsToRecordFailure = new HashMap<>();
+
                 handleFetchIndexLogResponse(
-                        responseData.getFetchIndexLogResultMap(), indexBucketsWithError);
+                        responseData.getFetchIndexLogResultMap(),
+                        indexBucketsWithError,
+                        bucketsToRecordFailure);
+
+                // Record failed buckets and remove them from status map
+                // This prevents them from being fetched again until IndexFetcherManager
+                // recreates the fetcher during reconciliation
+                for (Map.Entry<DataIndexTableBucket, String> entry :
+                        bucketsToRecordFailure.entrySet()) {
+                    DataIndexTableBucket bucket = entry.getKey();
+                    String reason = entry.getValue();
+                    invalidBuckets.put(bucket, reason);
+                    // Remove from status map to stop further fetch attempts
+                    fairIndexBucketStatusMap.remove(bucket);
+                    LOG.info(
+                            "Removed failed bucket {} from fetcher thread. Reason: {}. "
+                                    + "IndexFetcherManager will recreate fetcher during reconciliation.",
+                            bucket,
+                            reason);
+                }
 
                 // Handle error buckets within the same lock to avoid race condition
                 // This ensures delay status is set before next fetch cycle
@@ -251,7 +347,9 @@ final class IndexFetcherThread extends ShutdownableThread {
 
     private void handleFetchIndexLogResponse(
             Map<DataIndexTableBucket, FetchIndexLogResultForBucket> indexResponseData,
-            Set<DataIndexTableBucket> indexBucketsWithError) {
+            Set<DataIndexTableBucket> indexBucketsWithError,
+            Map<DataIndexTableBucket, String> bucketsToRecordFailure) {
+        serverMetricGroup.indexFetchRequests().inc();
         indexResponseData.forEach(
                 (dataIndexBucket, indexResultData) -> {
                     DataBucketIndexFetchStatus currentIndexFetchStatus =
@@ -260,38 +358,44 @@ final class IndexFetcherThread extends ShutdownableThread {
                             || !currentIndexFetchStatus.isReadyForFetch()) {
                         return;
                     }
-
                     switch (indexResultData.getError().error()) {
                         case NONE:
-                            serverMetricGroup.indexFetchRequests().inc();
                             handleFetchIndexLogResponseOfSuccessBucket(
-                                    dataIndexBucket, currentIndexFetchStatus, indexResultData);
+                                    dataIndexBucket, indexResultData);
                             break;
                         case LOG_OFFSET_OUT_OF_RANGE_EXCEPTION:
+                            serverMetricGroup.indexFetchErrors().inc();
                             LOG.info(
                                     "Index offset out of range for data-index bucket {}, attempting automatic recovery",
                                     dataIndexBucket);
-                            handleIndexOutOfRangeError(dataIndexBucket, currentIndexFetchStatus);
+                            handleIndexOutOfRangeError(dataIndexBucket);
                             break;
                         case NOT_LEADER_OR_FOLLOWER:
-                            LOG.debug(
-                                    "Remote server is not the leader for index replica {}, which indicate "
-                                            + "that the replica is being moved. Retrying after {} ms delay.",
+                            serverMetricGroup.indexFetchErrors().inc();
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug(
+                                        "Remote server is not the leader for index replica {}, which indicate "
+                                                + "that the replica is being moved. Retrying after {} ms delay.",
+                                        dataIndexBucket,
+                                        fetchBackOffMs);
+                            }
+                            // Record bucket failure, will be polled by IndexFetcherManager
+                            bucketsToRecordFailure.put(
                                     dataIndexBucket,
-                                    fetchBackOffMs);
-                            handleNotLeaderOrFollowerError(
-                                    dataIndexBucket, currentIndexFetchStatus);
+                                    "NOT_LEADER_OR_FOLLOWER: Data bucket leader changed or is unavailable");
                             break;
                         case UNKNOWN_TABLE_OR_BUCKET_EXCEPTION:
                             LOG.info(
                                     "Index replica {} no longer exists, removing from fetcher",
                                     dataIndexBucket);
-                            try {
-                                handleUnknownTableOrBucketError(
-                                        dataIndexBucket, currentIndexFetchStatus);
-                            } catch (InterruptedException e) {
-                                throw new RuntimeException(e);
-                            }
+                            serverMetricGroup.indexFetchErrors().inc();
+                            // Record bucket failure, will be polled by IndexFetcherManager
+                            bucketsToRecordFailure.put(
+                                    dataIndexBucket,
+                                    "UNKNOWN_TABLE_OR_BUCKET_EXCEPTION: Data bucket not found on leader");
+                            break;
+                        case FETCH_INDEX_EARLY_FIRE_EXCEPTION:
+                            // DO NOTHING
                             break;
                         default:
                             LOG.error(
@@ -306,34 +410,8 @@ final class IndexFetcherThread extends ShutdownableThread {
                 });
     }
 
-    private void handleNotLeaderOrFollowerError(
-            DataIndexTableBucket dataIndexBucket,
-            DataBucketIndexFetchStatus currentIndexFetchStatus) {
-        // Use internal method since we're already holding the lock
-        delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
-    }
-
-    private void handleUnknownTableOrBucketError(
-            DataIndexTableBucket dataIndexBucket,
-            DataBucketIndexFetchStatus currentIndexFetchStatus)
-            throws InterruptedException {
-        try {
-            Replica indexReplica =
-                    replicaManager.getReplicaOrException(dataIndexBucket.getIndexBucket());
-            checkArgument(indexReplica.isLeader());
-        } catch (Exception e) {
-            LOG.error("Index replica {} not exist or being leader", dataIndexBucket);
-            removeIndexBuckets(Collections.singleton(dataIndexBucket.getIndexBucket()));
-            return;
-        }
-        // Use internal method since we're already holding the lock
-        delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
-    }
-
     private void handleFetchIndexLogResponseOfSuccessBucket(
-            DataIndexTableBucket dataIndexBucket,
-            DataBucketIndexFetchStatus currentIndexFetchStatus,
-            FetchIndexLogResultForBucket indexResultData) {
+            DataIndexTableBucket dataIndexBucket, FetchIndexLogResultForBucket indexResultData) {
         try {
             // Get current fetch offset from IndexApplier (Source of Truth)
             TableBucket dataBucket = dataIndexBucket.getDataBucket();
@@ -356,6 +434,22 @@ final class IndexFetcherThread extends ShutdownableThread {
             // Process index fetch result - this involves writing index data to the index table
             long startOffset = indexResultData.getStartOffset();
             long endOffset = indexResultData.getEndOffset();
+            FetchIndexLogResultForBucket.DataStatus dataStatus = indexResultData.getDataStatus();
+
+            // Check if data is not ready (not loaded in cache yet)
+            if (dataStatus == FetchIndexLogResultForBucket.DataStatus.NOT_READY) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Index data not ready for data bucket {} -> index bucket {} range [{}, {}), will retry after {} ms delay",
+                            dataBucket,
+                            indexBucket,
+                            startOffset,
+                            endOffset,
+                            fetchBackOffMs);
+                }
+                delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
+                return;
+            }
 
             if (startOffset != currentAppliedEndOffset) {
                 LOG.warn(
@@ -366,17 +460,17 @@ final class IndexFetcherThread extends ShutdownableThread {
                         startOffset,
                         endOffset,
                         fetchBackOffMs);
-                // Use internal method since we're already holding the lock
                 delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
                 return;
             } else if (startOffset == endOffset) {
-                LOG.debug(
-                        "No new index data available for data bucket {} -> index bucket {} at offset {}, retrying after {} ms delay",
-                        dataBucket,
-                        indexBucket,
-                        startOffset,
-                        fetchBackOffMs);
-                // Use internal method since we're already holding the lock
+                if (LOG.isTraceEnabled()) {
+                    LOG.trace(
+                            "Received empty index segment for data bucket {} -> index bucket {} at offset {}, delayed for retry after {} ms delay",
+                            dataBucket,
+                            indexBucket,
+                            startOffset,
+                            fetchBackOffMs);
+                }
                 delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
                 return;
             }
@@ -392,26 +486,42 @@ final class IndexFetcherThread extends ShutdownableThread {
                     indexApplier.applyIndexRecords(
                             indexRecords, startOffset, endOffset, dataBucket);
 
-            LOG.debug(
-                    "Applied index records: data bucket {} -> index bucket {}, offset range [{}, {}), {} bytes, new offset: {}",
-                    dataBucket,
-                    indexBucket,
-                    startOffset,
-                    endOffset,
-                    indexRecords.sizeInBytes(),
-                    newAppliedOffset);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Applied index records: data bucket {} -> index bucket {}, offset range [{}, {}), {} bytes, new offset: {}",
+                        dataBucket,
+                        indexBucket,
+                        startOffset,
+                        endOffset,
+                        indexRecords.sizeInBytes(),
+                        newAppliedOffset);
+            }
 
             if (hasIndexData) {
                 serverMetricGroup.replicationBytesIn().inc(indexRecords.sizeInBytes());
             }
             fairIndexBucketStatusMap.moveToEnd(dataIndexBucket);
             // Remove this redundant log as it duplicates information already logged above
+        } catch (IndexOutOfBoundsException e) {
+            LOG.error(
+                    "Memory bounds error while processing index data for data-index bucket {}. This indicates corrupted index data or memory segment issues. "
+                            + "Delaying for retry after {} ms. Error details: {}",
+                    dataIndexBucket,
+                    fetchBackOffMs,
+                    e.getMessage(),
+                    e);
+            // Increment error metrics for memory-related index fetch failures
+            serverMetricGroup.indexFetchErrors().inc();
+            // Use internal method since we're already holding the lock
+            delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
         } catch (Exception e) {
             LOG.error(
                     "Error while processing index data for data-index bucket {}, delayed for retry after {} ms.",
                     dataIndexBucket,
                     fetchBackOffMs,
                     e);
+            // Increment error metrics for index fetch failures
+            serverMetricGroup.indexFetchErrors().inc();
             // Use internal method since we're already holding the lock
             delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
         }
@@ -419,11 +529,13 @@ final class IndexFetcherThread extends ShutdownableThread {
 
     private void handleIndexBucketWithError(Set<DataIndexTableBucket> indexBuckets) {
         if (!indexBuckets.isEmpty()) {
-            LOG.info(
-                    "Index fetch failed for {} buckets, retrying after {} ms delay: {}",
-                    indexBuckets.size(),
-                    fetchBackOffMs,
-                    indexBuckets);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Index fetch failed for {} buckets, retrying after {} ms delay: {}",
+                        indexBuckets.size(),
+                        fetchBackOffMs,
+                        indexBuckets);
+            }
             // Use internal method since we're already holding the lock
             delayIndexBucketsInternal(indexBuckets, fetchBackOffMs);
         }
@@ -433,8 +545,7 @@ final class IndexFetcherThread extends ShutdownableThread {
      * Handle index offset out of range error by resetting the fetch offset to a valid position.
      * This is similar to handleOutOfRangeError but specifically designed for index replication.
      */
-    private void handleIndexOutOfRangeError(
-            DataIndexTableBucket dataIndexBucket, DataBucketIndexFetchStatus fetchStatus) {
+    private void handleIndexOutOfRangeError(DataIndexTableBucket dataIndexBucket) {
         try {
             // Get current fetch offset from IndexApplier (Source of Truth) for logging
             TableBucket dataBucket = dataIndexBucket.getDataBucket();
@@ -482,10 +593,8 @@ final class IndexFetcherThread extends ShutdownableThread {
          * 2. Index buckets can be regenerated from data log if needed
          * 3. Index replication can start from any valid data log offset
          */
-        long leaderDataEndOffset =
-                leader.fetchLocalLogEndOffset(dataBucket).get(timeoutSeconds, TimeUnit.SECONDS);
-        long leaderDataStartOffset =
-                leader.fetchLocalLogStartOffset(dataBucket).get(timeoutSeconds, TimeUnit.SECONDS);
+        long leaderDataEndOffset = leader.fetchLocalLogEndOffset(dataBucket).get();
+        long leaderDataStartOffset = leader.fetchLocalLogStartOffset(dataBucket).get();
 
         // For index replication, we just need to coordinate the offset ranges but don't store
         // the actual fetch offset in DataBucketIndexFetchStatus anymore since IndexApplier
@@ -520,10 +629,10 @@ final class IndexFetcherThread extends ShutdownableThread {
         if (indexTablePath == null) {
             // Fallback: construct a reasonable table path
             // This is a safety measure, in normal cases currentStatus should exist
-            LOG.warn("Could not find index table path for {}, using fallback", dataIndexBucket);
+            LOG.warn("Could not find index table path or current status for {}", dataIndexBucket);
             throw new IllegalStateException(
                     String.format(
-                            "Index table path not found for data-index bucket %s",
+                            "Index table path or current status not found for data-index bucket %s",
                             dataIndexBucket));
         }
 
@@ -580,7 +689,10 @@ final class IndexFetcherThread extends ShutdownableThread {
             Map<DataIndexTableBucket, DataBucketIndexFetchStatus> indexBucketFetchStatusMap) {
         Map<Long, TablePath> tableIdToTablePath = new HashMap<>();
         FetchIndexRequest fetchRequest =
-                new FetchIndexRequest().setMaxRecords(maxFetchRecords).setMaxWaitMs(maxFetchWaitMs);
+                new FetchIndexRequest()
+                        .setMaxBytes(maxFetchBytes)
+                        .setMinAdvanceOffset(minAdvanceOffset)
+                        .setMaxWaitMs(maxFetchWaitMs);
         Set<DataIndexTableBucket> reqDataIndexBuckets = new HashSet<>();
 
         Map<TableBucket, Map<TableBucket, PbFetchIndexReqForIndexTableBucket>> indexBucketReqMap =
@@ -607,6 +719,12 @@ final class IndexFetcherThread extends ShutdownableThread {
                         .computeIfAbsent(dataIndexBucket.getDataBucket(), key -> Maps.newHashMap())
                         .put(dataIndexBucket.getIndexBucket(), fetchIndexReqForIndexBucket);
                 reqDataIndexBuckets.add(dataIndexBucket);
+            } else {
+                if (LOG.isTraceEnabled()) {
+                    LOG.trace(
+                            "Index bucket {} is not ready for fetch, skipping",
+                            dataIndexTableBucketDataBucketIndexFetchStatusEntry.getKey());
+                }
             }
         }
 

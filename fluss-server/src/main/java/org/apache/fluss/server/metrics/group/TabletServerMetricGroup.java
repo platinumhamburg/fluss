@@ -83,6 +83,7 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter indexApplyRequests;
     private final Counter indexApplyErrors;
     private final DescriptiveStatisticsHistogram indexApplyLatencyHistogram;
+    private final DescriptiveStatisticsHistogram indexApplyBatchSizeHistogram;
 
     public TabletServerMetricGroup(
             MetricRegistry registry, String clusterId, String rack, String hostname, int serverId) {
@@ -161,6 +162,8 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(MetricNames.INDEX_APPLY_ERRORS_RATE, new MeterView(indexApplyErrors));
         indexApplyLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
         histogram(MetricNames.INDEX_APPLY_LATENCY_MS, indexApplyLatencyHistogram);
+        indexApplyBatchSizeHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.INDEX_APPLY_BATCH_SIZE, indexApplyBatchSizeHistogram);
     }
 
     @Override
@@ -275,6 +278,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public DescriptiveStatisticsHistogram indexApplyLatencyHistogram() {
         return indexApplyLatencyHistogram;
+    }
+
+    public DescriptiveStatisticsHistogram indexApplyBatchSizeHistogram() {
+        return indexApplyBatchSizeHistogram;
     }
 
     // ------------------------------------------------------------------------

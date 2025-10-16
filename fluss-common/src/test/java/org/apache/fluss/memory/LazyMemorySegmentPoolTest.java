@@ -610,7 +610,6 @@ public class LazyMemorySegmentPoolTest {
             conf.set(
                     ConfigOptions.SERVER_INDEX_CACHE_PER_REQUEST_MEMORY_SIZE,
                     MemorySize.parse("4mb"));
-            conf.set(ConfigOptions.SERVER_INDEX_CACHE_POOL_WAIT_TIMEOUT, Duration.ofMillis(2000L));
 
             LazyMemorySegmentPool pool = LazyMemorySegmentPool.createIndexCacheBufferPool(conf);
             assertThat(pool).isNotNull();

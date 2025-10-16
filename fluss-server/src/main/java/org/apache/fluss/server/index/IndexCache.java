@@ -20,16 +20,20 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.bucketing.BucketingFunction;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
-import org.apache.fluss.metadata.TablePartitionId;
 import org.apache.fluss.record.LogRecords;
+import org.apache.fluss.server.kv.wal.WalBuilder;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,8 +44,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
@@ -64,7 +66,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *
  * <p>Architecture Changes: - Replaced CachedIndexSegments with IndexRowCache for row-level
  * management - Integrated IndexCacheWriter for enhanced cold data loading - Added support for
- * hot/cold data fusion with consistent data integrity - Enhanced fetchIndexLogData with three-stage
+ * hot/cold data fusion with consistent data integrity - Enhanced fetchIndex with three-stage
  * processing: cache analysis → cold loading → dynamic assembly
  *
  * <p>Thread Safety: This class provides concurrent read access with exclusive write operations
@@ -87,23 +89,26 @@ public final class IndexCache implements Closeable {
 
     private final LogTablet logTablet;
 
-    @SuppressWarnings("unused") // Used indirectly through indexRowCache and indexCacheWriter
-    private final MemorySegmentPool memoryPool;
-
     private final IndexCacheWriter indexCacheWriter;
-    private final List<Schema.Index> indexDefinitions;
-    private final TabletServerMetadataCache tabletServerMetadataCache;
     private final PhysicalTablePath dataTablePhysicalPath;
     private final IndexCommitHorizonCallback commitHorizonCallback;
 
-    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    private final IndexRowCache indexRowCache;
 
     private volatile long lastIndexCommitHorizon = -1;
 
-    private final IndexRowCache indexRowCache;
-
-    // Configuration and state
     private volatile boolean closed = false;
+
+    private final PendingWriteQueue pendingWriteQueue;
+
+    // For cold data loading on failover - batch loading support
+    private final long logEndOffsetOnLeaderStart;
+    private final long coldLoadBatchSize;
+
+    // Tracks the state of batch cold data loading
+    private volatile long coldLoadTargetEndOffset = -1; // Final target offset to load to
+    private volatile long coldLoadCurrentEndOffset = -1; // End offset of current batch
+    private volatile boolean coldLoadInProgress = false; // Whether a batch is currently loading
 
     /**
      * Creates a new IndexCache with the new row-level cache architecture.
@@ -114,6 +119,9 @@ public final class IndexCache implements Closeable {
      * @param dataTablePhysicalPath the physical path of the data table
      * @param metadataCache the metadata cache for table metadata
      * @param commitHorizonCallback callback for index commit horizon changes (can be null)
+     * @param dataBucketLogEndOffset the log end offset of the data bucket at the time when this
+     *     index cache is created (for cold data loading boundary)
+     * @param conf the server configuration
      */
     public IndexCache(
             LogTablet logTablet,
@@ -121,34 +129,40 @@ public final class IndexCache implements Closeable {
             Schema dataTableSchema,
             PhysicalTablePath dataTablePhysicalPath,
             TabletServerMetadataCache metadataCache,
-            IndexCommitHorizonCallback commitHorizonCallback) {
+            IndexCommitHorizonCallback commitHorizonCallback,
+            long dataBucketLogEndOffset,
+            Configuration conf) {
         this.logTablet = checkNotNull(logTablet, "logTablet cannot be null");
-        this.memoryPool = checkNotNull(memoryPool, "memoryPool cannot be null");
+        checkNotNull(memoryPool, "memoryPool cannot be null");
         checkNotNull(dataTableSchema, "dataTableSchema cannot be null");
-        this.tabletServerMetadataCache =
-                checkNotNull(metadataCache, "indexMetadataManager cannot be null");
+        checkNotNull(metadataCache, "indexMetadataManager cannot be null");
         this.dataTablePhysicalPath =
                 checkNotNull(dataTablePhysicalPath, "dataTablePhysicalPath cannot be null");
         this.commitHorizonCallback = commitHorizonCallback;
 
-        // Extract index definitions from the data table schema
-        this.indexDefinitions = dataTableSchema.getIndexes();
-
         BucketingFunction bucketingFunction = BucketingFunction.of(null);
 
-        List<TableInfo> indexTableInfos =
-                metadataCache.getRelatedIndexTables(dataTablePhysicalPath.getTablePath());
+        List<TableInfo> indexTableInfos;
+        try {
+            indexTableInfos = getIndexTablesWithRetry(metadataCache, dataTablePhysicalPath);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to initialize IndexCache: " + e.getMessage(), e);
+        }
 
-        Map<TablePartitionId, Integer> indexTableBucketDistribution =
+        Map<Long, Integer> indexTableBucketDistribution =
                 indexTableInfos.stream()
                         .collect(
                                 HashMap::new,
-                                (m, t) ->
-                                        m.put(
-                                                TablePartitionId.of(t.getTableId(), null),
-                                                t.getNumBuckets()),
+                                (m, t) -> m.put(t.getTableId(), t.getNumBuckets()),
                                 HashMap::putAll);
         this.indexRowCache = new IndexRowCache(memoryPool, logTablet, indexTableBucketDistribution);
+
+        // Get main table info for TTL and partition configuration
+        TableInfo mainTableInfo =
+                metadataCache
+                        .getTableMetadata(dataTablePhysicalPath.getTablePath())
+                        .map(org.apache.fluss.server.metadata.TableMetadata::getTableInfo)
+                        .orElse(null);
 
         this.indexCacheWriter =
                 new IndexCacheWriter(
@@ -156,12 +170,32 @@ public final class IndexCache implements Closeable {
                         indexRowCache,
                         bucketingFunction,
                         dataTableSchema,
-                        indexTableInfos);
+                        indexTableInfos,
+                        mainTableInfo);
+
+        // Record the data bucket's log end offset at leader start for cold data loading boundary
+        // This represents the upper boundary of cold data that needs to be loaded if there's a gap
+        this.logEndOffsetOnLeaderStart = dataBucketLogEndOffset;
+
+        // Get cold load batch size from configuration
+        MemorySize batchSize = conf.get(ConfigOptions.SERVER_INDEX_CACHE_COLD_LOAD_BATCH_SIZE);
+        this.coldLoadBatchSize = batchSize.getBytes();
+
+        // Initialize pending write queue to replace indexWriterExecutor
+        this.pendingWriteQueue =
+                new PendingWriteQueue(
+                        logTablet.getTableBucket().toString(),
+                        500, // queue capacity
+                        3, // max retries
+                        1000); // retry backoff ms
 
         LOG.info(
-                "IndexCache initialized with row-level cache architecture for data bucket {} with {} index definitions",
+                "IndexCache initialized with row-level cache architecture for data bucket {} with {} index definitions, "
+                        + "logEndOffsetOnLeaderStart: {}, coldLoadBatchSize: {} bytes",
                 logTablet.getTableBucket(),
-                indexDefinitions.size());
+                dataTableSchema.getIndexes().size(),
+                logEndOffsetOnLeaderStart,
+                coldLoadBatchSize);
     }
 
     /**
@@ -182,120 +216,282 @@ public final class IndexCache implements Closeable {
      * @return Map of index bucket to IndexSegment with dynamically assembled data
      * @throws Exception if an error occurs during fetch operation
      */
-    public Optional<Map<TableBucket, IndexSegment>> fetchIndexLogData(
-            Map<TableBucket, IndexCacheFetchParam> fetchRequests, boolean hotDataOnly)
+    public Tuple2<Integer, Optional<Map<TableBucket, IndexSegment>>> fetchIndex(
+            Map<TableBucket, IndexCacheFetchParam> fetchRequests,
+            long minAdvanceOffset,
+            int maxBytes,
+            boolean forceFetch)
             throws Exception {
         if (closed) {
             LOG.warn("IndexCache is closed, returning empty results");
-            return Optional.empty();
+            return Tuple2.of(0, Optional.empty());
         }
 
         long highWatermark = logTablet.getHighWatermark();
 
-        // Execute optimized batch processing flow
         Map<TableBucket, IndexSegment> results = new HashMap<>();
-        Map<TableBucket, List<OffsetRangeInfo>> unloadedRanges;
 
-        if (hotDataOnly) {
-            updateCommitOffset(fetchRequests);
+        updateCommitOffset(fetchRequests);
+
+        long minFetchStartOffset =
+                fetchRequests.values().stream()
+                        .mapToLong(IndexCacheFetchParam::getFetchOffset)
+                        .min()
+                        .orElseThrow(() -> new IllegalStateException("No fetch requests provided"));
+
+        if (!forceFetch) {
+            if (highWatermark - minFetchStartOffset < minAdvanceOffset) {
+                return Tuple2.of(0, Optional.empty());
+            }
         }
 
-        lock.readLock().lock();
-        try {
+        long currentEndOffset = minFetchStartOffset;
+        int currentFetchBytes = 0;
 
-            // Stage 1: Collect all unloaded ranges from all IndexBuckets in batch
-            unloadedRanges = indexRowCache.getUnloadedRanges(fetchRequests);
-
-            if (!unloadedRanges.isEmpty() && hotDataOnly) {
-                for (Map.Entry<TableBucket, List<OffsetRangeInfo>> entry :
-                        unloadedRanges.entrySet()) {
-                    LOG.info(
-                            "DataBucket {}: Index bucket {} has unloaded ranges: {}",
-                            this.logTablet.getTableBucket(),
-                            entry.getKey(),
-                            entry.getValue());
-                }
-                return Optional.empty();
-            }
-
-            // Stage 2: Batch load cold data if needed (single WAL read for all IndexBuckets)
-            if (!unloadedRanges.isEmpty()) {
-                loadColdDataForRanges(unloadedRanges);
-            }
-
-            // Stage 3: Assemble IndexSegments for each IndexBucket
+        while (currentFetchBytes < maxBytes && currentEndOffset <= highWatermark) {
+            currentEndOffset += minAdvanceOffset;
             for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
                 TableBucket indexBucket = entry.getKey();
-                IndexCacheFetchParam param = entry.getValue();
+                currentFetchBytes +=
+                        indexRowCache.getCachedBytesOfIndexBucketInRange(
+                                indexBucket, minFetchStartOffset, currentEndOffset);
+            }
+        }
 
-                long startOffset = param.getFetchOffset();
-                if (startOffset >= highWatermark) {
+        currentEndOffset = Math.min(currentEndOffset, highWatermark);
+
+        for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
+            TableBucket indexBucket = entry.getKey();
+            IndexCacheFetchParam param = entry.getValue();
+
+            long startOffset = param.getFetchOffset();
+            if (startOffset >= highWatermark) {
+                if (LOG.isTraceEnabled()) {
                     LOG.trace(
                             "DataBucket {}: Index bucket {} has no data to fetch from start offset {}",
                             this.logTablet.getTableBucket(),
                             indexBucket,
                             startOffset);
-                    results.put(indexBucket, IndexSegment.createEmptySegment(highWatermark));
-                    continue;
                 }
-
-                short schemaId = getSchemaIdForIndex(param.getIndexTableId());
-
-                // Get LogRecords directly from IndexRowCache with accurate metadata
-                // This eliminates the need for IndexLogRecordsBuilder's tricky estimations
-                LogRecords logRecords =
-                        indexRowCache.getRangeLogRecords(
-                                TablePartitionId.from(indexBucket),
-                                indexBucket.getBucket(),
-                                startOffset,
-                                highWatermark,
-                                schemaId);
-
-                LOG.trace(
-                        "DataBucket {}: Index bucket {} fetched {} bytes of index data from range [{}, {})",
-                        dataTablePhysicalPath,
-                        indexBucket,
-                        logRecords.sizeInBytes(),
-                        startOffset,
-                        highWatermark);
-                IndexSegment segment = new IndexSegment(startOffset, highWatermark, logRecords);
-                results.put(indexBucket, segment);
+                results.put(indexBucket, IndexSegment.createEmptySegment(highWatermark));
+                continue;
             }
-        } finally {
-            lock.readLock().unlock();
+
+            IndexRowCache.ReadResult readResult =
+                    indexRowCache.readIndexLogRecords(
+                            indexBucket.getTableId(),
+                            indexBucket.getBucket(),
+                            startOffset,
+                            currentEndOffset);
+
+            IndexSegment segment;
+            if (readResult.getStatus() == IndexRowCache.ReadStatus.NOT_LOADED) {
+                // Data not loaded in cache yet, return NOT_READY segment
+                segment = IndexSegment.createNotReadySegment(startOffset, currentEndOffset);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "DataBucket {}: Index bucket {} data not loaded for range [{}, {}), returning NOT_READY segment",
+                            this.logTablet.getTableBucket(),
+                            indexBucket,
+                            startOffset,
+                            currentEndOffset);
+                }
+            } else {
+                // Data loaded, create segment with records (may be empty but range is loaded)
+                LogRecords logRecords = readResult.getRecords();
+                segment =
+                        new IndexSegment(
+                                startOffset,
+                                currentEndOffset,
+                                logRecords,
+                                IndexSegment.DataStatus.LOADED);
+                if (LOG.isTraceEnabled()) {
+                    LOG.trace(
+                            "DataBucket {}: Index bucket {} fetched {} bytes of index data from range [{}, {}), highWatermark: {}",
+                            dataTablePhysicalPath,
+                            indexBucket,
+                            logRecords.sizeInBytes(),
+                            startOffset,
+                            currentEndOffset,
+                            highWatermark);
+                }
+            }
+            results.put(indexBucket, segment);
         }
 
-        LOG.debug(
-                "Batch fetched index data for {} buckets, loaded ranges: {}",
-                results.size(),
-                unloadedRanges);
-        return Optional.of(results);
+        return Tuple2.of(currentFetchBytes, Optional.of(results));
     }
 
     private void updateCommitOffset(Map<TableBucket, IndexCacheFetchParam> fetchRequests) {
-        long maxOffset = -1;
+        long maxCommitOffset = -1;
         for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
             TableBucket indexBucket = entry.getKey();
             long commitOffset = entry.getValue().getIndexCommitOffset();
             indexRowCache.updateCommitOffset(
-                    TablePartitionId.from(indexBucket), indexBucket.getBucket(), commitOffset);
-            maxOffset = Math.max(maxOffset, commitOffset);
+                    indexBucket.getTableId(), indexBucket.getBucket(), commitOffset);
+            maxCommitOffset = Math.max(maxCommitOffset, commitOffset);
         }
-        mayTriggerCommitHorizonCallback(maxOffset);
+        mayTriggerCommitHorizonCallback(maxCommitOffset);
     }
 
-    private void mayTriggerCommitHorizonCallback(long commitOffset) {
-        if (commitOffset > lastIndexCommitHorizon) {
+    private void mayTriggerCommitHorizonCallback(long maxCommitOffset) {
+        if (maxCommitOffset > lastIndexCommitHorizon) {
             long currentCommitHorizon = indexRowCache.getCommitHorizon();
             if (currentCommitHorizon > lastIndexCommitHorizon) {
                 lastIndexCommitHorizon = currentCommitHorizon;
                 try {
                     commitHorizonCallback.onIndexCommitHorizonUpdate(currentCommitHorizon);
-                    maybeCleanupExpiredRecords();
                 } catch (Exception e) {
                     LOG.error("Failed to trigger commit horizon callback", e);
                 }
+
+                // Check if we need to trigger cold data loading after failover
+                mayTriggerColdDataLoading(currentCommitHorizon);
             }
+        }
+    }
+
+    /**
+     * Checks if cold data loading should be triggered and submits the loading task if needed.
+     *
+     * <p>This method implements batch cold data loading to control memory usage. Cold data is
+     * loaded in batches based on the configured batch size. Each batch is only loaded after the
+     * previous batch has been consumed (indicated by indexCommitHorizon advancing).
+     *
+     * <p>Trigger conditions for new batch: 1. No batch currently in progress 2.
+     * logEndOffsetOnLeaderStart > 0 (historical data exists) 3. IndexCommitHorizon <
+     * logEndOffsetOnLeaderStart (not all historical data consumed) 4. Gap exists between cache and
+     * consumption progress (minCacheWatermark > IndexCommitHorizon or cache is empty) 5. Current
+     * batch consumed: currentCommitHorizon >= coldLoadCurrentEndOffset (or no batch loaded yet)
+     *
+     * <p>Note: IndexCommitHorizon >= 0 is always valid, including 0 which means downstream needs to
+     * consume from offset 0.
+     *
+     * @param currentCommitHorizon the current index commit horizon
+     */
+    private void mayTriggerColdDataLoading(long currentCommitHorizon) {
+        // If logEndOffsetOnLeaderStart <= 0, there is no historical data to load
+        // All data written after becoming leader is hot data and already cached
+        if (logEndOffsetOnLeaderStart <= 0) {
+            return;
+        }
+
+        // If IndexCommitHorizon has reached or exceeded logEndOffsetOnLeaderStart,
+        // it means all historical data that existed when becoming leader has been consumed
+        // No need to load cold data anymore
+        if (currentCommitHorizon >= logEndOffsetOnLeaderStart) {
+            // Reset state if all cold data has been consumed
+            if (coldLoadTargetEndOffset > 0) {
+                LOG.info(
+                        "DataBucket {}: All cold data has been consumed, resetting cold load state",
+                        logTablet.getTableBucket());
+                coldLoadTargetEndOffset = -1;
+                coldLoadCurrentEndOffset = -1;
+                coldLoadInProgress = false;
+            }
+            return;
+        }
+
+        // Check if a batch is currently being loaded
+        if (coldLoadInProgress) {
+            return;
+        }
+
+        // Check if there's a gap between cache and consumption progress
+        long minCacheWatermark = indexRowCache.getMinCacheWatermark();
+
+        // If no gap (cache is adjacent to or overlaps with commit horizon), no need to load
+        if (minCacheWatermark >= 0 && minCacheWatermark <= currentCommitHorizon) {
+            return;
+        }
+
+        // Check if previous batch has been consumed
+        // If coldLoadCurrentEndOffset > 0, it means we have loaded a batch before
+        // We should only load the next batch after the current one is consumed
+        if (coldLoadCurrentEndOffset > 0 && currentCommitHorizon < coldLoadCurrentEndOffset) {
+            // Previous batch not yet consumed, wait for it to be consumed
+            return;
+        }
+
+        // Calculate the range for the next batch
+        long loadStartOffset = currentCommitHorizon;
+
+        // Determine the final target end offset if not set yet
+        if (coldLoadTargetEndOffset < 0) {
+            if (minCacheWatermark < 0) {
+                // Cache is empty, target is logEndOffsetOnLeaderStart
+                coldLoadTargetEndOffset = logEndOffsetOnLeaderStart;
+            } else {
+                // Cache has some data, target is min(logEndOffsetOnLeaderStart, minCacheWatermark)
+                coldLoadTargetEndOffset = Math.min(logEndOffsetOnLeaderStart, minCacheWatermark);
+            }
+        }
+
+        // Calculate batch end offset based on batch size
+        // Use a simple heuristic: assume average record size of 1KB
+        // This is a rough estimate - actual size may vary
+        long estimatedRecordsInBatch = coldLoadBatchSize / 1024; // Assume 1KB per record
+        long batchEndOffset =
+                Math.min(loadStartOffset + estimatedRecordsInBatch, coldLoadTargetEndOffset);
+
+        // Validate the range
+        if (loadStartOffset >= batchEndOffset) {
+            return;
+        }
+
+        // Mark batch as in progress
+        coldLoadInProgress = true;
+        coldLoadCurrentEndOffset = batchEndOffset;
+
+        LOG.info(
+                "DataBucket {}: Triggering batch cold data loading from WAL, batch range [{}, {}), "
+                        + "target end offset: {}, batch size limit: {} bytes",
+                logTablet.getTableBucket(),
+                loadStartOffset,
+                batchEndOffset,
+                coldLoadTargetEndOffset,
+                coldLoadBatchSize);
+
+        // Create completion callback to handle batch completion
+        ColdDataLoad.CompletionCallback callback =
+                new ColdDataLoad.CompletionCallback() {
+                    @Override
+                    public void onComplete(long startOffset, long endOffset) {
+                        LOG.info(
+                                "DataBucket {}: Cold data loading batch completed successfully, range [{}, {})",
+                                logTablet.getTableBucket(),
+                                startOffset,
+                                endOffset);
+                        // Reset flag to allow next batch to be loaded
+                        coldLoadInProgress = false;
+                    }
+
+                    @Override
+                    public void onFailure(long startOffset, long endOffset, Exception cause) {
+                        LOG.error(
+                                "DataBucket {}: Cold data loading batch failed for range [{}, {})",
+                                logTablet.getTableBucket(),
+                                startOffset,
+                                endOffset,
+                                cause);
+                        // Reset flag to allow retry
+                        coldLoadInProgress = false;
+                    }
+                };
+
+        // Submit cold data loading task for this batch
+        ColdDataLoad coldDataLoad =
+                new ColdDataLoad(indexCacheWriter, loadStartOffset, batchEndOffset, callback);
+        boolean submitted = pendingWriteQueue.submit(coldDataLoad);
+
+        if (!submitted) {
+            LOG.error(
+                    "DataBucket {}: Failed to submit cold data loading task for batch range [{}, {})",
+                    logTablet.getTableBucket(),
+                    loadStartOffset,
+                    batchEndOffset);
+            // Reset flag to allow retry
+            coldLoadInProgress = false;
         }
     }
 
@@ -303,35 +499,38 @@ public final class IndexCache implements Closeable {
      * Write hot data from WAL records to index cache. This method leverages IndexCacheWriter to
      * process WAL data and write indexed data directly to cache for immediate availability.
      *
+     * @param walBuilder the WALBuilder used to process WAL data
      * @param walRecords the WAL LogRecords generated during KV processing
      * @param appendInfo the log append information containing offset details
-     * @throws Exception if an error occurs during hot data processing
      */
-    public void writeHotDataFromWAL(LogRecords walRecords, LogAppendInfo appendInfo)
-            throws Exception {
+    public void cacheIndexDataByHotData(
+            WalBuilder walBuilder, LogRecords walRecords, LogAppendInfo appendInfo) {
 
         if (closed) {
             LOG.warn(
                     "IndexCache is closed, cannot write hot data for table bucket {}",
                     logTablet.getTableBucket());
+            if (walBuilder != null) {
+                walBuilder.deallocate();
+            }
             return;
         }
 
-        lock.writeLock().lock();
-        try {
-            indexCacheWriter.writeHotDataFromWAL(walRecords, appendInfo);
-            LOG.debug(
-                    "Successfully processed hot data from WAL for table bucket {}",
-                    logTablet.getTableBucket());
+        // Create hot data write task and submit to pending write queue
+        HotDataWrite hotDataWrite =
+                new HotDataWrite(indexCacheWriter, walBuilder, walRecords, appendInfo);
+        boolean submitted = pendingWriteQueue.submit(hotDataWrite);
 
-        } catch (Exception e) {
-            LOG.warn(
-                    "Failed to process hot data from WAL for table bucket {}",
+        if (!submitted) {
+            LOG.error(
+                    "Failed to submit hot data write task for table bucket {}, range [{}, {}), queue may be full",
                     logTablet.getTableBucket(),
-                    e);
-            throw e;
-        } finally {
-            lock.writeLock().unlock();
+                    appendInfo.firstOffset(),
+                    appendInfo.lastOffset() + 1);
+            // Deallocate walBuilder if submission fails
+            if (walBuilder != null) {
+                walBuilder.deallocate();
+            }
         }
     }
 
@@ -344,6 +543,15 @@ public final class IndexCache implements Closeable {
         return indexRowCache.getCommitHorizon();
     }
 
+    /**
+     * Gets the IndexRowCache for memory usage analysis.
+     *
+     * @return the IndexRowCache instance
+     */
+    public IndexRowCache getIndexRowCache() {
+        return indexRowCache;
+    }
+
     @Override
     public void close() {
         if (closed) {
@@ -352,121 +560,100 @@ public final class IndexCache implements Closeable {
 
         LOG.info("Closing IndexCache for data bucket {}", logTablet.getTableBucket());
 
-        lock.writeLock().lock();
-        try {
-            closed = true;
+        closed = true;
 
-            // Close the row cache manager
-            if (indexRowCache != null) {
-                indexRowCache.close();
-            }
+        // Close the pending write queue
+        if (pendingWriteQueue != null) {
+            pendingWriteQueue.close();
+        }
 
-            // Close the cache writer
-            if (indexCacheWriter != null) {
-                try {
-                    indexCacheWriter.close();
-                } catch (IOException e) {
-                    LOG.warn("Error closing IndexCacheWriter", e);
-                }
+        // Close the row cache manager
+        if (indexRowCache != null) {
+            indexRowCache.close();
+        }
+
+        // Close the cache writer
+        if (indexCacheWriter != null) {
+            try {
+                indexCacheWriter.close();
+            } catch (IOException e) {
+                LOG.warn("Error closing IndexCacheWriter", e);
             }
-        } finally {
-            lock.writeLock().unlock();
         }
 
         LOG.info("IndexCache closed for data bucket {}", logTablet.getTableBucket());
     }
 
     /**
-     * Batch load cold data from WAL for multiple IndexBuckets using optimized single WAL read.
+     * Get related index tables with retry mechanism to handle index table creation delays.
      *
-     * <p>This method implements the core optimization by:
+     * <p>During main table creation, index tables are created after the main table. This method
+     * implements retry logic to wait for index table creation to complete.
      *
-     * <ul>
-     *   <li>Computing global WAL read range from all IndexBucket requirements
-     *   <li>Reading WAL data once for the entire global range
-     *   <li>Conditionally processing data based on each IndexBucket's declared needs
-     *   <li>Writing data only to IndexBuckets that declared they need it
-     * </ul>
+     * @param metadataCache the metadata cache
+     * @param dataTablePhysicalPath the physical path of the data table
+     * @return list of index table infos
+     * @throws Exception if max retries exceeded or other errors occur
      */
-    private void loadColdDataForRanges(Map<TableBucket, List<OffsetRangeInfo>> unloadedRanges)
+    private List<TableInfo> getIndexTablesWithRetry(
+            TabletServerMetadataCache metadataCache, PhysicalTablePath dataTablePhysicalPath)
             throws Exception {
 
-        // Check if there are actually any ranges to load
-        boolean hasNonEmptyRanges =
-                unloadedRanges.values().stream().anyMatch(ranges -> !ranges.isEmpty());
+        // Configuration for retry mechanism: retry every 1 second for up to 300 times (5 minutes)
+        final int maxRetries = 300;
+        final long retryIntervalMs = 1000;
 
-        if (!hasNonEmptyRanges) {
-            LOG.debug("No non-empty unloaded ranges found, skipping cold data loading");
-            return;
-        }
+        Exception lastException = null;
 
-        // Calculate global WAL read range
-        long globalStartOffset =
-                unloadedRanges.values().stream()
-                        .filter(ranges -> !ranges.isEmpty())
-                        .map(ranges -> ranges.get(0))
-                        .map(OffsetRangeInfo::getStartOffset)
-                        .min(Long::compareTo)
-                        .orElseThrow(
-                                () ->
-                                        new IllegalStateException(
-                                                "Expected non-empty ranges but found none"));
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                List<TableInfo> indexTableInfos =
+                        metadataCache.getRelatedIndexTables(dataTablePhysicalPath.getTablePath());
 
-        long globalEndOffset =
-                unloadedRanges.values().stream()
-                        .filter(ranges -> !ranges.isEmpty())
-                        .map(ranges -> ranges.get(0))
-                        .map(OffsetRangeInfo::getEndOffset)
-                        .min(Long::compareTo)
-                        .orElseThrow(
-                                () ->
-                                        new IllegalStateException(
-                                                "Expected non-empty ranges but found none"));
+                if (attempt > 0) {
+                    LOG.info(
+                            "Successfully retrieved index table information for data bucket {} after {} attempts",
+                            logTablet.getTableBucket(),
+                            attempt + 1);
+                }
 
-        indexCacheWriter.loadColdDataToCache(globalStartOffset, globalEndOffset);
-    }
+                return indexTableInfos;
 
-    /** Get schema ID for the specified index table. */
-    private short getSchemaIdForIndex(long indexTableId) {
-        try {
-            // Get all index tables for the data table
-            List<TableInfo> indexTables =
-                    tabletServerMetadataCache.getRelatedIndexTables(
-                            dataTablePhysicalPath.getTablePath());
+            } catch (Exception e) {
+                lastException = e;
 
-            // Find the index table with the matching ID
-            for (TableInfo indexTable : indexTables) {
-                if (indexTable.getTableId() == indexTableId) {
-                    return (short) indexTable.getSchemaId();
+                if (attempt == maxRetries - 1) {
+                    // Either not retryable or max attempts reached
+                    break;
+                }
+
+                LOG.warn(
+                        "Failed to retrieve index table information for data bucket {} on attempt {} (retryable error). "
+                                + "Index tables may still be creating. Retrying in {} ms. Error: {}",
+                        logTablet.getTableBucket(),
+                        attempt + 1,
+                        retryIntervalMs,
+                        e.getMessage());
+
+                try {
+                    Thread.sleep(retryIntervalMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new Exception(
+                            "Interrupted while waiting to retry index table retrieval", ie);
                 }
             }
-
-            LOG.warn(
-                    "Index table metadata not found for table ID: {}, using default schema ID",
-                    indexTableId);
-            return 1;
-        } catch (Exception e) {
-            LOG.warn(
-                    "Failed to get schema ID for index table ID: {}, using default schema ID",
-                    indexTableId,
-                    e);
-            return 1;
         }
-    }
 
-    private void maybeCleanupExpiredRecords() {
-        lock.writeLock().lock();
-        try {
-            if (closed) {
-                return;
-            }
+        // If we get here, all retries failed
+        String errorMsg =
+                String.format(
+                        "Failed to retrieve index table information for data bucket %s after %d attempts. "
+                                + "Index tables may not have been created yet or there is a configuration issue.",
+                        logTablet.getTableBucket(), maxRetries);
 
-            indexRowCache.cleanupBelowHorizon(lastIndexCommitHorizon);
-        } catch (IOException e) {
-            LOG.error("Error cleaning up expired records", e);
-        } finally {
-            lock.writeLock().unlock();
-        }
+        LOG.error(errorMsg, lastException);
+        throw new Exception(errorMsg, lastException);
     }
 
     // ================================================================================================
@@ -475,18 +662,12 @@ public final class IndexCache implements Closeable {
 
     /** IndexCache-specific fetch request structure. */
     public static final class IndexCacheFetchParam {
-        private final long indexTableId;
         private final long fetchOffset;
         private final long indexCommitOffset;
 
-        public IndexCacheFetchParam(long indexTableId, long fetchOffset, long indexCommitOffset) {
-            this.indexTableId = indexTableId;
+        public IndexCacheFetchParam(long fetchOffset, long indexCommitOffset) {
             this.fetchOffset = fetchOffset;
             this.indexCommitOffset = indexCommitOffset;
-        }
-
-        public long getIndexTableId() {
-            return indexTableId;
         }
 
         public long getFetchOffset() {

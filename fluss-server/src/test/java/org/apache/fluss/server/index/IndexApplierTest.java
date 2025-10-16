@@ -33,8 +33,6 @@ import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
-import org.apache.fluss.server.utils.FatalErrorHandler;
-import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
 import org.apache.fluss.testutils.DataTestUtils;
@@ -92,7 +90,6 @@ class IndexApplierTest {
     private LogTablet logTablet;
     private KvTablet kvTablet;
     private IndexApplier indexApplier;
-    private FatalErrorHandler fatalErrorHandler;
 
     private Schema indexSchema;
     private RowType indexRowType;
@@ -121,15 +118,17 @@ class IndexApplierTest {
         indexSchema = DATA1_SCHEMA_PK;
         indexRowType = indexSchema.getRowType();
 
-        // Create fatal error handler
-        fatalErrorHandler = NOPErrorHandler.INSTANCE;
-
         // Create LogTablet and KvTablet
         createLogTablet();
         createKvTablet();
 
         // Create IndexApplier with null DataLakeFormat (for testing)
-        indexApplier = new IndexApplier(kvTablet, logTablet, fatalErrorHandler, indexSchema);
+        indexApplier =
+                new IndexApplier(
+                        kvTablet,
+                        logTablet,
+                        indexSchema,
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
 
         // Setup test data buckets - these represent upstream data table buckets
         dataBucket1 = new TableBucket(DATA1_TABLE_ID, 0L, 0);
@@ -166,7 +165,8 @@ class IndexApplierTest {
         indexApplier.close();
 
         // Try to apply records after close
-        MemoryLogRecords records = createIndexMemoryLogRecords(DATA1.subList(0, 2));
+        MemoryLogRecords records =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 2), dataBucket1, 2L);
 
         long result = indexApplier.applyIndexRecords(records, 0L, 2L, dataBucket1);
 
@@ -181,16 +181,18 @@ class IndexApplierTest {
     @Test
     void testMultipleDataBucketsIndependentProgress() throws Exception {
         // Apply records for first data bucket
-        MemoryLogRecords records1 = createIndexMemoryLogRecords(DATA1.subList(0, 3));
+        MemoryLogRecords records1 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 3), dataBucket1, 3L);
         long applied1 = indexApplier.applyIndexRecords(records1, 0L, 3L, dataBucket1);
         assertThat(applied1).isEqualTo(3L);
 
         // Apply records for second data bucket
-        MemoryLogRecords records2 = createIndexMemoryLogRecords(DATA1.subList(3, 6));
+        MemoryLogRecords records2 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(3, 6), dataBucket2, 3L);
         long applied2 = indexApplier.applyIndexRecords(records2, 0L, 3L, dataBucket2);
         assertThat(applied2).isEqualTo(3L);
 
-        indexApplier.onUpdateHighWatermark(3);
+        updateHighWatermark(3);
 
         // Verify independent progress
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(3L);
@@ -203,54 +205,64 @@ class IndexApplierTest {
     @Test
     void testSequentialIndexApplication() throws Exception {
         // Apply the first batch of index records
-        MemoryLogRecords records1 = createIndexMemoryLogRecords(DATA1.subList(0, 2));
+        // Index records [0, 2) correspond to data bucket [0, 2)
+        MemoryLogRecords records1 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 2), dataBucket1, 2L);
         long applied1 = indexApplier.applyIndexRecords(records1, 0L, 2L, dataBucket1);
         assertThat(applied1).isEqualTo(2L);
 
         // Apply the second batch of index records (adjacent to the first batch)
-        MemoryLogRecords records2 = createIndexMemoryLogRecords(DATA1.subList(2, 4));
+        // Index records [2, 4) correspond to data bucket [2, 4)
+        MemoryLogRecords records2 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(2, 4), dataBucket1, 4L);
         long applied2 = indexApplier.applyIndexRecords(records2, 2L, 4L, dataBucket1);
         assertThat(applied2).isEqualTo(4L);
-        indexApplier.onUpdateHighWatermark(4);
+        updateHighWatermark(4);
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(4L);
 
         // Empty batch can be committed directly when no partial commit is pending
-        long applied3 = indexApplier.applyIndexRecords(MemoryLogRecords.EMPTY, 4L, 7L, dataBucket1);
+        MemoryLogRecords emptyRecords1 = createEmptyIndexMemoryLogRecordsWithState(dataBucket1, 7L);
+        long applied3 = indexApplier.applyIndexRecords(emptyRecords1, 4L, 7L, dataBucket1);
         assertThat(applied3).isEqualTo(7L);
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(7L);
 
         // Partial commit scenario
-        MemoryLogRecords records3 = createIndexMemoryLogRecords(DATA1.subList(4, 6));
+        MemoryLogRecords records3 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(4, 6), dataBucket1, 10L);
         long applied4 = indexApplier.applyIndexRecords(records3, 7L, 10L, dataBucket1);
         assertThat(applied4).isEqualTo(10L);
-        indexApplier.onUpdateHighWatermark(5L);
+        updateHighWatermark(6L);
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(9L);
 
         // Empty batch cannot be committed directly when partial commit is pending
-        long applied5 =
-                indexApplier.applyIndexRecords(MemoryLogRecords.EMPTY, 10L, 12L, dataBucket1);
+        MemoryLogRecords emptyRecords2 =
+                createEmptyIndexMemoryLogRecordsWithState(dataBucket1, 12L);
+        long applied5 = indexApplier.applyIndexRecords(emptyRecords2, 10L, 12L, dataBucket1);
         assertThat(applied5).isEqualTo(12L);
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(9L);
 
         // When high watermark is updated, all pending commits should be committed
-        indexApplier.onUpdateHighWatermark(6L);
+        updateHighWatermark(7L);
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(12L);
     }
 
     @Test
     void testGapDetectionInIndexApplication() throws Exception {
         // Apply initial batch [0, 3)
-        MemoryLogRecords records1 = createIndexMemoryLogRecords(DATA1.subList(0, 3));
+        MemoryLogRecords records1 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 3), dataBucket1, 3L);
         long applied1 = indexApplier.applyIndexRecords(records1, 0L, 3L, dataBucket1);
         assertThat(applied1).isEqualTo(3L);
 
         // Try to apply with gap [5, 8) - should be idempotent
-        MemoryLogRecords records2 = createIndexMemoryLogRecords(DATA1.subList(5, 8));
+        MemoryLogRecords records2 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(5, 8), dataBucket1, 8L);
         long applied2 = indexApplier.applyIndexRecords(records2, 5L, 8L, dataBucket1);
         assertThat(applied2).isEqualTo(3L); // Should return current applied offset due to gap
 
         // Apply correct next batch [3, 6) - should work
-        MemoryLogRecords records3 = createIndexMemoryLogRecords(DATA1.subList(3, 6));
+        MemoryLogRecords records3 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(3, 6), dataBucket1, 6L);
         long applied3 = indexApplier.applyIndexRecords(records3, 3L, 6L, dataBucket1);
         assertThat(applied3).isEqualTo(6L);
     }
@@ -262,7 +274,8 @@ class IndexApplierTest {
     @Test
     void testHighWatermarkUpdateWithSingleDataBucket() throws Exception {
         // Apply index records [0, 5)
-        MemoryLogRecords records = createIndexMemoryLogRecords(DATA1.subList(0, 5));
+        MemoryLogRecords records =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 5), dataBucket1, 5L);
 
         // Apply the records and get the index bucket offset range
         long applied = indexApplier.applyIndexRecords(records, 0L, 5L, dataBucket1);
@@ -274,21 +287,20 @@ class IndexApplierTest {
 
         // Test when high watermark is in the middle of applied range
         long hwInMiddle = indexStartOffset + 2;
-        indexApplier.onUpdateHighWatermark(hwInMiddle);
+        updateHighWatermark(hwInMiddle);
 
         // indexCommitDataOffset should be calculated as:
         // hwInMiddle - indexStartOffset + dataStartOffset = hwInMiddle - indexStartOffset + 0
-        long expectedCommitOffset = hwInMiddle - indexStartOffset + 0L;
+        long expectedCommitOffset = hwInMiddle - indexStartOffset;
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(expectedCommitOffset);
 
         // Test when high watermark covers all applied range
-        long hwFull = indexEndOffset;
-        indexApplier.onUpdateHighWatermark(hwFull);
+        updateHighWatermark(indexEndOffset);
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(5L); // dataEndOffset
 
         // Test when high watermark is beyond applied range
         long hwBeyond = indexEndOffset + 10;
-        indexApplier.onUpdateHighWatermark(hwBeyond);
+        updateHighWatermark(hwBeyond);
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1))
                 .isEqualTo(5L); // should stay same
     }
@@ -296,31 +308,34 @@ class IndexApplierTest {
     @Test
     void testHighWatermarkUpdateWithMultipleDataBuckets() throws Exception {
         // Apply records for first data bucket [0, 3)
-        MemoryLogRecords records1 = createIndexMemoryLogRecords(DATA1.subList(0, 3));
+        MemoryLogRecords records1 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 3), dataBucket1, 3L);
         indexApplier.applyIndexRecords(records1, 0L, 3L, dataBucket1);
 
         // Apply records for second data bucket [0, 4) - use DATA1 to match schema
-        MemoryLogRecords records2 = createIndexMemoryLogRecords(DATA1.subList(0, 4));
+        MemoryLogRecords records2 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 4), dataBucket2, 4L);
         indexApplier.applyIndexRecords(records2, 0L, 4L, dataBucket2);
 
         // Update high watermark to cover partially both ranges
         // First batch: index offsets [0, 3), Second batch: index offsets [3, 7)
         long hwPartial = 3L + 1; // Covers first fully (3 records), second partially (1 record)
-        indexApplier.onUpdateHighWatermark(hwPartial);
+        updateHighWatermark(hwPartial);
 
         // First data bucket should be fully committed
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(3L);
 
         // Second data bucket should be partially committed
         // hwPartial (4) - indexStartOffset of second bucket (3) + dataStartOffset (0) = 1
-        long expectedPartial = hwPartial - 3L + 0L;
+        long expectedPartial = hwPartial - 3L;
         assertThat(indexApplier.getIndexCommitOffset(dataBucket2)).isEqualTo(expectedPartial);
     }
 
     @Test
     void testHighWatermarkUpdateWhenClosed() throws Exception {
         // Apply some records first
-        MemoryLogRecords records = createIndexMemoryLogRecords(DATA1.subList(0, 2));
+        MemoryLogRecords records =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 2), dataBucket1, 2L);
         indexApplier.applyIndexRecords(records, 0L, 2L, dataBucket1);
         long commitOffsetBeforeClose = indexApplier.getIndexCommitOffset(dataBucket1);
 
@@ -328,7 +343,7 @@ class IndexApplierTest {
         indexApplier.close();
 
         // Try to update high watermark after close
-        indexApplier.onUpdateHighWatermark(100L);
+        updateHighWatermark(100L);
 
         // State should remain unchanged
         assertThat(indexApplier.getIndexCommitOffset(dataBucket1))
@@ -349,9 +364,12 @@ class IndexApplierTest {
             // Prepare different data buckets for concurrent application
             List<MemoryLogRecords> recordsList =
                     Arrays.asList(
-                            createIndexMemoryLogRecords(DATA1.subList(0, 2)),
-                            createIndexMemoryLogRecords(DATA1.subList(0, 2)),
-                            createIndexMemoryLogRecords(DATA1.subList(0, 2)));
+                            createIndexMemoryLogRecordsWithState(
+                                    DATA1.subList(0, 2), dataBucket1, 2L),
+                            createIndexMemoryLogRecordsWithState(
+                                    DATA1.subList(0, 2), dataBucket2, 2L),
+                            createIndexMemoryLogRecordsWithState(
+                                    DATA1.subList(0, 2), dataBucket3, 2L));
 
             List<TableBucket> dataBuckets = Arrays.asList(dataBucket1, dataBucket2, dataBucket3);
 
@@ -397,7 +415,7 @@ class IndexApplierTest {
                 assertThat(appliedOffset).isEqualTo(2L);
             }
 
-            indexApplier.onUpdateHighWatermark(1);
+            updateHighWatermark(1);
 
             int numIndexCommitOffsetIncreased = 0;
             for (TableBucket dataBucket : dataBuckets) {
@@ -414,7 +432,8 @@ class IndexApplierTest {
     @Test
     void testConcurrentHighWatermarkUpdates() throws Exception {
         // Apply some initial records
-        MemoryLogRecords records = createIndexMemoryLogRecords(DATA1.subList(0, 5));
+        MemoryLogRecords records =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 5), dataBucket1, 5L);
         LogAppendInfo appendInfo = logTablet.appendAsLeader(records);
         indexApplier.applyIndexRecords(records, 0L, 5L, dataBucket1);
 
@@ -430,7 +449,7 @@ class IndexApplierTest {
                         () -> {
                             try {
                                 startLatch.await();
-                                indexApplier.onUpdateHighWatermark(hw);
+                                updateHighWatermark(hw);
                             } catch (Exception e) {
                                 // Should not happen
                             } finally {
@@ -467,7 +486,8 @@ class IndexApplierTest {
                         try {
                             startLatch.await();
                             MemoryLogRecords records =
-                                    createIndexMemoryLogRecords(DATA1.subList(0, 3));
+                                    createIndexMemoryLogRecordsWithState(
+                                            DATA1.subList(0, 3), dataBucket1, 3L);
                             indexApplier.applyIndexRecords(records, 0L, 3L, dataBucket1);
                         } catch (Exception e) {
                             synchronized (exceptions) {
@@ -484,7 +504,8 @@ class IndexApplierTest {
                         try {
                             startLatch.await();
                             MemoryLogRecords records =
-                                    createIndexMemoryLogRecords(DATA1.subList(3, 6));
+                                    createIndexMemoryLogRecordsWithState(
+                                            DATA1.subList(3, 6), dataBucket2, 3L);
                             indexApplier.applyIndexRecords(records, 0L, 3L, dataBucket2);
                         } catch (Exception e) {
                             synchronized (exceptions) {
@@ -520,7 +541,7 @@ class IndexApplierTest {
                         try {
                             startLatch.await();
                             for (int i = 0; i < 50; i++) {
-                                indexApplier.onUpdateHighWatermark(i);
+                                updateHighWatermark(i);
                                 Thread.sleep(2);
                             }
                         } catch (Exception e) {
@@ -549,8 +570,9 @@ class IndexApplierTest {
     // ================================================================================================
 
     @Test
-    void testInvalidOffsetRangeValidation() throws Exception {
-        MemoryLogRecords records = createIndexMemoryLogRecords(DATA1.subList(0, 2));
+    void testInvalidOffsetRangeValidation() {
+        MemoryLogRecords records =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 2), dataBucket1, 2L);
 
         // Test invalid offset range
         assertThatThrownBy(() -> indexApplier.applyIndexRecords(records, 10L, 5L, dataBucket1))
@@ -560,8 +582,8 @@ class IndexApplierTest {
 
     @Test
     void testEmptyIndexRecordsApplication() throws Exception {
-        // Create empty records
-        MemoryLogRecords emptyRecords = MemoryLogRecords.EMPTY;
+        // Create empty records with state
+        MemoryLogRecords emptyRecords = createEmptyIndexMemoryLogRecordsWithState(dataBucket1, 1L);
 
         // Apply empty records
         long applied = indexApplier.applyIndexRecords(emptyRecords, 0L, 1L, dataBucket1);
@@ -571,13 +593,14 @@ class IndexApplierTest {
     }
 
     @Test
-    void testNullParameterHandling() throws Exception {
+    void testNullParameterHandling() {
         // Test null records
         assertThatThrownBy(() -> indexApplier.applyIndexRecords(null, 0L, 1L, dataBucket1))
                 .isInstanceOf(NullPointerException.class);
 
         // Test null data bucket
-        MemoryLogRecords records = createIndexMemoryLogRecords(DATA1.subList(0, 1));
+        MemoryLogRecords records =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 1), dataBucket1, 1L);
 
         assertThatThrownBy(() -> indexApplier.applyIndexRecords(records, 0L, 1L, null))
                 .isInstanceOf(NullPointerException.class);
@@ -602,8 +625,8 @@ class IndexApplierTest {
 
         // Test toString
         String statusString = status.toString();
-        assertThat(statusString).contains("[0,5)");
-        assertThat(statusString).contains("[100,105)");
+        assertThat(statusString).contains("[,5)");
+        assertThat(statusString).contains("[,105)");
         assertThat(statusString).contains("indexCommitDataOffset=5");
     }
 
@@ -665,7 +688,16 @@ class IndexApplierTest {
                         null); // IndexCache is not needed for this test
     }
 
-    private MemoryLogRecords createIndexMemoryLogRecords(List<Object[]> data) {
+    /**
+     * Creates index MemoryLogRecords with stateChangeLogs for proper state persistence. This
+     * simulates the behavior of IndexCache which adds stateChangeLogs when serving fetchIndex.
+     *
+     * @param data the data rows
+     * @param dataBucket the data bucket these index records correspond to
+     * @param dataEndOffset the end offset in the data bucket
+     */
+    private MemoryLogRecords createIndexMemoryLogRecordsWithState(
+            List<Object[]> data, TableBucket dataBucket, long dataEndOffset) {
         try {
             // Convert Object[] to IndexedRow for INDEXED log format
             List<IndexedRow> indexedRows = new ArrayList<>();
@@ -673,9 +705,34 @@ class IndexApplierTest {
                 indexedRows.add(DataTestUtils.indexedRow(indexRowType, row));
             }
 
-            return DataTestUtils.genIndexedMemoryLogRecords(indexedRows);
+            return DataTestUtils.genIndexedMemoryLogRecordsWithState(
+                    indexedRows, dataBucket, dataEndOffset);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to create index memory log records", e);
+            throw new RuntimeException("Failed to create index memory log records with state", e);
         }
+    }
+
+    /**
+     * Creates empty MemoryLogRecords with only stateChangeLogs for testing empty index segments.
+     * This simulates the behavior of IndexCache when there are no index records but state still
+     * needs to be tracked.
+     *
+     * @param dataBucket the data bucket these empty records correspond to
+     * @param dataEndOffset the end offset in the data bucket
+     */
+    private MemoryLogRecords createEmptyIndexMemoryLogRecordsWithState(
+            TableBucket dataBucket, long dataEndOffset) {
+        try {
+            return DataTestUtils.genIndexedMemoryLogRecordsWithState(
+                    new ArrayList<>(), dataBucket, dataEndOffset);
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to create empty index memory log records with state", e);
+        }
+    }
+
+    private void updateHighWatermark(long highWatermark) {
+        logTablet.updateHighWatermark(highWatermark);
+        indexApplier.onUpdateHighWatermark(highWatermark);
     }
 }

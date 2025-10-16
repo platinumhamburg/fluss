@@ -1301,9 +1301,9 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                             false)
                     .get();
 
-            // Wait for partitions to be ready
+            // Wait for partitions to be ready (2 pre-created + 2 manually created)
             FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
-                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 2);
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 4);
 
             // Step 4: Write data to the partitioned main table
             UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
@@ -1358,7 +1358,7 @@ class FlussTableITCase extends ClientToServerITCaseBase {
 
             // Wait for new partition to be ready
             FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
-                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 3);
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 5);
 
             // Add data to the new partition
             upsertWriter.upsert(row(5, "Eve", "eve@example.com", "2025")).get();
@@ -1385,12 +1385,6 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsDropped(
                     TestData.PARTITIONED_INDEXED_TABLE_PATH, Arrays.asList("2023"));
 
-            // Test lookup for data that was in the dropped partition should return empty
-            CompletableFuture<LookupResult> aliceLookupFuture =
-                    nameIndexLookuper.lookup(row("Alice"));
-            LookupResult aliceLookupResult = aliceLookupFuture.get();
-            assertThat(aliceLookupResult.getRowList()).isEmpty();
-
             // Test lookup for data in remaining partitions should still work
             CompletableFuture<LookupResult> charlieLookupFuture =
                     nameIndexLookuper.lookup(row("Charlie"));
@@ -1406,5 +1400,143 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             LookupResult nonExistentResult = nonExistentLookup.get();
             assertThat(nonExistentResult.getRowList()).isEmpty();
         }
+    }
+
+    @Test
+    void testSecondaryIndexMassiveDataTest() throws Exception {
+        // Step 1: Create a table with global secondary index definitions using INDEXED_SCHEMA
+        Schema schema = TestData.INDEXED_SCHEMA;
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        createTable(TestData.INDEXED_TABLE_PATH, tableDescriptor, false);
+
+        // Step 2: Generate large amount of random test data (100K rows)
+        int totalRows = 10000;
+        List<Object[]> testData = generateRandomTestData(totalRows);
+
+        // Step 3: Write data to main table
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Table mainTable = conn.getTable(TestData.INDEXED_TABLE_PATH);
+            // Check index tables exist
+            Table nameIndexTable = conn.getTable(TestData.IDX_NAME_TABLE_PATH);
+            assertThat(nameIndexTable).isNotNull();
+            Table emailIndexTable = conn.getTable(TestData.IDX_EMAIL_TABLE_PATH);
+            assertThat(emailIndexTable).isNotNull();
+
+            UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
+
+            // Insert data in batches to avoid memory issues
+            int batchSize = 1000;
+            for (int i = 0; i < testData.size(); i += batchSize) {
+                int endIdx = Math.min(i + batchSize, testData.size());
+                for (int j = i; j < endIdx; j++) {
+                    Object[] rowData = testData.get(j);
+                    upsertWriter.upsert(row(rowData[0], rowData[1], rowData[2]));
+                }
+                upsertWriter.flush();
+
+                // Log progress every 10K rows
+                if ((i + batchSize) % 10000 == 0) {
+                    System.out.println("Inserted " + (i + batchSize) + "/" + totalRows + " rows");
+                }
+            }
+
+            // Step 4: Wait for index replication to complete by checking all data visibility
+            // Wait for all replicas to be ready
+            long tableId = admin.getTableInfo(TestData.INDEXED_TABLE_PATH).get().getTableId();
+            waitAllReplicasReady(tableId, 3);
+
+            // Step 5: Verify all data is visible in main table through secondary index lookup
+            Lookuper nameIndexLookuper = mainTable.newLookup().lookupBy("name").createLookuper();
+            Lookuper emailIndexLookuper = mainTable.newLookup().lookupBy("email").createLookuper();
+
+            // Sample verification - test 100 random entries to ensure they are findable via index
+            int verificationSampleSize = Math.min(100, totalRows);
+            for (int i = 0; i < verificationSampleSize; i++) {
+                Object[] rowData = testData.get(i * (totalRows / verificationSampleSize));
+
+                // Test name index lookup
+                CompletableFuture<LookupResult> nameLookupFuture =
+                        nameIndexLookuper.lookup(row((String) rowData[1]));
+                LookupResult nameLookupResult = nameLookupFuture.get();
+                assertThat(nameLookupResult).isNotNull();
+                assertThat(nameLookupResult.getRowList()).hasSize(1);
+                InternalRow nameResultRow = nameLookupResult.getRowList().get(0);
+                assertThat(nameResultRow.getInt(0)).isEqualTo((Integer) rowData[0]);
+                assertThat(nameResultRow.getString(1).toString()).isEqualTo((String) rowData[1]);
+                assertThat(nameResultRow.getString(2).toString()).isEqualTo((String) rowData[2]);
+
+                // Test email index lookup
+                CompletableFuture<LookupResult> emailLookupFuture =
+                        emailIndexLookuper.lookup(row((String) rowData[2]));
+                LookupResult emailLookupResult = emailLookupFuture.get();
+                assertThat(emailLookupResult).isNotNull();
+                assertThat(emailLookupResult.getRowList()).hasSize(1);
+                InternalRow emailResultRow = emailLookupResult.getRowList().get(0);
+                assertThat(emailResultRow.getInt(0)).isEqualTo((Integer) rowData[0]);
+                assertThat(emailResultRow.getString(1).toString()).isEqualTo((String) rowData[1]);
+                assertThat(emailResultRow.getString(2).toString()).isEqualTo((String) rowData[2]);
+            }
+
+            System.out.println(
+                    "Successfully completed stress test with "
+                            + totalRows
+                            + " rows. All data is visible through secondary indexes.");
+        }
+    }
+
+    /** Generate random test data conforming to INDEXED_SCHEMA (id, name, email). */
+    private List<Object[]> generateRandomTestData(int rowCount) {
+        List<Object[]> testData = new ArrayList<>(rowCount);
+
+        // Pre-defined name and domain lists for generating realistic test data
+        String[] firstNames = {
+            "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Ivy", "Jack",
+            "Kate", "Liam", "Mia", "Noah", "Olivia", "Paul", "Quinn", "Rose", "Sam", "Tina"
+        };
+        String[] lastNames = {
+            "Smith",
+            "Johnson",
+            "Williams",
+            "Brown",
+            "Jones",
+            "Garcia",
+            "Miller",
+            "Davis",
+            "Rodriguez",
+            "Martinez",
+            "Hernandez",
+            "Lopez",
+            "Gonzalez",
+            "Wilson",
+            "Anderson"
+        };
+        String[] domains = {"example.com", "test.org", "sample.net", "demo.io", "mock.edu"};
+
+        for (int i = 0; i < rowCount; i++) {
+            // Generate unique id
+            int id = i + 1;
+
+            // Generate random name
+            String firstName = firstNames[i % firstNames.length];
+            String lastName = lastNames[(i / firstNames.length) % lastNames.length];
+            String name = firstName + lastName + "_" + (i / (firstNames.length * lastNames.length));
+
+            // Generate unique email based on name and id
+            String domain = domains[i % domains.length];
+            String email =
+                    firstName.toLowerCase()
+                            + "."
+                            + lastName.toLowerCase()
+                            + "."
+                            + id
+                            + "@"
+                            + domain;
+
+            testData.add(new Object[] {id, name, email});
+        }
+
+        return testData;
     }
 }

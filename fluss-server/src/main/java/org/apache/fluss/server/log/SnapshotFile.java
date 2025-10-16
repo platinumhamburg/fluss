@@ -58,6 +58,10 @@ public class SnapshotFile {
         return file;
     }
 
+    public long offset() {
+        return offset;
+    }
+
     @Override
     public String toString() {
         return "SnapshotFile(" + "offset=" + offset + ", file=" + file + ')';

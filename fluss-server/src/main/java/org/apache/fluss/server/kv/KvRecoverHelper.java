@@ -33,6 +33,7 @@ import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
+import org.apache.fluss.row.encode.TsValueEncoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.server.log.FetchIsolation;
@@ -164,7 +165,16 @@ public class KvRecoverHelper {
                                 // the log row format may not compatible with kv row format,
                                 // e.g, arrow vs. compacted, thus needs a conversion here.
                                 BinaryRow row = toKvRow(logRecord.getRow());
-                                value = ValueEncoder.encodeValue(schemaId, row);
+                                // Index tables always use TsValueEncoder to support TTL-based
+                                // compaction in RocksDB
+                                if (kvTablet.shouldUseTsEncoding()) {
+                                    // For index table, encode with timestamp from LogRecord
+                                    value =
+                                            TsValueEncoder.encodeValue(
+                                                    logRecord.timestamp(), schemaId, row);
+                                } else {
+                                    value = ValueEncoder.encodeValue(schemaId, row);
+                                }
                             }
                             resumeRecordConsumer.accept(
                                     new KeyValueAndLogOffset(key, value, logRecord.logOffset()));

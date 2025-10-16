@@ -20,29 +20,31 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.StateDefs;
 import org.apache.fluss.row.encode.KeyEncoder;
+import org.apache.fluss.row.encode.TsValueEncoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
-import org.apache.fluss.server.utils.FatalErrorHandler;
+import org.apache.fluss.server.log.state.BucketStateManager;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Maps;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
-import org.apache.fluss.utils.MapUtils;
 
 import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.io.Closeable;
@@ -87,25 +89,25 @@ public final class IndexApplier implements Closeable {
 
     private final KvTablet kvTablet;
     private final LogTablet logTablet;
-    private final FatalErrorHandler fatalErrorHandler;
     private final RowType indexRowType;
     private final KeyEncoder indexKeyEncoder;
+    private final TabletServerMetricGroup serverMetricGroup;
 
     // Lock for protecting internal state
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    // Internal state management - IndexApplyStatus for each data bucket
-    // Key: TableBucket (upstream data bucket), Value: IndexApplyStatus (tracking apply progress)
-    // IndexApplyStatus encapsulates all necessary state information including:
-    // - last applied log records range in both data and index bucket address spaces
-    // - index commit offset for reporting progress to upstream data buckets
-    @GuardedBy("lock")
-    private final Map<TableBucket, IndexApplyStatus> dataBucketStatusMap =
-            MapUtils.newConcurrentHashMap();
-
+    // Track uncommitted applies for indexCommitDataOffset calculation
+    // This map records the mapping between index bucket offsets and data bucket offsets
+    // for each apply operation, enabling partial commit calculation
     @GuardedBy("lock")
     private final Map<TableBucket, List<IndexApplyParams>> uncommittedApplyMap =
             Maps.newConcurrentMap();
+
+    // Cache for indexCommitDataOffset calculated from uncommittedApplyMap and highwatermark
+    // This is a computed view and does not need persistence - it can be reconstructed
+    // after failover by replaying highwatermark updates
+    @GuardedBy("lock")
+    private final Map<TableBucket, Long> indexCommitDataOffsetMap = Maps.newConcurrentMap();
 
     @GuardedBy("lock")
     private volatile boolean closed = false;
@@ -115,19 +117,19 @@ public final class IndexApplier implements Closeable {
      *
      * @param kvTablet the KV tablet for index data storage
      * @param logTablet the log tablet for WAL operations
-     * @param fatalErrorHandler the fatal error handler
      * @param indexTableSchema the schema of the index table
+     * @param serverMetricGroup the server metric group for metrics recording
      */
     public IndexApplier(
             KvTablet kvTablet,
             LogTablet logTablet,
-            FatalErrorHandler fatalErrorHandler,
-            Schema indexTableSchema) {
+            Schema indexTableSchema,
+            TabletServerMetricGroup serverMetricGroup) {
         this.kvTablet = checkNotNull(kvTablet, "kvTablet cannot be null");
         this.logTablet = checkNotNull(logTablet, "logTablet cannot be null");
-        this.fatalErrorHandler =
-                checkNotNull(fatalErrorHandler, "fatalErrorHandler cannot be null");
         checkNotNull(indexTableSchema, "indexTableSchema cannot be null");
+        this.serverMetricGroup =
+                checkNotNull(serverMetricGroup, "serverMetricGroup cannot be null");
 
         // Extract RowType from Schema
         this.indexRowType = indexTableSchema.getRowType();
@@ -157,13 +159,27 @@ public final class IndexApplier implements Closeable {
         checkNotNull(records, "records cannot be null");
         checkNotNull(dataBucket, "dataBucket cannot be null");
 
-        LOG.info(
-                "indexBucket {} applying index records from range [{}, {}) of data bucket {}, {} bytes of index data",
-                kvTablet.getTableBucket(),
-                startOffset,
-                endOffset,
-                dataBucket,
-                records.sizeInBytes());
+        // Debug: Check timestamp in received records
+        if (LOG.isDebugEnabled()) {
+            for (LogRecordBatch batch : records.batches()) {
+                LOG.debug(
+                        "IndexApplier received batch with commitTimestamp={}, records={}, magic={}, schemaId={}",
+                        batch.commitTimestamp(),
+                        batch.getRecordCount(),
+                        batch.magic(),
+                        batch.schemaId());
+            }
+        }
+
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "indexBucket {} applying index records from range [{}, {}) of data bucket {}, {} bytes of index data",
+                    kvTablet.getTableBucket(),
+                    startOffset,
+                    endOffset,
+                    dataBucket,
+                    records.sizeInBytes());
+        }
 
         if (startOffset > endOffset) {
             throw new IllegalArgumentException(
@@ -183,14 +199,14 @@ public final class IndexApplier implements Closeable {
                 lock,
                 () -> {
                     try {
-                        return doApplyIndexRecords(records, startOffset, endOffset, dataBucket);
+                        return applyIndexRecordsInternal(
+                                records, startOffset, endOffset, dataBucket);
                     } catch (Exception e) {
                         LOG.error(
                                 "Failed to apply index records from range [{}, {})",
                                 startOffset,
                                 endOffset,
                                 e);
-                        fatalErrorHandler.onFatalError(e);
                         throw e;
                     }
                 });
@@ -207,37 +223,43 @@ public final class IndexApplier implements Closeable {
         return getOrInitIndexApplyStatus(dataBucket).getIndexCommitDataOffset();
     }
 
-    private IndexApplyStatus getOrCreateIndexApplyStatusNoLocked(TableBucket dataBucket) {
-        IndexApplyStatus status = dataBucketStatusMap.get(dataBucket);
-        if (status != null) {
-            return status;
-        }
-        status = new IndexApplyStatus(0, 0, 0);
-        dataBucketStatusMap.put(dataBucket, status);
-        return status;
-    }
-
-    public IndexApplyStatus getOrInitIndexApplyStatusLocked(TableBucket dataBucket) {
-        return inWriteLock(lock, () -> getOrCreateIndexApplyStatusNoLocked(dataBucket));
-    }
-
     /**
-     * Get the IndexApplyStatus for the specified data bucket. This contains complete state
-     * information including fetch offsets and commit offsets.
+     * Get the IndexApplyStatus for the specified data bucket.
+     *
+     * <p>This method combines persisted state (lastApplyDataOffset from StateBucketManager) with
+     * computed state (indexCommitDataOffset from in-memory calculation based on uncommittedApplyMap
+     * and highwatermark).
      *
      * @param dataBucket the data table bucket
-     * @return the IndexApplyStatus, or null if no previous apply status exists for this data bucket
+     * @return the IndexApplyStatus with current state
      */
-    private @Nullable IndexApplyStatus getIndexApplyStatusLocked(TableBucket dataBucket) {
-        return inReadLock(lock, () -> dataBucketStatusMap.get(dataBucket));
-    }
-
     public IndexApplyStatus getOrInitIndexApplyStatus(TableBucket dataBucket) {
-        IndexApplyStatus status = getIndexApplyStatusLocked(dataBucket);
-        if (null == status) {
-            return getOrInitIndexApplyStatusLocked(dataBucket);
-        }
-        return status;
+        return inReadLock(
+                lock,
+                () -> {
+                    // Read uncommitted state (latest progress) from StateBucketManager
+                    // This is persisted and survives failover
+                    BucketStateManager.StateValueWithOffset uncommittedStateValue =
+                            logTablet.getStateWithOffset(
+                                    StateDefs.DATA_BUCKET_OFFSET_OF_INDEX, dataBucket, false);
+
+                    long lastApplyDataOffset =
+                            (uncommittedStateValue != null)
+                                    ? (Long) uncommittedStateValue.getValue()
+                                    : 0L;
+
+                    // lastApplyRecordsIndexEndOffset is always the current logEndOffset
+                    long lastApplyIndexOffset = logTablet.localLogEndOffset();
+
+                    // indexCommitDataOffset is computed from uncommittedApplyMap and highwatermark
+                    // It does not need persistence - after failover, it will be recalculated
+                    // when onUpdateHighWatermark is called
+                    long indexCommitDataOffset =
+                            indexCommitDataOffsetMap.getOrDefault(dataBucket, 0L);
+
+                    return new IndexApplyStatus(
+                            lastApplyDataOffset, lastApplyIndexOffset, indexCommitDataOffset);
+                });
     }
 
     /**
@@ -260,8 +282,7 @@ public final class IndexApplier implements Closeable {
                             uncommittedApplyMap.entrySet()) {
                         TableBucket dataBucket = entry.getKey();
                         List<IndexApplyParams> uncommittedApplies = entry.getValue();
-                        IndexApplyStatus currentStatus =
-                                getOrCreateIndexApplyStatusNoLocked(dataBucket);
+                        IndexApplyStatus currentStatus = getOrInitIndexApplyStatus(dataBucket);
                         long currentBucketIndexCommitOffset =
                                 currentStatus.getIndexCommitDataOffset();
                         while (!uncommittedApplies.isEmpty()) {
@@ -286,17 +307,14 @@ public final class IndexApplier implements Closeable {
                             }
                             break;
                         }
-                        dataBucketStatusMap.put(
-                                dataBucket,
-                                new IndexApplyStatus(
-                                        currentStatus.getLastApplyRecordsDataEndOffset(),
-                                        currentStatus.getLastApplyRecordsIndexEndOffset(),
-                                        currentBucketIndexCommitOffset));
-                        LOG.debug(
-                                "Updated indexCommitDataOffset for data bucket {}: hw={}, newIndexCommitDataOffset={}",
-                                dataBucket,
-                                highWatermark,
-                                currentBucketIndexCommitOffset);
+                        indexCommitDataOffsetMap.put(dataBucket, currentBucketIndexCommitOffset);
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug(
+                                    "Updated indexCommitDataOffset for data bucket {}: hw={}, newIndexCommitDataOffset={}",
+                                    dataBucket,
+                                    highWatermark,
+                                    currentBucketIndexCommitOffset);
+                        }
                     }
                 });
     }
@@ -365,13 +383,13 @@ public final class IndexApplier implements Closeable {
         }
     }
 
-    private long doApplyIndexRecords(
+    private long applyIndexRecordsInternal(
             MemoryLogRecords records, long startOffset, long endOffset, TableBucket dataBucket)
             throws Exception {
         TableBucket indexBucket = kvTablet.getTableBucket();
 
-        // Get current status for this data bucket
-        IndexApplyStatus currentStatus = getOrCreateIndexApplyStatusNoLocked(dataBucket);
+        // Get current status for this data bucket from StateBucketManager
+        IndexApplyStatus currentStatus = getOrInitIndexApplyStatus(dataBucket);
 
         // Check if the segment is adjacent to the last applied records
         if (startOffset != currentStatus.getLastApplyRecordsDataEndOffset()) {
@@ -384,50 +402,95 @@ public final class IndexApplier implements Closeable {
         }
 
         boolean isRecordsEmpty = isRecordsEmpty(records);
+
+        // Extract timestamps BEFORE appending to log tablet, as the commitTimestamp
+        // in LogRecordBatch will be overwritten to the write time by LogTablet
+        List<Long> originalTimestamps = null;
+        if (!isRecordsEmpty) {
+            originalTimestamps = extractTimestampsFromRecords(records);
+        }
+
+        // Append records to log tablet
+        // State changes in records (generated by IndexCache) will be automatically
+        // applied to StateBucketManager by LogTablet
+        LogAppendInfo appendInfo = logTablet.appendAsLeader(records);
+
         List<IndexApplyParams> uncommittedApplies =
                 uncommittedApplyMap.computeIfAbsent(dataBucket, tb -> new ArrayList<>());
+
         if (!isRecordsEmpty) {
-            LogAppendInfo appendInfo = logTablet.appendAsLeader(records);
-            processIndexRecordsToPreWriteBuffer(records, appendInfo);
+            // Write index records to KV pre-write buffer with original timestamps
+            writeIndexRecordsToPreWriteBuffer(records, appendInfo, originalTimestamps);
             long indexBucketStartOffset = appendInfo.firstOffset();
             long indexBucketEndOffset = appendInfo.lastOffset() + 1;
             uncommittedApplies.add(
                     new IndexApplyParams(
                             endOffset, indexBucketStartOffset, indexBucketEndOffset, false));
-            dataBucketStatusMap.put(
-                    dataBucket,
-                    new IndexApplyStatus(
-                            endOffset,
-                            indexBucketEndOffset,
-                            currentStatus.getIndexCommitDataOffset()));
-            LOG.info(
-                    "Applied index records from data range [{}, {}) to index bucket {}, "
-                            + "index bucket range: [{}:{}), currentIndexCommitDataOffset={}",
-                    startOffset,
-                    endOffset,
-                    indexBucket,
-                    indexBucketStartOffset,
-                    indexBucketEndOffset,
-                    currentStatus.getIndexCommitDataOffset());
-        } else if (!uncommittedApplies.isEmpty()) {
-            uncommittedApplies.add(
-                    new IndexApplyParams(
-                            endOffset,
-                            logTablet.localLogEndOffset(),
-                            logTablet.localLogEndOffset(),
-                            true));
-            dataBucketStatusMap.put(
-                    dataBucket,
-                    new IndexApplyStatus(
-                            endOffset,
-                            logTablet.localLogEndOffset(),
-                            currentStatus.getIndexCommitDataOffset()));
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Applied index records from data range [{}, {}) to index bucket {}, "
+                                + "index bucket range: [{}:{})",
+                        startOffset,
+                        endOffset,
+                        indexBucket,
+                        indexBucketStartOffset,
+                        indexBucketEndOffset);
+            }
         } else {
-            dataBucketStatusMap.put(
-                    dataBucket,
-                    new IndexApplyStatus(endOffset, logTablet.localLogEndOffset(), endOffset));
+            // For empty records with stateChangeLogs (generated by IndexCache)
+            long indexBucketStartOffset = appendInfo.firstOffset();
+            long indexBucketEndOffset = appendInfo.lastOffset();
+            if (!uncommittedApplies.isEmpty()) {
+                // If there are pending uncommitted applies, add this empty record to the queue
+                uncommittedApplies.add(
+                        new IndexApplyParams(
+                                endOffset, indexBucketEndOffset, indexBucketEndOffset, true));
+            } else {
+                // If no pending applies, empty records can be committed directly
+                indexCommitDataOffsetMap.put(dataBucket, endOffset);
+            }
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Applied empty index records from data range [{}, {}) to index bucket {}, "
+                                + "index bucket offset range: [{}:{})",
+                        startOffset,
+                        endOffset,
+                        indexBucket,
+                        indexBucketStartOffset,
+                        indexBucketEndOffset);
+            }
         }
         return endOffset;
+    }
+
+    /**
+     * Extract timestamps from all records in the MemoryLogRecords BEFORE writing to LogTablet. This
+     * is necessary because LogTablet will overwrite the batch's commitTimestamp.
+     *
+     * @param records the index records
+     * @return list of original timestamps for each record
+     */
+    private List<Long> extractTimestampsFromRecords(MemoryLogRecords records) {
+        List<Long> timestamps = new ArrayList<>();
+        LogRecordReadContext readContext =
+                LogRecordReadContext.createIndexedReadContext(indexRowType, 1);
+
+        for (LogRecordBatch batch : records.batches()) {
+            try (CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
+                while (recordIterator.hasNext()) {
+                    LogRecord record = recordIterator.next();
+                    timestamps.add(record.timestamp());
+                }
+            }
+        }
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Extracted {} timestamps from records", timestamps.size());
+        }
+
+        return timestamps;
     }
 
     /**
@@ -436,55 +499,126 @@ public final class IndexApplier implements Closeable {
      *
      * @param records the index records to process
      * @param appendInfo the log append info containing allocated index bucket offsets
-     * @throws Exception if processing fails
+     * @param originalTimestamps the original timestamps extracted before log append
      */
-    private void processIndexRecordsToPreWriteBuffer(
-            MemoryLogRecords records, LogAppendInfo appendInfo) throws Exception {
+    private void writeIndexRecordsToPreWriteBuffer(
+            MemoryLogRecords records, LogAppendInfo appendInfo, List<Long> originalTimestamps) {
         long currentIndexOffset = appendInfo.firstOffset();
+        int totalRecordCount = 0;
+        int timestampIndex = 0;
 
         // Create read context for processing index records
         LogRecordReadContext readContext =
                 LogRecordReadContext.createIndexedReadContext(indexRowType, 1);
 
         for (LogRecordBatch batch : records.batches()) {
+
             try (CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
                 while (recordIterator.hasNext()) {
                     LogRecord record = recordIterator.next();
 
                     // Process the index record and apply to KvPreWriteBuffer
                     // Use the sequentially allocated index bucket offset
-                    processIndexRecordToPreWriteBuffer(
-                            batch.schemaId(), record, currentIndexOffset);
+                    // Use original timestamp from extracted list instead of record.timestamp()
+                    // which was overwritten by LogTablet
+                    long originalTimestamp = originalTimestamps.get(timestampIndex);
+                    writeIndexRecordToPreWriteBuffer(
+                            batch.schemaId(), record, currentIndexOffset, originalTimestamp);
                     currentIndexOffset++;
+                    totalRecordCount++;
+                    timestampIndex++;
                 }
             }
+        }
+
+        // Record the batch size metric
+        serverMetricGroup.indexApplyBatchSizeHistogram().update(totalRecordCount);
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Processed {} index records in batch for index bucket {}",
+                    totalRecordCount,
+                    kvTablet.getTableBucket());
         }
     }
 
     /**
      * Process a single index record and apply it to the KV pre-write buffer.
      *
+     * <p>This method handles different changeTypes correctly:
+     *
+     * <ul>
+     *   <li>INSERT / UPDATE_AFTER: PUT operation to insert or update the index entry
+     *   <li>UPDATE_BEFORE: DELETE operation to remove the old index entry (before key change)
+     *   <li>DELETE: DELETE operation to remove the index entry
+     * </ul>
+     *
+     * @param schemaId the schema ID
      * @param record the index record to process
      * @param indexLogOffset the allocated log offset in index bucket address space
-     * @throws Exception if processing fails
+     * @param originalTimestamp the original timestamp extracted before log append
      */
-    private void processIndexRecordToPreWriteBuffer(
-            short schemaId, LogRecord record, long indexLogOffset) throws Exception {
-        // Extract key and value from the index record
+    private void writeIndexRecordToPreWriteBuffer(
+            short schemaId, LogRecord record, long indexLogOffset, long originalTimestamp) {
+        // Extract changeType and row from the index record
+        ChangeType changeType = record.getChangeType();
         IndexedRow indexedRow = (IndexedRow) record.getRow();
+
         // For index table, the key should be: [index columns] + [primary key columns]
         byte[] key = indexKeyEncoder.encodeKey(indexedRow);
-        // For index table, the value is the complete IndexedRow
-        byte[] valueBytes = ValueEncoder.encodeValue(schemaId, indexedRow);
-        // Apply to KV pre-write buffer using the allocated index bucket offset
-        // This leverages the fact that index records contain UB records and can be directly applied
-        kvTablet.putToPreWriteBuffer(key, valueBytes, indexLogOffset);
 
-        LOG.debug(
-                "Index record applied to pre-write buffer: indexLogOffset={}, keySize={}, valueSize={}",
-                indexLogOffset,
-                key.length,
-                valueBytes.length);
+        // Handle different changeTypes with appropriate operations
+        switch (changeType) {
+            case APPEND_ONLY:
+            case INSERT:
+            case UPDATE_AFTER:
+                // For APPEND_ONLY, INSERT and UPDATE_AFTER, we need to PUT the index entry
+                byte[] valueBytes;
+                if (kvTablet.shouldUseTsEncoding()) {
+                    // Value format with timestamp: [timestamp(8)][schemaId(2)][row bytes]
+                    // Use the original timestamp extracted before LogTablet append
+                    // record.timestamp() is no longer valid as it was overwritten by LogTablet
+                    valueBytes =
+                            TsValueEncoder.encodeValue(originalTimestamp, schemaId, indexedRow);
+                } else {
+                    // Normal value format: [schemaId(2)][row bytes]
+                    valueBytes = ValueEncoder.encodeValue(schemaId, indexedRow);
+                }
+                kvTablet.putToPreWriteBufferSafety(key, valueBytes, indexLogOffset);
+
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Index entry PUT to pre-write buffer: changeType={}, indexLogOffset={}, keySize={}, valueSize={}, timestamp={}",
+                            changeType,
+                            indexLogOffset,
+                            key.length,
+                            valueBytes.length,
+                            originalTimestamp);
+                }
+                break;
+
+            case UPDATE_BEFORE:
+            case DELETE:
+                // For UPDATE_BEFORE and DELETE, we need to DELETE the index entry
+                // Passing null as value indicates deletion
+                kvTablet.putToPreWriteBufferSafety(key, null, indexLogOffset);
+
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Index entry DELETE from pre-write buffer: changeType={}, indexLogOffset={}, keySize={}",
+                            changeType,
+                            indexLogOffset,
+                            key.length);
+                }
+                break;
+
+            default:
+                throw new UnsupportedOperationException(
+                        "Unsupported changeType: "
+                                + changeType
+                                + " at index log offset: "
+                                + indexLogOffset);
+        }
     }
 
     // ================================================================================================

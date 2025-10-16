@@ -34,9 +34,20 @@ import org.apache.fluss.record.MemoryLogRecords;
 @Internal
 public final class IndexSegment {
 
+    /** Status of the data in this segment. */
+    public enum DataStatus {
+        /** Data is loaded and available in the segment (may be empty but range is loaded). */
+        LOADED,
+        /** The range has no index data (normal empty). */
+        EMPTY,
+        /** Data not yet loaded from WAL (needs cold loading). */
+        NOT_READY
+    }
+
     private final long startOffset;
     private final long endOffset;
     private final LogRecords records;
+    private final DataStatus status;
 
     /**
      * Creates a new IndexSegment.
@@ -44,8 +55,9 @@ public final class IndexSegment {
      * @param startOffset the start offset of the WAL address space (inclusive)
      * @param endOffset the end offset of the WAL address space (exclusive)
      * @param records the log records for this segment (memory lifecycle managed by IndexCache)
+     * @param status the status of the data in this segment
      */
-    public IndexSegment(long startOffset, long endOffset, LogRecords records) {
+    public IndexSegment(long startOffset, long endOffset, LogRecords records, DataStatus status) {
         if (startOffset > endOffset) {
             throw new IllegalArgumentException(
                     "Start offset must be less or equal than end offset. "
@@ -57,6 +69,18 @@ public final class IndexSegment {
         this.startOffset = startOffset;
         this.endOffset = endOffset;
         this.records = records;
+        this.status = status;
+    }
+
+    /**
+     * Creates a new IndexSegment with LOADED status (for backward compatibility).
+     *
+     * @param startOffset the start offset of the WAL address space (inclusive)
+     * @param endOffset the end offset of the WAL address space (exclusive)
+     * @param records the log records for this segment (memory lifecycle managed by IndexCache)
+     */
+    public IndexSegment(long startOffset, long endOffset, LogRecords records) {
+        this(startOffset, endOffset, records, DataStatus.LOADED);
     }
 
     /**
@@ -87,6 +111,15 @@ public final class IndexSegment {
     }
 
     /**
+     * Gets the status of the data in this segment.
+     *
+     * @return the data status
+     */
+    public DataStatus getStatus() {
+        return status;
+    }
+
+    /**
      * Returns the size of the offset range covered by this segment.
      *
      * @return the number of offsets in the range (endOffset - startOffset - 1)
@@ -109,15 +142,33 @@ public final class IndexSegment {
         return startOffset == endOffset;
     }
 
+    /**
+     * Creates an empty segment indicating no data to fetch at this offset.
+     *
+     * @param endOffset the end offset
+     * @return an empty IndexSegment with EMPTY status
+     */
     public static IndexSegment createEmptySegment(long endOffset) {
-        return new IndexSegment(endOffset, endOffset, MemoryLogRecords.EMPTY);
+        return new IndexSegment(endOffset, endOffset, MemoryLogRecords.EMPTY, DataStatus.EMPTY);
+    }
+
+    /**
+     * Creates a segment indicating data is not ready (not loaded in cache yet).
+     *
+     * @param startOffset the start offset of the requested range
+     * @param endOffset the end offset of the requested range
+     * @return an IndexSegment with NOT_READY status
+     */
+    public static IndexSegment createNotReadySegment(long startOffset, long endOffset) {
+        return new IndexSegment(
+                startOffset, endOffset, MemoryLogRecords.EMPTY, DataStatus.NOT_READY);
     }
 
     @Override
     public String toString() {
         return String.format(
-                "IndexSegment{startOffset=%d, endOffset=%d, records=%s}",
-                startOffset, endOffset, records.getClass().getSimpleName());
+                "IndexSegment{startOffset=%d, endOffset=%d, status=%s, records=%s}",
+                startOffset, endOffset, status, records.getClass().getSimpleName());
     }
 
     @Override
@@ -132,6 +183,7 @@ public final class IndexSegment {
         IndexSegment that = (IndexSegment) o;
         return startOffset == that.startOffset
                 && endOffset == that.endOffset
+                && status == that.status
                 && records.equals(that.records);
     }
 
@@ -139,6 +191,7 @@ public final class IndexSegment {
     public int hashCode() {
         int result = Long.hashCode(startOffset);
         result = 31 * result + Long.hashCode(endOffset);
+        result = 31 * result + status.hashCode();
         result = 31 * result + records.hashCode();
         return result;
     }
