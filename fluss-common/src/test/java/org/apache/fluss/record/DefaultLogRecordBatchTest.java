@@ -33,6 +33,7 @@ import java.util.List;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -56,22 +57,23 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
     void testIndexedRowWriteAndReadBatch(byte magic) throws Exception {
         int recordNumber = 50;
         RowType allRowType = TestInternalRowGenerator.createAllRowType();
-        MemoryLogRecordsIndexedBuilder builder =
+        List<IndexedRow> rows = new ArrayList<>();
+        MemoryLogRecords memoryLogRecords;
+
+        try (MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.builder(
                         baseLogOffset,
                         schemaId,
                         Integer.MAX_VALUE,
                         magic,
-                        new UnmanagedPagedOutputView(100));
-
-        List<IndexedRow> rows = new ArrayList<>();
-        for (int i = 0; i < recordNumber; i++) {
-            IndexedRow row = TestInternalRowGenerator.genIndexedRowForAllType();
-            builder.append(ChangeType.INSERT, row);
-            rows.add(row);
+                        new UnmanagedPagedOutputView(100))) {
+            for (int i = 0; i < recordNumber; i++) {
+                IndexedRow row = TestInternalRowGenerator.genIndexedRowForAllType();
+                builder.append(ChangeType.INSERT, row);
+                rows.add(row);
+            }
+            memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         }
-
-        MemoryLogRecords memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
         Iterator<LogRecordBatch> iterator = memoryLogRecords.batches().iterator();
 
         assertThat(iterator.hasNext()).isTrue();
@@ -100,18 +102,22 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
                 i++;
             }
         }
-
-        builder.close();
     }
 
     @ParameterizedTest
     @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1})
     void testNoRecordAppend(byte magic) throws Exception {
         // 1. no record append with baseOffset as 0.
-        MemoryLogRecordsIndexedBuilder builder =
+        MemoryLogRecords memoryLogRecords;
+        try (MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.builder(
-                        0L, schemaId, Integer.MAX_VALUE, magic, new UnmanagedPagedOutputView(100));
-        MemoryLogRecords memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
+                        0L,
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        magic,
+                        new UnmanagedPagedOutputView(100))) {
+            memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
+        }
         Iterator<LogRecordBatch> iterator = memoryLogRecords.batches().iterator();
         // only contains batch header.
         assertThat(memoryLogRecords.sizeInBytes()).isEqualTo(recordBatchHeaderSize(magic));
@@ -132,14 +138,15 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
         }
 
         // 2. no record append with baseOffset as 100.
-        builder =
+        try (MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.builder(
                         100L,
                         schemaId,
                         Integer.MAX_VALUE,
                         magic,
-                        new UnmanagedPagedOutputView(100));
-        memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
+                        new UnmanagedPagedOutputView(100))) {
+            memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
+        }
         iterator = memoryLogRecords.batches().iterator();
         // only contains batch header.
         assertThat(memoryLogRecords.sizeInBytes()).isEqualTo(recordBatchHeaderSize(magic));
@@ -158,5 +165,52 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
                 CloseableIterator<LogRecord> iter = logRecordBatch.records(readContext)) {
             assertThat(iter.hasNext()).isFalse();
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1, LOG_MAGIC_VALUE_V3})
+    void testExtendProperties(byte magic) throws Exception {
+        MemoryLogRecords memoryLogRecords;
+
+        // Prepare extend properties for V3 version
+        byte[] extendProperties =
+                magic == LOG_MAGIC_VALUE_V3 ? "test-extend-properties".getBytes() : null;
+
+        try (MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.builder(
+                        baseLogOffset,
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        magic,
+                        new UnmanagedPagedOutputView(100),
+                        extendProperties)) {
+
+            // Append some records
+            for (int i = 0; i < 5; i++) {
+                IndexedRow row = TestInternalRowGenerator.genIndexedRowForAllType();
+                builder.append(ChangeType.INSERT, row);
+            }
+            memoryLogRecords = MemoryLogRecords.pointToBytesView(builder.build());
+        }
+
+        Iterator<LogRecordBatch> iterator = memoryLogRecords.batches().iterator();
+        assertThat(iterator.hasNext()).isTrue();
+        LogRecordBatch logRecordBatch = iterator.next();
+
+        // Test extend properties
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            assertThat(logRecordBatch.getExtendPropertiesLength()).isEqualTo(22);
+            assertThat(logRecordBatch.getExtendPropertiesData())
+                    .isEqualTo("test-extend-properties".getBytes());
+        } else {
+            assertThat(logRecordBatch.getExtendPropertiesLength()).isEqualTo(0);
+            assertThat(logRecordBatch.getExtendPropertiesData()).isEmpty();
+        }
+
+        // Ensure the batch is still valid
+        logRecordBatch.ensureValid();
+        assertThat(logRecordBatch.isValid()).isTrue();
+        assertThat(logRecordBatch.getRecordCount()).isEqualTo(5);
+        assertThat(logRecordBatch.magic()).isEqualTo(magic);
     }
 }

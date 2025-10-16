@@ -17,18 +17,30 @@
 
 package org.apache.fluss.server.log.state;
 
-import org.apache.fluss.record.LogRecordBatch;
+/** A definition of a state. */
+public enum StateDef {
+    INDEX_REPLICATE_OFFSET("index_apply_state");
 
-import java.util.Map;
+    private static final String STATE_KAY_SEPARATOR = "__";
 
-/** Converter interface for extracting state key-value pairs from LogRecordBatch. */
-public interface StateConverter {
+    private String namespace;
 
-    /**
-     * Converts a LogRecordBatch into state key-value pairs.
-     *
-     * @param batch the log record batch to convert
-     * @return map of state key-value pairs, both key and value can be any Object type
-     */
-    Map<Object, Object> convert(LogRecordBatch batch);
+    private String stateKeyPrefix;
+
+    StateDef(String namespace) {
+        this.namespace = namespace;
+        this.stateKeyPrefix = namespace + STATE_KAY_SEPARATOR;
+    }
+
+    public String namespace() {
+        return namespace;
+    }
+
+    public String stateKey(String key) {
+        return stateKeyPrefix + key;
+    }
+
+    public String stateKeyPrefix() {
+        return stateKeyPrefix;
+    }
 }

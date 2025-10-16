@@ -21,25 +21,22 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.metadata.TablePartitionId;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.row.indexed.IndexedRow;
-import org.apache.fluss.server.index.IndexCache.IndexCacheFetchParam;
 import org.apache.fluss.server.log.LogTablet;
-import org.apache.fluss.utils.MapUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
+import java.io.EOFException;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
-import static java.util.Collections.emptyList;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
@@ -60,11 +57,10 @@ public final class IndexRowCache implements Closeable {
 
     private static final Logger LOG = LoggerFactory.getLogger(IndexRowCache.class);
 
-    private final LogTablet logTablet;
-
     /** Map from index bucket to its row cache. */
-    private final Map<TablePartitionId, IndexBucketRowCache[]> bucketRowCaches =
-            MapUtils.newConcurrentHashMap();
+    private final Map<Long, IndexBucketRowCache[]> bucketRowCaches = new HashMap<>();
+
+    private final Map<Long, AtomicLong[]> bucketCommitOffsets = new HashMap<>();
 
     /** Whether this cache manager has been closed. */
     private boolean closed = false;
@@ -78,16 +74,22 @@ public final class IndexRowCache implements Closeable {
     public IndexRowCache(
             MemorySegmentPool memoryPool,
             LogTablet logTablet,
-            Map<TablePartitionId, Integer> indexBucketDistribution) {
-        this.logTablet = logTablet;
-        for (Map.Entry<TablePartitionId, Integer> entry : indexBucketDistribution.entrySet()) {
-            TablePartitionId tablePartitionId = entry.getKey();
+            Map<Long, Integer> indexBucketDistribution) {
+        for (Map.Entry<Long, Integer> entry : indexBucketDistribution.entrySet()) {
+            Long indexTableId = entry.getKey();
             int bucketCount = entry.getValue();
             IndexBucketRowCache[] bucketCaches = new IndexBucketRowCache[bucketCount];
+            AtomicLong[] bucketCommitOffsets = new AtomicLong[bucketCount];
             for (int i = 0; i < bucketCount; i++) {
-                bucketCaches[i] = new IndexBucketRowCache(memoryPool);
+                bucketCaches[i] =
+                        new IndexBucketRowCache(
+                                logTablet.getTableBucket(),
+                                new TableBucket(indexTableId, i),
+                                memoryPool);
+                bucketCommitOffsets[i] = new AtomicLong(0L);
             }
-            bucketRowCaches.put(tablePartitionId, bucketCaches);
+            bucketRowCaches.put(indexTableId, bucketCaches);
+            this.bucketCommitOffsets.put(indexTableId, bucketCommitOffsets);
         }
         LOG.info("IndexRowCache initialized with memory pool page size: {}", memoryPool.pageSize());
     }
@@ -95,13 +97,16 @@ public final class IndexRowCache implements Closeable {
     /**
      * Updates the commit offset for a specific index bucket.
      *
-     * @param tablePartitionId the index table
+     * @param indexTableId the index table id
      * @param bucketId the index bucket ID
      * @param commitOffset the commit offset
      */
-    public void updateCommitOffset(
-            TablePartitionId tablePartitionId, int bucketId, long commitOffset) {
-        getBucketRowCache(tablePartitionId, bucketId).updateCommitOffset(commitOffset);
+    public void updateCommitOffset(long indexTableId, int bucketId, long commitOffset) {
+        if (closed) {
+            throw new IllegalStateException("IndexRowCache is closed");
+        }
+        getCommitOffsetsArray(indexTableId)[bucketId].set(commitOffset);
+        getBucketRowCache(indexTableId, bucketId).garbageCollectBelowOffset(commitOffset);
     }
 
     /**
@@ -110,11 +115,11 @@ public final class IndexRowCache implements Closeable {
      * @return the commit offset
      */
     public long getCommitHorizon() {
-        return bucketRowCaches.values().stream()
+        return bucketCommitOffsets.values().stream()
                 .map(
-                        caches ->
-                                Arrays.stream(caches)
-                                        .map(IndexBucketRowCache::getCommitOffset)
+                        offsets ->
+                                Arrays.stream(offsets)
+                                        .map(AtomicLong::get)
                                         .min(Long::compareTo)
                                         .orElse(0L))
                 .min(Long::compareTo)
@@ -122,38 +127,25 @@ public final class IndexRowCache implements Closeable {
     }
 
     /**
-     * Writes an empty row to the cache for a specific index bucket and logOffset.
+     * Writes an IndexedRow only to the target bucket without writing empty rows to other buckets.
+     * This method is used during batch processing to reduce unnecessary empty row writes.
      *
-     * @param tablePartitionId the index table
-     * @param logOffset the log offset
-     * @throws IOException if an error occurs during writing
-     */
-    public void writeEmptyRows(TablePartitionId tablePartitionId, long logOffset)
-            throws IOException {
-        if (closed) {
-            throw new IllegalStateException("IndexRowCache is closed");
-        }
-        IndexBucketRowCache[] indexBucketCaches = getIndexBucketRowCaches(tablePartitionId);
-        for (IndexBucketRowCache bucketCache : indexBucketCaches) {
-            bucketCache.writeEmptyRowForOffset(logOffset);
-        }
-    }
-
-    /**
-     * Writes an IndexedRow to the cache for a specific index bucket and logOffset.
-     *
-     * @param tablePartitionId the index table
+     * @param indexTableId the index table id
      * @param bucketId the index bucket ID
      * @param logOffset the log offset
+     * @param changeType the change type of the row
      * @param indexedRow the IndexedRow to cache
+     * @param batchStartOffset the minimum offset for gap filling
      * @throws IOException if an error occurs during writing
+     * @throws IllegalStateException if the cache is closed
      */
-    public void writeIndexedRow(
-            TablePartitionId tablePartitionId,
+    public void writeIndexedRowToTargetBucket(
+            long indexTableId,
             int bucketId,
             long logOffset,
             ChangeType changeType,
-            IndexedRow indexedRow)
+            IndexedRow indexedRow,
+            long batchStartOffset)
             throws IOException {
         if (closed) {
             throw new IllegalStateException("IndexRowCache is closed");
@@ -161,23 +153,83 @@ public final class IndexRowCache implements Closeable {
         checkArgument(
                 changeType != null && indexedRow != null,
                 "changeType and indexedRow cannot be null");
-        IndexBucketRowCache[] indexBucketCaches = getIndexBucketRowCaches(tablePartitionId);
+
+        IndexBucketRowCache[] indexBucketCaches = getIndexBucketRowCaches(indexTableId);
         checkArgument(
-                bucketId >= 0 && bucketId < indexBucketCaches.length, "bucketId is out of range");
-        for (int i = 0; i < indexBucketCaches.length; i++) {
-            IndexBucketRowCache bucketCache = indexBucketCaches[i];
-            if (i == bucketId) {
-                bucketCache.writeIndexedRow(logOffset, changeType, indexedRow);
-            } else {
-                bucketCache.writeEmptyRowForOffset(logOffset);
+                bucketId >= 0 && bucketId < indexBucketCaches.length,
+                "bucketId %s is out of range [0, %s)",
+                bucketId,
+                indexBucketCaches.length);
+
+        IndexBucketRowCache targetBucketCache = indexBucketCaches[bucketId];
+
+        while (true) {
+            try {
+                // Only write to the target bucket
+                targetBucketCache.writeIndexedRow(
+                        logOffset, changeType, indexedRow, batchStartOffset);
+                if (LOG.isTraceEnabled()) {
+                    LOG.trace(
+                            "Wrote IndexedRow to target bucket for index table {}, bucket {} with logOffset {}",
+                            indexTableId,
+                            bucketId,
+                            logOffset);
+                }
+                return;
+            } catch (EOFException eofException) {
+                if (LOG.isInfoEnabled()) {
+                    LOG.trace(
+                            "EOFException happened during writing IndexedRow to target bucket for index table {}, bucket {} at logOffset {}: {}, that meens memory pressure is too high, backoff and retry.",
+                            indexTableId,
+                            bucketId,
+                            logOffset,
+                            eofException.getMessage(),
+                            eofException);
+                }
             }
         }
+    }
 
-        LOG.trace(
-                "Wrote IndexedRow for index table {}, bucket {} with logOffset {}",
-                tablePartitionId,
-                bucketId,
-                logOffset);
+    /**
+     * Synchronizes all buckets to the specified offset by writing empty rows where necessary. This
+     * method is used at the end of batch processing to ensure all buckets have consistent offset
+     * progression while minimizing the total number of empty row writes.
+     *
+     * @param indexTableId the index table id
+     * @param targetOffset the target offset to synchronize all buckets to
+     * @param batchStartOffset the minimum offset for gap filling
+     * @throws IOException if an error occurs during synchronization
+     * @throws IllegalStateException if the cache is closed
+     */
+    public void synchronizeAllBucketsToOffset(
+            long indexTableId, long targetOffset, long batchStartOffset) throws IOException {
+        if (closed) {
+            throw new IllegalStateException("IndexRowCache is closed");
+        }
+
+        IndexBucketRowCache[] indexBucketCaches = getIndexBucketRowCaches(indexTableId);
+
+        try {
+            // Write empty rows to all buckets to synchronize them to the target offset
+            for (IndexBucketRowCache bucketCache : indexBucketCaches) {
+                bucketCache.writeIndexedRow(targetOffset, null, null, batchStartOffset);
+            }
+
+            if (LOG.isTraceEnabled()) {
+                LOG.trace(
+                        "Synchronized all buckets for index table {} to offset {}",
+                        indexTableId,
+                        targetOffset);
+            }
+        } catch (Exception e) {
+            LOG.error(
+                    "Failed to synchronize buckets for index table {} to offset {}: {}",
+                    indexTableId,
+                    targetOffset,
+                    e.getMessage(),
+                    e);
+            throw e;
+        }
     }
 
     /**
@@ -188,117 +240,32 @@ public final class IndexRowCache implements Closeable {
      * <p>Note: The requested data range must form a continuous address space (or its subset) within
      * the cache. Queries spanning multiple ranges are not allowed and will throw an exception.
      *
-     * @param tablePartitionId the index table
+     * @param indexTableId the id of index table
      * @param bucketId the index bucket ID
      * @param startOffset the start offset (inclusive)
-     * @param endOffset the end offset (exclusive)
-     * @param schemaId the schema ID for LogRecordBatch headers
+     * @param expectedEndOffset the end offset (exclusive)
      * @return LogRecords with accurate headers, or empty LogRecords if bucket not found or no data
      *     in range
      */
-    public LogRecords getRangeLogRecords(
-            TablePartitionId tablePartitionId,
-            int bucketId,
-            long startOffset,
-            long endOffset,
-            short schemaId) {
+    public LogRecords readIndexLogRecords(
+            long indexTableId, int bucketId, long startOffset, long expectedEndOffset) {
         if (closed) {
             return createEmptyLogRecords();
         }
 
-        IndexBucketRowCache bucketCache = getBucketRowCache(tablePartitionId, bucketId);
+        IndexBucketRowCache bucketCache = getBucketRowCache(indexTableId, bucketId);
         if (bucketCache == null) {
             return createEmptyLogRecords();
         }
 
-        return bucketCache.getRangeLogRecords(startOffset, endOffset, schemaId);
+        return bucketCache.readIndexLogRecords(startOffset, expectedEndOffset);
     }
 
-    /**
-     * Gets all unloaded ranges within the specified range for an index bucket using Range-based gap
-     * analysis.
-     *
-     * <p>This method delegates to the IndexBucketRowCache to identify gaps between existing
-     * OffsetRanges that need to be loaded from WAL, restoring the two-phase fetch capability.
-     *
-     * @param indexBucket the index bucket
-     * @param startOffset the start offset (inclusive)
-     * @param endOffset the end offset (exclusive)
-     * @return a list of OffsetRangeInfo representing gaps that need data loading
-     */
-    public List<OffsetRangeInfo> getUnloadedRanges(
+    public int getCachedBytesOfIndexBucketInRange(
             TableBucket indexBucket, long startOffset, long endOffset) {
-        if (closed) {
-            return emptyList();
-        }
-        TablePartitionId tablePartitionId = TablePartitionId.from(indexBucket);
         IndexBucketRowCache bucketCache =
-                getBucketRowCache(tablePartitionId, indexBucket.getBucket());
-        return bucketCache.getUnloadedRanges(startOffset, endOffset);
-    }
-
-    /**
-     * Gets unloaded ranges for multiple IndexBuckets in a batch, optimized for efficient WAL
-     * processing.
-     *
-     * <p>This method collects unloaded ranges from multiple IndexBuckets and returns them in a
-     * OffsetRangeInfos structure that supports:
-     *
-     * <ul>
-     *   <li>Global min/max offset calculation for single WAL read
-     *   <li>Efficient lookup during WAL processing
-     *   <li>Conditional data writing based on IndexBucket requirements
-     * </ul>
-     *
-     * @param fetchRequests Map of IndexBucket to fetch parameters containing offset ranges
-     * @return OffsetRangeInfos containing all unloaded ranges for efficient batch processing
-     */
-    public Map<TableBucket, List<OffsetRangeInfo>> getUnloadedRanges(
-            Map<TableBucket, IndexCacheFetchParam> fetchRequests) {
-        if (closed || fetchRequests == null || fetchRequests.isEmpty()) {
-            return new HashMap<>();
-        }
-
-        Map<TableBucket, List<OffsetRangeInfo>> batchRanges = new HashMap<>();
-
-        long startOffset =
-                fetchRequests.values().stream()
-                        .map(IndexCacheFetchParam::getFetchOffset)
-                        .min(Long::compareTo)
-                        .orElse(0L);
-        long endOffset = logTablet.getHighWatermark();
-
-        for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
-            TableBucket indexBucket = entry.getKey();
-
-            List<OffsetRangeInfo> offsetRangeInfos =
-                    getUnloadedRanges(indexBucket, startOffset, endOffset);
-
-            if (offsetRangeInfos.isEmpty()) {
-                continue;
-            }
-            batchRanges.put(indexBucket, offsetRangeInfos);
-        }
-
-        LOG.debug("Collected batch unloaded ranges: {}", batchRanges);
-        return batchRanges;
-    }
-
-    /**
-     * Removes all entries with offsets below the given horizon for all index buckets.
-     *
-     * @param horizon the commit horizon
-     */
-    public void cleanupBelowHorizon(long horizon) throws IOException {
-        if (closed) {
-            return;
-        }
-        for (Map.Entry<TablePartitionId, IndexBucketRowCache[]> entry :
-                bucketRowCaches.entrySet()) {
-            for (IndexBucketRowCache cache : entry.getValue()) {
-                cache.cleanupBelowHorizon(horizon);
-            }
-        }
+                getBucketRowCache(indexBucket.getTableId(), indexBucket.getBucket());
+        return bucketCache.getCachedRecordBytesInRange(startOffset, endOffset);
     }
 
     /**
@@ -334,6 +301,21 @@ public final class IndexRowCache implements Closeable {
         return bucketRowCaches.isEmpty();
     }
 
+    /**
+     * Gets the total number of memory segments used across all index buckets.
+     *
+     * @return the total memory segment count
+     */
+    public int getTotalMemorySegmentCount() {
+        int totalSegmentCount = 0;
+        for (IndexBucketRowCache[] indexBucketRowCaches : bucketRowCaches.values()) {
+            for (IndexBucketRowCache cache : indexBucketRowCaches) {
+                totalSegmentCount += cache.getMemorySegmentCount();
+            }
+        }
+        return totalSegmentCount;
+    }
+
     @Override
     public void close() {
         if (closed) {
@@ -346,8 +328,7 @@ public final class IndexRowCache implements Closeable {
                 getTotalEntries());
 
         // Close all bucket caches
-        for (Map.Entry<TablePartitionId, IndexBucketRowCache[]> entry :
-                bucketRowCaches.entrySet()) {
+        for (Map.Entry<Long, IndexBucketRowCache[]> entry : bucketRowCaches.entrySet()) {
             for (int i = 0; i < entry.getValue().length; i++) {
                 try {
                     IndexBucketRowCache cache = entry.getValue()[i];
@@ -372,23 +353,31 @@ public final class IndexRowCache implements Closeable {
         return IndexBucketRowCache.createEmptyLogRecords();
     }
 
-    private IndexBucketRowCache[] getIndexBucketRowCaches(TablePartitionId tablePartitionId) {
-        IndexBucketRowCache[] bucketCaches = bucketRowCaches.get(tablePartitionId);
+    private IndexBucketRowCache[] getIndexBucketRowCaches(long indexTableId) {
+        IndexBucketRowCache[] bucketCaches = bucketRowCaches.get(indexTableId);
         if (null == bucketCaches) {
-
             throw new IllegalArgumentException(
-                    "IndexBucketRowCache not found for tablePartitionId: " + tablePartitionId);
+                    "IndexBucketRowCache not found for indexTableId: " + indexTableId);
         }
 
         return bucketCaches;
     }
 
-    private IndexBucketRowCache getBucketRowCache(TablePartitionId tablePartitionId, int bucketId)
+    private AtomicLong[] getCommitOffsetsArray(long indexTableId) {
+        AtomicLong[] commitOffsets = bucketCommitOffsets.get(indexTableId);
+        if (null == commitOffsets) {
+            throw new IllegalArgumentException(
+                    "IndexBucketRowCache not found for indexTableId: " + indexTableId);
+        }
+        return commitOffsets;
+    }
+
+    private IndexBucketRowCache getBucketRowCache(long indexTableId, int bucketId)
             throws IllegalArgumentException {
-        IndexBucketRowCache[] bucketCaches = getIndexBucketRowCaches(tablePartitionId);
+        IndexBucketRowCache[] bucketCaches = getIndexBucketRowCaches(indexTableId);
         if (bucketId < 0 || bucketId >= bucketCaches.length) {
             throw new IllegalArgumentException(
-                    "Invalid bucketId: " + bucketId + " for tablePartitionId: " + tablePartitionId);
+                    "Invalid bucketId: " + bucketId + " for indexTableId: " + indexTableId);
         }
         return bucketCaches[bucketId];
     }

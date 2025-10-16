@@ -28,6 +28,8 @@ import org.apache.fluss.exception.DatabaseNotExistException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.FencedTieringEpochException;
+import org.apache.fluss.exception.FetchIndexEarlyFireException;
+import org.apache.fluss.exception.IndexReplicateBackPressureException;
 import org.apache.fluss.exception.IneligibleReplicaException;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
@@ -225,7 +227,13 @@ public enum Errors {
             "The new ISR contains at least one ineligible replica.",
             IneligibleReplicaException::new),
     INVALID_ALTER_TABLE_EXCEPTION(
-            56, "The alter table is invalid.", InvalidAlterTableException::new);
+            56, "The alter table is invalid.", InvalidAlterTableException::new),
+    INDEX_REPLICATE_BACK_PRESSURE_EXCEPTION(
+            57,
+            "The index replicate pressure is too high.",
+            IndexReplicateBackPressureException::new),
+    FETCH_INDEX_EARLY_FIRE_EXCEPTION(
+            58, "The fetch index is early fire.", FetchIndexEarlyFireException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 

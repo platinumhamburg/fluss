@@ -19,6 +19,7 @@ package org.apache.fluss.server.replica.fetcher;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -35,7 +36,13 @@ import org.apache.fluss.rpc.messages.PbFetchLogRespForTable;
 import org.apache.fluss.rpc.messages.PbListOffsetsRespForBucket;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.log.ListOffsetsParam;
+import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.ConnectException;
+import java.nio.channels.ClosedChannelException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -47,8 +54,16 @@ import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.getFetchIndexLogRe
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.getFetchLogResultForBucket;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeListOffsetsRequest;
 
+/** Connection health state for rate limiting. */
+enum ConnectionHealth {
+    HEALTHY, // Normal operation, no rate limiting.
+    UNHEALTHY // Network issues detected, rate limiting enabled.
+}
+
 /** Facilitates fetches from a remote replica leader in one tablet server. */
 final class RemoteLeaderEndpoint implements LeaderEndpoint {
+    private static final Logger LOG = LoggerFactory.getLogger(RemoteLeaderEndpoint.class);
+
     private final int followerServerId;
     private final int remoteServerId;
     private final TabletServerGateway tabletServerGateway;
@@ -59,6 +74,11 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     private final int minFetchBytes;
     private final int maxFetchWaitMs;
+
+    /** Connection health state management. */
+    private volatile ConnectionHealth connectionHealth = ConnectionHealth.HEALTHY;
+    /** Rate limiter for unhealthy connections - 1 request per second. */
+    private final RateLimiter unhealthyRateLimiter = RateLimiter.create(1.0);
 
     RemoteLeaderEndpoint(
             Configuration conf,
@@ -98,11 +118,17 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     @Override
     public CompletableFuture<FetchData> fetchLog(FetchLogContext fetchLogContext) {
+        // Check rate limiting before making request
+        checkAndTryWaitHealthy();
+
         FetchLogRequest fetchLogRequest = fetchLogContext.getFetchLogRequest();
         return tabletServerGateway
                 .fetchLog(fetchLogRequest)
                 .thenApply(
                         fetchLogResponse -> {
+                            // Mark as healthy on successful response
+                            markConnectionHealthy();
+
                             Map<TableBucket, FetchLogResultForBucket> fetchLogResultMap =
                                     new HashMap<>();
                             List<PbFetchLogRespForTable> tablesRespList =
@@ -128,15 +154,29 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                             }
 
                             return new FetchData(fetchLogResponse, fetchLogResultMap);
+                        })
+                .exceptionally(
+                        throwable -> {
+                            // Mark as unhealthy on network exception
+                            if (isNetworkException(throwable)) {
+                                markConnectionUnhealthy();
+                            }
+                            throw new RuntimeException(throwable);
                         });
     }
 
     public CompletableFuture<FetchIndexData> fetchIndex(FetchIndexContext fetchIndexContext) {
+        // Check rate limiting before making request
+        checkAndTryWaitHealthy();
+
         FetchIndexRequest fetchIndexRequest = fetchIndexContext.getFetchIndexRequest();
         return tabletServerGateway
                 .fetchIndex(fetchIndexRequest)
                 .thenApply(
                         fetchIndexResponse -> {
+                            // Mark as healthy on successful response
+                            markConnectionHealthy();
+
                             Map<DataIndexTableBucket, FetchIndexLogResultForBucket>
                                     fetchIndexResultMap = new HashMap<>();
                             List<PbFetchIndexRespForIndexTableBucket> indexBucketResponseList =
@@ -170,6 +210,14 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                                 }
                             }
                             return new FetchIndexData(fetchIndexResponse, fetchIndexResultMap);
+                        })
+                .exceptionally(
+                        throwable -> {
+                            // Mark as unhealthy on network exception
+                            if (isNetworkException(throwable)) {
+                                markConnectionUnhealthy();
+                            }
+                            throw new RuntimeException(throwable);
                         });
     }
 
@@ -243,6 +291,9 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     /** Fetch log offset with given offset type. */
     private CompletableFuture<Long> fetchLogOffset(TableBucket tableBucket, int offsetType) {
+        // Check rate limiting before making request
+        checkAndTryWaitHealthy();
+
         return tabletServerGateway
                 .listOffsets(
                         makeListOffsetsRequest(
@@ -253,6 +304,9 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                                 tableBucket.getBucket()))
                 .thenApply(
                         response -> {
+                            // Mark as healthy on successful response
+                            markConnectionHealthy();
+
                             PbListOffsetsRespForBucket respForBucket =
                                     response.getBucketsRespsList().get(0);
                             if (respForBucket.hasErrorCode()) {
@@ -261,6 +315,66 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                             } else {
                                 return respForBucket.getOffset();
                             }
+                        })
+                .exceptionally(
+                        throwable -> {
+                            // Mark as unhealthy on network exception
+                            if (isNetworkException(throwable)) {
+                                markConnectionUnhealthy();
+                            }
+                            throw new RuntimeException(throwable);
                         });
+    }
+
+    /**
+     * Check connection health and apply rate limiting if necessary. This is a private method to
+     * handle rate limiting globally across all requests.
+     */
+    private void checkAndTryWaitHealthy() {
+        if (connectionHealth == ConnectionHealth.UNHEALTHY) {
+            // Block until rate limiter allows the request
+            unhealthyRateLimiter.acquire();
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Rate limited request to remote server {} due to unhealthy connection",
+                        remoteServerId);
+            }
+        }
+    }
+
+    /** Mark connection as healthy and disable rate limiting. */
+    private void markConnectionHealthy() {
+        if (connectionHealth == ConnectionHealth.UNHEALTHY) {
+            connectionHealth = ConnectionHealth.HEALTHY;
+            LOG.info(
+                    "Connection to remote server {} recovered, disabling rate limiting",
+                    remoteServerId);
+        }
+    }
+
+    /** Mark connection as unhealthy and enable rate limiting. */
+    private void markConnectionUnhealthy() {
+        if (connectionHealth == ConnectionHealth.HEALTHY) {
+            connectionHealth = ConnectionHealth.UNHEALTHY;
+            LOG.warn(
+                    "Network issues detected with remote server {}, enabling rate limiting (1 req/sec)",
+                    remoteServerId);
+        }
+    }
+
+    /**
+     * Check if the given throwable represents a network exception that should trigger rate
+     * limiting.
+     */
+    private boolean isNetworkException(Throwable throwable) {
+        // Unwrap CompletionException if present
+        Throwable cause = throwable;
+        while (cause.getCause() != null && cause != cause.getCause()) {
+            cause = cause.getCause();
+        }
+
+        return cause instanceof NetworkException
+                || cause instanceof ConnectException
+                || cause instanceof ClosedChannelException;
     }
 }

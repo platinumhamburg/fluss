@@ -15,17 +15,19 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.exception;
 
-import java.io.IOException;
+import org.apache.fluss.annotation.PublicEvolving;
 
-/** TODO StateCheckpointManager. */
-public interface RawStateStore {
-    void put(byte[] key, byte[] value) throws IOException;
+/**
+ * Thrown when the tabletServer is not available.
+ *
+ * @since 0.8
+ */
+@PublicEvolving
+public class FetchIndexEarlyFireException extends ApiException {
 
-    byte[] get(byte[] key) throws IOException;
-
-    void delete(byte[] key) throws IOException;
-
-    long checkpoint(long recoverLogOffset) throws IOException;
+    public FetchIndexEarlyFireException(String message) {
+        super(message);
+    }
 }

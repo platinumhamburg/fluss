@@ -38,6 +38,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.COMMIT_TIMESTAMP_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
@@ -45,6 +46,8 @@ import static org.apache.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffset
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.batchSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.extendPropertiesDataOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.extendPropertiesLengthOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.lastOffsetDeltaOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.leaderEpochOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
@@ -65,6 +68,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
  * <ul>
  *   <li>V0 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V0}
  *   <li>V1 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V1}
+ *   <li>V3 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V3}
  * </ul>
  *
  * @since 0.1
@@ -207,6 +211,46 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         return segment.getInt(position + recordsCountOffset(magic));
     }
 
+    /**
+     * Returns the extend properties length for V3 format.
+     *
+     * @return the length of extend properties data, 0 for non-V3 formats
+     */
+    public int getExtendPropertiesLength() {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            return segment.getInt(position + extendPropertiesLengthOffset(magic));
+        }
+        return 0;
+    }
+
+    /**
+     * Returns the extend properties data for V3 format.
+     *
+     * @return the extend properties data as byte array, empty for non-V3 formats
+     */
+    public byte[] getExtendPropertiesData() {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            int length = getExtendPropertiesLength();
+            if (length > 0) {
+                byte[] data = new byte[length];
+                int dataOffset = position + extendPropertiesDataOffset(magic);
+                segment.get(dataOffset, data);
+                return data;
+            }
+        }
+        return new byte[0];
+    }
+
+    /** Returns the start offset of records data, handling V3 format with extend properties. */
+    private int getRecordsStartOffset() {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            int extendPropertiesLength = getExtendPropertiesLength();
+            return position + recordBatchHeaderSize(magic) + extendPropertiesLength;
+        } else {
+            return position + recordBatchHeaderSize(magic);
+        }
+    }
+
     @Override
     public CloseableIterator<LogRecord> records(ReadContext context) {
         if (getRecordCount() == 0) {
@@ -255,7 +299,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
     private CloseableIterator<LogRecord> rowRecordIterator(RowType rowType, long timestamp) {
         DataType[] fieldTypes = rowType.getChildren().toArray(new DataType[0]);
         return new LogRecordIterator() {
-            int position = DefaultLogRecordBatch.this.position + recordBatchHeaderSize(magic);
+            int position = getRecordsStartOffset();
             int rowId = 0;
 
             @Override
@@ -284,9 +328,9 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         if (isAppendOnly) {
             // append only batch, no change type vector,
             // the start of the arrow data is the beginning of the batch records
-            int recordBatchHeaderSize = recordBatchHeaderSize(magic);
-            int arrowOffset = position + recordBatchHeaderSize;
-            int arrowLength = sizeInBytes() - recordBatchHeaderSize;
+            int recordsStartOffset = getRecordsStartOffset();
+            int arrowOffset = recordsStartOffset;
+            int arrowLength = sizeInBytes() - (recordsStartOffset - position);
             ArrowReader reader =
                     ArrowUtils.createArrowReader(
                             segment, arrowOffset, arrowLength, root, allocator, rowType);
@@ -299,12 +343,11 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         } else {
             // with change type, decode the change type vector first,
             // the arrow data starts after the change type vector
-            int changeTypeOffset = position + arrowChangeTypeOffset(magic);
+            int changeTypeOffset = getChangeTypeOffset();
             ChangeTypeVector changeTypeVector =
                     new ChangeTypeVector(segment, changeTypeOffset, getRecordCount());
             int arrowOffset = changeTypeOffset + changeTypeVector.sizeInBytes();
-            int arrowLength =
-                    sizeInBytes() - arrowChangeTypeOffset(magic) - changeTypeVector.sizeInBytes();
+            int arrowLength = sizeInBytes() - (arrowOffset - position);
             ArrowReader reader =
                     ArrowUtils.createArrowReader(
                             segment, arrowOffset, arrowLength, root, allocator, rowType);
@@ -314,6 +357,16 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
                     return changeTypeVector.getChangeType(rowId);
                 }
             };
+        }
+    }
+
+    /** Returns the offset of the change type vector, handling V3 format with extend properties. */
+    private int getChangeTypeOffset() {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            int extendPropertiesLength = getExtendPropertiesLength();
+            return position + recordBatchHeaderSize(magic) + extendPropertiesLength;
+        } else {
+            return position + arrowChangeTypeOffset(magic);
         }
     }
 

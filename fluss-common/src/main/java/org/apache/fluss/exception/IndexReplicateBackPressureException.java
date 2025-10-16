@@ -15,32 +15,34 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.state;
+package org.apache.fluss.exception;
 
-import java.io.IOException;
+import org.apache.fluss.annotation.PublicEvolving;
 
 /**
- * Generic serializer and deserializer interface for state keys and values.
+ * This exception indicates a record has failed its internal CRC check, this generally indicates
+ * network or disk corruption.
  *
- * @param <T> the type of objects to serialize/deserialize
+ * @since 0.1
  */
-public interface StateSerde<T> {
+@PublicEvolving
+public class IndexReplicateBackPressureException extends RetriableException {
 
-    /**
-     * Serializes an object to byte array.
-     *
-     * @param data the object to serialize
-     * @return serialized byte array
-     * @throws IOException if serialization fails
-     */
-    byte[] serialize(T data) throws IOException;
+    private static final long serialVersionUID = 1L;
 
-    /**
-     * Deserializes byte array to object.
-     *
-     * @param bytes the byte array to deserialize
-     * @return deserialized object
-     * @throws IOException if deserialization fails
-     */
-    T deserialize(byte[] bytes) throws IOException;
+    public IndexReplicateBackPressureException() {
+        super("Index replication back pressure.");
+    }
+
+    public IndexReplicateBackPressureException(String message) {
+        super(message);
+    }
+
+    public IndexReplicateBackPressureException(Throwable cause) {
+        super(cause);
+    }
+
+    public IndexReplicateBackPressureException(String message, Throwable cause) {
+        super(message, cause);
+    }
 }
