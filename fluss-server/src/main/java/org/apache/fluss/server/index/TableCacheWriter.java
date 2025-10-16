@@ -19,7 +19,6 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.metadata.Schema;
-import org.apache.fluss.metadata.TablePartitionId;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.IndexedRowEncoder;
@@ -37,32 +36,32 @@ import java.util.List;
  * intermediate IndexSegments. This provides the core functionality for the unified hot/cold data
  * processing pipeline.
  */
-public final class CacheWriterForIndexTable implements Closeable {
+public final class TableCacheWriter implements Closeable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(CacheWriterForIndexTable.class);
+    private static final Logger LOG = LoggerFactory.getLogger(TableCacheWriter.class);
 
-    private TablePartitionId indexTablePartitionId;
-    private Schema indexSchema;
-    private int indexBucketCount;
+    private final long indexTableId;
+    private final Schema indexSchema;
+    private final int indexBucketCount;
     private final BucketingFunction bucketingFunction;
     private final IndexRowCache indexRowCache;
 
     // For building IndexedRow
-    private IndexedRowEncoder indexedRowEncoder;
-    private InternalRow.FieldGetter[] fieldGetters;
-    private KeyEncoder bucketKeyEncoder;
+    private final IndexedRowEncoder indexedRowEncoder;
+    private final InternalRow.FieldGetter[] fieldGetters;
+    private final KeyEncoder bucketKeyEncoder;
 
-    private int[] indexFieldIndicesOfDataRow;
+    private final int[] indexFieldIndicesOfDataRow;
 
-    public CacheWriterForIndexTable(
-            TablePartitionId indexTablePartitionId,
+    public TableCacheWriter(
+            long indexTableId,
             Schema tableSchema,
             Schema indexSchema,
             int indexBucketCount,
             List<String> bucketKeys,
             BucketingFunction bucketingFunction,
             IndexRowCache indexRowCache) {
-        this.indexTablePartitionId = indexTablePartitionId;
+        this.indexTableId = indexTableId;
         this.indexSchema = indexSchema;
         this.indexBucketCount = indexBucketCount;
         this.bucketingFunction = bucketingFunction;
@@ -89,13 +88,9 @@ public final class CacheWriterForIndexTable implements Closeable {
             byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(indexedRow);
             int targetBucketId = bucketingFunction.bucketing(bucketKeyBytes, indexBucketCount);
             indexRowCache.writeIndexedRow(
-                    indexTablePartitionId,
-                    targetBucketId,
-                    offset,
-                    walRecord.getChangeType(),
-                    indexedRow);
+                    indexTableId, targetBucketId, offset, walRecord.getChangeType(), indexedRow);
         } else {
-            indexRowCache.writeEmptyRows(indexTablePartitionId, offset);
+            indexRowCache.writeEmptyRows(indexTableId, offset);
         }
     }
 

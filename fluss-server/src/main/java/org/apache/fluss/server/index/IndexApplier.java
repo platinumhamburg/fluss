@@ -31,7 +31,7 @@ import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
-import org.apache.fluss.server.utils.FatalErrorHandler;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Maps;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
@@ -87,9 +87,9 @@ public final class IndexApplier implements Closeable {
 
     private final KvTablet kvTablet;
     private final LogTablet logTablet;
-    private final FatalErrorHandler fatalErrorHandler;
     private final RowType indexRowType;
     private final KeyEncoder indexKeyEncoder;
+    private final TabletServerMetricGroup serverMetricGroup;
 
     // Lock for protecting internal state
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
@@ -115,19 +115,19 @@ public final class IndexApplier implements Closeable {
      *
      * @param kvTablet the KV tablet for index data storage
      * @param logTablet the log tablet for WAL operations
-     * @param fatalErrorHandler the fatal error handler
      * @param indexTableSchema the schema of the index table
+     * @param serverMetricGroup the server metric group for metrics recording
      */
     public IndexApplier(
             KvTablet kvTablet,
             LogTablet logTablet,
-            FatalErrorHandler fatalErrorHandler,
-            Schema indexTableSchema) {
+            Schema indexTableSchema,
+            TabletServerMetricGroup serverMetricGroup) {
         this.kvTablet = checkNotNull(kvTablet, "kvTablet cannot be null");
         this.logTablet = checkNotNull(logTablet, "logTablet cannot be null");
-        this.fatalErrorHandler =
-                checkNotNull(fatalErrorHandler, "fatalErrorHandler cannot be null");
         checkNotNull(indexTableSchema, "indexTableSchema cannot be null");
+        this.serverMetricGroup =
+                checkNotNull(serverMetricGroup, "serverMetricGroup cannot be null");
 
         // Extract RowType from Schema
         this.indexRowType = indexTableSchema.getRowType();
@@ -157,13 +157,15 @@ public final class IndexApplier implements Closeable {
         checkNotNull(records, "records cannot be null");
         checkNotNull(dataBucket, "dataBucket cannot be null");
 
-        LOG.info(
-                "indexBucket {} applying index records from range [{}, {}) of data bucket {}, {} bytes of index data",
-                kvTablet.getTableBucket(),
-                startOffset,
-                endOffset,
-                dataBucket,
-                records.sizeInBytes());
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "indexBucket {} applying index records from range [{}, {}) of data bucket {}, {} bytes of index data",
+                    kvTablet.getTableBucket(),
+                    startOffset,
+                    endOffset,
+                    dataBucket,
+                    records.sizeInBytes());
+        }
 
         if (startOffset > endOffset) {
             throw new IllegalArgumentException(
@@ -183,14 +185,14 @@ public final class IndexApplier implements Closeable {
                 lock,
                 () -> {
                     try {
-                        return doApplyIndexRecords(records, startOffset, endOffset, dataBucket);
+                        return applyIndexRecordsInternal(
+                                records, startOffset, endOffset, dataBucket);
                     } catch (Exception e) {
                         LOG.error(
                                 "Failed to apply index records from range [{}, {})",
                                 startOffset,
                                 endOffset,
                                 e);
-                        fatalErrorHandler.onFatalError(e);
                         throw e;
                     }
                 });
@@ -292,11 +294,13 @@ public final class IndexApplier implements Closeable {
                                         currentStatus.getLastApplyRecordsDataEndOffset(),
                                         currentStatus.getLastApplyRecordsIndexEndOffset(),
                                         currentBucketIndexCommitOffset));
-                        LOG.debug(
-                                "Updated indexCommitDataOffset for data bucket {}: hw={}, newIndexCommitDataOffset={}",
-                                dataBucket,
-                                highWatermark,
-                                currentBucketIndexCommitOffset);
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug(
+                                    "Updated indexCommitDataOffset for data bucket {}: hw={}, newIndexCommitDataOffset={}",
+                                    dataBucket,
+                                    highWatermark,
+                                    currentBucketIndexCommitOffset);
+                        }
                     }
                 });
     }
@@ -365,7 +369,7 @@ public final class IndexApplier implements Closeable {
         }
     }
 
-    private long doApplyIndexRecords(
+    private long applyIndexRecordsInternal(
             MemoryLogRecords records, long startOffset, long endOffset, TableBucket dataBucket)
             throws Exception {
         TableBucket indexBucket = kvTablet.getTableBucket();
@@ -388,7 +392,7 @@ public final class IndexApplier implements Closeable {
                 uncommittedApplyMap.computeIfAbsent(dataBucket, tb -> new ArrayList<>());
         if (!isRecordsEmpty) {
             LogAppendInfo appendInfo = logTablet.appendAsLeader(records);
-            processIndexRecordsToPreWriteBuffer(records, appendInfo);
+            writeIndexRecordsToPreWriteBuffer(records, appendInfo);
             long indexBucketStartOffset = appendInfo.firstOffset();
             long indexBucketEndOffset = appendInfo.lastOffset() + 1;
             uncommittedApplies.add(
@@ -400,15 +404,17 @@ public final class IndexApplier implements Closeable {
                             endOffset,
                             indexBucketEndOffset,
                             currentStatus.getIndexCommitDataOffset()));
-            LOG.info(
-                    "Applied index records from data range [{}, {}) to index bucket {}, "
-                            + "index bucket range: [{}:{}), currentIndexCommitDataOffset={}",
-                    startOffset,
-                    endOffset,
-                    indexBucket,
-                    indexBucketStartOffset,
-                    indexBucketEndOffset,
-                    currentStatus.getIndexCommitDataOffset());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Applied index records from data range [{}, {}) to index bucket {}, "
+                                + "index bucket range: [{}:{}), currentIndexCommitDataOffset={}",
+                        startOffset,
+                        endOffset,
+                        indexBucket,
+                        indexBucketStartOffset,
+                        indexBucketEndOffset,
+                        currentStatus.getIndexCommitDataOffset());
+            }
         } else if (!uncommittedApplies.isEmpty()) {
             uncommittedApplies.add(
                     new IndexApplyParams(
@@ -436,11 +442,11 @@ public final class IndexApplier implements Closeable {
      *
      * @param records the index records to process
      * @param appendInfo the log append info containing allocated index bucket offsets
-     * @throws Exception if processing fails
      */
-    private void processIndexRecordsToPreWriteBuffer(
-            MemoryLogRecords records, LogAppendInfo appendInfo) throws Exception {
+    private void writeIndexRecordsToPreWriteBuffer(
+            MemoryLogRecords records, LogAppendInfo appendInfo) {
         long currentIndexOffset = appendInfo.firstOffset();
+        int totalRecordCount = 0;
 
         // Create read context for processing index records
         LogRecordReadContext readContext =
@@ -453,11 +459,21 @@ public final class IndexApplier implements Closeable {
 
                     // Process the index record and apply to KvPreWriteBuffer
                     // Use the sequentially allocated index bucket offset
-                    processIndexRecordToPreWriteBuffer(
-                            batch.schemaId(), record, currentIndexOffset);
+                    writeIndexRecordToPreWriteBuffer(batch.schemaId(), record, currentIndexOffset);
                     currentIndexOffset++;
+                    totalRecordCount++;
                 }
             }
+        }
+
+        // Record the batch size metric
+        serverMetricGroup.indexApplyBatchSizeHistogram().update(totalRecordCount);
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Processed {} index records in batch for index bucket {}",
+                    totalRecordCount,
+                    kvTablet.getTableBucket());
         }
     }
 
@@ -466,10 +482,9 @@ public final class IndexApplier implements Closeable {
      *
      * @param record the index record to process
      * @param indexLogOffset the allocated log offset in index bucket address space
-     * @throws Exception if processing fails
      */
-    private void processIndexRecordToPreWriteBuffer(
-            short schemaId, LogRecord record, long indexLogOffset) throws Exception {
+    private void writeIndexRecordToPreWriteBuffer(
+            short schemaId, LogRecord record, long indexLogOffset) {
         // Extract key and value from the index record
         IndexedRow indexedRow = (IndexedRow) record.getRow();
         // For index table, the key should be: [index columns] + [primary key columns]
@@ -478,13 +493,15 @@ public final class IndexApplier implements Closeable {
         byte[] valueBytes = ValueEncoder.encodeValue(schemaId, indexedRow);
         // Apply to KV pre-write buffer using the allocated index bucket offset
         // This leverages the fact that index records contain UB records and can be directly applied
-        kvTablet.putToPreWriteBuffer(key, valueBytes, indexLogOffset);
+        kvTablet.putToPreWriteBufferSafety(key, valueBytes, indexLogOffset);
 
-        LOG.debug(
-                "Index record applied to pre-write buffer: indexLogOffset={}, keySize={}, valueSize={}",
-                indexLogOffset,
-                key.length,
-                valueBytes.length);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Index record applied to pre-write buffer: indexLogOffset={}, keySize={}, valueSize={}",
+                    indexLogOffset,
+                    key.length,
+                    valueBytes.length);
+        }
     }
 
     // ================================================================================================

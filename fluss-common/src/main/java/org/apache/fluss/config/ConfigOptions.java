@@ -467,7 +467,7 @@ public class ConfigOptions {
     public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_MEMORY_SIZE =
             key("server.index-cache.memory-size")
                     .memoryType()
-                    .defaultValue(MemorySize.parse("128mb"))
+                    .defaultValue(MemorySize.parse("512mb"))
                     .withDescription(
                             "The total bytes of memory the server can use for index cache, used by IndexLogCache and IndexLogBuildHelper components.");
 
@@ -483,7 +483,7 @@ public class ConfigOptions {
     public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_PER_REQUEST_MEMORY_SIZE =
             key("server.index-cache.per-request-memory-size")
                     .memoryType()
-                    .defaultValue(MemorySize.parse("8mb"))
+                    .defaultValue(MemorySize.parse("2mb"))
                     .withDescription(
                             "The minimum number of bytes that will be allocated by the index cache writer rounded down to the closest multiple of "
                                     + SERVER_INDEX_CACHE_PAGE_SIZE.key()
@@ -491,13 +491,6 @@ public class ConfigOptions {
                                     + SERVER_INDEX_CACHE_PAGE_SIZE.key()
                                     + ". "
                                     + "This option allows to allocate memory in batches to have better CPU-cached friendliness due to contiguous segments.");
-
-    public static final ConfigOption<Duration> SERVER_INDEX_CACHE_POOL_WAIT_TIMEOUT =
-            key("server.index-cache.wait-timeout")
-                    .durationType()
-                    .defaultValue(Duration.ofNanos(Long.MAX_VALUE))
-                    .withDescription(
-                            "Defines how long the index cache buffer pool will block when waiting for segments to become available.");
 
     // ------------------------------------------------------------------
     // ZooKeeper Settings

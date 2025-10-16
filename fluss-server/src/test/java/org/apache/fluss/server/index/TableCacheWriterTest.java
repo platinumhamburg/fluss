@@ -22,7 +22,6 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
-import org.apache.fluss.metadata.TablePartitionId;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.GenericRecord;
 import org.apache.fluss.record.LogRecord;
@@ -54,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
- * Comprehensive unit tests for {@link CacheWriterForIndexTable}.
+ * Comprehensive unit tests for {@link TableCacheWriter}.
  *
  * <p>This test class covers:
  *
@@ -67,7 +66,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  *   <li>Exception handling scenarios
  * </ul>
  */
-class CacheWriterForIndexTableTest {
+class TableCacheWriterTest {
 
     // Use INDEXED_TABLE_ID from TestData instead of defining our own
     private static final int DEFAULT_BUCKET_COUNT = 3;
@@ -76,11 +75,11 @@ class CacheWriterForIndexTableTest {
 
     private TestingMemorySegmentPool memoryPool;
     private IndexRowCache indexRowCache;
-    private TablePartitionId tablePartitionId;
+    private long indexTableId;
     private Schema mainTableSchema;
     private Schema indexSchema;
     private BucketingFunction bucketingFunction;
-    private CacheWriterForIndexTable cacheWriter;
+    private TableCacheWriter cacheWriter;
     private FlussScheduler scheduler;
     private LogTablet logTablet;
 
@@ -94,8 +93,6 @@ class CacheWriterForIndexTableTest {
         // Create LogTablet for IndexRowCache
         createLogTablet();
 
-        tablePartitionId = TablePartitionId.of(INDEXED_TABLE_ID, null);
-
         // Use TestData's indexed schema as main table schema
         mainTableSchema = INDEXED_SCHEMA;
 
@@ -105,14 +102,14 @@ class CacheWriterForIndexTableTest {
         bucketingFunction = BucketingFunction.of(null); // Use default FlussBucketingFunction
 
         // Create real IndexRowCache
-        Map<TablePartitionId, Integer> indexBucketDistribution = new HashMap<>();
-        indexBucketDistribution.put(tablePartitionId, DEFAULT_BUCKET_COUNT);
+        Map<Long, Integer> indexBucketDistribution = new HashMap<>();
+        indexBucketDistribution.put(indexTableId, DEFAULT_BUCKET_COUNT);
         this.indexRowCache = new IndexRowCache(memoryPool, logTablet, indexBucketDistribution);
 
-        // Create CacheWriterForIndexTable instance
+        // Create TableCacheWriter instance
         cacheWriter =
-                new CacheWriterForIndexTable(
-                        tablePartitionId,
+                new TableCacheWriter(
+                        indexTableId,
                         mainTableSchema,
                         indexSchema,
                         DEFAULT_BUCKET_COUNT,

@@ -33,6 +33,7 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
@@ -263,6 +264,34 @@ public final class KvTablet {
      */
     public LogAppendInfo putAsLeader(KvRecordBatch kvRecords, @Nullable int[] targetColumns)
             throws Exception {
+        WalBundle walBundle = null;
+        try {
+            walBundle = putAsLeaderInternal(kvRecords, targetColumns);
+            writeIndexCacheIfNeeded(walBundle.getWal(), walBundle.getAppendInfo());
+            return walBundle.getAppendInfo();
+        } finally {
+            if (walBundle != null && walBundle.getWalBuilder() != null) {
+                walBundle.getWalBuilder().deallocate();
+            }
+        }
+    }
+
+    private void writeIndexCacheIfNeeded(MemoryLogRecords logRecords, LogAppendInfo appendInfo) {
+        IndexCache cache = this.indexCache;
+        if (cache != null && !schema.getIndexes().isEmpty() && !appendInfo.duplicated()) {
+            try {
+                cache.cacheIndexDataFromLog(logRecords, appendInfo);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Successfully processed hot data via IndexCache for {}", tableBucket);
+                }
+            } catch (Exception e) {
+                LOG.warn("Error while writing hot data to IndexCache for {}", tableBucket, e);
+            }
+        }
+    }
+
+    private WalBundle putAsLeaderInternal(KvRecordBatch kvRecords, @Nullable int[] targetColumns)
+            throws Exception {
         return inWriteLock(
                 kvLock,
                 () -> {
@@ -294,7 +323,8 @@ public final class KvTablet {
                                 // it's for deletion
                                 byte[] oldValue = getFromBufferOrKv(key);
                                 if (oldValue == null) {
-                                    // there might be large amount of such deletion, so we don't log
+                                    // there might be large amount of such deletion, so we
+                                    // don't log
                                     LOG.debug(
                                             "The specific key can't be found in kv tablet although the kv record is for deletion, "
                                                     + "ignore it directly as it doesn't exist in the kv tablet yet.");
@@ -306,7 +336,8 @@ public final class KvTablet {
                                         walBuilder.append(ChangeType.DELETE, oldRow);
                                         kvPreWriteBuffer.delete(key, logOffset++);
                                     } else {
-                                        // otherwise, it's a partial update, should produce -U,+U
+                                        // otherwise, it's a partial update, should produce
+                                        // -U,+U
                                         walBuilder.append(ChangeType.UPDATE_BEFORE, oldRow);
                                         walBuilder.append(ChangeType.UPDATE_AFTER, newRow);
                                         kvPreWriteBuffer.put(
@@ -326,12 +357,14 @@ public final class KvTablet {
                                             currentMerger.merge(oldRow, kvRecord.getRow());
                                     if (newRow == oldRow) {
                                         // newRow is the same to oldRow, means nothing
-                                        // happens (no update/delete), and input should be ignored
+                                        // happens (no update/delete), and input should be
+                                        // ignored
                                         continue;
                                     }
                                     walBuilder.append(ChangeType.UPDATE_BEFORE, oldRow);
                                     walBuilder.append(ChangeType.UPDATE_AFTER, newRow);
-                                    // logOffset is for -U, logOffset + 1 is for +U, we need to use
+                                    // logOffset is for -U, logOffset + 1 is for +U, we need
+                                    // to use
                                     // the log offset for +U
                                     kvPreWriteBuffer.put(
                                             key,
@@ -340,7 +373,8 @@ public final class KvTablet {
                                     logOffset += 2;
                                 } else {
                                     // it's insert
-                                    // TODO: we should add guarantees that all non-specified columns
+                                    // TODO: we should add guarantees that all non-specified
+                                    // columns
                                     //  of the input row are set to null.
                                     BinaryRow newRow = kvRecord.getRow();
                                     walBuilder.append(ChangeType.INSERT, newRow);
@@ -352,56 +386,49 @@ public final class KvTablet {
                             }
                         }
 
-                        // There will be a situation that these batches of kvRecordBatch have not
-                        // generated any CDC logs, for example, when client attempts to delete
-                        // some non-existent keys or MergeEngineType set to FIRST_ROW. In this case,
+                        // There will be a situation that these batches of kvRecordBatch
+                        // have not
+                        // generated any CDC logs, for example, when client attempts to
+                        // delete
+                        // some non-existent keys or MergeEngineType set to FIRST_ROW. In
+                        // this case,
                         // we cannot simply return, as doing so would cause a
-                        // OutOfOrderSequenceException problem. Therefore, here we will build an
-                        // empty batch with lastLogOffset to 0L as the baseLogOffset is 0L. As doing
-                        // that, the logOffsetDelta in logRecordBatch will be set to 0L. So, we will
-                        // put a batch into file with recordCount 0 and offset plus 1L, it will
-                        // update the batchSequence corresponding to the writerId and also increment
+                        // OutOfOrderSequenceException problem. Therefore, here we will
+                        // build an
+                        // empty batch with lastLogOffset to 0L as the baseLogOffset is 0L.
+                        // As doing
+                        // that, the logOffsetDelta in logRecordBatch will be set to 0L. So,
+                        // we will
+                        // put a batch into file with recordCount 0 and offset plus 1L, it
+                        // will
+                        // update the batchSequence corresponding to the writerId and also
+                        // increment
                         // the CDC log offset by 1.
-                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
+                        MemoryLogRecords logRecords = walBuilder.build();
 
-                        // if the batch is duplicated, we should truncate the kvPreWriteBuffer
+                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(logRecords);
+
+                        // if the batch is duplicated, we should truncate the
+                        // kvPreWriteBuffer
                         // already written.
                         if (logAppendInfo.duplicated()) {
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
-                        } else {
-                            // NEW: Write hot data to IndexCache for real-time index caching
-                            // Only process hot data writing if the batch is not duplicated
-                            IndexCache cache = this.indexCache;
-                            if (cache != null && !schema.getIndexes().isEmpty()) {
-                                try {
-                                    // Use the WAL LogRecords and appendInfo to process hot data
-                                    cache.writeHotDataFromWAL(walBuilder.build(), logAppendInfo);
-                                    LOG.debug(
-                                            "Successfully processed hot data via IndexCache for {}",
-                                            tableBucket);
-                                } catch (Exception e) {
-                                    LOG.warn(
-                                            "Error while writing hot data to IndexCache for {}",
-                                            tableBucket,
-                                            e);
-                                    // Don't fail the main write operation due to index cache issues
-                                }
-                            }
                         }
-                        return logAppendInfo;
+                        return new WalBundle(logAppendInfo, walBuilder, logRecords);
                     } catch (Throwable t) {
-                        // While encounter error here, the CDC logs may fail writing to disk,
-                        // and the client probably will resend the batch. If we do not remove the
-                        // values generated by the erroneous batch from the kvPreWriteBuffer, the
+                        // While encounter error here, the CDC logs may fail writing to
+                        // disk,
+                        // and the client probably will resend the batch. If we do not
+                        // remove the
+                        // values generated by the erroneous batch from the
+                        // kvPreWriteBuffer, the
                         // retry-send batch will produce incorrect CDC logs.
-                        // TODO for some errors, the cdc logs may already be written to disk, for
+                        // TODO for some errors, the cdc logs may already be written to
+                        // disk, for
                         //  those errors, we should not truncate the kvPreWriteBuffer.
                         kvPreWriteBuffer.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.ERROR);
                         throw t;
-                    } finally {
-                        // deallocate the memory and arrow writer used by the wal builder
-                        walBuilder.deallocate();
                     }
                 });
     }
@@ -458,7 +485,8 @@ public final class KvTablet {
                             flushedLogOffset = exclusiveUpToLogOffset;
                         } catch (Throwable t) {
                             fatalErrorHandler.onFatalError(
-                                    new KvStorageException("Failed to flush kv pre-write buffer."));
+                                    new KvStorageException(
+                                            "Failed to flush kv pre-write buffer.", t));
                         }
                     }
                 });
@@ -481,6 +509,20 @@ public final class KvTablet {
         } else {
             kvPreWriteBuffer.put(wrapKey, value, logOffset);
         }
+    }
+
+    /**
+     * Put key,value,logOffset into pre-write buffer directly.
+     *
+     * <p>This method is intended for use only in recovery operations and index updates. It bypasses
+     * the normal write flow and should not be used for regular client writes.
+     *
+     * @param key the key bytes
+     * @param value the value bytes, null for deletion
+     * @param logOffset the log offset for this record
+     */
+    public void putToPreWriteBufferSafety(byte[] key, @Nullable byte[] value, long logOffset) {
+        inWriteLock(kvLock, () -> putToPreWriteBuffer(key, value, logOffset));
     }
 
     /**
@@ -584,5 +626,29 @@ public final class KvTablet {
     @VisibleForTesting
     public RocksDBKv getRocksDBKv() {
         return rocksDBKv;
+    }
+
+    private static class WalBundle {
+        private LogAppendInfo appendInfo;
+        private WalBuilder walBuilder;
+        private MemoryLogRecords wal;
+
+        WalBundle(LogAppendInfo appendInfo, WalBuilder walBuilder, MemoryLogRecords wal) {
+            this.appendInfo = appendInfo;
+            this.walBuilder = walBuilder;
+            this.wal = wal;
+        }
+
+        public LogAppendInfo getAppendInfo() {
+            return appendInfo;
+        }
+
+        public WalBuilder getWalBuilder() {
+            return walBuilder;
+        }
+
+        public MemoryLogRecords getWal() {
+            return wal;
+        }
     }
 }

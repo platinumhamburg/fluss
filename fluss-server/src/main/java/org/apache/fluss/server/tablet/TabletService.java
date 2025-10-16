@@ -242,9 +242,17 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     private static FetchIndexParams getFetchIndexParams(FetchIndexRequest request) {
         FetchIndexParams fetchParams;
         if (request.hasMaxWaitMs()) {
-            fetchParams = new FetchIndexParams(request.getMaxRecords(), request.getMaxWaitMs());
+            fetchParams =
+                    new FetchIndexParams(
+                            request.getMaxRecords(),
+                            request.getMinBucketFetchRecords(),
+                            request.getMaxWaitMs());
         } else {
-            fetchParams = new FetchIndexParams(request.getMaxRecords());
+            fetchParams =
+                    new FetchIndexParams(
+                            request.getMaxRecords(),
+                            request.getMinBucketFetchRecords(),
+                            FetchIndexParams.DEFAULT_MAX_WAIT_MS);
         }
         return fetchParams;
     }

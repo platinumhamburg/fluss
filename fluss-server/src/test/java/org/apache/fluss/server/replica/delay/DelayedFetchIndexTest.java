@@ -70,6 +70,7 @@ public class DelayedFetchIndexTest extends ReplicaTestBase {
         DelayedFetchIndex delayedFetchIndex =
                 createDelayedFetchIndexRequest(
                         10, // maxFetchRecords
+                        -1,
                         Duration.ofMinutes(3).toMillis(), // max wait ms large enough
                         dataBucketRequests,
                         new HashMap<>(), // empty complete fetches initially
@@ -122,6 +123,7 @@ public class DelayedFetchIndexTest extends ReplicaTestBase {
         DelayedFetchIndex delayedFetchIndex =
                 createDelayedFetchIndexRequest(
                         10, // maxFetchRecords
+                        -1,
                         1000, // wait time is small enough
                         dataBucketRequests,
                         new HashMap<>(), // empty complete fetches initially
@@ -164,11 +166,13 @@ public class DelayedFetchIndexTest extends ReplicaTestBase {
 
     private DelayedFetchIndex createDelayedFetchIndexRequest(
             int maxFetchRecords,
+            int minBucketFetchRecords,
             long maxWaitMs,
             Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> dataBucketRequests,
             Map<TableBucket, DataBucketIndexFetchResult> completeFetches,
             Consumer<Map<TableBucket, DataBucketIndexFetchResult>> responseCallback) {
-        FetchIndexParams fetchIndexParams = new FetchIndexParams(maxFetchRecords, maxWaitMs);
+        FetchIndexParams fetchIndexParams =
+                new FetchIndexParams(maxFetchRecords, minBucketFetchRecords, maxWaitMs);
         return new DelayedFetchIndex(
                 fetchIndexParams,
                 replicaManager,

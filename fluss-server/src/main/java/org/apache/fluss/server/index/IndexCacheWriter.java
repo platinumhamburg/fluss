@@ -22,7 +22,6 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
-import org.apache.fluss.metadata.TablePartitionId;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
@@ -78,7 +77,7 @@ public final class IndexCacheWriter implements Closeable {
 
     private volatile boolean closed = false;
 
-    private List<CacheWriterForIndexTable> cacheWriterForIndexTableTables;
+    private final List<TableCacheWriter> tableTableCacheWriters;
 
     public IndexCacheWriter(
             LogTablet logTablet,
@@ -89,13 +88,12 @@ public final class IndexCacheWriter implements Closeable {
         this.logTablet = logTablet;
         this.tableSchema = tableSchema;
 
-        this.cacheWriterForIndexTableTables =
+        this.tableTableCacheWriters =
                 indexTableInfos.stream()
                         .map(
                                 indexTableInfo ->
-                                        new CacheWriterForIndexTable(
-                                                TablePartitionId.of(
-                                                        indexTableInfo.getTableId(), null),
+                                        new TableCacheWriter(
+                                                indexTableInfo.getTableId(),
                                                 tableSchema,
                                                 indexTableInfo.getSchema(),
                                                 indexTableInfo.getNumBuckets(),
@@ -118,7 +116,7 @@ public final class IndexCacheWriter implements Closeable {
      * @param appendInfo the log append information containing offset details
      * @throws Exception if an error occurs during hot data processing
      */
-    public void writeHotDataFromWAL(LogRecords walRecords, LogAppendInfo appendInfo)
+    public void cacheIndexDataByLog(LogRecords walRecords, LogAppendInfo appendInfo)
             throws Exception {
 
         if (closed) {
@@ -129,9 +127,11 @@ public final class IndexCacheWriter implements Closeable {
         }
 
         if (walRecords == null || appendInfo == null) {
-            LOG.debug(
-                    "Invalid parameters for hot data writing, skipping, tableBucket {}",
-                    logTablet.getTableBucket());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Invalid parameters for hot data writing, skipping, tableBucket {}",
+                        logTablet.getTableBucket());
+            }
             return;
         }
 
@@ -142,17 +142,21 @@ public final class IndexCacheWriter implements Closeable {
             return;
         }
 
-        LOG.debug(
-                "Writing hot data from WAL, base offset: {}, tableBucket {}",
-                appendInfo.firstOffset(),
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Writing hot data from WAL, base offset: {}, tableBucket {}",
+                    appendInfo.firstOffset(),
+                    logTablet.getTableBucket());
+        }
 
         // Use unified distribution pipeline to write to cache
         distributeRecordsToCache(walRecords, appendInfo.firstOffset());
 
-        LOG.debug(
-                "Successfully wrote hot data to cache for table bucket {}",
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Successfully wrote hot data to cache for table bucket {}",
+                    logTablet.getTableBucket());
+        }
     }
 
     /**
@@ -180,19 +184,23 @@ public final class IndexCacheWriter implements Closeable {
         }
 
         if (globalStartOffset >= globalEndOffset) {
-            LOG.debug(
-                    "No data to batch load, start offset {} >= end offset {}, tableBucket {}",
-                    globalStartOffset,
-                    globalEndOffset,
-                    logTablet.getTableBucket());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "No data to batch load, start offset {} >= end offset {}, tableBucket {}",
+                        globalStartOffset,
+                        globalEndOffset,
+                        logTablet.getTableBucket());
+            }
             return;
         }
 
-        LOG.debug(
-                "Batch loading cold data from global WAL range [{}, {}), tableBucket {}",
-                globalStartOffset,
-                globalEndOffset,
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Batch loading cold data from global WAL range [{}, {}), tableBucket {}",
+                    globalStartOffset,
+                    globalEndOffset,
+                    logTablet.getTableBucket());
+        }
 
         // Read WAL data and distribute with conditional writing
         long currentOffset = globalStartOffset;
@@ -224,11 +232,13 @@ public final class IndexCacheWriter implements Closeable {
             currentOffset = nextOffset;
         }
 
-        LOG.debug(
-                "Successfully batch loaded cold data from global WAL range [{}, {}), tableBucket {}",
-                globalStartOffset,
-                globalEndOffset,
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Successfully batch loaded cold data from global WAL range [{}, {}), tableBucket {}",
+                    globalStartOffset,
+                    globalEndOffset,
+                    logTablet.getTableBucket());
+        }
     }
 
     /**
@@ -252,7 +262,7 @@ public final class IndexCacheWriter implements Closeable {
                     CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
                 while (recordIterator.hasNext()) {
                     LogRecord walRecord = recordIterator.next();
-                    for (CacheWriterForIndexTable indexWriter : cacheWriterForIndexTableTables) {
+                    for (TableCacheWriter indexWriter : tableTableCacheWriters) {
                         indexWriter.writeRecord(walRecord, currentOffset);
                     }
                     currentOffset++;
