@@ -22,6 +22,8 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentOutputView;
 import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.metadata.SchemaInfo;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.BytesViewLogRecords;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.IndexedLogRecord;
@@ -36,16 +38,21 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
+import java.io.EOFException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static java.util.Collections.emptyList;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
+import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
+import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
 
 /**
  * IndexBucketRowCache manages cached index data for a single bucket using a range-based
@@ -66,141 +73,97 @@ public class IndexBucketRowCache implements Closeable {
 
     private static final Logger LOG = LoggerFactory.getLogger(IndexBucketRowCache.class);
 
-    private final MemorySegmentPool memoryPool;
-    private final TreeMap<Long, OffsetRange> offsetRanges = new TreeMap<>();
-    private volatile boolean closed = false;
-    private int totalSize = 0;
-    private long commitOffset = 0;
+    /** ReadWrite lock to protect concurrent operations. */
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    public IndexBucketRowCache(MemorySegmentPool memoryPool) {
+    private final MemorySegmentPool memoryPool;
+    private final NavigableMap<Long, OffsetRange> offsetRanges = new TreeMap<>();
+
+    /** Cache for the last accessed range to optimize consecutive operations. */
+    private volatile OffsetRange lastReadRange = null;
+
+    private volatile boolean closed = false;
+
+    private final TableBucket dataBucket;
+
+    private final TableBucket indexBucket;
+
+    public IndexBucketRowCache(
+            TableBucket dataBucket, TableBucket indexBucket, MemorySegmentPool memoryPool) {
+        this.dataBucket = dataBucket;
+        this.indexBucket = indexBucket;
         this.memoryPool = memoryPool;
     }
 
-    public void updateCommitOffset(long commitOffset) {
-        this.commitOffset = commitOffset;
-    }
-
-    public long getCommitOffset() {
-        return commitOffset;
-    }
-
     /**
-     * Writes to cache for sparse indexing support - drives Range creation or expansion without
-     * actual IndexedRow data.
-     *
-     * <p>This method is specifically designed to handle sparse indexing scenarios where certain
-     * offsets may not have corresponding index data but still need to participate in the Range
-     * structure management.
-     *
-     * <p>Key behaviors: - Ignores if logOffset already exists in any range to prevent duplicates -
-     * Creates or expands OffsetRange to include the specified offset - Supports auto-merging of
-     * adjacent ranges when boundaries meet - Uses the same Range-based adjacency strategy as the
-     * main writeIndexedRow method
-     *
-     * @param logOffset the log offset to expand range for (without actual data)
-     * @throws IOException if there's an error during range operations
-     */
-    public void writeEmptyRowForOffset(long logOffset) throws IOException {
-        if (closed) {
-            throw new IllegalStateException("IndexBucketRowCache is closed");
-        }
-
-        // Check if logOffset already exists in any range - ignore if found
-        if (containsOffset(logOffset)) {
-            LOG.trace(
-                    "Ignoring range expansion for existing logOffset {} in IndexBucketRowCache",
-                    logOffset);
-            return;
-        }
-
-        // Find appropriate range using TreeMap floor entry (largest range <= logOffset)
-        Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
-        OffsetRange targetRange = null;
-
-        if (floorEntry != null) {
-            OffsetRange candidateRange = floorEntry.getValue();
-            // Check if the offset is adjacent to the range's right boundary
-            if (candidateRange.canAcceptOffset(logOffset)) {
-                targetRange = candidateRange;
-            }
-        }
-
-        // Create new range if no suitable range found
-        if (targetRange == null) {
-            targetRange = createNewRange(logOffset);
-        }
-
-        // Expand range boundary without writing actual data
-        targetRange.expandRangeBoundary(logOffset);
-
-        // Check for auto-merging with the next range
-        checkAndMergeWithNextRange(targetRange);
-
-        LOG.trace(
-                "Expanded range for logOffset {} to range [{}, {}), total ranges: {}",
-                logOffset,
-                targetRange.getStartOffset(),
-                targetRange.getEndOffset(),
-                offsetRanges.size());
-    }
-
-    /**
-     * Writes an IndexedRow to the cache for a specific logOffset using Range-based strict adjacency
-     * mechanism.
-     *
-     * <p>Range-Based Write Strategy: - Find the largest range smaller than data offset using
-     * TreeMap.floorEntry() - Check adjacency: data offset must equal range right boundary - Extend
-     * existing range if adjacent, create new range if not adjacent - Auto-merge ranges when
-     * boundaries meet after expansion
-     *
-     * <p>Duplication Handling: If the logOffset already exists in any range, the write is ignored
-     * to prevent duplicates and maintain data consistency.
+     * Writes an IndexedRow to the cache for a specific logOffset with optional automatic gap
+     * filling capability. This method also supports writing empty rows for sparse indexing by
+     * passing null values for changeType and indexedRow.
      *
      * @param logOffset the log offset
-     * @param indexedRow the IndexedRow to cache
-     * @throws IOException if an error occurs during writing
+     * @param changeType the change type of the row (null for empty row)
+     * @param indexedRow the IndexedRow to cache (null for empty row)
+     * @param batchStartOffset the minimum offset for gap filling
      */
-    public void writeIndexedRow(long logOffset, ChangeType changeType, IndexedRow indexedRow)
+    public void writeIndexedRow(
+            long logOffset, ChangeType changeType, IndexedRow indexedRow, long batchStartOffset)
             throws IOException {
-        if (closed) {
-            throw new IllegalStateException("IndexBucketRowCache is closed");
-        }
+        inWriteLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        throw new IllegalStateException("IndexBucketRowCache is closed");
+                    }
 
-        // Check if logOffset already exists across all ranges - ignore if found
-        if (containsOffset(logOffset)) {
-            LOG.trace("Ignoring write for existing logOffset {} in IndexBucketRowCache", logOffset);
-            return;
-        }
+                    // Determine if this is an empty row write
+                    boolean isEmptyRowWrite = (changeType == null && indexedRow == null);
 
-        // Find appropriate range using TreeMap floor entry (largest range <= logOffset)
-        Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
-        OffsetRange targetRange = null;
+                    // Find appropriate range using TreeMap floor entry (largest range <= logOffset)
+                    Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
+                    OffsetRange targetRange = null;
 
-        if (floorEntry != null) {
-            OffsetRange candidateRange = floorEntry.getValue();
-            // Check if the offset is adjacent to the range's right boundary
-            if (candidateRange.canAcceptOffset(logOffset)) {
-                targetRange = candidateRange;
-            }
-        }
+                    if (floorEntry != null) {
+                        OffsetRange candidateRange = floorEntry.getValue();
 
-        // Create new range if no suitable range found
-        if (targetRange == null) {
-            targetRange = createNewRange(logOffset);
-        }
+                        if (logOffset == candidateRange.getEndOffset()) {
+                            // Adjacent write
+                            targetRange = candidateRange;
+                        } else if (logOffset > candidateRange.getEndOffset()) {
+                            if (candidateRange.getEndOffset() < batchStartOffset) {
+                                targetRange =
+                                        createNewRangeForOffsetRange(batchStartOffset, logOffset);
+                            } else {
+                                candidateRange.expandRangeBoundaryToOffset(logOffset);
+                                targetRange = candidateRange;
+                            }
+                        } else {
+                            // Data already exists in a range, ignore
+                            return;
+                        }
+                    } else {
+                        targetRange = createNewRangeForOffsetRange(batchStartOffset, logOffset);
+                    }
 
-        // Write data to the target range
-        totalSize += targetRange.writeIndexedRow(logOffset, changeType, indexedRow);
+                    // Write data to the target range (only if not empty row)
+                    if (!isEmptyRowWrite) {
+                        targetRange.writeIndexedRow(logOffset, changeType, indexedRow);
+                    } else {
+                        targetRange.expandRangeBoundaryToOffset(logOffset + 1);
+                    }
 
-        // Check for auto-merging with the next range
-        checkAndMergeWithNextRange(targetRange);
+                    // Check for auto-merging with the next range
+                    checkAndMergeWithNextRange(targetRange);
 
-        LOG.trace(
-                "Wrote IndexedRow for logOffset {} to range [{}, {}), total ranges: {}",
-                logOffset,
-                targetRange.getStartOffset(),
-                targetRange.getEndOffset(),
-                offsetRanges.size());
+                    if (LOG.isTraceEnabled()) {
+                        LOG.trace(
+                                "{} for logOffset {} to range [{}, {}), total ranges: {}",
+                                isEmptyRowWrite ? "Expanded range" : "Wrote IndexedRow",
+                                logOffset,
+                                targetRange.getStartOffset(),
+                                targetRange.getEndOffset(),
+                                offsetRanges.size());
+                    }
+                });
     }
 
     /**
@@ -212,58 +175,52 @@ public class IndexBucketRowCache implements Closeable {
      * logical address continuity and accurate LogRecordBatch construction.
      *
      * @param startOffset the start offset (inclusive)
-     * @param endOffset the end offset (exclusive)
-     * @param schemaId the schema ID for the LogRecordBatch headers
+     * @param maxEndOffset the end offset (exclusive)
      * @return LogRecords with accurate headers, or empty LogRecords if no data in range
      * @throws IllegalArgumentException if the query spans multiple ranges
      */
-    public LogRecords getRangeLogRecords(long startOffset, long endOffset, short schemaId) {
-        if (closed) {
-            return createEmptyLogRecords();
-        }
+    public LogRecords readIndexLogRecords(long startOffset, long maxEndOffset) {
+        return inReadLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        return createEmptyLogRecords();
+                    }
 
-        if (startOffset >= endOffset) {
-            return createEmptyLogRecords();
-        }
+                    if (startOffset >= maxEndOffset) {
+                        return createEmptyLogRecords();
+                    }
 
-        // Find the range containing the start offset
-        OffsetRange containingRange = findRangeContaining(startOffset);
-        if (containingRange == null) {
-            return createEmptyLogRecords();
-        }
+                    if (lastReadRange != null && lastReadRange.contains(startOffset)) {
+                        return lastReadRange.getRangeRecords(startOffset, maxEndOffset);
+                    }
 
-        // Enforce single range constraint
-        if (!containingRange.containsRange(startOffset, endOffset)) {
-            throw new IllegalArgumentException(
-                    String.format(
-                            "Query range [%d, %d) spans multiple ranges or exceeds range boundary. "
-                                    + "Found range [%d, %d). Single range queries only.",
-                            startOffset,
-                            endOffset,
-                            containingRange.getStartOffset(),
-                            containingRange.getEndOffset()));
-        }
+                    // Find the range containing the start offset using optimized method
+                    OffsetRange containingRange = findRangeContaining(startOffset);
 
-        // Get LogRecords from the single range with accurate metadata
-        return containingRange.getRangeLogRecords(startOffset, endOffset, schemaId);
-    }
+                    lastReadRange = containingRange;
 
-    /**
-     * Checks if the cache contains actual IndexedRow data for a specific offset.
-     *
-     * @param offset the offset to check
-     * @return true if actual IndexedRow data exists at this offset
-     */
-    public boolean containsOffset(long offset) {
-        if (closed) {
-            return false;
-        }
-        OffsetRange containingRange = findRangeContaining(offset);
-        if (containingRange == null) {
-            return false;
-        }
-        // Check if there's actual IndexedRow data at this offset, not just range boundary
-        return containingRange.hasDataAtOffset(offset);
+                    if (containingRange == null) {
+                        return createEmptyLogRecords();
+                    }
+
+                    if (!containingRange.contains(startOffset)) {
+                        throw new IllegalArgumentException(
+                                String.format(
+                                        "Start offset %d is not within the containing range [%d, %d).",
+                                        startOffset,
+                                        containingRange.getStartOffset(),
+                                        containingRange.getEndOffset()));
+                    }
+
+                    // Calculate the actual end offset - use the smaller of expectedEndOffset or
+                    // range
+                    // boundary
+                    long actualEndOffset = Math.min(maxEndOffset, containingRange.getEndOffset());
+
+                    // Get LogRecords from the single range with accurate metadata
+                    return containingRange.getRangeRecords(startOffset, actualEndOffset);
+                });
     }
 
     /**
@@ -272,10 +229,78 @@ public class IndexBucketRowCache implements Closeable {
      * @return total cached entries count
      */
     public int totalEntries() {
-        if (closed) {
-            return 0;
-        }
-        return offsetRanges.values().stream().mapToInt(OffsetRange::size).sum();
+        return inReadLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        return 0;
+                    }
+
+                    return offsetRanges.values().stream().mapToInt(OffsetRange::size).sum();
+                });
+    }
+
+    /**
+     * Returns the total number of MemorySegments used across all ranges.
+     *
+     * @return total memory segment count
+     */
+    public int getMemorySegmentCount() {
+        return inReadLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        return 0;
+                    }
+
+                    return offsetRanges.values().stream()
+                            .mapToInt(OffsetRange::getMemorySegmentCount)
+                            .sum();
+                });
+    }
+
+    /**
+     * Gets the number of cached hot data records in the specified range. This method counts actual
+     * IndexedRow entries that are already cached (hot data), excluding any gaps that would need to
+     * be loaded from WAL.
+     *
+     * <p>This method is used to determine if there are enough hot records to satisfy a
+     * minBucketFetchRecords requirement without loading additional data from WAL.
+     *
+     * @param startOffset the start offset (inclusive)
+     * @param maxEndOffset the end offset (exclusive)
+     * @return the number of hot data records in the range
+     */
+    public int getCachedRecordCountInRange(long startOffset, long maxEndOffset) {
+        return inReadLock(
+                lock,
+                () -> {
+                    if (closed || startOffset >= maxEndOffset) {
+                        return 0;
+                    }
+
+                    int totalRecords = 0;
+
+                    // Find all ranges that intersect with the query range
+                    for (OffsetRange range : offsetRanges.values()) {
+                        if (range.getStartOffset() < maxEndOffset
+                                && range.getEndOffset() > startOffset) {
+                            // Calculate the intersection range
+                            long intersectionStart = Math.max(range.getStartOffset(), startOffset);
+                            long intersectionEnd = Math.min(range.getEndOffset(), maxEndOffset);
+
+                            // Count records in the intersection range
+                            if (intersectionStart < intersectionEnd) {
+                                NavigableMap<Long, RowCacheIndexEntry> entriesInRange =
+                                        range.localIndex.getEntriesInRange(
+                                                intersectionStart, intersectionEnd);
+                                totalRecords += entriesInRange.size();
+                            }
+                        }
+                    }
+
+                    return totalRecords;
+                });
     }
 
     /**
@@ -288,21 +313,79 @@ public class IndexBucketRowCache implements Closeable {
     }
 
     /**
-     * Returns the number of OffsetRange segments in this cache.
+     * Returns the TableBucket information for data bucket.
      *
-     * @return the count of active ranges
+     * @return the data bucket
      */
-    public int getRangeCount() {
-        return offsetRanges.size();
+    public TableBucket getDataBucket() {
+        return dataBucket;
     }
 
     /**
-     * Returns the total size in bytes of all cached data.
+     * Returns the TableBucket information for index bucket.
      *
-     * @return total size in bytes
+     * @return the index bucket
      */
-    public long getTotalSize() {
-        return totalSize;
+    public TableBucket getIndexBucket() {
+        return indexBucket;
+    }
+
+    /**
+     * Gets Range distribution information for memory usage analysis.
+     *
+     * @return a list of range memory information
+     */
+    public List<RangeMemoryInfo> getRangeDistribution() {
+        return inReadLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        return Collections.emptyList();
+                    }
+
+                    List<RangeMemoryInfo> rangeInfos = new ArrayList<>();
+                    for (OffsetRange range : offsetRanges.values()) {
+                        rangeInfos.add(
+                                new RangeMemoryInfo(
+                                        range.getStartOffset(),
+                                        range.getEndOffset(),
+                                        range.size(),
+                                        range.getMemorySegmentCount()));
+                    }
+                    return rangeInfos;
+                });
+    }
+
+    /** Information about an offset range for memory usage analysis. */
+    public static class RangeMemoryInfo {
+        private final long startOffset;
+        private final long endOffset;
+        private final int entryCount;
+        private final int memorySegmentCount;
+
+        public RangeMemoryInfo(
+                long startOffset, long endOffset, int entryCount, int memorySegmentCount) {
+            this.startOffset = startOffset;
+            this.endOffset = endOffset;
+            this.entryCount = entryCount;
+            this.memorySegmentCount = memorySegmentCount;
+        }
+
+        public long getStartOffset() {
+            return startOffset;
+        }
+
+        public long getEndOffset() {
+            return endOffset;
+        }
+
+        public int getEntryCount() {
+            return entryCount;
+        }
+
+        public int getMemorySegmentCount() {
+            return memorySegmentCount;
+        }
     }
 
     /**
@@ -320,144 +403,162 @@ public class IndexBucketRowCache implements Closeable {
      * @return a list of OffsetRangeInfo representing gaps that need data loading
      */
     public List<OffsetRangeInfo> getUnloadedRanges(long startOffset, long endOffset) {
-        if (closed) {
-            return emptyList();
-        }
+        return inReadLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        return emptyList();
+                    }
 
-        if (startOffset >= endOffset) {
-            return emptyList();
-        }
+                    if (startOffset >= endOffset) {
+                        return emptyList();
+                    }
 
-        List<OffsetRangeInfo> unloadedRanges = new ArrayList<>();
+                    List<OffsetRangeInfo> unloadedRanges = new ArrayList<>();
 
-        if (offsetRanges.isEmpty()) {
-            // No ranges exist, entire query range is unloaded
-            unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
-            return unloadedRanges;
-        }
+                    if (offsetRanges.isEmpty()) {
+                        // No ranges exist, entire query range is unloaded
+                        unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
+                        return unloadedRanges;
+                    }
 
-        // Find all ranges that might intersect with the query range
-        List<OffsetRange> intersectingRanges = new ArrayList<>();
-        for (OffsetRange range : offsetRanges.values()) {
-            // Check if range intersects with [startOffset, endOffset)
-            if (range.getStartOffset() < endOffset && range.getEndOffset() > startOffset) {
-                intersectingRanges.add(range);
-            }
-        }
+                    // Find all ranges that might intersect with the query range
+                    List<OffsetRange> intersectingRanges = new ArrayList<>();
+                    for (OffsetRange range : offsetRanges.values()) {
+                        // Check if range intersects with [startOffset, endOffset)
+                        if (range.getStartOffset() < endOffset
+                                && range.getEndOffset() > startOffset) {
+                            intersectingRanges.add(range);
+                        }
+                    }
 
-        if (intersectingRanges.isEmpty()) {
-            // No existing ranges intersect with query range, entire range is unloaded
-            unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
-            return unloadedRanges;
-        }
+                    if (intersectingRanges.isEmpty()) {
+                        // No existing ranges intersect with query range, entire range is unloaded
+                        unloadedRanges.add(new OffsetRangeInfo(startOffset, endOffset));
+                        return unloadedRanges;
+                    }
 
-        // Sort ranges by start offset (should already be sorted, but ensure)
-        intersectingRanges.sort((r1, r2) -> Long.compare(r1.getStartOffset(), r2.getStartOffset()));
+                    // Sort ranges by start offset (should already be sorted, but ensure)
+                    intersectingRanges.sort(Comparator.comparingLong(OffsetRange::getStartOffset));
 
-        // Find gaps within the query range
-        long currentOffset = startOffset;
+                    // Find gaps within the query range
+                    long currentOffset = startOffset;
 
-        for (OffsetRange range : intersectingRanges) {
-            long rangeStart = Math.max(range.getStartOffset(), startOffset);
-            long rangeEnd = Math.min(range.getEndOffset(), endOffset);
+                    for (OffsetRange range : intersectingRanges) {
+                        long rangeStart = Math.max(range.getStartOffset(), startOffset);
+                        long rangeEnd = Math.min(range.getEndOffset(), endOffset);
 
-            // Check for gap before this range
-            if (currentOffset < rangeStart) {
-                unloadedRanges.add(new OffsetRangeInfo(currentOffset, rangeStart));
-            }
+                        // Check for gap before this range
+                        if (currentOffset < rangeStart) {
+                            unloadedRanges.add(new OffsetRangeInfo(currentOffset, rangeStart));
+                        }
 
-            // Move current offset past this range
-            currentOffset = Math.max(currentOffset, rangeEnd);
-        }
+                        // Move current offset past this range
+                        currentOffset = Math.max(currentOffset, rangeEnd);
+                    }
 
-        // Check for gap after all ranges
-        if (currentOffset < endOffset) {
-            unloadedRanges.add(new OffsetRangeInfo(currentOffset, endOffset));
-        }
+                    // Check for gap after all ranges
+                    if (currentOffset < endOffset) {
+                        unloadedRanges.add(new OffsetRangeInfo(currentOffset, endOffset));
+                    }
 
-        LOG.trace(
-                "Found {} unloaded ranges within [{}, {}) with {} existing ranges",
-                unloadedRanges.size(),
-                startOffset,
-                endOffset,
-                intersectingRanges.size());
+                    LOG.trace(
+                            "Found {} unloaded ranges within [{}, {}) with {} existing ranges",
+                            unloadedRanges.size(),
+                            startOffset,
+                            endOffset,
+                            intersectingRanges.size());
 
-        return unloadedRanges;
+                    return unloadedRanges;
+                });
     }
 
     /**
      * Cleanup cached data below the given horizon offset.
      *
-     * @param horizonOffset the horizon offset - data below this will be cleaned up
-     * @throws IOException if cleanup operation fails
+     * @param cleanupHorizonOffset the horizon offset - data below this will be cleaned up
      */
-    public void cleanupBelowHorizon(long horizonOffset) throws IOException {
-        if (closed) {
-            return;
-        }
+    public void garbageCollectBelowOffset(long cleanupHorizonOffset) {
+        inWriteLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        return;
+                    }
 
-        List<Long> rangesToRemove = new ArrayList<>();
-        int totalRemovedSize = 0;
-        for (Map.Entry<Long, OffsetRange> entry : offsetRanges.entrySet()) {
-            OffsetRange range = entry.getValue();
-            int removedSize = range.cleanupBelowHorizon(horizonOffset);
-            totalRemovedSize += removedSize;
+                    List<Long> rangesToRemove = new ArrayList<>();
+                    int totalRemovedSize = 0;
+                    for (Map.Entry<Long, OffsetRange> entry : offsetRanges.entrySet()) {
+                        OffsetRange range = entry.getValue();
+                        int removedSize = range.cleanupBelowHorizon(cleanupHorizonOffset);
+                        totalRemovedSize += removedSize;
 
-            if (range.isEmpty()) {
-                rangesToRemove.add(entry.getKey());
-            }
-        }
+                        if (range.isEmpty()) {
+                            rangesToRemove.add(entry.getKey());
+                        }
+                    }
 
-        // Update total size
-        totalSize -= totalRemovedSize;
-
-        // Remove empty ranges
-        for (Long rangeKey : rangesToRemove) {
-            OffsetRange range = offsetRanges.remove(rangeKey);
-            if (range != null) {
-                range.close();
-            }
-        }
-
-        LOG.debug(
-                "Cleaned up data below horizon {}, reclaimed {} bytes, removed {} empty ranges. Current ranges: {}",
-                horizonOffset,
-                totalRemovedSize,
-                rangesToRemove.size(),
-                offsetRanges.size());
+                    // Remove empty ranges
+                    for (Long rangeKey : rangesToRemove) {
+                        OffsetRange range = offsetRanges.remove(rangeKey);
+                        if (range != null) {
+                            try {
+                                range.close();
+                            } catch (IOException e) {
+                                LOG.error("Error closing range", e);
+                            }
+                        }
+                    }
+                    if (totalRemovedSize > 0) {
+                        LOG.info(
+                                "IndexBucketRowCache({} -> {}) cleaned up data below horizon {}, reclaimed {} bytes, removed {} empty ranges. Current ranges: {}",
+                                dataBucket,
+                                indexBucket,
+                                cleanupHorizonOffset,
+                                totalRemovedSize,
+                                rangesToRemove.size(),
+                                offsetRanges.size());
+                    }
+                });
     }
 
     @Override
     public void close() throws IOException {
-        if (closed) {
-            return;
-        }
+        inWriteLock(
+                lock,
+                () -> {
+                    if (closed) {
+                        return;
+                    }
+                    closed = true;
 
-        closed = true;
+                    // Clear cache
+                    lastReadRange = null;
 
-        // Close all ranges
-        for (OffsetRange range : offsetRanges.values()) {
-            try {
-                range.close();
-            } catch (Exception e) {
-                LOG.warn("Error closing offset range", e);
-            }
-        }
-
-        offsetRanges.clear();
-        totalSize = 0;
-
-        LOG.debug("IndexBucketRowCache closed successfully");
+                    // Close all ranges
+                    for (OffsetRange range : offsetRanges.values()) {
+                        try {
+                            range.close();
+                        } catch (Exception e) {
+                            LOG.warn("Error closing offset range", e);
+                        }
+                    }
+                    offsetRanges.clear();
+                });
     }
 
-    // Internal helper methods
-
+    /** Optimized range finding using TreeMap's built-in indexing. */
     private OffsetRange findRangeContaining(long offset) {
-        for (OffsetRange range : offsetRanges.values()) {
-            if (range.contains(offset)) {
-                return range;
+        // Use TreeMap's floorEntry to find the largest start offset <= target offset
+        Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(offset);
+
+        if (floorEntry != null) {
+            OffsetRange candidate = floorEntry.getValue();
+            if (candidate.contains(offset)) {
+                return candidate;
             }
         }
+
         return null;
     }
 
@@ -468,7 +569,6 @@ public class IndexBucketRowCache implements Closeable {
     }
 
     private void checkAndMergeWithNextRange(OffsetRange currentRange) {
-        // Check if current range can be merged with the next range
         long currentEnd = currentRange.getEndOffset();
         Map.Entry<Long, OffsetRange> nextEntry = offsetRanges.ceilingEntry(currentEnd);
 
@@ -477,13 +577,7 @@ public class IndexBucketRowCache implements Closeable {
             if (nextRange.getStartOffset() == currentEnd) {
                 // Ranges are adjacent - merge them
                 currentRange.mergeWith(nextRange);
-                offsetRanges.remove(nextEntry.getKey());
-                try {
-                    nextRange.close();
-                } catch (IOException e) {
-                    LOG.warn("Error closing merged range", e);
-                }
-
+                OffsetRange removedRange = offsetRanges.remove(nextEntry.getKey());
                 LOG.trace(
                         "Merged ranges: [{}, {}) + [{}, {}) = [{}, {})",
                         currentRange.getStartOffset(),
@@ -492,8 +586,28 @@ public class IndexBucketRowCache implements Closeable {
                         nextRange.getEndOffset(),
                         currentRange.getStartOffset(),
                         currentRange.getEndOffset());
+                try {
+                    removedRange.close();
+                } catch (IOException e) {
+                    LOG.warn("Error closing merged range", e);
+                }
             }
         }
+    }
+
+    /**
+     * Creates a new OffsetRange that spans the specified offset range.
+     *
+     * @param startOffset the start offset (inclusive)
+     * @param endOffset the end offset (exclusive)
+     * @return the newly created OffsetRange
+     */
+    private OffsetRange createNewRangeForOffsetRange(long startOffset, long endOffset) {
+        OffsetRange newRange = new OffsetRange(startOffset, memoryPool);
+        offsetRanges.put(startOffset, newRange);
+        // Directly set the end offset for the entire range
+        newRange.expandRangeBoundaryToOffset(endOffset);
+        return newRange;
     }
 
     /** Creates an empty LogRecords for cases where no data is available. */
@@ -528,6 +642,7 @@ public class IndexBucketRowCache implements Closeable {
         private final List<MemorySegment> memorySegments = new ArrayList<>();
         private final List<SegmentMetadata> segmentMetadataList = new ArrayList<>();
         private final RowCacheIndex localIndex;
+        private volatile boolean closed = false;
 
         OffsetRange(long startOffset, MemorySegmentPool memoryPool) {
             this.startOffset = startOffset;
@@ -545,42 +660,26 @@ public class IndexBucketRowCache implements Closeable {
         }
 
         public boolean contains(long offset) {
-            return offset >= startOffset && offset < endOffset;
-        }
-
-        public boolean containsRange(long start, long end) {
-            return start >= startOffset && end <= endOffset;
-        }
-
-        public boolean canAcceptOffset(long offset) {
-            return offset == endOffset;
+            return startOffset <= offset && offset < endOffset;
         }
 
         /**
-         * Checks if there's actual IndexedRow data at the specified offset.
+         * Expands the range boundary to the specified end offset for batch operations. This method
+         * allows efficient expansion of the range to cover a continuous offset range without
+         * requiring adjacency checks for each individual offset.
          *
-         * @param offset the offset to check
-         * @return true if actual IndexedRow data exists at this offset
+         * @param targetEndOffset the target end offset (exclusive) to expand the range to
          */
-        public boolean hasDataAtOffset(long offset) {
-            return localIndex.getIndexEntry(offset) != null;
-        }
-
-        /**
-         * Expands the range boundary to include the given offset without writing actual data.
-         *
-         * @param logOffset the offset to expand the range to
-         */
-        public void expandRangeBoundary(long logOffset) {
-            if (logOffset != endOffset) {
+        public void expandRangeBoundaryToOffset(long targetEndOffset) {
+            if (targetEndOffset < endOffset) {
                 throw new IllegalArgumentException(
                         String.format(
-                                "Cannot expand range with non-adjacent offset. Range end: %d, Offset: %d",
-                                endOffset, logOffset));
+                                "Cannot shrink range boundary. Current end: %d, Target end: %d",
+                                endOffset, targetEndOffset));
             }
 
-            // Simply extend the range boundary without writing data
-            endOffset = logOffset + 1;
+            // Extend the range boundary to the target end offset
+            endOffset = targetEndOffset;
         }
 
         /**
@@ -590,7 +689,6 @@ public class IndexBucketRowCache implements Closeable {
          * @param changeType the change type of the row
          * @param row the row to write
          * @return the number of bytes written
-         * @throws IOException if an error occurs during writing
          */
         public int writeIndexedRow(long logOffset, ChangeType changeType, IndexedRow row)
                 throws IOException {
@@ -635,10 +733,9 @@ public class IndexBucketRowCache implements Closeable {
          *
          * @param start the start offset (inclusive)
          * @param end the end offset (exclusive)
-         * @param schemaId the schema ID for LogRecordBatch headers
          * @return LogRecords with accurate headers and metadata
          */
-        public LogRecords getRangeLogRecords(long start, long end, short schemaId) {
+        public LogRecords getRangeRecords(long start, long end) {
             // Find the first entry >= start offset
             Map.Entry<Long, RowCacheIndexEntry> firstEntry = localIndex.getCeilingEntry(start);
             if (firstEntry == null) {
@@ -652,71 +749,9 @@ public class IndexBucketRowCache implements Closeable {
             }
 
             try {
-                RowCacheIndexEntry firstIndexEntry = firstEntry.getValue();
-                RowCacheIndexEntry lastIndexEntry = lastEntry.getValue();
-
-                int firstSegmentIndex = firstIndexEntry.getSegmentIndex();
-                int lastSegmentIndex = lastIndexEntry.getSegmentIndex();
-
-                List<MemorySegmentBytesView> segmentBytesViews = new ArrayList<>();
-
-                if (firstSegmentIndex == lastSegmentIndex) {
-                    // All data in single segment - create one BytesView with proper boundaries
-                    MemorySegment segment = memorySegments.get(firstSegmentIndex);
-                    int startOffset = firstIndexEntry.getSegmentOffset();
-                    int endOffset =
-                            lastIndexEntry.getSegmentOffset() + lastIndexEntry.getRowLength();
-
-                    MemorySegmentBytesView segmentView =
-                            new MemorySegmentBytesView(
-                                    segment, startOffset, endOffset - startOffset);
-                    segmentBytesViews.add(segmentView);
-
-                } else {
-                    // Multiple segments involved
-
-                    // First segment - from firstEntry to end of segment
-                    MemorySegment firstSegment = memorySegments.get(firstSegmentIndex);
-                    SegmentMetadata firstSegmentMeta = segmentMetadataList.get(firstSegmentIndex);
-                    int firstStartOffset = firstIndexEntry.getSegmentOffset();
-                    int firstEndOffset =
-                            firstSegmentMeta.getNextOffset(); // End of used space in segment
-
-                    if (firstEndOffset > firstStartOffset) {
-                        MemorySegmentBytesView firstSegmentView =
-                                new MemorySegmentBytesView(
-                                        firstSegment,
-                                        firstStartOffset,
-                                        firstEndOffset - firstStartOffset);
-                        segmentBytesViews.add(firstSegmentView);
-                    }
-
-                    // Middle segments - complete segments
-                    for (int segIndex = firstSegmentIndex + 1;
-                            segIndex < lastSegmentIndex;
-                            segIndex++) {
-                        MemorySegment segment = memorySegments.get(segIndex);
-                        SegmentMetadata segmentMeta = segmentMetadataList.get(segIndex);
-
-                        if (segmentMeta.getNextOffset() > 0) {
-                            MemorySegmentBytesView segmentView =
-                                    new MemorySegmentBytesView(
-                                            segment, 0, segmentMeta.getNextOffset());
-                            segmentBytesViews.add(segmentView);
-                        }
-                    }
-
-                    // Last segment - from beginning to lastEntry end
-                    MemorySegment lastSegment = memorySegments.get(lastSegmentIndex);
-                    int lastEndOffset =
-                            lastIndexEntry.getSegmentOffset() + lastIndexEntry.getRowLength();
-
-                    if (lastEndOffset > 0) {
-                        MemorySegmentBytesView lastSegmentView =
-                                new MemorySegmentBytesView(lastSegment, 0, lastEndOffset);
-                        segmentBytesViews.add(lastSegmentView);
-                    }
-                }
+                // Build segment views for the range
+                List<MemorySegmentBytesView> segmentBytesViews =
+                        buildSegmentBytesViews(firstEntry.getValue(), lastEntry.getValue());
 
                 if (segmentBytesViews.isEmpty()) {
                     return createEmptyLogRecords();
@@ -725,15 +760,19 @@ public class IndexBucketRowCache implements Closeable {
                 // Calculate the number of records in the range
                 int recordCount = localIndex.getEntriesInRange(start, end).size();
 
-                // Build LogRecords using MemoryLogRecordsIndexedBuilder with preWrittenByteViews
-                BytesView recordBatchBytesView =
+                // Build LogRecords using MemoryLogRecordsIndexedBuilder with
+                // preWrittenByteViews
+                // Use default schema ID since index tables don't allow schema changes
+                BytesView recordBatchBytesView;
+                try (MemoryLogRecordsIndexedBuilder builder =
                         MemoryLogRecordsIndexedBuilder.builder(
-                                        schemaId,
-                                        // preWritten mode
-                                        segmentBytesViews,
-                                        recordCount,
-                                        false)
-                                .build();
+                                SchemaInfo.DEFAULT_SCHEMA_ID,
+                                // preWritten mode
+                                segmentBytesViews,
+                                recordCount,
+                                false)) {
+                    recordBatchBytesView = builder.build();
+                }
 
                 LOG.trace(
                         "Built LogRecords for range [{}, {}) using {} MemorySegments with {} bytes",
@@ -747,6 +786,98 @@ public class IndexBucketRowCache implements Closeable {
             } catch (Exception e) {
                 LOG.warn("Failed to build LogRecords for range [{}, {})", start, end, e);
                 return createEmptyLogRecords();
+            }
+        }
+
+        /**
+         * Builds a list of MemorySegmentBytesView for the given range defined by first and last
+         * index entries. This method handles both single-segment and multi-segment scenarios
+         * efficiently.
+         *
+         * @param firstIndexEntry the first index entry in the range
+         * @param lastIndexEntry the last index entry in the range
+         * @return list of MemorySegmentBytesView covering the range
+         */
+        private List<MemorySegmentBytesView> buildSegmentBytesViews(
+                RowCacheIndexEntry firstIndexEntry, RowCacheIndexEntry lastIndexEntry) {
+            List<MemorySegmentBytesView> segmentBytesViews = new ArrayList<>();
+
+            int firstSegmentIndex = firstIndexEntry.getSegmentIndex();
+            int lastSegmentIndex = lastIndexEntry.getSegmentIndex();
+
+            if (firstSegmentIndex == lastSegmentIndex) {
+                // All data in single segment - create one BytesView with proper boundaries
+                MemorySegment segment = memorySegments.get(firstSegmentIndex);
+                int startOffset = firstIndexEntry.getSegmentOffset();
+                int endOffset = lastIndexEntry.getSegmentOffset() + lastIndexEntry.getRowLength();
+
+                MemorySegmentBytesView segmentView =
+                        new MemorySegmentBytesView(segment, startOffset, endOffset - startOffset);
+                segmentBytesViews.add(segmentView);
+            } else {
+                // Multiple segments involved
+                buildMultiSegmentViews(
+                        segmentBytesViews,
+                        firstIndexEntry,
+                        lastIndexEntry,
+                        firstSegmentIndex,
+                        lastSegmentIndex);
+            }
+
+            return segmentBytesViews;
+        }
+
+        /**
+         * Builds MemorySegmentBytesView list for multi-segment ranges. This method handles the
+         * complexity of first segment (partial), middle segments (complete), and last segment
+         * (partial) separately.
+         *
+         * @param segmentBytesViews the list to add views to
+         * @param firstIndexEntry the first index entry in the range
+         * @param lastIndexEntry the last index entry in the range
+         * @param firstSegmentIndex the first segment index
+         * @param lastSegmentIndex the last segment index
+         */
+        private void buildMultiSegmentViews(
+                List<MemorySegmentBytesView> segmentBytesViews,
+                RowCacheIndexEntry firstIndexEntry,
+                RowCacheIndexEntry lastIndexEntry,
+                int firstSegmentIndex,
+                int lastSegmentIndex) {
+
+            // First segment - from firstEntry to end of segment
+            MemorySegment firstSegment = memorySegments.get(firstSegmentIndex);
+            SegmentMetadata firstSegmentMeta = segmentMetadataList.get(firstSegmentIndex);
+            int firstStartOffset = firstIndexEntry.getSegmentOffset();
+            int firstEndOffset = firstSegmentMeta.getNextOffset(); // End of used space in segment
+
+            if (firstEndOffset > firstStartOffset) {
+                MemorySegmentBytesView firstSegmentView =
+                        new MemorySegmentBytesView(
+                                firstSegment, firstStartOffset, firstEndOffset - firstStartOffset);
+                segmentBytesViews.add(firstSegmentView);
+            }
+
+            // Middle segments - complete segments
+            for (int segIndex = firstSegmentIndex + 1; segIndex < lastSegmentIndex; segIndex++) {
+                MemorySegment segment = memorySegments.get(segIndex);
+                SegmentMetadata segmentMeta = segmentMetadataList.get(segIndex);
+
+                if (segmentMeta.getNextOffset() > 0) {
+                    MemorySegmentBytesView segmentView =
+                            new MemorySegmentBytesView(segment, 0, segmentMeta.getNextOffset());
+                    segmentBytesViews.add(segmentView);
+                }
+            }
+
+            // Last segment - from beginning to lastEntry end
+            MemorySegment lastSegment = memorySegments.get(lastSegmentIndex);
+            int lastEndOffset = lastIndexEntry.getSegmentOffset() + lastIndexEntry.getRowLength();
+
+            if (lastEndOffset > 0) {
+                MemorySegmentBytesView lastSegmentView =
+                        new MemorySegmentBytesView(lastSegment, 0, lastEndOffset);
+                segmentBytesViews.add(lastSegmentView);
             }
         }
 
@@ -767,18 +898,21 @@ public class IndexBucketRowCache implements Closeable {
             // Extend this range to include the other range
             this.endOffset = other.endOffset;
 
-            // Merge memory segments
-            for (MemorySegment segment : other.memorySegments) {
-                this.memorySegments.add(segment);
-            }
+            // Transfer memory segments from other to this range
+            this.memorySegments.addAll(other.memorySegments);
 
-            // Merge segment metadata with updated indices
+            // Clear the memory segments from the other range to transfer ownership
+            // This prevents the other range from releasing these segments when it's closed
+            other.memorySegments.clear();
+
+            // Transfer segment metadata with updated indices
             int baseIndex = this.segmentMetadataList.size();
-            for (SegmentMetadata metadata : other.segmentMetadataList) {
-                this.segmentMetadataList.add(metadata);
-            }
+            this.segmentMetadataList.addAll(other.segmentMetadataList);
 
-            // Merge indices with updated segment references
+            // Clear the segment metadata from the other range
+            other.segmentMetadataList.clear();
+
+            // Transfer indices with updated segment references
             NavigableMap<Long, RowCacheIndexEntry> otherEntries = other.localIndex.getAllEntries();
             for (Map.Entry<Long, RowCacheIndexEntry> entry : otherEntries.entrySet()) {
                 RowCacheIndexEntry indexEntry = entry.getValue();
@@ -790,10 +924,13 @@ public class IndexBucketRowCache implements Closeable {
                                 indexEntry.getRowLength());
                 this.localIndex.addIndexEntry(entry.getKey(), updatedEntry);
             }
+
+            // Clear the local index from the other range to complete the ownership transfer
+            other.localIndex.clear();
         }
 
         public int cleanupBelowHorizon(long horizonOffset) {
-            if (memorySegments.isEmpty()) {
+            if (closed || memorySegments.isEmpty()) {
                 return 0;
             }
 
@@ -835,42 +972,49 @@ public class IndexBucketRowCache implements Closeable {
             Collections.reverse(segmentsToRemove);
 
             for (int segmentIndex : segmentsToRemove) {
-                // Return memory segment to pool
-                MemorySegment segmentToRemove = memorySegments.get(segmentIndex);
-                memoryPool.returnPage(segmentToRemove);
+                // Return memory segment to pool only if not closed
+                if (!closed) {
+                    MemorySegment segmentToRemove = memorySegments.get(segmentIndex);
+                    try {
+                        memoryPool.returnPage(segmentToRemove);
+                        LOG.trace(
+                                "Returned MemorySegment {} from OffsetRange to pool, maxOffset was < horizon {}",
+                                segmentIndex,
+                                horizonOffset);
+                    } catch (Exception e) {
+                        LOG.warn(
+                                "Failed to return MemorySegment {} to pool: {}",
+                                segmentIndex,
+                                e.getMessage());
+                    }
+                }
 
                 // Remove from lists
                 memorySegments.remove(segmentIndex);
                 segmentMetadataList.remove(segmentIndex);
-
-                LOG.trace(
-                        "Removed MemorySegment {} from OffsetRange, maxOffset was < horizon {}",
-                        segmentIndex,
-                        horizonOffset);
             }
 
             // Update index after segment removal
             if (!segmentsToRemove.isEmpty()) {
                 Collections.reverse(segmentsToRemove); // Back to ascending order
 
-                // Remove index entries for deleted segments and update remaining segment indices
-                for (int i = 0; i < segmentsToRemove.size(); i++) {
-                    int removedSegmentIndex = segmentsToRemove.get(i);
-
-                    // Remove all entries for this segment
+                // Remove index entries for deleted segments
+                for (int removedSegmentIndex : segmentsToRemove) {
                     localIndex.removeEntriesForSegment(removedSegmentIndex);
-
-                    // Adjust segment indices for all remaining segments after this removed one
-                    // We subtract (i+1) because we've already removed i segments before this one
-                    localIndex.adjustSegmentIndices(removedSegmentIndex - i, 1);
                 }
 
-                LOG.debug(
-                        "Cleaned up {} MemorySegments below horizon {}, {} segments remaining",
-                        segmentsToRemove.size(),
-                        horizonOffset,
-                        memorySegments.size());
+                // One-time adjustment of all remaining segments' indices
+                // Since segments are deleted consecutively, subtract the total count
+                int totalRemovedCount = segmentsToRemove.size();
+                int lowestRemovedIndex = segmentsToRemove.get(0); // Smallest removed index
+                localIndex.adjustSegmentIndices(lowestRemovedIndex, totalRemovedCount);
             }
+
+            LOG.debug(
+                    "Cleaned up {} MemorySegments below horizon {}, {} segments remaining",
+                    segmentsToRemove.size(),
+                    horizonOffset,
+                    memorySegments.size());
 
             // Clean up any remaining individual entries that are below horizon
             localIndex.removeEntriesBelowHorizon(horizonOffset);
@@ -882,17 +1026,44 @@ public class IndexBucketRowCache implements Closeable {
             return localIndex.size();
         }
 
+        /**
+         * Gets the number of MemorySegments used by this range.
+         *
+         * @return the number of memory segments
+         */
+        public int getMemorySegmentCount() {
+            return memorySegments.size();
+        }
+
         public boolean isEmpty() {
             return localIndex.isEmpty();
         }
 
         @Override
         public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+
+            closed = true;
+
             // Release memory segments back to the pool
-            memoryPool.returnAll(memorySegments);
-            memorySegments.clear();
-            segmentMetadataList.clear();
-            localIndex.clear();
+            try {
+                if (!memorySegments.isEmpty()) {
+                    memoryPool.returnAll(memorySegments);
+                    LOG.trace(
+                            "Returned {} MemorySegments to pool during OffsetRange close",
+                            memorySegments.size());
+                }
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to return memory segments to pool during close: {}",
+                        e.getMessage());
+            } finally {
+                memorySegments.clear();
+                segmentMetadataList.clear();
+                localIndex.clear();
+            }
         }
 
         private SegmentMetadata findOrAllocateSegment(int requiredSize) throws IOException {
@@ -908,7 +1079,7 @@ public class IndexBucketRowCache implements Closeable {
             // Allocate a new segment
             MemorySegment newSegment = memoryPool.nextSegment();
             if (newSegment == null) {
-                throw new IOException("Cannot allocate new memory segment from pool");
+                throw new EOFException("Cannot allocate new memory segment from pool");
             }
 
             memorySegments.add(newSegment);

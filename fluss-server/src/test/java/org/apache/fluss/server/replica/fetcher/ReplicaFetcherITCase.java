@@ -21,6 +21,7 @@ import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -36,9 +37,11 @@ import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvResponse;
+import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.index.IndexApplier;
+import org.apache.fluss.server.index.IndexRowCache;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
@@ -390,7 +393,11 @@ public class ReplicaFetcherITCase {
         TablePath indexTablePath =
                 IndexTableUtils.generateIndexTablePath(INDEXED_TABLE_PATH, "idx_name");
 
-        MetadataManager metadataManager = new MetadataManager(zkClient, new Configuration(), null);
+        MetadataManager metadataManager =
+                new MetadataManager(
+                        zkClient,
+                        new Configuration(),
+                        new LakeCatalogDynamicLoader(new Configuration(), null, true));
         TableInfo indexTableInfo = metadataManager.getTable(indexTablePath);
         TableBucket indexTableBucket = new TableBucket(indexTableInfo.getTableId(), 0);
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(indexTableBucket);
@@ -472,7 +479,11 @@ public class ReplicaFetcherITCase {
         TableBucket dataTableBucket = new TableBucket(dataTableId, 0);
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(dataTableBucket);
 
-        MetadataManager metadataManager = new MetadataManager(zkClient, new Configuration(), null);
+        MetadataManager metadataManager =
+                new MetadataManager(
+                        zkClient,
+                        new Configuration(),
+                        new LakeCatalogDynamicLoader(new Configuration(), null, true));
 
         // Verify both index tables were created using TestData predefined paths
         TableInfo idxNameTableInfo = metadataManager.getTable(IDX_NAME_TABLE_PATH);
@@ -719,6 +730,13 @@ public class ReplicaFetcherITCase {
 
         LOG.info(
                 "Comprehensive index fetch chain test completed successfully for both idx_name and idx_email tables");
+
+        // Step 8: Verify IndexCache memory is properly garbage collected after replication
+        // completion
+        LOG.info("Step 8: Verifying IndexCache memory garbage collection");
+        verifyIndexCacheMemoryReclaimed();
+
+        LOG.info("Step 8 completed: IndexCache memory garbage collection verified");
     }
 
     private static void assertPutKvResponse(PutKvResponse putKvResponse, int bucketId) {
@@ -814,5 +832,122 @@ public class ReplicaFetcherITCase {
                 "Index table '{}' IndexCommitOffset verified at {}", indexName, expectedDataOffset);
 
         return indexTableBucket;
+    }
+
+    /**
+     * Verifies that IndexCache memory is properly reclaimed after index replication completion.
+     * This method checks that: 1. MemoryPool available memory has returned to near initial values
+     * 2. IndexCache holds minimal or no memory 3. All memory segments have been properly garbage
+     * collected
+     */
+    private void verifyIndexCacheMemoryReclaimed() throws Exception {
+        retry(
+                Duration.ofMinutes(2),
+                () -> {
+                    // Trigger garbage collection to ensure proper memory cleanup
+                    System.gc();
+                    Thread.sleep(500); // Allow GC to complete
+
+                    // Check memory usage across all tablet servers
+                    for (int serverId = 0;
+                            serverId < FLUSS_CLUSTER_EXTENSION.getTabletServerNodes().size();
+                            serverId++) {
+                        ReplicaManager replicaManager =
+                                FLUSS_CLUSTER_EXTENSION
+                                        .getTabletServerById(serverId)
+                                        .getReplicaManager();
+
+                        try {
+                            MemorySegmentPool indexCacheMemoryPool =
+                                    replicaManager.getIndexCacheMemoryPool();
+
+                            // Get memory pool statistics
+                            long totalMemoryBytes = indexCacheMemoryPool.totalSize();
+                            long availableMemoryBytes = indexCacheMemoryPool.availableMemory();
+                            long usedMemoryBytes = totalMemoryBytes - availableMemoryBytes;
+                            int freePages = indexCacheMemoryPool.freePages();
+
+                            LOG.info(
+                                    "TabletServer {} IndexCache Memory Status: "
+                                            + "Total: {} bytes, Available: {} bytes, Used: {} bytes, FreePages: {}",
+                                    serverId,
+                                    totalMemoryBytes,
+                                    availableMemoryBytes,
+                                    usedMemoryBytes,
+                                    freePages);
+
+                            // Verify memory pool has returned to near-full availability
+                            // Allow for small amount of retained memory (less than 5% of total)
+                            double memoryUsageRatio = (double) usedMemoryBytes / totalMemoryBytes;
+                            assertThat(memoryUsageRatio)
+                                    .as(
+                                            "Memory usage ratio should be minimal after GC for server %d",
+                                            serverId)
+                                    .isLessThan(0.05);
+
+                            // Verify available memory is close to total memory
+                            assertThat(availableMemoryBytes)
+                                    .as(
+                                            "Available memory should be close to total memory for server %d",
+                                            serverId)
+                                    .isGreaterThan((long) (totalMemoryBytes * 0.95));
+
+                            // Use reflection to access private getOnlineReplicaList method
+                            java.lang.reflect.Method getOnlineReplicaListMethod =
+                                    ReplicaManager.class.getDeclaredMethod("getOnlineReplicaList");
+                            getOnlineReplicaListMethod.setAccessible(true);
+                            List<Replica> onlineReplicas =
+                                    (List<Replica>)
+                                            getOnlineReplicaListMethod.invoke(replicaManager);
+
+                            // Check IndexCache statistics from all replicas
+                            int totalCacheEntries = 0;
+                            int totalMemorySegments = 0;
+
+                            for (Replica replica : onlineReplicas) {
+                                if (replica.getIndexCache() != null) {
+                                    IndexRowCache indexRowCache =
+                                            replica.getIndexCache().getIndexRowCache();
+                                    if (indexRowCache != null) {
+                                        totalCacheEntries += indexRowCache.getTotalEntries();
+                                        totalMemorySegments +=
+                                                indexRowCache.getTotalMemorySegmentCount();
+                                    }
+                                }
+                            }
+
+                            LOG.info(
+                                    "TabletServer {} IndexCache Statistics: "
+                                            + "Total entries: {}, Total memory segments: {}",
+                                    serverId,
+                                    totalCacheEntries,
+                                    totalMemorySegments);
+
+                            // Verify IndexCache holds minimal memory
+                            // After replication completion, cache should be mostly empty
+                            assertThat(totalMemorySegments)
+                                    .as(
+                                            "IndexCache should hold minimal memory segments after GC for server %d",
+                                            serverId)
+                                    .isLessThanOrEqualTo(10); // Allow for very small residual cache
+
+                            // If there are entries, they should be minimal
+                            if (totalCacheEntries > 0) {
+                                assertThat(totalCacheEntries)
+                                        .as(
+                                                "IndexCache entries should be minimal after GC for server %d",
+                                                serverId)
+                                        .isLessThanOrEqualTo(
+                                                100); // Allow for small residual entries
+                            }
+
+                        } catch (Exception e) {
+                            throw new RuntimeException(
+                                    "Failed to access IndexCache memory information", e);
+                        }
+                    }
+
+                    LOG.info("IndexCache memory reclamation verification completed successfully");
+                });
     }
 }

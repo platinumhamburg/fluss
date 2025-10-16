@@ -65,16 +65,6 @@ public final class RowCacheIndex {
     }
 
     /**
-     * Checks if a specific logOffset exists in the index.
-     *
-     * @param logOffset the log offset to check
-     * @return true if the offset exists, false otherwise
-     */
-    public boolean containsOffset(long logOffset) {
-        return offsetEntries.containsKey(logOffset);
-    }
-
-    /**
      * Gets all IndexEntries in the specified range [startOffset, endOffset).
      *
      * @param startOffset the start offset (inclusive)
@@ -142,9 +132,7 @@ public final class RowCacheIndex {
             }
         }
         // Update entries in offsetEntries
-        for (java.util.Map.Entry<Long, RowCacheIndexEntry> entry : updatedEntries.entrySet()) {
-            offsetEntries.put(entry.getKey(), entry.getValue());
-        }
+        offsetEntries.putAll(updatedEntries);
     }
 
     /**

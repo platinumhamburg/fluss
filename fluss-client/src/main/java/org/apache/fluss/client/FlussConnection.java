@@ -133,7 +133,7 @@ public final class FlussConnection implements Connection {
         if (lookupClient == null) {
             synchronized (this) {
                 if (lookupClient == null) {
-                    lookupClient = new LookupClient(conf, metadataUpdater);
+                    lookupClient = new LookupClient(conf, metadataUpdater, clientMetricGroup);
                 }
             }
         }

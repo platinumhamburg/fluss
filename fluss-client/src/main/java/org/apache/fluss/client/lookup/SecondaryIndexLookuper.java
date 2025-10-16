@@ -19,6 +19,7 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.MetadataUpdater;
+import org.apache.fluss.client.metrics.LookuperMetricGroup;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
@@ -51,13 +52,17 @@ public class SecondaryIndexLookuper implements Lookuper {
     /** Projection to extract primary key from index table results. */
     private final ProjectedRow primaryKeyProjection;
 
+    /** Metric group for reporting secondary index lookup metrics. */
+    private final LookuperMetricGroup lookuperMetricGroup;
+
     public SecondaryIndexLookuper(
             TableInfo mainTableInfo,
             TableInfo indexTableInfo,
             Schema.Index index,
             MetadataUpdater metadataUpdater,
             LookupClient lookupClient,
-            List<String> lookupColumnNames) {
+            List<String> lookupColumnNames,
+            LookuperMetricGroup lookuperMetricGroup) {
 
         // Create index table lookuper to query index table using secondary index keys
         this.indexTableLookuper =
@@ -78,8 +83,9 @@ public class SecondaryIndexLookuper implements Lookuper {
         }
 
         this.primaryKeyProjection = ProjectedRow.from(primaryKeyIndexes);
+        this.lookuperMetricGroup = lookuperMetricGroup;
 
-        LOG.debug(
+        LOG.trace(
                 "Created SecondaryIndexLookuper for main table {} via index table {}, lookup columns: {}",
                 mainTableInfo.getTablePath(),
                 indexTableInfo.getTablePath(),
@@ -89,7 +95,10 @@ public class SecondaryIndexLookuper implements Lookuper {
     @Override
     public CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
         long startTime = System.currentTimeMillis();
-        LOG.debug("Starting secondary index lookup with key: {}", lookupKey);
+        LOG.trace("Starting secondary index lookup with key: {}", lookupKey);
+
+        // Increment request count metric
+        lookuperMetricGroup.secondaryIndexRequestCount().inc();
 
         // Step 1: Query index table to get primary keys
         return indexTableLookuper
@@ -97,20 +106,22 @@ public class SecondaryIndexLookuper implements Lookuper {
                 .thenCompose(
                         indexResult -> {
                             List<InternalRow> indexRows = indexResult.getRowList();
-                            LOG.debug("Index table lookup returned {} records", indexRows.size());
+                            LOG.trace("Index table lookup returned {} records", indexRows.size());
 
                             if (indexRows.isEmpty()) {
                                 // No matching records found in index table
-                                LOG.debug(
+                                LOG.trace(
                                         "No matching records found in index table for key: {}",
                                         lookupKey);
+                                long duration = System.currentTimeMillis() - startTime;
+                                lookuperMetricGroup.updateSecondaryIndexLookupLatency(duration);
                                 return CompletableFuture.completedFuture(
                                         new LookupResult(new ArrayList<>()));
                             }
 
                             // Step 2: Extract primary keys from index table results and query main
                             // table
-                            LOG.debug(
+                            LOG.trace(
                                     "Querying main table with {} primary keys extracted from index",
                                     indexRows.size());
                             List<CompletableFuture<LookupResult>> mainTableLookups =
@@ -188,13 +199,30 @@ public class SecondaryIndexLookuper implements Lookuper {
                                                         duration);
 
                                                 if (nullResults > 0) {
-                                                    LOG.debug(
+                                                    LOG.trace(
                                                             "Found {} null results during main table lookup, indicating potential data inconsistency between index and main table",
                                                             nullResults);
                                                 }
 
+                                                // Update latency metric
+                                                lookuperMetricGroup
+                                                        .updateSecondaryIndexLookupLatency(
+                                                                duration);
+
                                                 return new LookupResult(result);
                                             });
+                        })
+                .exceptionally(
+                        throwable -> {
+                            // Increment error count for any uncaught exceptions
+                            lookuperMetricGroup.secondaryIndexErrorCount().inc();
+                            long duration = System.currentTimeMillis() - startTime;
+                            lookuperMetricGroup.updateSecondaryIndexLookupLatency(duration);
+                            LOG.error(
+                                    "Secondary index lookup failed for key: {}",
+                                    lookupKey,
+                                    throwable);
+                            throw new RuntimeException("Secondary index lookup failed", throwable);
                         });
     }
 }

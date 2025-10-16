@@ -71,6 +71,9 @@ public class TableLookup implements Lookup {
                 TablePath indexTablePath =
                         IndexTableUtils.generateIndexTablePath(
                                 tableInfo.getTablePath(), matchedIndex.getIndexName());
+                // Ensure metadata cache is updated before getting index table info
+                metadataUpdater.checkAndUpdateTableMetadata(
+                        java.util.Collections.singleton(indexTablePath));
                 TableInfo indexTableInfo = metadataUpdater.getTableInfoOrElseThrow(indexTablePath);
 
                 return new SecondaryIndexLookuper(
@@ -79,7 +82,8 @@ public class TableLookup implements Lookup {
                         matchedIndex,
                         metadataUpdater,
                         lookupClient,
-                        lookupColumnNames);
+                        lookupColumnNames,
+                        lookupClient.getLookuperMetricGroup());
             } else {
                 // Use PrefixKeyLookuper for prefix lookup
                 return new PrefixKeyLookuper(

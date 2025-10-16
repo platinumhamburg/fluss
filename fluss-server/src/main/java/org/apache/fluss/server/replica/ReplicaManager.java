@@ -18,6 +18,7 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FencedLeaderEpochException;
@@ -72,6 +73,9 @@ import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.index.FetchIndexParams;
 import org.apache.fluss.server.index.IndexApplier;
+import org.apache.fluss.server.index.IndexBucketRowCache;
+import org.apache.fluss.server.index.IndexCache;
+import org.apache.fluss.server.index.IndexRowCache;
 import org.apache.fluss.server.index.IndexSegment;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
@@ -325,19 +329,20 @@ public class ReplicaManager {
                 this::maybeShrinkIsr,
                 0L,
                 conf.get(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME).toMillis() / 2);
+
+        // start up under-replicated watchdog thread.
+        // Check and log under-replicated replicas every 30 seconds.
+        scheduler.schedule(
+                "under-replicated-watchdog", this::logUnderReplicatedReplicas, 0L, 30000L);
+
+        // start up IndexCache memory usage watchdog thread.
+        // Check and log IndexCache memory usage statistics every 30 seconds.
+        scheduler.schedule(
+                "index-cache-memory-watchdog", this::logIndexCacheMemoryUsage, 0L, 30000L);
     }
 
     public RemoteLogManager getRemoteLogManager() {
         return remoteLogManager;
-    }
-
-    /**
-     * Get the unified index cache memory pool shared by all index components.
-     *
-     * @return the index cache memory pool
-     */
-    public MemorySegmentPool getIndexCacheMemoryPool() {
-        return indexCacheMemoryPool;
     }
 
     private void registerMetrics() {
@@ -406,6 +411,10 @@ public class ReplicaManager {
 
     private long logicalStorageKvSize() {
         return onlineReplicas().map(Replica::logicalStorageKvSize).reduce(0L, Long::sum);
+    }
+
+    public MemorySegmentPool getIndexCacheMemoryPool() {
+        return indexCacheMemoryPool;
     }
 
     private long physicalStorageLocalSize() {
@@ -588,12 +597,13 @@ public class ReplicaManager {
                             dataBucket, new DataBucketIndexFetchResult(indexBucketResults));
                 }
             } catch (Exception e) {
-                LOG.error("Failed to fetch index for data bucket {}", dataBucket, e);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Failed to fetch index for data bucket {}", dataBucket, e);
+                }
+                ApiError error = ApiError.fromThrowable(e);
                 // Return error result
                 for (TableBucket indexBucket : indexBucketFetchRequests.keySet()) {
-                    indexBucketResults.put(
-                            indexBucket,
-                            new FetchIndexLogResultForBucket(ApiError.fromThrowable(e)));
+                    indexBucketResults.put(indexBucket, new FetchIndexLogResultForBucket(error));
                 }
                 completeFetches.put(dataBucket, new DataBucketIndexFetchResult(indexBucketResults));
             }
@@ -1102,18 +1112,8 @@ public class ReplicaManager {
         for (int bucketId = 0; bucketId < dataBucketCount; bucketId++) {
             TableBucket dataBucket = new TableBucket(dataTableId, partitionId, bucketId);
 
-            // Get data bucket leader info using ZooKeeper
-            Optional<LeaderAndIsr> optLeaderAndIsr = zkClient.getLeaderAndIsr(dataBucket);
-            int dataLeader =
-                    optLeaderAndIsr
-                            .orElseThrow(
-                                    () ->
-                                            new IllegalStateException(
-                                                    "Failed to get leader for data bucket: "
-                                                            + dataBucket
-                                                            + " when init fetcher for index bucket "
-                                                            + indexBucket))
-                            .leader();
+            // Wait for data bucket to be ready with valid leader
+            int dataLeader = waitForDataBucketReady(dataBucket, indexBucket);
 
             // Create DataIndexTableBucket mapping
             DataIndexTableBucket dataIndexBucket =
@@ -1138,12 +1138,98 @@ public class ReplicaManager {
                             indexApplier);
 
             dataIndexBucketAndStatus.put(dataIndexBucket, fetchStatus);
-            LOG.debug(
-                    "Created index fetch status for data bucket {} -> index bucket {}, initFetchOffset: {}, indexCommitOffset: {}",
-                    dataBucket,
-                    indexBucket,
-                    initFetchOffset,
-                    indexCommitOffset);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Created index fetch status for data bucket {} -> index bucket {}, initFetchOffset: {}, indexCommitOffset: {}",
+                        dataBucket,
+                        indexBucket,
+                        initFetchOffset,
+                        indexCommitOffset);
+            }
+        }
+    }
+
+    /**
+     * Wait for a data bucket to be ready with a valid leader and ensure the leader's server node is
+     * available in metadata cache. This method will retry indefinitely until both conditions are
+     * met.
+     *
+     * @param dataBucket the data bucket to wait for
+     * @param indexBucket the index bucket that depends on this data bucket
+     * @return the leader id of the data bucket
+     * @throws InterruptedException if the thread is interrupted while waiting
+     */
+    private int waitForDataBucketReady(TableBucket dataBucket, TableBucket indexBucket)
+            throws InterruptedException {
+        long retryIntervalMs = conf.get(ConfigOptions.ZOOKEEPER_RETRY_WAIT).toMillis();
+        int retryCount = 0;
+
+        while (true) {
+            try {
+                Optional<LeaderAndIsr> optLeaderAndIsr = zkClient.getLeaderAndIsr(dataBucket);
+                if (optLeaderAndIsr.isPresent()) {
+                    int dataLeader = optLeaderAndIsr.get().leader();
+                    if (dataLeader >= 0) {
+                        // Check if the leader server node is available in metadata cache
+                        Optional<ServerNode> serverNode =
+                                metadataCache.getTabletServer(dataLeader, internalListenerName);
+                        if (serverNode.isPresent()) {
+                            if (retryCount > 0) {
+                                LOG.info(
+                                        "Data bucket {} is now ready with leader {} and server node cached after {} retries for index bucket {}",
+                                        dataBucket,
+                                        dataLeader,
+                                        retryCount,
+                                        indexBucket);
+                            }
+                            return dataLeader;
+                        } else {
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug(
+                                        "Data bucket {} has valid leader {} but server node not yet cached, retrying... (retry count: {})",
+                                        dataBucket,
+                                        dataLeader,
+                                        retryCount);
+                            }
+                        }
+                    } else {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug(
+                                    "Data bucket {} has invalid leader {}, retrying... (retry count: {})",
+                                    dataBucket,
+                                    dataLeader,
+                                    retryCount);
+                        }
+                    }
+                } else {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug(
+                                "Data bucket {} leader info not available, retrying... (retry count: {})",
+                                dataBucket,
+                                retryCount);
+                    }
+                }
+            } catch (Exception e) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Error getting leader info or server node for data bucket {}, retrying... (retry count: {})",
+                            dataBucket,
+                            retryCount,
+                            e);
+                }
+            }
+
+            retryCount++;
+            if (retryCount % 10 == 0) {
+                LOG.info(
+                        "Still waiting for data bucket {} to be ready with cached server node for index bucket {}, retry count: {}",
+                        dataBucket,
+                        indexBucket,
+                        retryCount);
+            }
+
+            // Sleep before next retry
+            Thread.sleep(retryIntervalMs);
         }
     }
 
@@ -1216,7 +1302,7 @@ public class ReplicaManager {
             Integer leaderId = replica.getLeaderId();
             TableBucket tb = replica.getTableBucket();
             LogTablet logTablet = replica.getLogTablet();
-            if (leaderId == null) {
+            if (leaderId == null || leaderId < 0) {
                 result.put(
                         tb,
                         new NotifyLeaderAndIsrResultForBucket(
@@ -1674,7 +1760,9 @@ public class ReplicaManager {
             Consumer<Map<TableBucket, DataBucketIndexFetchResult>> responseCallback) {
         if (!delayedIndexFetchRequired(params, dataBucketIndexFetchInfo, completeFetches)) {
             responseCallback.accept(completeFetches);
+            return;
         }
+
         DelayedFetchIndex delayedFetchIndex =
                 new DelayedFetchIndex(
                         params,
@@ -1808,6 +1896,153 @@ public class ReplicaManager {
         }
     }
 
+    private void logUnderReplicatedReplicas() {
+        LOG.trace("Checking for under-replicated replicas.");
+        List<Replica> underReplicatedReplicas =
+                getOnlineReplicaList().stream()
+                        .filter(Replica::isUnderReplicated)
+                        .collect(Collectors.toList());
+
+        if (!underReplicatedReplicas.isEmpty()) {
+            LOG.warn("Found {} under-replicated replica(s):", underReplicatedReplicas.size());
+            for (Replica replica : underReplicatedReplicas) {
+                LOG.warn(
+                        "Under-replicated replica - TablePath: {}, TableBucket: {}",
+                        replica.getTablePath(),
+                        replica.getTableBucket());
+            }
+        }
+    }
+
+    private void logIndexCacheMemoryUsage() {
+        try {
+            LOG.trace("Checking IndexCache memory usage statistics.");
+
+            // Get memory pool statistics
+            long totalMemoryBytes = indexCacheMemoryPool.totalSize();
+            long availableMemoryBytes = indexCacheMemoryPool.availableMemory();
+            long usedMemoryBytes = totalMemoryBytes - availableMemoryBytes;
+            int pageSize = indexCacheMemoryPool.pageSize();
+
+            // Collect IndexCache statistics from all replicas
+            List<Replica> replicasWithIndexCache =
+                    getOnlineReplicaList().stream()
+                            .filter(replica -> replica.getIndexCache() != null)
+                            .collect(Collectors.toList());
+
+            if (replicasWithIndexCache.isEmpty()) {
+                LOG.info(
+                        "IndexCache Memory Usage Summary: No replicas with IndexCache found. "
+                                + "MemoryPool: {}/{} bytes available ({} pages), page size: {} bytes",
+                        availableMemoryBytes,
+                        totalMemoryBytes,
+                        indexCacheMemoryPool.freePages(),
+                        pageSize);
+                return;
+            }
+
+            int totalCacheEntries = 0;
+            int totalMemorySegments = 0;
+            IndexBucketRowCacheStats maxMemoryBucketCache = null;
+
+            for (Replica replica : replicasWithIndexCache) {
+                IndexCache indexCache = replica.getIndexCache();
+                if (indexCache != null) {
+                    IndexRowCache indexRowCache = indexCache.getIndexRowCache();
+                    if (indexRowCache != null) {
+                        totalCacheEntries += indexRowCache.getTotalEntries();
+                        totalMemorySegments += indexRowCache.getTotalMemorySegmentCount();
+
+                        // Find the bucket cache with maximum memory usage
+                        List<IndexRowCache.IndexBucketRowCacheInfo> bucketCacheInfos =
+                                indexRowCache.getAllBucketCacheInfos();
+                        for (IndexRowCache.IndexBucketRowCacheInfo cacheInfo : bucketCacheInfos) {
+                            if (maxMemoryBucketCache == null
+                                    || cacheInfo.getMemorySegmentCount()
+                                            > maxMemoryBucketCache.memorySegmentCount) {
+                                maxMemoryBucketCache =
+                                        new IndexBucketRowCacheStats(
+                                                replica.getTableBucket(),
+                                                cacheInfo.getIndexTableId(),
+                                                cacheInfo.getBucketId(),
+                                                cacheInfo.getMemorySegmentCount(),
+                                                cacheInfo.getTotalEntries(),
+                                                cacheInfo.getCache().getRangeDistribution());
+                            }
+                        }
+                    }
+                }
+            }
+
+            long totalUsedMemoryBytes = (long) totalMemorySegments * pageSize;
+
+            LOG.info(
+                    "IndexCache Memory Usage Summary: "
+                            + "MemoryPool: {}/{} bytes available ({} pages), "
+                            + "IndexCache: {} entries using {} segments ({} bytes), "
+                            + "ReplicasWithIndexCache: {}",
+                    availableMemoryBytes,
+                    totalMemoryBytes,
+                    indexCacheMemoryPool.freePages(),
+                    totalCacheEntries,
+                    totalMemorySegments,
+                    totalUsedMemoryBytes,
+                    replicasWithIndexCache.size());
+
+            // Log details of the bucket cache with maximum memory usage
+            if (maxMemoryBucketCache != null) {
+                LOG.info(
+                        "Largest IndexBucketRowCache: "
+                                + "DataBucket: {}, IndexTable: {}, IndexBucket: {}, "
+                                + "MemorySegments: {}, Entries: {}, Ranges: {}",
+                        maxMemoryBucketCache.dataBucket,
+                        maxMemoryBucketCache.indexTableId,
+                        maxMemoryBucketCache.indexBucketId,
+                        maxMemoryBucketCache.memorySegmentCount,
+                        maxMemoryBucketCache.totalEntries,
+                        maxMemoryBucketCache.ranges.size());
+
+                // Log range distribution details
+                for (IndexBucketRowCache.RangeMemoryInfo rangeInfo : maxMemoryBucketCache.ranges) {
+                    LOG.info(
+                            "  Range: [{}, {}), Entries: {}, MemorySegments: {}",
+                            rangeInfo.getStartOffset(),
+                            rangeInfo.getEndOffset(),
+                            rangeInfo.getEntryCount(),
+                            rangeInfo.getMemorySegmentCount());
+                }
+            }
+
+        } catch (Exception e) {
+            LOG.warn("Failed to collect IndexCache memory usage statistics", e);
+        }
+    }
+
+    /** Statistics for IndexBucketRowCache with maximum memory usage. */
+    private static class IndexBucketRowCacheStats {
+        final TableBucket dataBucket;
+        final long indexTableId;
+        final int indexBucketId;
+        final int memorySegmentCount;
+        final int totalEntries;
+        final List<IndexBucketRowCache.RangeMemoryInfo> ranges;
+
+        IndexBucketRowCacheStats(
+                TableBucket dataBucket,
+                long indexTableId,
+                int indexBucketId,
+                int memorySegmentCount,
+                int totalEntries,
+                List<IndexBucketRowCache.RangeMemoryInfo> ranges) {
+            this.dataBucket = dataBucket;
+            this.indexTableId = indexTableId;
+            this.indexBucketId = indexBucketId;
+            this.memorySegmentCount = memorySegmentCount;
+            this.totalEntries = totalEntries;
+            this.ranges = ranges;
+        }
+    }
+
     /** Stop the given replica. */
     private StopReplicaResultForBucket stopReplica(
             TableBucket tb,
@@ -1911,6 +2146,7 @@ public class ReplicaManager {
                                 logManager,
                                 isKvTable ? kvManager : null,
                                 conf.get(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME).toMillis(),
+                                conf.get(ConfigOptions.INDEX_COMMIT_HORIZON_MAX_LAG_OFFSET),
                                 conf.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER),
                                 serverId,
                                 new OffsetCheckpointFile.LazyOffsetCheckpoints(
