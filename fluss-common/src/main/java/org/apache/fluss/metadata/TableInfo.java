@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 
 import javax.annotation.Nullable;
 
@@ -219,7 +220,7 @@ public final class TableInfo {
 
     /** Check if the table is partitioned and auto partition is enabled. */
     public boolean isAutoPartitioned() {
-        return isPartitioned() && tableConfig.getAutoPartitionStrategy().isAutoPartitionEnabled();
+        return isPartitioned() && getAutoPartitionStrategy().isAutoPartitionEnabled();
     }
 
     /**
@@ -252,6 +253,16 @@ public final class TableInfo {
      */
     public TableConfig getTableConfig() {
         return tableConfig;
+    }
+
+    /**
+     * Returns the auto partition strategy with correctly initialized key field and pre-computed
+     * runtime fields. For single-column partitioned tables, the key will be automatically set to
+     * that partition column.
+     */
+    public AutoPartitionStrategy getAutoPartitionStrategy() {
+        return AutoPartitionStrategy.from(
+                properties, partitionKeys, rowType, schema.getColumnNames());
     }
 
     /**

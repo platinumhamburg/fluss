@@ -22,7 +22,6 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
-import org.apache.fluss.metadata.TablePartitionId;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
@@ -32,10 +31,13 @@ import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.CloseableIterator;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -78,30 +80,41 @@ public final class IndexCacheWriter implements Closeable {
 
     private volatile boolean closed = false;
 
-    private List<CacheWriterForIndexTable> cacheWriterForIndexTableTables;
+    private final List<TableCacheWriter> tableTableCacheWriters;
 
     public IndexCacheWriter(
             LogTablet logTablet,
             IndexRowCache indexRowCache,
             BucketingFunction bucketingFunction,
             Schema tableSchema,
-            List<TableInfo> indexTableInfos) {
+            List<TableInfo> indexTableInfos,
+            @Nullable TableInfo mainTableInfo) {
         this.logTablet = logTablet;
         this.tableSchema = tableSchema;
 
-        this.cacheWriterForIndexTableTables =
+        // Get auto-partition strategy from main table if available and enabled
+        AutoPartitionStrategy autoPartitionStrategy =
+                (mainTableInfo != null
+                                && mainTableInfo.getAutoPartitionStrategy() != null
+                                && mainTableInfo
+                                        .getAutoPartitionStrategy()
+                                        .isAutoPartitionEnabled())
+                        ? mainTableInfo.getAutoPartitionStrategy()
+                        : null;
+
+        this.tableTableCacheWriters =
                 indexTableInfos.stream()
                         .map(
                                 indexTableInfo ->
-                                        new CacheWriterForIndexTable(
-                                                TablePartitionId.of(
-                                                        indexTableInfo.getTableId(), null),
+                                        new TableCacheWriter(
+                                                indexTableInfo.getTableId(),
                                                 tableSchema,
                                                 indexTableInfo.getSchema(),
                                                 indexTableInfo.getNumBuckets(),
                                                 indexTableInfo.getBucketKeys(),
                                                 bucketingFunction,
-                                                indexRowCache))
+                                                indexRowCache,
+                                                autoPartitionStrategy))
                         .collect(Collectors.toList());
 
         LOG.info(
@@ -118,7 +131,7 @@ public final class IndexCacheWriter implements Closeable {
      * @param appendInfo the log append information containing offset details
      * @throws Exception if an error occurs during hot data processing
      */
-    public void writeHotDataFromWAL(LogRecords walRecords, LogAppendInfo appendInfo)
+    public void cacheIndexDataByHotData(LogRecords walRecords, LogAppendInfo appendInfo)
             throws Exception {
 
         if (closed) {
@@ -129,9 +142,11 @@ public final class IndexCacheWriter implements Closeable {
         }
 
         if (walRecords == null || appendInfo == null) {
-            LOG.debug(
-                    "Invalid parameters for hot data writing, skipping, tableBucket {}",
-                    logTablet.getTableBucket());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Invalid parameters for hot data writing, skipping, tableBucket {}",
+                        logTablet.getTableBucket());
+            }
             return;
         }
 
@@ -142,17 +157,21 @@ public final class IndexCacheWriter implements Closeable {
             return;
         }
 
-        LOG.debug(
-                "Writing hot data from WAL, base offset: {}, tableBucket {}",
-                appendInfo.firstOffset(),
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Writing hot data from WAL, base offset: {}, tableBucket {}",
+                    appendInfo.firstOffset(),
+                    logTablet.getTableBucket());
+        }
 
         // Use unified distribution pipeline to write to cache
         distributeRecordsToCache(walRecords, appendInfo.firstOffset());
 
-        LOG.debug(
-                "Successfully wrote hot data to cache for table bucket {}",
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Successfully wrote hot data to cache for table bucket {}",
+                    logTablet.getTableBucket());
+        }
     }
 
     /**
@@ -180,19 +199,23 @@ public final class IndexCacheWriter implements Closeable {
         }
 
         if (globalStartOffset >= globalEndOffset) {
-            LOG.debug(
-                    "No data to batch load, start offset {} >= end offset {}, tableBucket {}",
-                    globalStartOffset,
-                    globalEndOffset,
-                    logTablet.getTableBucket());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "No data to batch load, start offset {} >= end offset {}, tableBucket {}",
+                        globalStartOffset,
+                        globalEndOffset,
+                        logTablet.getTableBucket());
+            }
             return;
         }
 
-        LOG.debug(
-                "Batch loading cold data from global WAL range [{}, {}), tableBucket {}",
-                globalStartOffset,
-                globalEndOffset,
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Batch loading cold data from global WAL range [{}, {}), tableBucket {}",
+                    globalStartOffset,
+                    globalEndOffset,
+                    logTablet.getTableBucket());
+        }
 
         // Read WAL data and distribute with conditional writing
         long currentOffset = globalStartOffset;
@@ -200,13 +223,15 @@ public final class IndexCacheWriter implements Closeable {
             // Use fixed fetch size since maxFetchBytes parameter is removed
             int maxFetchBytes = 64 * 1024 * 1024;
 
+            // Use LOG_END isolation for cold data loading because:
+            // 1. This is leader loading historical data locally, not serving client reads
+            // 2. HIGH_WATERMARK would be limited by indexCommitHorizon which could be 0
+            //    during failover recovery, preventing any data from being loaded
+            // 3. The data range [globalStartOffset, globalEndOffset) is already validated
+            //    to be within logEndOffsetOnLeaderStart, ensuring we only load historical data
             FetchDataInfo fetchResult =
                     logTablet.read(
-                            currentOffset,
-                            maxFetchBytes,
-                            FetchIsolation.HIGH_WATERMARK,
-                            true,
-                            null);
+                            currentOffset, maxFetchBytes, FetchIsolation.LOG_END, true, null);
 
             if (fetchResult.getRecords() == null
                     || fetchResult.getRecords() == MemoryLogRecords.EMPTY) {
@@ -224,11 +249,13 @@ public final class IndexCacheWriter implements Closeable {
             currentOffset = nextOffset;
         }
 
-        LOG.debug(
-                "Successfully batch loaded cold data from global WAL range [{}, {}), tableBucket {}",
-                globalStartOffset,
-                globalEndOffset,
-                logTablet.getTableBucket());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Successfully batch loaded cold data from global WAL range [{}, {}), tableBucket {}",
+                    globalStartOffset,
+                    globalEndOffset,
+                    logTablet.getTableBucket());
+        }
     }
 
     /**
@@ -237,6 +264,7 @@ public final class IndexCacheWriter implements Closeable {
      * optional conditional writing support.
      *
      * @param walRecords the WAL records to process
+     * @param firstOffset the first offset of the WAL records
      * @return the maximum processed offset
      * @throws Exception if an error occurs during processing
      */
@@ -246,18 +274,35 @@ public final class IndexCacheWriter implements Closeable {
         for (LogRecordBatch batch : walRecords.batches()) {
             short schemaId = batch.schemaId();
 
+            // Record the batch start offset for gap filling lowerBound
+            long batchStartOffset = currentOffset;
+            long batchEndOffset = currentOffset;
+
             try (LogRecordReadContext readContext =
                             LogRecordReadContext.createArrowReadContext(
                                     tableSchema.getRowType(), schemaId);
                     CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
                 while (recordIterator.hasNext()) {
                     LogRecord walRecord = recordIterator.next();
-                    for (CacheWriterForIndexTable indexWriter : cacheWriterForIndexTableTables) {
-                        indexWriter.writeRecord(walRecord, currentOffset);
+                    // Process each record with batch mode (only write to target buckets)
+                    for (TableCacheWriter indexWriter : tableTableCacheWriters) {
+                        indexWriter.writeRecordInBatch(walRecord, batchEndOffset, batchStartOffset);
                     }
-                    currentOffset++;
+                    batchEndOffset++;
                 }
             }
+
+            // After processing all records in the batch, synchronize all buckets to the same offset
+            // level
+            // This ensures all buckets have consistent offset progression while minimizing empty
+            // row writes
+            if (batchEndOffset > batchStartOffset) {
+                for (TableCacheWriter indexWriter : tableTableCacheWriters) {
+                    indexWriter.finalizeBatch(batchEndOffset - 1, batchStartOffset);
+                }
+            }
+
+            currentOffset = batchEndOffset;
         }
         return currentOffset;
     }

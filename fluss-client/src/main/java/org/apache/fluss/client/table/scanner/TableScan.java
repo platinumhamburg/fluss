@@ -27,6 +27,7 @@ import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.LogScannerImpl;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.types.RowType;
@@ -126,6 +127,10 @@ public class TableScan implements Scan {
             throw new FlussRuntimeException("Failed to get snapshot metadata", e);
         }
 
+        // Determine if values are encoded with timestamp
+        // Currently, only index tables use TsValueEncoder
+        boolean shouldUseTsDecoding =
+                IndexTableUtils.isIndexTable(tableInfo.getTablePath().getTableName());
         return new KvSnapshotBatchScanner(
                 tableInfo.getRowType(),
                 tableBucket,
@@ -133,6 +138,7 @@ public class TableScan implements Scan {
                 projectedColumns,
                 scannerTmpDir,
                 tableInfo.getTableConfig().getKvFormat(),
-                conn.getOrCreateRemoteFileDownloader());
+                conn.getOrCreateRemoteFileDownloader(),
+                shouldUseTsDecoding);
     }
 }

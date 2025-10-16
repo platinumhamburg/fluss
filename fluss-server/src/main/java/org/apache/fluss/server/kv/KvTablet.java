@@ -21,8 +21,10 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -33,9 +35,11 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
+import org.apache.fluss.row.encode.TsValueDecoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.server.index.IndexCache;
@@ -60,8 +64,8 @@ import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.FileUtils;
-import org.apache.fluss.utils.FlussPaths;
-import org.apache.fluss.utils.types.Tuple2;
+import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.clock.SystemClock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -108,6 +112,10 @@ public final class KvTablet {
     private final RowMerger rowMerger;
     private final ArrowCompressionInfo arrowCompressionInfo;
 
+    private final boolean isIndexTable;
+    // flag to indicate if should use timestamp encoding (index table with TTL)
+    private final boolean shouldUseTsEncoding;
+
     // IndexCache for real-time hot data indexing (nullable for tables without indexes)
     private final @Nullable IndexCache indexCache;
 
@@ -151,9 +159,16 @@ public final class KvTablet {
         this.rowMerger = rowMerger;
         this.arrowCompressionInfo = arrowCompressionInfo;
         this.indexCache = indexCache;
+        // Only use timestamp encoding for index tables with TTL enabled
+        // For index tables of non-partitioned main tables, ttlMillis will be -1, so no Ts encoding
+        this.isIndexTable =
+                IndexTableUtils.isIndexTable(physicalPath.getTablePath().getTableName());
+        this.shouldUseTsEncoding = isIndexTable;
     }
 
     public static KvTablet create(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
             LogTablet logTablet,
             File kvTabletDir,
             Configuration serverConf,
@@ -164,24 +179,49 @@ public final class KvTablet {
             Schema schema,
             RowMerger rowMerger,
             ArrowCompressionInfo arrowCompressionInfo,
-            @Nullable IndexCache indexCache)
+            @Nullable IndexCache indexCache,
+            long ttlMillis,
+            Clock clock)
             throws IOException {
-        Tuple2<PhysicalTablePath, TableBucket> tablePathAndBucket =
-                FlussPaths.parseTabletDir(kvTabletDir);
-        return create(
-                tablePathAndBucket.f0,
-                tablePathAndBucket.f1,
-                logTablet,
-                kvTabletDir,
-                serverConf,
-                serverMetricGroup,
-                arrowBufferAllocator,
-                memorySegmentPool,
-                kvFormat,
-                schema,
-                rowMerger,
-                arrowCompressionInfo,
-                indexCache);
+        RocksDBKv kv = null;
+        try {
+            kv = buildRocksDBKv(serverConf, kvTabletDir, ttlMillis, clock);
+            return new KvTablet(
+                    tablePath,
+                    tableBucket,
+                    logTablet,
+                    kvTabletDir,
+                    serverMetricGroup,
+                    kv,
+                    serverConf.get(ConfigOptions.KV_WRITE_BATCH_SIZE).getBytes(),
+                    logTablet.getLogFormat(),
+                    arrowBufferAllocator,
+                    memorySegmentPool,
+                    kvFormat,
+                    schema,
+                    rowMerger,
+                    arrowCompressionInfo,
+                    indexCache);
+        } catch (Throwable t) {
+            // Clean up RocksDBKv if KvTablet construction fails to prevent resource leak
+            if (kv != null) {
+                try {
+                    kv.close();
+                } catch (Exception e) {
+                    LOG.warn(
+                            "Failed to close RocksDBKv during cleanup after KvTablet creation failure",
+                            e);
+                }
+            }
+            // Re-throw the original exception
+            if (t instanceof IOException) {
+                throw (IOException) t;
+            } else if (t instanceof RuntimeException) {
+                throw (RuntimeException) t;
+            } else {
+                throw (Error) t;
+            }
+        }
     }
 
     public static KvTablet create(
@@ -199,29 +239,29 @@ public final class KvTablet {
             ArrowCompressionInfo arrowCompressionInfo,
             @Nullable IndexCache indexCache)
             throws IOException {
-        RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir);
-        return new KvTablet(
+        return KvTablet.create(
                 tablePath,
                 tableBucket,
                 logTablet,
                 kvTabletDir,
+                serverConf,
                 serverMetricGroup,
-                kv,
-                serverConf.get(ConfigOptions.KV_WRITE_BATCH_SIZE).getBytes(),
-                logTablet.getLogFormat(),
                 arrowBufferAllocator,
                 memorySegmentPool,
                 kvFormat,
                 schema,
                 rowMerger,
                 arrowCompressionInfo,
-                indexCache);
+                indexCache,
+                -1,
+                SystemClock.getInstance());
     }
 
-    private static RocksDBKv buildRocksDBKv(Configuration configuration, File kvDir)
+    private static RocksDBKv buildRocksDBKv(
+            Configuration configuration, File kvDir, long ttlMillis, Clock clock)
             throws IOException {
         RocksDBResourceContainer rocksDBResourceContainer =
-                new RocksDBResourceContainer(configuration, kvDir);
+                new RocksDBResourceContainer(configuration, kvDir, false, ttlMillis, clock);
         RocksDBKvBuilder rocksDBKvBuilder =
                 new RocksDBKvBuilder(
                         kvDir,
@@ -241,6 +281,14 @@ public final class KvTablet {
     @Nullable
     public String getPartitionName() {
         return physicalPath.getPartitionName();
+    }
+
+    /**
+     * Returns whether this KV tablet should use timestamp encoding. This is true only for index
+     * tables with TTL enabled (main table is partitioned with retention).
+     */
+    public boolean shouldUseTsEncoding() {
+        return shouldUseTsEncoding;
     }
 
     public File getKvTabletDir() {
@@ -263,6 +311,9 @@ public final class KvTablet {
      */
     public LogAppendInfo putAsLeader(KvRecordBatch kvRecords, @Nullable int[] targetColumns)
             throws Exception {
+        if (isIndexTable) {
+            throw new InvalidTableException("Index table does not support direct client writes.");
+        }
         return inWriteLock(
                 kvLock,
                 () -> {
@@ -281,8 +332,16 @@ public final class KvTablet {
                         // TODO: reuse the read context and decoder
                         KvRecordBatch.ReadContext readContext =
                                 KvRecordReadContext.createReadContext(kvFormat, fieldTypes);
-                        ValueDecoder valueDecoder =
-                                new ValueDecoder(readContext.getRowDecoder(schemaId));
+                        // Use TsValueDecoder only for index tables with TTL enabled
+                        ValueDecoder valueDecoder = null;
+                        TsValueDecoder tsValueDecoder = null;
+                        if (shouldUseTsEncoding) {
+                            tsValueDecoder =
+                                    new TsValueDecoder(readContext.getRowDecoder(schemaId));
+                        } else {
+                            valueDecoder = new ValueDecoder(readContext.getRowDecoder(schemaId));
+                        }
+
                         for (KvRecord kvRecord : kvRecords.records(readContext)) {
                             byte[] keyBytes = BytesUtils.toArray(kvRecord.getKey());
                             KvPreWriteBuffer.Key key = KvPreWriteBuffer.Key.of(keyBytes);
@@ -299,7 +358,10 @@ public final class KvTablet {
                                             "The specific key can't be found in kv tablet although the kv record is for deletion, "
                                                     + "ignore it directly as it doesn't exist in the kv tablet yet.");
                                 } else {
-                                    BinaryRow oldRow = valueDecoder.decodeValue(oldValue).row;
+                                    BinaryRow oldRow =
+                                            shouldUseTsEncoding
+                                                    ? tsValueDecoder.decodeValue(oldValue).row
+                                                    : valueDecoder.decodeValue(oldValue).row;
                                     BinaryRow newRow = currentMerger.delete(oldRow);
                                     // if newRow is null, it means the row should be deleted
                                     if (newRow == null) {
@@ -321,7 +383,10 @@ public final class KvTablet {
                                 byte[] oldValue = getFromBufferOrKv(key);
                                 // it's update
                                 if (oldValue != null) {
-                                    BinaryRow oldRow = valueDecoder.decodeValue(oldValue).row;
+                                    BinaryRow oldRow =
+                                            shouldUseTsEncoding
+                                                    ? tsValueDecoder.decodeValue(oldValue).row
+                                                    : valueDecoder.decodeValue(oldValue).row;
                                     BinaryRow newRow =
                                             currentMerger.merge(oldRow, kvRecord.getRow());
                                     if (newRow == oldRow) {
@@ -362,6 +427,7 @@ public final class KvTablet {
                         // put a batch into file with recordCount 0 and offset plus 1L, it will
                         // update the batchSequence corresponding to the writerId and also increment
                         // the CDC log offset by 1.
+                        MemoryLogRecords logRecords = walBuilder.build();
                         LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
 
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
@@ -373,20 +439,11 @@ public final class KvTablet {
                             // NEW: Write hot data to IndexCache for real-time index caching
                             // Only process hot data writing if the batch is not duplicated
                             IndexCache cache = this.indexCache;
-                            if (cache != null && !schema.getIndexes().isEmpty()) {
-                                try {
-                                    // Use the WAL LogRecords and appendInfo to process hot data
-                                    cache.writeHotDataFromWAL(walBuilder.build(), logAppendInfo);
-                                    LOG.debug(
-                                            "Successfully processed hot data via IndexCache for {}",
-                                            tableBucket);
-                                } catch (Exception e) {
-                                    LOG.warn(
-                                            "Error while writing hot data to IndexCache for {}",
-                                            tableBucket,
-                                            e);
-                                    // Don't fail the main write operation due to index cache issues
-                                }
+                            if (cache != null) {
+                                cache.cacheIndexDataByHotData(
+                                        walBuilder, logRecords, logAppendInfo);
+                                // walBuilder will be deallocate by IndexCache
+                                walBuilder = null;
                             }
                         }
                         return logAppendInfo;
@@ -401,7 +458,9 @@ public final class KvTablet {
                         throw t;
                     } finally {
                         // deallocate the memory and arrow writer used by the wal builder
-                        walBuilder.deallocate();
+                        if (walBuilder != null) {
+                            walBuilder.deallocate();
+                        }
                     }
                 });
     }
@@ -458,7 +517,8 @@ public final class KvTablet {
                             flushedLogOffset = exclusiveUpToLogOffset;
                         } catch (Throwable t) {
                             fatalErrorHandler.onFatalError(
-                                    new KvStorageException("Failed to flush kv pre-write buffer."));
+                                    new KvStorageException(
+                                            "Failed to flush kv pre-write buffer.", t));
                         }
                     }
                 });
@@ -481,6 +541,20 @@ public final class KvTablet {
         } else {
             kvPreWriteBuffer.put(wrapKey, value, logOffset);
         }
+    }
+
+    /**
+     * Put key,value,logOffset into pre-write buffer directly.
+     *
+     * <p>This method is intended for use only in recovery operations and index updates. It bypasses
+     * the normal write flow and should not be used for regular client writes.
+     *
+     * @param key the key bytes
+     * @param value the value bytes, null for deletion
+     * @param logOffset the log offset for this record
+     */
+    public void putToPreWriteBufferSafety(byte[] key, @Nullable byte[] value, long logOffset) {
+        inWriteLock(kvLock, () -> putToPreWriteBuffer(key, value, logOffset));
     }
 
     /**
@@ -532,6 +606,17 @@ public final class KvTablet {
 
     public KvBatchWriter createKvBatchWriter() {
         return rocksDBKv.newWriteBatch(writeBatchSize);
+    }
+
+    /**
+     * Triggers manual compaction on the RocksDB instance. This is useful for testing TTL
+     * functionality, as it forces RocksDB to evaluate and remove expired data based on the
+     * configured CompactionFilter.
+     *
+     * @throws IOException if compaction fails
+     */
+    public void compact() throws IOException {
+        rocksDBKv.compact();
     }
 
     public void close() throws Exception {

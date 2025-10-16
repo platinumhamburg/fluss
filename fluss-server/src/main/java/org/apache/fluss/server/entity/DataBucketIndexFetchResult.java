@@ -19,13 +19,13 @@ package org.apache.fluss.server.entity;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.record.LogRecordBatch;
-import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
+import org.apache.fluss.rpc.protocol.ApiError;
 
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The structure of index fetch result information for all index buckets associated with a data
@@ -46,10 +46,6 @@ public final class DataBucketIndexFetchResult {
         return indexBucketResults;
     }
 
-    public void addIndexBucketResult(TableBucket indexBucket, FetchIndexLogResultForBucket result) {
-        indexBucketResults.put(indexBucket, result);
-    }
-
     public FetchIndexLogResultForBucket getIndexBucketResult(TableBucket indexBucket) {
         return indexBucketResults.get(indexBucket);
     }
@@ -64,36 +60,13 @@ public final class DataBucketIndexFetchResult {
                 .anyMatch(FetchIndexLogResultForBucket::hasError);
     }
 
-    /**
-     * Get total bytes from all successful index bucket results.
-     *
-     * @return total bytes
-     */
-    public int getTotalBytes() {
-        return indexBucketResults.values().stream()
-                .filter(result -> !result.hasError())
-                .mapToInt(result -> result.recordsOrEmpty().sizeInBytes())
-                .sum();
-    }
-
-    /**
-     * Get total estimated records from all successful index bucket results.
-     *
-     * @return estimated total records
-     */
-    public int getTotalRecords() {
-        return indexBucketResults.values().stream()
-                .filter(result -> !result.hasError())
-                .mapToInt(
-                        result -> {
-                            int totalRecords = 0;
-                            LogRecords records = result.recordsOrEmpty();
-                            for (LogRecordBatch batch : records.batches()) {
-                                totalRecords += batch.getRecordCount();
-                            }
-                            return totalRecords;
-                        })
-                .sum();
+    public static DataBucketIndexFetchResult errorResult(
+            Set<TableBucket> indexBucketsToFetch, ApiError error) {
+        Map<TableBucket, FetchIndexLogResultForBucket> indexBucketResults = new HashMap<>();
+        for (TableBucket indexBucket : indexBucketsToFetch) {
+            indexBucketResults.put(indexBucket, new FetchIndexLogResultForBucket(error));
+        }
+        return new DataBucketIndexFetchResult(indexBucketResults);
     }
 
     @Override

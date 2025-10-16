@@ -18,6 +18,7 @@
 package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.client.metadata.MetadataUpdater;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -131,7 +132,8 @@ class TableLookupTest {
 
     @Test
     void testCreatePrimaryKeyLookuper() {
-        TableLookup tableLookup = new TableLookup(mainTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(mainTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         Lookuper lookuper = tableLookup.createLookuper();
 
@@ -140,7 +142,8 @@ class TableLookupTest {
 
     @Test
     void testCreateSecondaryIndexLookuper() {
-        TableLookup tableLookup = new TableLookup(mainTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(mainTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Test single column index lookup
         Lookup emailLookup = tableLookup.lookupBy(Collections.singletonList("email"));
@@ -167,7 +170,8 @@ class TableLookupTest {
 
     @Test
     void testCreatePrefixKeyLookuper() {
-        TableLookup tableLookup = new TableLookup(mainTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(mainTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Test lookup by bucket key should use prefix lookup (when not using primary key lookup)
         Lookup idLookup = tableLookup.lookupBy(Collections.singletonList("id"));
@@ -201,7 +205,8 @@ class TableLookupTest {
                         System.currentTimeMillis(),
                         System.currentTimeMillis());
 
-        TableLookup tableLookup = new TableLookup(indexTable, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(indexTable, metadataUpdater, lookupClient, new Configuration());
 
         // Even if we lookup by columns that would match an index, it should not create
         // SecondaryIndexLookuper for index tables
@@ -238,7 +243,8 @@ class TableLookupTest {
                         System.currentTimeMillis());
 
         TableLookup tableLookup =
-                new TableLookup(tableWithoutIndexes, metadataUpdater, lookupClient);
+                new TableLookup(
+                        tableWithoutIndexes, metadataUpdater, lookupClient, new Configuration());
 
         // Must lookup by bucket key for prefix lookup to work
         Lookup idLookup = tableLookup.lookupBy(Collections.singletonList("id"));
@@ -249,7 +255,8 @@ class TableLookupTest {
 
     @Test
     void testPartialIndexMatchShouldUsePrefixLookup() {
-        TableLookup tableLookup = new TableLookup(mainTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(mainTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Test lookup by partial index columns (only name from name_age_idx)
         // Should fall back to prefix lookup - but for prefix lookup to work,
@@ -289,7 +296,8 @@ class TableLookupTest {
                         System.currentTimeMillis());
 
         TableLookup tableLookup =
-                new TableLookup(partitionedTableInfo, metadataUpdater, lookupClient);
+                new TableLookup(
+                        partitionedTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // For partitioned table, lookup columns must contain all partition keys AND bucket keys
         Lookup validLookup = tableLookup.lookupBy(Arrays.asList("partition_col", "id"));
@@ -324,7 +332,9 @@ class TableLookupTest {
                         System.currentTimeMillis(),
                         System.currentTimeMillis());
 
-        TableLookup tableLookup = new TableLookup(multiKeyTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(
+                        multiKeyTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Lookup columns must exactly match bucket keys in order
         Lookup validLookup = tableLookup.lookupBy(Arrays.asList("id1", "id2"));
@@ -361,7 +371,8 @@ class TableLookupTest {
                         System.currentTimeMillis());
 
         TableLookup tableLookup =
-                new TableLookup(partitionedTableInfo, metadataUpdater, lookupClient);
+                new TableLookup(
+                        partitionedTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Should fail when partition column is missing
         Lookup invalidLookup = tableLookup.lookupBy(Collections.singletonList("id"));
@@ -374,7 +385,8 @@ class TableLookupTest {
 
     @Test
     void testPrefixLookupShouldFailWhenBucketKeysNotMatched() {
-        TableLookup tableLookup = new TableLookup(mainTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(mainTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Should fail when lookup columns don't match bucket keys exactly
         Lookup invalidLookup = tableLookup.lookupBy(Collections.singletonList("name"));
@@ -412,7 +424,9 @@ class TableLookupTest {
                         System.currentTimeMillis(),
                         System.currentTimeMillis());
 
-        TableLookup tableLookup = new TableLookup(multiKeyTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(
+                        multiKeyTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Should fail when bucket keys are in wrong order
         Lookup invalidLookup = tableLookup.lookupBy(Arrays.asList("id2", "id1"));
@@ -446,7 +460,8 @@ class TableLookupTest {
                         System.currentTimeMillis(),
                         System.currentTimeMillis());
 
-        TableLookup tableLookup = new TableLookup(logTableInfo, metadataUpdater, lookupClient);
+        TableLookup tableLookup =
+                new TableLookup(logTableInfo, metadataUpdater, lookupClient, new Configuration());
 
         // Should fail on log table (no primary key)
         Lookup invalidLookup = tableLookup.lookupBy(Collections.singletonList("id"));

@@ -18,7 +18,9 @@
 package org.apache.fluss.metadata;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -211,11 +213,40 @@ public final class IndexTableUtils {
                         .schema(indexTableSchema)
                         .kvFormat(KvFormat.INDEXED)
                         .logFormat(LogFormat.INDEXED)
-                        .property(
-                                ConfigOptions.TABLE_REPLICATION_FACTOR.key(),
-                                String.valueOf(indexBucketCount))
                         .distributedBy(indexBucketCount, indexColumns);
 
+        // inherit replication factor from main table if it's set
+        String mainTableReplicationFactor =
+                mainTableDescriptor
+                        .getProperties()
+                        .get(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
+        if (mainTableReplicationFactor != null) {
+            builder.property(
+                    ConfigOptions.TABLE_REPLICATION_FACTOR.key(), mainTableReplicationFactor);
+        }
+
         return builder.build();
+    }
+
+    /**
+     * Calculate the TTL for an index table based on the main table's AutoPartitionStrategy.
+     *
+     * <p>The TTL is derived from the main table's {@code table.auto-partition.num-retention}
+     * configuration. If auto-partitioning is not enabled or retention is not configured, returns -1
+     * to indicate no TTL.
+     *
+     * @param mainTableProperties the properties/configuration of the main table
+     * @return TTL in milliseconds, or -1 if TTL should not be enabled
+     */
+    public static long calculateIndexTableTTL(Configuration mainTableProperties) {
+        AutoPartitionStrategy strategy = AutoPartitionStrategy.from(mainTableProperties);
+
+        // If auto partition is not enabled or retention is not configured (< 0), don't enable TTL
+        if (!strategy.isAutoPartitionEnabled() || strategy.numToRetain() < 0) {
+            return -1;
+        }
+
+        // Use the time unit's built-in conversion method
+        return strategy.timeUnit().toApproximateTtlMillis(strategy.numToRetain());
     }
 }

@@ -505,7 +505,9 @@ public final class TestData {
                     .schema(PARTITIONED_INDEXED_SCHEMA)
                     .distributedBy(INDEX_TABLE_BUCKET_COUNT, "id")
                     .partitionedBy("year")
+                    .property("table.auto-partition.enabled", "true")
                     .build();
+
     public static final PhysicalTablePath PARTITIONED_INDEXED_PHYSICAL_TABLE_PATH =
             PhysicalTablePath.of(PARTITIONED_INDEXED_TABLE_PATH);
     public static final TableInfo PARTITIONED_INDEXED_TABLE_INFO =
