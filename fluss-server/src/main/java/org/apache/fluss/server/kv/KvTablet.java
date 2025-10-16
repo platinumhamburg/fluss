@@ -33,6 +33,7 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
@@ -362,6 +363,7 @@ public final class KvTablet {
                         // put a batch into file with recordCount 0 and offset plus 1L, it will
                         // update the batchSequence corresponding to the writerId and also increment
                         // the CDC log offset by 1.
+                        MemoryLogRecords logRecords = walBuilder.build();
                         LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
 
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
@@ -373,20 +375,11 @@ public final class KvTablet {
                             // NEW: Write hot data to IndexCache for real-time index caching
                             // Only process hot data writing if the batch is not duplicated
                             IndexCache cache = this.indexCache;
-                            if (cache != null && !schema.getIndexes().isEmpty()) {
-                                try {
-                                    // Use the WAL LogRecords and appendInfo to process hot data
-                                    cache.writeHotDataFromWAL(walBuilder.build(), logAppendInfo);
-                                    LOG.debug(
-                                            "Successfully processed hot data via IndexCache for {}",
-                                            tableBucket);
-                                } catch (Exception e) {
-                                    LOG.warn(
-                                            "Error while writing hot data to IndexCache for {}",
-                                            tableBucket,
-                                            e);
-                                    // Don't fail the main write operation due to index cache issues
-                                }
+                            if (cache != null) {
+                                cache.cacheIndexDataByHotData(
+                                        walBuilder, logRecords, logAppendInfo);
+                                // walBuilder will be deallocate by IndexCache
+                                walBuilder = null;
                             }
                         }
                         return logAppendInfo;
@@ -401,7 +394,9 @@ public final class KvTablet {
                         throw t;
                     } finally {
                         // deallocate the memory and arrow writer used by the wal builder
-                        walBuilder.deallocate();
+                        if (walBuilder != null) {
+                            walBuilder.deallocate();
+                        }
                     }
                 });
     }
@@ -458,7 +453,8 @@ public final class KvTablet {
                             flushedLogOffset = exclusiveUpToLogOffset;
                         } catch (Throwable t) {
                             fatalErrorHandler.onFatalError(
-                                    new KvStorageException("Failed to flush kv pre-write buffer."));
+                                    new KvStorageException(
+                                            "Failed to flush kv pre-write buffer.", t));
                         }
                     }
                 });
@@ -481,6 +477,20 @@ public final class KvTablet {
         } else {
             kvPreWriteBuffer.put(wrapKey, value, logOffset);
         }
+    }
+
+    /**
+     * Put key,value,logOffset into pre-write buffer directly.
+     *
+     * <p>This method is intended for use only in recovery operations and index updates. It bypasses
+     * the normal write flow and should not be used for regular client writes.
+     *
+     * @param key the key bytes
+     * @param value the value bytes, null for deletion
+     * @param logOffset the log offset for this record
+     */
+    public void putToPreWriteBufferSafety(byte[] key, @Nullable byte[] value, long logOffset) {
+        inWriteLock(kvLock, () -> putToPreWriteBuffer(key, value, logOffset));
     }
 
     /**
@@ -584,5 +594,29 @@ public final class KvTablet {
     @VisibleForTesting
     public RocksDBKv getRocksDBKv() {
         return rocksDBKv;
+    }
+
+    private static class WalBundle {
+        private LogAppendInfo appendInfo;
+        private WalBuilder walBuilder;
+        private MemoryLogRecords wal;
+
+        WalBundle(LogAppendInfo appendInfo, WalBuilder walBuilder, MemoryLogRecords wal) {
+            this.appendInfo = appendInfo;
+            this.walBuilder = walBuilder;
+            this.wal = wal;
+        }
+
+        public LogAppendInfo getAppendInfo() {
+            return appendInfo;
+        }
+
+        public WalBuilder getWalBuilder() {
+            return walBuilder;
+        }
+
+        public MemoryLogRecords getWal() {
+            return wal;
+        }
     }
 }

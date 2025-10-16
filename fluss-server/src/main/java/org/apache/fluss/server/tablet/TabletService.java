@@ -70,7 +70,6 @@ import org.apache.fluss.server.DynamicConfigManager;
 import org.apache.fluss.server.RpcServiceBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.coordinator.MetadataManager;
-import org.apache.fluss.server.entity.DataBucketIndexFetchResult;
 import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
@@ -222,7 +221,6 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
 
     @Override
     public CompletableFuture<FetchIndexResponse> fetchIndex(FetchIndexRequest request) {
-        Map<TableBucket, DataBucketIndexFetchResult> errorResponseMap = new HashMap<>();
         Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> dataBucketIndexFetchInfo =
                 getIndexReqMap(request);
 
@@ -242,9 +240,17 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     private static FetchIndexParams getFetchIndexParams(FetchIndexRequest request) {
         FetchIndexParams fetchParams;
         if (request.hasMaxWaitMs()) {
-            fetchParams = new FetchIndexParams(request.getMaxRecords(), request.getMaxWaitMs());
+            fetchParams =
+                    new FetchIndexParams(
+                            request.getMaxBytes(),
+                            request.getMinAdvanceOffset(),
+                            request.getMaxWaitMs());
         } else {
-            fetchParams = new FetchIndexParams(request.getMaxRecords());
+            fetchParams =
+                    new FetchIndexParams(
+                            request.getMaxBytes(),
+                            request.getMinAdvanceOffset(),
+                            FetchIndexParams.DEFAULT_MAX_WAIT_MS);
         }
         return fetchParams;
     }
