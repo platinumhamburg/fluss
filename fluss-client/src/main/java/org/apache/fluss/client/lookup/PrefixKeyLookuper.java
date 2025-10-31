@@ -35,6 +35,7 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.NotThreadSafe;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -49,6 +50,7 @@ import static org.apache.fluss.client.utils.ClientUtils.getPartitionId;
  * An implementation of {@link Lookuper} that lookups by prefix key. A prefix key is a prefix subset
  * of the primary key.
  */
+@NotThreadSafe
 class PrefixKeyLookuper implements Lookuper {
 
     private final TableInfo tableInfo;
