@@ -18,6 +18,7 @@
 package org.apache.fluss.exception;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.metadata.TablePath;
 
 /**
  * Exception for trying to operate on a table that doesn't exist.
@@ -26,6 +27,11 @@ import org.apache.fluss.annotation.PublicEvolving;
  */
 @PublicEvolving
 public class TableNotExistException extends ApiException {
+
+    public TableNotExistException(TablePath tablePath) {
+        this("Table " + tablePath + " does not exist.");
+    }
+
     public TableNotExistException(String message) {
         this(message, null);
     }

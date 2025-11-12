@@ -26,7 +26,6 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.replica.ReplicaTestBase;
-import org.apache.fluss.server.replica.fetcher.ReplicaFetcherManager.ServerIdAndFetcherId;
 import org.apache.fluss.server.tablet.TestTabletServerGateway;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
@@ -101,7 +100,7 @@ class ReplicaFetcherManagerTest extends ReplicaTestBase {
         Map<TableBucket, InitialFetchStatus> initialFetchStateMap = new HashMap<>();
         initialFetchStateMap.put(tb, initialFetchStatus);
         fetcherManager.addFetcherForBuckets(initialFetchStateMap);
-        Map<ReplicaFetcherManager.ServerIdAndFetcherId, ReplicaFetcherThread> fetcherThreadMap =
+        Map<ServerIdAndFetcherId, ReplicaFetcherThread> fetcherThreadMap =
                 fetcherManager.getFetcherThreadMap();
         assertThat(fetcherThreadMap.size()).isEqualTo(1);
         ReplicaFetcherThread thread =

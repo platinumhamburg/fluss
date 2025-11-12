@@ -19,9 +19,9 @@ package org.apache.fluss.server.replica.delay;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.exception.FlussRuntimeException;
-import org.apache.fluss.server.utils.timer.DefaultTimer;
-import org.apache.fluss.server.utils.timer.Timer;
-import org.apache.fluss.server.utils.timer.TimerTask;
+import org.apache.fluss.timer.DefaultTimer;
+import org.apache.fluss.timer.Timer;
+import org.apache.fluss.timer.TimerTask;
 import org.apache.fluss.utils.MapUtils;
 import org.apache.fluss.utils.concurrent.ShutdownableThread;
 

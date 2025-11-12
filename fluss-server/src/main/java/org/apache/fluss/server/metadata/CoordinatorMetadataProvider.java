@@ -111,6 +111,23 @@ public class CoordinatorMetadataProvider extends ZkBasedMetadataProvider {
         return ctx.getPhysicalTablePath(partitionId);
     }
 
+    @Override
+    public Optional<TablePath> getTablePathFromCache(long tableId) {
+        return Optional.ofNullable(ctx.getTablePathById(tableId));
+    }
+
+    @Override
+    protected Optional<Integer> getBucketLeaderIdFromCacheInternal(TableBucket tableBucket) {
+        // Efficiently retrieve leader ID from coordinator context without constructing intermediate
+        // objects
+        Optional<LeaderAndIsr> optLeaderAndIsr = ctx.getBucketLeaderAndIsr(tableBucket);
+        if (!optLeaderAndIsr.isPresent()) {
+            return Optional.empty();
+        }
+        // Return leader ID (may be -1 if no leader elected)
+        return Optional.of(optLeaderAndIsr.get().leader());
+    }
+
     /**
      * Constructs bucket metadata list from coordinator context information.
      *

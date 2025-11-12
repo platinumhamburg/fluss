@@ -24,7 +24,6 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
-import org.apache.fluss.utils.AutoPartitionStrategy;
 
 import java.time.Duration;
 import java.util.Optional;
@@ -120,10 +119,5 @@ public class TableConfig {
     /** Gets the Arrow compression type and compression level of the table. */
     public ArrowCompressionInfo getArrowCompressionInfo() {
         return ArrowCompressionInfo.fromConf(config);
-    }
-
-    /** Gets the auto partition strategy of the table. */
-    public AutoPartitionStrategy getAutoPartitionStrategy() {
-        return AutoPartitionStrategy.from(config);
     }
 }

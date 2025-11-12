@@ -28,6 +28,10 @@ import org.apache.fluss.annotation.Internal;
  */
 @Internal
 public final class SchemaInfo {
+
+    /** Default schema ID that tables begin with. */
+    public static final short DEFAULT_SCHEMA_ID = 1;
+
     private final Schema schema;
     private final int schemaId;
 

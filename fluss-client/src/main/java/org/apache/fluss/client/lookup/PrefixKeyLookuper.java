@@ -22,14 +22,17 @@ import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.table.getter.PartitionGetter;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.decode.RowDecoder;
 import org.apache.fluss.row.encode.KeyEncoder;
+import org.apache.fluss.row.encode.TsValueDecoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
 
@@ -68,6 +71,12 @@ class PrefixKeyLookuper implements Lookuper {
     /** Decode the lookup bytes to result row. */
     private final ValueDecoder kvValueDecoder;
 
+    /** Decode the lookup bytes for values with timestamp encoding. */
+    private final TsValueDecoder kvTsValueDecoder;
+
+    /** Whether the values are encoded with timestamp (TsValueEncoder). */
+    private final boolean shouldUseTsDecoding;
+
     public PrefixKeyLookuper(
             TableInfo tableInfo,
             MetadataUpdater metadataUpdater,
@@ -90,11 +99,17 @@ class PrefixKeyLookuper implements Lookuper {
                 tableInfo.isPartitioned()
                         ? new PartitionGetter(lookupRowType, tableInfo.getPartitionKeys())
                         : null;
-        this.kvValueDecoder =
-                new ValueDecoder(
-                        RowDecoder.create(
-                                tableInfo.getTableConfig().getKvFormat(),
-                                tableInfo.getRowType().getChildren().toArray(new DataType[0])));
+
+        // Determine if values are encoded with timestamp
+        // Currently, only index tables use TsValueEncoder
+        this.shouldUseTsDecoding =
+                IndexTableUtils.isIndexTable(tableInfo.getTablePath().getTableName());
+        RowDecoder rowDecoder =
+                RowDecoder.create(
+                        tableInfo.getTableConfig().getKvFormat(),
+                        tableInfo.getRowType().getChildren().toArray(new DataType[0]));
+        this.kvValueDecoder = new ValueDecoder(rowDecoder);
+        this.kvTsValueDecoder = new TsValueDecoder(rowDecoder);
     }
 
     private void validatePrefixLookup(TableInfo tableInfo, List<String> lookupColumns) {
@@ -146,37 +161,49 @@ class PrefixKeyLookuper implements Lookuper {
     }
 
     @Override
-    public CompletableFuture<LookupResult> lookup(InternalRow prefixKey) {
-        byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(prefixKey);
-        int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
+    public synchronized CompletableFuture<LookupResult> lookup(InternalRow prefixKey) {
+        try {
+            byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(prefixKey);
+            int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
 
-        Long partitionId = null;
-        if (partitionGetter != null) {
-            try {
-                partitionId =
-                        getPartitionId(
-                                prefixKey,
-                                partitionGetter,
-                                tableInfo.getTablePath(),
-                                metadataUpdater);
-            } catch (PartitionNotExistException e) {
-                return CompletableFuture.completedFuture(new LookupResult(Collections.emptyList()));
+            Long partitionId = null;
+            if (partitionGetter != null) {
+                try {
+                    partitionId =
+                            getPartitionId(
+                                    prefixKey,
+                                    partitionGetter,
+                                    tableInfo.getTablePath(),
+                                    metadataUpdater);
+                } catch (PartitionNotExistException e) {
+                    return CompletableFuture.completedFuture(
+                            new LookupResult(Collections.emptyList()));
+                }
             }
-        }
 
-        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-        return lookupClient
-                .prefixLookup(tableBucket, bucketKeyBytes)
-                .thenApply(
-                        result -> {
-                            List<InternalRow> rowList = new ArrayList<>(result.size());
-                            for (byte[] valueBytes : result) {
-                                if (valueBytes == null) {
-                                    continue;
+            TableBucket tableBucket =
+                    new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
+            return lookupClient
+                    .prefixLookup(tableBucket, bucketKeyBytes)
+                    .thenApply(
+                            result -> {
+                                List<InternalRow> rowList = new ArrayList<>(result.size());
+                                for (byte[] valueBytes : result) {
+                                    if (valueBytes == null) {
+                                        continue;
+                                    }
+                                    // For values encoded with timestamp, use TsValueDecoder;
+                                    // otherwise use ValueDecoder
+                                    InternalRow row =
+                                            shouldUseTsDecoding
+                                                    ? kvTsValueDecoder.decodeValue(valueBytes).row
+                                                    : kvValueDecoder.decodeValue(valueBytes).row;
+                                    rowList.add(row);
                                 }
-                                rowList.add(kvValueDecoder.decodeValue(valueBytes).row);
-                            }
-                            return new LookupResult(rowList);
-                        });
+                                return new LookupResult(rowList);
+                            });
+        } catch (Exception e) {
+            return FutureUtils.failedCompletableFuture(e);
+        }
     }
 }

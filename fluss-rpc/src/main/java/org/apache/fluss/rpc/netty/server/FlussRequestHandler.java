@@ -21,9 +21,13 @@ import org.apache.fluss.rpc.RpcGatewayService;
 import org.apache.fluss.rpc.messages.ApiMessage;
 import org.apache.fluss.rpc.protocol.ApiMethod;
 import org.apache.fluss.rpc.protocol.RequestType;
+import org.apache.fluss.timer.Timer;
+import org.apache.fluss.timer.TimerTask;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.lang.reflect.InvocationTargetException;
 import java.util.concurrent.CompletableFuture;
@@ -35,9 +39,22 @@ public class FlussRequestHandler implements RequestHandler<FlussRequest> {
     private static final Logger LOG = LoggerFactory.getLogger(FlussRequestHandler.class);
 
     private final RpcGatewayService service;
+    private final boolean slowRequestMonitoringEnabled;
+    private final long slowRequestThresholdMs;
+    private final boolean dumpStack;
+    @Nullable private final Timer timer;
 
-    public FlussRequestHandler(RpcGatewayService service) {
+    public FlussRequestHandler(
+            RpcGatewayService service,
+            boolean slowRequestMonitoringEnabled,
+            long slowRequestThresholdMs,
+            boolean dumpStack,
+            @Nullable Timer timer) {
         this.service = service;
+        this.slowRequestMonitoringEnabled = slowRequestMonitoringEnabled;
+        this.slowRequestThresholdMs = slowRequestThresholdMs;
+        this.dumpStack = dumpStack;
+        this.timer = timer;
     }
 
     @Override
@@ -50,6 +67,22 @@ public class FlussRequestHandler implements RequestHandler<FlussRequest> {
         request.setRequestDequeTimeMs(System.currentTimeMillis());
         ApiMethod api = request.getApiMethod();
         ApiMessage message = request.getMessage();
+
+        // Schedule slow request detection if enabled
+        TimerTask slowRequestDetector = null;
+        if (slowRequestMonitoringEnabled && timer != null && slowRequestThresholdMs > 0) {
+            slowRequestDetector =
+                    new SlowRequestDetector(
+                            request,
+                            Thread.currentThread(),
+                            slowRequestThresholdMs,
+                            dumpStack,
+                            slowRequestThresholdMs);
+            timer.add(slowRequestDetector);
+        }
+
+        final TimerTask detectorTask = slowRequestDetector;
+
         try {
             service.setCurrentSession(
                     new Session(
@@ -64,6 +97,10 @@ public class FlussRequestHandler implements RequestHandler<FlussRequest> {
             responseFuture.whenComplete(
                     (response, throwable) -> {
                         request.setRequestCompletedTimeMs(System.currentTimeMillis());
+                        // Cancel the slow request detector since request completed
+                        if (detectorTask != null) {
+                            detectorTask.cancel();
+                        }
                         if (throwable != null) {
                             request.fail(throwable);
                         } else {
@@ -79,6 +116,10 @@ public class FlussRequestHandler implements RequestHandler<FlussRequest> {
                         }
                     });
         } catch (Throwable t) {
+            // Cancel the slow request detector on immediate failure
+            if (detectorTask != null) {
+                detectorTask.cancel();
+            }
             LOG.debug("Error while executing RPC {}", api, t);
             request.fail(stripException(t, InvocationTargetException.class));
         }

@@ -18,6 +18,7 @@
 package org.apache.fluss.server.metadata;
 
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -82,6 +83,11 @@ public class TabletServerMetadataProvider extends ZkBasedMetadataProvider {
     }
 
     @Override
+    public Optional<TablePath> getTablePathFromCache(long tableId) {
+        return metadataCache.getTablePath(tableId);
+    }
+
+    @Override
     public List<TableMetadata> getTablesMetadataFromZK(Collection<TablePath> tablePaths) {
         List<TableMetadata> result = super.getTablesMetadataFromZK(tablePaths);
         // Update local cache after successfully fetching from ZooKeeper
@@ -96,5 +102,18 @@ public class TabletServerMetadataProvider extends ZkBasedMetadataProvider {
         // Update local cache after successfully fetching from ZooKeeper
         result.forEach(metadataCache::updatePartitionMetadata);
         return result;
+    }
+
+    @Override
+    public List<PartitionMetadata> getPartitionsMetadataFromZK(long partitionId) {
+        List<PartitionMetadata> result = super.getPartitionsMetadataFromZK(partitionId);
+        // Update local cache after successfully fetching from ZooKeeper
+        result.forEach(metadataCache::updatePartitionMetadata);
+        return result;
+    }
+
+    @Override
+    protected Optional<Integer> getBucketLeaderIdFromCacheInternal(TableBucket tableBucket) {
+        return metadataCache.getBucketLeaderId(tableBucket);
     }
 }

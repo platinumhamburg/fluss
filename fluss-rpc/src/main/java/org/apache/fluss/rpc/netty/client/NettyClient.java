@@ -33,8 +33,11 @@ import org.apache.fluss.shaded.netty4.io.netty.bootstrap.Bootstrap;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.PooledByteBufAllocator;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelOption;
 import org.apache.fluss.shaded.netty4.io.netty.channel.EventLoopGroup;
+import org.apache.fluss.timer.DefaultTimer;
+import org.apache.fluss.timer.Timer;
 import org.apache.fluss.utils.MapUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
+import org.apache.fluss.utils.concurrent.ShutdownableThread;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,6 +85,12 @@ public final class NettyClient implements RpcClient {
      */
     private final boolean isInnerClient;
 
+    /** Shared timer for all connections to handle request timeouts. */
+    private final Timer sharedTimer;
+
+    /** Background reaper to advance shared timer clock. */
+    private final TimerReaper sharedTimerReaper;
+
     private volatile boolean isClosed = false;
 
     public NettyClient(
@@ -109,6 +118,12 @@ public final class NettyClient implements RpcClient {
         this.isInnerClient = isInnerClient;
         this.clientMetricGroup = clientMetricGroup;
         this.authenticatorSupplier = AuthenticationFactory.loadClientAuthenticatorSupplier(conf);
+
+        // Initialize shared timer and timer reaper for all connections
+        this.sharedTimer = new DefaultTimer("NettyClient-TimeoutReaper");
+        this.sharedTimerReaper = new TimerReaper();
+        this.sharedTimerReaper.start();
+
         NettyMetrics.registerNettyMetrics(clientMetricGroup, pooledAllocator);
     }
 
@@ -178,6 +193,15 @@ public final class NettyClient implements RpcClient {
                 }
             }
             shutdownFutures.add(NettyUtils.shutdownGroup(eventGroup));
+
+            // Shutdown shared timer and timer reaper
+            if (sharedTimerReaper != null) {
+                sharedTimerReaper.initiateShutdown();
+            }
+            if (sharedTimer != null) {
+                sharedTimer.shutdown();
+            }
+
             CompletableFuture.allOf(shutdownFutures.toArray(new CompletableFuture<?>[0]))
                     .get(10, TimeUnit.SECONDS);
             LOG.info("Netty client was shutdown successfully.");
@@ -198,12 +222,36 @@ public final class NettyClient implements RpcClient {
                             clientMetricGroup,
                             authenticatorSupplier.get(),
                             (con, ignore) -> connections.remove(serverId, con),
-                            isInnerClient);
+                            isInnerClient,
+                            sharedTimer);
                 });
     }
 
     @VisibleForTesting
     Map<String, ServerConnection> connections() {
         return connections;
+    }
+
+    /** Get shared timer for connections to use. */
+    Timer getSharedTimer() {
+        return sharedTimer;
+    }
+
+    /** A background reaper to advance shared timer clock. */
+    private class TimerReaper extends ShutdownableThread {
+        TimerReaper() {
+            super("NettyClient-TimerReaper", false);
+        }
+
+        @Override
+        public void doWork() {
+            try {
+                sharedTimer.advanceClock(200L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // Exit the loop when interrupted
+                return;
+            }
+        }
     }
 }

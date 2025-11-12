@@ -25,9 +25,11 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.messages.PbAclFilter;
 import org.apache.fluss.rpc.messages.PbAclInfo;
+import org.apache.fluss.rpc.messages.PbFetchIndexRespForTableBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbKeyValue;
 import org.apache.fluss.rpc.messages.PbPartitionSpec;
@@ -208,6 +210,30 @@ public class CommonRpcMessageUtils {
         }
 
         return fetchLogResultForBucket;
+    }
+
+    public static FetchIndexLogResultForBucket getFetchIndexLogResultForBucket(
+            PbFetchIndexRespForTableBucket respForBucket) {
+        FetchIndexLogResultForBucket fetchIndexLogResultForBucket;
+        if (respForBucket.hasErrorCode()) {
+            fetchIndexLogResultForBucket =
+                    new FetchIndexLogResultForBucket(ApiError.fromErrorMessage(respForBucket));
+        } else {
+            ByteBuffer recordsBuffer = toByteBuffer(respForBucket.getRecordsSlice());
+            LogRecords records =
+                    respForBucket.hasRecords()
+                            ? MemoryLogRecords.pointToByteBuffer(recordsBuffer)
+                            : MemoryLogRecords.EMPTY;
+            boolean isDataReady =
+                    respForBucket.hasIsDataReady() ? respForBucket.isIsDataReady() : true;
+            fetchIndexLogResultForBucket =
+                    new FetchIndexLogResultForBucket(
+                            records,
+                            respForBucket.getStartOffset(),
+                            respForBucket.getEndOffset(),
+                            isDataReady);
+        }
+        return fetchIndexLogResultForBucket;
     }
 
     public static ByteBuffer toByteBuffer(ByteBuf buf) {

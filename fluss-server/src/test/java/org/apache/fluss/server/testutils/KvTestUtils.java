@@ -176,6 +176,14 @@ public class KvTestUtils {
         assertThat(lookupValue).isEqualTo(expectedValue);
     }
 
+    public static void assertLookupResponseNotNull(LookupResponse lookupResponse) {
+        assertThat(lookupResponse.getBucketsRespsCount()).isEqualTo(1);
+        PbLookupRespForBucket pbLookupRespForBucket = lookupResponse.getBucketsRespAt(0);
+        assertThat(pbLookupRespForBucket.getValuesCount()).isEqualTo(1);
+        PbValue pbValue = pbLookupRespForBucket.getValueAt(0);
+        assertThat(pbValue.hasValues()).isTrue();
+    }
+
     public static void assertPrefixLookupResponse(
             PrefixLookupResponse prefixLookupResponse, List<List<byte[]>> expectedValues) {
         assertThat(prefixLookupResponse.getBucketsRespsCount()).isEqualTo(1);

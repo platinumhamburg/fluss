@@ -18,6 +18,8 @@
 package org.apache.fluss.rpc.gateway;
 
 import org.apache.fluss.rpc.RpcGateway;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
+import org.apache.fluss.rpc.messages.FetchIndexResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
@@ -96,6 +98,15 @@ public interface TabletServerGateway extends RpcGateway, AdminReadOnlyGateway {
      */
     @RPC(api = ApiKeys.FETCH_LOG)
     CompletableFuture<FetchLogResponse> fetchLog(FetchLogRequest request);
+
+    /**
+     * Fetch index data from the specified table bucket. The request can send by the client scanner
+     * or other tablet server.
+     *
+     * @return the fetch response.
+     */
+    @RPC(api = ApiKeys.FETCH_INDEX)
+    CompletableFuture<FetchIndexResponse> fetchIndex(FetchIndexRequest request);
 
     /**
      * Put kv data to the specified table bucket.

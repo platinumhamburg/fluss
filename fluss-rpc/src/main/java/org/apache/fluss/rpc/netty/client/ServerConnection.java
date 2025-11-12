@@ -23,6 +23,7 @@ import org.apache.fluss.exception.DisconnectException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.exception.RetriableAuthenticationException;
+import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.rpc.messages.ApiMessage;
 import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
@@ -41,6 +42,8 @@ import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBufAllocator;
 import org.apache.fluss.shaded.netty4.io.netty.channel.Channel;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelFuture;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelFutureListener;
+import org.apache.fluss.timer.Timer;
+import org.apache.fluss.timer.TimerTask;
 import org.apache.fluss.utils.ExponentialBackoff;
 import org.apache.fluss.utils.MapUtils;
 
@@ -67,6 +70,9 @@ import static org.apache.fluss.utils.IOUtils.closeQuietly;
 final class ServerConnection {
     private static final Logger LOG = LoggerFactory.getLogger(ServerConnection.class);
 
+    /** Default request timeout in milliseconds. */
+    private static final long DEFAULT_REQUEST_TIMEOUT_MS = 60_000L;
+
     private final ServerNode node;
 
     // TODO: add max inflight requests limit like Kafka's "max.in.flight.requests.per.connection"
@@ -75,6 +81,7 @@ final class ServerConnection {
     private final ConnectionMetrics connectionMetrics;
     private final ClientAuthenticator authenticator;
     private final ExponentialBackoff backoff;
+    private final Timer timer;
 
     private final Object lock = new Object();
 
@@ -105,12 +112,15 @@ final class ServerConnection {
             ClientMetricGroup clientMetricGroup,
             ClientAuthenticator authenticator,
             BiConsumer<ServerConnection, Throwable> closeCallback,
-            boolean isInnerClient) {
+            boolean isInnerClient,
+            Timer sharedTimer) {
         this.node = node;
         this.state = ConnectionState.CONNECTING;
         this.connectionMetrics = clientMetricGroup.createConnectionMetricGroup(node.uid());
         this.authenticator = authenticator;
         this.backoff = new ExponentialBackoff(100L, 2, 5000L, 0.2);
+        this.timer = sharedTimer;
+
         whenClose(closeCallback);
 
         // connect and handle should be last in case of other variables are nullable and close
@@ -166,6 +176,10 @@ final class ServerConnection {
             // notify all the inflight requests
             for (int requestId : inflightRequests.keySet()) {
                 InflightRequest request = inflightRequests.remove(requestId);
+                // Cancel timeout task
+                if (request.timeoutTask != null) {
+                    request.timeoutTask.cancel();
+                }
                 request.responseFuture.completeExceptionally(requestCause);
             }
 
@@ -194,6 +208,7 @@ final class ServerConnection {
         }
 
         closeQuietly(authenticator);
+        // Note: Timer is shared and managed by NettyClient, so we don't shut it down here
         return closeFuture;
     }
 
@@ -220,6 +235,10 @@ final class ServerConnection {
         public void onRequestResult(int requestId, ApiMessage response) {
             InflightRequest request = inflightRequests.remove(requestId);
             if (request != null && !request.responseFuture.isDone()) {
+                // Cancel timeout task
+                if (request.timeoutTask != null) {
+                    request.timeoutTask.cancel();
+                }
                 connectionMetrics.updateMetricsAfterGetResponse(
                         ApiKeys.forId(request.apiKey),
                         request.requestStartTime,
@@ -232,6 +251,10 @@ final class ServerConnection {
         public void onRequestFailure(int requestId, Throwable cause) {
             InflightRequest request = inflightRequests.remove(requestId);
             if (request != null && !request.responseFuture.isDone()) {
+                // Cancel timeout task
+                if (request.timeoutTask != null) {
+                    request.timeoutTask.cancel();
+                }
                 connectionMetrics.updateMetricsAfterGetResponse(
                         ApiKeys.forId(request.apiKey), request.requestStartTime, 0);
                 request.responseFuture.completeExceptionally(cause);
@@ -308,18 +331,31 @@ final class ServerConnection {
                 }
             }
 
+            int currentRequestId = requestCount++;
+
+            // Create timeout timer task
+            RequestTimeoutTask timeoutTask =
+                    new RequestTimeoutTask(currentRequestId, DEFAULT_REQUEST_TIMEOUT_MS);
+
             InflightRequest inflight =
                     new InflightRequest(
-                            apiKey.id, version, requestCount++, rawRequest, responseFuture);
+                            apiKey.id,
+                            version,
+                            currentRequestId,
+                            rawRequest,
+                            responseFuture,
+                            timeoutTask);
             inflightRequests.put(inflight.requestId, inflight);
-
-            // TODO: maybe we need to add timeout for the inflight requests
             ByteBuf byteBuf;
             try {
                 byteBuf = inflight.toByteBuf(channel.alloc());
             } catch (Exception e) {
                 LOG.error("Failed to encode request for '{}'.", ApiKeys.forId(inflight.apiKey), e);
                 inflightRequests.remove(inflight.requestId);
+                // Cancel timeout task
+                if (inflight.timeoutTask != null) {
+                    inflight.timeoutTask.cancel();
+                }
                 responseFuture.completeExceptionally(
                         new FlussRuntimeException(
                                 String.format(
@@ -331,6 +367,8 @@ final class ServerConnection {
 
             connectionMetrics.updateMetricsBeforeSendRequest(apiKey, rawRequest.totalSize());
 
+            // Add timeout task to timer
+            timer.add(timeoutTask);
             channel.writeAndFlush(byteBuf)
                     .addListener(
                             (ChannelFutureListener)
@@ -338,6 +376,10 @@ final class ServerConnection {
                                         if (!future.isSuccess()) {
                                             connectionMetrics.updateMetricsAfterGetResponse(
                                                     apiKey, inflight.requestStartTime, 0);
+                                            // Cancel timeout task
+                                            if (inflight.timeoutTask != null) {
+                                                inflight.timeoutTask.cancel();
+                                            }
                                             Throwable cause = future.cause();
                                             if (cause instanceof IOException) {
                                                 // when server close the channel, the cause will be
@@ -527,18 +569,21 @@ final class ServerConnection {
         final ApiMessage request;
         final long requestStartTime;
         final CompletableFuture<ApiMessage> responseFuture;
+        final TimerTask timeoutTask;
 
         InflightRequest(
                 short apiKey,
                 short apiVersion,
                 int requestId,
                 ApiMessage request,
-                CompletableFuture<ApiMessage> responseFuture) {
+                CompletableFuture<ApiMessage> responseFuture,
+                TimerTask timeoutTask) {
             this.apiKey = apiKey;
             this.apiVersion = apiVersion;
             this.requestId = requestId;
             this.request = request;
             this.responseFuture = responseFuture;
+            this.timeoutTask = timeoutTask;
             this.requestStartTime = System.currentTimeMillis();
         }
 
@@ -557,5 +602,30 @@ final class ServerConnection {
     @VisibleForTesting
     ConnectionState getConnectionState() {
         return state;
+    }
+
+    /** A timer task to handle request timeout. */
+    private class RequestTimeoutTask extends TimerTask {
+        private final int requestId;
+
+        RequestTimeoutTask(int requestId, long delayMs) {
+            super(delayMs);
+            this.requestId = requestId;
+        }
+
+        @Override
+        public void run() {
+            InflightRequest request = inflightRequests.remove(requestId);
+            if (request != null && !request.responseFuture.isDone()) {
+                String timeoutMsg =
+                        String.format(
+                                "Request %s to server %s timed out after %d ms",
+                                ApiKeys.forId(request.apiKey).toString(),
+                                node,
+                                DEFAULT_REQUEST_TIMEOUT_MS);
+                LOG.warn(timeoutMsg);
+                request.responseFuture.completeExceptionally(new TimeoutException(timeoutMsg));
+            }
+        }
     }
 }

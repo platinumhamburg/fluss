@@ -25,6 +25,7 @@ import org.apache.fluss.rocksdb.RocksIteratorWrapper;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
 import org.apache.fluss.row.decode.RowDecoder;
+import org.apache.fluss.row.encode.TsValueDecoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
@@ -53,6 +54,8 @@ import java.nio.file.Path;
 class SnapshotFilesReader implements CloseableIterator<InternalRow> {
 
     private final ValueDecoder valueDecoder;
+    private final TsValueDecoder tsValueDecoder;
+    private final boolean shouldUseTsDecoding;
     @Nullable private final int[] projectedFields;
     private RocksIteratorWrapper rocksIteratorWrapper;
 
@@ -66,12 +69,14 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
             KvFormat kvFormat,
             Path rocksDbPath,
             RowType tableRowType,
-            @Nullable int[] projectedFields)
+            @Nullable int[] projectedFields,
+            boolean shouldUseTsDecoding)
             throws IOException {
-        this.valueDecoder =
-                new ValueDecoder(
-                        RowDecoder.create(
-                                kvFormat, tableRowType.getChildren().toArray(new DataType[0])));
+        RowDecoder rowDecoder =
+                RowDecoder.create(kvFormat, tableRowType.getChildren().toArray(new DataType[0]));
+        this.valueDecoder = new ValueDecoder(rowDecoder);
+        this.tsValueDecoder = new TsValueDecoder(rowDecoder);
+        this.shouldUseTsDecoding = shouldUseTsDecoding;
         this.projectedFields = projectedFields;
         closeableRegistry = new CloseableRegistry();
         try {
@@ -151,7 +156,11 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
         byte[] value = rocksIteratorWrapper.value();
         rocksIteratorWrapper.next();
 
-        InternalRow originRow = valueDecoder.decodeValue(value).row;
+        // For values encoded with timestamp, use TsValueDecoder; otherwise use ValueDecoder
+        InternalRow originRow =
+                shouldUseTsDecoding
+                        ? tsValueDecoder.decodeValue(value).row
+                        : valueDecoder.decodeValue(value).row;
         if (projectedFields != null) {
             ProjectedRow projectedRow = ProjectedRow.from(projectedFields);
             projectedRow.replaceRow(originRow);

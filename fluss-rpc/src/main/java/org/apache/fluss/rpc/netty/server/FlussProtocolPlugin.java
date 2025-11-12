@@ -27,6 +27,9 @@ import org.apache.fluss.rpc.protocol.NetworkProtocolPlugin;
 import org.apache.fluss.security.auth.AuthenticationFactory;
 import org.apache.fluss.security.auth.PlainTextAuthenticationPlugin;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelHandler;
+import org.apache.fluss.timer.Timer;
+
+import javax.annotation.Nullable;
 
 import java.util.List;
 import java.util.Optional;
@@ -36,13 +39,18 @@ public class FlussProtocolPlugin implements NetworkProtocolPlugin {
     private final ApiManager apiManager;
     private final List<String> listeners;
     private final RequestsMetrics requestsMetrics;
+    @Nullable private final Timer timer;
     private Configuration conf;
 
     public FlussProtocolPlugin(
-            ServerType serverType, List<String> listeners, RequestsMetrics requestsMetrics) {
+            ServerType serverType,
+            List<String> listeners,
+            RequestsMetrics requestsMetrics,
+            @Nullable Timer timer) {
         this.apiManager = new ApiManager(serverType);
         this.listeners = listeners;
         this.requestsMetrics = requestsMetrics;
+        this.timer = timer;
     }
 
     @Override
@@ -78,7 +86,13 @@ public class FlussProtocolPlugin implements NetworkProtocolPlugin {
 
     @Override
     public RequestHandler<?> createRequestHandler(RpcGatewayService service) {
-        return new FlussRequestHandler(service);
+        boolean slowRequestMonitoringEnabled =
+                conf.get(ConfigOptions.RPC_SERVER_SLOW_REQUEST_MONITORING_ENABLED);
+        long thresholdMs = conf.get(ConfigOptions.RPC_SERVER_SLOW_REQUEST_THRESHOLD).toMillis();
+        boolean dumpStack = conf.get(ConfigOptions.RPC_SERVER_SLOW_REQUEST_DUMP_STACK);
+
+        return new FlussRequestHandler(
+                service, slowRequestMonitoringEnabled, thresholdMs, dumpStack, timer);
     }
 
     @VisibleForTesting
