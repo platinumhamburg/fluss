@@ -45,6 +45,8 @@ import org.apache.fluss.security.auth.AuthenticationFactory;
 import org.apache.fluss.security.auth.ClientAuthenticator;
 import org.apache.fluss.shaded.netty4.io.netty.bootstrap.Bootstrap;
 import org.apache.fluss.shaded.netty4.io.netty.channel.EventLoopGroup;
+import org.apache.fluss.timer.DefaultTimer;
+import org.apache.fluss.timer.Timer;
 import org.apache.fluss.utils.NetUtils;
 
 import org.junit.jupiter.api.AfterEach;
@@ -114,6 +116,7 @@ public class ServerConnectionTest {
 
     @Test
     void testConnectionClose() {
+        Timer timer = new DefaultTimer("test-timer");
         ServerConnection connection =
                 new ServerConnection(
                         bootstrap,
@@ -121,7 +124,8 @@ public class ServerConnectionTest {
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {},
-                        false);
+                        false,
+                        timer);
         ConnectionState connectionState = connection.getConnectionState();
         assertThat(connectionState).isEqualTo(ConnectionState.CONNECTING);
 
@@ -147,6 +151,7 @@ public class ServerConnectionTest {
 
     @Test
     void testConnectionMetrics() throws ExecutionException, InterruptedException {
+        Timer timer = new DefaultTimer("test-timer");
         MockMetricRegistry metricRegistry = new MockMetricRegistry();
         ClientMetricGroup client = new ClientMetricGroup(metricRegistry, "client");
         ServerConnection connection =
@@ -156,7 +161,8 @@ public class ServerConnectionTest {
                         client,
                         clientAuthenticator,
                         (con, ignore) -> {},
-                        false);
+                        false,
+                        timer);
         ServerConnection connection2 =
                 new ServerConnection(
                         bootstrap,
@@ -164,7 +170,8 @@ public class ServerConnectionTest {
                         client,
                         clientAuthenticator,
                         (con, ignore) -> {},
-                        false);
+                        false,
+                        timer);
         LookupRequest request = new LookupRequest().setTableId(1);
         PbLookupReqForBucket pbLookupReqForBucket = request.addBucketsReq();
         pbLookupReqForBucket.setBucketId(1);
