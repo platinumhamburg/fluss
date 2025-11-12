@@ -19,10 +19,13 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableBucketReplica;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePartition;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.event.CoordinatorEvent;
 import org.apache.fluss.server.coordinator.event.DeleteReplicaResponseReceivedEvent;
 import org.apache.fluss.server.coordinator.event.TestingEventManager;
@@ -37,6 +40,7 @@ import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
+import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -57,6 +61,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
@@ -398,5 +403,190 @@ class TableManagerTest {
             }
         }
         return deleteReplicaResponseReceivedEvent;
+    }
+
+    @Test
+    void testCreateTableWithGlobalSecondaryIndex() throws Exception {
+        // create schema with index
+        Schema schemaWithIndex =
+                Schema.newBuilder()
+                        .primaryKey("id")
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("age", DataTypes.INT())
+                        .column("city", DataTypes.STRING())
+                        .index("name_idx", "name")
+                        .index("age_city_idx", "age", "city")
+                        .build();
+
+        TableDescriptor tableDescriptorWithIndex =
+                TableDescriptor.builder()
+                        .schema(schemaWithIndex)
+                        .comment("test table with global secondary index")
+                        .distributedBy(3, "id")
+                        .property(ConfigOptions.TABLE_INDEX_BUCKET_NUM, 5)
+                        .build();
+
+        TablePath mainTablePath = TablePath.of("test_db", "test_table_with_index");
+        long mainTableId = zookeeperClient.getTableIdAndIncrement();
+
+        // add table info to coordinator context
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        mainTablePath,
+                        mainTableId,
+                        0,
+                        tableDescriptorWithIndex,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+
+        TableAssignment mainTableAssignment = createAssignment();
+
+        // create main table with index - should automatically create index tables
+        tableManager.onCreateNewTable(mainTablePath, mainTableId, mainTableAssignment);
+
+        // verify main table replicas are online
+        checkReplicaOnline(mainTableId, null, mainTableAssignment);
+
+        // Note: In the actual integration tests, the creation of index tables would be validated
+        // through end-to-end testing at the Admin layer. Here we verify that the main table
+        // with indexes is properly created and handled by TableManager.
+
+        // The index table creation is handled by CoordinatorService, not directly by TableManager,
+        // so we verify the main table's schema contains the expected indexes
+        TableInfo mainTableInfo = coordinatorContext.getTableInfoById(mainTableId);
+        assertThat(mainTableInfo).isNotNull();
+        assertThat(mainTableInfo.toTableDescriptor().getSchema().getIndexes()).hasSize(2);
+
+        List<String> indexNames =
+                mainTableInfo.toTableDescriptor().getSchema().getIndexes().stream()
+                        .map(Schema.Index::getIndexName)
+                        .collect(Collectors.toList());
+        assertThat(indexNames).containsExactlyInAnyOrder("name_idx", "age_city_idx");
+
+        // cleanup
+        zookeeperClient.deleteTableAssignment(mainTableId);
+    }
+
+    @Test
+    void testCreatePartitionedTableWithGlobalSecondaryIndex() throws Exception {
+        // create schema with index for partitioned table
+        Schema partitionedSchemaWithIndex =
+                Schema.newBuilder()
+                        .primaryKey("id", "region")
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("age", DataTypes.INT())
+                        .column("region", DataTypes.STRING())
+                        .index("name_idx", "name")
+                        .build();
+
+        TableDescriptor partitionedTableDescriptorWithIndex =
+                TableDescriptor.builder()
+                        .schema(partitionedSchemaWithIndex)
+                        .comment("test partitioned table with global secondary index")
+                        .distributedBy(3, "id")
+                        .partitionedBy("region")
+                        .property(ConfigOptions.TABLE_INDEX_BUCKET_NUM, 4)
+                        .build();
+
+        TablePath mainTablePath = TablePath.of("test_db", "test_partitioned_table_with_index");
+        long mainTableId = zookeeperClient.getTableIdAndIncrement();
+
+        // create main partitioned table with index
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        mainTablePath,
+                        mainTableId,
+                        0,
+                        partitionedTableDescriptorWithIndex,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+
+        TableAssignment mainTableAssignment =
+                TableAssignment.builder().build(); // empty assignment for partitioned table
+
+        tableManager.onCreateNewTable(mainTablePath, mainTableId, mainTableAssignment);
+
+        // verify main table schema and structure
+        TableInfo mainTableInfo = coordinatorContext.getTableInfoById(mainTableId);
+        assertThat(mainTableInfo).isNotNull();
+        assertThat(mainTableInfo.toTableDescriptor().isPartitioned()).isTrue();
+        assertThat(mainTableInfo.toTableDescriptor().getPartitionKeys()).containsExactly("region");
+        assertThat(mainTableInfo.toTableDescriptor().getSchema().getIndexes()).hasSize(1);
+
+        Schema.Index nameIndex = mainTableInfo.toTableDescriptor().getSchema().getIndexes().get(0);
+        assertThat(nameIndex.getIndexName()).isEqualTo("name_idx");
+        assertThat(nameIndex.getColumnNames()).containsExactly("name");
+
+        // cleanup - for partitioned table, there's no table assignment to delete
+    }
+
+    @Test
+    void testDeleteTableWithGlobalSecondaryIndex() throws Exception {
+        // first, create a table with index
+        Schema schemaWithIndex =
+                Schema.newBuilder()
+                        .primaryKey("id")
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .index("name_idx", "name")
+                        .build();
+
+        TableDescriptor tableDescriptorWithIndex =
+                TableDescriptor.builder()
+                        .schema(schemaWithIndex)
+                        .distributedBy(3, "id")
+                        .property(ConfigOptions.TABLE_INDEX_BUCKET_NUM, 3)
+                        .build();
+
+        TablePath mainTablePath = TablePath.of("test_db", "test_table_delete_with_index");
+        long mainTableId = zookeeperClient.getTableIdAndIncrement();
+
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        mainTablePath,
+                        mainTableId,
+                        0,
+                        tableDescriptorWithIndex,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+
+        TableAssignment mainTableAssignment = createAssignment();
+        zookeeperClient.registerTableAssignment(mainTableId, mainTableAssignment);
+
+        tableManager.onCreateNewTable(mainTablePath, mainTableId, mainTableAssignment);
+
+        // verify main table was created successfully
+        checkReplicaOnline(mainTableId, null, mainTableAssignment);
+
+        // verify the main table has the expected index schema
+        TableInfo mainTableInfo = coordinatorContext.getTableInfoById(mainTableId);
+        assertThat(mainTableInfo).isNotNull();
+        assertThat(mainTableInfo.toTableDescriptor().getSchema().getIndexes()).hasSize(1);
+        assertThat(mainTableInfo.toTableDescriptor().getSchema().getIndexes().get(0).getIndexName())
+                .isEqualTo("name_idx");
+
+        // now delete the main table - the deletion of associated index tables
+        // should be handled at the CoordinatorService level in integration tests
+        coordinatorContext.queueTableDeletion(Collections.singleton(mainTableId));
+        tableManager.onDeleteTable(mainTableId);
+
+        // verify main table deletion events are generated
+        checkReplicaDelete(mainTableId, null, mainTableAssignment);
+
+        // mark all replicas as deleted
+        for (TableBucketReplica replica : getReplicas(mainTableId, mainTableAssignment)) {
+            coordinatorContext.putReplicaState(replica, ReplicaDeletionSuccessful);
+        }
+
+        // call method resumeDeletions, should delete assignments from zk
+        tableManager.resumeDeletions();
+        // retry for async deletion of TableAssignment
+        retry(
+                Duration.ofSeconds(30),
+                () -> assertThat(zookeeperClient.getTableAssignment(mainTableId)).isEmpty());
+        // main table should be removed from coordinator context
+        assertThat(coordinatorContext.getAllReplicasForTable(mainTableId)).isEmpty();
     }
 }

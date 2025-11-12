@@ -154,6 +154,9 @@ public class FlinkTableSource
 
     private final Map<String, String> tableOptions;
 
+    /** Secondary indexes definition: array of column indexes for each index. */
+    @Nullable private final int[][] secondaryIndexes;
+
     @Nullable private LakeSource<LakeSplit> lakeSource;
 
     public FlinkTableSource(
@@ -170,7 +173,8 @@ public class FlinkTableSource
             long scanPartitionDiscoveryIntervalMs,
             boolean isDataLakeEnabled,
             @Nullable MergeEngineType mergeEngineType,
-            Map<String, String> tableOptions) {
+            Map<String, String> tableOptions,
+            @Nullable int[][] secondaryIndexes) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableOutputType = tableOutputType;
@@ -188,6 +192,7 @@ public class FlinkTableSource
         this.isDataLakeEnabled = isDataLakeEnabled;
         this.mergeEngineType = mergeEngineType;
         this.tableOptions = tableOptions;
+        this.secondaryIndexes = secondaryIndexes;
         if (isDataLakeEnabled) {
             this.lakeSource =
                     checkNotNull(
@@ -401,7 +406,8 @@ public class FlinkTableSource
                         bucketKeyIndexes,
                         partitionKeyIndexes,
                         tableOutputType,
-                        projectedFields);
+                        projectedFields,
+                        secondaryIndexes);
         if (lookupAsync) {
             AsyncLookupFunction asyncLookupFunction =
                     new FlinkAsyncLookupFunction(
@@ -448,7 +454,8 @@ public class FlinkTableSource
                         scanPartitionDiscoveryIntervalMs,
                         isDataLakeEnabled,
                         mergeEngineType,
-                        tableOptions);
+                        tableOptions,
+                        secondaryIndexes);
         source.producedDataType = producedDataType;
         source.projectedFields = projectedFields;
         source.singleRowFilter = singleRowFilter;

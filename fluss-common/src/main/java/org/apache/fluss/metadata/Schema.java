@@ -62,6 +62,7 @@ public final class Schema implements Serializable {
     private final List<Column> columns;
     private final @Nullable PrimaryKey primaryKey;
     private final List<String> autoIncrementColumnNames;
+    private final List<Index> indexes;
     private final RowType rowType;
 
     /**
@@ -74,10 +75,12 @@ public final class Schema implements Serializable {
             List<Column> columns,
             @Nullable PrimaryKey primaryKey,
             int highestFieldId,
-            List<String> autoIncrementColumnNames) {
+            List<String> autoIncrementColumnNames,
+            List<Index> indexes) {
         this.columns = normalizeColumns(columns, primaryKey, autoIncrementColumnNames);
         this.primaryKey = primaryKey;
         this.autoIncrementColumnNames = autoIncrementColumnNames;
+        this.indexes = normalizeIndexes(columns, indexes);
         // pre-create the row type as it is the most frequently used part of the schema
         this.rowType =
                 new RowType(
@@ -102,11 +105,14 @@ public final class Schema implements Serializable {
         return autoIncrementColumnNames;
     }
 
+    public List<Index> getIndexes() {
+        return indexes;
+    }
+
     public RowType getRowType() {
         return rowType;
     }
 
-    /** Returns the primary key indexes, if any, otherwise returns an empty array. */
     public int[] getPrimaryKeyIndexes() {
         final List<String> columns = getColumnNames();
         return getPrimaryKey()
@@ -177,6 +183,7 @@ public final class Schema implements Serializable {
         if (primaryKey != null) {
             components.add(primaryKey);
         }
+        components.addAll(indexes);
         return components.stream()
                 .map(Objects::toString)
                 .collect(Collectors.joining(",", "(", ")"));
@@ -192,12 +199,13 @@ public final class Schema implements Serializable {
         }
         Schema schema = (Schema) o;
         return Objects.equals(columns, schema.columns)
-                && Objects.equals(primaryKey, schema.primaryKey);
+                && Objects.equals(primaryKey, schema.primaryKey)
+                && Objects.equals(indexes, schema.indexes);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(columns, primaryKey);
+        return Objects.hash(columns, primaryKey, indexes);
     }
 
     // --------------------------------------------------------------------------------------------
@@ -218,11 +226,13 @@ public final class Schema implements Serializable {
         private @Nullable PrimaryKey primaryKey;
         private final List<String> autoIncrementColumnNames;
         private AtomicInteger highestFieldId;
+        private final List<Index> indexes;
 
         private Builder() {
             columns = new ArrayList<>();
             autoIncrementColumnNames = new ArrayList<>();
             highestFieldId = new AtomicInteger(-1);
+            indexes = new ArrayList<>();
         }
 
         /** Adopts all members from the given schema. */
@@ -232,11 +242,13 @@ public final class Schema implements Serializable {
                 primaryKeyNamed(schema.primaryKey.constraintName, schema.primaryKey.columnNames);
             }
             this.highestFieldId = new AtomicInteger(schema.highestFieldId);
+            indexes.addAll(schema.indexes);
             return this;
         }
 
         public Builder highestFieldId(int highestFieldId) {
             this.highestFieldId = new AtomicInteger(highestFieldId);
+
             return this;
         }
 
@@ -390,6 +402,35 @@ public final class Schema implements Serializable {
             return this;
         }
 
+        /**
+         * Declares a global secondary index for a set of given columns. Index names can only
+         * contain letters, digits, and underscores.
+         *
+         * @param indexName name for the index
+         * @param columnNames columns that form the index
+         */
+        public Builder index(String indexName, String... columnNames) {
+            return index(indexName, Arrays.asList(columnNames));
+        }
+
+        /**
+         * Declares a global secondary index for a set of given columns. Index names can only
+         * contain letters, digits, and underscores.
+         *
+         * @param indexName name for the index
+         * @param columnNames columns that form the index
+         */
+        public Builder index(String indexName, List<String> columnNames) {
+            checkArgument(
+                    columnNames != null && !columnNames.isEmpty(),
+                    "Index constraint must be defined for at least a single column.");
+            checkArgument(
+                    !StringUtils.isNullOrWhitespaceOnly(indexName),
+                    "Index name must not be empty.");
+            indexes.add(new Index(indexName, columnNames));
+            return this;
+        }
+
         /** Returns an instance of an {@link Schema}. */
         public Schema build() {
             Integer maximumColumnId =
@@ -402,7 +443,8 @@ public final class Schema implements Serializable {
             checkState(
                     columns.stream().map(Column::getColumnId).distinct().count() == columns.size(),
                     "Column ids must be unique.");
-            return new Schema(columns, primaryKey, highestFieldId.get(), autoIncrementColumnNames);
+            return new Schema(
+                    columns, primaryKey, highestFieldId.get(), autoIncrementColumnNames, indexes);
         }
     }
 
@@ -542,7 +584,57 @@ public final class Schema implements Serializable {
 
         @Override
         public int hashCode() {
-            return Objects.hash(super.hashCode(), columnNames);
+            return Objects.hash(columnNames);
+        }
+    }
+
+    /**
+     * Index in a schema.
+     *
+     * @since 0.8
+     */
+    @PublicStable
+    public static final class Index implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String indexName;
+        private final List<String> columnNames;
+
+        public Index(String indexName, List<String> columnNames) {
+            this.indexName = indexName;
+            this.columnNames = columnNames;
+        }
+
+        public String getIndexName() {
+            return indexName;
+        }
+
+        public List<String> getColumnNames() {
+            return columnNames;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("INDEX %s (%s)", indexName, String.join(", ", columnNames));
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            Index index = (Index) o;
+            return Objects.equals(indexName, index.indexName)
+                    && Objects.equals(columnNames, index.columnNames);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(indexName, columnNames);
         }
     }
 
@@ -623,6 +715,61 @@ public final class Schema implements Serializable {
         }
 
         return Collections.unmodifiableList(newColumns);
+    }
+
+    /** Normalize indexes. */
+    private static List<Index> normalizeIndexes(List<Column> columns, List<Index> indexes) {
+
+        List<String> columnNames =
+                columns.stream().map(Column::getName).collect(Collectors.toList());
+        Set<String> allFields = new HashSet<>(columnNames);
+
+        if (indexes.isEmpty()) {
+            return Collections.unmodifiableList(indexes);
+        }
+
+        // check for duplicate index names
+        Set<String> indexNames =
+                indexes.stream().map(Index::getIndexName).collect(Collectors.toSet());
+        checkState(
+                indexNames.size() == indexes.size(),
+                "Duplicate index names found in indexes %s",
+                indexes.stream().map(Index::getIndexName).collect(Collectors.toList()));
+
+        // validate each index
+        for (Index index : indexes) {
+            List<String> indexColumnNames = index.getColumnNames();
+
+            // check for duplicate column names within single index
+            Set<String> duplicateColumns = duplicate(indexColumnNames);
+            checkState(
+                    duplicateColumns.isEmpty(),
+                    "Index %s must not contain duplicate columns. Found: %s",
+                    index.getIndexName(),
+                    duplicateColumns);
+
+            // check that all index columns exist in the table
+            checkState(
+                    allFields.containsAll(indexColumnNames),
+                    "Index %s references non-existent columns. Index columns %s should be a subset of table columns %s",
+                    index.getIndexName(),
+                    indexColumnNames,
+                    columnNames);
+
+            // check that index name contains only valid characters (letters, digits, underscore)
+            checkArgument(
+                    index.getIndexName().matches("^[a-zA-Z0-9_]+$"),
+                    "Index name '%s' can only contain letters, digits, and underscores",
+                    index.getIndexName());
+
+            // check that index name does not contain double underscores
+            checkArgument(
+                    !index.getIndexName().contains("__"),
+                    "Index name '%s' cannot contain double underscores '__'",
+                    index.getIndexName());
+        }
+
+        return Collections.unmodifiableList(indexes);
     }
 
     private static Set<String> duplicate(List<String> names) {

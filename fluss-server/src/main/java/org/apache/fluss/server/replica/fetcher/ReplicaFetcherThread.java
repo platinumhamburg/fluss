@@ -40,6 +40,7 @@ import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.replica.fetcher.LeaderEndpoint.FetchData;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.concurrent.ShutdownableThread;
@@ -60,7 +61,9 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -224,10 +227,18 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                     leader.leaderServerId());
             // TODO this need not blocking to wait fetch log complete, change to async, see
             // FLUSS-56115172.
-            responseData = leader.fetchLog(fetchLogContext).get(timeoutSeconds, TimeUnit.SECONDS);
+            responseData = leader.fetchLog(fetchLogContext).get();
         } catch (Throwable t) {
             if (isRunning()) {
-                LOG.warn("Error in response for fetch log request {}", fetchLogRequest, t);
+                Throwable e = ExceptionUtils.stripException(t, ExecutionException.class);
+                if (e instanceof TimeoutException) {
+                    LOG.warn("fetch log timeout from leader {}", leader.leaderServerId());
+                } else {
+                    LOG.warn(
+                            "Error in response for fetch log request from leader {}",
+                            leader.leaderServerId(),
+                            t);
+                }
                 inLock(
                         bucketStatusMapLock,
                         () -> bucketsWithError.addAll(fairBucketStatusMap.bucketSet()));
@@ -425,8 +436,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
          * <p>There is a potential for a mismatch between the logs of the two replicas here. We
          * don't fix this mismatch as of now.
          */
-        long leaderEndOffset =
-                leader.fetchLocalLogEndOffset(tableBucket).get(timeoutSeconds, TimeUnit.SECONDS);
+        long leaderEndOffset = leader.fetchLocalLogEndOffset(tableBucket).get();
         if (leaderEndOffset < replicaEndOffset) {
             LOG.warn(
                     "Reset fetch offset for bucket {} from {} to current leader's latest offset {}",
@@ -460,9 +470,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
              * needs to be set for both tablet servers and producers.
              *
              * */
-            long leaderStartOffset =
-                    leader.fetchLocalLogStartOffset(tableBucket)
-                            .get(timeoutSeconds, TimeUnit.SECONDS);
+            long leaderStartOffset = leader.fetchLocalLogStartOffset(tableBucket).get();
             LOG.warn(
                     "Reset fetch offset for bucket {} from {} to current leader's start offset {}",
                     tableBucket,
@@ -596,8 +604,9 @@ final class ReplicaFetcherThread extends ShutdownableThread {
             log.writerStateManager().truncateFullyAndStartAt(0L);
 
             // 2. download writer id snapshots from remote storage.
-            File snapshotFile = FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
-            buildWriterIdSnapshotFile(snapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
+            File writerSnapshotFile =
+                    FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
+            buildWriterIdSnapshotFile(writerSnapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
 
             // 3. Perform a reloadSnapshots after buildWriterIdSnapshotFile() to load the latest
             // downloaded writerId snapshot file into the writerStateManager.
@@ -611,6 +620,17 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                             + "writer size: {} and remoteLogEndOffset: {}",
                     tb,
                     log.writerStateManager().activeWriters().size(),
+                    nextFetchOffset);
+
+            // 4. download bucket state snapshot from remote storage.
+            File stateSnapshotFile = FlussPaths.stateSnapshotFile(log.getLogDir(), nextFetchOffset);
+            buildStateSnapshotFile(stateSnapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
+
+            // 5. Load the state snapshot into bucketStateManager.
+            log.loadStateSnapshot(stateSnapshotFile, nextFetchOffset);
+            LOG.info(
+                    "Build the bucket state snapshots from remote storage for {} at offset: {}",
+                    tb,
                     nextFetchOffset);
         } catch (Exception e) {
             LOG.error(
@@ -629,6 +649,19 @@ final class ReplicaFetcherThread extends ShutdownableThread {
         Files.copy(
                 rlm.getRemoteLogStorage()
                         .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT),
+                tmpSnapshotFile.toPath(),
+                StandardCopyOption.REPLACE_EXISTING);
+        FileUtils.atomicMoveWithFallback(tmpSnapshotFile.toPath(), snapshotFile.toPath(), false);
+    }
+
+    private void buildStateSnapshotFile(
+            File snapshotFile, RemoteLogSegment remoteLogSegment, RemoteLogManager rlm)
+            throws RemoteStorageException, IOException {
+        File tmpSnapshotFile = new File(snapshotFile.getAbsolutePath() + ".tmp");
+        // Copy it to snapshot file in atomic manner.
+        Files.copy(
+                rlm.getRemoteLogStorage()
+                        .fetchIndex(remoteLogSegment, IndexType.BUCKET_STATE_SNAPSHOT),
                 tmpSnapshotFile.toPath(),
                 StandardCopyOption.REPLACE_EXISTING);
         FileUtils.atomicMoveWithFallback(tmpSnapshotFile.toPath(), snapshotFile.toPath(), false);

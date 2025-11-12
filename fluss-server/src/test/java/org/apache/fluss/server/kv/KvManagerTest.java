@@ -67,6 +67,7 @@ import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESS
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link KvManager} . */
 final class KvManagerTest {
@@ -359,7 +360,9 @@ final class KvManagerTest {
                 KvFormat.COMPACTED,
                 schemaGetter,
                 new TableConfig(new Configuration()),
-                DEFAULT_COMPRESSION);
+                DEFAULT_COMPRESSION,
+                null,
+                -1); // IndexCache can be null for testing
     }
 
     private byte[] valueOf(KvRecord kvRecord) {
@@ -370,5 +373,75 @@ final class KvManagerTest {
             throws IOException {
         List<byte[]> gotValues = kvTablet.multiGet(Collections.singletonList(key));
         assertThat(gotValues).containsExactly(expectedValue);
+    }
+
+    @Test
+    void testLoadKvPreventsDuplicateRocksDBOpen() throws Exception {
+        // Initialize table buckets for testing
+        initTableBuckets(null);
+
+        // Register table in ZooKeeper so that loadKv can retrieve table information
+        org.apache.fluss.metadata.TableDescriptor tableDescriptor =
+                org.apache.fluss.metadata.TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(3)
+                        .build();
+        zkClient.registerTable(
+                tablePath1,
+                org.apache.fluss.server.zk.data.TableRegistration.newTable(
+                        tableBucket1.getTableId(), tableDescriptor));
+        zkClient.registerFirstSchema(tablePath1, DATA1_SCHEMA_PK);
+
+        // Create a KvTablet using getOrCreateKv first
+        PhysicalTablePath physicalTablePath =
+                PhysicalTablePath.of(tablePath1.getDatabaseName(), tablePath1.getTableName(), null);
+        LogTablet logTablet =
+                logManager.getOrCreateLog(
+                        physicalTablePath, tableBucket1, LogFormat.ARROW, 1, true);
+        SchemaGetter schemaGetter = new TestingSchemaGetter(1, DATA1_SCHEMA_PK);
+        KvTablet originalKv =
+                kvManager.getOrCreateKv(
+                        physicalTablePath,
+                        tableBucket1,
+                        logTablet,
+                        KvFormat.COMPACTED,
+                        schemaGetter,
+                        new TableConfig(new Configuration()),
+                        DEFAULT_COMPRESSION,
+                        null,
+                        -1);
+
+        // Add some data to verify the KvTablet is working
+        byte[] testKey = "testKey".getBytes();
+        KvRecord testRecord = kvRecordFactory.ofRecord(testKey, new Object[] {1, "test"});
+        put(originalKv, testRecord);
+
+        // Get the tablet directory
+        File tabletDir = originalKv.getKvTabletDir();
+
+        // Verify that attempting to load the same KvTablet throws IllegalStateException
+        // This prevents duplicate RocksDB opens for the same directory
+        assertThatThrownBy(() -> kvManager.loadKv(tabletDir, schemaGetter, null, -1))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Duplicate kv tablet for bucket")
+                .hasMessageContaining("already exists");
+
+        // Verify the original KvTablet is still functional and data is preserved
+        verifyMultiGet(originalKv, testKey, valueOf(testRecord));
+
+        // Clean up by dropping the KvTablet
+        kvManager.dropKv(tableBucket1);
+
+        // Now loadKv should work on the same directory after the previous KvTablet is dropped
+        // This verifies that loadKv works correctly when there's no existing duplicate
+        KvTablet loadedKv = kvManager.loadKv(tabletDir, schemaGetter, null, -1);
+        assertThat(loadedKv).isNotNull();
+        assertThat(loadedKv.getTableBucket()).isEqualTo(tableBucket1);
+
+        // Verify that attempting to load again still throws IllegalStateException
+        assertThatThrownBy(() -> kvManager.loadKv(tabletDir, schemaGetter, null, -1))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Duplicate kv tablet for bucket")
+                .hasMessageContaining("already exists");
     }
 }

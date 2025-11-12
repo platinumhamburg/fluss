@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client.lookup;
 
+import org.apache.fluss.client.metrics.TestingLookuperMetricGroup;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TableBucket;
 
@@ -39,7 +40,7 @@ class LookupQueueTest {
         Configuration conf = new Configuration();
         conf.set(CLIENT_LOOKUP_MAX_BATCH_SIZE, 10);
         conf.setString(CLIENT_LOOKUP_BATCH_TIMEOUT.key(), "1ms");
-        LookupQueue queue = new LookupQueue(conf);
+        LookupQueue queue = new LookupQueue(conf, TestingLookuperMetricGroup.newInstance());
 
         // drain empty
         assertThat(queue.drain()).hasSize(0);
@@ -67,7 +68,7 @@ class LookupQueueTest {
     void testAppendLookupBlocksWhenQueueIsFull() throws Exception {
         Configuration conf = new Configuration();
         conf.set(CLIENT_LOOKUP_QUEUE_SIZE, 5);
-        LookupQueue queue = new LookupQueue(conf);
+        LookupQueue queue = new LookupQueue(conf, TestingLookuperMetricGroup.newInstance());
 
         appendLookups(queue, 5);
         assertThat(queue.getLookupQueue()).hasSize(5);
@@ -95,7 +96,7 @@ class LookupQueueTest {
         Configuration conf = new Configuration();
         conf.set(CLIENT_LOOKUP_QUEUE_SIZE, 5);
         conf.set(CLIENT_LOOKUP_MAX_BATCH_SIZE, 5);
-        LookupQueue queue = new LookupQueue(conf);
+        LookupQueue queue = new LookupQueue(conf, TestingLookuperMetricGroup.newInstance());
 
         appendLookups(queue, 5);
         assertThat(queue.getLookupQueue()).hasSize(5);

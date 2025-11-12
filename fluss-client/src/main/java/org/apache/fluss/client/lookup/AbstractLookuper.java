@@ -19,6 +19,7 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
@@ -41,6 +42,12 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** Abstract lookuper implementation for common methods. */
 abstract class AbstractLookuper implements Lookuper {
+    /** Timestamp length in TsValue format (8 bytes). */
+    private static final int TS_LENGTH = 8;
+
+    /** Schema ID length (2 bytes). */
+    private static final int SCHEMA_ID_LENGTH = 2;
+
     protected final TableInfo tableInfo;
 
     protected final MetadataUpdater metadataUpdater;
@@ -50,6 +57,12 @@ abstract class AbstractLookuper implements Lookuper {
     protected final short targetSchemaId;
 
     private final SchemaGetter schemaGetter;
+
+    /**
+     * Whether the values are encoded with timestamp (TsValueEncoder). Currently, only index tables
+     * use TsValueEncoder.
+     */
+    private final boolean shouldUseTsDecoding;
 
     /**
      * Cache for row decoders for different schema ids. Use CopyOnWriteMap for fast access, as it is
@@ -67,6 +80,10 @@ abstract class AbstractLookuper implements Lookuper {
         this.lookupClient = lookupClient;
         this.targetSchemaId = (short) tableInfo.getSchemaId();
         this.schemaGetter = schemaGetter;
+        // Determine if values are encoded with timestamp
+        // Currently, only index tables use TsValueEncoder
+        this.shouldUseTsDecoding =
+                IndexTableUtils.isIndexTable(tableInfo.getTablePath().getTableName());
         this.decoders = new CopyOnWriteMap<>();
         // initialize the decoder for the same schema
         this.decoders.put(
@@ -85,7 +102,10 @@ abstract class AbstractLookuper implements Lookuper {
                 continue;
             }
             MemorySegment memorySegment = MemorySegment.wrap(valueBytes);
-            short schemaId = memorySegment.getShort(0);
+            // For index tables (TsValue format), schema id is at offset TS_LENGTH
+            // For normal tables, schema id is at offset 0
+            int schemaIdOffset = shouldUseTsDecoding ? TS_LENGTH : 0;
+            short schemaId = memorySegment.getShort(schemaIdOffset);
             if (targetSchemaId != schemaId) {
                 allTargetSchema = false;
                 if (!decoders.containsKey(schemaId)) {
@@ -133,7 +153,15 @@ abstract class AbstractLookuper implements Lookuper {
         FixedSchemaDecoder decoder = decoders.get(targetSchemaId);
         List<InternalRow> rowList = new ArrayList<>(valueList.size());
         for (MemorySegment value : valueList) {
-            rowList.add(decoder.decode(value));
+            if (shouldUseTsDecoding) {
+                // For TsValue format: skip timestamp (8 bytes) and schema id (2 bytes)
+                int offset = TS_LENGTH + SCHEMA_ID_LENGTH;
+                int sizeInBytes = value.size() - offset;
+                rowList.add(decoder.decode(value, offset, sizeInBytes));
+            } else {
+                // For normal format: use the default decode method which skips schema id (2 bytes)
+                rowList.add(decoder.decode(value));
+            }
         }
         return new LookupResult(rowList);
     }
@@ -141,10 +169,20 @@ abstract class AbstractLookuper implements Lookuper {
     protected LookupResult processSchemaMismatchedRows(List<MemorySegment> valueList) {
         List<InternalRow> rowList = new ArrayList<>(valueList.size());
         for (MemorySegment value : valueList) {
-            short schemaId = value.getShort(0);
+            int schemaIdOffset = shouldUseTsDecoding ? TS_LENGTH : 0;
+            short schemaId = value.getShort(schemaIdOffset);
             FixedSchemaDecoder decoder = decoders.get(schemaId);
             checkArgument(decoder != null, "Decoder for schema id %s not found", schemaId);
-            InternalRow row = decoder.decode(value);
+            InternalRow row;
+            if (shouldUseTsDecoding) {
+                // For TsValue format: skip timestamp (8 bytes) and schema id (2 bytes)
+                int offset = TS_LENGTH + SCHEMA_ID_LENGTH;
+                int sizeInBytes = value.size() - offset;
+                row = decoder.decode(value, offset, sizeInBytes);
+            } else {
+                // For normal format: use the default decode method which skips schema id (2 bytes)
+                row = decoder.decode(value);
+            }
             rowList.add(row);
         }
         return new LookupResult(rowList);
@@ -161,7 +199,8 @@ abstract class AbstractLookuper implements Lookuper {
         // process the value list to convert to target schema
         List<InternalRow> rowList = new ArrayList<>(valueList.size());
         for (MemorySegment value : valueList) {
-            short schemaId = value.getShort(0);
+            int schemaIdOffset = shouldUseTsDecoding ? TS_LENGTH : 0;
+            short schemaId = value.getShort(schemaIdOffset);
             FixedSchemaDecoder decoder =
                     decoders.computeIfAbsent(
                             schemaId,
@@ -172,9 +211,23 @@ abstract class AbstractLookuper implements Lookuper {
                                         sourceSchema,
                                         tableInfo.getSchema());
                             });
-            InternalRow row = decoder.decode(value);
+            InternalRow row;
+            if (shouldUseTsDecoding) {
+                // For TsValue format: skip timestamp (8 bytes) and schema id (2 bytes)
+                int offset = TS_LENGTH + SCHEMA_ID_LENGTH;
+                int sizeInBytes = value.size() - offset;
+                row = decoder.decode(value, offset, sizeInBytes);
+            } else {
+                // For normal format: use the default decode method which skips schema id (2 bytes)
+                row = decoder.decode(value);
+            }
             rowList.add(row);
         }
         return new LookupResult(rowList);
+    }
+
+    @Override
+    public void close() {
+        // Default implementation does nothing. Subclasses can override to clean up resources.
     }
 }

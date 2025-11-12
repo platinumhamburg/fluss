@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv;
 
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
@@ -47,6 +48,7 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.KvEntry;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Value;
+import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogAppendInfo;
@@ -57,6 +59,7 @@ import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.types.StringType;
+import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
 
@@ -191,7 +194,53 @@ class KvTabletTest {
                 KvFormat.COMPACTED,
                 rowMerger,
                 DEFAULT_COMPRESSION,
-                schemaGetter);
+                schemaGetter,
+                null,
+                -1L,
+                SystemClock.getInstance());
+    }
+
+    @Test
+    void testIndexTableRejectsDirectClientWrite() throws Exception {
+        // Create an index table (identified by naming convention)
+        String indexTableName = "__test_table__index__name_idx";
+        TablePath indexTablePath = TablePath.of("testDb", indexTableName);
+        PhysicalTablePath physicalIndexTablePath = PhysicalTablePath.of(indexTablePath);
+
+        final Schema schema1 = DATA1_SCHEMA_PK;
+        LogTablet indexLogTablet = createLogTablet(tempLogDir, 0L, physicalIndexTablePath);
+        TableBucket indexTableBucket = indexLogTablet.getTableBucket();
+
+        RowMerger rowMerger =
+                RowMerger.create(new TableConfig(new Configuration()), KvFormat.COMPACTED);
+        SchemaGetter schemaGetter = new TestingSchemaGetter(1, schema1);
+        KvTablet indexKvTablet =
+                KvTablet.create(
+                        physicalIndexTablePath,
+                        indexTableBucket,
+                        indexLogTablet,
+                        tmpKvDir,
+                        conf,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        new RootAllocator(Long.MAX_VALUE),
+                        new TestingMemorySegmentPool(10 * 1024),
+                        KvFormat.COMPACTED,
+                        rowMerger,
+                        DEFAULT_COMPRESSION,
+                        schemaGetter,
+                        null);
+
+        // Try to write to index table should be rejected
+        KvRecordBatch kvRecordBatch =
+                kvRecordBatchFactory.ofRecords(
+                        Collections.singletonList(
+                                kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, "v1"})));
+        assertThatThrownBy(() -> indexKvTablet.putAsLeader(kvRecordBatch, null))
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining("Index table")
+                .hasMessageContaining("does not support direct client writes");
+
+        indexKvTablet.close();
     }
 
     @Test
@@ -1107,5 +1156,136 @@ class KvTabletTest {
 
     private Value valueOf(BinaryRow row) {
         return Value.of(ValueEncoder.encodeValue(schemaId, row));
+    }
+
+    /**
+     * Test for TTL functionality with TsValueEncoder in index tables. This test verifies that: 1.
+     * Data is encoded with timestamps using TsValueEncoder 2. Manual compaction triggers TTL
+     * evaluation 3. Expired data is removed after compaction 4. Non-expired data remains after
+     * compaction
+     */
+    @Test
+    void testIndexTableTTLWithCompaction() throws Exception {
+        // Initialize index table with 10-second TTL
+        long ttlMillis = 10_000L; // 10 seconds
+
+        // Create a ManualClock for precise time control
+        ManualClock manualClock = new ManualClock(System.currentTimeMillis());
+
+        // Reuse index table schema and path from TestData
+        Schema indexSchema = TestData.IDX_NAME_SCHEMA;
+        RowType indexRowType = TestData.IDX_NAME_ROW_TYPE;
+        PhysicalTablePath indexTablePath = TestData.IDX_NAME_PHYSICAL_TABLE_PATH;
+
+        logTablet = createLogTablet(tempLogDir, 0L, indexTablePath);
+        TableBucket tableBucket = logTablet.getTableBucket();
+
+        // Create index KvTablet with TTL enabled and ManualClock
+        RowMerger rowMerger =
+                RowMerger.create(
+                        new TableConfig(Configuration.fromMap(Collections.emptyMap())),
+                        KvFormat.COMPACTED);
+        SchemaGetter schemaGetter = new TestingSchemaGetter(1, indexSchema);
+        kvTablet =
+                KvTablet.create(
+                        indexTablePath,
+                        tableBucket,
+                        logTablet,
+                        tmpKvDir,
+                        conf,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        new RootAllocator(Long.MAX_VALUE),
+                        new TestingMemorySegmentPool(10 * 1024),
+                        KvFormat.COMPACTED,
+                        rowMerger,
+                        DEFAULT_COMPRESSION,
+                        schemaGetter,
+                        null,
+                        ttlMillis,
+                        manualClock);
+
+        // Prepare test data with timestamps
+        // Use the clock's current time to determine expiration
+        // For expired data, use a timestamp that is older than TTL
+        // For valid data, use a very recent timestamp (just 1 second ago)
+        long currentTime = manualClock.milliseconds();
+        long expiredTimestamp = currentTime - ttlMillis - 5000L; // 15 seconds ago (expired)
+        long validTimestamp = currentTime - 1000L; // 1 second ago (valid)
+
+        // Create rows with schema [name(STRING), id(INT), __offset(BIGINT)]
+        BinaryRow expiredRow1 = compactedRow(indexRowType, new Object[] {"name1", 1, 100L});
+        BinaryRow expiredRow2 = compactedRow(indexRowType, new Object[] {"name2", 2, 200L});
+        BinaryRow validRow1 = compactedRow(indexRowType, new Object[] {"name3", 3, 300L});
+        BinaryRow validRow2 = compactedRow(indexRowType, new Object[] {"name4", 4, 400L});
+
+        // Encode with TsValueEncoder: [timestamp(8)][schemaId(2)][row bytes]
+        byte[] key1 = new byte[] {0, 0, 0, 1}; // key for id=1
+        byte[] key2 = new byte[] {0, 0, 0, 2}; // key for id=2
+        byte[] key3 = new byte[] {0, 0, 0, 3}; // key for id=3
+        byte[] key4 = new byte[] {0, 0, 0, 4}; // key for id=4
+
+        byte[] expiredValue1 =
+                org.apache.fluss.row.encode.TsValueEncoder.encodeValue(
+                        expiredTimestamp, schemaId, expiredRow1);
+        byte[] expiredValue2 =
+                org.apache.fluss.row.encode.TsValueEncoder.encodeValue(
+                        expiredTimestamp, schemaId, expiredRow2);
+        byte[] validValue1 =
+                org.apache.fluss.row.encode.TsValueEncoder.encodeValue(
+                        validTimestamp, schemaId, validRow1);
+        byte[] validValue2 =
+                org.apache.fluss.row.encode.TsValueEncoder.encodeValue(
+                        validTimestamp, schemaId, validRow2);
+
+        // Write data directly to RocksDB
+        KvBatchWriter batchWriter = kvTablet.createKvBatchWriter();
+        batchWriter.put(key1, expiredValue1);
+        batchWriter.put(key2, expiredValue2);
+        batchWriter.put(key3, validValue1);
+        batchWriter.put(key4, validValue2);
+        batchWriter.flush();
+        batchWriter.close();
+
+        // Get RocksDBKv for direct access
+        RocksDBKv rocksDBKv = kvTablet.getRocksDBKv();
+
+        // Verify all data exists before compaction
+        byte[] readValue1 = rocksDBKv.get(key1);
+        byte[] readValue2 = rocksDBKv.get(key2);
+        byte[] readValue3 = rocksDBKv.get(key3);
+        byte[] readValue4 = rocksDBKv.get(key4);
+        assertThat(readValue1).isNotNull();
+        assertThat(readValue2).isNotNull();
+        assertThat(readValue3).isNotNull();
+        assertThat(readValue4).isNotNull();
+
+        // Trigger manual compaction to apply TTL filtering
+        // The expiredTimestamp is already 15 seconds old, which is beyond the 10-second TTL
+        kvTablet.compact();
+
+        // Wait longer for compaction to complete
+        Thread.sleep(1000);
+
+        // Verify expired data is removed
+        assertThat(rocksDBKv.get(key1))
+                .as("Expired row 1 should be removed after compaction")
+                .isNull();
+        assertThat(rocksDBKv.get(key2))
+                .as("Expired row 2 should be removed after compaction")
+                .isNull();
+
+        // Verify valid data still exists
+        assertThat(rocksDBKv.get(key3))
+                .as("Valid row 1 should still exist after compaction")
+                .isNotNull();
+        assertThat(rocksDBKv.get(key4))
+                .as("Valid row 2 should still exist after compaction")
+                .isNotNull();
+
+        // Verify the content of valid rows
+        byte[] validReadValue1 = rocksDBKv.get(key3);
+        byte[] validReadValue2 = rocksDBKv.get(key4);
+        assertThat(validReadValue1).isEqualTo(validValue1);
+        assertThat(validReadValue2).isEqualTo(validValue2);
     }
 }

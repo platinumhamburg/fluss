@@ -482,7 +482,8 @@ class LookupSender implements Runnable {
                         "Get error {} response on table bucket {}, retrying ({} attempts left). Error: {}",
                         lookupType,
                         tableBucket,
-                        maxRetries - lookup.retries(),
+                        lookup.retries(),
+                        maxRetries,
                         error.formatErrMsg());
                 lookup.incrementRetries();
                 reEnqueueLookup(lookup);

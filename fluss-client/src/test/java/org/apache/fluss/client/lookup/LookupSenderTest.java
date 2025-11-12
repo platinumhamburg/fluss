@@ -18,6 +18,7 @@
 package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.client.metadata.TestingMetadataUpdater;
+import org.apache.fluss.client.metrics.TestingLookuperMetricGroup;
 import org.apache.fluss.cluster.BucketLocation;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -92,7 +93,7 @@ public class LookupSenderTest {
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.CLIENT_LOOKUP_QUEUE_SIZE, 5);
         conf.set(ConfigOptions.CLIENT_LOOKUP_MAX_BATCH_SIZE, 10);
-        lookupQueue = new LookupQueue(conf);
+        lookupQueue = new LookupQueue(conf, new TestingLookuperMetricGroup());
 
         lookupSender =
                 new LookupSender(metadataUpdater, lookupQueue, MAX_INFLIGHT_REQUESTS, MAX_RETRIES);

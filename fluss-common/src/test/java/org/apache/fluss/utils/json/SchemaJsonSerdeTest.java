@@ -77,17 +77,42 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
                     .primaryKey("a", "c")
                     .enableAutoIncrement("b")
                     .build();
+    static final Schema SCHEMA_WITH_SINGLE_INDEX =
+            Schema.newBuilder()
+                    .column("id", DataTypes.INT())
+                    .column("name", DataTypes.STRING())
+                    .column("age", DataTypes.INT())
+                    .primaryKey("id")
+                    .index("name_idx", "name")
+                    .build();
+
+    static final Schema SCHEMA_WITH_MULTIPLE_INDEXES =
+            Schema.newBuilder()
+                    .column("id", DataTypes.INT())
+                    .column("name", DataTypes.STRING())
+                    .column("age", DataTypes.INT())
+                    .column("city", DataTypes.STRING())
+                    .primaryKey("id")
+                    .index("name_idx", "name")
+                    .index("age_city_idx", "age", "city")
+                    .build();
 
     static final String SCHEMA_JSON_0 =
-            "{\"version\":1,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"comment\":\"a is first column\",\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"STRING\"},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"CHAR\",\"nullable\":false,\"length\":10},\"comment\":\"c is third column\",\"id\":2}],\"primary_key\":[\"a\",\"c\"],\"highest_field_id\":2}";
+            "{\"version\":2,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"comment\":\"a is first column\",\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"STRING\"},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"CHAR\",\"nullable\":false,\"length\":10},\"comment\":\"c is third column\",\"id\":2}],\"primary_key\":[\"a\",\"c\"],\"highest_field_id\":2}";
     static final String SCHEMA_JSON_1 =
-            "{\"version\":1,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"STRING\"},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"comment\":\"c is third column\",\"id\":2}],\"primary_key\":[\"a\"],\"highest_field_id\":2}";
+            "{\"version\":2,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"STRING\"},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"comment\":\"c is third column\",\"id\":2}],\"primary_key\":[\"a\"],\"highest_field_id\":2}";
     // shouldn't contain primary_key fields
     static final String SCHEMA_JSON_3 =
-            "{\"version\":1,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"BIGINT\"},\"comment\":\"a is first column\",\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"STRING\"},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"comment\":\"c is third column\",\"id\":2}],\"highest_field_id\":2}";
+            "{\"version\":2,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"BIGINT\"},\"comment\":\"a is first column\",\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"STRING\"},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"comment\":\"c is third column\",\"id\":2}],\"highest_field_id\":2}";
 
     static final String SCHEMA_JSON_4 =
-            "{\"version\":1,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"comment\":\"a is first column\",\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"CHAR\",\"nullable\":false,\"length\":10},\"comment\":\"c is third column\",\"id\":2}],\"primary_key\":[\"a\",\"c\"],\"auto_increment_column\":[\"b\"],\"highest_field_id\":2}";
+            "{\"version\":2,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"comment\":\"a is first column\",\"id\":0},{\"name\":\"b\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"comment\":\"b is second column\",\"id\":1},{\"name\":\"c\",\"data_type\":{\"type\":\"CHAR\",\"nullable\":false,\"length\":10},\"comment\":\"c is third column\",\"id\":2}],\"primary_key\":[\"a\",\"c\"],\"auto_increment_column\":[\"b\"],\"highest_field_id\":2}";
+
+    static final String SCHEMA_JSON_WITH_SINGLE_INDEX =
+            "{\"version\":2,\"columns\":[{\"name\":\"id\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"id\":0},{\"name\":\"name\",\"data_type\":{\"type\":\"STRING\"},\"id\":1},{\"name\":\"age\",\"data_type\":{\"type\":\"INTEGER\"},\"id\":2}],\"primary_key\":[\"id\"],\"highest_field_id\":2,\"indexes\":[{\"name\":\"name_idx\",\"columns\":[\"name\"]}]}";
+
+    static final String SCHEMA_JSON_WITH_MULTIPLE_INDEXES =
+            "{\"version\":2,\"columns\":[{\"name\":\"id\",\"data_type\":{\"type\":\"INTEGER\",\"nullable\":false},\"id\":0},{\"name\":\"name\",\"data_type\":{\"type\":\"STRING\"},\"id\":1},{\"name\":\"age\",\"data_type\":{\"type\":\"INTEGER\"},\"id\":2},{\"name\":\"city\",\"data_type\":{\"type\":\"STRING\"},\"id\":3}],\"primary_key\":[\"id\"],\"highest_field_id\":3,\"indexes\":[{\"name\":\"name_idx\",\"columns\":[\"name\"]},{\"name\":\"age_city_idx\",\"columns\":[\"age\",\"city\"]}]}";
 
     SchemaJsonSerdeTest() {
         super(SchemaJsonSerde.INSTANCE);
@@ -95,13 +120,27 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
 
     @Override
     protected Schema[] createObjects() {
-        return new Schema[] {SCHEMA_0, SCHEMA_1, SCHEMA_2, SCHEMA_3, SCHEMA_4};
+        return new Schema[] {
+            SCHEMA_0,
+            SCHEMA_1,
+            SCHEMA_2,
+            SCHEMA_3,
+            SCHEMA_4,
+            SCHEMA_WITH_SINGLE_INDEX,
+            SCHEMA_WITH_MULTIPLE_INDEXES
+        };
     }
 
     @Override
     protected String[] expectedJsons() {
         return new String[] {
-            SCHEMA_JSON_0, SCHEMA_JSON_1, SCHEMA_JSON_1, SCHEMA_JSON_3, SCHEMA_JSON_4
+            SCHEMA_JSON_0,
+            SCHEMA_JSON_1,
+            SCHEMA_JSON_1,
+            SCHEMA_JSON_3,
+            SCHEMA_JSON_4,
+            SCHEMA_JSON_WITH_SINGLE_INDEX,
+            SCHEMA_JSON_WITH_MULTIPLE_INDEXES
         };
     }
 

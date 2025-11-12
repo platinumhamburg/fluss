@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 
 import javax.annotation.Nullable;
 
@@ -56,6 +57,7 @@ public final class TableInfo {
     private final List<String> bucketKeys;
     private final List<String> partitionKeys;
     private final int numBuckets;
+    private final boolean isIndexTable;
     private final Configuration properties;
     private final TableConfig tableConfig;
     private final Configuration customProperties;
@@ -87,6 +89,7 @@ public final class TableInfo {
         this.bucketKeys = bucketKeys;
         this.partitionKeys = partitionKeys;
         this.numBuckets = numBuckets;
+        this.isIndexTable = IndexTableUtils.isIndexTable(tablePath.getTableName());
         this.properties = properties;
         this.tableConfig = new TableConfig(properties);
         this.customProperties = customProperties;
@@ -155,6 +158,11 @@ public final class TableInfo {
         return !primaryKeys.isEmpty();
     }
 
+    /** Check if the table is an index table or not. */
+    public boolean isIndexTable() {
+        return isIndexTable;
+    }
+
     /**
      * Returns the logical primary keys of the table. The logical primary keys are the defined
      * PRIMARY KEY clause when creating table.
@@ -217,7 +225,7 @@ public final class TableInfo {
 
     /** Check if the table is partitioned and auto partition is enabled. */
     public boolean isAutoPartitioned() {
-        return isPartitioned() && tableConfig.getAutoPartitionStrategy().isAutoPartitionEnabled();
+        return isPartitioned() && getAutoPartitionStrategy().isAutoPartitionEnabled();
     }
 
     /**
@@ -250,6 +258,16 @@ public final class TableInfo {
      */
     public TableConfig getTableConfig() {
         return tableConfig;
+    }
+
+    /**
+     * Returns the auto partition strategy with correctly initialized key field and pre-computed
+     * runtime fields. For single-column partitioned tables, the key will be automatically set to
+     * that partition column.
+     */
+    public AutoPartitionStrategy getAutoPartitionStrategy() {
+        return AutoPartitionStrategy.from(
+                properties, partitionKeys, rowType, schema.getColumnNames());
     }
 
     /**
@@ -367,6 +385,7 @@ public final class TableInfo {
         return tableId == that.tableId
                 && schemaId == that.schemaId
                 && numBuckets == that.numBuckets
+                && isIndexTable == that.isIndexTable
                 && Objects.equals(tablePath, that.tablePath)
                 && Objects.equals(rowType, that.rowType)
                 && Objects.equals(primaryKeys, that.primaryKeys)
@@ -391,6 +410,7 @@ public final class TableInfo {
                 bucketKeys,
                 partitionKeys,
                 numBuckets,
+                isIndexTable,
                 properties,
                 customProperties,
                 comment);
@@ -415,6 +435,8 @@ public final class TableInfo {
                 + partitionKeys
                 + ", numBuckets="
                 + numBuckets
+                + ", isIndexTable="
+                + isIndexTable
                 + ", properties="
                 + properties
                 + ", customProperties="

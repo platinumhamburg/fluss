@@ -25,6 +25,7 @@ import org.apache.fluss.utils.IOUtils;
 
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.FlushOptions;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
@@ -154,6 +155,18 @@ public class RocksDBKv implements AutoCloseable {
             db.delete(key);
         } catch (RocksDBException e) {
             throw new IOException("Fail to delete key.", e);
+        }
+    }
+
+    public void compact() throws IOException {
+        checkIfRocksDBClosed();
+        try {
+            // Flush first to ensure data is in SST files for compaction
+            db.flush(new FlushOptions().setWaitForFlush(true), defaultColumnFamilyHandle);
+            // Compact the entire range (null, null means compact everything)
+            db.compactRange(defaultColumnFamilyHandle);
+        } catch (RocksDBException e) {
+            throw new IOException("Failed to compact RocksDB", e);
         }
     }
 

@@ -103,7 +103,11 @@ public final class FlussConnection implements Connection {
         // force to update the table info from server to avoid stale data in cache.
         metadataUpdater.updateTableOrPartitionMetadata(tablePath, null);
         Admin admin = getOrCreateAdmin();
-        return new FlussTable(this, tablePath, admin.getTableInfo(tablePath).join());
+        return new FlussTable(this, tablePath, admin.getTableInfo(tablePath).join(), conf);
+    }
+
+    public RpcClient getRpcClient() {
+        return rpcClient;
     }
 
     public MetadataUpdater getMetadataUpdater() {
@@ -131,7 +135,7 @@ public final class FlussConnection implements Connection {
         if (lookupClient == null) {
             synchronized (this) {
                 if (lookupClient == null) {
-                    lookupClient = new LookupClient(conf, metadataUpdater);
+                    lookupClient = new LookupClient(conf, metadataUpdater, clientMetricGroup);
                 }
             }
         }

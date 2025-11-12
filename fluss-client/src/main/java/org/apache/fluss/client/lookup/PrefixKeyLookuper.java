@@ -28,6 +28,7 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
@@ -131,39 +132,45 @@ class PrefixKeyLookuper extends AbstractLookuper {
 
     @Override
     public CompletableFuture<LookupResult> lookup(InternalRow prefixKey) {
-        byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(prefixKey);
-        int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
+        try {
+            byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(prefixKey);
+            int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
 
-        Long partitionId = null;
-        if (partitionGetter != null) {
-            try {
-                partitionId =
-                        getPartitionId(
-                                prefixKey,
-                                partitionGetter,
-                                tableInfo.getTablePath(),
-                                metadataUpdater);
-            } catch (PartitionNotExistException e) {
-                return CompletableFuture.completedFuture(new LookupResult(Collections.emptyList()));
+            Long partitionId = null;
+            if (partitionGetter != null) {
+                try {
+                    partitionId =
+                            getPartitionId(
+                                    prefixKey,
+                                    partitionGetter,
+                                    tableInfo.getTablePath(),
+                                    metadataUpdater);
+                } catch (PartitionNotExistException e) {
+                    return CompletableFuture.completedFuture(
+                            new LookupResult(Collections.emptyList()));
+                }
             }
-        }
 
-        CompletableFuture<LookupResult> lookupFuture = new CompletableFuture<>();
-        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-        lookupClient
-                .prefixLookup(tableInfo.getTablePath(), tableBucket, bucketKeyBytes)
-                .whenComplete(
-                        (result, error) -> {
-                            if (error != null) {
-                                lookupFuture.completeExceptionally(
-                                        new RuntimeException(
-                                                "Failed to perform prefix lookup for table: "
-                                                        + tableInfo.getTablePath(),
-                                                error));
-                            } else {
-                                handleLookupResponse(result, lookupFuture);
-                            }
-                        });
-        return lookupFuture;
+            CompletableFuture<LookupResult> lookupFuture = new CompletableFuture<>();
+            TableBucket tableBucket =
+                    new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
+            lookupClient
+                    .prefixLookup(tableInfo.getTablePath(), tableBucket, bucketKeyBytes)
+                    .whenComplete(
+                            (result, error) -> {
+                                if (error != null) {
+                                    lookupFuture.completeExceptionally(
+                                            new RuntimeException(
+                                                    "Failed to perform prefix lookup for table: "
+                                                            + tableInfo.getTablePath(),
+                                                    error));
+                                } else {
+                                    handleLookupResponse(result, lookupFuture);
+                                }
+                            });
+            return lookupFuture;
+        } catch (Exception e) {
+            return FutureUtils.failedCompletableFuture(e);
+        }
     }
 }

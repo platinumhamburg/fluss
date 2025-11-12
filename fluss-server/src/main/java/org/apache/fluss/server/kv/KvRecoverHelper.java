@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv;
 
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -33,6 +34,7 @@ import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
+import org.apache.fluss.row.encode.TsValueEncoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.server.log.FetchIsolation;
@@ -59,6 +61,7 @@ public class KvRecoverHelper {
     // will be initialized when first encounter a log record during recovering from log
     private Integer currentSchemaId;
     private RowType currentRowType;
+    private LogFormat currentLogFormat;
 
     private KeyEncoder keyEncoder;
     private RowEncoder rowEncoder;
@@ -158,9 +161,20 @@ public class KvRecoverHelper {
                                     // the log row format may not compatible with kv row format,
                                     // e.g, arrow vs. compacted, thus needs a conversion here.
                                     BinaryRow row = toKvRow(logRecord.getRow());
-                                    value =
-                                            ValueEncoder.encodeValue(
-                                                    currentSchemaId.shortValue(), row);
+                                    // Index tables always use TsValueEncoder to support TTL-based
+                                    // compaction in RocksDB
+                                    if (kvTablet.shouldUseTsEncoding()) {
+                                        // For index table, encode with timestamp from LogRecord
+                                        value =
+                                                TsValueEncoder.encodeValue(
+                                                        logRecord.timestamp(),
+                                                        currentSchemaId.shortValue(),
+                                                        row);
+                                    } else {
+                                        value =
+                                                ValueEncoder.encodeValue(
+                                                        currentSchemaId.shortValue(), row);
+                                    }
                                 }
                                 resumeRecordConsumer.accept(
                                         new KeyValueAndLogOffset(
@@ -204,6 +218,7 @@ public class KvRecoverHelper {
         currentRowType = schemaGetter.getSchema(schemaId).getRowType();
         DataType[] dataTypes = currentRowType.getChildren().toArray(new DataType[0]);
         currentSchemaId = schemaId;
+        currentLogFormat = tableInfo.getTableConfig().getLogFormat();
 
         DataLakeFormat lakeFormat = tableInfo.getTableConfig().getDataLakeFormat().orElse(null);
         keyEncoder = KeyEncoder.of(currentRowType, tableInfo.getPhysicalPrimaryKeys(), lakeFormat);

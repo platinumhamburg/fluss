@@ -185,10 +185,9 @@ class CoordinatorEventProcessorTest {
         serverMetadataCache = new CoordinatorMetadataCache();
         // set a test channel manager for the context
         testCoordinatorChannelManager = new TestCoordinatorChannelManager();
-        autoPartitionManager =
-                new AutoPartitionManager(serverMetadataCache, metadataManager, new Configuration());
-        lakeTableTieringManager = new LakeTableTieringManager();
         Configuration conf = new Configuration();
+        autoPartitionManager = new AutoPartitionManager(serverMetadataCache, metadataManager, conf);
+        lakeTableTieringManager = new LakeTableTieringManager();
         conf.setString(ConfigOptions.REMOTE_DATA_DIR, "/tmp/fluss/remote-data");
         eventProcessor = buildCoordinatorEventProcessor();
         eventProcessor.startup();

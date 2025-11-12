@@ -31,11 +31,14 @@ import java.util.concurrent.CompletableFuture;
  *
  * <p>Note: Lookuper instances are not thread-safe.
  *
+ * <p>Lookuper instances should be closed after use to release any resources. It is recommended to
+ * use try-with-resources statement to ensure proper resource cleanup.
+ *
  * @since 0.6
  */
 @PublicEvolving
 @NotThreadSafe
-public interface Lookuper {
+public interface Lookuper extends AutoCloseable {
 
     /**
      * Lookups certain row from the given lookup key.
@@ -48,4 +51,14 @@ public interface Lookuper {
      * @return the result of lookup.
      */
     CompletableFuture<LookupResult> lookup(InternalRow lookupKey);
+
+    /**
+     * Closes this lookuper and releases any resources associated with it. This method should be
+     * called when the lookuper is no longer needed to prevent resource leaks.
+     *
+     * <p>Note: This method does not throw checked exceptions for easier usage with
+     * try-with-resources.
+     */
+    @Override
+    void close();
 }

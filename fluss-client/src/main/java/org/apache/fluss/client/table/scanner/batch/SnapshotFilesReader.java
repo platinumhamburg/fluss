@@ -27,6 +27,7 @@ import org.apache.fluss.rocksdb.RocksDBHandle;
 import org.apache.fluss.rocksdb.RocksIteratorWrapper;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
+import org.apache.fluss.row.encode.TsValueDecoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.CloseableRegistry;
@@ -59,6 +60,8 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
     private final Schema targetSchema;
     private final SchemaGetter schemaGetter;
     private final ValueDecoder valueDecoder;
+    private final TsValueDecoder tsValueDecoder;
+    private final boolean shouldUseTsDecoding;
     @Nullable private final int[] projectedFields;
     private RocksIteratorWrapper rocksIteratorWrapper;
 
@@ -80,12 +83,15 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
             @Nullable int[] projectedFields,
             int targetSchemaId,
             Schema targetSchema,
-            SchemaGetter schemaGetter)
+            SchemaGetter schemaGetter,
+            boolean shouldUseTsDecoding)
             throws IOException {
         this.targetSchemaId = targetSchemaId;
         this.targetSchema = targetSchema;
         this.schemaGetter = schemaGetter;
         this.valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
+        this.tsValueDecoder = new TsValueDecoder(schemaGetter, kvFormat);
+        this.shouldUseTsDecoding = shouldUseTsDecoding;
         this.projectedFields = projectedFields;
         closeableRegistry = new CloseableRegistry();
         try {
@@ -165,18 +171,28 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
         byte[] value = rocksIteratorWrapper.value();
         rocksIteratorWrapper.next();
 
-        BinaryValue originValue = valueDecoder.decodeValue(value);
-        InternalRow originRow = originValue.row;
-        if (targetSchemaId != originValue.schemaId) {
+        // For values encoded with timestamp, use TsValueDecoder; otherwise use ValueDecoder
+        short originSchemaId;
+        InternalRow originRow;
+        if (shouldUseTsDecoding) {
+            TsValueDecoder.TsValue tsValue = tsValueDecoder.decodeValue(value);
+            originSchemaId = tsValue.schemaId;
+            originRow = tsValue.row;
+        } else {
+            BinaryValue binaryValue = valueDecoder.decodeValue(value);
+            originSchemaId = binaryValue.schemaId;
+            originRow = binaryValue.row;
+        }
+
+        if (targetSchemaId != originSchemaId) {
             int[] indexMapping =
                     schemaProjectionCache.computeIfAbsent(
-                            originValue.schemaId,
+                            originSchemaId,
                             sourceSchemaId ->
                                     SchemaUtil.getIndexMapping(
                                             schemaGetter.getSchema(sourceSchemaId), targetSchema));
             originRow = ProjectedRow.from(indexMapping).replaceRow(originRow);
         }
-
         if (projectedFields != null) {
             ProjectedRow projectedRow = ProjectedRow.from(projectedFields);
             projectedRow.replaceRow(originRow);

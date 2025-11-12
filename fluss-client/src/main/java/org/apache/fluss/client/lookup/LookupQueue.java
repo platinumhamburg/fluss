@@ -19,6 +19,7 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.client.metrics.LookuperMetricGroup;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 
@@ -48,13 +49,15 @@ class LookupQueue {
     private final BlockingQueue<AbstractLookupQuery<?>> reEnqueuedLookupQueue;
     private final int maxBatchSize;
     private final long batchTimeoutNanos;
+    private final LookuperMetricGroup lookuperMetricGroup;
 
-    LookupQueue(Configuration conf) {
+    LookupQueue(Configuration conf, LookuperMetricGroup lookuperMetricGroup) {
         this.lookupQueue =
                 new ArrayBlockingQueue<>(conf.get(ConfigOptions.CLIENT_LOOKUP_QUEUE_SIZE));
         this.reEnqueuedLookupQueue = new LinkedBlockingQueue<>();
         this.maxBatchSize = conf.get(ConfigOptions.CLIENT_LOOKUP_MAX_BATCH_SIZE);
         this.batchTimeoutNanos = conf.get(ConfigOptions.CLIENT_LOOKUP_BATCH_TIMEOUT).toNanos();
+        this.lookuperMetricGroup = lookuperMetricGroup;
         this.closed = false;
     }
 
@@ -66,6 +69,8 @@ class LookupQueue {
 
         try {
             lookupQueue.put(lookup);
+            // Update queue size metrics after adding
+            lookuperMetricGroup.updateLookupQueueSize(lookupQueue.size());
         } catch (InterruptedException e) {
             lookup.future().completeExceptionally(e);
         }
@@ -121,6 +126,8 @@ class LookupQueue {
                 break;
             }
         }
+        // Update queue size metrics after draining
+        lookuperMetricGroup.updateLookupQueueSize(lookupQueue.size());
         return lookupOperations;
     }
 
@@ -129,6 +136,8 @@ class LookupQueue {
         List<AbstractLookupQuery<?>> lookupOperations = new ArrayList<>(lookupQueue.size());
         lookupQueue.drainTo(lookupOperations);
         reEnqueuedLookupQueue.drainTo(lookupOperations);
+        // Update queue size metrics after draining all
+        lookuperMetricGroup.updateLookupQueueSize(lookupQueue.size());
         return lookupOperations;
     }
 

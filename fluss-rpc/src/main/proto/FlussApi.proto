@@ -219,6 +219,18 @@ message FetchLogResponse {
   repeated PbFetchLogRespForTable tables_resp = 1;
 }
 
+// fetch log request and response
+message FetchIndexRequest {
+  required int32 max_bytes = 1;
+  optional int32 max_wait_ms = 2;
+  optional int32 min_advance_offset = 3;
+  repeated PbFetchIndexReqForTableBucket req_for_table_buckets = 4;
+}
+
+message FetchIndexResponse {
+  repeated PbFetchIndexRespForIndexTableBucket resp_for_index_table_buckets = 1;
+}
+
 // put kv request and response
 message PutKvRequest {
   required int32 acks = 1;
@@ -677,6 +689,40 @@ message PbFetchLogRespForBucket {
   optional int64 log_start_offset = 6; // TODO now we don't introduce log start offset, but remain it in protobuf
   optional PbRemoteLogFetchInfo remote_log_fetch_info = 7;
   optional bytes records = 8;
+}
+
+message PbFetchIndexReqForIndexTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  required int64 fetch_offset = 4;
+  required int64 index_commit_offset = 5;
+}
+
+message PbFetchIndexReqForTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  repeated PbFetchIndexReqForIndexTableBucket req_for_index_buckets = 4;
+}
+
+message PbFetchIndexRespForTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  optional int32 error_code = 4;
+  optional string error_message = 5;
+  optional int64 start_offset = 6;
+  optional int64 end_offset = 7;
+  optional bytes records = 8;
+  optional bool is_data_ready = 9;
+}
+
+message PbFetchIndexRespForIndexTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  repeated PbFetchIndexRespForTableBucket resp_for_tables = 4;
 }
 
 message PbPutKvReqForBucket {

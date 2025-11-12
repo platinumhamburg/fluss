@@ -446,6 +446,43 @@ public class ConfigOptions {
                     .withDescription(
                             "The number of threads to use for various background processing tasks.");
 
+    // ------------------------------------------------------------------
+    // RPC Slow Request Monitoring Settings
+    // ------------------------------------------------------------------
+
+    public static final ConfigOption<Boolean> RPC_SERVER_SLOW_REQUEST_MONITORING_ENABLED =
+            key("rpc.server.slow-request.monitoring.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Enable slow request monitoring on RPC server side. When enabled, "
+                                    + "requests exceeding the threshold will be logged with detailed "
+                                    + "information including thread stack traces and timing breakdown. "
+                                    + "The default value is true.");
+
+    public static final ConfigOption<Duration> RPC_SERVER_SLOW_REQUEST_THRESHOLD =
+            key("rpc.server.slow-request.threshold")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "The threshold for identifying slow RPC requests on the server side. "
+                                    + "When a request takes longer than this threshold to process, "
+                                    + "a warning log with detailed diagnostic information (including thread stack trace) "
+                                    + "will be generated. This threshold applies to all request types. "
+                                    + "The default value is 30 seconds.");
+
+    public static final ConfigOption<Boolean> RPC_SERVER_SLOW_REQUEST_DUMP_STACK =
+            key("rpc.server.slow-request.dump-stack")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether to dump thread stack trace when slow request is detected. "
+                                    + "Dumping stack trace helps identify the exact location where "
+                                    + "the request processing is stuck (e.g., waiting for locks, "
+                                    + "slow I/O operations). The default value is true. "
+                                    + "Note: Stack trace dumping has minimal overhead as it only "
+                                    + "occurs when requests exceed the threshold.");
+
     public static final ConfigOption<MemorySize> SERVER_BUFFER_MEMORY_SIZE =
             key("server.buffer.memory-size")
                     .memoryType()
@@ -465,7 +502,7 @@ public class ConfigOptions {
     public static final ConfigOption<MemorySize> SERVER_BUFFER_PER_REQUEST_MEMORY_SIZE =
             key("server.buffer.per-request-memory-size")
                     .memoryType()
-                    .defaultValue(MemorySize.parse("16mb"))
+                    .defaultValue(MemorySize.parse("8mb"))
                     .withDescription(
                             "The minimum number of bytes that will be allocated by the writer rounded down to the closes multiple of "
                                     + SERVER_BUFFER_PAGE_SIZE.key()
@@ -480,6 +517,65 @@ public class ConfigOptions {
                     .defaultValue(Duration.ofNanos(Long.MAX_VALUE))
                     .withDescription(
                             "Defines how long the buffer pool will block when waiting for segments to become available.");
+
+    // ------------------------------------------------------------------
+    // Index Cache Memory Pool Settings
+    // ------------------------------------------------------------------
+
+    public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_MEMORY_SIZE =
+            key("server.index-cache.memory-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("1024mb"))
+                    .withDescription(
+                            "The total bytes of memory the server can use for index cache, used by IndexLogCache and IndexLogBuildHelper components.");
+
+    public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_PAGE_SIZE =
+            key("server.index-cache.page-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("64kb"))
+                    .withDescription(
+                            "Size of every page in index cache memory buffers (`"
+                                    + SERVER_INDEX_CACHE_MEMORY_SIZE.key()
+                                    + "`).");
+
+    public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_PER_REQUEST_MEMORY_SIZE =
+            key("server.index-cache.per-request-memory-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("4mb"))
+                    .withDescription(
+                            "The minimum number of bytes that will be allocated by the index cache writer rounded down to the closest multiple of "
+                                    + SERVER_INDEX_CACHE_PAGE_SIZE.key()
+                                    + "It must be greater than or equal to "
+                                    + SERVER_INDEX_CACHE_PAGE_SIZE.key()
+                                    + ". "
+                                    + "This option allows to allocate memory in batches to have better CPU-cached friendliness due to contiguous segments.");
+
+    public static final ConfigOption<Duration> SERVER_INDEX_CACHE_WAIT_TIMEOUT =
+            key("server.index-cache.wait-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(10L))
+                    .withDescription(
+                            "Defines how long the buffer pool will block when waiting for segments to become available.");
+
+    public static final ConfigOption<MemorySize> SERVER_INDEX_CACHE_COLD_LOAD_BATCH_SIZE =
+            key("server.index-cache.cold-load-batch-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("16mb"))
+                    .withDescription(
+                            "The maximum amount of data to load in a single batch when performing cold data loading from WAL. "
+                                    + "Cold data loading occurs when an index replica needs to catch up with historical data after a failover. "
+                                    + "By limiting the batch size, memory pressure can be controlled during cold data loading. "
+                                    + "The next batch will only be loaded after the current batch is consumed (indexCommitHorizon advances).");
+
+    public static final ConfigOption<Integer> SERVER_INDEX_PENDING_WRITE_THREADS =
+            key("server.index-cache.pending-write-threads")
+                    .intType()
+                    .defaultValue(16)
+                    .withDescription(
+                            "The number of worker threads in the PendingWriteQueuePool for processing index cache write operations. "
+                                    + "Each thread can handle multiple table buckets' pending write queues using fair scheduling. "
+                                    + "This fixed-size thread pool prevents thread explosion in multi-table scenarios. "
+                                    + "The default value of 16 is suitable for most use cases.");
 
     // ------------------------------------------------------------------
     // ZooKeeper Settings
@@ -539,6 +635,16 @@ public class ConfigOptions {
                     .withDeprecatedKeys("recovery.zookeeper.client.max-retry-attempts")
                     .withDescription(
                             "Defines the number of connection retries before the client gives up.");
+
+    public static final ConfigOption<Integer> INDEX_AUTO_CREATE_MAX_RETRY_ATTEMPTS =
+            key("index.auto-create.max-retry-attempts")
+                    .intType()
+                    .defaultValue(3)
+                    .withDescription(
+                            "Defines the maximum number of retry attempts when automatically creating "
+                                    + "index tables during main table creation. If index table creation "
+                                    + "fails after all retry attempts, the main table creation will be "
+                                    + "rolled back.");
 
     public static final ConfigOption<Boolean> ZOOKEEPER_TOLERATE_SUSPENDED_CONNECTIONS =
             key("zookeeper.client.tolerate-suspended-connections")
@@ -647,6 +753,46 @@ public class ConfigOptions {
                             "If a follower replica hasn't sent any fetch log requests or hasn't "
                                     + "consumed up the leaders log end offset for at least this time, "
                                     + "the leader will remove the follower replica form isr");
+
+    public static final ConfigOption<Long> INDEX_COMMIT_HORIZON_MAX_LAG_OFFSET =
+            key("index.commit-horizon.max-lag-offset")
+                    .longType()
+                    .defaultValue(1048560L)
+                    .withDescription(
+                            "The maximum lag offset of the index commit horizon. "
+                                    + "If the index commit horizon is more than this offset, "
+                                    + "the index commit horizon will be updated to the max lag offset.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICA_FETCH_MAX_BYTES =
+            key("index.replica.fetch.max-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("16mb"))
+                    .withDescription(
+                            "The maximum amount of data the server should return for an index fetch request from follower. "
+                                    + "Records are fetched in batches, and if the first record batch in the first "
+                                    + "non-empty bucket of the fetch is larger than this value, the record batch "
+                                    + "will still be returned to ensure that the fetch can make progress. As such, "
+                                    + "this is not a absolute maximum. Note that the index fetcher performs multiple fetches "
+                                    + "in parallel.");
+
+    public static final ConfigOption<Integer> INDEX_REPLICA_FETCH_MIN_ADVANCE_OFFSET =
+            key("index.replica.fetch.min-advance-offset")
+                    .intType()
+                    .defaultValue(512)
+                    .withDescription(
+                            "The minimum offset to advance for index fetch requests when the current offset "
+                                    + "does not have sufficient data. This parameter helps to avoid frequent small "
+                                    + "fetch requests by ensuring that the fetcher advances by at least this amount "
+                                    + "when seeking forward in the index log.");
+
+    public static final ConfigOption<Duration> INDEX_REPLICA_FETCH_WAIT_MAX_TIME =
+            key("index.replica.fetch.wait-max-time")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(128))
+                    .withDescription(
+                            "The maximum time to wait for enough data to be available for an index fetch request "
+                                    + "from follower to response. This value should be tuned based on the expected "
+                                    + "index update frequency and latency requirements.");
 
     public static final ConfigOption<Integer> LOG_REPLICA_WRITE_OPERATION_PURGE_NUMBER =
             key("log.replica.write-operation-purge-number")
@@ -1223,6 +1369,26 @@ public class ConfigOptions {
                                     + ". It should be a positive number and not larger than the number of tablet servers in the "
                                     + "Fluss cluster. A value larger than the number of tablet servers in Fluss cluster "
                                     + "will result in an error when the new table is created.");
+
+    public static final ConfigOption<Integer> TABLE_INDEX_BUCKET_NUM =
+            key("table.index.bucket.num")
+                    .intType()
+                    .defaultValue(3)
+                    .withDescription(
+                            "The number of buckets for global secondary index tables. This is a table-level property "
+                                    + "that determines how many buckets each global secondary index table will have. "
+                                    + "The default value is 3. It should be a positive number.");
+
+    public static final ConfigOption<String> TABLE_INDEXES_COLUMNS =
+            key("table.indexes.columns")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The global secondary index configuration for the table. Multiple indexes are separated by ';', "
+                                    + "and columns within each index are separated by ','. For example: 'col1,col2;col3,col4' "
+                                    + "defines two indexes - one on (col1,col2) and another on (col3,col4). "
+                                    + "Columns within a single index cannot be duplicated, but columns can be shared across different indexes. "
+                                    + "Multiple indexes cannot have exactly the same column configuration.");
 
     public static final ConfigOption<LogFormat> TABLE_LOG_FORMAT =
             key("table.log.format")

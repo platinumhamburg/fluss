@@ -19,6 +19,7 @@ package org.apache.fluss.client.table.scanner.batch;
 
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.exception.LeaderNotAvailableException;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
@@ -68,6 +69,12 @@ public class LimitBatchScanner implements BatchScanner {
     private final int targetSchemaId;
 
     /**
+     * Whether the values are encoded with timestamp (TsValueEncoder). Currently, only index tables
+     * use TsValueEncoder.
+     */
+    private final boolean shouldUseTsDecoding;
+
+    /**
      * A cache for schema projection mapping from source schema to target. Use HashMap here, because
      * LimitBatchScanner is used in single thread only.
      */
@@ -115,6 +122,10 @@ public class LimitBatchScanner implements BatchScanner {
         this.scanFuture = gateway.limitScan(limitScanRequest);
 
         this.kvFormat = tableInfo.getTableConfig().getKvFormat();
+        // Determine if values are encoded with timestamp
+        // Currently, only index tables use TsValueEncoder
+        this.shouldUseTsDecoding =
+                IndexTableUtils.isIndexTable(tableInfo.getTablePath().getTableName());
         this.endOfInput = false;
     }
 
