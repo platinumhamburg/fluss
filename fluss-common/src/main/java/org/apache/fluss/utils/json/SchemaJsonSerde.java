@@ -36,8 +36,9 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
 
     private static final String COLUMNS_NAME = "columns";
     private static final String PRIMARY_KEY_NAME = "primary_key";
+    private static final String INDEXES_NAME = "indexes";
     private static final String VERSION_KEY = "version";
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
 
     @Override
     public void serialize(Schema schema, JsonGenerator generator) throws IOException {
@@ -62,11 +63,30 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
             generator.writeEndArray();
         }
 
+        // serialize indexes
+        List<Schema.Index> indexes = schema.getIndexes();
+        if (!indexes.isEmpty()) {
+            generator.writeArrayFieldStart(INDEXES_NAME);
+            for (Schema.Index index : indexes) {
+                generator.writeStartObject();
+                generator.writeStringField("name", index.getIndexName());
+                generator.writeArrayFieldStart("columns");
+                for (String columnName : index.getColumnNames()) {
+                    generator.writeString(columnName);
+                }
+                generator.writeEndArray();
+                generator.writeEndObject();
+            }
+            generator.writeEndArray();
+        }
+
         generator.writeEndObject();
     }
 
     @Override
     public Schema deserialize(JsonNode node) {
+        // Handle backward compatibility - version 1 doesn't have indexes
+        int version = node.has(VERSION_KEY) ? node.get(VERSION_KEY).asInt() : 1;
         Iterator<JsonNode> columnJsons = node.get(COLUMNS_NAME).elements();
         List<Schema.Column> columns = new ArrayList<>();
         while (columnJsons.hasNext()) {
@@ -81,6 +101,21 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
                 primaryKeys.add(primaryKeyJsons.next().asText());
             }
             builder.primaryKey(primaryKeys);
+        }
+
+        // deserialize indexes (only available in version 2 and later)
+        if (version >= 2 && node.has(INDEXES_NAME)) {
+            Iterator<JsonNode> indexJsons = node.get(INDEXES_NAME).elements();
+            while (indexJsons.hasNext()) {
+                JsonNode indexNode = indexJsons.next();
+                String indexName = indexNode.get("name").asText();
+                Iterator<JsonNode> indexColumnJsons = indexNode.get("columns").elements();
+                List<String> indexColumns = new ArrayList<>();
+                while (indexColumnJsons.hasNext()) {
+                    indexColumns.add(indexColumnJsons.next().asText());
+                }
+                builder.index(indexName, indexColumns);
+            }
         }
 
         return builder.build();

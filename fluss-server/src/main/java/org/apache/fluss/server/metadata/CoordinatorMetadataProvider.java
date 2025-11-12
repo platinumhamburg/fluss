@@ -111,6 +111,11 @@ public class CoordinatorMetadataProvider extends ZkBasedMetadataProvider {
         return ctx.getPhysicalTablePath(partitionId);
     }
 
+    @Override
+    public Optional<TablePath> getTablePathFromCache(long tableId) {
+        return Optional.ofNullable(ctx.getTablePathById(tableId));
+    }
+
     /**
      * Constructs bucket metadata list from coordinator context information.
      *

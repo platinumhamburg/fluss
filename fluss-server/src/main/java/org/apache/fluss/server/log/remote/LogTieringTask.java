@@ -252,12 +252,17 @@ public class LogTieringTask implements Runnable {
 
             File writerIdSnapshotFile =
                     log.writerStateManager().fetchSnapshot(endOffset).orElse(null);
+            File bucketStateSnapshotFile =
+                    log.bucketStateManager().fetchSnapshot(endOffset).orElse(null);
             LogSegmentFiles logSegmentFiles =
                     new LogSegmentFiles(
                             logFile.toPath(),
                             toPathIfExists(segment.offsetIndex().file()),
                             toPathIfExists(segment.timeIndex().file()),
-                            writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null);
+                            writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null,
+                            bucketStateSnapshotFile != null
+                                    ? bucketStateSnapshotFile.toPath()
+                                    : null);
 
             UUID remoteLogSegmentId = UUID.randomUUID();
             int sizeInBytes = segment.getFileLogRecords().sizeInBytes();

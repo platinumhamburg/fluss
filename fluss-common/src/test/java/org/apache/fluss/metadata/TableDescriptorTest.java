@@ -316,4 +316,63 @@ class TableDescriptorTest {
                 .hasMessage(
                         "Bucket key [f0, f3] shouldn't include any column in partition keys [f0].");
     }
+
+    @Test
+    void testIndexesWithPrimaryKeyTable() {
+        // Test that indexes work with primary key tables
+        final Schema schemaWithIndex =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .primaryKey("f0", "f2")
+                        .index("idx1", "f1")
+                        .build();
+
+        TableDescriptor descriptor = TableDescriptor.builder().schema(schemaWithIndex).build();
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName()).isEqualTo("idx1");
+        assertThat(descriptor.getSchema().getIndexes().get(0).getColumnNames())
+                .containsExactly("f1");
+    }
+
+    @Test
+    void testIndexesWithoutPrimaryKeyTable() {
+        // Test that indexes are not allowed without primary key
+        final Schema schemaWithIndexNoPK =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .index("idx1", "f1")
+                        .build();
+
+        assertThatThrownBy(() -> TableDescriptor.builder().schema(schemaWithIndexNoPK).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(
+                        "Global secondary indexes are only supported for primary key tables");
+    }
+
+    @Test
+    void testMultipleIndexes() {
+        // Test multiple indexes
+        final Schema schemaWithMultipleIndexes =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .column("f3", DataTypes.INT())
+                        .primaryKey("f0", "f2")
+                        .index("idx1", "f1")
+                        .index("idx2", "f3")
+                        .build();
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(schemaWithMultipleIndexes).build();
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(2);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName()).isEqualTo("idx1");
+        assertThat(descriptor.getSchema().getIndexes().get(1).getIndexName()).isEqualTo("idx2");
+    }
 }
