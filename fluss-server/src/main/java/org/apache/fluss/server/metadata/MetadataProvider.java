@@ -56,6 +56,14 @@ public interface MetadataProvider {
     Optional<PhysicalTablePath> getPhysicalTablePathFromCache(long partitionId);
 
     /**
+     * Retrieves the table path from local cache using table ID.
+     *
+     * @param tableId the table identifier
+     * @return an Optional containing the table path if found in cache, empty otherwise
+     */
+    Optional<TablePath> getTablePathFromCache(long tableId);
+
+    /**
      * Retrieves a batch of table metadata from ZooKeeper.
      *
      * @param tablePaths the path identifying the table
