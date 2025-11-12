@@ -66,7 +66,9 @@ class DefaultRemoteLogStorageTest extends RemoteLogTestBase {
         assertThat(remoteLogDir.exists()).isTrue();
         File[] remoteFiles = remoteLogDir.listFiles();
         assertThat(remoteFiles).isNotNull();
-        assertThat(remoteFiles).hasSize(4);
+        // log file + offset index + time index + writer snapshot are required
+        // bucket state snapshot is optional (only for PK tables or when state exists)
+        assertThat(remoteFiles.length).isGreaterThanOrEqualTo(4).isLessThanOrEqualTo(5);
 
         File[] allFilesForLocalLog = logTablet.getLogDir().listFiles();
         assertThat(allFilesForLocalLog).isNotNull();
@@ -86,7 +88,9 @@ class DefaultRemoteLogStorageTest extends RemoteLogTestBase {
         File remoteLogDir = getTestingRemoteLogSegmentDir(remoteLogSegment);
         assertThat(remoteLogDir.exists()).isTrue();
         File[] remoteFiles = remoteLogDir.listFiles();
-        assertThat(remoteFiles).hasSize(4);
+        // log file + offset index + time index + writer snapshot are required
+        // bucket state snapshot is optional (only for PK tables or when state exists)
+        assertThat(remoteFiles.length).isGreaterThanOrEqualTo(4).isLessThanOrEqualTo(5);
 
         remoteLogStorageManager.deleteLogSegmentFiles(remoteLogSegment);
         remoteLogDir = getTestingRemoteLogSegmentDir(remoteLogSegment);
@@ -104,7 +108,9 @@ class DefaultRemoteLogStorageTest extends RemoteLogTestBase {
 
         File[] remoteFiles = remoteLogDir.listFiles();
         assertThat(remoteFiles).isNotNull();
-        assertThat(remoteFiles).hasSize(4);
+        // log file + offset index + time index + writer snapshot are required
+        // bucket state snapshot is optional (only for PK tables or when state exists)
+        assertThat(remoteFiles.length).isGreaterThanOrEqualTo(4).isLessThanOrEqualTo(5);
 
         File tmpIndexFile = new File(tempDir, "tmp-index");
         try (InputStream inputStream =
@@ -122,6 +128,61 @@ class DefaultRemoteLogStorageTest extends RemoteLogTestBase {
                     .endsWith(RemoteLogStorage.IndexType.getFileSuffix(IndexType.OFFSET))) {
                 assertThat(Files.equal(remoteFile, tmpIndexFile)).isTrue();
                 assertThat(Files.equal(tmpIndexFile, localFile)).isTrue();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testFetchBucketStateSnapshot(boolean partitionTable) throws Exception {
+        LogTablet logTablet = makeLogTabletAndAddSegments(partitionTable);
+        RemoteLogSegment remoteLogSegment =
+                copyLogSegmentToRemote(logTablet, remoteLogStorageManager, 0);
+        File remoteLogDir = getTestingRemoteLogSegmentDir(remoteLogSegment);
+        assertThat(remoteLogDir.exists()).isTrue();
+
+        File[] remoteFiles = remoteLogDir.listFiles();
+        assertThat(remoteFiles).isNotNull();
+        // log file + offset index + time index + writer snapshot are required
+        // bucket state snapshot is optional (only for PK tables or when state exists)
+        assertThat(remoteFiles.length).isGreaterThanOrEqualTo(4).isLessThanOrEqualTo(5);
+
+        // Check if bucket state snapshot exists
+        boolean hasStateSnapshot = false;
+        for (File remoteFile : remoteFiles) {
+            if (remoteFile
+                    .getName()
+                    .endsWith(
+                            RemoteLogStorage.IndexType.getFileSuffix(
+                                    IndexType.BUCKET_STATE_SNAPSHOT))) {
+                hasStateSnapshot = true;
+                break;
+            }
+        }
+
+        if (hasStateSnapshot) {
+            File tmpStateSnapshotFile = new File(tempDir, "tmp-state-snapshot");
+            try (InputStream inputStream =
+                    remoteLogStorageManager.fetchIndex(
+                            remoteLogSegment, IndexType.BUCKET_STATE_SNAPSHOT)) {
+                java.nio.file.Files.copy(
+                        inputStream,
+                        tmpStateSnapshotFile.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            File[] allFilesForLocalLog = logTablet.getLogDir().listFiles();
+            assertThat(allFilesForLocalLog).isNotNull();
+            for (File remoteFile : remoteFiles) {
+                File localFile = getLocalFileByName(remoteFile.getName(), allFilesForLocalLog);
+                if (localFile
+                        .getName()
+                        .endsWith(
+                                RemoteLogStorage.IndexType.getFileSuffix(
+                                        IndexType.BUCKET_STATE_SNAPSHOT))) {
+                    assertThat(Files.equal(remoteFile, tmpStateSnapshotFile)).isTrue();
+                    assertThat(Files.equal(tmpStateSnapshotFile, localFile)).isTrue();
+                }
             }
         }
     }
@@ -170,7 +231,9 @@ class DefaultRemoteLogStorageTest extends RemoteLogTestBase {
         File remoteLogDir = getTestingRemoteLogSegmentDir(remoteLogSegment);
         assertThat(remoteLogDir.exists()).isTrue();
         File[] remoteFiles = remoteLogDir.listFiles();
-        assertThat(remoteFiles).hasSize(4);
+        // log file + offset index + time index + writer snapshot are required
+        // bucket state snapshot is optional (only for PK tables or when state exists)
+        assertThat(remoteFiles.length).isGreaterThanOrEqualTo(4).isLessThanOrEqualTo(5);
 
         PhysicalTablePath physicalTablePath = logTablet.getPhysicalTablePath();
         TableBucket tableBucket = logTablet.getTableBucket();

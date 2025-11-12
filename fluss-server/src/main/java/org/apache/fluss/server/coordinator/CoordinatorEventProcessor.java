@@ -356,10 +356,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     }
                 }
                 // if the table is auto partition, put the partitions info
-                if (tableInfo
-                        .getTableConfig()
-                        .getAutoPartitionStrategy()
-                        .isAutoPartitionEnabled()) {
+                if (tableInfo.getAutoPartitionStrategy().isAutoPartitionEnabled()) {
                     autoPartitionTables.add(tableInfo);
                 }
             }
