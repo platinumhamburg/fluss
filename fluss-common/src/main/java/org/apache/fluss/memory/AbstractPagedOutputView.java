@@ -37,7 +37,7 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  *
  * <p>The paging assumes that all memory segments are of the same size.
  */
-public abstract class AbstractPagedOutputView implements OutputView, MemorySegmentWritable {
+public abstract class AbstractPagedOutputView implements MemorySegmentWritableOutputView {
 
     /** The page size of each memory segments. */
     protected final int pageSize;
