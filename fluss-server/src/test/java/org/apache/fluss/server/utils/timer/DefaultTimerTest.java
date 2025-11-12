@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.utils.timer;
+package org.apache.fluss.timer;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Test for {@link org.apache.fluss.server.utils.timer.DefaultTimer}. */
+/** Test for {@link org.apache.fluss.timer.DefaultTimer}. */
 public class DefaultTimerTest {
     private DefaultTimer timer;
 

@@ -43,6 +43,7 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
 import org.apache.fluss.rpc.entity.ListOffsetsResultForBucket;
@@ -57,6 +58,8 @@ import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
 import org.apache.fluss.rpc.messages.CreateAclsResponse;
 import org.apache.fluss.rpc.messages.DropAclsResponse;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
+import org.apache.fluss.rpc.messages.FetchIndexResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
@@ -89,6 +92,10 @@ import org.apache.fluss.rpc.messages.PbCreateAclRespInfo;
 import org.apache.fluss.rpc.messages.PbDescribeConfig;
 import org.apache.fluss.rpc.messages.PbDropAclsFilterResult;
 import org.apache.fluss.rpc.messages.PbDropAclsMatchingAcl;
+import org.apache.fluss.rpc.messages.PbFetchIndexReqForIndexTableBucket;
+import org.apache.fluss.rpc.messages.PbFetchIndexReqForTableBucket;
+import org.apache.fluss.rpc.messages.PbFetchIndexRespForIndexTableBucket;
+import org.apache.fluss.rpc.messages.PbFetchIndexRespForTableBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForTable;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
@@ -140,6 +147,8 @@ import org.apache.fluss.server.authorizer.AclDeleteResult;
 import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
 import org.apache.fluss.server.entity.CommitLakeTableSnapshotData;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
+import org.apache.fluss.server.entity.DataBucketIndexFetchResult;
+import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
 import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
@@ -717,6 +726,44 @@ public class ServerRpcMessageUtils {
         return produceResponse;
     }
 
+    public static Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> getIndexReqMap(
+            FetchIndexRequest request) {
+        Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> fetchIndexDataMap = new HashMap<>();
+
+        for (PbFetchIndexReqForTableBucket reqForTableBucket :
+                request.getReqForTableBucketsList()) {
+            TableBucket dataBucket =
+                    new TableBucket(
+                            reqForTableBucket.getTableId(),
+                            reqForTableBucket.hasPartitionId()
+                                    ? reqForTableBucket.getPartitionId()
+                                    : null,
+                            reqForTableBucket.getBucketId());
+
+            for (PbFetchIndexReqForIndexTableBucket reqForIndexBucket :
+                    reqForTableBucket.getReqForIndexBucketsList()) {
+                TableBucket indexBucket =
+                        new TableBucket(
+                                reqForIndexBucket.getTableId(),
+                                reqForIndexBucket.hasPartitionId()
+                                        ? reqForIndexBucket.getPartitionId()
+                                        : null,
+                                reqForIndexBucket.getBucketId());
+
+                FetchIndexReqInfo reqInfo =
+                        new FetchIndexReqInfo(
+                                reqForIndexBucket.getFetchOffset(),
+                                reqForIndexBucket.getIndexCommitOffset());
+
+                fetchIndexDataMap
+                        .computeIfAbsent(dataBucket, k -> new HashMap<>())
+                        .put(indexBucket, reqInfo);
+            }
+        }
+
+        return fetchIndexDataMap;
+    }
+
     public static Map<TableBucket, FetchReqInfo> getFetchLogData(FetchLogRequest request) {
         Map<TableBucket, FetchReqInfo> fetchDataMap = new HashMap<>();
         for (PbFetchLogReqForTable fetchLogReqForTable : request.getTablesReqsList()) {
@@ -850,6 +897,77 @@ public class ServerRpcMessageUtils {
         FetchLogResponse fetchLogResponse = new FetchLogResponse();
         fetchLogResponse.addAllTablesResps(fetchLogRespForTables);
         return fetchLogResponse;
+    }
+
+    public static FetchIndexResponse makeFetchIndexResponse(
+            Map<TableBucket, DataBucketIndexFetchResult> fetchIndexLogResult) {
+        FetchIndexResponse fetchIndexResponse = new FetchIndexResponse();
+        List<PbFetchIndexRespForIndexTableBucket> fetchIndexRespForTables = new ArrayList<>();
+        for (Map.Entry<TableBucket, DataBucketIndexFetchResult> entry :
+                fetchIndexLogResult.entrySet()) {
+            TableBucket dataBucket = entry.getKey();
+            DataBucketIndexFetchResult fetchIndexLogResultForBucket = entry.getValue();
+            Map<TableBucket, FetchIndexLogResultForBucket> indexBucketResults =
+                    fetchIndexLogResultForBucket.getIndexBucketResults();
+            for (Map.Entry<TableBucket, FetchIndexLogResultForBucket> indexBucketResultEntry :
+                    indexBucketResults.entrySet()) {
+                TableBucket indexBucket = indexBucketResultEntry.getKey();
+                FetchIndexLogResultForBucket indexBucketResult = indexBucketResultEntry.getValue();
+
+                PbFetchIndexRespForIndexTableBucket respForIndexTableBucket =
+                        new PbFetchIndexRespForIndexTableBucket()
+                                .setTableId(indexBucket.getTableId())
+                                .setBucketId(indexBucket.getBucket());
+
+                if (indexBucket.getPartitionId() != null) {
+                    respForIndexTableBucket.setPartitionId(indexBucket.getPartitionId());
+                }
+
+                PbFetchIndexRespForTableBucket respForTableBucket =
+                        respForIndexTableBucket
+                                .addRespForTable()
+                                .setTableId(dataBucket.getTableId())
+                                .setBucketId(dataBucket.getBucket());
+
+                if (dataBucket.getPartitionId() != null) {
+                    respForTableBucket.setPartitionId(dataBucket.getPartitionId());
+                }
+
+                if (indexBucketResult.hasError()) {
+                    respForTableBucket.setError(
+                            indexBucketResult.getError().error().code(),
+                            indexBucketResult.getError().message());
+                } else {
+                    respForTableBucket
+                            .setStartOffset(indexBucketResult.getStartOffset())
+                            .setEndOffset(indexBucketResult.getEndOffset());
+
+                    LogRecords records = indexBucketResult.recordsOrEmpty();
+                    if (records instanceof MemoryLogRecords) {
+                        MemoryLogRecords memoryRecords = (MemoryLogRecords) records;
+                        if (memoryRecords == MemoryLogRecords.EMPTY) {
+                            respForTableBucket.setRecords(new byte[0]);
+                        } else {
+                            respForTableBucket.setRecords(
+                                    memoryRecords.getMemorySegment(),
+                                    memoryRecords.getPosition(),
+                                    memoryRecords.sizeInBytes());
+                        }
+                    } else if (records instanceof BytesViewLogRecords) {
+                        // zero-copy for dynamic index log records assemble
+                        respForTableBucket.setRecordsBytesView(
+                                ((BytesViewLogRecords) records).getBytesView());
+                    } else {
+                        throw new UnsupportedOperationException(
+                                "Unsupported log records type: " + records.getClass().getName());
+                    }
+                }
+
+                fetchIndexRespForTables.add(respForIndexTableBucket);
+            }
+        }
+        fetchIndexResponse.addAllRespForIndexTableBuckets(fetchIndexRespForTables);
+        return fetchIndexResponse;
     }
 
     public static Map<TableBucket, KvRecordBatch> getPutKvData(PutKvRequest putKvRequest) {

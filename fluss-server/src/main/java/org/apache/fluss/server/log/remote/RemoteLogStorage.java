@@ -28,6 +28,7 @@ import java.io.Closeable;
 import java.io.InputStream;
 
 import static org.apache.fluss.utils.FlussPaths.INDEX_FILE_SUFFIX;
+import static org.apache.fluss.utils.FlussPaths.STATE_SNAPSHOT_FILE_SUFFIX;
 import static org.apache.fluss.utils.FlussPaths.TIME_INDEX_FILE_SUFFIX;
 import static org.apache.fluss.utils.FlussPaths.WRITER_SNAPSHOT_FILE_SUFFIX;
 
@@ -50,7 +51,10 @@ public interface RemoteLogStorage extends Closeable {
         TIMESTAMP,
 
         /** Represents producer snapshot index. */
-        WRITER_ID_SNAPSHOT;
+        WRITER_ID_SNAPSHOT,
+
+        /** Represents bucket state snapshot. */
+        BUCKET_STATE_SNAPSHOT;
 
         public static String getFileSuffix(IndexType indexType) {
             switch (indexType) {
@@ -60,6 +64,8 @@ public interface RemoteLogStorage extends Closeable {
                     return TIME_INDEX_FILE_SUFFIX;
                 case WRITER_ID_SNAPSHOT:
                     return WRITER_SNAPSHOT_FILE_SUFFIX;
+                case BUCKET_STATE_SNAPSHOT:
+                    return STATE_SNAPSHOT_FILE_SUFFIX;
                 default:
                     throw new IllegalArgumentException("Unknown index type: " + indexType);
             }

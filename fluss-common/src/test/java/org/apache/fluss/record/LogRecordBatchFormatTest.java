@@ -32,6 +32,8 @@ import static org.apache.fluss.record.LogRecordBatchFormat.leaderEpochOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordsCountOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.stateChangeLogsDataOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.stateChangeLogsLengthOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -77,5 +79,28 @@ public class LogRecordBatchFormatTest {
         assertThat(recordsCountOffset(magic)).isEqualTo(48);
         assertThat(recordBatchHeaderSize(magic)).isEqualTo(52);
         assertThat(arrowChangeTypeOffset(magic)).isEqualTo(52);
+    }
+
+    @Test
+    void testLogRecordBatchFormatForMagicV3() {
+        byte magic = (byte) 3;
+        assertThat(leaderEpochOffset(magic)).isEqualTo(21);
+        assertThat(crcOffset(magic)).isEqualTo(25);
+        assertThat(schemaIdOffset(magic)).isEqualTo(29);
+        assertThat(attributeOffset(magic)).isEqualTo(31);
+        assertThat(lastOffsetDeltaOffset(magic)).isEqualTo(32);
+        assertThat(writeClientIdOffset(magic)).isEqualTo(36);
+        assertThat(batchSequenceOffset(magic)).isEqualTo(44);
+        assertThat(recordsCountOffset(magic)).isEqualTo(48);
+        assertThat(stateChangeLogsLengthOffset(magic)).isEqualTo(52);
+        assertThat(stateChangeLogsDataOffset(magic)).isEqualTo(56);
+        assertThat(recordBatchHeaderSize(magic))
+                .isEqualTo(56); // Base header size up to extend properties length
+
+        // Test unsupported method for V3
+        assertThatThrownBy(() -> arrowChangeTypeOffset(magic))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(
+                        "arrowChangeTypeOffset for V3 requires extend properties length");
     }
 }

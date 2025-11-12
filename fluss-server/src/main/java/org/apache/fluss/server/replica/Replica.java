@@ -20,8 +20,10 @@ package org.apache.fluss.server.replica;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.IndexReplicateBackPressureException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.InvalidUpdateVersionException;
@@ -31,6 +33,8 @@ import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -47,7 +51,11 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
+import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.index.IndexApplier;
+import org.apache.fluss.server.index.IndexCache;
+import org.apache.fluss.server.index.IndexSegment;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
@@ -73,7 +81,7 @@ import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
-import org.apache.fluss.server.metadata.ServerMetadataCache;
+import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -149,11 +157,13 @@ public final class Replica {
     private final LogManager logManager;
     private final LogTablet logTablet;
     private final long replicaMaxLagTime;
+    private final long indexCommitHorizonMaxLagOffset;
     /** A closeable registry to register all registered {@link Closeable}s. */
     private final CloseableRegistry closeableRegistry;
 
     private final int minInSyncReplicas;
-    private final ServerMetadataCache metadataCache;
+    private final TabletServerMetadataCache metadataCache;
+    private final Configuration conf;
     private final FatalErrorHandler fatalErrorHandler;
     private final BucketMetricGroup bucketMetricGroup;
 
@@ -166,12 +176,17 @@ public final class Replica {
     private final DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager;
     /** The manger to manger the isr expand and shrink. */
     private final AdjustIsrManager adjustIsrManager;
+    /** Unified index cache memory pool shared by all index components. */
+    private final MemorySegmentPool indexCacheMemoryPool;
 
     private final Schema schema;
     private final TableConfig tableConfig;
     // logFormat and arrowCompressionInfo are used in hot-path, so cache them here.
     private final LogFormat logFormat;
     private final ArrowCompressionInfo arrowCompressionInfo;
+    // Cache table type information to avoid repeated computation
+    private final boolean isTableWithIndexes;
+    private final boolean isIndexTable;
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
     private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
@@ -196,6 +211,12 @@ public final class Replica {
     private volatile @Nullable CloseableRegistry closeableRegistryForKv;
     private @Nullable PeriodicSnapshotManager kvSnapshotManager;
 
+    // null if no indexes or haven't become leader (IndexCache for data tables with indexes)
+    // or index table not become leader (IndexApplier for index tables)
+    private volatile @Nullable IndexCache indexCache;
+    private volatile @Nullable IndexApplier indexApplier;
+    private volatile @Nullable CloseableRegistry closeableRegistryForIndexComponent;
+
     // ------- metrics
     private Counter isrShrinks;
     private Counter isrExpands;
@@ -209,6 +230,7 @@ public final class Replica {
             LogManager logManager,
             @Nullable KvManager kvManager,
             long replicaMaxLagTime,
+            long indexCommitHorizonMaxLagOffset,
             int minInSyncReplicas,
             int localTabletServerId,
             OffsetCheckpointFile.LazyOffsetCheckpoints lazyHighWatermarkCheckpoint,
@@ -216,18 +238,23 @@ public final class Replica {
             DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager,
             AdjustIsrManager adjustIsrManager,
             SnapshotContext snapshotContext,
-            ServerMetadataCache metadataCache,
+            TabletServerMetadataCache metadataCache,
             FatalErrorHandler fatalErrorHandler,
             BucketMetricGroup bucketMetricGroup,
             TableInfo tableInfo,
-            Clock clock)
+            Clock clock,
+            @Nullable RemoteLogManager remoteLogManager,
+            MemorySegmentPool indexCacheMemoryPool,
+            Configuration conf)
             throws Exception {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logManager = logManager;
         this.kvManager = kvManager;
         this.metadataCache = metadataCache;
+        this.conf = conf;
         this.replicaMaxLagTime = replicaMaxLagTime;
+        this.indexCommitHorizonMaxLagOffset = indexCommitHorizonMaxLagOffset;
         this.minInSyncReplicas = minInSyncReplicas;
         this.localTabletServerId = localTabletServerId;
         this.delayedWriteManager = delayedWriteManager;
@@ -235,16 +262,23 @@ public final class Replica {
         this.adjustIsrManager = adjustIsrManager;
         this.fatalErrorHandler = fatalErrorHandler;
         this.bucketMetricGroup = bucketMetricGroup;
+        this.indexCacheMemoryPool = indexCacheMemoryPool;
         this.schema = tableInfo.getSchema();
         this.tableConfig = tableInfo.getTableConfig();
         this.logFormat = tableConfig.getLogFormat();
         this.arrowCompressionInfo = tableConfig.getArrowCompressionInfo();
+
+        // Initialize table type flags once to avoid repeated computation
+        this.isIndexTable =
+                IndexTableUtils.isIndexTable(physicalPath.getTablePath().getTableName());
+        this.isTableWithIndexes = !isIndexTable && !schema.getIndexes().isEmpty();
         this.snapshotContext = snapshotContext;
         // create a closeable registry for the replica
         this.closeableRegistry = new CloseableRegistry();
 
         this.logTablet = createLog(lazyHighWatermarkCheckpoint);
         this.clock = clock;
+
         registerMetrics();
     }
 
@@ -542,13 +576,71 @@ public final class Replica {
             registerLakeTieringMetrics();
         }
 
+        // Create index components first for proper lifecycle management
+        if (isTableWithIndexes || isIndexTable) {
+            resetIndexComponent();
+        }
+        if (isTableWithIndexes) {
+            try {
+                // Create IndexCache for data table with indexes BEFORE KvTablet
+                createIndexCache();
+                LOG.info(
+                        "IndexCache created successfully for data bucket {} with {} indexes",
+                        tableBucket,
+                        schema.getIndexes().size());
+            } catch (Exception e) {
+                LOG.error("Failed to create IndexCache for bucket {}", tableBucket, e);
+                resetIndexComponent();
+                throw new RuntimeException(
+                        "Failed to create IndexCache for bucket " + tableBucket, e);
+            }
+        }
+
         if (isKvTable()) {
             // if it's become new leader, we must
             // first destroy the old kv tablet
             // if exist. Otherwise, it'll use still the old kv tablet which will cause data loss
             dropKv();
-            // now, we can create a new kv tablet
+            // now, we can create a new kv tablet (IndexCache is already available if needed)
             createKv();
+        }
+
+        // Create IndexApplier for index table after KvTablet is ready
+        if (isIndexTable && closeableRegistryForIndexComponent != null) {
+            try {
+                createIndexApplier();
+                if (indexApplier != null) {
+                    LOG.info("IndexApplier created successfully for index bucket {}", tableBucket);
+                }
+            } catch (Exception e) {
+                LOG.error("Failed to create IndexApplier for index bucket {}", tableBucket, e);
+                resetIndexComponent();
+                throw new RuntimeException(
+                        "Failed to create IndexApplier for bucket " + tableBucket, e);
+            }
+        }
+    }
+
+    private void resetIndexComponent() {
+        if (logTablet != null) {
+            logTablet.setIndexCache(null);
+        }
+
+        if (closeableRegistry.unregisterCloseable(closeableRegistryForIndexComponent)) {
+            IOUtils.closeQuietly(closeableRegistryForIndexComponent);
+        }
+        indexCache = null;
+        indexApplier = null;
+        closeableRegistryForIndexComponent = null;
+
+        // Then create new index components
+        try {
+            // Create closeable registry for index components
+            closeableRegistryForIndexComponent = new CloseableRegistry();
+            closeableRegistry.registerCloseable(closeableRegistryForIndexComponent);
+        } catch (IOException e) {
+            LOG.warn(
+                    "Failed to register closeable registry for index, may cause resource leak.", e);
         }
     }
 
@@ -576,11 +668,68 @@ public final class Replica {
         if (lakeTieringMetricGroup != null) {
             lakeTieringMetricGroup.close();
         }
+
+        // Drop index components when becoming follower
+        if (isTableWithIndexes || isIndexTable) {
+            LOG.info("Resetting index components for follower bucket {}", tableBucket);
+            resetIndexComponent();
+        }
     }
 
     @VisibleForTesting
     public void updateLeaderEndOffsetSnapshot() {
         logTablet.updateLeaderEndOffsetSnapshot();
+    }
+
+    /**
+     * Get the IndexApplier for this replica if available. IndexApplier is only available for index
+     * table bucket leaders.
+     *
+     * @return the IndexApplier instance or null if not available
+     */
+    public IndexApplier getIndexApplier() {
+        return indexApplier;
+    }
+
+    /**
+     * Check if this replica represents an index table.
+     *
+     * @return true if this is an index table, false otherwise
+     */
+    public boolean isIndexTable() {
+        return isIndexTable;
+    }
+
+    /**
+     * Gets the IndexCache for this replica.
+     *
+     * @return the IndexCache, or null if not available
+     */
+    @Nullable
+    public IndexCache getIndexCache() {
+        return indexCache;
+    }
+
+    public Tuple2<Integer, Optional<Map<TableBucket, IndexSegment>>> fetchIndex(
+            Map<TableBucket, FetchIndexReqInfo> indexBucketFetchInfo,
+            long minAdvanceOffset,
+            int maxBytes,
+            boolean forceFetch)
+            throws Exception {
+        checkNotNull(this.isLeader(), "Replica is not leader for bucket " + tableBucket);
+        IndexCache indexCache =
+                checkNotNull(
+                        this.indexCache, "IndexCache is not available for bucket " + tableBucket);
+        Map<TableBucket, IndexCache.IndexCacheFetchParam> indexCacheFetchParams = new HashMap<>();
+        for (Map.Entry<TableBucket, FetchIndexReqInfo> entry : indexBucketFetchInfo.entrySet()) {
+            TableBucket indexBucket = entry.getKey();
+            FetchIndexReqInfo reqInfo = entry.getValue();
+            IndexCache.IndexCacheFetchParam fetchParam =
+                    new IndexCache.IndexCacheFetchParam(
+                            reqInfo.getFetchOffset(), reqInfo.getIndexCommitOffset());
+            indexCacheFetchParams.put(indexBucket, fetchParam);
+        }
+        return indexCache.fetchIndex(indexCacheFetchParams, minAdvanceOffset, maxBytes, forceFetch);
     }
 
     private void createKv() {
@@ -614,6 +763,102 @@ public final class Replica {
         startPeriodicKvSnapshot(snapshotUsed.orElse(null));
     }
 
+    private void createIndexCache() {
+        // Create callback for index commit horizon changes
+        IndexCache.IndexCommitHorizonCallback horizonCallback =
+                (newHorizon) -> {
+                    // Trigger KV flush when index commit horizon changes
+                    LogTablet logTablet = this.logTablet;
+                    if (logTablet != null) {
+                        long currentHW = logTablet.getHighWatermark();
+                        mayFlushKv(currentHW, newHorizon);
+                    }
+
+                    // Trigger DelayedWrite operation completion check when index commit horizon
+                    // changes
+                    // This ensures that DelayedWrite operations waiting for index synchronization
+                    // can be completed as soon as the index commit horizon advances
+                    DelayedTableBucketKey delayedTableBucketKey =
+                            new DelayedTableBucketKey(tableBucket);
+                    delayedWriteManager.checkAndComplete(delayedTableBucketKey);
+                };
+
+        CloseableRegistry registry = closeableRegistryForIndexComponent;
+        checkNotNull(registry, "CloseableRegistry should not be null");
+
+        // Get data bucket's log end offset for cold data loading boundary
+        // This represents the upper boundary of data that may need to be loaded as cold data
+        long dataBucketLogEndOffset = (logTablet != null) ? logTablet.localLogEndOffset() : 0L;
+
+        indexCache =
+                new IndexCache(
+                        logTablet,
+                        indexCacheMemoryPool,
+                        schema,
+                        physicalPath,
+                        metadataCache,
+                        horizonCallback,
+                        dataBucketLogEndOffset,
+                        conf);
+
+        try {
+            registry.registerCloseable(indexCache);
+        } catch (IOException e) {
+            LOG.warn("Failed to register IndexCache", e);
+        }
+
+        // Set IndexCache in LogTablet for visibility control
+        if (logTablet != null) {
+            logTablet.setIndexCache(indexCache);
+            LOG.info(
+                    "IndexCache registered with LogTablet for visibility control: {}, dataBucketLogEndOffset: {}",
+                    tableBucket,
+                    dataBucketLogEndOffset);
+        }
+    }
+
+    // Hot data indexing logic has been moved to KvTablet for better code organization
+    // and to leverage existing KV processing logic for IndexedRow generation
+
+    private void createIndexApplier() {
+        Optional<TableInfo> dataTable =
+                metadataCache.getMainTableForIndex(physicalPath.getTablePath());
+        if (!dataTable.isPresent()) {
+            LOG.warn(
+                    "No data table info found for index table {}, skipping IndexApplier creation",
+                    tableBucket);
+            return;
+        }
+
+        if (kvTablet == null) {
+            LOG.warn(
+                    "KV tablet not available for index table {}, skipping IndexApplier creation",
+                    tableBucket);
+            return;
+        }
+        CloseableRegistry registry = closeableRegistryForIndexComponent;
+        checkNotNull(registry, "CloseableRegistry should not be null");
+
+        // This replica is for index table
+        indexApplier =
+                new IndexApplier(
+                        kvTablet,
+                        logTablet,
+                        schema,
+                        bucketMetricGroup.getTableMetricGroup().getServerMetricGroup());
+
+        try {
+            registry.registerCloseable(indexApplier);
+        } catch (IOException e) {
+            LOG.warn("Failed to register IndexApplier", e);
+        }
+
+        LOG.debug(
+                "IndexApplier created for index bucket {} with data table {}",
+                tableBucket,
+                dataTable.get().getTablePath());
+    }
+
     private void dropKv() {
         // close any closeable registry for kv
         if (closeableRegistry.unregisterCloseable(closeableRegistryForKv)) {
@@ -627,10 +872,31 @@ public final class Replica {
         }
     }
 
-    private void mayFlushKv(long newHighWatermark) {
+    private void mayFlushKv(long highWatermark, long indexCommitHorizon) {
         KvTablet kvTablet = this.kvTablet;
         if (kvTablet != null) {
-            kvTablet.flush(newHighWatermark, fatalErrorHandler);
+            long flushUpTo;
+
+            // For tables with indexes, use combined visibility control
+            IndexCache indexCache = this.indexCache;
+            if (indexCache != null) {
+                // Use minimum of HW and indexCommitHorizon for visibility control
+                flushUpTo = Math.min(highWatermark, indexCommitHorizon);
+
+                if (flushUpTo < highWatermark) {
+                    LOG.trace(
+                            "KV flush limited by index commit horizon: HW={}, indexHorizon={}, effective={}, bucket={}",
+                            highWatermark,
+                            indexCommitHorizon,
+                            flushUpTo,
+                            tableBucket);
+                }
+            } else {
+                // For tables without indexes, only use HW
+                flushUpTo = highWatermark;
+            }
+
+            kvTablet.flush(flushUpTo, fatalErrorHandler);
         }
     }
 
@@ -675,7 +941,9 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet = kvManager.loadKv(tabletDir);
+                // Calculate TTL for index table from main table descriptor
+                long ttlMillis = calculateTTLForCurrentTable();
+                kvTablet = kvManager.loadKv(tabletDir, indexCache, ttlMillis);
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
@@ -686,6 +954,8 @@ public final class Replica {
                         physicalPath);
                 // actually, kv manager always create a kv tablet since we will drop the kv
                 // if it exists before init kv tablet
+                // Calculate TTL for index table from main table descriptor
+                long ttlMillis = calculateTTLForCurrentTable();
                 kvTablet =
                         kvManager.getOrCreateKv(
                                 physicalPath,
@@ -694,7 +964,9 @@ public final class Replica {
                                 tableConfig.getKvFormat(),
                                 schema,
                                 tableConfig,
-                                arrowCompressionInfo);
+                                arrowCompressionInfo,
+                                indexCache,
+                                ttlMillis);
             }
 
             logTablet.updateMinRetainOffset(restoreStartOffset);
@@ -937,6 +1209,7 @@ public final class Replica {
                     }
 
                     validateInSyncReplicaSize(requiredAcks);
+                    validateIndexReplicateLag();
                     KvTablet kv = this.kvTablet;
                     checkNotNull(
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
@@ -949,6 +1222,9 @@ public final class Replica {
                         throw new KvStorageException(
                                 "Error while putting records to " + tableBucket, e);
                     }
+
+                    // Hot data indexing is now handled directly in KvTablet.putAsLeader()
+
                     // we may need to increment high watermark.
                     maybeIncrementLeaderHW(logTablet, clock.milliseconds());
                     return logAppendInfo;
@@ -1040,7 +1316,9 @@ public final class Replica {
         // and then update highWatermark.
         // TODO The flushKV and updateHighWatermark need to be atomic operation. See
         // https://github.com/apache/fluss/issues/513
-        mayFlushKv(newHighWatermark.getMessageOffset());
+        mayFlushKv(
+                newHighWatermark.getMessageOffset(),
+                this.indexCache != null ? this.indexCache.getIndexCommitHorizon() : Long.MAX_VALUE);
 
         Optional<LogOffsetMetadata> oldWatermark =
                 leaderLog.maybeIncrementHighWatermark(newHighWatermark);
@@ -1050,6 +1328,24 @@ public final class Replica {
                     oldWatermark.get(),
                     newHighWatermark,
                     tableBucket);
+
+            // For index tables, notify IndexApplier when high watermark is actually incremented
+            IndexApplier indexApplier = this.indexApplier;
+            if (indexApplier != null && isIndexTable) {
+                try {
+                    indexApplier.onUpdateHighWatermark(newHighWatermark.getMessageOffset());
+                    LOG.debug(
+                            "IndexApplier notified of high watermark update to {} for index bucket {}",
+                            newHighWatermark.getMessageOffset(),
+                            tableBucket);
+                } catch (Exception e) {
+                    LOG.error(
+                            "Failed to notify IndexApplier of high watermark update for index bucket {}",
+                            tableBucket,
+                            e);
+                }
+            }
+
             return true;
         } else {
             return false;
@@ -1297,8 +1593,8 @@ public final class Replica {
             if (LOG.isTraceEnabled()) {
                 traceAckInfo(curMaximalIsr, requiredOffset);
             }
-
-            if (logTablet.getHighWatermark() >= requiredOffset) {
+            if (logTablet.getHighWatermark() >= requiredOffset
+                    && mayCheckIndexReplicaReachOffset(requiredOffset)) {
                 if (minInSyncReplicas <= curMaximalIsr.size()) {
                     return Tuple2.of(true, Errors.NONE);
                 } else {
@@ -1310,6 +1606,35 @@ public final class Replica {
         } else {
             return Tuple2.of(false, Errors.NOT_LEADER_OR_FOLLOWER);
         }
+    }
+
+    private boolean mayCheckIndexReplicaReachOffset(long requiredOffset) {
+        // For data tables with indexes, check IndexCache's commit horizon
+        if (isTableWithIndexes) {
+            IndexCache indexCache = this.indexCache;
+            if (indexCache != null) {
+                long indexCommitHorizon = indexCache.getIndexCommitHorizon();
+                boolean satisfied = indexCommitHorizon >= requiredOffset;
+                if (!satisfied) {
+                    LOG.debug(
+                            "Index commit horizon {} has not reached required offset {} for bucket {}, "
+                                    + "DelayedWrite waiting for index synchronization",
+                            indexCommitHorizon,
+                            requiredOffset,
+                            tableBucket);
+                }
+                return satisfied;
+            } else {
+                // If IndexCache is not available, we cannot guarantee index synchronization
+                LOG.warn(
+                        "IndexCache not available for bucket {}, index synchronization check skipped",
+                        tableBucket);
+                return true;
+            }
+        }
+
+        // For tables without indexes, always allow
+        return true;
     }
 
     public long getOffset(RemoteLogManager remoteLogManager, ListOffsetsParam listOffsetsParam)
@@ -1505,6 +1830,7 @@ public final class Replica {
                                         LOG.info(
                                                 "Shrink ISR From {} to {} for bucket {}. Leader: (high watermark: {}, "
                                                         + "end offset: {}, out of sync replicas: {})",
+                                                tableBucket,
                                                 currentIstState.isr(),
                                                 newIsr,
                                                 tableBucket,
@@ -1664,7 +1990,8 @@ public final class Replica {
             isrState = new IsrState.CommittedIsrState(leaderAndIsr.isr());
             bucketEpoch = leaderAndIsr.bucketEpoch();
             LOG.info(
-                    "ISR updated to {} and bucket epoch updated to {} for bucket {}",
+                    "[{}] ISR updated to {} and bucket epoch updated to {} for bucket {}",
+                    tableBucket,
                     isrState.isr(),
                     bucketEpoch,
                     tableBucket);
@@ -1830,6 +2157,35 @@ public final class Replica {
         }
     }
 
+    private void validateIndexReplicateLag() {
+        if (!this.isTableWithIndexes || !this.isLeader()) {
+            return;
+        }
+        IndexCache indexCache = this.indexCache;
+        if (indexCache == null) {
+            return;
+        }
+        long commitHorizon = indexCache.getIndexCommitHorizon();
+        long currentLogEndOffset = logTablet.localLogEndOffset();
+        if (currentLogEndOffset - commitHorizon > indexCommitHorizonMaxLagOffset) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Index backpressure triggered for bucket {}: horizon={}, endOffset={}, threshold={}",
+                        tableBucket,
+                        commitHorizon,
+                        currentLogEndOffset,
+                        indexCommitHorizonMaxLagOffset);
+            }
+            throw new IndexReplicateBackPressureException(
+                    String.format(
+                            "Index commit horizon %d is more than %d offset from the leader end offset %d for bucket %s",
+                            commitHorizon,
+                            indexCommitHorizonMaxLagOffset,
+                            currentLogEndOffset,
+                            tableBucket));
+        }
+    }
+
     public boolean isUnderReplicated() {
         // is leader and isr size less than numReplicas
         return isLeader() && isrState.isr().size() < tableConfig.getReplicationFactor();
@@ -1936,5 +2292,39 @@ public final class Replica {
     @VisibleForTesting
     public List<Integer> getIsr() {
         return isrState.isr();
+    }
+
+    /**
+     * Calculate TTL for the current table. For index tables, TTL is calculated based on the main
+     * table's auto-partition retention configuration. For normal tables, returns -1 (no TTL).
+     *
+     * @return TTL in milliseconds, or -1 if TTL is not applicable
+     */
+    private long calculateTTLForCurrentTable() {
+        // Only index tables have TTL based on main table's retention
+        if (!isIndexTable) {
+            return -1;
+        }
+
+        // Get main table info from metadata cache
+        Optional<TableInfo> mainTableInfo =
+                metadataCache.getMainTableForIndex(physicalPath.getTablePath());
+        if (!mainTableInfo.isPresent()) {
+            LOG.warn(
+                    "No main table info found for index table {}, TTL will not be enabled",
+                    physicalPath.getTablePath());
+            return -1;
+        }
+
+        // Calculate TTL from main table's properties
+        long ttlMillis =
+                IndexTableUtils.calculateIndexTableTTL(mainTableInfo.get().getProperties());
+        if (ttlMillis > 0) {
+            LOG.info(
+                    "Calculated TTL for index table {}: {} ms",
+                    physicalPath.getTablePath(),
+                    ttlMillis);
+        }
+        return ttlMillis;
     }
 }
