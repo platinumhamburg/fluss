@@ -24,6 +24,8 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.ReadableConfig;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.clock.SystemClock;
 
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.BloomFilter;
@@ -31,6 +33,7 @@ import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.CompactionStyle;
 import org.rocksdb.CompressionType;
 import org.rocksdb.DBOptions;
+import org.rocksdb.FlinkCompactionFilter;
 import org.rocksdb.InfoLogLevel;
 import org.rocksdb.PlainTableConfig;
 import org.rocksdb.ReadOptions;
@@ -73,22 +76,51 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
     private final boolean enableStatistics;
 
+    /** TTL in milliseconds for index table (-1 means no TTL). */
+    private final long ttlMillis;
+
+    /** Clock for time-related operations. */
+    private final Clock clock;
+
     /** The handles to be closed when the container is closed. */
     private final ArrayList<AutoCloseable> handlesToClose;
 
     @VisibleForTesting
     RocksDBResourceContainer() {
-        this(new Configuration(), null, false);
+        this(new Configuration(), null, false, false, -1);
     }
 
     public RocksDBResourceContainer(ReadableConfig configuration, @Nullable File instanceBasePath) {
-        this(configuration, instanceBasePath, false);
+        this(configuration, instanceBasePath, false, false, -1);
     }
 
     public RocksDBResourceContainer(
             ReadableConfig configuration,
             @Nullable File instanceBasePath,
             boolean enableStatistics) {
+        this(configuration, instanceBasePath, enableStatistics, false, -1);
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            boolean isIndexTable,
+            long ttlMillis) {
+        this(
+                configuration,
+                instanceBasePath,
+                enableStatistics,
+                ttlMillis,
+                SystemClock.getInstance());
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            long ttlMillis,
+            Clock clock) {
         this.configuration = configuration;
 
         this.instanceRocksDBPath =
@@ -96,6 +128,8 @@ public class RocksDBResourceContainer implements AutoCloseable {
                         ? RocksDBKvBuilder.getInstanceRocksDBPath(instanceBasePath)
                         : null;
         this.enableStatistics = enableStatistics;
+        this.ttlMillis = ttlMillis;
+        this.clock = clock;
 
         this.handlesToClose = new ArrayList<>();
     }
@@ -134,6 +168,29 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
         // load configurable options on top of pre-defined profile
         setColumnFamilyOptionsFromConfigurableOptions(opt, handlesToClose);
+
+        // Configure CompactionFilter for index table TTL if applicable
+        if (ttlMillis > 0) {
+            // TimeProvider provides current timestamp for expiration checks
+            // Use Clock.milliseconds() which is test-friendly and high-performance
+            FlinkCompactionFilter.TimeProvider timeProvider = clock::milliseconds;
+            FlinkCompactionFilter.FlinkCompactionFilterFactory filterFactory =
+                    new FlinkCompactionFilter.FlinkCompactionFilterFactory(timeProvider);
+
+            // Configure for value state with timestamp at offset 0
+            // Value format: [timestamp(8)][schemaId(2)][row bytes]
+            FlinkCompactionFilter.Config config =
+                    FlinkCompactionFilter.Config.createForValue(
+                            ttlMillis, // TTL in milliseconds
+                            100 // queryTimeAfterNumEntries - balance between accuracy and
+                            // performance
+                            );
+            filterFactory.configure(config);
+            opt.setCompactionFilterFactory(filterFactory);
+            handlesToClose.add(filterFactory);
+
+            LOG.info("Configured CompactionFilter for index table with TTL: {} ms", ttlMillis);
+        }
 
         return opt;
     }
