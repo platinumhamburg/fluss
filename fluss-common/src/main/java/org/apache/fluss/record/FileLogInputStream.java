@@ -27,13 +27,16 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Objects;
+import java.util.Optional;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
+import static org.apache.fluss.record.LogRecordBatchFormat.stateChangeLogsLengthOffset;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
@@ -167,6 +170,53 @@ public class FileLogInputStream
         @Override
         public CloseableIterator<LogRecord> records(ReadContext context) {
             return loadFullBatch().records(context);
+        }
+
+        @Override
+        public Optional<StateChangeLogs> stateChangeLogs() {
+            if (magic != LOG_MAGIC_VALUE_V3) {
+                return Optional.empty();
+            }
+
+            // Load only the header to read stateChangeLogsLength
+            LogRecordBatch header = loadBatchHeader();
+            int stateChangeLogsLength = getStateChangeLogsLength(header);
+            if (stateChangeLogsLength == 0) {
+                return Optional.empty();
+            }
+
+            // Zero-copy: read only the state change logs portion
+            int headerSize = headerSize();
+            int stateChangeLogsPosition = position + headerSize;
+            ByteBuffer buffer =
+                    loadByteBufferWithSize(
+                            stateChangeLogsLength, stateChangeLogsPosition, "state change logs");
+
+            // Create DefaultStateChangeLogs with zero-copy
+            DefaultStateChangeLogs logs = new DefaultStateChangeLogs();
+            logs.pointTo(MemorySegment.wrap(buffer.array()), 0, stateChangeLogsLength);
+            return Optional.of(logs);
+        }
+
+        private int getStateChangeLogsLength(LogRecordBatch header) {
+            if (header instanceof DefaultLogRecordBatch) {
+                return ((DefaultLogRecordBatch) header).getStateChangLogsLength();
+            }
+            // Fallback: read directly from file
+            ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
+            lengthBuffer.order(ByteOrder.LITTLE_ENDIAN);
+            try {
+                FileUtils.readFullyOrFail(
+                        fileRecords.channel(),
+                        lengthBuffer,
+                        position + stateChangeLogsLengthOffset(magic),
+                        "state change logs length");
+                lengthBuffer.rewind();
+                return lengthBuffer.getInt();
+            } catch (IOException e) {
+                throw new FlussRuntimeException(
+                        "Failed to read state change logs length at position " + position, e);
+            }
         }
 
         @Override

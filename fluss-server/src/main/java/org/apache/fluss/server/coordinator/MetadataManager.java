@@ -278,8 +278,30 @@ public class MetadataManager {
             @Nullable TableAssignment tableAssignment,
             boolean ignoreIfExists)
             throws TableAlreadyExistException, DatabaseNotExistException {
+        return createTable(tablePath, tableToCreate, tableAssignment, ignoreIfExists, false);
+    }
+
+    /**
+     * Creates the necessary metadata of the given table in zookeeper and return the table id.
+     * Returns -1 if the table already exists and ignoreIfExists is true.
+     *
+     * @param tablePath the table path
+     * @param tableToCreate the table descriptor describing the table to create
+     * @param tableAssignment the table assignment, will be null when the table is partitioned table
+     * @param ignoreIfExists whether to ignore if the table already exists
+     * @param isIndexTable whether this is an index table (index tables are allowed to use __offset
+     *     system column)
+     * @return the table id
+     */
+    public long createTable(
+            TablePath tablePath,
+            TableDescriptor tableToCreate,
+            @Nullable TableAssignment tableAssignment,
+            boolean ignoreIfExists,
+            boolean isIndexTable)
+            throws TableAlreadyExistException, DatabaseNotExistException {
         // validate table properties before creating table
-        validateTableDescriptor(tableToCreate, maxBucketNum);
+        validateTableDescriptor(tableToCreate, maxBucketNum, isIndexTable);
 
         if (!databaseExists(tablePath.getDatabaseName())) {
             throw new DatabaseNotExistException(
