@@ -194,4 +194,40 @@ public class ServerMetadataSnapshot {
                             .containsKey(tableBucket.getBucket());
         }
     }
+
+    /**
+     * Efficiently retrieve only the leader ID for a given table bucket without constructing
+     * BucketMetadata objects. This method is optimized for high-frequency leader queries.
+     *
+     * @param tableBucket the table bucket to query
+     * @return Optional containing the leader ID if found (may be -1 if no leader elected),
+     *     Optional.empty() if bucket metadata not found in snapshot
+     */
+    public Optional<Integer> getBucketLeaderId(TableBucket tableBucket) {
+        BucketMetadata bucketMetadata;
+        if (tableBucket.getPartitionId() == null) {
+            // Non-partitioned table
+            Map<Integer, BucketMetadata> bucketMap =
+                    bucketMetadataMapForTables.get(tableBucket.getTableId());
+            if (bucketMap == null) {
+                return Optional.empty();
+            }
+            bucketMetadata = bucketMap.get(tableBucket.getBucket());
+        } else {
+            // Partitioned table
+            Map<Integer, BucketMetadata> bucketMap =
+                    bucketMetadataMapForPartitions.get(tableBucket.getPartitionId());
+            if (bucketMap == null) {
+                return Optional.empty();
+            }
+            bucketMetadata = bucketMap.get(tableBucket.getBucket());
+        }
+
+        if (bucketMetadata == null) {
+            return Optional.empty();
+        }
+
+        // Return leader ID if present, otherwise return -1 to indicate no leader elected
+        return Optional.of(bucketMetadata.getLeaderId().orElse(-1));
+    }
 }

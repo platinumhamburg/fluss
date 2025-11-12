@@ -17,10 +17,21 @@
 
 package org.apache.fluss.utils;
 
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.types.CharType;
+import org.apache.fluss.types.DataType;
+import org.apache.fluss.types.DecimalType;
+import org.apache.fluss.types.LocalZonedTimestampType;
+import org.apache.fluss.types.RowType;
+import org.apache.fluss.types.TimestampType;
+
 import java.util.Arrays;
 
 /** Utility class to convert objects into strings in vice-versa. */
 public class StringUtils {
+
+    public static final String EMPTY_STRING = "";
+
     /**
      * Checks if the string is null, empty, or contains only whitespace characters. A whitespace
      * character is defined via {@link Character#isWhitespace(char)}.
@@ -51,5 +62,104 @@ public class StringUtils {
     public static String arrayAwareToString(Object o) {
         final String arrayString = Arrays.deepToString(new Object[] {o});
         return arrayString.substring(1, arrayString.length() - 1);
+    }
+
+    public static String internalRowDebugString(RowType rowType, InternalRow row) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Row[");
+        for (int i = 0; i < rowType.getFieldCount(); i++) {
+            if (i != 0) {
+                sb.append(", ");
+            }
+            String valueString;
+            if (row.isNullAt(i)) {
+                valueString = "null";
+            } else {
+                DataType type = rowType.getTypeAt(i);
+                switch (type.getTypeRoot()) {
+                    case CHAR:
+                        CharType charType = (CharType) rowType.getTypeAt(i);
+                        valueString = "'" + row.getChar(i, charType.getLength()) + "'";
+                        break;
+                    case STRING:
+                        valueString = "'" + row.getString(i).toString() + "'";
+                        break;
+                    case BOOLEAN:
+                        valueString = String.valueOf(row.getBoolean(i));
+                        break;
+                    case BINARY:
+                        int binaryLength =
+                                ((org.apache.fluss.types.BinaryType) rowType.getTypeAt(i))
+                                        .getLength();
+                        valueString = "@binary[" + row.getBinary(i, binaryLength).length + "]";
+                        break;
+                    case BYTES:
+                        valueString = "@bytes[" + row.getBytes(i).length + "]";
+                        break;
+                    case DECIMAL:
+                        DecimalType decimalType = (DecimalType) rowType.getTypeAt(i);
+                        valueString =
+                                row.getDecimal(
+                                                i,
+                                                decimalType.getPrecision(),
+                                                decimalType.getScale())
+                                        .toString();
+                        break;
+                    case TINYINT:
+                        valueString = String.valueOf(row.getByte(i));
+                        break;
+                    case SMALLINT:
+                        valueString = String.valueOf(row.getShort(i));
+                        break;
+                    case INTEGER:
+                        valueString = String.valueOf(row.getInt(i));
+                        break;
+                    case BIGINT:
+                        valueString = String.valueOf(row.getLong(i));
+                        break;
+                    case FLOAT:
+                        valueString = String.valueOf(row.getFloat(i));
+                        break;
+                    case DOUBLE:
+                        valueString = String.valueOf(row.getDouble(i));
+                        break;
+                    case DATE:
+                        valueString = String.valueOf(row.getInt(i));
+                        break;
+                    case TIME_WITHOUT_TIME_ZONE:
+                        valueString = String.valueOf(row.getInt(i));
+                        break;
+                    case TIMESTAMP_WITHOUT_TIME_ZONE:
+                        TimestampType timestampType = (TimestampType) rowType.getTypeAt(i);
+                        valueString =
+                                String.valueOf(
+                                        row.getTimestampNtz(i, timestampType.getPrecision()));
+                        break;
+                    case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                        LocalZonedTimestampType localZonedTimestampType =
+                                (LocalZonedTimestampType) rowType.getTypeAt(i);
+                        valueString =
+                                String.valueOf(
+                                        row.getTimestampLtz(
+                                                i, localZonedTimestampType.getPrecision()));
+                        break;
+                    case ARRAY:
+                        valueString = "@array";
+                        break;
+                    case MAP:
+                        valueString = "@map";
+                        break;
+                    case ROW:
+                        valueString = "@row";
+                        break;
+                    default:
+                        valueString = "@unknown_type";
+                        break;
+                }
+            }
+            sb.append(rowType.getFieldNames().get(i)).append(": ").append(valueString);
+        }
+        sb.append("]");
+        return sb.toString();
     }
 }
