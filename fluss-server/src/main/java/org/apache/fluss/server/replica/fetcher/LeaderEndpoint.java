@@ -17,8 +17,11 @@
 
 package org.apache.fluss.server.replica.fetcher;
 
+import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
+import org.apache.fluss.rpc.messages.FetchIndexResponse;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 
 import java.util.Map;
@@ -26,7 +29,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /** Defines the interface to be used to access a tablet server that is a leader. */
-interface LeaderEndpoint {
+public interface LeaderEndpoint {
 
     /** The tablet server id we want to connect to. */
     int leaderServerId();
@@ -47,6 +50,15 @@ interface LeaderEndpoint {
      * @return fetchData.
      */
     CompletableFuture<FetchData> fetchLog(FetchLogContext fetchLogContext);
+
+    /**
+     * Given a fetchIndexContext, carries out the expected request and returns the results from
+     * fetching from the leader.
+     *
+     * @param fetchIndexContext The fetch index context we want to carry out.
+     * @return fetchIndexData.
+     */
+    CompletableFuture<FetchIndexData> fetchIndex(FetchIndexContext fetchIndexContext);
 
     /**
      * Builds a fetch request, given a bucket map.
@@ -77,6 +89,28 @@ interface LeaderEndpoint {
 
         public Map<TableBucket, FetchLogResultForBucket> getFetchLogResultMap() {
             return fetchLogResultMap;
+        }
+    }
+
+    /** Fetch data returned by fetchIndex method. */
+    final class FetchIndexData {
+        private final FetchIndexResponse fetchIndexResponse;
+        private final Map<DataIndexTableBucket, FetchIndexLogResultForBucket>
+                fetchIndexLogResultMap;
+
+        public FetchIndexData(
+                FetchIndexResponse fetchIndexResponse,
+                Map<DataIndexTableBucket, FetchIndexLogResultForBucket> fetchIndexLogResultMap) {
+            this.fetchIndexResponse = fetchIndexResponse;
+            this.fetchIndexLogResultMap = fetchIndexLogResultMap;
+        }
+
+        public FetchIndexResponse getFetchIndexResponse() {
+            return fetchIndexResponse;
+        }
+
+        public Map<DataIndexTableBucket, FetchIndexLogResultForBucket> getFetchIndexLogResultMap() {
+            return fetchIndexLogResultMap;
         }
     }
 }

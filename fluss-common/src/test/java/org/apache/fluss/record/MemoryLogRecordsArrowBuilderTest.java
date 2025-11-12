@@ -24,6 +24,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.memory.ManagedPagedOutputView;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
@@ -48,6 +49,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
@@ -55,6 +57,7 @@ import static org.apache.fluss.compression.ArrowCompressionInfo.NO_COMPRESSION;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
@@ -107,7 +110,7 @@ public class MemoryLogRecordsArrowBuilderTest {
     }
 
     @ParameterizedTest
-    @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1})
+    @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1, LOG_MAGIC_VALUE_V3})
     void testAppend(byte recordBatchMagic) throws Exception {
         int maxSizeInBytes = 1024;
         ArrowWriter writer =
@@ -360,6 +363,10 @@ public class MemoryLogRecordsArrowBuilderTest {
         List<Arguments> params = new ArrayList<>();
         params.add(Arguments.arguments(LOG_MAGIC_VALUE_V0, 48));
         params.add(Arguments.arguments(LOG_MAGIC_VALUE_V1, 52));
+        params.add(
+                Arguments.arguments(
+                        LOG_MAGIC_VALUE_V3,
+                        56)); // V3 has additional 4 bytes for extend properties length
         return params;
     }
 
@@ -369,6 +376,18 @@ public class MemoryLogRecordsArrowBuilderTest {
             int maxPages,
             int pageSizeInBytes,
             byte recordBatchMagic)
+            throws IOException {
+        return createMemoryLogRecordsArrowBuilderWithStateChangeLogs(
+                baseOffset, writer, maxPages, pageSizeInBytes, recordBatchMagic, null);
+    }
+
+    private MemoryLogRecordsArrowBuilder createMemoryLogRecordsArrowBuilderWithStateChangeLogs(
+            int baseOffset,
+            ArrowWriter writer,
+            int maxPages,
+            int pageSizeInBytes,
+            byte recordBatchMagic,
+            StateChangeLogs stateChangeLogs)
             throws IOException {
         conf.set(
                 ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE,
@@ -380,6 +399,160 @@ public class MemoryLogRecordsArrowBuilderTest {
                 recordBatchMagic,
                 DEFAULT_SCHEMA_ID,
                 writer,
-                new ManagedPagedOutputView(new TestingMemorySegmentPool(pageSizeInBytes)));
+                new ManagedPagedOutputView(new TestingMemorySegmentPool(pageSizeInBytes)),
+                stateChangeLogs);
+    }
+
+    @Test
+    void testV3FormatWithStateChangeLogs() throws Exception {
+        // Create state change logs
+        DefaultStateChangeLogsBuilder logsBuilder = new DefaultStateChangeLogsBuilder();
+        TableBucket key1 = new TableBucket(1L, 0);
+        TableBucket key2 = new TableBucket(1L, 1);
+        TableBucket key3 = new TableBucket(1L, 2);
+        logsBuilder.addLog(ChangeType.INSERT, StateDefs.DATA_BUCKET_OFFSET_OF_INDEX, key1, 100L);
+        logsBuilder.addLog(
+                ChangeType.UPDATE_AFTER, StateDefs.DATA_BUCKET_OFFSET_OF_INDEX, key2, 200L);
+        logsBuilder.addLog(ChangeType.DELETE, StateDefs.DATA_BUCKET_OFFSET_OF_INDEX, key3, null);
+        DefaultStateChangeLogs stateLogs = logsBuilder.build();
+
+        // Create batch with state change logs using V3 format
+        int maxSizeInBytes = 1024;
+        ArrowWriter writer =
+                provider.getOrCreateWriter(
+                        1L, DEFAULT_SCHEMA_ID, maxSizeInBytes, DATA1_ROW_TYPE, DEFAULT_COMPRESSION);
+        MemoryLogRecordsArrowBuilder builder =
+                createMemoryLogRecordsArrowBuilderWithStateChangeLogs(
+                        0, writer, 10, 1024, LOG_MAGIC_VALUE_V3, stateLogs);
+
+        // Append some records
+        List<Object[]> dataSet =
+                Arrays.asList(
+                        new Object[] {1, "test1"},
+                        new Object[] {2, "test2"},
+                        new Object[] {3, "test3"});
+
+        for (Object[] data : dataSet) {
+            builder.append(ChangeType.APPEND_ONLY, row(data));
+        }
+
+        builder.close();
+        MemoryLogRecords records = MemoryLogRecords.pointToBytesView(builder.build());
+
+        // Verify batch
+        Iterator<LogRecordBatch> iterator = records.batches().iterator();
+        assertThat(iterator.hasNext()).isTrue();
+        LogRecordBatch batch = iterator.next();
+
+        assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+        assertThat(batch.getRecordCount()).isEqualTo(dataSet.size());
+        batch.ensureValid();
+
+        // Verify state change logs
+        Optional<StateChangeLogs> stateChangeLogsOpt = batch.stateChangeLogs();
+        assertThat(stateChangeLogsOpt).isPresent();
+
+        StateChangeLogs retrievedLogs = stateChangeLogsOpt.get();
+        List<StateChangeLog> logs = new ArrayList<>();
+        retrievedLogs.iters().forEachRemaining(logs::add);
+
+        assertThat(logs).hasSize(3);
+        assertThat(logs.get(0).getChangeType()).isEqualTo(ChangeType.INSERT);
+        assertThat(logs.get(0).getStateDef()).isEqualTo(StateDefs.DATA_BUCKET_OFFSET_OF_INDEX);
+        assertThat(logs.get(0).getKey()).isEqualTo(key1);
+        assertThat(logs.get(0).getValue()).isEqualTo(100L);
+
+        assertThat(logs.get(1).getChangeType()).isEqualTo(ChangeType.UPDATE_AFTER);
+        assertThat(logs.get(1).getKey()).isEqualTo(key2);
+        assertThat(logs.get(1).getValue()).isEqualTo(200L);
+
+        assertThat(logs.get(2).getChangeType()).isEqualTo(ChangeType.DELETE);
+        assertThat(logs.get(2).getKey()).isEqualTo(key3);
+        assertThat(logs.get(2).getValue()).isNull();
+
+        // Verify records are intact
+        assertLogRecordsEquals(DATA1_ROW_TYPE, records, dataSet);
+    }
+
+    @ParameterizedTest
+    @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1})
+    void testNonV3FormatHasNoStateChangeLogs(byte recordBatchMagic) throws Exception {
+        // Create batch with non-V3 format
+        int maxSizeInBytes = 1024;
+        ArrowWriter writer =
+                provider.getOrCreateWriter(
+                        1L, DEFAULT_SCHEMA_ID, maxSizeInBytes, DATA1_ROW_TYPE, DEFAULT_COMPRESSION);
+        MemoryLogRecordsArrowBuilder builder =
+                createMemoryLogRecordsArrowBuilder(0, writer, 10, 1024, recordBatchMagic);
+
+        // Append some records
+        List<Object[]> dataSet =
+                Arrays.asList(
+                        new Object[] {1, "test1"},
+                        new Object[] {2, "test2"},
+                        new Object[] {3, "test3"});
+
+        for (Object[] data : dataSet) {
+            builder.append(ChangeType.APPEND_ONLY, row(data));
+        }
+
+        builder.close();
+        MemoryLogRecords records = MemoryLogRecords.pointToBytesView(builder.build());
+
+        // Verify batch
+        Iterator<LogRecordBatch> iterator = records.batches().iterator();
+        assertThat(iterator.hasNext()).isTrue();
+        LogRecordBatch batch = iterator.next();
+
+        assertThat(batch.magic()).isEqualTo(recordBatchMagic);
+        assertThat(batch.getRecordCount()).isEqualTo(dataSet.size());
+
+        // Verify no state change logs for non-V3 formats
+        Optional<StateChangeLogs> stateChangeLogsOpt = batch.stateChangeLogs();
+        assertThat(stateChangeLogsOpt).isEmpty();
+
+        // Verify records are intact
+        assertLogRecordsEquals(DATA1_ROW_TYPE, records, dataSet);
+    }
+
+    @Test
+    void testV3FormatWithEmptyStateChangeLogs() throws Exception {
+        // Create batch with V3 format but no state change logs
+        int maxSizeInBytes = 1024;
+        ArrowWriter writer =
+                provider.getOrCreateWriter(
+                        1L, DEFAULT_SCHEMA_ID, maxSizeInBytes, DATA1_ROW_TYPE, DEFAULT_COMPRESSION);
+        MemoryLogRecordsArrowBuilder builder =
+                createMemoryLogRecordsArrowBuilderWithStateChangeLogs(
+                        0, writer, 10, 1024, LOG_MAGIC_VALUE_V3, null);
+
+        // Append some records
+        List<Object[]> dataSet =
+                Arrays.asList(
+                        new Object[] {1, "test1"},
+                        new Object[] {2, "test2"},
+                        new Object[] {3, "test3"});
+
+        for (Object[] data : dataSet) {
+            builder.append(ChangeType.APPEND_ONLY, row(data));
+        }
+
+        builder.close();
+        MemoryLogRecords records = MemoryLogRecords.pointToBytesView(builder.build());
+
+        // Verify batch
+        Iterator<LogRecordBatch> iterator = records.batches().iterator();
+        assertThat(iterator.hasNext()).isTrue();
+        LogRecordBatch batch = iterator.next();
+
+        assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+        assertThat(batch.getRecordCount()).isEqualTo(dataSet.size());
+
+        // Verify no state change logs when null is provided
+        Optional<StateChangeLogs> stateChangeLogsOpt = batch.stateChangeLogs();
+        assertThat(stateChangeLogsOpt).isEmpty();
+
+        // Verify records are intact
+        assertLogRecordsEquals(DATA1_ROW_TYPE, records, dataSet);
     }
 }

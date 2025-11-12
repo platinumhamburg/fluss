@@ -119,6 +119,14 @@ public final class TableDescriptor implements Serializable {
                                             f));
         }
 
+        // validate indexes: indexes are only supported for primary key tables
+        if (!schema.getIndexes().isEmpty()) {
+            checkArgument(
+                    schema.getPrimaryKey().isPresent(),
+                    "Global secondary indexes are only supported for primary key tables. Found %d indexes but no primary key.",
+                    schema.getIndexes().size());
+        }
+
         checkArgument(
                 properties.entrySet().stream()
                         .allMatch(e -> e.getKey() != null && e.getValue() != null),
