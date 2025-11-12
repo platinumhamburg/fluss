@@ -54,6 +54,7 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter delayedWriteExpireCount;
     private final Counter delayedFetchFromFollowerExpireCount;
     private final Counter delayedFetchFromClientExpireCount;
+    private final Counter delayedIndexFetchFromFollowerExpireCount;
 
     // aggregated metrics
     private final Counter messagesIn;
@@ -74,6 +75,17 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter isrShrinks;
     private final Counter isrExpands;
     private final Counter failedIsrUpdates;
+
+    // Index-related metrics
+    private final Counter indexFetchRequests;
+    private final Counter indexFetchErrors;
+    private final DescriptiveStatisticsHistogram indexFetchLatencyHistogram;
+    private final DescriptiveStatisticsHistogram indexFetchBucketsPerRequestHistogram;
+    private final Counter indexFetchEarlyFire;
+    private final Counter indexApplyRequests;
+    private final Counter indexApplyErrors;
+    private final DescriptiveStatisticsHistogram indexApplyLatencyHistogram;
+    private final DescriptiveStatisticsHistogram indexApplyBatchSizeHistogram;
 
     public TabletServerMetricGroup(
             MetricRegistry registry, String clusterId, String rack, String hostname, int serverId) {
@@ -98,6 +110,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(
                 MetricNames.DELAYED_FETCH_FROM_CLIENT_EXPIRES_RATE,
                 new MeterView(delayedFetchFromClientExpireCount));
+        delayedIndexFetchFromFollowerExpireCount = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.DELAYED_INDEX_FETCH_FROM_FOLLOWER_EXPIRES_RATE,
+                new MeterView(delayedIndexFetchFromFollowerExpireCount));
 
         messagesIn = new ThreadSafeSimpleCounter();
         meter(MetricNames.MESSAGES_IN_RATE, new MeterView(messagesIn));
@@ -133,6 +149,28 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(MetricNames.ISR_SHRINKS_RATE, new MeterView(isrShrinks));
         failedIsrUpdates = new SimpleCounter();
         meter(MetricNames.FAILED_ISR_UPDATES_RATE, new MeterView(failedIsrUpdates));
+
+        // Index-related metrics initialization
+        indexFetchRequests = new SimpleCounter();
+        meter(MetricNames.INDEX_FETCH_REQUESTS_RATE, new MeterView(indexFetchRequests));
+        indexFetchErrors = new SimpleCounter();
+        meter(MetricNames.INDEX_FETCH_ERRORS_RATE, new MeterView(indexFetchErrors));
+        indexFetchLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.INDEX_FETCH_LATENCY_MS, indexFetchLatencyHistogram);
+        indexFetchBucketsPerRequestHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(
+                MetricNames.INDEX_FETCH_BUCKETS_PER_REQUEST, indexFetchBucketsPerRequestHistogram);
+        indexFetchEarlyFire = new SimpleCounter();
+        meter(MetricNames.INDEX_FETCH_EARLY_FIRE_RATE, new MeterView(indexFetchEarlyFire));
+
+        indexApplyRequests = new SimpleCounter();
+        meter(MetricNames.INDEX_APPLY_REQUESTS_RATE, new MeterView(indexApplyRequests));
+        indexApplyErrors = new SimpleCounter();
+        meter(MetricNames.INDEX_APPLY_ERRORS_RATE, new MeterView(indexApplyErrors));
+        indexApplyLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.INDEX_APPLY_LATENCY_MS, indexApplyLatencyHistogram);
+        indexApplyBatchSizeHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.INDEX_APPLY_BATCH_SIZE, indexApplyBatchSizeHistogram);
     }
 
     @Override
@@ -171,6 +209,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Counter delayedFetchFromClientExpireCount() {
         return delayedFetchFromClientExpireCount;
+    }
+
+    public Counter delayedIndexFetchFromFollowerExpireCount() {
+        return delayedIndexFetchFromFollowerExpireCount;
     }
 
     public Counter messageIn() {
@@ -219,6 +261,42 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Counter failedIsrUpdates() {
         return failedIsrUpdates;
+    }
+
+    public Counter indexFetchRequests() {
+        return indexFetchRequests;
+    }
+
+    public Counter indexFetchErrors() {
+        return indexFetchErrors;
+    }
+
+    public DescriptiveStatisticsHistogram indexFetchLatencyHistogram() {
+        return indexFetchLatencyHistogram;
+    }
+
+    public DescriptiveStatisticsHistogram indexFetchBucketsPerRequestHistogram() {
+        return indexFetchBucketsPerRequestHistogram;
+    }
+
+    public Counter indexFetchEarlyFire() {
+        return indexFetchEarlyFire;
+    }
+
+    public Counter indexApplyRequests() {
+        return indexApplyRequests;
+    }
+
+    public Counter indexApplyErrors() {
+        return indexApplyErrors;
+    }
+
+    public DescriptiveStatisticsHistogram indexApplyLatencyHistogram() {
+        return indexApplyLatencyHistogram;
+    }
+
+    public DescriptiveStatisticsHistogram indexApplyBatchSizeHistogram() {
+        return indexApplyBatchSizeHistogram;
     }
 
     // ------------------------------------------------------------------------
