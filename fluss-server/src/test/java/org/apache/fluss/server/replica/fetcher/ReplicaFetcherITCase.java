@@ -40,6 +40,8 @@ import org.apache.fluss.utils.types.Tuple2;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Arrays;
@@ -76,6 +78,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** ITCase for replica fetcher. */
 public class ReplicaFetcherITCase {
+    private static final Logger LOG = LoggerFactory.getLogger(ReplicaFetcherITCase.class);
+
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
             FlussClusterExtension.builder()

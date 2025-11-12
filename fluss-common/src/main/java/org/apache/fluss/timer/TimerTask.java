@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.utils.timer;
+package org.apache.fluss.timer;
 
 import javax.annotation.concurrent.ThreadSafe;
 
