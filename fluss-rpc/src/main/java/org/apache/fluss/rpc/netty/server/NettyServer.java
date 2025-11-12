@@ -35,7 +35,10 @@ import org.apache.fluss.shaded.netty4.io.netty.channel.Channel;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelHandler;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelOption;
 import org.apache.fluss.shaded.netty4.io.netty.channel.EventLoopGroup;
+import org.apache.fluss.timer.DefaultTimer;
+import org.apache.fluss.timer.Timer;
 import org.apache.fluss.utils.concurrent.FutureUtils;
+import org.apache.fluss.utils.concurrent.ShutdownableThread;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,6 +77,8 @@ public final class NettyServer implements RpcServer {
     private final List<NetworkProtocolPlugin> protocols;
     private final List<Channel> bindChannels;
     private final List<Endpoint> bindEndpoints;
+    private final Timer slowRequestTimer;
+    private final TimerReaper timerReaper;
 
     private EventLoopGroup acceptorGroup;
     private EventLoopGroup selectorGroup;
@@ -89,7 +94,14 @@ public final class NettyServer implements RpcServer {
         this.conf = checkNotNull(conf, "conf");
         this.serverMetricGroup = checkNotNull(serverMetricGroup, "serverMetricGroup");
         this.endpoints = checkNotNull(endpoints, "endpoints");
-        this.protocols = loadProtocols(conf, service.providerType(), endpoints, requestsMetrics);
+
+        // Initialize timer for slow request monitoring
+        this.slowRequestTimer = new DefaultTimer("RpcServer-SlowRequestDetector");
+        this.timerReaper = new TimerReaper();
+
+        this.protocols =
+                loadProtocols(
+                        conf, service.providerType(), endpoints, requestsMetrics, slowRequestTimer);
 
         this.workerPool =
                 new RequestProcessorPool(
@@ -125,6 +137,9 @@ public final class NettyServer implements RpcServer {
 
         // setup worker thread pool
         workerPool.start();
+
+        // start timer reaper for slow request monitoring
+        timerReaper.start();
 
         // load protocol plugins
         Map<String, NetworkProtocolPlugin> protocols = getProtocolsByListenerName();
@@ -223,7 +238,8 @@ public final class NettyServer implements RpcServer {
             Configuration conf,
             ServerType serverType,
             Collection<Endpoint> endpoints,
-            RequestsMetrics requestsMetrics) {
+            RequestsMetrics requestsMetrics,
+            Timer slowRequestTimer) {
         List<String> listeners =
                 endpoints.stream().map(Endpoint::getListenerName).collect(Collectors.toList());
         List<NetworkProtocolPlugin> protocolPlugins = new ArrayList<>();
@@ -238,7 +254,7 @@ public final class NettyServer implements RpcServer {
         // Add the Fluss protocol plugin in the end to allow other protocol
         // pick their listener names first
         NetworkProtocolPlugin flussPlugin =
-                new FlussProtocolPlugin(serverType, listeners, requestsMetrics);
+                new FlussProtocolPlugin(serverType, listeners, requestsMetrics, slowRequestTimer);
         flussPlugin.setup(conf);
         protocolPlugins.add(flussPlugin);
         return protocolPlugins;
@@ -286,6 +302,15 @@ public final class NettyServer implements RpcServer {
 
         isRunning = false;
 
+        // Shutdown timer reaper and timer
+        try {
+            timerReaper.shutdown();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.warn("Timer reaper shutdown interrupted", e);
+        }
+        slowRequestTimer.shutdown();
+
         CompletableFuture<Void> acceptorShutdownFuture = shutdownGroup(acceptorGroup);
         CompletableFuture<Void> selectorShutdownFuture = shutdownGroup(selectorGroup);
         CompletableFuture<Void> channelShutdownFuture =
@@ -305,5 +330,23 @@ public final class NettyServer implements RpcServer {
                 selectorShutdownFuture,
                 channelShutdownFuture,
                 workerShutdownFuture);
+    }
+
+    /** A background reaper to advance slow request timer clock. */
+    private class TimerReaper extends ShutdownableThread {
+        TimerReaper() {
+            super("RpcServer-SlowRequestTimerReaper", false);
+        }
+
+        @Override
+        public void doWork() {
+            try {
+                slowRequestTimer.advanceClock(200L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // Exit the loop when interrupted
+                return;
+            }
+        }
     }
 }
