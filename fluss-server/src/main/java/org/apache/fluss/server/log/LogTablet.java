@@ -38,7 +38,10 @@ import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.StateDefs;
+import org.apache.fluss.server.index.IndexCache;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
+import org.apache.fluss.server.log.state.BucketStateManager;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.utils.FlussPaths;
@@ -97,12 +100,17 @@ public final class LogTablet {
     @GuardedBy("lock")
     private final WriterStateManager writerStateManager;
 
+    // IndexCache for index visibility control, null if no indexes exist for the table
+    private volatile IndexCache indexCache;
+
     private final Scheduler scheduler;
     private final ScheduledFuture<?> writerExpireCheck;
     private final LogFormat logFormat;
     private final int tieredLogLocalSegments;
     private final Clock clock;
     private final boolean isChangeLog;
+
+    private final BucketStateManager bucketStateManager;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -133,6 +141,7 @@ public final class LogTablet {
             Configuration conf,
             Scheduler scheduler,
             WriterStateManager writerStateManager,
+            BucketStateManager bucketStateManager,
             LogFormat logFormat,
             int tieredLogLocalSegments,
             boolean isChangelog,
@@ -144,6 +153,7 @@ public final class LogTablet {
         int writerExpirationCheckIntervalMs =
                 (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_CHECK_INTERVAL).toMillis();
         this.writerStateManager = writerStateManager;
+        this.bucketStateManager = bucketStateManager;
         this.highWatermarkMetadata = new LogOffsetMetadata(0L);
 
         this.scheduler = scheduler;
@@ -243,6 +253,16 @@ public final class LogTablet {
         return lakeTableSnapshotId;
     }
 
+    /**
+     * Set the IndexCache for index visibility control. This is called by Replica when IndexCache is
+     * created.
+     *
+     * @param indexCache the IndexCache instance, can be null if no indexes exist
+     */
+    public void setIndexCache(@Nullable IndexCache indexCache) {
+        this.indexCache = indexCache;
+    }
+
     public long getLakeLogStartOffset() {
         return lakeLogStartOffset;
     }
@@ -280,6 +300,11 @@ public final class LogTablet {
         return writerStateManager;
     }
 
+    @VisibleForTesting
+    public BucketStateManager bucketStateManager() {
+        return bucketStateManager;
+    }
+
     public static LogTablet create(
             PhysicalTablePath tablePath,
             File tabletDir,
@@ -305,6 +330,7 @@ public final class LogTablet {
                         tableBucket,
                         tabletDir,
                         (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis());
+        BucketStateManager bucketStateManager = new BucketStateManager(tableBucket, tabletDir);
 
         LoadedLogOffsets offsets =
                 new LogLoader(
@@ -314,6 +340,7 @@ public final class LogTablet {
                                 recoveryPoint,
                                 logFormat,
                                 writerStateManager,
+                                bucketStateManager,
                                 isCleanShutdown)
                         .load();
 
@@ -334,6 +361,7 @@ public final class LogTablet {
                 conf,
                 scheduler,
                 writerStateManager,
+                bucketStateManager,
                 logFormat,
                 tieredLogLocalSegments,
                 isChangelog,
@@ -397,7 +425,36 @@ public final class LogTablet {
         if (fetchIsolation == FetchIsolation.LOG_END) {
             maxOffsetMetadata = localLog.getLocalLogEndOffsetMetadata();
         } else if (fetchIsolation == FetchIsolation.HIGH_WATERMARK) {
-            maxOffsetMetadata = fetchHighWatermarkMetadata();
+            // Get base high watermark first
+            LogOffsetMetadata highWatermarkMetadata = fetchHighWatermarkMetadata();
+
+            // Apply index visibility control if IndexCache exists
+            IndexCache cache = this.indexCache;
+            if (cache != null) {
+                long indexCommitHorizon = cache.getIndexCommitHorizon();
+                long highWatermark = highWatermarkMetadata.getMessageOffset();
+
+                // Use minimum of HW and indexCommitHorizon for visibility control
+                long maxOffset = Math.min(highWatermark, indexCommitHorizon);
+
+                if (maxOffset < highWatermark) {
+                    // Need to create offset metadata for the maxOffset
+                    try {
+                        maxOffsetMetadata = convertToOffsetMetadataOrThrow(maxOffset);
+                    } catch (LogOffsetOutOfRangeException e) {
+                        LOG.warn(
+                                "Index commit horizon {} is out of range, falling back to base HW {} for bucket {}",
+                                maxOffset,
+                                highWatermark,
+                                getTableBucket());
+                        maxOffsetMetadata = highWatermarkMetadata;
+                    }
+                } else {
+                    maxOffsetMetadata = highWatermarkMetadata;
+                }
+            } else {
+                maxOffsetMetadata = highWatermarkMetadata;
+            }
         }
 
         return localLog.read(readOffset, maxLength, minOneMessage, maxOffsetMetadata, projection);
@@ -436,6 +493,7 @@ public final class LogTablet {
                         localLog.getTableBucket());
             }
             highWatermarkMetadata = newHighWatermark;
+            bucketStateManager.commitTo(newHighWatermark.getMessageOffset());
             // TODO log offset listener to update log offset.
         }
         LOG.trace(
@@ -548,6 +606,12 @@ public final class LogTablet {
         }
     }
 
+    public void loadStateSnapshot(File snapshotFile, long lastOffset) throws IOException {
+        synchronized (lock) {
+            bucketStateManager.restore(snapshotFile, lastOffset);
+        }
+    }
+
     public void deleteSegmentsAlreadyExistsInRemote() {
         deleteSegments(remoteLogEndOffset);
     }
@@ -564,6 +628,17 @@ public final class LogTablet {
                 localLogStartOffset(),
                 localLog.getLocalLogEndOffsetMetadata(),
                 highWatermark);
+    }
+
+    public Object getState(StateDefs stateDef, String key, boolean readCommitted) {
+        BucketStateManager.StateValueWithOffset stateValue =
+                bucketStateManager.getState(stateDef, key, readCommitted);
+        return stateValue != null ? stateValue.getValue() : null;
+    }
+
+    public BucketStateManager.StateValueWithOffset getStateWithOffset(
+            StateDefs stateDef, Object key, boolean readCommitted) {
+        return bucketStateManager.getState(stateDef, key, readCommitted);
     }
 
     private void deleteSegments(long cleanUpToOffset) {
@@ -709,6 +784,18 @@ public final class LogTablet {
                         appendInfo.maxTimestamp(),
                         appendInfo.startOffsetOfMaxTimestamp(),
                         validRecords);
+
+                validRecords
+                        .batches()
+                        .forEach(
+                                batch ->
+                                        batch.stateChangeLogs()
+                                                .ifPresent(
+                                                        stateChangeLogs ->
+                                                                bucketStateManager.apply(
+                                                                        batch.lastLogOffset(),
+                                                                        stateChangeLogs.iters())));
+
                 updateHighWatermarkWithLogEndOffset();
 
                 // update the writer state.
@@ -853,6 +940,11 @@ public final class LogTablet {
             // we manually override the state offset here prior to taking the snapshot.
             writerStateManager.updateMapEndOffset(segment.getBaseOffset());
             writerStateManager.takeSnapshot();
+
+            // Also take a snapshot of the bucket state for recovery
+            // Bucket state snapshot is based on committed offset, no need to update offset manually
+            bucketStateManager.takeSnapshot();
+
             updateHighWatermarkWithLogEndOffset();
 
             scheduler.scheduleOnce(
@@ -970,6 +1062,14 @@ public final class LogTablet {
                 writerStateManager.takeSnapshot();
             } catch (IOException e) {
                 LOG.error("Error while taking writer snapshot for bucket {}.", getTableBucket(), e);
+            }
+            try {
+                bucketStateManager.takeSnapshot();
+            } catch (IOException e) {
+                LOG.error(
+                        "Error while taking bucket state snapshot for bucket {}.",
+                        getTableBucket(),
+                        e);
             }
             localLog.close();
         }
@@ -1145,6 +1245,7 @@ public final class LogTablet {
         localLog.checkIfMemoryMappedBufferClosed();
         localLog.removeAndDeleteSegments(deletableSegments, reason);
         deleteWriterSnapshots(deletableSegments, writerStateManager);
+        deleteBucketStateSnapshots(deletableSegments, bucketStateManager);
     }
 
     private static void updateWriterAppendInfo(
@@ -1287,6 +1388,13 @@ public final class LogTablet {
             List<LogSegment> segments, WriterStateManager writerStateManager) throws IOException {
         for (LogSegment segment : segments) {
             writerStateManager.removeAndDeleteSnapshot(segment.getBaseOffset());
+        }
+    }
+
+    private static void deleteBucketStateSnapshots(
+            List<LogSegment> segments, BucketStateManager bucketStateManager) throws IOException {
+        for (LogSegment segment : segments) {
+            bucketStateManager.removeAndDeleteSnapshot(segment.getBaseOffset());
         }
     }
 

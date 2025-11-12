@@ -49,6 +49,7 @@ public class LogRecordBatchFormat {
     private static final int WRITE_CLIENT_ID_LENGTH = 8;
     private static final int BATCH_SEQUENCE_LENGTH = 4;
     private static final int RECORDS_COUNT_LENGTH = 4;
+    private static final int STATE_CHANGELOG_LENGTH_LENGTH = 4;
 
     public static final int BASE_OFFSET_OFFSET = 0;
     public static final int LENGTH_OFFSET = BASE_OFFSET_OFFSET + BASE_OFFSET_LENGTH;
@@ -56,6 +57,68 @@ public class LogRecordBatchFormat {
     public static final int COMMIT_TIMESTAMP_OFFSET = MAGIC_OFFSET + MAGIC_LENGTH;
     public static final int LOG_OVERHEAD = LENGTH_OFFSET + LENGTH_LENGTH;
     public static final int HEADER_SIZE_UP_TO_MAGIC = MAGIC_OFFSET + MAGIC_LENGTH;
+
+    // ----------------------------------------------------------------------------------------
+    // Format of Magic Version: V3
+    // ----------------------------------------------------------------------------------------
+
+    /**
+     * LogRecordBatch implementation for magic 3 (V3). The schema of {@link LogRecordBatch} is given
+     * below:
+     *
+     * <ul>
+     *   RecordBatch =>
+     *   <li>BaseOffset => Int64
+     *   <li>Length => Int32
+     *   <li>Magic => Int8
+     *   <li>CommitTimestamp => Int64
+     *   <li>LeaderEpoch => Int32
+     *   <li>CRC => Uint32
+     *   <li>SchemaId => Int16
+     *   <li>Attributes => Int8
+     *   <li>LastOffsetDelta => Int32
+     *   <li>WriterID => Int64
+     *   <li>SequenceID => Int32
+     *   <li>RecordCount => Int32
+     *   <li>ExtendPropertiesLength => Int32
+     *   <li>ExtendPropertiesData => ByteArray
+     *   <li>Records => [Record]
+     * </ul>
+     *
+     * <p>Newly added fields in LogRecordBatch header of magic V3 are ExtendPropertiesLength and
+     * ExtendPropertiesData, which are used to store extend properties data. The
+     * ExtendPropertiesLength field indicates the byte length of the ExtendPropertiesData field that
+     * immediately follows it. For better layout organization, all fixed-length fields are placed
+     * before variable-length fields, with ExtendPropertiesData before Records.
+     *
+     * <p>The current attributes are given below:
+     *
+     * <pre>
+     * ------------------------------------------
+     * |  Unused (1-7)   |  AppendOnly Flag (0) |
+     * ------------------------------------------
+     * </pre>
+     *
+     * @since 0.8
+     */
+    public static final byte LOG_MAGIC_VALUE_V3 = 3;
+
+    private static final int V3_LEADER_EPOCH_OFFSET =
+            COMMIT_TIMESTAMP_OFFSET + COMMIT_TIMESTAMP_LENGTH;
+    private static final int V3_CRC_OFFSET = V3_LEADER_EPOCH_OFFSET + LEADER_EPOCH_LENGTH;
+    private static final int V3_SCHEMA_ID_OFFSET = V3_CRC_OFFSET + CRC_LENGTH;
+    private static final int V3_ATTRIBUTES_OFFSET = V3_SCHEMA_ID_OFFSET + SCHEMA_ID_LENGTH;
+    private static final int V3_LAST_OFFSET_DELTA_OFFSET = V3_ATTRIBUTES_OFFSET + ATTRIBUTE_LENGTH;
+    private static final int V3_WRITE_CLIENT_ID_OFFSET =
+            V3_LAST_OFFSET_DELTA_OFFSET + LAST_OFFSET_DELTA_LENGTH;
+    private static final int V3_BATCH_SEQUENCE_OFFSET =
+            V3_WRITE_CLIENT_ID_OFFSET + WRITE_CLIENT_ID_LENGTH;
+    private static final int V3_RECORDS_COUNT_OFFSET =
+            V3_BATCH_SEQUENCE_OFFSET + BATCH_SEQUENCE_LENGTH;
+    private static final int V3_STATE_CHANGELOG_LENGTH_OFFSET =
+            V3_RECORDS_COUNT_OFFSET + RECORDS_COUNT_LENGTH;
+    public static final int V3_BASE_RECORD_BATCH_HEADER_SIZE =
+            V3_STATE_CHANGELOG_LENGTH_OFFSET + STATE_CHANGELOG_LENGTH_LENGTH;
 
     // ----------------------------------------------------------------------------------------
     // Format of Magic Version: V1
@@ -185,14 +248,20 @@ public class LogRecordBatchFormat {
     // ----------------------------------------------------------------------------------------
 
     public static int leaderEpochOffset(byte magic) {
-        if (magic == LOG_MAGIC_VALUE_V1) {
-            return V1_LEADER_EPOCH_OFFSET;
+        switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_LEADER_EPOCH_OFFSET;
+            case LOG_MAGIC_VALUE_V1:
+                return V1_LEADER_EPOCH_OFFSET;
+            default:
+                throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
-        throw new IllegalArgumentException("Unsupported magic value " + magic);
     }
 
     public static int crcOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_CRC_OFFSET;
             case LOG_MAGIC_VALUE_V1:
                 return V1_CRC_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -204,6 +273,8 @@ public class LogRecordBatchFormat {
 
     public static int schemaIdOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_SCHEMA_ID_OFFSET;
             case LOG_MAGIC_VALUE_V1:
                 return V1_SCHEMA_ID_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -215,6 +286,8 @@ public class LogRecordBatchFormat {
 
     public static int attributeOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_ATTRIBUTES_OFFSET;
             case LOG_MAGIC_VALUE_V1:
                 return V1_ATTRIBUTES_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -226,6 +299,8 @@ public class LogRecordBatchFormat {
 
     public static int lastOffsetDeltaOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_LAST_OFFSET_DELTA_OFFSET;
             case LOG_MAGIC_VALUE_V1:
                 return V1_LAST_OFFSET_DELTA_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -237,6 +312,8 @@ public class LogRecordBatchFormat {
 
     public static int writeClientIdOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_WRITE_CLIENT_ID_OFFSET;
             case LOG_MAGIC_VALUE_V1:
                 return V1_WRITE_CLIENT_ID_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -248,6 +325,8 @@ public class LogRecordBatchFormat {
 
     public static int batchSequenceOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_BATCH_SEQUENCE_OFFSET;
             case LOG_MAGIC_VALUE_V1:
                 return V1_BATCH_SEQUENCE_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -259,6 +338,8 @@ public class LogRecordBatchFormat {
 
     public static int recordsCountOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_RECORDS_COUNT_OFFSET;
             case LOG_MAGIC_VALUE_V1:
                 return V1_RECORDS_COUNT_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -270,6 +351,8 @@ public class LogRecordBatchFormat {
 
     public static int recordBatchHeaderSize(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                return V3_BASE_RECORD_BATCH_HEADER_SIZE;
             case LOG_MAGIC_VALUE_V1:
                 return V1_RECORD_BATCH_HEADER_SIZE;
             case LOG_MAGIC_VALUE_V0:
@@ -281,6 +364,10 @@ public class LogRecordBatchFormat {
 
     public static int arrowChangeTypeOffset(byte magic) {
         switch (magic) {
+            case LOG_MAGIC_VALUE_V3:
+                // For V3, arrow change type offset is dynamic based on extend properties length
+                throw new IllegalArgumentException(
+                        "arrowChangeTypeOffset for V3 requires extend properties length");
             case LOG_MAGIC_VALUE_V1:
                 return V1_ARROW_CHANGETYPE_OFFSET;
             case LOG_MAGIC_VALUE_V0:
@@ -288,5 +375,35 @@ public class LogRecordBatchFormat {
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
+    }
+
+    /**
+     * Returns the offset of the state changelogs length field for V3 format.
+     *
+     * @param magic the magic value of the record batch
+     * @return the offset of state changelogs length field
+     * @throws IllegalArgumentException if the magic value is not V3
+     */
+    public static int stateChangeLogsLengthOffset(byte magic) {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            return V3_STATE_CHANGELOG_LENGTH_OFFSET;
+        }
+        throw new IllegalArgumentException(
+                "stateChangeLogsLengthOffset is only available for V3 format");
+    }
+
+    /**
+     * Returns the offset of the state changelogs data field for V3 format.
+     *
+     * @param magic the magic value of the record batch
+     * @return the offset of state changelogs data field
+     * @throws IllegalArgumentException if the magic value is not V3
+     */
+    public static int stateChangeLogsDataOffset(byte magic) {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            return V3_STATE_CHANGELOG_LENGTH_OFFSET + STATE_CHANGELOG_LENGTH_LENGTH;
+        }
+        throw new IllegalArgumentException(
+                "stateChangeLogsDataOffset is only available for V3 format");
     }
 }

@@ -18,6 +18,7 @@
 package org.apache.fluss.client.table;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.FlussConnection;
 import org.apache.fluss.client.lookup.Lookup;
 import org.apache.fluss.client.lookup.TableLookup;
@@ -27,6 +28,8 @@ import org.apache.fluss.client.table.writer.Append;
 import org.apache.fluss.client.table.writer.TableAppend;
 import org.apache.fluss.client.table.writer.TableUpsert;
 import org.apache.fluss.client.table.writer.Upsert;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 
@@ -44,12 +47,26 @@ public class FlussTable implements Table {
     private final TablePath tablePath;
     private final TableInfo tableInfo;
     private final boolean hasPrimaryKey;
+    private final Configuration conf;
 
-    public FlussTable(FlussConnection conn, TablePath tablePath, TableInfo tableInfo) {
+    public FlussTable(
+            FlussConnection conn, TablePath tablePath, TableInfo tableInfo, Configuration conf) {
         this.conn = conn;
         this.tablePath = tablePath;
         this.tableInfo = tableInfo;
         this.hasPrimaryKey = tableInfo.hasPrimaryKey();
+        this.conf = conf;
+    }
+
+    /**
+     * Check if this table is an index table based on the table name. Index table name format: "__"
+     * + mainTableName + "__" + "index" + "__" + indexName.
+     *
+     * @return true if this is an index table, false otherwise
+     */
+    @VisibleForTesting
+    boolean isIndexTable() {
+        return IndexTableUtils.isIndexTable(tablePath.getTableName());
     }
 
     @Override
@@ -65,7 +82,7 @@ public class FlussTable implements Table {
     @Override
     public Lookup newLookup() {
         return new TableLookup(
-                tableInfo, conn.getMetadataUpdater(), conn.getOrCreateLookupClient());
+                tableInfo, conn.getMetadataUpdater(), conn.getOrCreateLookupClient(), conf);
     }
 
     @Override
@@ -73,6 +90,10 @@ public class FlussTable implements Table {
         checkState(
                 !hasPrimaryKey,
                 "Table %s is not a Log Table and doesn't support AppendWriter.",
+                tablePath);
+        checkState(
+                !isIndexTable(),
+                "Index table %s doesn't support AppendWriter. Index tables can only be updated by internal roles.",
                 tablePath);
         return new TableAppend(tablePath, tableInfo, conn.getOrCreateWriterClient());
     }
@@ -82,6 +103,10 @@ public class FlussTable implements Table {
         checkState(
                 hasPrimaryKey,
                 "Table %s is not a Primary Key Table and doesn't support UpsertWriter.",
+                tablePath);
+        checkState(
+                !isIndexTable(),
+                "Index table %s doesn't support UpsertWriter. Index tables can only be updated by internal roles.",
                 tablePath);
         return new TableUpsert(tablePath, tableInfo, conn.getOrCreateWriterClient());
     }

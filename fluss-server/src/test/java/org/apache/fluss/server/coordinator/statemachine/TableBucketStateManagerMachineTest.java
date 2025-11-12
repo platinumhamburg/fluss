@@ -71,7 +71,7 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link TableBucketStateMachine}. */
-class TableBucketStateMachineTest {
+class TableBucketStateManagerMachineTest {
 
     @RegisterExtension
     public static final AllCallbackWrapper<ZooKeeperExtension> ZOO_KEEPER_EXTENSION_WRAPPER =

@@ -25,7 +25,7 @@ import java.util.Arrays;
  *
  * <p>NOTE: currently it only works on-heap {@link MemorySegment}, see {@link #resize(int)}.
  */
-public class MemorySegmentOutputView implements OutputView, MemorySegmentWritable {
+public class MemorySegmentOutputView implements MemorySegmentWritableOutputView {
     private MemorySegment memorySegment;
     private int position;
 
