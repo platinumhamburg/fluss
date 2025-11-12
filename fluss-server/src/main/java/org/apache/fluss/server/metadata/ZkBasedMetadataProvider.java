@@ -31,6 +31,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -48,6 +49,13 @@ public abstract class ZkBasedMetadataProvider implements MetadataProvider {
         this.zkClient = zkClient;
         this.metadataManager = metadataManager;
     }
+
+    protected ZooKeeperClient getZkClient() {
+        return zkClient;
+    }
+
+    @Override
+    public abstract Optional<TablePath> getTablePathFromCache(long tableId);
 
     @Override
     public List<TableMetadata> getTablesMetadataFromZK(Collection<TablePath> tablePaths) {

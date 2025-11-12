@@ -67,6 +67,9 @@ public class FlussPaths {
     /** Suffix of a writer snapshot file. */
     public static final String WRITER_SNAPSHOT_FILE_SUFFIX = ".writer_snapshot";
 
+    /** Suffix of a state snapshot file. */
+    public static final String STATE_SNAPSHOT_FILE_SUFFIX = ".state_snapshot";
+
     /** The directory name for storing remote log index files. */
     public static final String REMOTE_LOG_INDEX_LOCAL_CACHE = "remote-log-index-cache";
 
@@ -314,6 +317,11 @@ public class FlussPaths {
                 logTabletDir, filenamePrefixFromOffset(offset) + WRITER_SNAPSHOT_FILE_SUFFIX);
     }
 
+    public static File stateSnapshotFile(File logTabletDir, long offset) {
+        return new File(
+                logTabletDir, filenamePrefixFromOffset(offset) + STATE_SNAPSHOT_FILE_SUFFIX);
+    }
+
     /**
      * Make log segment file name from offset bytes. All this does is pad out the offset number with
      * zeros so that ls sorts the files numerically.
@@ -517,6 +525,19 @@ public class FlussPaths {
     }
 
     public static FsPath remoteWriterSnapshotFile(
+            FsPath remoteLogDir, RemoteLogSegment remoteLogSegment, String indexSuffix) {
+        return remoteLogIndexFile(
+                remoteLogSegmentDir(
+                        remoteLogTabletDir(
+                                remoteLogDir,
+                                remoteLogSegment.physicalTablePath(),
+                                remoteLogSegment.tableBucket()),
+                        remoteLogSegment.remoteLogSegmentId()),
+                remoteLogSegment.remoteLogEndOffset(),
+                indexSuffix);
+    }
+
+    public static FsPath remoteStateSnapshotFile(
             FsPath remoteLogDir, RemoteLogSegment remoteLogSegment, String indexSuffix) {
         return remoteLogIndexFile(
                 remoteLogSegmentDir(
