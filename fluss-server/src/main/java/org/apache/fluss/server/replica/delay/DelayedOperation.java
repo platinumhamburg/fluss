@@ -18,7 +18,7 @@
 package org.apache.fluss.server.replica.delay;
 
 import org.apache.fluss.annotation.VisibleForTesting;
-import org.apache.fluss.server.utils.timer.TimerTask;
+import org.apache.fluss.timer.TimerTask;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;

@@ -19,6 +19,7 @@ package org.apache.fluss.client.table.scanner.batch;
 
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.exception.LeaderNotAvailableException;
+import org.apache.fluss.metadata.IndexTableUtils;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.record.DefaultValueRecordBatch;
@@ -33,6 +34,7 @@ import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
 import org.apache.fluss.row.decode.RowDecoder;
+import org.apache.fluss.row.encode.TsValueDecoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.LimitScanRequest;
@@ -62,6 +64,8 @@ public class LimitBatchScanner implements BatchScanner {
     private final InternalRow.FieldGetter[] fieldGetters;
     private final CompletableFuture<LimitScanResponse> scanFuture;
     private final ValueDecoder kvValueDecoder;
+    private final TsValueDecoder kvTsValueDecoder;
+    private final boolean shouldUseTsDecoding;
 
     private boolean endOfInput;
 
@@ -102,11 +106,16 @@ public class LimitBatchScanner implements BatchScanner {
         }
         this.scanFuture = gateway.limitScan(limitScanRequest);
 
-        this.kvValueDecoder =
-                new ValueDecoder(
-                        RowDecoder.create(
-                                tableInfo.getTableConfig().getKvFormat(),
-                                rowType.getChildren().toArray(new DataType[0])));
+        // Determine if values are encoded with timestamp
+        // Currently, only index tables use TsValueEncoder
+        this.shouldUseTsDecoding =
+                IndexTableUtils.isIndexTable(tableInfo.getTablePath().getTableName());
+        RowDecoder rowDecoder =
+                RowDecoder.create(
+                        tableInfo.getTableConfig().getKvFormat(),
+                        rowType.getChildren().toArray(new DataType[0]));
+        this.kvValueDecoder = new ValueDecoder(rowDecoder);
+        this.kvTsValueDecoder = new TsValueDecoder(rowDecoder);
         this.endOfInput = false;
     }
 
@@ -138,8 +147,12 @@ public class LimitBatchScanner implements BatchScanner {
         if (tableInfo.hasPrimaryKey()) {
             DefaultValueRecordBatch valueRecords =
                     DefaultValueRecordBatch.pointToByteBuffer(recordsBuffer);
-            ValueRecordReadContext readContext =
-                    new ValueRecordReadContext(kvValueDecoder.getRowDecoder());
+            // For values encoded with timestamp, use TsValueDecoder; otherwise use ValueDecoder
+            RowDecoder decoder =
+                    shouldUseTsDecoding
+                            ? kvTsValueDecoder.getRowDecoder()
+                            : kvValueDecoder.getRowDecoder();
+            ValueRecordReadContext readContext = new ValueRecordReadContext(decoder);
             for (ValueRecord record : valueRecords.records(readContext)) {
                 scanRows.add(maybeProject(record.getRow()));
             }

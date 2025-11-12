@@ -144,13 +144,13 @@ public class ReplicaFetcherManager {
         }
 
         if (!tableBuckets.isEmpty()) {
-            LOG.info("Remove fetcher for buckets: {}", tableBuckets);
+            LOG.info("Removed fetcher for {} buckets: {}", tableBuckets.size(), tableBuckets);
         }
     }
 
     public void shutdownIdleFetcherThreads() {
         synchronized (lock) {
-            Set<ServerIdAndFetcherId> keysToBeRemoved = new HashSet<>();
+            Set<ServerIdAndFetcherId> fetcherThreadsToBeRemoved = new HashSet<>();
             fetcherThreadMap.forEach(
                     (serverIdAndFetcherId, fetcher) -> {
                         if (fetcher.getBucketCount() <= 0) {
@@ -159,11 +159,11 @@ public class ReplicaFetcherManager {
                             } catch (InterruptedException e) {
                                 LOG.error("Interrupted while shutting down fetcher threads.", e);
                             }
-                            keysToBeRemoved.add(serverIdAndFetcherId);
+                            fetcherThreadsToBeRemoved.add(serverIdAndFetcherId);
                         }
                     });
 
-            keysToBeRemoved.forEach(fetcherThreadMap::remove);
+            fetcherThreadsToBeRemoved.forEach(fetcherThreadMap::remove);
         }
     }
 
@@ -204,7 +204,7 @@ public class ReplicaFetcherManager {
                                 return optionalServerNode.get();
                             } else {
                                 // no available serverNode to connect, throw exception,
-                                // fetch thead expects to retry
+                                // fetch thread expects to retry
                                 throw new RuntimeException(
                                         "ServerNode "
                                                 + leaderId
@@ -221,9 +221,9 @@ public class ReplicaFetcherManager {
         try {
             fetcherThread.addBuckets(initialFetchStatusMap);
             LOG.info(
-                    "Added fetcher to server {} with initial fetch status {}",
+                    "Added fetcher to server {} for {} data buckets",
                     fetcherThread.getLeader().leaderServerId(),
-                    initialFetchStatusMap);
+                    initialFetchStatusMap.size());
         } catch (InterruptedException e) {
             LOG.error("Interrupted while add buckets to fetcher threads.", e);
         }
@@ -274,34 +274,6 @@ public class ReplicaFetcherManager {
         @Override
         public int hashCode() {
             return Objects.hash(leaderId, fetcherId);
-        }
-    }
-
-    /** Class to represent server id and fetcher id. */
-    public static class ServerIdAndFetcherId {
-        private final int serverId;
-        private final int fetcherId;
-
-        ServerIdAndFetcherId(int serverId, int fetcherId) {
-            this.serverId = serverId;
-            this.fetcherId = fetcherId;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (o == null || getClass() != o.getClass()) {
-                return false;
-            }
-            ServerIdAndFetcherId that = (ServerIdAndFetcherId) o;
-            return serverId == that.serverId && fetcherId == that.fetcherId;
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(serverId, fetcherId);
         }
     }
 }
