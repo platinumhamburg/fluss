@@ -17,7 +17,11 @@
 
 package org.apache.fluss.server.kv.rocksdb;
 
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.utils.MapUtils;
+import org.apache.fluss.utils.concurrent.FlussScheduler;
+import org.apache.fluss.utils.concurrent.Scheduler;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,65 +29,78 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Global collector for RocksDB metrics that efficiently manages metric collection for thousands of
- * RocksDB instances using a shared thread pool and batch processing.
+ * Collector for RocksDB metrics that efficiently manages metric collection for thousands of RocksDB
+ * instances using a shared thread pool and batch processing.
  */
 public class RocksDBMetricsManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(RocksDBMetricsManager.class);
 
-    /** Singleton instance. */
-    private static volatile RocksDBMetricsManager instance;
-
     /** Update interval for metrics collection (in seconds). */
     private static final long METRICS_UPDATE_INTERVAL_SECONDS = 5;
 
-    /** Batch size for processing metrics collectors. */
-    private static final int BATCH_SIZE = 100;
+    /** Update interval for metrics collection (in milliseconds). */
+    private static final long METRICS_UPDATE_INTERVAL_MS = METRICS_UPDATE_INTERVAL_SECONDS * 1000;
 
-    /** Shared thread pool for metrics collection. */
-    private final ScheduledExecutorService metricsCollectionExecutor;
+    /** Scheduler for metrics collection. */
+    private final Scheduler scheduler;
+
+    /** Scheduled future for the metrics collection task. */
+    private volatile ScheduledFuture<?> scheduledTask;
 
     /** Map of registered metrics collectors. */
     private final ConcurrentMap<String, RocksDBMetricsCollector> collectors =
             MapUtils.newConcurrentHashMap();
 
-    /** Flag to track if collector is running. */
+    /** Flag to track if manager is running. */
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    /** Flag to track if collector is shutdown. */
+    /** Flag to track if manager is shutdown. */
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
 
     /** Lock for synchronizing collector registration/unregistration. */
     private final Object collectorLock = new Object();
 
-    private RocksDBMetricsManager() {
-        this.metricsCollectionExecutor =
-                Executors.newScheduledThreadPool(
-                        1,
-                        r -> {
-                            Thread thread = new Thread(r, "rocksdb-metrics-collector");
-                            thread.setDaemon(true);
-                            return thread;
-                        });
+    /** Server metric group for aggregating metrics. */
+    private final TabletServerMetricGroup serverMetricGroup;
+
+    /** Previous values for calculating deltas (for Counter metrics). */
+    private long previousBlockCacheMissCount = 0;
+
+    private long previousBlockCacheHitCount = 0;
+    private long previousBlockCacheAddCount = 0;
+    private long previousCompactionBytesRead = 0;
+    private long previousCompactionBytesWritten = 0;
+    private long previousFlushBytesWritten = 0;
+    private long previousBytesRead = 0;
+    private long previousBytesWritten = 0;
+
+    /**
+     * Constructor for production use.
+     *
+     * @param serverMetricGroup the server metric group for aggregating metrics
+     */
+    public RocksDBMetricsManager(TabletServerMetricGroup serverMetricGroup) {
+        this.serverMetricGroup = serverMetricGroup;
+        FlussScheduler flussScheduler = new FlussScheduler(1, true, "rocksdb-metrics-collector-");
+        flussScheduler.startup();
+        this.scheduler = flussScheduler;
     }
 
-    /** Get the singleton instance of RocksDBMetricsCollector. */
-    public static RocksDBMetricsManager getInstance() {
-        if (instance == null) {
-            synchronized (RocksDBMetricsManager.class) {
-                if (instance == null) {
-                    instance = new RocksDBMetricsManager();
-                }
-            }
-        }
-        return instance;
+    /**
+     * Constructor for testing purposes.
+     *
+     * @param scheduler the scheduler to use for metrics collection
+     * @param serverMetricGroup the server metric group for aggregating metrics
+     */
+    @VisibleForTesting
+    public RocksDBMetricsManager(Scheduler scheduler, TabletServerMetricGroup serverMetricGroup) {
+        this.scheduler = scheduler;
+        this.serverMetricGroup = serverMetricGroup;
     }
 
     /**
@@ -130,16 +147,14 @@ public class RocksDBMetricsManager {
 
         synchronized (collectorLock) {
             String key = createCollectorKey(collector);
-            synchronized (key.intern()) {
-                RocksDBMetricsCollector removed = collectors.remove(key);
-                if (removed != null) {
-                    LOG.debug(
-                            "Unregistered RocksDB metrics collector for {}, remaining collectors: {}",
-                            key,
-                            collectors.size());
-                } else {
-                    LOG.debug("Collector {} was not found in registry", key);
-                }
+            RocksDBMetricsCollector removed = collectors.remove(key);
+            if (removed != null) {
+                LOG.debug(
+                        "Unregistered RocksDB metrics collector for {}, remaining collectors: {}",
+                        key,
+                        collectors.size());
+            } else {
+                LOG.debug("Collector {} was not found in registry", key);
             }
         }
     }
@@ -149,17 +164,26 @@ public class RocksDBMetricsManager {
         if (running.compareAndSet(false, true)) {
             LOG.info("Starting RocksDB metrics collection.");
 
-            metricsCollectionExecutor.scheduleAtFixedRate(
-                    this::gatherMetrics,
-                    METRICS_UPDATE_INTERVAL_SECONDS,
-                    METRICS_UPDATE_INTERVAL_SECONDS,
-                    TimeUnit.SECONDS);
+            // Ensure scheduler is started (for FlussScheduler)
+            if (scheduler instanceof FlussScheduler) {
+                FlussScheduler flussScheduler = (FlussScheduler) scheduler;
+                if (!flussScheduler.isStarted()) {
+                    flussScheduler.startup();
+                }
+            }
+
+            scheduledTask =
+                    scheduler.schedule(
+                            "rocksdb-metrics-collection",
+                            this::gatherMetrics,
+                            METRICS_UPDATE_INTERVAL_MS,
+                            METRICS_UPDATE_INTERVAL_MS);
         }
     }
 
-    /** Collect metrics from all registered collectors in batches. */
+    /** Collect and aggregate metrics from all registered collectors. */
     private void gatherMetrics() {
-        if (collectors.isEmpty()) {
+        if (serverMetricGroup == null) {
             return;
         }
 
@@ -170,34 +194,202 @@ public class RocksDBMetricsManager {
         }
 
         if (collectorList.isEmpty()) {
+            resetMetrics(serverMetricGroup);
             return;
         }
 
-        // Process collectors in batches to avoid overwhelming the system
-        for (int i = 0; i < collectorList.size(); i += BATCH_SIZE) {
-            int endIndex = Math.min(i + BATCH_SIZE, collectorList.size());
-            List<RocksDBMetricsCollector> batch = collectorList.subList(i, endIndex);
+        // Initialize aggregation variables
+        long blockCacheMissCount = 0;
+        long blockCacheHitCount = 0;
+        long blockCacheAddCount = 0;
+        long compactionBytesRead = 0;
+        long compactionBytesWritten = 0;
+        long flushBytesWritten = 0;
+        long bytesRead = 0;
+        long bytesWritten = 0;
 
-            // Submit batch for processing
-            metricsCollectionExecutor.submit(() -> processBatch(batch));
+        long blockCacheUsage = 0;
+        long blockCachePinnedUsage = 0;
+        long memtableMemoryUsage = 0;
+        long blockCacheMemoryUsage = 0;
+        long tableReadersMemoryUsage = 0;
+        long totalMemoryUsage = 0;
+        long totalSstFilesSize = 0;
+
+        long compactionPendingSum = 0;
+        long flushPendingSum = 0;
+        long numFilesAtLevel0Sum = 0;
+
+        long writeStallMicrosMax = 0;
+
+        long dbGetLatencyMicrosSum = 0;
+        long dbWriteLatencyMicrosSum = 0;
+        long compactionTimeMicrosSum = 0;
+        int latencyCollectorCount = 0;
+        int validCollectorCount = 0;
+
+        // Update and aggregate metrics in a single pass
+        for (RocksDBMetricsCollector collector : collectorList) {
+            if (!collector.isCollectorValidForAggregation()) {
+                continue;
+            }
+
+            // Update metrics first, then aggregate
+            collector.updateMetrics();
+
+            // Counter type (SUM)
+            blockCacheMissCount += collector.getBlockCacheMissCount();
+            blockCacheHitCount += collector.getBlockCacheHitCount();
+            blockCacheAddCount += collector.getBlockCacheAddCount();
+            compactionBytesRead += collector.getCompactionBytesRead();
+            compactionBytesWritten += collector.getCompactionBytesWritten();
+            flushBytesWritten += collector.getFlushBytesWritten();
+            bytesRead += collector.getBytesRead();
+            bytesWritten += collector.getBytesWritten();
+
+            // Gauge type SUM (resource usage)
+            blockCacheUsage += collector.getBlockCacheUsage();
+            blockCachePinnedUsage += collector.getBlockCachePinnedUsage();
+            memtableMemoryUsage += collector.getMemtableMemoryUsage();
+            blockCacheMemoryUsage += collector.getBlockCacheMemoryUsage();
+            tableReadersMemoryUsage += collector.getTableReadersMemoryUsage();
+            totalMemoryUsage += collector.getTotalMemoryUsage();
+            totalSstFilesSize += collector.getTotalSstFilesSize();
+
+            // Gauge type AVG (count metrics)
+            compactionPendingSum += collector.getCompactionPending();
+            flushPendingSum += collector.getFlushPending();
+            numFilesAtLevel0Sum += collector.getNumFilesAtLevel0();
+
+            // Gauge type MAX (time metrics)
+            long stallTime = collector.getStallTimeMicros();
+            if (stallTime > writeStallMicrosMax) {
+                writeStallMicrosMax = stallTime;
+            }
+
+            // Histogram type AVG (latency metrics)
+            long dbGetLatency = collector.getDbGetLatencyMicros();
+            long dbWriteLatency = collector.getDbWriteLatencyMicros();
+            long compactionTime = collector.getCompactionTimeMicros();
+            if (dbGetLatency > 0 || dbWriteLatency > 0 || compactionTime > 0) {
+                dbGetLatencyMicrosSum += dbGetLatency;
+                dbWriteLatencyMicrosSum += dbWriteLatency;
+                compactionTimeMicrosSum += compactionTime;
+                latencyCollectorCount++;
+            }
+
+            validCollectorCount++;
         }
-    }
 
-    /** Process a batch of collectors. */
-    private void processBatch(List<RocksDBMetricsCollector> batch) {
-        for (RocksDBMetricsCollector collector : batch) {
-            try {
-                String key = createCollectorKey(collector);
-                synchronized (key.intern()) {
-                    collector.updateMetrics();
-                }
-            } catch (Exception e) {
-                LOG.warn(
-                        "Error updating metrics for collector {}",
-                        createCollectorKey(collector),
-                        e);
+        int collectorCount = validCollectorCount;
+
+        // Update server-level Counter metrics (calculate deltas and increment)
+        long deltaBlockCacheMissCount = blockCacheMissCount - previousBlockCacheMissCount;
+        long deltaBlockCacheHitCount = blockCacheHitCount - previousBlockCacheHitCount;
+        long deltaBlockCacheAddCount = blockCacheAddCount - previousBlockCacheAddCount;
+        long deltaCompactionBytesRead = compactionBytesRead - previousCompactionBytesRead;
+        long deltaCompactionBytesWritten = compactionBytesWritten - previousCompactionBytesWritten;
+        long deltaFlushBytesWritten = flushBytesWritten - previousFlushBytesWritten;
+        long deltaBytesRead = bytesRead - previousBytesRead;
+        long deltaBytesWritten = bytesWritten - previousBytesWritten;
+
+        // Only increment if delta is positive (handle counter reset or decrease)
+        if (deltaBlockCacheMissCount > 0) {
+            serverMetricGroup.rocksdbBlockCacheMissCount().inc(deltaBlockCacheMissCount);
+        }
+        if (deltaBlockCacheHitCount > 0) {
+            serverMetricGroup.rocksdbBlockCacheHitCount().inc(deltaBlockCacheHitCount);
+        }
+        if (deltaBlockCacheAddCount > 0) {
+            serverMetricGroup.rocksdbBlockCacheAddCount().inc(deltaBlockCacheAddCount);
+        }
+        if (deltaCompactionBytesRead > 0) {
+            serverMetricGroup.rocksdbCompactionBytesRead().inc(deltaCompactionBytesRead);
+        }
+        if (deltaCompactionBytesWritten > 0) {
+            serverMetricGroup.rocksdbCompactionBytesWritten().inc(deltaCompactionBytesWritten);
+        }
+        if (deltaFlushBytesWritten > 0) {
+            serverMetricGroup.rocksdbFlushBytesWritten().inc(deltaFlushBytesWritten);
+        }
+        if (deltaBytesRead > 0) {
+            serverMetricGroup.rocksdbBytesRead().inc(deltaBytesRead);
+        }
+        if (deltaBytesWritten > 0) {
+            serverMetricGroup.rocksdbBytesWritten().inc(deltaBytesWritten);
+        }
+
+        // Update previous values for next iteration
+        previousBlockCacheMissCount = blockCacheMissCount;
+        previousBlockCacheHitCount = blockCacheHitCount;
+        previousBlockCacheAddCount = blockCacheAddCount;
+        previousCompactionBytesRead = compactionBytesRead;
+        previousCompactionBytesWritten = compactionBytesWritten;
+        previousFlushBytesWritten = flushBytesWritten;
+        previousBytesRead = bytesRead;
+        previousBytesWritten = bytesWritten;
+
+        serverMetricGroup.rocksdbBlockCacheUsage().set(blockCacheUsage);
+        serverMetricGroup.rocksdbBlockCachePinnedUsage().set(blockCachePinnedUsage);
+        serverMetricGroup.rocksdbMemtableMemoryUsage().set(memtableMemoryUsage);
+        serverMetricGroup.rocksdbBlockCacheMemoryUsage().set(blockCacheMemoryUsage);
+        serverMetricGroup.rocksdbTableReadersMemoryUsage().set(tableReadersMemoryUsage);
+        serverMetricGroup.rocksdbTotalMemoryUsage().set(totalMemoryUsage);
+        serverMetricGroup.rocksdbTotalSstFilesSize().set(totalSstFilesSize);
+
+        serverMetricGroup.rocksdbCompactionPendingSum().set(compactionPendingSum);
+        serverMetricGroup.rocksdbFlushPendingSum().set(flushPendingSum);
+        serverMetricGroup.rocksdbNumFilesAtLevel0Sum().set(numFilesAtLevel0Sum);
+        serverMetricGroup.rocksdbCollectorCount().set(collectorCount);
+
+        serverMetricGroup.rocksdbWriteStallMicros().set(writeStallMicrosMax);
+
+        // Update Histogram metrics (update with average latency values)
+        if (latencyCollectorCount > 0) {
+            long avgDbGetLatency = dbGetLatencyMicrosSum / latencyCollectorCount;
+            long avgDbWriteLatency = dbWriteLatencyMicrosSum / latencyCollectorCount;
+            long avgCompactionTime = compactionTimeMicrosSum / latencyCollectorCount;
+            if (avgDbGetLatency > 0) {
+                serverMetricGroup.rocksdbDbGetLatencyHistogram().update(avgDbGetLatency);
+            }
+            if (avgDbWriteLatency > 0) {
+                serverMetricGroup.rocksdbDbWriteLatencyHistogram().update(avgDbWriteLatency);
+            }
+            if (avgCompactionTime > 0) {
+                serverMetricGroup.rocksdbCompactionTimeHistogram().update(avgCompactionTime);
             }
         }
+        serverMetricGroup.rocksdbLatencyCollectorCount().set(latencyCollectorCount);
+    }
+
+    /** Reset all metrics to 0. */
+    private void resetMetrics(TabletServerMetricGroup serverMetrics) {
+        // Reset previous values for Counter metrics
+        previousBlockCacheMissCount = 0;
+        previousBlockCacheHitCount = 0;
+        previousBlockCacheAddCount = 0;
+        previousCompactionBytesRead = 0;
+        previousCompactionBytesWritten = 0;
+        previousFlushBytesWritten = 0;
+        previousBytesRead = 0;
+        previousBytesWritten = 0;
+
+        serverMetrics.rocksdbBlockCacheUsage().set(0);
+        serverMetrics.rocksdbBlockCachePinnedUsage().set(0);
+        serverMetrics.rocksdbMemtableMemoryUsage().set(0);
+        serverMetrics.rocksdbBlockCacheMemoryUsage().set(0);
+        serverMetrics.rocksdbTableReadersMemoryUsage().set(0);
+        serverMetrics.rocksdbTotalMemoryUsage().set(0);
+        serverMetrics.rocksdbTotalSstFilesSize().set(0);
+
+        serverMetrics.rocksdbCompactionPendingSum().set(0);
+        serverMetrics.rocksdbFlushPendingSum().set(0);
+        serverMetrics.rocksdbNumFilesAtLevel0Sum().set(0);
+        serverMetrics.rocksdbCollectorCount().set(0);
+
+        serverMetrics.rocksdbWriteStallMicros().set(0);
+
+        serverMetrics.rocksdbLatencyCollectorCount().set(0);
     }
 
     /** Create a unique key for a collector. */
@@ -215,37 +407,40 @@ public class RocksDBMetricsManager {
         return collectors.size();
     }
 
-    /** Shutdown the metrics collector. */
+    /** Shutdown the metrics manager. */
     public void shutdown() {
         if (shutdown.compareAndSet(false, true)) {
             LOG.info("Shutting down RocksDB metrics collector");
 
             running.set(false);
 
+            // Cancel scheduled task
+            if (scheduledTask != null) {
+                scheduledTask.cancel(false);
+                scheduledTask = null;
+            }
+
             synchronized (collectorLock) {
                 collectors.clear();
             }
 
-            if (metricsCollectionExecutor != null && !metricsCollectionExecutor.isShutdown()) {
-                metricsCollectionExecutor.shutdown();
+            // Shutdown scheduler if it's a FlussScheduler
+            if (scheduler instanceof FlussScheduler) {
                 try {
-                    if (!metricsCollectionExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
-                        metricsCollectionExecutor.shutdownNow();
-                    }
+                    scheduler.shutdown();
                 } catch (InterruptedException e) {
-                    metricsCollectionExecutor.shutdownNow();
                     Thread.currentThread().interrupt();
                 }
             }
         }
     }
 
-    /** Check if the collector is running. */
+    /** Check if the manager is running. */
     public boolean isRunning() {
         return running.get();
     }
 
-    /** Check if the collector is shutdown. */
+    /** Check if the manager is shutdown. */
     public boolean isShutdown() {
         return shutdown.get();
     }

@@ -1496,7 +1496,7 @@ public class ConfigOptions {
                                     + "will flush just based on item count if this config set to 0.");
 
     public static final ConfigOption<Boolean> KV_STATISTICS_ENABLED =
-            key("kv.rocksdb.statistics.enabled")
+            key("kv.rocksdb.metrics.enabled")
                     .booleanType()
                     .defaultValue(true)
                     .withDescription("Enable RocksDB statistics collection for monitoring metrics");

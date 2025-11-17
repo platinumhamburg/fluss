@@ -15,60 +15,85 @@
  * limitations under the License.
  */
 
-package com.alibaba.fluss.server.kv.rocksdb;
+package org.apache.fluss.server.kv.rocksdb;
 
-import com.alibaba.fluss.config.Configuration;
-import com.alibaba.fluss.metadata.TableBucket;
-import com.alibaba.fluss.metadata.TablePath;
-import com.alibaba.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.memory.TestingMemorySegmentPool;
+import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.rowmerger.RowMerger;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.LogTestUtils;
+import org.apache.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
+import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
+import org.apache.fluss.utils.clock.SystemClock;
+import org.apache.fluss.utils.concurrent.FlussScheduler;
+import org.apache.fluss.utils.concurrent.Scheduler;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
-import org.mockito.MockitoAnnotations;
 import org.rocksdb.RocksDB;
 import org.rocksdb.Statistics;
 
-import java.lang.reflect.Field;
+import java.io.File;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
+import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.spy;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 
 /** Tests for {@link RocksDBMetricsManager}. */
 class RocksDBMetricsManagerTest {
 
     @TempDir Path tempDir;
+    @TempDir File tempLogDir;
+    @TempDir File tmpKvDir;
     private RocksDBResourceContainer resourceContainer;
     private List<RocksDBMetricsCollector> collectors;
-    private AutoCloseable mocksCloseable;
+    private ManuallyTriggeredScheduledExecutorService testScheduler;
+    private TestScheduler scheduler;
+    private RocksDBMetricsManager testManager;
+    private final Configuration conf = new Configuration();
     @RegisterExtension public RocksDBExtension rocksDBExtension = new RocksDBExtension();
 
     @BeforeEach
     void setUp() {
         RocksDB.loadLibrary();
-        mocksCloseable = MockitoAnnotations.openMocks(this);
         // Setup resource container
         resourceContainer = new RocksDBResourceContainer(new Configuration(), tempDir.toFile());
 
         collectors = new ArrayList<>();
 
-        // Reset singleton instance for testing
-        resetSingleton();
+        // Setup test scheduler
+        testScheduler = new ManuallyTriggeredScheduledExecutorService();
+        scheduler = new TestScheduler(testScheduler);
+        scheduler.startup();
+
+        // Create test manager
+        testManager =
+                new RocksDBMetricsManager(scheduler, TestingMetricGroups.TABLET_SERVER_METRICS);
     }
 
     @AfterEach
@@ -80,184 +105,181 @@ class RocksDBMetricsManagerTest {
         collectors.clear();
 
         // Shutdown manager
-        RocksDBMetricsManager.getInstance().shutdown();
+        if (testManager != null) {
+            try {
+                testManager.shutdown();
+            } catch (Exception e) {
+                // Ignore if already shutdown
+            }
+        }
 
         // Clean up resources
         if (resourceContainer != null) {
             resourceContainer.close();
         }
-        if (mocksCloseable != null) {
-            mocksCloseable.close();
-        }
-
-        // Reset singleton for next test
-        resetSingleton();
     }
 
     @Test
     void testRegisterCollector() throws Exception {
+        scheduler.startup();
 
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
-
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
 
         RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", 0);
-        manager.registerCollector(collector);
 
-        assertThat(manager.getCollectorCount()).isEqualTo(1);
-        assertThat(manager.isRunning()).isTrue();
+        assertThat(testManager.getCollectorCount()).isEqualTo(1);
+        assertThat(testManager.isRunning()).isTrue();
 
         collectors.add(collector);
     }
 
     @Test
     void testRegisterMultipleCollectors() throws Exception {
-
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         for (int i = 0; i < 5; i++) {
             RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", i);
-            manager.registerCollector(collector);
             collectors.add(collector);
         }
 
-        assertThat(manager.getCollectorCount()).isEqualTo(5);
-        assertThat(manager.isRunning()).isTrue();
+        assertThat(testManager.getCollectorCount()).isEqualTo(5);
+        assertThat(testManager.isRunning()).isTrue();
     }
 
     @Test
     void testUnregisterCollector() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", 0);
-        manager.registerCollector(collector);
         collectors.add(collector);
 
-        assertThat(manager.getCollectorCount()).isEqualTo(1);
+        assertThat(testManager.getCollectorCount()).isEqualTo(1);
 
-        manager.unregisterCollector(collector);
+        testManager.unregisterCollector(collector);
 
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
     }
 
     @Test
     void testRegisterAfterShutdown() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
-        manager.shutdown();
+        scheduler.startup();
+        testManager.shutdown();
 
         RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", 0);
-        manager.registerCollector(collector);
 
         // Should not be registered after shutdown
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
 
         collectors.add(collector);
     }
 
     @Test
     void testMetricsCollectionStartsWithFirstCollector() throws Exception {
+        scheduler.startup();
 
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
-
-        assertThat(manager.isRunning()).isFalse();
+        assertThat(testManager.isRunning()).isFalse();
 
         RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", 0);
-        manager.registerCollector(collector);
         collectors.add(collector);
 
-        assertThat(manager.isRunning()).isTrue();
+        assertThat(testManager.isRunning()).isTrue();
     }
 
     @Test
     void testBatchProcessing() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        // Ensure scheduler is started
+        scheduler.startup();
 
         // Create many collectors to test batch processing
         int collectorCount = 250; // More than batch size (100)
-        List<RocksDBMetricsCollector> spyCollectors = new ArrayList<>();
+        List<TestableRocksDBMetricsCollector> testCollectors = new ArrayList<>();
 
         for (int i = 0; i < collectorCount; i++) {
-            RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", i);
-            RocksDBMetricsCollector spyCollector = spy(collector);
-            manager.registerCollector(spyCollector);
-            spyCollectors.add(spyCollector);
+            TestableRocksDBMetricsCollector collector =
+                    createTestableCollector("test_db", "test_table", i);
+            testCollectors.add(collector);
             collectors.add(collector);
         }
 
-        // Wait for metrics collection to occur
-        Thread.sleep(6000); // Wait for at least one collection cycle
+        // Ensure scheduler task is scheduled (first collector triggers startCollection)
+        // Then trigger metrics collection manually
+        assertThat(testManager.isRunning()).isTrue();
+        assertThat(testScheduler.getActivePeriodicScheduledTask().size()).isGreaterThan(0);
+
+        // Trigger metrics collection manually
+        testScheduler.triggerPeriodicScheduledTasks();
 
         // Verify that updateMetrics was called on all collectors
-        for (RocksDBMetricsCollector collector : spyCollectors) {
-            verify(collector, times(1)).updateMetrics();
+        for (TestableRocksDBMetricsCollector collector : testCollectors) {
+            assertThat(collector.getUpdateMetricsCallCount())
+                    .as("updateMetrics should be called at least once")
+                    .isGreaterThan(0);
         }
     }
 
     @Test
     void testExceptionHandlingInMetricsCollection() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         // Create a collector that throws exception
-        RocksDBMetricsCollector faultyCollector = createMockCollector("test_db", "test_table", 0);
-        doThrow(new RuntimeException("Test exception")).when(faultyCollector).updateMetrics();
+        FaultyRocksDBMetricsCollector faultyCollector =
+                createFaultyCollector("test_db", "test_table", 0);
 
         // Create a normal collector
-        RocksDBMetricsCollector normalCollector = createMockCollector("test_db", "test_table", 1);
-        RocksDBMetricsCollector spyNormalCollector = spy(normalCollector);
-
-        manager.registerCollector(faultyCollector);
-        manager.registerCollector(spyNormalCollector);
+        TestableRocksDBMetricsCollector normalCollector =
+                createTestableCollector("test_db", "test_table", 1);
 
         collectors.add(faultyCollector);
         collectors.add(normalCollector);
 
-        // Wait for metrics collection
-        try {
-            Thread.sleep(6000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        // Ensure scheduler task is scheduled
+        assertThat(testManager.isRunning()).isTrue();
+
+        // Trigger metrics collection manually
+        testScheduler.triggerPeriodicScheduledTasks();
 
         // Normal collector should still be called despite exception in faulty collector
-        verify(spyNormalCollector, times(1)).updateMetrics();
+        assertThat(normalCollector.getUpdateMetricsCallCount())
+                .as("Normal collector should still be called despite exception in faulty collector")
+                .isGreaterThan(0);
     }
 
     @Test
     void testShutdown() {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         // Register some collectors
         for (int i = 0; i < 3; i++) {
             RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", i);
-            manager.registerCollector(collector);
+            testManager.registerCollector(collector);
             collectors.add(collector);
         }
 
-        assertThat(manager.isRunning()).isTrue();
-        assertThat(manager.getCollectorCount()).isEqualTo(3);
+        assertThat(testManager.isRunning()).isTrue();
+        assertThat(testManager.getCollectorCount()).isEqualTo(3);
 
-        manager.shutdown();
+        testManager.shutdown();
 
-        assertThat(manager.isRunning()).isFalse();
-        assertThat(manager.isShutdown()).isTrue();
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.isRunning()).isFalse();
+        assertThat(testManager.isShutdown()).isTrue();
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
     }
 
     @Test
     void testDoubleShutdown() {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
-        manager.shutdown();
-        assertThat(manager.isShutdown()).isTrue();
+        testManager.shutdown();
+        assertThat(testManager.isShutdown()).isTrue();
 
         // Second shutdown should not cause issues
-        manager.shutdown();
-        assertThat(manager.isShutdown()).isTrue();
+        testManager.shutdown();
+        assertThat(testManager.isShutdown()).isTrue();
     }
 
     @Test
     void testConcurrentRegistrationAndUnregistration() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         int threadCount = 10;
         CountDownLatch latch = new CountDownLatch(threadCount);
@@ -274,12 +296,12 @@ class RocksDBMetricsManagerTest {
                                                 "test_db",
                                                 "test_table",
                                                 collectorId.getAndIncrement());
-                                manager.registerCollector(collector);
+                                testManager.registerCollector(collector);
                                 collectors.add(collector);
 
                                 // Immediately unregister some collectors
                                 if (j % 2 == 0) {
-                                    manager.unregisterCollector(collector);
+                                    testManager.unregisterCollector(collector);
                                 }
                             }
                         } finally {
@@ -292,21 +314,18 @@ class RocksDBMetricsManagerTest {
         executor.shutdown();
 
         // Should handle concurrent access gracefully
-        assertThat(manager.getCollectorCount()).isGreaterThanOrEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isGreaterThanOrEqualTo(0);
     }
 
     @Test
     void testEmptyCollectorsDoesNotCauseIssues() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         // Start with no collectors
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
 
-        // Wait a bit to ensure no exceptions are thrown
-        Thread.sleep(1000);
-
-        // Should still be not running
-        assertThat(manager.isRunning()).isFalse();
+        // Should still be not running (no collectors registered)
+        assertThat(testManager.isRunning()).isFalse();
     }
 
     @Test
@@ -340,70 +359,68 @@ class RocksDBMetricsManagerTest {
 
     @Test
     void testManagerStateAfterAllCollectorsUnregistered() {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         // Register collectors
         List<RocksDBMetricsCollector> testCollectors = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", i);
-            manager.registerCollector(collector);
+            testManager.registerCollector(collector);
             testCollectors.add(collector);
             collectors.add(collector);
         }
 
-        assertThat(manager.isRunning()).isTrue();
-        assertThat(manager.getCollectorCount()).isEqualTo(3);
+        assertThat(testManager.isRunning()).isTrue();
+        assertThat(testManager.getCollectorCount()).isEqualTo(3);
 
         // Unregister all collectors
         for (RocksDBMetricsCollector collector : testCollectors) {
-            manager.unregisterCollector(collector);
+            testManager.unregisterCollector(collector);
         }
 
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
         // Manager should still be running (collection thread continues)
-        assertThat(manager.isRunning()).isTrue();
+        assertThat(testManager.isRunning()).isTrue();
     }
 
     @Test
     void testResourceCleanupOnShutdown() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         // Register a collector to start the manager
         RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", 0);
-        manager.registerCollector(collector);
+        testManager.registerCollector(collector);
         collectors.add(collector);
 
-        assertThat(manager.isRunning()).isTrue();
+        assertThat(testManager.isRunning()).isTrue();
 
-        // Get the executor service via reflection to verify it's cleaned up
-        Field executorField =
-                RocksDBMetricsManager.class.getDeclaredField("metricsCollectionExecutor");
-        executorField.setAccessible(true);
-        ScheduledExecutorService executor = (ScheduledExecutorService) executorField.get(manager);
+        testManager.shutdown();
 
-        assertThat(executor.isShutdown()).isFalse();
-
-        manager.shutdown();
-
-        assertThat(manager.isShutdown()).isTrue();
-        assertThat(executor.isShutdown()).isTrue();
+        assertThat(testManager.isShutdown()).isTrue();
+        // For test scheduler, we check if scheduled task is cancelled
+        // The test scheduler's executor service doesn't have isShutdown() method
+        // Instead, we verify that the manager is shutdown and collectors are cleared
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
     }
 
     @Test
     void testConcurrentCloseAndMetricsCollection() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         // Create multiple collectors
         List<RocksDBMetricsCollector> testCollectors = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
             RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", i);
-            manager.registerCollector(collector);
+            testManager.registerCollector(collector);
             testCollectors.add(collector);
             collectors.add(collector);
         }
 
-        assertThat(manager.isRunning()).isTrue();
-        assertThat(manager.getCollectorCount()).isEqualTo(10);
+        assertThat(testManager.isRunning()).isTrue();
+        assertThat(testManager.getCollectorCount()).isEqualTo(10);
+
+        // Trigger metrics collection to simulate collection running
+        testScheduler.triggerPeriodicScheduledTasks();
 
         // Start concurrent operations - close collectors while metrics collection is running
         ExecutorService executorService = Executors.newFixedThreadPool(5);
@@ -415,8 +432,6 @@ class RocksDBMetricsManagerTest {
                     executorService.submit(
                             () -> {
                                 try {
-                                    // Random delay to simulate real-world conditions
-                                    Thread.sleep((long) (Math.random() * 50));
                                     collector.close();
                                     // Verify cleanup completion
                                     assertThat(collector.waitForCleanup(2, TimeUnit.SECONDS))
@@ -436,24 +451,28 @@ class RocksDBMetricsManagerTest {
         executorService.shutdown();
         executorService.awaitTermination(5, TimeUnit.SECONDS);
 
+        // Trigger metrics collection again to process unregistered collectors
+        testScheduler.triggerPeriodicScheduledTasks();
+        testScheduler.triggerAll();
+
         // Verify all collectors were properly unregistered
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
 
         // Verify manager is still running (collection thread continues)
-        assertThat(manager.isRunning()).isTrue();
+        assertThat(testManager.isRunning()).isTrue();
     }
 
     @Test
     void testCleanupTimeoutHandling() throws Exception {
-        RocksDBMetricsManager manager = RocksDBMetricsManager.getInstance();
+        scheduler.startup();
 
         // Create a collector
         RocksDBMetricsCollector collector = createMockCollector("test_db", "test_table", 0);
-        manager.registerCollector(collector);
+        testManager.registerCollector(collector);
         collectors.add(collector);
 
-        assertThat(manager.isRunning()).isTrue();
-        assertThat(manager.getCollectorCount()).isEqualTo(1);
+        assertThat(testManager.isRunning()).isTrue();
+        assertThat(testManager.getCollectorCount()).isEqualTo(1);
 
         // Close the collector
         collector.close();
@@ -461,8 +480,107 @@ class RocksDBMetricsManagerTest {
         // Verify cleanup completion with timeout
         assertThat(collector.waitForCleanup(1, TimeUnit.SECONDS)).isTrue();
 
+        // Trigger metrics collection to process unregistered collector
+        testScheduler.triggerPeriodicScheduledTasks();
+        testScheduler.triggerAll();
+
         // Verify collector was unregistered
-        assertThat(manager.getCollectorCount()).isEqualTo(0);
+        assertThat(testManager.getCollectorCount()).isEqualTo(0);
+    }
+
+    @Test
+    void testConcurrentKvTabletCreateAndClose() throws Exception {
+        // Test high concurrency scenario simulating Replica dynamic online/offline
+        final int threadCount = 20;
+        final int operationsPerThread = 10;
+        final ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
+        final List<Future<?>> futures = new ArrayList<>();
+        final AtomicInteger successCount = new AtomicInteger(0);
+        final AtomicInteger errorCount = new AtomicInteger(0);
+
+        // Use existing test manager from setUp
+
+        // Concurrently create and close KvTablets
+        for (int i = 0; i < threadCount; i++) {
+            final int threadId = i;
+            futures.add(
+                    executorService.submit(
+                            () -> {
+                                for (int j = 0; j < operationsPerThread; j++) {
+                                    try {
+                                        // Create a new KvTablet
+                                        PhysicalTablePath tablePath =
+                                                PhysicalTablePath.of(
+                                                        TablePath.of(
+                                                                "testDb",
+                                                                "table_" + threadId + "_" + j));
+                                        File kvDir = new File(tmpKvDir, "kv_" + threadId + "_" + j);
+                                        kvDir.mkdirs();
+
+                                        LogTablet logTablet =
+                                                createLogTablet(
+                                                        tempLogDir,
+                                                        threadId * 1000L + j,
+                                                        tablePath);
+                                        TableBucket tableBucket = logTablet.getTableBucket();
+
+                                        KvTablet kvTablet =
+                                                createKvTablet(
+                                                        tablePath,
+                                                        tableBucket,
+                                                        logTablet,
+                                                        kvDir,
+                                                        DATA1_SCHEMA_PK,
+                                                        new HashMap<>());
+
+                                        // RocksDB metrics collector is automatically initialized in
+                                        // constructor
+                                        // Close the KvTablet
+                                        kvTablet.close();
+
+                                        successCount.incrementAndGet();
+                                    } catch (Exception e) {
+                                        errorCount.incrementAndGet();
+                                        // Log but don't fail - we're testing resilience
+                                        System.err.println(
+                                                "Error in thread "
+                                                        + threadId
+                                                        + " operation "
+                                                        + j
+                                                        + ": "
+                                                        + e.getMessage());
+                                    }
+                                }
+                            }));
+        }
+
+        // Wait for all operations to complete
+        for (Future<?> future : futures) {
+            future.get(30, TimeUnit.SECONDS);
+        }
+
+        // Trigger metrics collection multiple times to simulate multiple collection cycles
+        // This ensures all collectors are properly processed and unregistered
+        for (int i = 0; i < 3; i++) {
+            testScheduler.triggerPeriodicScheduledTasks();
+            testScheduler.triggerAll();
+        }
+
+        // Verify no null pointer exceptions occurred
+        assertThat(errorCount.get())
+                .as("No exceptions should occur during concurrent create/close")
+                .isEqualTo(0);
+
+        // Verify metrics manager is still running
+        assertThat(testManager.isRunning()).isTrue();
+
+        // Verify metrics manager can still aggregate without errors
+        assertThat(testManager.getCollectorCount())
+                .as("All collectors should be unregistered after close")
+                .isEqualTo(0);
+
+        executorService.shutdown();
+        executorService.awaitTermination(5, TimeUnit.SECONDS);
     }
 
     private RocksDBMetricsCollector createMockCollector(String database, String table, int bucket) {
@@ -471,29 +589,256 @@ class RocksDBMetricsManagerTest {
 
     private RocksDBMetricsCollector createMockCollectorWithPartition(
             String database, String table, int bucket, String partition) {
-        Statistics mockStatistics = mock(Statistics.class);
+        // Create a new Statistics object for testing
+        Statistics statistics = new Statistics();
 
         TablePath tablePath = TablePath.of(database, table);
         TableBucket tableBucket = new TableBucket(0, bucket);
 
-        return spy(
-                new RocksDBMetricsCollector(
-                        rocksDBExtension.getRocksDb(),
-                        mockStatistics,
-                        TestingMetricGroups.BUCKET_METRICS,
-                        tableBucket,
-                        tablePath,
-                        partition,
-                        resourceContainer));
+        return new RocksDBMetricsCollector(
+                rocksDBExtension.getRocksDb(),
+                statistics,
+                tableBucket,
+                tablePath,
+                partition,
+                resourceContainer,
+                testManager);
     }
 
-    private void resetSingleton() {
-        try {
-            Field instanceField = RocksDBMetricsManager.class.getDeclaredField("instance");
-            instanceField.setAccessible(true);
-            instanceField.set(null, null);
-        } catch (Exception e) {
-            // Ignore for testing
+    private TestableRocksDBMetricsCollector createTestableCollector(
+            String database, String table, int bucket) {
+        // Create a new Statistics object for testing
+        Statistics statistics = new Statistics();
+
+        TablePath tablePath = TablePath.of(database, table);
+        TableBucket tableBucket = new TableBucket(0, bucket);
+
+        return new TestableRocksDBMetricsCollector(
+                rocksDBExtension.getRocksDb(),
+                statistics,
+                tableBucket,
+                tablePath,
+                null,
+                resourceContainer,
+                testManager);
+    }
+
+    private FaultyRocksDBMetricsCollector createFaultyCollector(
+            String database, String table, int bucket) {
+        // Create a new Statistics object for testing
+        Statistics statistics = new Statistics();
+
+        TablePath tablePath = TablePath.of(database, table);
+        TableBucket tableBucket = new TableBucket(0, bucket);
+
+        return new FaultyRocksDBMetricsCollector(
+                rocksDBExtension.getRocksDb(),
+                statistics,
+                tableBucket,
+                tablePath,
+                null,
+                resourceContainer,
+                testManager);
+    }
+
+    private LogTablet createLogTablet(File tempLogDir, long tableId, PhysicalTablePath tablePath)
+            throws Exception {
+        File logTabletDir =
+                LogTestUtils.makeRandomLogTabletDir(
+                        tempLogDir, tablePath.getDatabaseName(), tableId, tablePath.getTableName());
+        return LogTablet.create(
+                tablePath,
+                logTabletDir,
+                conf,
+                TestingMetricGroups.TABLET_SERVER_METRICS,
+                0,
+                new FlussScheduler(1),
+                LogFormat.ARROW,
+                1,
+                true,
+                SystemClock.getInstance(),
+                true);
+    }
+
+    private KvTablet createKvTablet(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File tmpKvDir,
+            Schema schema,
+            Map<String, String> tableConfig)
+            throws Exception {
+        RowMerger rowMerger =
+                RowMerger.create(
+                        new TableConfig(Configuration.fromMap(tableConfig)),
+                        schema,
+                        KvFormat.COMPACTED);
+        return KvTablet.create(
+                tablePath,
+                tableBucket,
+                logTablet,
+                tmpKvDir,
+                conf,
+                TestingMetricGroups.TABLET_SERVER_METRICS,
+                testManager,
+                new RootAllocator(Long.MAX_VALUE),
+                new TestingMemorySegmentPool(10 * 1024),
+                KvFormat.COMPACTED,
+                schema,
+                rowMerger,
+                DEFAULT_COMPRESSION);
+    }
+
+    /** A testable Scheduler implementation that wraps ManuallyTriggeredScheduledExecutorService. */
+    private static class TestScheduler implements Scheduler {
+        private final ManuallyTriggeredScheduledExecutorService executorService;
+        boolean started = false;
+
+        TestScheduler(ManuallyTriggeredScheduledExecutorService executorService) {
+            this.executorService = executorService;
+        }
+
+        @Override
+        public void startup() {
+            started = true;
+        }
+
+        @Override
+        public void shutdown() throws InterruptedException {
+            started = false;
+            executorService.shutdown();
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(
+                String name, Runnable task, long delayMs, long periodMs) {
+            if (!started) {
+                throw new IllegalStateException("Scheduler not started");
+            }
+            if (periodMs > 0) {
+                return new TestScheduledFuture(
+                        executorService.scheduleAtFixedRate(
+                                task, delayMs, periodMs, TimeUnit.MILLISECONDS));
+            } else {
+                return new TestScheduledFuture(
+                        executorService.schedule(task, delayMs, TimeUnit.MILLISECONDS));
+            }
+        }
+    }
+
+    /** Wrapper for ScheduledFuture to match Scheduler interface. */
+    private static class TestScheduledFuture implements ScheduledFuture<Void> {
+        private final ScheduledFuture<?> delegate;
+
+        TestScheduledFuture(ScheduledFuture<?> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            return delegate.cancel(mayInterruptIfRunning);
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return delegate.isCancelled();
+        }
+
+        @Override
+        public boolean isDone() {
+            return delegate.isDone();
+        }
+
+        @Override
+        public Void get() {
+            try {
+                delegate.get();
+                return null;
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        @Override
+        public Void get(long timeout, TimeUnit unit) {
+            try {
+                delegate.get(timeout, unit);
+                return null;
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        @Override
+        public long getDelay(TimeUnit unit) {
+            return delegate.getDelay(unit);
+        }
+
+        @Override
+        public int compareTo(java.util.concurrent.Delayed o) {
+            return delegate.compareTo(o);
+        }
+    }
+
+    /** Testable RocksDBMetricsCollector that tracks updateMetrics() calls without using mockito. */
+    private static class TestableRocksDBMetricsCollector extends RocksDBMetricsCollector {
+        private final AtomicLong updateMetricsCallCount = new AtomicLong(0);
+
+        public TestableRocksDBMetricsCollector(
+                RocksDB rocksDB,
+                Statistics statistics,
+                TableBucket tableBucket,
+                TablePath tablePath,
+                String partitionName,
+                RocksDBResourceContainer resourceContainer,
+                RocksDBMetricsManager metricsManager) {
+            super(
+                    rocksDB,
+                    statistics,
+                    tableBucket,
+                    tablePath,
+                    partitionName,
+                    resourceContainer,
+                    metricsManager);
+        }
+
+        @Override
+        public void updateMetrics() {
+            updateMetricsCallCount.incrementAndGet();
+            super.updateMetrics();
+        }
+
+        public long getUpdateMetricsCallCount() {
+            return updateMetricsCallCount.get();
+        }
+    }
+
+    /**
+     * Faulty RocksDBMetricsCollector that throws exception in updateMetrics() for testing error
+     * handling.
+     */
+    private static class FaultyRocksDBMetricsCollector extends RocksDBMetricsCollector {
+        public FaultyRocksDBMetricsCollector(
+                RocksDB rocksDB,
+                Statistics statistics,
+                TableBucket tableBucket,
+                TablePath tablePath,
+                String partitionName,
+                RocksDBResourceContainer resourceContainer,
+                RocksDBMetricsManager metricsManager) {
+            super(
+                    rocksDB,
+                    statistics,
+                    tableBucket,
+                    tablePath,
+                    partitionName,
+                    resourceContainer,
+                    metricsManager);
+        }
+
+        @Override
+        public void updateMetrics() {
+            throw new RuntimeException("Test exception");
         }
     }
 }

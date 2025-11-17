@@ -19,10 +19,6 @@ package org.apache.fluss.server.kv.rocksdb;
 
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.metrics.Gauge;
-import org.apache.fluss.metrics.MetricNames;
-import org.apache.fluss.metrics.groups.MetricGroup;
-import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 
 import org.rocksdb.Cache;
 import org.rocksdb.HistogramData;
@@ -56,11 +52,11 @@ public class RocksDBMetricsCollector implements Closeable {
 
     private final RocksDB rocksDB;
     private final Statistics statistics;
-    private final MetricGroup bucketMetricGroup;
     private final TableBucket tableBucket;
     private final TablePath tablePath;
     private final String partitionName;
     private final RocksDBResourceContainer resourceContainer;
+    private final RocksDBMetricsManager metricsManager;
 
     private volatile boolean registered = false;
 
@@ -138,78 +134,24 @@ public class RocksDBMetricsCollector implements Closeable {
     public RocksDBMetricsCollector(
             RocksDB rocksDB,
             Statistics statistics,
-            BucketMetricGroup bucketMetricGroup,
             TableBucket tableBucket,
             TablePath tablePath,
             @Nullable String partitionName,
-            RocksDBResourceContainer resourceContainer) {
+            RocksDBResourceContainer resourceContainer,
+            RocksDBMetricsManager metricsManager) {
         this.rocksDB = rocksDB;
         this.statistics = statistics;
         this.tableBucket = tableBucket;
         this.tablePath = tablePath;
         this.partitionName = partitionName;
         this.resourceContainer = resourceContainer;
-        this.bucketMetricGroup = bucketMetricGroup;
-        registerMetrics();
-        RocksDBMetricsManager.getInstance().registerCollector(this);
+        this.metricsManager = metricsManager;
+        metricsManager.registerCollector(this);
         this.registered = true;
         LOG.info(
                 "RocksDB metrics collector started for table {} bucket {}",
                 tablePath,
                 tableBucket.getBucket());
-    }
-
-    private void registerMetrics() {
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_BLOCK_CACHE_HIT_COUNT, (Gauge<Long>) () -> blockCacheHitCount);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_BLOCK_CACHE_MISS_COUNT,
-                (Gauge<Long>) () -> blockCacheMissCount);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_COMPACTION_BYTES_READ, (Gauge<Long>) () -> compactionBytesRead);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_COMPACTION_BYTES_WRITTEN,
-                (Gauge<Long>) () -> compactionBytesWritten);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_FLUSH_BYTES_WRITTEN, (Gauge<Long>) () -> flushBytesWritten);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_MEMTABLE_MEMORY_USAGE, (Gauge<Long>) () -> memtableMemoryUsage);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_BLOCK_CACHE_MEMORY_USAGE,
-                (Gauge<Long>) () -> blockCacheMemoryUsage);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_TABLE_READERS_MEMORY_USAGE,
-                (Gauge<Long>) () -> tableReadersMemoryUsage);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_TOTAL_MEMORY_USAGE, (Gauge<Long>) () -> totalMemoryUsage);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_BLOCK_CACHE_USAGE, (Gauge<Long>) () -> blockCacheUsage);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_BLOCK_CACHE_PINNED_USAGE,
-                (Gauge<Long>) () -> blockCachePinnedUsage);
-        bucketMetricGroup.gauge(MetricNames.ROCKSDB_BYTES_READ, (Gauge<Long>) () -> bytesRead);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_BYTES_WRITTEN, (Gauge<Long>) () -> bytesWritten);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_TOTAL_SST_FILES_SIZE, (Gauge<Long>) () -> totalSstFilesSize);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_BLOCK_CACHE_ADD_COUNT, (Gauge<Long>) () -> blockCacheAddCount);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_NUM_FILES_AT_LEVEL_0, (Gauge<Long>) () -> numFilesAtLevel0);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_WRITE_STALL_MICROS, (Gauge<Long>) () -> stallTimeMicros);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_COMPACTION_PENDING, (Gauge<Long>) () -> compactionPending);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_FLUSH_PENDING, (Gauge<Long>) () -> flushPending);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_DB_GET_LATENCY_MICROS, (Gauge<Long>) () -> dbGetLatencyMicros);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_DB_WRITE_LATENCY_MICROS,
-                (Gauge<Long>) () -> dbWriteLatencyMicros);
-        bucketMetricGroup.gauge(
-                MetricNames.ROCKSDB_COMPACTION_TIME_MICROS,
-                (Gauge<Long>) () -> compactionTimeMicros);
     }
 
     public void updateMetrics() {
@@ -232,9 +174,9 @@ public class RocksDBMetricsCollector implements Closeable {
             memtableMemoryUsage = getMemoryUsage(MemoryUsageType.kMemTableTotal);
             blockCacheMemoryUsage = getMemoryUsage(MemoryUsageType.kCacheTotal);
             tableReadersMemoryUsage = getMemoryUsage(MemoryUsageType.kTableReadersTotal);
-            totalMemoryUsage = getTotalMemoryUsage();
-            blockCacheUsage = getBlockCacheUsage();
-            blockCachePinnedUsage = getBlockCachePinnedUsage();
+            totalMemoryUsage = computeTotalMemoryUsage();
+            blockCacheUsage = computeBlockCacheUsage();
+            blockCachePinnedUsage = computeBlockCachePinnedUsage();
             numFilesAtLevel0 = getPropertyValueAsLong("rocksdb.num-files-at-level0");
             compactionPending = getPropertyValueAsLong("rocksdb.compaction-pending");
             flushPending = getPropertyValueAsLong("rocksdb.flush-pending");
@@ -317,7 +259,7 @@ public class RocksDBMetricsCollector implements Closeable {
         }
     }
 
-    private long getTotalMemoryUsage() {
+    private long computeTotalMemoryUsage() {
         try {
             // Check if collector is still valid before accessing resources
             if (!isCollectorValid()) {
@@ -340,7 +282,7 @@ public class RocksDBMetricsCollector implements Closeable {
         }
     }
 
-    private long getBlockCacheUsage() {
+    private long computeBlockCacheUsage() {
         try {
             // Check if collector is still valid before accessing cache
             if (!isCollectorValid()) {
@@ -354,7 +296,7 @@ public class RocksDBMetricsCollector implements Closeable {
 
             // Check if cache is still valid before casting
             if (cache instanceof org.rocksdb.LRUCache) {
-                return ((org.rocksdb.LRUCache) cache).getUsage();
+                return cache.getUsage();
             }
 
             return 0L;
@@ -364,7 +306,7 @@ public class RocksDBMetricsCollector implements Closeable {
         }
     }
 
-    private long getBlockCachePinnedUsage() {
+    private long computeBlockCachePinnedUsage() {
         try {
             // Check if collector is still valid before accessing cache
             if (!isCollectorValid()) {
@@ -378,7 +320,7 @@ public class RocksDBMetricsCollector implements Closeable {
 
             // Check if cache is still valid before casting
             if (cache instanceof org.rocksdb.LRUCache) {
-                return ((org.rocksdb.LRUCache) cache).getPinnedUsage();
+                return cache.getPinnedUsage();
             }
 
             return 0L;
@@ -390,30 +332,38 @@ public class RocksDBMetricsCollector implements Closeable {
 
     @Override
     public void close() {
-        LOG.info(
-                "Closing RocksDB metrics collector for table {} bucket {}.",
-                tablePath,
-                tableBucket.getBucket());
-
-        // Set cleanup in progress flag to prevent new operations
-        cleanupInProgress = true;
-
-        // Set closed flag to prevent new operations
-        closed = true;
-
-        // Unregister from global collector
-        if (registered) {
-            try {
-                RocksDBMetricsManager.getInstance().unregisterCollector(this);
-            } catch (Exception e) {
-                LOG.warn("Error unregistering collector from manager: {}", e.getMessage());
-            } finally {
-                registered = false;
+        // Use synchronized block to ensure thread-safe close operation
+        synchronized (this) {
+            // Check if already closed to prevent double closing
+            if (closed) {
+                return;
             }
-        }
 
-        // Signal cleanup completion
-        cleanupLatch.countDown();
+            LOG.info(
+                    "Closing RocksDB metrics collector for table {} bucket {}.",
+                    tablePath,
+                    tableBucket.getBucket());
+
+            // Set cleanup in progress flag to prevent new operations
+            cleanupInProgress = true;
+
+            // Set closed flag to prevent new operations
+            closed = true;
+
+            // Unregister from metrics manager
+            if (registered && metricsManager != null) {
+                try {
+                    metricsManager.unregisterCollector(this);
+                } catch (Exception e) {
+                    LOG.warn("Error unregistering collector from manager: {}", e.getMessage());
+                } finally {
+                    registered = false;
+                }
+            }
+
+            // Signal cleanup completion
+            cleanupLatch.countDown();
+        }
     }
 
     public TableBucket getTableBucket() {
@@ -426,5 +376,104 @@ public class RocksDBMetricsCollector implements Closeable {
 
     public String getPartitionName() {
         return partitionName;
+    }
+
+    /**
+     * Check if collector is valid for metrics collection.
+     *
+     * @return true if collector is valid
+     */
+    public boolean isCollectorValidForAggregation() {
+        return !cleanupInProgress && !closed && isCollectorValid();
+    }
+
+    // Getters for aggregated metrics
+
+    public long getBlockCacheMissCount() {
+        return blockCacheMissCount;
+    }
+
+    public long getBlockCacheHitCount() {
+        return blockCacheHitCount;
+    }
+
+    public long getBlockCacheAddCount() {
+        return blockCacheAddCount;
+    }
+
+    public long getCompactionBytesRead() {
+        return compactionBytesRead;
+    }
+
+    public long getCompactionBytesWritten() {
+        return compactionBytesWritten;
+    }
+
+    public long getFlushBytesWritten() {
+        return flushBytesWritten;
+    }
+
+    public long getBytesRead() {
+        return bytesRead;
+    }
+
+    public long getBytesWritten() {
+        return bytesWritten;
+    }
+
+    public long getBlockCacheUsage() {
+        return blockCacheUsage;
+    }
+
+    public long getBlockCachePinnedUsage() {
+        return blockCachePinnedUsage;
+    }
+
+    public long getMemtableMemoryUsage() {
+        return memtableMemoryUsage;
+    }
+
+    public long getBlockCacheMemoryUsage() {
+        return blockCacheMemoryUsage;
+    }
+
+    public long getTableReadersMemoryUsage() {
+        return tableReadersMemoryUsage;
+    }
+
+    public long getTotalMemoryUsage() {
+        return totalMemoryUsage;
+    }
+
+    public long getTotalSstFilesSize() {
+        return totalSstFilesSize;
+    }
+
+    public long getCompactionPending() {
+        return compactionPending;
+    }
+
+    public long getFlushPending() {
+        return flushPending;
+    }
+
+    public long getNumFilesAtLevel0() {
+        return numFilesAtLevel0;
+    }
+
+    public long getStallTimeMicros() {
+        return stallTimeMicros;
+    }
+
+    public long getDbGetLatencyMicros() {
+        return dbGetLatencyMicros;
+    }
+
+    public long getDbWriteLatencyMicros() {
+        return dbWriteLatencyMicros;
+    }
+
+    public long getCompactionTimeMicros() {
+        return compactionTimeMicros;
     }
 }

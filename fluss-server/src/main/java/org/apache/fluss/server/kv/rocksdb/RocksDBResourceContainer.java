@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.config.ReadableConfig;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
@@ -50,6 +51,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 
 /* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
@@ -79,8 +81,8 @@ public class RocksDBResourceContainer implements AutoCloseable {
     /** The handles to be closed when the container is closed. */
     private final ArrayList<AutoCloseable> handlesToClose;
 
-    @Nullable private Statistics statistics;
-    @Nullable private Cache blockCache;
+    @Nullable private final Statistics statistics;
+    @Nullable private final Cache blockCache;
 
     /** Flag to track if the container is closed. */
     private volatile boolean closed = false;
@@ -99,8 +101,22 @@ public class RocksDBResourceContainer implements AutoCloseable {
                         : null;
         this.enableStatistics = configuration.get(ConfigOptions.KV_STATISTICS_ENABLED);
         this.handlesToClose = new ArrayList<>();
-        initializeStatisticsIfEnable();
-        initializeBlockCacheIfEnable();
+        if (enableStatistics) {
+            statistics = new Statistics();
+            handlesToClose.add(statistics);
+        } else {
+            statistics = null;
+        }
+        long blockCacheSize =
+                Optional.ofNullable(internalGetOption(ConfigOptions.KV_BLOCK_CACHE_SIZE))
+                        .map(MemorySize::getBytes)
+                        .orElse(0L);
+        if (blockCacheSize > 0) {
+            blockCache = new LRUCache(blockCacheSize);
+            handlesToClose.add(blockCache);
+        } else {
+            blockCache = null;
+        }
     }
 
     /** Gets the RocksDB {@link DBOptions} to be used for RocksDB instances. */
@@ -287,7 +303,7 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
         // Create explicit cache instance instead of using setBlockCacheSize
         long blockCacheSize = internalGetOption(ConfigOptions.KV_BLOCK_CACHE_SIZE).getBytes();
-        if (blockCacheSize > 0) {
+        if (blockCacheSize > 0 && blockCache != null) {
             blockBasedTableConfig.setBlockCache(blockCache);
         }
 
@@ -397,20 +413,5 @@ public class RocksDBResourceContainer implements AutoCloseable {
     private File resolveFileLocation(String logFilePath) {
         File logFile = new File(logFilePath);
         return (logFile.exists() && logFile.canRead()) ? logFile : null;
-    }
-
-    private void initializeStatisticsIfEnable() {
-        if (enableStatistics) {
-            statistics = new Statistics();
-            handlesToClose.add(statistics);
-        }
-    }
-
-    private void initializeBlockCacheIfEnable() {
-        long blockCacheSize = internalGetOption(ConfigOptions.KV_BLOCK_CACHE_SIZE).getBytes();
-        if (blockCacheSize > 0) {
-            blockCache = new LRUCache(blockCacheSize);
-            handlesToClose.add(blockCache);
-        }
     }
 }
