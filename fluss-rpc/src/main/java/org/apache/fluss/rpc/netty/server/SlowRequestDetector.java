@@ -23,6 +23,8 @@ import org.apache.fluss.timer.TimerTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -44,7 +46,7 @@ class SlowRequestDetector extends TimerTask {
     private static final Logger LOG = LoggerFactory.getLogger(SlowRequestDetector.class);
 
     private final FlussRequest request;
-    private final Thread processingThread;
+    private volatile Thread processingThread;
     private final boolean dumpStack;
     private final long thresholdMs;
     private final AtomicBoolean executed = new AtomicBoolean(false);
@@ -53,14 +55,15 @@ class SlowRequestDetector extends TimerTask {
      * Creates a slow request detector.
      *
      * @param request the request to monitor
-     * @param processingThread the thread processing this request
+     * @param processingThread the thread processing this request (can be null initially and set
+     *     later)
      * @param thresholdMs the threshold in milliseconds after which the request is considered slow
      * @param dumpStack whether to dump the thread stack trace
      * @param delayMs the delay in milliseconds before checking if the request is slow
      */
     SlowRequestDetector(
             FlussRequest request,
-            Thread processingThread,
+            @Nullable Thread processingThread,
             long thresholdMs,
             boolean dumpStack,
             long delayMs) {
@@ -69,6 +72,17 @@ class SlowRequestDetector extends TimerTask {
         this.processingThread = processingThread;
         this.thresholdMs = thresholdMs;
         this.dumpStack = dumpStack;
+    }
+
+    /**
+     * Sets the processing thread. This allows the detector to be created when the request is
+     * received (to monitor queue time) and updated with the actual processing thread when the
+     * request starts being processed.
+     *
+     * @param processingThread the thread that is processing the request
+     */
+    void setProcessingThread(Thread processingThread) {
+        this.processingThread = processingThread;
     }
 
     @Override
