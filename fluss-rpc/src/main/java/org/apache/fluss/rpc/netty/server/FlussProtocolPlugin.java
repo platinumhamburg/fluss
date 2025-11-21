@@ -71,6 +71,12 @@ public class FlussProtocolPlugin implements NetworkProtocolPlugin {
     @Override
     public ChannelHandler createChannelHandler(
             RequestChannel[] requestChannels, String listenerName) {
+        boolean slowRequestMonitoringEnabled =
+                conf.get(ConfigOptions.RPC_SERVER_SLOW_REQUEST_MONITORING_ENABLED);
+        long slowRequestThresholdMs =
+                conf.get(ConfigOptions.RPC_SERVER_SLOW_REQUEST_THRESHOLD).toMillis();
+        boolean dumpStack = conf.get(ConfigOptions.RPC_SERVER_SLOW_REQUEST_DUMP_STACK);
+
         return new ServerChannelInitializer(
                 requestChannels,
                 apiManager,
@@ -81,7 +87,11 @@ public class FlussProtocolPlugin implements NetworkProtocolPlugin {
                 Optional.ofNullable(
                                 AuthenticationFactory.loadServerAuthenticatorSuppliers(conf)
                                         .get(listenerName))
-                        .orElse(PlainTextAuthenticationPlugin.PlainTextServerAuthenticator::new));
+                        .orElse(PlainTextAuthenticationPlugin.PlainTextServerAuthenticator::new),
+                slowRequestMonitoringEnabled,
+                slowRequestThresholdMs,
+                dumpStack,
+                timer);
     }
 
     @Override

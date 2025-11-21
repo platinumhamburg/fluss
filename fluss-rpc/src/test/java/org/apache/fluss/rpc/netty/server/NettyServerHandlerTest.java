@@ -72,7 +72,11 @@ final class NettyServerHandlerTest {
                         "FLUSS",
                         true,
                         RequestsMetrics.createCoordinatorServerRequestMetrics(metricGroup),
-                        new PlainTextAuthenticationPlugin.PlainTextServerAuthenticator());
+                        new PlainTextAuthenticationPlugin.PlainTextServerAuthenticator(),
+                        false,
+                        30000L,
+                        false,
+                        null);
         this.ctx = mockChannelHandlerContext();
         serverHandler.channelActive(ctx);
     }

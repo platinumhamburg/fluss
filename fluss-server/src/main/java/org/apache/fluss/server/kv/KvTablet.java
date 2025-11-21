@@ -435,7 +435,7 @@ public final class KvTablet {
                         // update the batchSequence corresponding to the writerId and also increment
                         // the CDC log offset by 1.
                         MemoryLogRecords logRecords = walBuilder.build();
-                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
+                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(logRecords);
 
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
