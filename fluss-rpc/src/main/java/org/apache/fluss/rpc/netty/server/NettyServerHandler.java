@@ -39,11 +39,15 @@ import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelHandlerContext;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelInboundHandlerAdapter;
 import org.apache.fluss.shaded.netty4.io.netty.handler.timeout.IdleState;
 import org.apache.fluss.shaded.netty4.io.netty.handler.timeout.IdleStateEvent;
+import org.apache.fluss.timer.Timer;
+import org.apache.fluss.timer.TimerTask;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.IOUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
@@ -71,6 +75,12 @@ public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
 
     private final ServerAuthenticator authenticator;
 
+    // Slow request monitoring configuration
+    private final boolean slowRequestMonitoringEnabled;
+    private final long slowRequestThresholdMs;
+    private final boolean dumpStack;
+    @Nullable private final Timer timer;
+
     private volatile ConnectionState state;
     private volatile boolean initialized = false;
 
@@ -80,13 +90,21 @@ public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
             String listenerName,
             boolean isInternal,
             RequestsMetrics requestsMetrics,
-            ServerAuthenticator authenticator) {
+            ServerAuthenticator authenticator,
+            boolean slowRequestMonitoringEnabled,
+            long slowRequestThresholdMs,
+            boolean dumpStack,
+            @Nullable Timer timer) {
         this.requestChannel = requestChannel;
         this.apiManager = apiManager;
         this.listenerName = listenerName;
         this.isInternal = isInternal;
         this.requestsMetrics = requestsMetrics;
         this.authenticator = authenticator;
+        this.slowRequestMonitoringEnabled = slowRequestMonitoringEnabled;
+        this.slowRequestThresholdMs = slowRequestThresholdMs;
+        this.dumpStack = dumpStack;
+        this.timer = timer;
         this.state = ConnectionState.START;
     }
 
@@ -132,6 +150,20 @@ public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
                             authenticator.isCompleted() ? authenticator.createPrincipal() : null,
                             ((InetSocketAddress) ctx.channel().remoteAddress()).getAddress(),
                             future);
+
+            // Schedule slow request detection immediately when request is received
+            // This ensures we monitor the total server-side time including queue waiting
+            if (slowRequestMonitoringEnabled && timer != null && slowRequestThresholdMs > 0) {
+                TimerTask slowRequestDetector =
+                        new SlowRequestDetector(
+                                request,
+                                null,
+                                slowRequestThresholdMs,
+                                dumpStack,
+                                slowRequestThresholdMs);
+                request.setSlowRequestDetector(slowRequestDetector);
+                timer.add(slowRequestDetector);
+            }
 
             future.whenCompleteAsync((r, t) -> sendResponse(ctx, request), ctx.executor());
             if (apiKey == ApiKeys.AUTHENTICATE.id

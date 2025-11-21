@@ -463,7 +463,7 @@ public class ConfigOptions {
     public static final ConfigOption<Duration> RPC_SERVER_SLOW_REQUEST_THRESHOLD =
             key("rpc.server.slow-request.threshold")
                     .durationType()
-                    .defaultValue(Duration.ofSeconds(30))
+                    .defaultValue(Duration.ofSeconds(60))
                     .withDescription(
                             "The threshold for identifying slow RPC requests on the server side. "
                                     + "When a request takes longer than this threshold to process, "

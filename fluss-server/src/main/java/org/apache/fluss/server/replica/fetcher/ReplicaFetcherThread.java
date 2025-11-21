@@ -291,6 +291,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                                     "Remote server is not the leader for replica {}, which indicate "
                                             + "that the replica is being moved.",
                                     tableBucket);
+                            replicasWithError.add(tableBucket);
                             break;
                         default:
                             LOG.error(
