@@ -29,7 +29,6 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.record.LogRecords;
-import org.apache.fluss.server.kv.wal.WalBuilder;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
@@ -506,26 +505,24 @@ public final class IndexCache implements Closeable {
      * Write hot data from WAL records to index cache. This method leverages IndexCacheWriter to
      * process WAL data and write indexed data directly to cache for immediate availability.
      *
-     * @param walBuilder the WALBuilder used to process WAL data
-     * @param walRecords the WAL LogRecords generated during KV processing
+     * <p>NOTE: The walRecords passed here should be an independent copy with its own memory, not
+     * sharing memory with any WalBuilder. This ensures the records remain valid during asynchronous
+     * processing.
+     *
+     * @param walRecords the WAL LogRecords (independent copy) generated during KV processing
      * @param appendInfo the log append information containing offset details
      */
-    public void cacheIndexDataByHotData(
-            WalBuilder walBuilder, LogRecords walRecords, LogAppendInfo appendInfo) {
+    public void cacheIndexDataByHotData(LogRecords walRecords, LogAppendInfo appendInfo) {
 
         if (closed) {
             LOG.warn(
                     "IndexCache is closed, cannot write hot data for table bucket {}",
                     logTablet.getTableBucket());
-            if (walBuilder != null) {
-                walBuilder.deallocate();
-            }
             return;
         }
 
         // Create hot data write task and submit to pending write queue
-        HotDataWrite hotDataWrite =
-                new HotDataWrite(indexCacheWriter, walBuilder, walRecords, appendInfo);
+        HotDataWrite hotDataWrite = new HotDataWrite(indexCacheWriter, walRecords, appendInfo);
         boolean submitted = pendingWriteQueue.submit(hotDataWrite);
 
         if (!submitted) {
@@ -534,10 +531,6 @@ public final class IndexCache implements Closeable {
                     logTablet.getTableBucket(),
                     appendInfo.firstOffset(),
                     appendInfo.lastOffset() + 1);
-            // Deallocate walBuilder if submission fails
-            if (walBuilder != null) {
-                walBuilder.deallocate();
-            }
         }
     }
 

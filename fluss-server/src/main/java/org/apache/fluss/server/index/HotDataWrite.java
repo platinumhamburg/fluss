@@ -20,41 +20,33 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.record.LogRecords;
-import org.apache.fluss.server.kv.wal.WalBuilder;
 import org.apache.fluss.server.log.LogAppendInfo;
 
 /**
  * Represents a hot data write operation that extracts index data from real-time WAL records and
  * writes to IndexCache.
+ *
+ * <p>NOTE: The walRecords should be an independent copy with its own memory, not sharing memory
+ * with any WalBuilder. The WalBuilder's lifecycle is managed by the caller (KvTablet) and will be
+ * deallocated immediately after creating this task.
  */
 @Internal
 public final class HotDataWrite implements PendingWrite {
 
     private final IndexCacheWriter indexCacheWriter;
-    private final WalBuilder walBuilder;
     private final LogRecords walRecords;
     private final LogAppendInfo appendInfo;
 
     public HotDataWrite(
-            IndexCacheWriter indexCacheWriter,
-            WalBuilder walBuilder,
-            LogRecords walRecords,
-            LogAppendInfo appendInfo) {
+            IndexCacheWriter indexCacheWriter, LogRecords walRecords, LogAppendInfo appendInfo) {
         this.indexCacheWriter = indexCacheWriter;
-        this.walBuilder = walBuilder;
         this.walRecords = walRecords;
         this.appendInfo = appendInfo;
     }
 
     @Override
     public void execute() throws Exception {
-        try {
-            indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo);
-        } finally {
-            if (walBuilder != null) {
-                walBuilder.deallocate();
-            }
-        }
+        indexCacheWriter.cacheIndexDataByHotData(walRecords, appendInfo);
     }
 
     @Override
