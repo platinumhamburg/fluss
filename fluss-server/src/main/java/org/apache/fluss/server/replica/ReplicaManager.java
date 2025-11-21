@@ -1708,14 +1708,27 @@ public class ReplicaManager {
         boolean errorReadingData = false;
         boolean hasFetchFromLocal = false;
         Map<TableBucket, FetchBucketStatus> fetchBucketStatusMap = new HashMap<>();
+        Map<TableBucket, FetchLogResultForBucket> expectedErrorBuckets = new HashMap<>();
         for (Map.Entry<TableBucket, LogReadResult> logReadResultEntry : logReadResults.entrySet()) {
             TableBucket tb = logReadResultEntry.getKey();
             LogReadResult logReadResult = logReadResultEntry.getValue();
             FetchLogResultForBucket fetchLogResultForBucket =
                     logReadResult.getFetchLogResultForBucket();
             if (fetchLogResultForBucket.failed()) {
-                errorReadingData = true;
-                break;
+                // Check if this is an expected error (like NOT_LEADER_OR_FOLLOWER,
+                // UNKNOWN_TABLE_OR_BUCKET, LOG_OFFSET_OUT_OF_RANGE) which should not
+                // short-circuit the entire fetch request.
+                Errors error = fetchLogResultForBucket.getError().error();
+                if (isNonCriticalFetchError(error)) {
+                    // Expected errors should not prevent other buckets from being delayed.
+                    // Save the error bucket to be returned later, and continue processing others.
+                    expectedErrorBuckets.put(tb, fetchLogResultForBucket);
+                    continue;
+                } else {
+                    // Severe/unexpected error - short-circuit and return immediately
+                    errorReadingData = true;
+                    break;
+                }
             }
 
             if (!fetchLogResultForBucket.fetchFromRemote()) {
@@ -1751,7 +1764,11 @@ public class ReplicaManager {
                             params,
                             this,
                             fetchBucketStatusMap,
-                            responseCallback,
+                            delayedResponse -> {
+                                // Merge expected error buckets with delayed response
+                                delayedResponse.putAll(expectedErrorBuckets);
+                                responseCallback.accept(delayedResponse);
+                            },
                             serverMetricGroup);
 
             // try to complete the request immediately, otherwise put it into the
@@ -1763,6 +1780,19 @@ public class ReplicaManager {
                             .map(DelayedTableBucketKey::new)
                             .collect(Collectors.toList()));
         }
+    }
+
+    /**
+     * Check if the error is an expected fetch error that should not short-circuit the entire fetch
+     * request. These errors are common during normal operations (e.g., leader changes, bucket
+     * migrations) and should not prevent other buckets from being delayed.
+     *
+     * @param error the error to check
+     * @return true if the error is expected and should not short-circuit
+     */
+    private boolean isNonCriticalFetchError(Errors error) {
+        return error == Errors.NOT_LEADER_OR_FOLLOWER
+                || error == Errors.UNKNOWN_TABLE_OR_BUCKET_EXCEPTION;
     }
 
     private void maybeAddDelayedFetchIndex(

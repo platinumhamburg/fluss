@@ -39,10 +39,6 @@ public class FlussRequestHandler implements RequestHandler<FlussRequest> {
     private static final Logger LOG = LoggerFactory.getLogger(FlussRequestHandler.class);
 
     private final RpcGatewayService service;
-    private final boolean slowRequestMonitoringEnabled;
-    private final long slowRequestThresholdMs;
-    private final boolean dumpStack;
-    @Nullable private final Timer timer;
 
     public FlussRequestHandler(
             RpcGatewayService service,
@@ -51,10 +47,8 @@ public class FlussRequestHandler implements RequestHandler<FlussRequest> {
             boolean dumpStack,
             @Nullable Timer timer) {
         this.service = service;
-        this.slowRequestMonitoringEnabled = slowRequestMonitoringEnabled;
-        this.slowRequestThresholdMs = slowRequestThresholdMs;
-        this.dumpStack = dumpStack;
-        this.timer = timer;
+        // These parameters are kept for backward compatibility but not used anymore
+        // The slow request monitoring is now done in NettyServerHandler
     }
 
     @Override
@@ -68,20 +62,13 @@ public class FlussRequestHandler implements RequestHandler<FlussRequest> {
         ApiMethod api = request.getApiMethod();
         ApiMessage message = request.getMessage();
 
-        // Schedule slow request detection if enabled
-        TimerTask slowRequestDetector = null;
-        if (slowRequestMonitoringEnabled && timer != null && slowRequestThresholdMs > 0) {
-            slowRequestDetector =
-                    new SlowRequestDetector(
-                            request,
-                            Thread.currentThread(),
-                            slowRequestThresholdMs,
-                            dumpStack,
-                            slowRequestThresholdMs);
-            timer.add(slowRequestDetector);
+        // Update the processing thread in the existing slow request detector
+        // The detector was already started when the request was received (in NettyServerHandler)
+        // Now we update it with the actual processing thread
+        TimerTask detectorTask = request.getSlowRequestDetector();
+        if (detectorTask instanceof SlowRequestDetector) {
+            ((SlowRequestDetector) detectorTask).setProcessingThread(Thread.currentThread());
         }
-
-        final TimerTask detectorTask = slowRequestDetector;
 
         try {
             service.setCurrentSession(

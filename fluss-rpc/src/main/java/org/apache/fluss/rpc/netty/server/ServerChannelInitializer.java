@@ -23,10 +23,13 @@ import org.apache.fluss.security.auth.ServerAuthenticator;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelHandlerContext;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelInitializer;
 import org.apache.fluss.shaded.netty4.io.netty.channel.socket.SocketChannel;
+import org.apache.fluss.timer.Timer;
 import org.apache.fluss.utils.MathUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.util.function.Supplier;
 
@@ -43,6 +46,10 @@ final class ServerChannelInitializer extends NettyChannelInitializer {
     private final boolean isInternal;
     private final RequestsMetrics requestsMetrics;
     private final Supplier<ServerAuthenticator> authenticatorSupplier;
+    private final boolean slowRequestMonitoringEnabled;
+    private final long slowRequestThresholdMs;
+    private final boolean dumpStack;
+    @Nullable private final Timer timer;
 
     public ServerChannelInitializer(
             RequestChannel[] requestChannels,
@@ -51,7 +58,11 @@ final class ServerChannelInitializer extends NettyChannelInitializer {
             boolean isInternal,
             RequestsMetrics requestsMetrics,
             long maxIdleTimeSeconds,
-            Supplier<ServerAuthenticator> authenticatorSupplier) {
+            Supplier<ServerAuthenticator> authenticatorSupplier,
+            boolean slowRequestMonitoringEnabled,
+            long slowRequestThresholdMs,
+            boolean dumpStack,
+            @Nullable Timer timer) {
         super(maxIdleTimeSeconds);
         this.requestChannels = requestChannels;
         this.apiManager = apiManager;
@@ -59,6 +70,10 @@ final class ServerChannelInitializer extends NettyChannelInitializer {
         this.isInternal = isInternal;
         this.requestsMetrics = requestsMetrics;
         this.authenticatorSupplier = authenticatorSupplier;
+        this.slowRequestMonitoringEnabled = slowRequestMonitoringEnabled;
+        this.slowRequestThresholdMs = slowRequestThresholdMs;
+        this.dumpStack = dumpStack;
+        this.timer = timer;
     }
 
     @Override
@@ -84,7 +99,11 @@ final class ServerChannelInitializer extends NettyChannelInitializer {
                                 endpointListenerName,
                                 isInternal,
                                 requestsMetrics,
-                                serverAuthenticator));
+                                serverAuthenticator,
+                                slowRequestMonitoringEnabled,
+                                slowRequestThresholdMs,
+                                dumpStack,
+                                timer));
     }
 
     @Override

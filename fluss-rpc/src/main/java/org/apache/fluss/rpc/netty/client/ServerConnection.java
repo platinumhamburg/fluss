@@ -333,18 +333,11 @@ final class ServerConnection {
 
             int currentRequestId = requestCount++;
 
-            // Create timeout timer task
-            RequestTimeoutTask timeoutTask =
-                    new RequestTimeoutTask(currentRequestId, DEFAULT_REQUEST_TIMEOUT_MS);
-
+            // Create InflightRequest without timeout task initially
+            // Timeout will be started only after the request is successfully sent to network
             InflightRequest inflight =
                     new InflightRequest(
-                            apiKey.id,
-                            version,
-                            currentRequestId,
-                            rawRequest,
-                            responseFuture,
-                            timeoutTask);
+                            apiKey.id, version, currentRequestId, rawRequest, responseFuture, null);
             inflightRequests.put(inflight.requestId, inflight);
             ByteBuf byteBuf;
             try {
@@ -352,10 +345,6 @@ final class ServerConnection {
             } catch (Exception e) {
                 LOG.error("Failed to encode request for '{}'.", ApiKeys.forId(inflight.apiKey), e);
                 inflightRequests.remove(inflight.requestId);
-                // Cancel timeout task
-                if (inflight.timeoutTask != null) {
-                    inflight.timeoutTask.cancel();
-                }
                 responseFuture.completeExceptionally(
                         new FlussRuntimeException(
                                 String.format(
@@ -367,19 +356,27 @@ final class ServerConnection {
 
             connectionMetrics.updateMetricsBeforeSendRequest(apiKey, rawRequest.totalSize());
 
-            // Add timeout task to timer
-            timer.add(timeoutTask);
+            // Send request to network
             channel.writeAndFlush(byteBuf)
                     .addListener(
                             (ChannelFutureListener)
                                     future -> {
-                                        if (!future.isSuccess()) {
+                                        if (future.isSuccess()) {
+                                            // Start timeout timer only after successfully sent to
+                                            // network
+                                            // This ensures timeout only measures network round-trip
+                                            // + server processing time,
+                                            // excluding client-side queuing time (e.g., semaphore
+                                            // waiting)
+                                            RequestTimeoutTask timeoutTask =
+                                                    new RequestTimeoutTask(
+                                                            currentRequestId,
+                                                            DEFAULT_REQUEST_TIMEOUT_MS);
+                                            inflight.timeoutTask = timeoutTask;
+                                            timer.add(timeoutTask);
+                                        } else {
                                             connectionMetrics.updateMetricsAfterGetResponse(
                                                     apiKey, inflight.requestStartTime, 0);
-                                            // Cancel timeout task
-                                            if (inflight.timeoutTask != null) {
-                                                inflight.timeoutTask.cancel();
-                                            }
                                             Throwable cause = future.cause();
                                             if (cause instanceof IOException) {
                                                 // when server close the channel, the cause will be
@@ -569,7 +566,7 @@ final class ServerConnection {
         final ApiMessage request;
         final long requestStartTime;
         final CompletableFuture<ApiMessage> responseFuture;
-        final TimerTask timeoutTask;
+        volatile TimerTask timeoutTask;
 
         InflightRequest(
                 short apiKey,

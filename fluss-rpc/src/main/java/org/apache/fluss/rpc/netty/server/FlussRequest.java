@@ -23,9 +23,12 @@ import org.apache.fluss.rpc.protocol.RequestType;
 import org.apache.fluss.security.acl.FlussPrincipal;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
 import org.apache.fluss.shaded.netty4.io.netty.util.ReferenceCountUtil;
+import org.apache.fluss.timer.TimerTask;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.net.InetAddress;
 import java.util.concurrent.CompletableFuture;
@@ -53,6 +56,9 @@ public final class FlussRequest implements RpcRequest {
     private volatile long requestDequeTimeMs;
     private volatile long requestCompletedTimeMs;
     private volatile boolean cancelled = false;
+
+    // slow request detector, started when request is received
+    @Nullable private volatile TimerTask slowRequestDetector;
 
     public FlussRequest(
             short apiKey,
@@ -165,6 +171,15 @@ public final class FlussRequest implements RpcRequest {
 
     public boolean isInternal() {
         return isInternal;
+    }
+
+    public void setSlowRequestDetector(TimerTask slowRequestDetector) {
+        this.slowRequestDetector = slowRequestDetector;
+    }
+
+    @Nullable
+    public TimerTask getSlowRequestDetector() {
+        return slowRequestDetector;
     }
 
     @Override

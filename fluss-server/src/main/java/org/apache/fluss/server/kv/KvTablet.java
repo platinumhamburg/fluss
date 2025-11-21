@@ -435,7 +435,7 @@ public final class KvTablet {
                         // update the batchSequence corresponding to the writerId and also increment
                         // the CDC log offset by 1.
                         MemoryLogRecords logRecords = walBuilder.build();
-                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
+                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(logRecords);
 
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
@@ -447,10 +447,13 @@ public final class KvTablet {
                             // Only process hot data writing if the batch is not duplicated
                             IndexCache cache = this.indexCache;
                             if (cache != null) {
-                                cache.cacheIndexDataByHotData(
-                                        walBuilder, logRecords, logAppendInfo);
-                                // walBuilder will be deallocate by IndexCache
-                                walBuilder = null;
+                                // FIX: Deep copy logRecords for IndexCache to avoid use-after-free
+                                // The original logRecords shares memory with walBuilder. We need to
+                                // create an independent copy for IndexCache's asynchronous
+                                // processing
+                                // to prevent corruption when walBuilder is deallocated.
+                                MemoryLogRecords logRecordsCopy = deepCopyLogRecords(logRecords);
+                                cache.cacheIndexDataByHotData(logRecordsCopy, logAppendInfo);
                             }
                         }
                         return logAppendInfo;
@@ -470,6 +473,27 @@ public final class KvTablet {
                         }
                     }
                 });
+    }
+
+    /**
+     * Deep copy MemoryLogRecords to create an independent copy with its own memory.
+     *
+     * <p>This is necessary because the original MemoryLogRecords shares memory with WalBuilder's
+     * internal buffer pool. If we pass the original to asynchronous components (like IndexCache),
+     * and then deallocate the WalBuilder, the memory will be freed/reused, causing data corruption
+     * and CRC validation failures.
+     *
+     * @param original the original MemoryLogRecords that shares memory with WalBuilder
+     * @return a deep copy with independent memory
+     */
+    private MemoryLogRecords deepCopyLogRecords(MemoryLogRecords original) {
+        // Allocate a new byte array and copy the data
+        int sizeInBytes = original.sizeInBytes();
+        byte[] copyBytes = new byte[sizeInBytes];
+        original.getMemorySegment().get(original.getPosition(), copyBytes, 0, sizeInBytes);
+
+        // Create a new MemoryLogRecords from the copied bytes
+        return MemoryLogRecords.pointToBytes(copyBytes);
     }
 
     private WalBuilder createWalBuilder(int schemaId, RowType rowType) throws Exception {
