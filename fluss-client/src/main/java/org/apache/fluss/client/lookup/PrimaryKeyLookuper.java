@@ -116,7 +116,7 @@ class PrimaryKeyLookuper implements Lookuper {
     }
 
     @Override
-    public synchronized CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
+    public CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
         try {
             // encoding the key row using a compacted way consisted with how the key is encoded when
             // put
