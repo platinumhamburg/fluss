@@ -176,11 +176,13 @@ final class ServerConnection {
             // notify all the inflight requests
             for (int requestId : inflightRequests.keySet()) {
                 InflightRequest request = inflightRequests.remove(requestId);
-                // Cancel timeout task
-                if (request.timeoutTask != null) {
-                    request.timeoutTask.cancel();
+                if (request != null) {
+                    // Cancel timeout task
+                    if (request.timeoutTask != null) {
+                        request.timeoutTask.cancel();
+                    }
+                    request.responseFuture.completeExceptionally(requestCause);
                 }
-                request.responseFuture.completeExceptionally(requestCause);
             }
 
             // notify all the pending requests
