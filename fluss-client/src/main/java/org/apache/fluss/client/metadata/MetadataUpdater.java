@@ -19,6 +19,7 @@ package org.apache.fluss.client.metadata;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.utils.ClientUtils;
+import org.apache.fluss.client.utils.MetadataUtils;
 import org.apache.fluss.cluster.BucketLocation;
 import org.apache.fluss.cluster.Cluster;
 import org.apache.fluss.cluster.ServerNode;
@@ -52,6 +53,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
@@ -201,6 +203,31 @@ public class MetadataUpdater {
     }
 
     /**
+     * Async version of checkAndUpdatePartitionMetadata that returns the partition ID. This is used
+     * to avoid deadlock when called from Netty IO threads.
+     */
+    public CompletableFuture<Long> checkAndUpdatePartitionMetadataAsync(
+            PhysicalTablePath physicalTablePath) {
+        if (cluster.getPartitionId(physicalTablePath).isPresent()) {
+            return CompletableFuture.completedFuture(
+                    cluster.getPartitionIdOrElseThrow(physicalTablePath));
+        }
+
+        return updateMetadataAsync(null, Collections.singleton(physicalTablePath), null)
+                .thenApply(
+                        v -> {
+                            // After update, check again
+                            if (cluster.getPartitionId(physicalTablePath).isPresent()) {
+                                return cluster.getPartitionIdOrElseThrow(physicalTablePath);
+                            } else {
+                                throw new FlussRuntimeException(
+                                        new PartitionNotExistException(
+                                                "Partition does not exist: " + physicalTablePath));
+                            }
+                        });
+    }
+
+    /**
      * Check the table/partition info for the given table bucket exist in metadata cache, if not,
      * try to update the metadata cache.
      */
@@ -259,15 +286,26 @@ public class MetadataUpdater {
             @Nullable Collection<PhysicalTablePath> tablePartitionNames,
             @Nullable Collection<Long> tablePartitionIds)
             throws PartitionNotExistException {
+        // Read current cluster state outside synchronized block to avoid deadlock
+        final Cluster currentCluster;
+        synchronized (this) {
+            currentCluster = cluster;
+        }
+
         try {
+            // Perform network I/O without holding lock to avoid deadlock
+            // when Netty IO thread tries to update metadata in callback
+            Cluster newCluster =
+                    sendMetadataRequestAndRebuildCluster(
+                            currentCluster,
+                            rpcClient,
+                            tablePaths,
+                            tablePartitionNames,
+                            tablePartitionIds);
+
+            // Update shared state in synchronized block
             synchronized (this) {
-                cluster =
-                        sendMetadataRequestAndRebuildCluster(
-                                cluster,
-                                rpcClient,
-                                tablePaths,
-                                tablePartitionNames,
-                                tablePartitionIds);
+                cluster = newCluster;
             }
         } catch (Exception e) {
             Throwable t = ExceptionUtils.stripExecutionException(e);
@@ -280,6 +318,52 @@ public class MetadataUpdater {
                 throw new FlussRuntimeException("Failed to update metadata", t);
             }
         }
+    }
+
+    /**
+     * Async version of updateMetadata that does not block the calling thread. This is used to avoid
+     * deadlock when called from Netty IO threads.
+     */
+    public CompletableFuture<Void> updateMetadataAsync(
+            @Nullable Set<TablePath> tablePaths,
+            @Nullable Collection<PhysicalTablePath> tablePartitionNames,
+            @Nullable Collection<Long> tablePartitionIds) {
+        // Read current cluster state outside synchronized block
+        final Cluster currentCluster;
+        synchronized (this) {
+            currentCluster = cluster;
+        }
+
+        // Perform async network I/O without blocking
+        return MetadataUtils.sendMetadataRequestAndRebuildClusterAsync(
+                        currentCluster,
+                        rpcClient,
+                        tablePaths,
+                        tablePartitionNames,
+                        tablePartitionIds)
+                .thenAccept(
+                        newCluster -> {
+                            // Update shared state in synchronized block
+                            synchronized (this) {
+                                cluster = newCluster;
+                            }
+                        })
+                .exceptionally(
+                        e -> {
+                            Throwable t = ExceptionUtils.stripExecutionException(e);
+                            if (t instanceof RetriableException || t instanceof TimeoutException) {
+                                LOG.warn(
+                                        "Failed to update metadata, but the exception is re-triable.",
+                                        t);
+                            } else if (t instanceof PartitionNotExistException) {
+                                LOG.warn(
+                                        "Failed to update metadata because the partition does not exist",
+                                        t);
+                            } else {
+                                LOG.error("Failed to update metadata", t);
+                            }
+                            return null;
+                        });
     }
 
     /**

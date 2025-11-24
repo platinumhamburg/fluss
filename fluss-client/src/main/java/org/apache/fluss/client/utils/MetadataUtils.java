@@ -48,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 
@@ -89,6 +90,25 @@ public class MetadataUtils {
                 gateway, true, cluster, tablePaths, tablePartitionNames, tablePartitionIds);
     }
 
+    /**
+     * Async version of sendMetadataRequestAndRebuildCluster. This is used to avoid deadlock when
+     * called from Netty IO threads.
+     */
+    public static CompletableFuture<Cluster> sendMetadataRequestAndRebuildClusterAsync(
+            Cluster cluster,
+            RpcClient client,
+            @Nullable Set<TablePath> tablePaths,
+            @Nullable Collection<PhysicalTablePath> tablePartitionNames,
+            @Nullable Collection<Long> tablePartitionIds) {
+        AdminReadOnlyGateway gateway =
+                GatewayClientProxy.createGatewayProxy(
+                        () -> getOneAvailableTabletServerNode(cluster),
+                        client,
+                        AdminReadOnlyGateway.class);
+        return sendMetadataRequestAndRebuildClusterAsync(
+                gateway, true, cluster, tablePaths, tablePartitionNames, tablePartitionIds);
+    }
+
     /** maybe partial update cluster. */
     public static Cluster sendMetadataRequestAndRebuildCluster(
             AdminReadOnlyGateway gateway,
@@ -98,6 +118,24 @@ public class MetadataUtils {
             @Nullable Collection<PhysicalTablePath> tablePartitions,
             @Nullable Collection<Long> tablePartitionIds)
             throws ExecutionException, InterruptedException, TimeoutException {
+        return sendMetadataRequestAndRebuildClusterAsync(
+                        gateway,
+                        partialUpdate,
+                        originCluster,
+                        tablePaths,
+                        tablePartitions,
+                        tablePartitionIds)
+                .get();
+    }
+
+    /** Async version of sendMetadataRequestAndRebuildCluster. */
+    public static CompletableFuture<Cluster> sendMetadataRequestAndRebuildClusterAsync(
+            AdminReadOnlyGateway gateway,
+            boolean partialUpdate,
+            Cluster originCluster,
+            @Nullable Set<TablePath> tablePaths,
+            @Nullable Collection<PhysicalTablePath> tablePartitions,
+            @Nullable Collection<Long> tablePartitionIds) {
         MetadataRequest metadataRequest =
                 ClientRpcMessageUtils.makeMetadataRequest(
                         tablePaths, tablePartitions, tablePartitionIds);
@@ -158,8 +196,7 @@ public class MetadataUtils {
                                     newTablePathToTableId,
                                     newPartitionIdByPath,
                                     newTablePathToTableInfo);
-                        })
-                .get();
+                        });
     }
 
     private static NewTableMetadata getTableMetadataToUpdate(
