@@ -20,7 +20,7 @@ package org.apache.fluss.client.lookup;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.metrics.LookuperMetricGroup;
-import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
@@ -52,8 +52,8 @@ public class SecondaryIndexLookuper implements Lookuper {
     /** Lookuper for querying the main table. */
     private final PrimaryKeyLookuper mainTableLookuper;
 
-    /** Projection to extract primary key from index table results. */
-    private final ProjectedRow primaryKeyProjection;
+    /** Index mapping to extract primary key from index table results. */
+    private final int[] primaryKeyIndexes;
 
     /** Metric group for reporting secondary index lookup metrics. */
     private final LookuperMetricGroup lookuperMetricGroup;
@@ -83,16 +83,15 @@ public class SecondaryIndexLookuper implements Lookuper {
         this.mainTableLookuper =
                 new PrimaryKeyLookuper(mainTableInfo, metadataUpdater, lookupClient);
 
-        // Create projection to extract primary key columns from index table results
+        // Create index mapping to extract primary key columns from index table results
         List<String> mainTablePrimaryKeys = mainTableInfo.getPrimaryKeys();
-        int[] primaryKeyIndexes = new int[mainTablePrimaryKeys.size()];
+        this.primaryKeyIndexes = new int[mainTablePrimaryKeys.size()];
         List<String> indexTableColumns = indexTableInfo.getRowType().getFieldNames();
 
         for (int i = 0; i < mainTablePrimaryKeys.size(); i++) {
-            primaryKeyIndexes[i] = indexTableColumns.indexOf(mainTablePrimaryKeys.get(i));
+            this.primaryKeyIndexes[i] = indexTableColumns.indexOf(mainTablePrimaryKeys.get(i));
         }
 
-        this.primaryKeyProjection = ProjectedRow.from(primaryKeyIndexes);
         this.lookuperMetricGroup = lookuperMetricGroup;
         this.mainTableLookupBatchSize = Math.max(1, mainTableLookupBatchSize);
 
@@ -213,7 +212,9 @@ public class SecondaryIndexLookuper implements Lookuper {
 
         for (InternalRow indexRow : batch) {
             // Extract primary key from index table row
-            InternalRow primaryKey = primaryKeyProjection.replaceRow(indexRow);
+            // Create a new ProjectedRow instance for each lookup to ensure thread safety
+            ProjectedRow projectedRow = ProjectedRow.from(primaryKeyIndexes);
+            InternalRow primaryKey = projectedRow.replaceRow(indexRow);
 
             // Query main table using primary key with exception handling
             CompletableFuture<LookupResult> mainLookup =
@@ -271,14 +272,19 @@ public class SecondaryIndexLookuper implements Lookuper {
                         "Error happened during main table lookup for sk:%s, pk:%s",
                         StringUtils.internalRowDebugString(lookupRowType, lookupKey),
                         StringUtils.internalRowDebugString(primaryKeyRowType, primaryKey));
-        LOG.error(errorMessage, throwable);
-        if (ExceptionUtils.findThrowable(throwable, UnknownTableOrBucketException.class)
-                .isPresent()) {
-            return new LookupResult((InternalRow) null);
-        } else if (ExceptionUtils.findThrowable(throwable, IllegalArgumentException.class)
-                .isPresent()) {
+
+        // Handle recoverable exceptions by returning empty result
+        if (ExceptionUtils.findThrowable(throwable, PartitionNotExistException.class).isPresent()) {
+            // This can happen when main table partition has been deleted (TTL)
+            // but index table still has references due to different retention mechanisms
+            LOG.debug(
+                    "Partition not found during main table lookup for sk:{}, pk:{}. "
+                            + "This may indicate index-main table retention mismatch.",
+                    StringUtils.internalRowDebugString(lookupRowType, lookupKey),
+                    StringUtils.internalRowDebugString(primaryKeyRowType, primaryKey));
             return new LookupResult((InternalRow) null);
         } else {
+            LOG.error(errorMessage, throwable);
             throw new RuntimeException(errorMessage, throwable);
         }
     }

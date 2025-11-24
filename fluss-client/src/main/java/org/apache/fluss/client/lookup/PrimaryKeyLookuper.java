@@ -32,6 +32,7 @@ import org.apache.fluss.row.encode.TsValueDecoder;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
@@ -39,8 +40,9 @@ import javax.annotation.concurrent.NotThreadSafe;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
-import static org.apache.fluss.client.utils.ClientUtils.getPartitionId;
+import static org.apache.fluss.client.utils.ClientUtils.getPartitionIdAsync;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** An implementation of {@link Lookuper} that lookups by primary key. */
@@ -123,47 +125,69 @@ class PrimaryKeyLookuper implements Lookuper {
             // encoding the key row using a compacted way consisted with how the key is encoded when
             // put
             // a row
-            byte[] pkBytes = primaryKeyEncoder.encodeKey(lookupKey);
-            byte[] bkBytes =
-                    bucketKeyEncoder == primaryKeyEncoder
-                            ? pkBytes
-                            : bucketKeyEncoder.encodeKey(lookupKey);
-            Long partitionId = null;
-            if (partitionGetter != null) {
-                try {
-                    partitionId =
-                            getPartitionId(
-                                    lookupKey,
-                                    partitionGetter,
-                                    tableInfo.getTablePath(),
-                                    metadataUpdater);
-                } catch (PartitionNotExistException e) {
-                    return CompletableFuture.completedFuture(
-                            new LookupResult(Collections.emptyList()));
-                }
+            // Synchronize only the KeyEncoder usage to avoid blocking on network I/O
+            final byte[] pkBytes;
+            final byte[] bkBytes;
+            synchronized (this) {
+                pkBytes = primaryKeyEncoder.encodeKey(lookupKey);
+                bkBytes =
+                        bucketKeyEncoder == primaryKeyEncoder
+                                ? pkBytes
+                                : bucketKeyEncoder.encodeKey(lookupKey);
             }
 
-            int bucketId = bucketingFunction.bucketing(bkBytes, numBuckets);
-            TableBucket tableBucket =
-                    new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-            return lookupClient
-                    .lookup(tableBucket, pkBytes)
-                    .thenApply(
-                            valueBytes -> {
-                                InternalRow row;
-                                if (valueBytes == null) {
-                                    row = null;
-                                } else if (shouldUseTsDecoding) {
-                                    // For values encoded with timestamp, use TsValueDecoder
-                                    row = kvTsValueDecoder.decodeValue(valueBytes).row;
-                                } else {
-                                    // For normal values, use ValueDecoder
-                                    row = kvValueDecoder.decodeValue(valueBytes).row;
-                                }
-                                return new LookupResult(row);
-                            });
+            // If partition getter is present, we need to get partition ID asynchronously
+            if (partitionGetter != null) {
+                // Use async version to avoid blocking Netty IO threads
+                return getPartitionIdAsync(
+                                lookupKey,
+                                partitionGetter,
+                                tableInfo.getTablePath(),
+                                metadataUpdater)
+                        .thenCompose(
+                                partitionId -> {
+                                    int bucketId = bucketingFunction.bucketing(bkBytes, numBuckets);
+                                    TableBucket tableBucket =
+                                            new TableBucket(
+                                                    tableInfo.getTableId(), partitionId, bucketId);
+                                    return lookupClient.lookup(tableBucket, pkBytes);
+                                })
+                        .thenApply(this::decodeValue)
+                        .exceptionally(
+                                e -> {
+                                    // Handle PartitionNotExistException by returning empty result
+                                    // Use ExceptionUtils.findThrowable to search through the
+                                    // entire exception chain, as the exception may be wrapped in
+                                    // multiple layers of CompletionException
+                                    if (ExceptionUtils.findThrowable(
+                                                    e, PartitionNotExistException.class)
+                                            .isPresent()) {
+                                        return new LookupResult(Collections.emptyList());
+                                    }
+                                    throw new CompletionException(e);
+                                });
+            } else {
+                // No partition, directly perform lookup
+                int bucketId = bucketingFunction.bucketing(bkBytes, numBuckets);
+                TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), null, bucketId);
+                return lookupClient.lookup(tableBucket, pkBytes).thenApply(this::decodeValue);
+            }
         } catch (Exception e) {
             return FutureUtils.failedCompletableFuture(e);
         }
+    }
+
+    private LookupResult decodeValue(byte[] valueBytes) {
+        InternalRow row;
+        if (valueBytes == null) {
+            row = null;
+        } else if (shouldUseTsDecoding) {
+            // For values encoded with timestamp, use TsValueDecoder
+            row = kvTsValueDecoder.decodeValue(valueBytes).row;
+        } else {
+            // For normal values, use ValueDecoder
+            row = kvValueDecoder.decodeValue(valueBytes).row;
+        }
+        return new LookupResult(row);
     }
 }
