@@ -18,6 +18,7 @@
 package org.apache.fluss.client.metadata;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.client.utils.ClientRpcMessageUtils;
 import org.apache.fluss.client.utils.ClientUtils;
 import org.apache.fluss.client.utils.MetadataUtils;
 import org.apache.fluss.cluster.BucketLocation;
@@ -39,6 +40,7 @@ import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.AdminReadOnlyGateway;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.MetadataRequest;
 import org.apache.fluss.utils.ExceptionUtils;
 
 import org.slf4j.Logger;
@@ -54,6 +56,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
@@ -286,28 +289,10 @@ public class MetadataUpdater {
             @Nullable Collection<PhysicalTablePath> tablePartitionNames,
             @Nullable Collection<Long> tablePartitionIds)
             throws PartitionNotExistException {
-        // Read current cluster state outside synchronized block to avoid deadlock
-        final Cluster currentCluster;
-        synchronized (this) {
-            currentCluster = cluster;
-        }
-
         try {
-            // Perform network I/O without holding lock to avoid deadlock
-            // when Netty IO thread tries to update metadata in callback
-            Cluster newCluster =
-                    sendMetadataRequestAndRebuildCluster(
-                            currentCluster,
-                            rpcClient,
-                            tablePaths,
-                            tablePartitionNames,
-                            tablePartitionIds);
-
-            // Update shared state in synchronized block
-            synchronized (this) {
-                cluster = newCluster;
-            }
-        } catch (Exception e) {
+            // Delegate to async version and wait for completion
+            updateMetadataAsync(tablePaths, tablePartitionNames, tablePartitionIds).get();
+        } catch (ExecutionException e) {
             Throwable t = ExceptionUtils.stripExecutionException(e);
             if (t instanceof RetriableException || t instanceof TimeoutException) {
                 LOG.warn("Failed to update metadata, but the exception is re-triable.", t);
@@ -317,6 +302,9 @@ public class MetadataUpdater {
             } else {
                 throw new FlussRuntimeException("Failed to update metadata", t);
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new FlussRuntimeException("Interrupted while updating metadata", e);
         }
     }
 
@@ -328,41 +316,35 @@ public class MetadataUpdater {
             @Nullable Set<TablePath> tablePaths,
             @Nullable Collection<PhysicalTablePath> tablePartitionNames,
             @Nullable Collection<Long> tablePartitionIds) {
-        // Read current cluster state outside synchronized block
-        final Cluster currentCluster;
-        synchronized (this) {
-            currentCluster = cluster;
-        }
-
-        // Perform async network I/O without blocking
-        return MetadataUtils.sendMetadataRequestAndRebuildClusterAsync(
-                        currentCluster,
+        AdminReadOnlyGateway gateway =
+                GatewayClientProxy.createGatewayProxy(
+                        () -> MetadataUtils.getOneAvailableTabletServerNode(cluster),
                         rpcClient,
-                        tablePaths,
-                        tablePartitionNames,
-                        tablePartitionIds)
+                        AdminReadOnlyGateway.class);
+
+        MetadataRequest metadataRequest =
+                ClientRpcMessageUtils.makeMetadataRequest(
+                        tablePaths, tablePartitionNames, tablePartitionIds);
+
+        // Perform async network I/O without blocking.
+        // The response will be merged with the LATEST cluster state in synchronized block,
+        // which prevents lost update issues from concurrent metadata updates.
+        return gateway.metadata(metadataRequest)
                 .thenAccept(
-                        newCluster -> {
-                            // Update shared state in synchronized block
+                        response -> {
+                            // Merge response with latest cluster in synchronized block to avoid
+                            // lost update.
+                            // This is safe because:
+                            // 1. Network I/O is done outside the lock (no deadlock)
+                            // 2. Merge uses the most current cluster state (no lost update)
+                            // 3. Merge operation is fast (minimal lock contention)
                             synchronized (this) {
-                                cluster = newCluster;
+                                cluster =
+                                        MetadataUtils.mergeMetadataResponseIntoCluster(
+                                                cluster, // Use latest cluster, not a stale snapshot
+                                                response,
+                                                tablePaths != null && !tablePaths.isEmpty());
                             }
-                        })
-                .exceptionally(
-                        e -> {
-                            Throwable t = ExceptionUtils.stripExecutionException(e);
-                            if (t instanceof RetriableException || t instanceof TimeoutException) {
-                                LOG.warn(
-                                        "Failed to update metadata, but the exception is re-triable.",
-                                        t);
-                            } else if (t instanceof PartitionNotExistException) {
-                                LOG.warn(
-                                        "Failed to update metadata because the partition does not exist",
-                                        t);
-                            } else {
-                                LOG.error("Failed to update metadata", t);
-                            }
-                            return null;
                         });
     }
 
