@@ -180,13 +180,15 @@ public final class IndexCache implements Closeable {
         MemorySize batchSize = conf.get(ConfigOptions.SERVER_INDEX_CACHE_COLD_LOAD_BATCH_SIZE);
         this.coldLoadBatchSize = batchSize.getBytes();
 
-        // Initialize pending write queue to replace indexWriterExecutor
+        // Initialize unbounded pending write queue with guaranteed task execution
+        // to handle multi-index table scenarios where processing time increases proportionally
+        // with the number of indexes. All tasks will retry indefinitely until success.
         this.pendingWriteQueue =
                 new PendingWriteQueue(
                         logTablet.getTableBucket().toString(),
-                        500, // queue capacity
-                        3, // max retries
-                        1000); // retry backoff ms
+                        9192, // initial capacity hint
+                        100, // log error every 100 retries
+                        10); // retry every 10ms
 
         LOG.info(
                 "IndexCache initialized with row-level cache architecture for data bucket {} with {} index definitions, "
@@ -485,14 +487,14 @@ public final class IndexCache implements Closeable {
                     }
                 };
 
-        // Submit cold data loading task for this batch
+        // Submit cold data loading task to unbounded queue
         ColdDataLoad coldDataLoad =
                 new ColdDataLoad(indexCacheWriter, loadStartOffset, batchEndOffset, callback);
         boolean submitted = pendingWriteQueue.submit(coldDataLoad);
 
         if (!submitted) {
             LOG.error(
-                    "DataBucket {}: Failed to submit cold data loading task for batch range [{}, {})",
+                    "DataBucket {}: Failed to submit cold data loading task for batch range [{}, {}), queue may be closed",
                     logTablet.getTableBucket(),
                     loadStartOffset,
                     batchEndOffset);
@@ -521,13 +523,13 @@ public final class IndexCache implements Closeable {
             return;
         }
 
-        // Create hot data write task and submit to pending write queue
+        // Create hot data write task and submit to unbounded pending write queue
         HotDataWrite hotDataWrite = new HotDataWrite(indexCacheWriter, walRecords, appendInfo);
         boolean submitted = pendingWriteQueue.submit(hotDataWrite);
 
         if (!submitted) {
             LOG.error(
-                    "Failed to submit hot data write task for table bucket {}, range [{}, {}), queue may be full",
+                    "Failed to submit hot data write task for table bucket {}, range [{}, {}), queue may be closed",
                     logTablet.getTableBucket(),
                     appendInfo.firstOffset(),
                     appendInfo.lastOffset() + 1);
