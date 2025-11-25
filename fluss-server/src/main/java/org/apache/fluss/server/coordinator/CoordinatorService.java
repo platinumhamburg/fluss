@@ -311,11 +311,13 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         // then create table;
-        metadataManager.createTable(
-                tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+        long tableId =
+                metadataManager.createTable(
+                        tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
 
-        // create index tables if the main table has indexes and creation was successful
-        if (!tableDescriptor.getSchema().getIndexes().isEmpty()) {
+        // create index tables if the main table has indexes and the table was actually created
+        // (tableId != -1 means the table was newly created, not skipped due to IF NOT EXISTS)
+        if (tableId != -1 && !tableDescriptor.getSchema().getIndexes().isEmpty()) {
             try {
                 indexTableHelper.createIndexTables(tablePath, tableDescriptor);
             } catch (Exception e) {

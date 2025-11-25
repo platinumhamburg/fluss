@@ -87,8 +87,12 @@ public class IndexTableHelper {
 
                 while (retryAttempts < indexAutoCreateMaxRetryAttempts && !created) {
                     try {
-                        createSingleIndexTable(indexTablePath, indexTableDescriptor);
-                        createdIndexTables.add(indexTablePath);
+                        long indexTableId =
+                                createSingleIndexTable(indexTablePath, indexTableDescriptor);
+                        // Only track as created if it was actually created (not skipped)
+                        if (indexTableId != -1) {
+                            createdIndexTables.add(indexTablePath);
+                        }
                         created = true;
                     } catch (Exception e) {
                         lastException = e;
@@ -136,8 +140,9 @@ public class IndexTableHelper {
      *
      * @param indexTablePath the path of the index table
      * @param indexTableDescriptor the descriptor of the index table
+     * @return the table id, or -1 if the table already exists and was skipped
      */
-    private void createSingleIndexTable(
+    private long createSingleIndexTable(
             TablePath indexTablePath, TableDescriptor indexTableDescriptor) {
         int bucketCount = indexTableDescriptor.getTableDistribution().get().getBucketCount().get();
         int replicaFactor = indexTableDescriptor.getReplicationFactor();
@@ -145,9 +150,20 @@ public class IndexTableHelper {
         TableAssignment indexTableAssignment =
                 generateAssignment(bucketCount, replicaFactor, servers);
 
-        // create the index table (mark as index table to allow __offset system column)
-        metadataManager.createTable(
-                indexTablePath, indexTableDescriptor, indexTableAssignment, false, true);
+        // create the index table with ignoreIfExists=true to avoid failure when index table
+        // already exists (mark as index table to allow __offset system column)
+        long tableId =
+                metadataManager.createTable(
+                        indexTablePath, indexTableDescriptor, indexTableAssignment, true, true);
+
+        if (tableId == -1) {
+            LOG.info(
+                    "Index table {} already exists, skipping creation for index {}",
+                    indexTablePath,
+                    indexTableDescriptor.getSchema().getIndexes().get(0).getIndexName());
+        }
+
+        return tableId;
     }
 
     /**
