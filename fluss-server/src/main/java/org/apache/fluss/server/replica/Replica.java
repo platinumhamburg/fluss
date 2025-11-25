@@ -669,6 +669,15 @@ public final class Replica {
             logTablet.setIndexCache(null);
         }
 
+        // Unregister IndexCache metrics suppliers from TableMetricGroup
+        if (indexCache != null && bucketMetricGroup != null) {
+            TableMetricGroup tableMetricGroup = (TableMetricGroup) bucketMetricGroup.getParent();
+            tableMetricGroup.unregisterBucketIndexCacheMetricsSuppliers(tableBucket);
+            LOG.info(
+                    "IndexCache metrics unregistered from TableMetricGroup for table bucket {}",
+                    tableBucket);
+        }
+
         if (closeableRegistry.unregisterCloseable(closeableRegistryForIndexComponent)) {
             IOUtils.closeQuietly(closeableRegistryForIndexComponent);
         }
@@ -858,6 +867,32 @@ public final class Replica {
                     tableBucket,
                     dataBucketLogEndOffset);
         }
+
+        // Register IndexCache metrics to BucketMetricGroup
+        registerIndexCacheMetrics();
+    }
+
+    private void registerIndexCacheMetrics() {
+        if (indexCache == null || bucketMetricGroup == null) {
+            return;
+        }
+
+        // Get TableMetricGroup from BucketMetricGroup's parent
+        TableMetricGroup tableMetricGroup = (TableMetricGroup) bucketMetricGroup.getParent();
+
+        // Register IndexCache metrics suppliers to TableMetricGroup for table-level aggregation
+        tableMetricGroup.registerBucketIndexCacheMetricsSuppliers(
+                tableBucket,
+                indexCache::getHotDataQueuedTasks,
+                indexCache::getHotDataExecutedTasks,
+                indexCache::getHotDataRetryingTasks,
+                indexCache::getColdDataQueuedTasks,
+                indexCache::getColdDataExecutedTasks,
+                indexCache::getColdDataRetryingTasks);
+
+        LOG.info(
+                "IndexCache metrics registered to TableMetricGroup for table bucket {}",
+                tableBucket);
     }
 
     // Hot data indexing logic has been moved to KvTablet for better code organization

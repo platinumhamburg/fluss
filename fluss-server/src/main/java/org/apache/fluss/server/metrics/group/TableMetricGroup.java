@@ -62,6 +62,23 @@ public class TableMetricGroup extends AbstractMetricGroup {
     // Flag to ensure index max replication lag gauge is registered only once
     private volatile boolean indexMaxLagGaugeRegistered = false;
 
+    // Maps to track IndexCache write queue metrics suppliers for each bucket
+    private final Map<TableBucket, java.util.function.Supplier<Long>> hotDataQueuedSuppliers =
+            MapUtils.newConcurrentHashMap();
+    private final Map<TableBucket, java.util.function.Supplier<Long>> hotDataExecutedSuppliers =
+            MapUtils.newConcurrentHashMap();
+    private final Map<TableBucket, java.util.function.Supplier<Long>> hotDataRetryingSuppliers =
+            MapUtils.newConcurrentHashMap();
+    private final Map<TableBucket, java.util.function.Supplier<Long>> coldDataQueuedSuppliers =
+            MapUtils.newConcurrentHashMap();
+    private final Map<TableBucket, java.util.function.Supplier<Long>> coldDataExecutedSuppliers =
+            MapUtils.newConcurrentHashMap();
+    private final Map<TableBucket, java.util.function.Supplier<Long>> coldDataRetryingSuppliers =
+            MapUtils.newConcurrentHashMap();
+
+    // Flag to ensure IndexCache write queue gauges are registered only once
+    private volatile boolean indexCacheMetricsRegistered = false;
+
     public TableMetricGroup(
             MetricRegistry registry,
             TablePath tablePath,
@@ -296,6 +313,115 @@ public class TableMetricGroup extends AbstractMetricGroup {
                 .mapToLong(java.util.function.Supplier::get)
                 .max()
                 .orElse(0L);
+    }
+
+    /**
+     * Register IndexCache write queue metrics suppliers for a specific bucket. The table-level
+     * gauges will aggregate metrics across all registered buckets.
+     *
+     * @param tableBucket the table bucket
+     * @param hotDataQueuedSupplier supplier for hot data queued tasks count
+     * @param hotDataExecutedSupplier supplier for hot data executed tasks count
+     * @param hotDataRetryingSupplier supplier for hot data retrying tasks count
+     * @param coldDataQueuedSupplier supplier for cold data queued tasks count
+     * @param coldDataExecutedSupplier supplier for cold data executed tasks count
+     * @param coldDataRetryingSupplier supplier for cold data retrying tasks count
+     */
+    public void registerBucketIndexCacheMetricsSuppliers(
+            TableBucket tableBucket,
+            java.util.function.Supplier<Long> hotDataQueuedSupplier,
+            java.util.function.Supplier<Long> hotDataExecutedSupplier,
+            java.util.function.Supplier<Long> hotDataRetryingSupplier,
+            java.util.function.Supplier<Long> coldDataQueuedSupplier,
+            java.util.function.Supplier<Long> coldDataExecutedSupplier,
+            java.util.function.Supplier<Long> coldDataRetryingSupplier) {
+        hotDataQueuedSuppliers.put(tableBucket, hotDataQueuedSupplier);
+        hotDataExecutedSuppliers.put(tableBucket, hotDataExecutedSupplier);
+        hotDataRetryingSuppliers.put(tableBucket, hotDataRetryingSupplier);
+        coldDataQueuedSuppliers.put(tableBucket, coldDataQueuedSupplier);
+        coldDataExecutedSuppliers.put(tableBucket, coldDataExecutedSupplier);
+        coldDataRetryingSuppliers.put(tableBucket, coldDataRetryingSupplier);
+
+        // Register table-level gauges only once for the first bucket
+        if (!indexCacheMetricsRegistered) {
+            synchronized (this) {
+                if (!indexCacheMetricsRegistered) {
+                    // Hot data metrics
+                    gauge(
+                            MetricNames.INDEX_CACHE_HOT_DATA_QUEUED_TASKS,
+                            this::getTotalHotDataQueued);
+                    gauge(
+                            MetricNames.INDEX_CACHE_HOT_DATA_EXECUTED_TASKS,
+                            this::getTotalHotDataExecuted);
+                    gauge(
+                            MetricNames.INDEX_CACHE_HOT_DATA_RETRYING_TASKS,
+                            this::getTotalHotDataRetrying);
+
+                    // Cold data metrics
+                    gauge(
+                            MetricNames.INDEX_CACHE_COLD_DATA_QUEUED_TASKS,
+                            this::getTotalColdDataQueued);
+                    gauge(
+                            MetricNames.INDEX_CACHE_COLD_DATA_EXECUTED_TASKS,
+                            this::getTotalColdDataExecuted);
+                    gauge(
+                            MetricNames.INDEX_CACHE_COLD_DATA_RETRYING_TASKS,
+                            this::getTotalColdDataRetrying);
+
+                    indexCacheMetricsRegistered = true;
+                }
+            }
+        }
+    }
+
+    /**
+     * Unregister IndexCache write queue metrics suppliers when a bucket is removed.
+     *
+     * @param tableBucket the table bucket
+     */
+    public void unregisterBucketIndexCacheMetricsSuppliers(TableBucket tableBucket) {
+        hotDataQueuedSuppliers.remove(tableBucket);
+        hotDataExecutedSuppliers.remove(tableBucket);
+        hotDataRetryingSuppliers.remove(tableBucket);
+        coldDataQueuedSuppliers.remove(tableBucket);
+        coldDataExecutedSuppliers.remove(tableBucket);
+        coldDataRetryingSuppliers.remove(tableBucket);
+    }
+
+    private long getTotalHotDataQueued() {
+        return hotDataQueuedSuppliers.values().stream()
+                .mapToLong(java.util.function.Supplier::get)
+                .sum();
+    }
+
+    private long getTotalHotDataExecuted() {
+        return hotDataExecutedSuppliers.values().stream()
+                .mapToLong(java.util.function.Supplier::get)
+                .sum();
+    }
+
+    private long getTotalHotDataRetrying() {
+        return hotDataRetryingSuppliers.values().stream()
+                .mapToLong(java.util.function.Supplier::get)
+                .sum();
+    }
+
+    private long getTotalColdDataQueued() {
+        return coldDataQueuedSuppliers.values().stream()
+                .mapToLong(java.util.function.Supplier::get)
+                .sum();
+    }
+
+    private long getTotalColdDataExecuted() {
+        return coldDataExecutedSuppliers.values().stream()
+                .mapToLong(java.util.function.Supplier::get)
+                .sum();
+    }
+
+    private long getTotalColdDataRetrying() {
+        return coldDataRetryingSuppliers.values().stream()
+                .mapToLong(java.util.function.Supplier::get)
+                .sum();
     }
 
     /** Metric group for specific kind of tablet of a table. */

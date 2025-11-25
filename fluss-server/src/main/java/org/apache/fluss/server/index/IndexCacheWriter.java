@@ -151,10 +151,15 @@ public final class IndexCacheWriter implements Closeable {
         }
 
         if (!appendInfo.offsetsMonotonic() || appendInfo.duplicated()) {
-            LOG.error(
-                    "Invalid appendInfo for hot data writing, skipping, tableBucket {}",
-                    logTablet.getTableBucket());
-            return;
+            String errorMsg =
+                    String.format(
+                            "Invalid appendInfo for hot data writing: offsetsMonotonic=%s, duplicated=%s, tableBucket=%s, appendInfo=%s",
+                            appendInfo.offsetsMonotonic(),
+                            appendInfo.duplicated(),
+                            logTablet.getTableBucket(),
+                            appendInfo);
+            LOG.error(errorMsg);
+            throw new IllegalArgumentException(errorMsg);
         }
 
         if (LOG.isDebugEnabled()) {
@@ -241,11 +246,27 @@ public final class IndexCacheWriter implements Closeable {
             LogRecords walRecords = fetchResult.getRecords();
             long nextOffset =
                     distributeRecordsToCache(
-                            walRecords, fetchResult.getFetchOffsetMetadata().getMessageOffset());
+                            walRecords,
+                            fetchResult.getFetchOffsetMetadata().getMessageOffset(),
+                            globalEndOffset);
 
             if (nextOffset <= currentOffset) {
                 break;
             }
+
+            // Critical: prevent overflow beyond globalEndOffset
+            // This ensures cold data loading strictly respects logEndOffsetOnLeaderStart boundary
+            if (nextOffset > globalEndOffset) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Cold data loading reached boundary: nextOffset={} > globalEndOffset={}, stopping. TableBucket: {}",
+                            nextOffset,
+                            globalEndOffset,
+                            logTablet.getTableBucket());
+                }
+                break;
+            }
+
             currentOffset = nextOffset;
         }
 
@@ -270,6 +291,20 @@ public final class IndexCacheWriter implements Closeable {
      */
     private long distributeRecordsToCache(LogRecords walRecords, long firstOffset)
             throws Exception {
+        return distributeRecordsToCache(walRecords, firstOffset, Long.MAX_VALUE);
+    }
+
+    /**
+     * Unified record distribution pipeline with boundary control for cold data loading.
+     *
+     * @param walRecords the WAL records to process
+     * @param firstOffset the first offset of the WAL records
+     * @param maxEndOffset the maximum end offset (exclusive) to prevent overflow
+     * @return the maximum processed offset
+     * @throws Exception if an error occurs during processing
+     */
+    private long distributeRecordsToCache(
+            LogRecords walRecords, long firstOffset, long maxEndOffset) throws Exception {
         long currentOffset = firstOffset;
         for (LogRecordBatch batch : walRecords.batches()) {
             short schemaId = batch.schemaId();
@@ -283,6 +318,18 @@ public final class IndexCacheWriter implements Closeable {
                                     tableSchema.getRowType(), schemaId);
                     CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
                 while (recordIterator.hasNext()) {
+                    // Critical: check boundary before processing each record
+                    if (batchEndOffset >= maxEndOffset) {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug(
+                                    "Stopping record processing at offset {} due to maxEndOffset {} boundary. TableBucket: {}",
+                                    batchEndOffset,
+                                    maxEndOffset,
+                                    logTablet.getTableBucket());
+                        }
+                        break; // Stop processing this batch
+                    }
+
                     LogRecord walRecord = recordIterator.next();
                     // Process each record with batch mode (only write to target buckets)
                     for (TableCacheWriter indexWriter : tableTableCacheWriters) {
@@ -303,6 +350,11 @@ public final class IndexCacheWriter implements Closeable {
             }
 
             currentOffset = batchEndOffset;
+
+            // If we stopped due to boundary, exit early
+            if (currentOffset >= maxEndOffset) {
+                break;
+            }
         }
         return currentOffset;
     }

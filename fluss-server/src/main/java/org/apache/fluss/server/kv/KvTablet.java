@@ -445,15 +445,27 @@ public final class KvTablet {
                         } else {
                             // NEW: Write hot data to IndexCache for real-time index caching
                             // Only process hot data writing if the batch is not duplicated
-                            IndexCache cache = this.indexCache;
-                            if (cache != null) {
-                                // FIX: Deep copy logRecords for IndexCache to avoid use-after-free
-                                // The original logRecords shares memory with walBuilder. We need to
-                                // create an independent copy for IndexCache's asynchronous
-                                // processing
-                                // to prevent corruption when walBuilder is deallocated.
-                                MemoryLogRecords logRecordsCopy = deepCopyLogRecords(logRecords);
-                                cache.cacheIndexDataByHotData(logRecordsCopy, logAppendInfo);
+                            // and offsets are monotonic
+                            if (!logAppendInfo.offsetsMonotonic()) {
+                                LOG.error(
+                                        "LogAppendInfo has non-monotonic offsets, skipping index cache write. TableBucket: {}, appendInfo: {}",
+                                        getTableBucket(),
+                                        logAppendInfo);
+                            } else {
+                                IndexCache cache = this.indexCache;
+                                if (cache != null) {
+                                    // FIX: Deep copy logRecords for IndexCache to avoid
+                                    // use-after-free
+                                    // The original logRecords shares memory with walBuilder. We
+                                    // need
+                                    // to
+                                    // create an independent copy for IndexCache's asynchronous
+                                    // processing
+                                    // to prevent corruption when walBuilder is deallocated.
+                                    MemoryLogRecords logRecordsCopy =
+                                            deepCopyLogRecords(logRecords);
+                                    cache.cacheIndexDataByHotData(logRecordsCopy, logAppendInfo);
+                                }
                             }
                         }
                         return logAppendInfo;

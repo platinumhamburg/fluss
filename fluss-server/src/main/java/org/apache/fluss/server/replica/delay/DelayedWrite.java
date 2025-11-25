@@ -155,11 +155,36 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
         delayedWriteMetadata
                 .getBucketStatusMap()
                 .forEach(
-                        (tableBucket, delayedBucketStatus) ->
-                                LOG.debug(
-                                        "Expiring delay write operation for bucket {} with status {}",
-                                        tableBucket,
-                                        delayedBucketStatus));
+                        (tableBucket, delayedBucketStatus) -> {
+                            if (delayedBucketStatus.isAcksPending()) {
+                                logTimeoutDiagnostics(tableBucket, delayedBucketStatus);
+                            } else {
+                                if (LOG.isDebugEnabled()) {
+                                    LOG.debug(
+                                            "Expiring delay write operation for bucket {} with status {}",
+                                            tableBucket,
+                                            delayedBucketStatus);
+                                }
+                            }
+                        });
+    }
+
+    private void logTimeoutDiagnostics(
+            TableBucket tableBucket, DelayedBucketStatus<T> delayedBucketStatus) {
+        try {
+            Replica replica = replicaManager.getReplicaOrException(tableBucket);
+            long requiredOffset = delayedBucketStatus.getRequiredOffset();
+            String diagnostics = replica.getTimeoutDiagnostics(requiredOffset);
+            LOG.warn(diagnostics);
+        } catch (Exception e) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Expiring delay write operation for bucket {} with status {}, failed to get diagnostics: {}",
+                        tableBucket,
+                        delayedBucketStatus,
+                        e.getMessage());
+            }
+        }
     }
 
     /** Upon completion, return the current response status along with the error code per bucket. */

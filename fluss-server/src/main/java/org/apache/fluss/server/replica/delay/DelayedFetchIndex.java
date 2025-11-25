@@ -246,9 +246,15 @@ public class DelayedFetchIndex extends DelayedOperation {
                         }
                     }
                     if (indexBucketResults.size() != indexBucketFetchRequests.size()) {
+                        // When partial index buckets are not ready, log at INFO level instead of
+                        // DEBUG
+                        // to help diagnose index replication stall issues
                         LOG.warn(
-                                "Some index buckets data are not loaded for data bucket {}",
-                                dataBucket);
+                                "Some index buckets data are not loaded for data bucket {}, "
+                                        + "loaded {}/{} buckets. Will retry on next attempt or timeout.",
+                                dataBucket,
+                                indexBucketResults.size(),
+                                indexBucketFetchRequests.size());
                         continue;
                     }
                     completeFetches.put(

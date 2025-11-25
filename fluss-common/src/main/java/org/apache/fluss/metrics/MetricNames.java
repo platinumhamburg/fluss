@@ -131,6 +131,18 @@ public class MetricNames {
     // for index cache memory
     public static final String INDEX_CACHE_MEMORY_USAGE_PERCENT = "indexCacheMemoryUsagePercent";
 
+    // for index cache write queue (per table bucket)
+    public static final String INDEX_CACHE_HOT_DATA_QUEUED_TASKS = "indexCacheHotDataQueuedTasks";
+    public static final String INDEX_CACHE_HOT_DATA_EXECUTED_TASKS =
+            "indexCacheHotDataExecutedTasks";
+    public static final String INDEX_CACHE_HOT_DATA_RETRYING_TASKS =
+            "indexCacheHotDataRetryingTasks";
+    public static final String INDEX_CACHE_COLD_DATA_QUEUED_TASKS = "indexCacheColdDataQueuedTasks";
+    public static final String INDEX_CACHE_COLD_DATA_EXECUTED_TASKS =
+            "indexCacheColdDataExecutedTasks";
+    public static final String INDEX_CACHE_COLD_DATA_RETRYING_TASKS =
+            "indexCacheColdDataRetryingTasks";
+
     // for log tablet
     public static final String LOG_FLUSH_RATE = "logFlushPerSecond";
     public static final String LOG_FLUSH_LATENCY_MS = "logFlushLatencyMs";

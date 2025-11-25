@@ -109,6 +109,9 @@ public final class IndexCache implements Closeable {
     private volatile long coldLoadCurrentEndOffset = -1; // End offset of current batch
     private volatile boolean coldLoadInProgress = false; // Whether a batch is currently loading
 
+    // Lock to protect cold data loading scheduling to prevent concurrent scheduling
+    private final Object coldLoadScheduleLock = new Object();
+
     /**
      * Creates a new IndexCache with the new row-level cache architecture.
      *
@@ -181,12 +184,13 @@ public final class IndexCache implements Closeable {
         this.coldLoadBatchSize = batchSize.getBytes();
 
         // Initialize pending write queue to replace indexWriterExecutor
+        // Configure PendingWriteQueue with infinite retry to prevent data loss
+        // Fixed 10ms retry interval ensures fast recovery without overwhelming the system
         this.pendingWriteQueue =
                 new PendingWriteQueue(
                         logTablet.getTableBucket().toString(),
                         500, // queue capacity
-                        3, // max retries
-                        1000); // retry backoff ms
+                        10); // retry backoff ms (fixed interval, infinite retry)
 
         LOG.info(
                 "IndexCache initialized with row-level cache architecture for data bucket {} with {} index definitions, "
@@ -242,6 +246,12 @@ public final class IndexCache implements Closeable {
             if (highWatermark - minFetchStartOffset < minAdvanceOffset) {
                 return Tuple2.of(0, Optional.empty());
             }
+        } else {
+            // When forceFetch is true (e.g., from DelayedFetchIndex timeout),
+            // proactively check and trigger cold data loading to break potential deadlock
+            // where data is stuck in NOT_LOADED state
+            long currentCommitHorizon = indexRowCache.getCommitHorizon();
+            mayTriggerColdDataLoading(currentCommitHorizon);
         }
 
         long currentEndOffset = minFetchStartOffset;
@@ -287,7 +297,25 @@ public final class IndexCache implements Closeable {
             if (readResult.getStatus() == IndexRowCache.ReadStatus.NOT_LOADED) {
                 // Data not loaded in cache yet, return NOT_READY segment
                 segment = IndexSegment.createNotReadySegment(startOffset, currentEndOffset);
-                if (LOG.isDebugEnabled()) {
+                if (forceFetch) {
+                    // When forceFetch is true but data is still NOT_LOADED, this indicates
+                    // a potential deadlock situation where cold data loading may be stuck
+                    LOG.warn(
+                            "DataBucket {}: Index bucket {} data NOT_LOADED even with forceFetch=true for range [{}, {}). "
+                                    + "This may indicate cold data loading is stuck. "
+                                    + "logEndOffsetOnLeaderStart={}, coldLoadInProgress={}, coldLoadCurrentEndOffset={}, "
+                                    + "coldLoadTargetEndOffset={}, commitHorizon={}, minCacheWatermark={}",
+                            this.logTablet.getTableBucket(),
+                            indexBucket,
+                            startOffset,
+                            currentEndOffset,
+                            logEndOffsetOnLeaderStart,
+                            coldLoadInProgress,
+                            coldLoadCurrentEndOffset,
+                            coldLoadTargetEndOffset,
+                            indexRowCache.getCommitHorizon(),
+                            indexRowCache.getMinCacheWatermark());
+                } else if (LOG.isDebugEnabled()) {
                     LOG.debug(
                             "DataBucket {}: Index bucket {} data not loaded for range [{}, {}), returning NOT_READY segment",
                             this.logTablet.getTableBucket(),
@@ -398,7 +426,7 @@ public final class IndexCache implements Closeable {
             return;
         }
 
-        // Check if a batch is currently being loaded
+        // Check if a batch is currently being loaded (fast path, no lock)
         if (coldLoadInProgress) {
             return;
         }
@@ -416,20 +444,50 @@ public final class IndexCache implements Closeable {
         // We should only load the next batch after the current one is consumed
         if (coldLoadCurrentEndOffset > 0 && currentCommitHorizon < coldLoadCurrentEndOffset) {
             // Previous batch not yet consumed, wait for it to be consumed
+            // Log diagnostic info when cold loading is blocked
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "DataBucket {}: Waiting for previous cold load batch to be consumed. "
+                                + "commitHorizon={}, coldLoadCurrentEndOffset={}, uncommitted buckets: {}",
+                        logTablet.getTableBucket(),
+                        currentCommitHorizon,
+                        coldLoadCurrentEndOffset,
+                        currentCommitHorizon < 0
+                                ? indexRowCache.getBucketsWithUncommittedOffsets()
+                                : "N/A");
+            }
             return;
         }
 
         // Calculate the range for the next batch
         long loadStartOffset = currentCommitHorizon;
 
+        // Validate loadStartOffset - must be >= 0 to proceed with cold loading
+        // currentCommitHorizon = -1 means IndexFetcher hasn't updated yet
+        // This could be either a new table or old table just after failover
+        // We should wait for IndexFetcher to establish the correct starting point
+        if (loadStartOffset < 0) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "DataBucket {}: Cannot trigger cold data loading because commitHorizon={} (< 0). "
+                                + "Waiting for IndexFetcher to establish initial commit offset. "
+                                + "Uncommitted buckets: {}",
+                        logTablet.getTableBucket(),
+                        loadStartOffset,
+                        indexRowCache.getBucketsWithUncommittedOffsets());
+            }
+            return;
+        }
+
         // Determine the final target end offset if not set yet
-        if (coldLoadTargetEndOffset < 0) {
+        long targetEndOffset = coldLoadTargetEndOffset;
+        if (targetEndOffset < 0) {
             if (minCacheWatermark < 0) {
                 // Cache is empty, target is logEndOffsetOnLeaderStart
-                coldLoadTargetEndOffset = logEndOffsetOnLeaderStart;
+                targetEndOffset = logEndOffsetOnLeaderStart;
             } else {
                 // Cache has some data, target is min(logEndOffsetOnLeaderStart, minCacheWatermark)
-                coldLoadTargetEndOffset = Math.min(logEndOffsetOnLeaderStart, minCacheWatermark);
+                targetEndOffset = Math.min(logEndOffsetOnLeaderStart, minCacheWatermark);
             }
         }
 
@@ -437,24 +495,40 @@ public final class IndexCache implements Closeable {
         // Use a simple heuristic: assume average record size of 1KB
         // This is a rough estimate - actual size may vary
         long estimatedRecordsInBatch = coldLoadBatchSize / 1024; // Assume 1KB per record
-        long batchEndOffset =
-                Math.min(loadStartOffset + estimatedRecordsInBatch, coldLoadTargetEndOffset);
+        long batchEndOffset = Math.min(loadStartOffset + estimatedRecordsInBatch, targetEndOffset);
 
         // Validate the range
         if (loadStartOffset >= batchEndOffset) {
             return;
         }
 
-        // Mark batch as in progress
-        coldLoadInProgress = true;
-        coldLoadCurrentEndOffset = batchEndOffset;
+        // Use lock to protect only the critical check-then-act sequence
+        // This minimizes lock contention while preventing duplicate submissions
+        final long finalLoadStartOffset = loadStartOffset;
+        final long finalBatchEndOffset = batchEndOffset;
+        final long finalTargetEndOffset = targetEndOffset;
+
+        synchronized (coldLoadScheduleLock) {
+            // Double-check if a batch is currently being loaded
+            if (coldLoadInProgress) {
+                return;
+            }
+
+            // Mark batch as in progress
+            coldLoadInProgress = true;
+            coldLoadCurrentEndOffset = finalBatchEndOffset;
+            // Update target if it was calculated in this call
+            if (coldLoadTargetEndOffset < 0) {
+                coldLoadTargetEndOffset = finalTargetEndOffset;
+            }
+        } // End of synchronized block
 
         LOG.info(
                 "DataBucket {}: Triggering batch cold data loading from WAL, batch range [{}, {}), "
                         + "target end offset: {}, batch size limit: {} bytes",
                 logTablet.getTableBucket(),
-                loadStartOffset,
-                batchEndOffset,
+                finalLoadStartOffset,
+                finalBatchEndOffset,
                 coldLoadTargetEndOffset,
                 coldLoadBatchSize);
 
@@ -487,15 +561,16 @@ public final class IndexCache implements Closeable {
 
         // Submit cold data loading task for this batch
         ColdDataLoad coldDataLoad =
-                new ColdDataLoad(indexCacheWriter, loadStartOffset, batchEndOffset, callback);
+                new ColdDataLoad(
+                        indexCacheWriter, finalLoadStartOffset, finalBatchEndOffset, callback);
         boolean submitted = pendingWriteQueue.submit(coldDataLoad);
 
         if (!submitted) {
             LOG.error(
                     "DataBucket {}: Failed to submit cold data loading task for batch range [{}, {})",
                     logTablet.getTableBucket(),
-                    loadStartOffset,
-                    batchEndOffset);
+                    finalLoadStartOffset,
+                    finalBatchEndOffset);
             // Reset flag to allow retry
             coldLoadInProgress = false;
         }
@@ -550,6 +625,60 @@ public final class IndexCache implements Closeable {
      */
     public Map<Long, List<Integer>> getBucketsWithUncommittedOffsets() {
         return indexRowCache.getBucketsWithUncommittedOffsets();
+    }
+
+    /**
+     * Gets the total number of hot data tasks queued.
+     *
+     * @return total number of hot data tasks queued
+     */
+    public long getHotDataQueuedTasks() {
+        return pendingWriteQueue.getHotDataQueuedTasksCount();
+    }
+
+    /**
+     * Gets the total number of hot data tasks executed.
+     *
+     * @return total number of hot data tasks executed
+     */
+    public long getHotDataExecutedTasks() {
+        return pendingWriteQueue.getHotDataExecutedTasksCount();
+    }
+
+    /**
+     * Gets the current number of hot data tasks being retried.
+     *
+     * @return current number of hot data tasks being retried
+     */
+    public long getHotDataRetryingTasks() {
+        return pendingWriteQueue.getHotDataRetryingTasksCount();
+    }
+
+    /**
+     * Gets the total number of cold data tasks queued.
+     *
+     * @return total number of cold data tasks queued
+     */
+    public long getColdDataQueuedTasks() {
+        return pendingWriteQueue.getColdDataQueuedTasksCount();
+    }
+
+    /**
+     * Gets the total number of cold data tasks executed.
+     *
+     * @return total number of cold data tasks executed
+     */
+    public long getColdDataExecutedTasks() {
+        return pendingWriteQueue.getColdDataExecutedTasksCount();
+    }
+
+    /**
+     * Gets the current number of cold data tasks being retried.
+     *
+     * @return current number of cold data tasks being retried
+     */
+    public long getColdDataRetryingTasks() {
+        return pendingWriteQueue.getColdDataRetryingTasksCount();
     }
 
     /**
