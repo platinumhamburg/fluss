@@ -39,10 +39,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Key Features:
  *
  * <ul>
+ *   <li>Unbounded queue: uses PriorityBlockingQueue with automatic capacity expansion to prevent
+ *       task rejection in multi-index table scenarios
  *   <li>Priority-based execution order: processes tasks with smaller startOffset first to help
  *       index fetch progress continuously
  *   <li>Asynchronous processing to avoid blocking main paths
- *   <li>Automatic retry on failures with exponential backoff
+ *   <li>Guaranteed task execution: unlimited retries with fixed 10ms backoff to ensure all tasks
+ *       eventually succeed
  *   <li>Graceful shutdown with pending task draining
  * </ul>
  *
@@ -56,30 +59,35 @@ public final class PendingWriteQueue implements Closeable {
     private final BlockingQueue<PendingWrite> queue;
     private final ExecutorService executor;
     private final String tableBucketName;
-    private final int maxRetries;
     private final long retryBackoffMs;
+    private final int retryLogThreshold;
     private final AtomicLong queuedTasks = new AtomicLong(0);
     private final AtomicLong executedTasks = new AtomicLong(0);
-    private final AtomicLong failedTasks = new AtomicLong(0);
 
     private volatile boolean closed = false;
 
     /**
-     * Creates a new PendingWriteQueue.
+     * Creates a new PendingWriteQueue with unbounded capacity and guaranteed task execution.
      *
      * @param tableBucketName the name of the table bucket for logging
-     * @param queueCapacity the maximum capacity of the queue
-     * @param maxRetries the maximum number of retries for failed operations
-     * @param retryBackoffMs the base backoff time in milliseconds for retries
+     * @param initialCapacity the initial capacity hint for the queue (actual capacity is unbounded
+     *     and will grow as needed)
+     * @param retryLogThreshold the retry count threshold for logging errors (e.g., 100 means log
+     *     every 100 retries)
+     * @param retryBackoffMs the fixed backoff time in milliseconds between retries
      */
     public PendingWriteQueue(
-            String tableBucketName, int queueCapacity, int maxRetries, long retryBackoffMs) {
+            String tableBucketName,
+            int initialCapacity,
+            int retryLogThreshold,
+            long retryBackoffMs) {
         this.tableBucketName = tableBucketName;
-        // Use PriorityBlockingQueue to prioritize older data (smaller startOffset)
+        // Use unbounded PriorityBlockingQueue to prioritize older data (smaller startOffset)
+        // The queue will automatically expand as needed, preventing task rejection
         this.queue =
                 new PriorityBlockingQueue<>(
-                        queueCapacity, Comparator.comparingLong(PendingWrite::getStartOffset));
-        this.maxRetries = maxRetries;
+                        initialCapacity, Comparator.comparingLong(PendingWrite::getStartOffset));
+        this.retryLogThreshold = retryLogThreshold;
         this.retryBackoffMs = retryBackoffMs;
         this.executor =
                 Executors.newSingleThreadExecutor(
@@ -88,18 +96,18 @@ public final class PendingWriteQueue implements Closeable {
         startConsumer();
 
         LOG.info(
-                "PendingWriteQueue initialized for table bucket {} with capacity {}, maxRetries {}, retryBackoffMs {}, priority ordering by startOffset",
+                "PendingWriteQueue initialized for table bucket {} with unbounded capacity (initial: {}), unlimited retries with {}ms fixed backoff, logging every {} retries",
                 tableBucketName,
-                queueCapacity,
-                maxRetries,
-                retryBackoffMs);
+                initialCapacity,
+                retryBackoffMs,
+                retryLogThreshold);
     }
 
     /**
-     * Submits a pending write operation to the queue.
+     * Submits a pending write operation to the unbounded queue.
      *
      * @param pendingWrite the pending write operation
-     * @return true if successfully submitted, false if queue is full or closed
+     * @return true if successfully submitted, false if queue is closed
      */
     public boolean submit(PendingWrite pendingWrite) {
         if (closed) {
@@ -110,24 +118,17 @@ public final class PendingWriteQueue implements Closeable {
             return false;
         }
 
-        boolean submitted = queue.offer(pendingWrite);
-        if (submitted) {
-            queuedTasks.incrementAndGet();
-            if (LOG.isDebugEnabled()) {
-                LOG.debug(
-                        "Submitted {} to queue for table bucket {}, queue size: {}",
-                        pendingWrite,
-                        tableBucketName,
-                        queue.size());
-            }
-        } else {
-            LOG.warn(
-                    "Failed to submit {} to queue for table bucket {}, queue is full (capacity: {})",
+        // PriorityBlockingQueue is unbounded, offer() always succeeds (unless out of memory)
+        queue.offer(pendingWrite);
+        queuedTasks.incrementAndGet();
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Submitted {} to queue for table bucket {}, queue size: {}",
                     pendingWrite,
                     tableBucketName,
                     queue.size());
         }
-        return submitted;
+        return true;
     }
 
     /**
@@ -155,15 +156,6 @@ public final class PendingWriteQueue implements Closeable {
      */
     public long getExecutedTasksCount() {
         return executedTasks.get();
-    }
-
-    /**
-     * Gets the total number of failed tasks.
-     *
-     * @return the total number of tasks that have failed after all retries
-     */
-    public long getFailedTasksCount() {
-        return failedTasks.get();
     }
 
     private void startConsumer() {
@@ -203,9 +195,8 @@ public final class PendingWriteQueue implements Closeable {
 
     private void executeWithRetry(PendingWrite pendingWrite) {
         int attempt = 0;
-        Exception lastException = null;
 
-        while (attempt <= maxRetries && !closed) {
+        while (!closed) {
             try {
                 pendingWrite.execute();
                 executedTasks.incrementAndGet();
@@ -216,39 +207,51 @@ public final class PendingWriteQueue implements Closeable {
                             tableBucketName,
                             attempt + 1);
                 }
+                // Task succeeded, exit retry loop
                 return;
             } catch (Exception e) {
-                lastException = e;
                 attempt++;
 
-                if (attempt <= maxRetries) {
-                    long backoffMs = retryBackoffMs * (1L << (attempt - 1));
-                    LOG.warn(
+                // Log error at every retryLogThreshold attempts to track persistent failures
+                if (attempt % retryLogThreshold == 0) {
+                    LOG.error(
+                            "Failed to execute {} for table bucket {} after {} attempts, will continue retrying indefinitely",
+                            pendingWrite,
+                            tableBucketName,
+                            attempt,
+                            e);
+                } else if (LOG.isDebugEnabled()) {
+                    LOG.debug(
                             "Failed to execute {} for table bucket {} (attempt {}), retrying in {} ms",
                             pendingWrite,
                             tableBucketName,
                             attempt,
-                            backoffMs,
+                            retryBackoffMs,
                             e);
+                }
 
-                    try {
-                        Thread.sleep(backoffMs);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        LOG.warn("Retry backoff interrupted for table bucket {}", tableBucketName);
-                        break;
-                    }
+                // Fixed backoff before retry
+                try {
+                    Thread.sleep(retryBackoffMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    LOG.warn(
+                            "Retry backoff interrupted for table bucket {}, re-queuing task {}",
+                            tableBucketName,
+                            pendingWrite);
+                    // Re-queue the task to ensure it gets executed
+                    queue.offer(pendingWrite);
+                    return;
                 }
             }
         }
 
-        failedTasks.incrementAndGet();
-        LOG.error(
-                "Failed to execute {} for table bucket {} after {} attempts, giving up",
+        // Only reach here if closed=true, re-queue task for graceful shutdown processing
+        LOG.warn(
+                "PendingWriteQueue closed while retrying {} for table bucket {}, task will be processed during shutdown",
                 pendingWrite,
-                tableBucketName,
-                attempt,
-                lastException);
+                tableBucketName);
+        queue.offer(pendingWrite);
     }
 
     @Override
@@ -277,10 +280,9 @@ public final class PendingWriteQueue implements Closeable {
         }
 
         LOG.info(
-                "PendingWriteQueue closed for table bucket {}, stats: queued={}, executed={}, failed={}",
+                "PendingWriteQueue closed for table bucket {}, stats: queued={}, executed={}",
                 tableBucketName,
                 queuedTasks.get(),
-                executedTasks.get(),
-                failedTasks.get());
+                executedTasks.get());
     }
 }
