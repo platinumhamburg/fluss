@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.metrics.LookuperMetricGroup;
 import org.apache.fluss.exception.PartitionNotExistException;
+import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
@@ -283,6 +284,21 @@ public class SecondaryIndexLookuper implements Lookuper {
                     StringUtils.internalRowDebugString(lookupRowType, lookupKey),
                     StringUtils.internalRowDebugString(primaryKeyRowType, primaryKey));
             return new LookupResult((InternalRow) null);
+        } else if (ExceptionUtils.findThrowable(throwable, RetriableException.class).isPresent()) {
+            // For retriable exceptions (e.g., NetworkException during cluster failover),
+            // rethrow the original exception to allow the underlying retry mechanism to work
+            LOG.debug(
+                    "Retriable exception during main table lookup for sk:{}, pk:{}. "
+                            + "The underlying retry mechanism will handle this.",
+                    StringUtils.internalRowDebugString(lookupRowType, lookupKey),
+                    StringUtils.internalRowDebugString(primaryKeyRowType, primaryKey),
+                    throwable);
+            // Rethrow as CompletionException to preserve the original exception type
+            if (throwable instanceof java.util.concurrent.CompletionException) {
+                throw (java.util.concurrent.CompletionException) throwable;
+            } else {
+                throw new java.util.concurrent.CompletionException(throwable);
+            }
         } else {
             LOG.error(errorMessage, throwable);
             throw new RuntimeException(errorMessage, throwable);
@@ -299,14 +315,32 @@ public class SecondaryIndexLookuper implements Lookuper {
      */
     private LookupResult handleLookupException(
             Throwable throwable, InternalRow lookupKey, long startTime) {
-        // Increment error count for any uncaught exceptions
-        lookuperMetricGroup.secondaryIndexErrorCount().inc();
         long duration = System.currentTimeMillis() - startTime;
         lookuperMetricGroup.updateSecondaryIndexLookupLatency(duration);
-        LOG.error(
-                "Secondary index lookup failed for key: {}",
-                StringUtils.internalRowDebugString(lookupRowType, lookupKey),
-                throwable);
-        throw new RuntimeException("Secondary index lookup failed", throwable);
+
+        // For retriable exceptions (e.g., NetworkException during cluster failover),
+        // rethrow the original exception to allow the underlying retry mechanism to work
+        if (ExceptionUtils.findThrowable(throwable, RetriableException.class).isPresent()) {
+            LOG.debug(
+                    "Retriable exception during secondary index lookup for key: {}. "
+                            + "The underlying retry mechanism will handle this.",
+                    StringUtils.internalRowDebugString(lookupRowType, lookupKey),
+                    throwable);
+            // Don't increment error count for retriable exceptions as they may succeed on retry
+            // Rethrow as CompletionException to preserve the original exception type
+            if (throwable instanceof java.util.concurrent.CompletionException) {
+                throw (java.util.concurrent.CompletionException) throwable;
+            } else {
+                throw new java.util.concurrent.CompletionException(throwable);
+            }
+        } else {
+            // Increment error count for non-retriable exceptions
+            lookuperMetricGroup.secondaryIndexErrorCount().inc();
+            LOG.error(
+                    "Secondary index lookup failed for key: {}",
+                    StringUtils.internalRowDebugString(lookupRowType, lookupKey),
+                    throwable);
+            throw new RuntimeException("Secondary index lookup failed", throwable);
+        }
     }
 }
