@@ -427,6 +427,38 @@ public final class IndexRowCache implements Closeable {
         return totalSegmentCount;
     }
 
+    /**
+     * Gets the commit offset for a specific index bucket.
+     *
+     * @param indexTableId the index table id
+     * @param bucketId the bucket id
+     * @return the commit offset, or -1 if not set
+     */
+    public long getCommitOffset(long indexTableId, int bucketId) {
+        AtomicLong[] offsets = bucketCommitOffsets.get(indexTableId);
+        if (offsets == null || bucketId >= offsets.length) {
+            return -1L;
+        }
+        return offsets[bucketId].get();
+    }
+
+    /**
+     * Gets offset range information for a specific index bucket.
+     *
+     * @param indexTableId the index table id
+     * @param bucketId the bucket id
+     * @return formatted string with offset range layout, empty string if no ranges exist
+     */
+    public String getIndexBucketRangeInfo(long indexTableId, int bucketId) {
+        IndexBucketRowCache[] caches = bucketRowCaches.get(indexTableId);
+        if (caches == null || bucketId >= caches.length) {
+            return "";
+        }
+
+        IndexBucketRowCache cache = caches[bucketId];
+        return cache.getOffsetRangeInfo();
+    }
+
     @Override
     public void close() {
         if (closed) {

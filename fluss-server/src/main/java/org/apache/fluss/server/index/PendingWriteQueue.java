@@ -140,24 +140,6 @@ public final class PendingWriteQueue implements Closeable {
         return queue.size();
     }
 
-    /**
-     * Gets the total number of queued tasks.
-     *
-     * @return the total number of tasks that have been queued
-     */
-    public long getQueuedTasksCount() {
-        return queuedTasks.get();
-    }
-
-    /**
-     * Gets the total number of executed tasks.
-     *
-     * @return the total number of tasks that have been executed
-     */
-    public long getExecutedTasksCount() {
-        return executedTasks.get();
-    }
-
     private void startConsumer() {
         executor.submit(
                 () -> {

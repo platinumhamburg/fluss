@@ -2292,17 +2292,31 @@ public final class Replica {
                             .append(indexCommitHorizon)
                             .append(") has not reached required offset, lag: ")
                             .append(indexLag)
-                            .append(" offsets.");
+                            .append(" offsets. ");
                 } else {
                     diagnostics
                             .append("[Index Replication] Index commit horizon (")
                             .append(indexCommitHorizon)
-                            .append(") has reached required offset.");
+                            .append(") has reached required offset. ");
                 }
             } else {
-                diagnostics.append("[Index Replication] IndexCache is not available.");
+                diagnostics.append("[Index Replication] IndexCache is not available. ");
             }
         }
+
+        // Check ISR status - this is critical for understanding ack failures
+        List<Integer> curMaximalIsr = isrState.maximalIsr();
+        List<Integer> curIsr = isrState.isr();
+        diagnostics
+                .append("[ISR Status] Current ISR: ")
+                .append(curIsr)
+                .append(", Maximal ISR: ")
+                .append(curMaximalIsr)
+                .append(", Min ISR required: ")
+                .append(minInSyncReplicas)
+                .append(", ISR size sufficient: ")
+                .append(curMaximalIsr.size() >= minInSyncReplicas)
+                .append(".");
 
         return diagnostics.toString();
     }

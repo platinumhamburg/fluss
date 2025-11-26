@@ -246,9 +246,67 @@ public class DelayedFetchIndex extends DelayedOperation {
                         }
                     }
                     if (indexBucketResults.size() != indexBucketFetchRequests.size()) {
-                        LOG.debug(
-                                "Some index buckets data are not loaded for data bucket {}",
-                                dataBucket);
+                        // Identify which buckets are not loaded (NOT_READY)
+                        java.util.List<TableBucket> notLoadedBuckets =
+                                indexBucketFetchRequests.keySet().stream()
+                                        .filter(ib -> !indexBucketResults.containsKey(ib))
+                                        .collect(java.util.stream.Collectors.toList());
+
+                        // Build complete diagnostic information in a single string for easier grep
+                        StringBuilder fullDiagnostic = new StringBuilder();
+                        fullDiagnostic
+                                .append("Some index buckets data are not loaded for data bucket ")
+                                .append(dataBucket)
+                                .append(". LoadedBuckets: ")
+                                .append(indexBucketResults.size())
+                                .append("/")
+                                .append(indexBucketFetchRequests.size())
+                                .append(", NotLoadedBuckets: ")
+                                .append(notLoadedBuckets);
+
+                        // Collect diagnostic information ONLY for not-loaded buckets
+                        try {
+                            org.apache.fluss.server.index.IndexCache indexCache =
+                                    dataReplica.getIndexCache();
+                            if (indexCache != null) {
+                                fullDiagnostic.append(
+                                        "\n========== Diagnostic for NOT_LOADED IndexBuckets ==========");
+
+                                for (TableBucket notLoadedBucket : notLoadedBuckets) {
+                                    // Get fetch request info for this bucket
+                                    FetchIndexReqInfo fetchReq =
+                                            indexBucketFetchRequests.get(notLoadedBucket);
+                                    long requestedOffset = fetchReq.getFetchOffset();
+
+                                    // Get bucket-specific diagnostic info
+                                    // Use a reasonable end offset estimate (requestedOffset + 1000)
+                                    String bucketDiag =
+                                            indexCache.getIndexBucketDiagnosticInfo(
+                                                    notLoadedBucket,
+                                                    requestedOffset,
+                                                    requestedOffset + 1000);
+                                    fullDiagnostic.append(bucketDiag);
+                                }
+
+                                fullDiagnostic.append(
+                                        "\n============================================");
+                            } else {
+                                fullDiagnostic.append(
+                                        "\n[ERROR] IndexCache is NULL for this data bucket, this should not happen for a leader replica");
+                            }
+                        } catch (Exception diagEx) {
+                            fullDiagnostic
+                                    .append("\n[ERROR] Failed to collect diagnostic info: ")
+                                    .append(diagEx.getMessage());
+                            LOG.debug(
+                                    "Exception details for diagnostic collection failure on data bucket {}",
+                                    dataBucket,
+                                    diagEx);
+                        }
+
+                        // Output all diagnostic information in a single log line for easier grep
+                        LOG.warn(fullDiagnostic.toString());
+
                         continue;
                     }
                     completeFetches.put(
