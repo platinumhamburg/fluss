@@ -563,6 +563,91 @@ public final class IndexCache implements Closeable {
         return indexRowCache;
     }
 
+    /**
+     * Gets diagnostic information for a specific index bucket. This is more focused than
+     * getDiagnosticInfo() and only returns information relevant to the specified bucket.
+     *
+     * @param indexBucket the index bucket to diagnose
+     * @param requestedStartOffset the start offset that was requested (for gap analysis)
+     * @param requestedEndOffset the end offset that was requested (for gap analysis)
+     * @return a formatted diagnostic string for the specific bucket
+     */
+    public String getIndexBucketDiagnosticInfo(
+            TableBucket indexBucket, long requestedStartOffset, long requestedEndOffset) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n  --- Diagnostic for IndexBucket ").append(indexBucket).append(" ---\n");
+
+        // General context
+        sb.append("  DataBucket: ").append(logTablet.getTableBucket()).append("\n");
+        sb.append("  RequestedRange: [")
+                .append(requestedStartOffset)
+                .append(", ")
+                .append(requestedEndOffset)
+                .append(")\n");
+
+        // Log offsets
+        sb.append("  LogEndOffset: ").append(logTablet.localLogEndOffset()).append("\n");
+        sb.append("  HighWatermark: ").append(logTablet.getHighWatermark()).append("\n");
+        sb.append("  LogEndOffsetOnLeaderStart: ").append(logEndOffsetOnLeaderStart).append("\n");
+
+        // Index commit state for this bucket
+        long commitOffset =
+                indexRowCache.getCommitOffset(indexBucket.getTableId(), indexBucket.getBucket());
+        sb.append("  IndexBucketCommitOffset: ").append(commitOffset).append("\n");
+        sb.append("  GlobalIndexCommitHorizon: ")
+                .append(indexRowCache.getCommitHorizon())
+                .append("\n");
+
+        // This bucket's cache state
+        String bucketRangeInfo =
+                indexRowCache.getIndexBucketRangeInfo(
+                        indexBucket.getTableId(), indexBucket.getBucket());
+        sb.append("  CachedRanges:\n");
+        if (bucketRangeInfo.isEmpty()) {
+            sb.append("    [EMPTY - No cached ranges for this bucket]\n");
+        } else {
+            sb.append(bucketRangeInfo);
+        }
+
+        // Analyze why data is not loaded
+        sb.append("  GapAnalysis:\n");
+        if (requestedStartOffset < logEndOffsetOnLeaderStart) {
+            sb.append(
+                    "    RequestedOffset < LogEndOffsetOnLeaderStart: YES (should be loadable from WAL)\n");
+        } else {
+            sb.append(
+                    "    RequestedOffset >= LogEndOffsetOnLeaderStart: YES (hot data, check PendingWriteQueue)\n");
+        }
+
+        // Cold load state
+        sb.append("  ColdLoadState:\n");
+        sb.append("    InProgress: ").append(coldLoadInProgress).append("\n");
+        sb.append("    CurrentEndOffset: ").append(coldLoadCurrentEndOffset).append("\n");
+        sb.append("    TargetEndOffset: ").append(coldLoadTargetEndOffset).append("\n");
+
+        if (requestedStartOffset >= coldLoadCurrentEndOffset
+                && requestedStartOffset < logEndOffsetOnLeaderStart) {
+            sb.append("    ⚠️  Requested data [")
+                    .append(requestedStartOffset)
+                    .append(", ")
+                    .append(requestedEndOffset)
+                    .append(") is beyond coldLoadCurrentEndOffset ")
+                    .append(coldLoadCurrentEndOffset)
+                    .append(", may need next batch\n");
+        }
+
+        // PendingWriteQueue summary (not full details)
+        int queueSize = pendingWriteQueue.getQueueSize();
+        sb.append("  PendingWriteQueue: queueSize=").append(queueSize);
+        if (queueSize > 0) {
+            sb.append(", may contain tasks for this range\n");
+        } else {
+            sb.append(", no pending tasks\n");
+        }
+
+        return sb.toString();
+    }
+
     @Override
     public void close() {
         if (closed) {
