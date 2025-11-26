@@ -375,6 +375,36 @@ public class IndexBucketRowCache implements Closeable {
     }
 
     /**
+     * Gets formatted offset range information for diagnostic purposes. Returns a string showing all
+     * cached offset ranges with their start/end offsets and entry counts.
+     *
+     * @return formatted string with offset range layout, empty string if no ranges exist
+     */
+    public String getOffsetRangeInfo() {
+        return inReadLock(
+                lock,
+                () -> {
+                    if (offsetRanges.isEmpty()) {
+                        return "";
+                    }
+
+                    StringBuilder sb = new StringBuilder();
+                    for (OffsetRange range : offsetRanges.values()) {
+                        sb.append("      Range [")
+                                .append(range.getStartOffset())
+                                .append(", ")
+                                .append(range.getEndOffset())
+                                .append("), entries=")
+                                .append(range.entriesCount())
+                                .append(", memSegments=")
+                                .append(range.getMemorySegmentCount())
+                                .append("\n");
+                    }
+                    return sb.toString();
+                });
+    }
+
+    /**
      * Cleanup cached data below the given horizon offset.
      *
      * @param cleanupHorizonOffset the horizon offset - data below this will be cleaned up
