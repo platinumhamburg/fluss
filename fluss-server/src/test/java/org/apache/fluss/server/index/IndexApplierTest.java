@@ -128,6 +128,7 @@ class IndexApplierTest {
                         kvTablet,
                         logTablet,
                         indexSchema,
+                        TestingMetricGroups.TABLE_METRICS,
                         TestingMetricGroups.TABLET_SERVER_METRICS);
 
         // Setup test data buckets - these represent upstream data table buckets

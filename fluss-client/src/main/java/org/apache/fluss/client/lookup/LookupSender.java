@@ -446,10 +446,11 @@ class LookupSender implements Runnable {
         for (AbstractLookupQuery<?> lookup : lookups) {
             if (canRetry(lookup, error.exception())) {
                 LOG.warn(
-                        "Get error {}lookup response on table bucket {}, retrying ({} attempts left). Error: {}",
+                        "Get error {}lookup response on table bucket {}, retrying (attempt {} of {}). Error: {}",
                         lookupType,
                         tableBucket,
-                        maxRetries - lookup.retries(),
+                        lookup.retries(),
+                        maxRetries,
                         error.formatErrMsg());
                 reEnqueueLookup(lookup);
             } else {

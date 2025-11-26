@@ -126,6 +126,7 @@ public class MetricNames {
     public static final String INDEX_APPLY_ERRORS_RATE = "indexApplyErrorsPerSecond";
     public static final String INDEX_APPLY_LATENCY_MS = "indexApplyLatencyMs";
     public static final String INDEX_APPLY_BATCH_SIZE = "indexApplyBatchSize";
+    public static final String INDEX_MAX_REPLICATION_LAG_OFFSET = "indexMaxReplicationLagOffset";
 
     // for index cache memory
     public static final String INDEX_CACHE_MEMORY_USAGE_PERCENT = "indexCacheMemoryUsagePercent";

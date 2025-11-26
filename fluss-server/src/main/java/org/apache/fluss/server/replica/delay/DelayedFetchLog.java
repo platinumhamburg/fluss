@@ -200,6 +200,25 @@ public class DelayedFetchLog extends DelayedOperation {
         } else {
             serverMetricGroup.delayedFetchFromClientExpireCount().inc();
         }
+
+        // Log detailed diagnostics for timeout
+        for (Map.Entry<TableBucket, FetchBucketStatus> entry : fetchBucketStatusMap.entrySet()) {
+            TableBucket tableBucket = entry.getKey();
+            FetchBucketStatus fetchBucketStatus = entry.getValue();
+
+            try {
+                Replica replica = replicaManager.getReplicaOrException(tableBucket);
+                long fetchOffset = fetchBucketStatus.fetchReqInfo.getFetchOffset();
+                String diagnostics = replica.getTimeoutDiagnostics(fetchOffset);
+                LOG.warn(diagnostics);
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to get timeout diagnostics for bucket {} with fetch offset {}: {}",
+                        tableBucket,
+                        fetchBucketStatus.fetchReqInfo.getFetchOffset(),
+                        e.getMessage());
+            }
+        }
     }
 
     @Override

@@ -510,9 +510,10 @@ public class Sender implements Runnable {
             // if batch failed because of retrievable exception, we need to retry send all those
             // batches.
             LOG.warn(
-                    "Get error write response on table bucket {}, retrying ({} attempts left). Error: {}",
+                    "Get error write response on table bucket {}, retrying (attempt {} of {}). Error: {}",
                     readyWriteBatch.tableBucket(),
-                    retries - writeBatch.attempts(),
+                    writeBatch.attempts(),
+                    retries,
                     error.formatErrMsg());
 
             if (!idempotenceManager.idempotenceEnabled()) {
