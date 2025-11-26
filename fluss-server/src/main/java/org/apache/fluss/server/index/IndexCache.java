@@ -327,9 +327,18 @@ public final class IndexCache implements Closeable {
         long maxCommitOffset = -1;
         for (Map.Entry<TableBucket, IndexCacheFetchParam> entry : fetchRequests.entrySet()) {
             TableBucket indexBucket = entry.getKey();
-            long commitOffset = entry.getValue().getIndexCommitOffset();
+            IndexCacheFetchParam fetchParam = entry.getValue();
+            long commitOffset = fetchParam.getIndexCommitOffset();
+            long fetchOffset = fetchParam.getFetchOffset();
+            int leaderServerId = fetchParam.getLeaderServerId();
+
             indexRowCache.updateCommitOffset(
-                    indexBucket.getTableId(), indexBucket.getBucket(), commitOffset);
+                    indexBucket.getTableId(),
+                    indexBucket.getBucket(),
+                    commitOffset,
+                    fetchOffset,
+                    leaderServerId);
+
             maxCommitOffset = Math.max(maxCommitOffset, commitOffset);
         }
         mayTriggerCommitHorizonCallback(maxCommitOffset);
@@ -760,10 +769,12 @@ public final class IndexCache implements Closeable {
     public static final class IndexCacheFetchParam {
         private final long fetchOffset;
         private final long indexCommitOffset;
+        private final int leaderServerId;
 
-        public IndexCacheFetchParam(long fetchOffset, long indexCommitOffset) {
+        public IndexCacheFetchParam(long fetchOffset, long indexCommitOffset, int leaderServerId) {
             this.fetchOffset = fetchOffset;
             this.indexCommitOffset = indexCommitOffset;
+            this.leaderServerId = leaderServerId;
         }
 
         public long getFetchOffset() {
@@ -772,6 +783,10 @@ public final class IndexCache implements Closeable {
 
         public long getIndexCommitOffset() {
             return indexCommitOffset;
+        }
+
+        public int getLeaderServerId() {
+            return leaderServerId;
         }
     }
 }

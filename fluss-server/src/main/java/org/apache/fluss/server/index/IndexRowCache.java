@@ -39,7 +39,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
@@ -101,7 +100,8 @@ public final class IndexRowCache implements Closeable {
     /** Map from index bucket to its row cache. */
     private final Map<Long, IndexBucketRowCache[]> bucketRowCaches = new HashMap<>();
 
-    private final Map<Long, AtomicLong[]> bucketCommitOffsets = new HashMap<>();
+    /** Map from index table id to fetch states (including commit offsets) for each bucket. */
+    private final Map<Long, RemoteFetchState[]> bucketFetchStates = new HashMap<>();
 
     /** Whether this cache manager has been closed. */
     private boolean closed = false;
@@ -120,33 +120,42 @@ public final class IndexRowCache implements Closeable {
             Long indexTableId = entry.getKey();
             int bucketCount = entry.getValue();
             IndexBucketRowCache[] bucketCaches = new IndexBucketRowCache[bucketCount];
-            AtomicLong[] bucketCommitOffsets = new AtomicLong[bucketCount];
+            RemoteFetchState[] fetchStates = new RemoteFetchState[bucketCount];
             for (int i = 0; i < bucketCount; i++) {
                 bucketCaches[i] =
                         new IndexBucketRowCache(
                                 logTablet.getTableBucket(),
                                 new TableBucket(indexTableId, i),
                                 memoryPool);
-                bucketCommitOffsets[i] = new AtomicLong(-1L);
+                fetchStates[i] = new RemoteFetchState();
             }
             bucketRowCaches.put(indexTableId, bucketCaches);
-            this.bucketCommitOffsets.put(indexTableId, bucketCommitOffsets);
+            this.bucketFetchStates.put(indexTableId, fetchStates);
         }
         LOG.info("IndexRowCache initialized with memory pool page size: {}", memoryPool.pageSize());
     }
 
     /**
-     * Updates the commit offset for a specific index bucket.
+     * Updates the commit offset and fetch offset for a specific index bucket.
      *
      * @param indexTableId the index table id
      * @param bucketId the index bucket ID
      * @param commitOffset the commit offset
+     * @param fetchOffset the fetch offset being requested
+     * @param leaderServerId the leader server id that this bucket is fetching from
      */
-    public void updateCommitOffset(long indexTableId, int bucketId, long commitOffset) {
+    public void updateCommitOffset(
+            long indexTableId,
+            int bucketId,
+            long commitOffset,
+            long fetchOffset,
+            int leaderServerId) {
         if (closed) {
             throw new IllegalStateException("IndexRowCache is closed");
         }
-        getCommitOffsetsArray(indexTableId)[bucketId].set(commitOffset);
+        RemoteFetchState[] states = getFetchStatesArray(indexTableId);
+        states[bucketId].updateCommitOffset(commitOffset, leaderServerId);
+        states[bucketId].recordFetchOffset(fetchOffset);
         getBucketRowCache(indexTableId, bucketId).garbageCollectBelowOffset(commitOffset);
     }
 
@@ -156,12 +165,12 @@ public final class IndexRowCache implements Closeable {
      * @return the commit offset
      */
     public long getCommitHorizon() {
-        return bucketCommitOffsets.values().stream()
+        return bucketFetchStates.values().stream()
                 .map(
-                        offsets ->
-                                Arrays.stream(offsets)
-                                        .map(AtomicLong::get)
-                                        .min(Long::compareTo)
+                        states ->
+                                Arrays.stream(states)
+                                        .mapToLong(RemoteFetchState::getCommitOffset)
+                                        .min()
                                         .orElse(-1L))
                 .min(Long::compareTo)
                 .orElse(-1L);
@@ -174,12 +183,12 @@ public final class IndexRowCache implements Closeable {
      */
     public Map<Long, List<Integer>> getBucketsWithUncommittedOffsets() {
         Map<Long, List<Integer>> result = new HashMap<>();
-        for (Map.Entry<Long, AtomicLong[]> entry : bucketCommitOffsets.entrySet()) {
+        for (Map.Entry<Long, RemoteFetchState[]> entry : bucketFetchStates.entrySet()) {
             Long indexTableId = entry.getKey();
-            AtomicLong[] offsets = entry.getValue();
+            RemoteFetchState[] states = entry.getValue();
             List<Integer> uncommittedBuckets = new ArrayList<>();
-            for (int i = 0; i < offsets.length; i++) {
-                if (offsets[i].get() == -1L) {
+            for (int i = 0; i < states.length; i++) {
+                if (states[i].getCommitOffset() == -1L) {
                     uncommittedBuckets.add(i);
                 }
             }
@@ -188,6 +197,30 @@ public final class IndexRowCache implements Closeable {
             }
         }
         return result;
+    }
+
+    /**
+     * Gets detailed diagnostic information for index buckets that are blocking the commit horizon.
+     * Only returns information for buckets whose commit offset equals the current commit horizon,
+     * as these are the ones preventing progress.
+     *
+     * @return a list of diagnostic strings for buckets blocking the commit horizon
+     */
+    public List<String> getBlockingBucketDiagnostics() {
+        List<String> diagnostics = new ArrayList<>();
+        long commitHorizon = getCommitHorizon();
+
+        // Only report buckets that are at the commit horizon (blocking progress)
+        for (Map.Entry<Long, RemoteFetchState[]> entry : bucketFetchStates.entrySet()) {
+            Long indexTableId = entry.getKey();
+            RemoteFetchState[] states = entry.getValue();
+            for (int i = 0; i < states.length; i++) {
+                if (states[i].getCommitOffset() == commitHorizon) {
+                    diagnostics.add(states[i].getDiagnosticString(indexTableId, i));
+                }
+            }
+        }
+        return diagnostics;
     }
 
     /**
@@ -435,11 +468,11 @@ public final class IndexRowCache implements Closeable {
      * @return the commit offset, or -1 if not set
      */
     public long getCommitOffset(long indexTableId, int bucketId) {
-        AtomicLong[] offsets = bucketCommitOffsets.get(indexTableId);
-        if (offsets == null || bucketId >= offsets.length) {
+        RemoteFetchState[] states = bucketFetchStates.get(indexTableId);
+        if (states == null || bucketId >= states.length) {
             return -1L;
         }
-        return offsets[bucketId].get();
+        return states[bucketId].getCommitOffset();
     }
 
     /**
@@ -506,13 +539,13 @@ public final class IndexRowCache implements Closeable {
         return bucketCaches;
     }
 
-    private AtomicLong[] getCommitOffsetsArray(long indexTableId) {
-        AtomicLong[] commitOffsets = bucketCommitOffsets.get(indexTableId);
-        if (null == commitOffsets) {
+    private RemoteFetchState[] getFetchStatesArray(long indexTableId) {
+        RemoteFetchState[] fetchStates = bucketFetchStates.get(indexTableId);
+        if (null == fetchStates) {
             throw new IllegalArgumentException(
-                    "IndexBucketRowCache not found for indexTableId: " + indexTableId);
+                    "RemoteFetchState not found for indexTableId: " + indexTableId);
         }
-        return commitOffsets;
+        return fetchStates;
     }
 
     private IndexBucketRowCache getBucketRowCache(long indexTableId, int bucketId)

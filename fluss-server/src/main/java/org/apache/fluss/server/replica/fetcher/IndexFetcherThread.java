@@ -364,7 +364,7 @@ final class IndexFetcherThread extends ShutdownableThread {
                             break;
                         case LOG_OFFSET_OUT_OF_RANGE_EXCEPTION:
                             serverMetricGroup.indexFetchErrors().inc();
-                            LOG.info(
+                            LOG.error(
                                     "Index offset out of range for data-index bucket {}, attempting automatic recovery",
                                     dataIndexBucket);
                             handleIndexOutOfRangeError(dataIndexBucket);
@@ -448,15 +448,13 @@ final class IndexFetcherThread extends ShutdownableThread {
 
             // Check if data is not ready (not loaded in cache yet)
             if (!isDataReady) {
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug(
-                            "Index data not ready for data bucket {} -> index bucket {} range [{}, {}), will retry after {} ms delay",
-                            dataBucket,
-                            indexBucket,
-                            startOffset,
-                            endOffset,
-                            fetchBackOffMs);
-                }
+                LOG.warn(
+                        "Index data not ready for data bucket {} -> index bucket {} range [{}, {}), will retry after {} ms delay",
+                        dataBucket,
+                        indexBucket,
+                        startOffset,
+                        endOffset,
+                        fetchBackOffMs);
                 delayIndexBucketsInternal(Collections.singleton(dataIndexBucket), fetchBackOffMs);
                 return;
             }
