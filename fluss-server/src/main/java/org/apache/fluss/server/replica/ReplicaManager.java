@@ -1026,9 +1026,20 @@ public class ReplicaManager {
             PartitionListenerHandle listenerHandle = partitionListenerHandleMap.remove(tb);
             if (listenerHandle != null) {
                 listenerHandle.stopWatch();
-                LOG.debug(
-                        "Stopped partition listener for index bucket {} before becoming leader",
-                        tb);
+                // Try to get physical path for better logging, fallback to TableBucket if not
+                // available
+                Optional<PhysicalTablePath> physicalPath =
+                        metadataCache.getPhysicalTablePath(
+                                tb.getPartitionId() != null ? tb.getPartitionId() : -1);
+                if (physicalPath.isPresent()) {
+                    LOG.debug(
+                            "Stopped partition listener for index table {} before becoming leader",
+                            physicalPath.get());
+                } else {
+                    LOG.debug(
+                            "Stopped partition listener for index bucket {} before becoming leader",
+                            tb);
+                }
             }
         }
 
@@ -1124,12 +1135,18 @@ public class ReplicaManager {
             if (dataTable.isPartitioned()) {
                 // Watch for partition changes and handle them automatically
                 // Use partitionEventExecutor to handle events asynchronously, avoiding deadlocks
+                TablePath dataTablePath = dataTable.getTablePath();
                 Tuple2<List<PartitionMetadata>, PartitionListenerHandle> listPartitionResult =
                         metadataCache.listPartitionMetaAndWatch(
-                                dataTable.getTablePath(),
+                                dataTablePath,
                                 partitionEvent -> {
-                                    long partitionId =
-                                            partitionEvent.getPartitionMetadata().getPartitionId();
+                                    PartitionMetadata partitionMetadata =
+                                            partitionEvent.getPartitionMetadata();
+                                    long partitionId = partitionMetadata.getPartitionId();
+                                    String partitionName = partitionMetadata.getPartitionName();
+                                    PhysicalTablePath dataPartitionPath =
+                                            PhysicalTablePath.of(dataTablePath, partitionName);
+
                                     if (partitionEvent.getType()
                                             == TabletServerMetadataCache.PartitionEventType
                                                     .CREATED) {
@@ -1155,10 +1172,10 @@ public class ReplicaManager {
                                         indexFetcherManager.addOrUpdateTargetsForIndexBucket(
                                                 indexBucket, newPartitionGoals);
                                         LOG.info(
-                                                "Added {} fetcher targets for new partition {} of index bucket {}",
+                                                "Added {} fetcher targets for data partition {} to index table {}",
                                                 newPartitionGoals.size(),
-                                                partitionId,
-                                                indexBucket);
+                                                dataPartitionPath,
+                                                indexPhysicalPath);
                                     } else if (partitionEvent.getType()
                                             == TabletServerMetadataCache.PartitionEventType
                                                     .DELETED) {
@@ -1175,10 +1192,10 @@ public class ReplicaManager {
                                         indexFetcherManager.removeDataBucketsFromIndexBucket(
                                                 indexBucket, deletedDataBuckets);
                                         LOG.info(
-                                                "Removed {} fetcher targets for deleted partition {} of index bucket {}",
+                                                "Removed {} fetcher targets for data partition {} from index table {}",
                                                 deletedDataBuckets.size(),
-                                                partitionId,
-                                                indexBucket);
+                                                dataPartitionPath,
+                                                indexPhysicalPath);
                                     }
                                 },
                                 partitionEventExecutor);
@@ -1284,9 +1301,20 @@ public class ReplicaManager {
             PartitionListenerHandle listenerHandle = partitionListenerHandleMap.remove(tb);
             if (listenerHandle != null) {
                 listenerHandle.stopWatch();
-                LOG.debug(
-                        "Stopped partition listener for index bucket {} before becoming follower",
-                        tb);
+                // Try to get physical path for better logging, fallback to TableBucket if not
+                // available
+                Optional<PhysicalTablePath> physicalPath =
+                        metadataCache.getPhysicalTablePath(
+                                tb.getPartitionId() != null ? tb.getPartitionId() : -1);
+                if (physicalPath.isPresent()) {
+                    LOG.debug(
+                            "Stopped partition listener for index table {} before becoming follower",
+                            physicalPath.get());
+                } else {
+                    LOG.debug(
+                            "Stopped partition listener for index bucket {} before becoming follower",
+                            tb);
+                }
             }
         }
 
@@ -2026,7 +2054,15 @@ public class ReplicaManager {
         PartitionListenerHandle listenerHandle = partitionListenerHandleMap.remove(tb);
         if (listenerHandle != null) {
             listenerHandle.stopWatch();
-            LOG.info("Stopped partition listener for index bucket {}", tb);
+            // Try to get physical path for better logging, fallback to TableBucket if not available
+            Optional<PhysicalTablePath> physicalPath =
+                    metadataCache.getPhysicalTablePath(
+                            tb.getPartitionId() != null ? tb.getPartitionId() : -1);
+            if (physicalPath.isPresent()) {
+                LOG.info("Stopped partition listener for index table {}", physicalPath.get());
+            } else {
+                LOG.info("Stopped partition listener for index bucket {}", tb);
+            }
         }
 
         HostedReplica replica = getReplica(tb);

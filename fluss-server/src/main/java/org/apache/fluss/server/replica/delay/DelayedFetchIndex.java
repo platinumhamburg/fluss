@@ -246,7 +246,7 @@ public class DelayedFetchIndex extends DelayedOperation {
                         }
                     }
                     if (indexBucketResults.size() != indexBucketFetchRequests.size()) {
-                        LOG.warn(
+                        LOG.debug(
                                 "Some index buckets data are not loaded for data bucket {}",
                                 dataBucket);
                         continue;
@@ -295,6 +295,19 @@ public class DelayedFetchIndex extends DelayedOperation {
     public void onExpiration() {
         // Index fetch requests only come from index table bucket leaders (followers)
         serverMetricGroup.delayedIndexFetchFromFollowerExpireCount().inc();
+
+        Set<TableBucket> remainingDataBuckets =
+                Sets.difference(dataBucketRequests.keySet(), completeFetches.keySet());
+        if (!remainingDataBuckets.isEmpty()) {
+            LOG.warn(
+                    "Delayed fetch index operation timed out. Pending data buckets: {}, "
+                            + "completed data buckets: {}, fetched bytes: {}/{}, params: {}",
+                    remainingDataBuckets,
+                    completeFetches.keySet(),
+                    fetchedBytes.get(),
+                    params.maxBytes(),
+                    params);
+        }
     }
 
     @Override

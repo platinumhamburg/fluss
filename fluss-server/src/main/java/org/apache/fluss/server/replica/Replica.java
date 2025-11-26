@@ -295,6 +295,43 @@ public final class Replica {
         logicalStorageMetrics.gauge(
                 MetricNames.LOCAL_STORAGE_LOG_SIZE, this::logicalStorageLogSize);
         logicalStorageMetrics.gauge(MetricNames.LOCAL_STORAGE_KV_SIZE, this::logicalStorageKvSize);
+
+        // Register index replication lag supplier for tables with indexes.
+        // Each bucket registers its own lag calculator, and the TableMetricGroup
+        // will compute the maximum lag across all buckets.
+        if (isTableWithIndexes) {
+            TableMetricGroup tableMetricGroup = bucketMetricGroup.getTableMetricGroup();
+            tableMetricGroup.registerBucketIndexLagSupplier(
+                    tableBucket, this::getIndexReplicationLag);
+        }
+    }
+
+    /**
+     * Calculate the index replication lag for this bucket. The lag is defined as the difference
+     * between high watermark and index commit horizon.
+     *
+     * @return the replication lag, or 0 if index cache is not available or not a leader
+     */
+    private long getIndexReplicationLag() {
+        if (!isLeader() || !isTableWithIndexes) {
+            return 0L;
+        }
+
+        IndexCache indexCache = this.indexCache;
+        if (indexCache == null) {
+            return 0L;
+        }
+
+        long highWatermark = logTablet.getHighWatermark();
+        long indexCommitHorizon = indexCache.getIndexCommitHorizon();
+
+        // Return the lag; if indexCommitHorizon is -1 (not initialized), return highWatermark as
+        // lag
+        if (indexCommitHorizon < 0) {
+            return highWatermark;
+        }
+
+        return Math.max(0, highWatermark - indexCommitHorizon);
     }
 
     public long logicalStorageLogSize() {
@@ -519,6 +556,12 @@ public final class Replica {
         inWriteLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    // Unregister index lag supplier if this table has indexes
+                    if (isTableWithIndexes) {
+                        TableMetricGroup tableMetricGroup = bucketMetricGroup.getTableMetricGroup();
+                        tableMetricGroup.unregisterBucketIndexLagSupplier(tableBucket);
+                    }
+
                     if (isKvTable()) {
                         dropKv();
                     }
@@ -845,6 +888,7 @@ public final class Replica {
                         kvTablet,
                         logTablet,
                         schema,
+                        bucketMetricGroup.getTableMetricGroup(),
                         bucketMetricGroup.getTableMetricGroup().getServerMetricGroup());
 
         try {
@@ -2176,6 +2220,91 @@ public final class Replica {
 
     public boolean isUnderMinIsr() {
         return isLeader() && isrState.isr().size() < minInSyncReplicas;
+    }
+
+    /**
+     * Returns a detailed timeout diagnostics message for delayed write operation.
+     *
+     * @param requiredOffset the offset that delayed write is waiting for
+     * @return diagnostics message describing why the write operation timed out
+     */
+    public String getTimeoutDiagnostics(long requiredOffset) {
+        StringBuilder diagnostics = new StringBuilder();
+        diagnostics
+                .append("Delayed write operation timed out for table ")
+                .append(physicalPath)
+                .append(", bucket ")
+                .append(tableBucket)
+                .append(". Required offset: ")
+                .append(requiredOffset)
+                .append(". Diagnostics: ");
+
+        // Check log replication status
+        long highWatermark = logTablet.getHighWatermark();
+        long logLag = requiredOffset - highWatermark;
+        if (highWatermark < requiredOffset) {
+            diagnostics
+                    .append("[Log Replication] High watermark (")
+                    .append(highWatermark)
+                    .append(") has not reached required offset, lag: ")
+                    .append(logLag)
+                    .append(" offsets. ");
+
+            // Add follower replica details
+            List<Integer> curMaximalIsr = isrState.maximalIsr();
+            List<String> followerInfoList = new ArrayList<>();
+            for (Integer replicaId : curMaximalIsr) {
+                if (replicaId != localTabletServerId
+                        && followerReplicasMap.containsKey(replicaId)) {
+                    FollowerReplica followerReplica = followerReplicasMap.get(replicaId);
+                    long followerLogEndOffset = followerReplica.stateSnapshot().getLogEndOffset();
+                    long followerLag = requiredOffset - followerLogEndOffset;
+                    String status = followerLogEndOffset >= requiredOffset ? "synced" : "lagging";
+                    followerInfoList.add(
+                            String.format(
+                                    "server-%d: LEO=%d, lag=%d, status=%s",
+                                    replicaId, followerLogEndOffset, followerLag, status));
+                }
+            }
+
+            if (!followerInfoList.isEmpty()) {
+                diagnostics
+                        .append("Follower replicas: ")
+                        .append(String.join(", ", followerInfoList))
+                        .append(". ");
+            }
+        } else {
+            diagnostics
+                    .append("[Log Replication] High watermark (")
+                    .append(highWatermark)
+                    .append(") has reached required offset. ");
+        }
+
+        // Check index replication status if applicable
+        if (isTableWithIndexes) {
+            IndexCache indexCache = this.indexCache;
+            if (indexCache != null) {
+                long indexCommitHorizon = indexCache.getIndexCommitHorizon();
+                long indexLag = requiredOffset - indexCommitHorizon;
+                if (indexCommitHorizon < requiredOffset) {
+                    diagnostics
+                            .append("[Index Replication] Index commit horizon (")
+                            .append(indexCommitHorizon)
+                            .append(") has not reached required offset, lag: ")
+                            .append(indexLag)
+                            .append(" offsets.");
+                } else {
+                    diagnostics
+                            .append("[Index Replication] Index commit horizon (")
+                            .append(indexCommitHorizon)
+                            .append(") has reached required offset.");
+                }
+            } else {
+                diagnostics.append("[Index Replication] IndexCache is not available.");
+            }
+        }
+
+        return diagnostics.toString();
     }
 
     private LogTablet localLogOrThrow(boolean requireLeader) {
