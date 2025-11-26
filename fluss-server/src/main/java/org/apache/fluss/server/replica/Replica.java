@@ -767,9 +767,11 @@ public final class Replica {
         for (Map.Entry<TableBucket, FetchIndexReqInfo> entry : indexBucketFetchInfo.entrySet()) {
             TableBucket indexBucket = entry.getKey();
             FetchIndexReqInfo reqInfo = entry.getValue();
+            // TODO: Get actual leader server ID from request context
+            // For now, use -1 to indicate unknown leader
             IndexCache.IndexCacheFetchParam fetchParam =
                     new IndexCache.IndexCacheFetchParam(
-                            reqInfo.getFetchOffset(), reqInfo.getIndexCommitOffset());
+                            reqInfo.getFetchOffset(), reqInfo.getIndexCommitOffset(), -1);
             indexCacheFetchParams.put(indexBucket, fetchParam);
         }
         return indexCache.fetchIndex(indexCacheFetchParams, minAdvanceOffset, maxBytes, forceFetch);
@@ -2293,6 +2295,65 @@ public final class Replica {
                             .append(") has not reached required offset, lag: ")
                             .append(indexLag)
                             .append(" offsets. ");
+
+                    // Add detailed diagnostics for index buckets blocking the commit horizon
+                    List<String> blockingBuckets =
+                            indexCache.getIndexRowCache().getBlockingBucketDiagnostics();
+
+                    if (!blockingBuckets.isEmpty()) {
+                        diagnostics.append("Blocking index buckets (at commit horizon): ");
+                        for (String bucketDiag : blockingBuckets) {
+                            diagnostics.append("\n  - ").append(bucketDiag);
+                        }
+
+                        // Add detailed IndexCache diagnostic info for blocking buckets
+                        diagnostics.append(
+                                "\n========== Detailed Diagnostic for Blocking IndexBuckets ==========");
+                        for (String bucketDiag : blockingBuckets) {
+                            // Extract index bucket info from diagnostic string
+                            // Format: "IndexBucket{tableId=X, bucket=Y}: ..."
+                            try {
+                                int tableIdStart = bucketDiag.indexOf("tableId=") + 8;
+                                int tableIdEnd = bucketDiag.indexOf(",", tableIdStart);
+                                int bucketIdStart = bucketDiag.indexOf("bucket=", tableIdEnd) + 7;
+                                int bucketIdEnd = bucketDiag.indexOf("}", bucketIdStart);
+
+                                if (tableIdStart > 8
+                                        && tableIdEnd > tableIdStart
+                                        && bucketIdStart > 7
+                                        && bucketIdEnd > bucketIdStart) {
+                                    long indexTableId =
+                                            Long.parseLong(
+                                                    bucketDiag
+                                                            .substring(tableIdStart, tableIdEnd)
+                                                            .trim());
+                                    int indexBucketId =
+                                            Integer.parseInt(
+                                                    bucketDiag
+                                                            .substring(bucketIdStart, bucketIdEnd)
+                                                            .trim());
+
+                                    TableBucket indexBucket =
+                                            new TableBucket(indexTableId, indexBucketId);
+
+                                    // Get detailed diagnostic info for this index bucket
+                                    // Use requiredOffset as the requested offset for context
+                                    String detailedDiag =
+                                            indexCache.getIndexBucketDiagnosticInfo(
+                                                    indexBucket,
+                                                    requiredOffset,
+                                                    requiredOffset + 1000);
+                                    diagnostics.append(detailedDiag);
+                                }
+                            } catch (Exception e) {
+                                diagnostics
+                                        .append("\n  [ERROR] Failed to parse bucket info for: ")
+                                        .append(bucketDiag);
+                            }
+                        }
+                        diagnostics.append("\n============================================");
+                        diagnostics.append(". ");
+                    }
                 } else {
                     diagnostics
                             .append("[Index Replication] Index commit horizon (")
