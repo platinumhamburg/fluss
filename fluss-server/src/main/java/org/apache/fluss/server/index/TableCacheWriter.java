@@ -234,14 +234,18 @@ public final class TableCacheWriter implements Closeable {
      * ensures that all buckets have consistent offset progression while minimizing the number of
      * empty row writes.
      *
-     * @param lastOffset the last offset in the batch
+     * <p>The targetOffset parameter should be the last processed offset (batch.lastLogOffset()).
+     * Since synchronizeAllBucketsToOffset expands Range to targetOffset+1, the final Range
+     * endOffset will equal batch.nextLogOffset(), correctly covering all processed offsets.
+     *
+     * @param targetOffset the last processed offset in the batch (batch.lastLogOffset())
      * @param batchStartOffset the start offset of the batch
      * @throws Exception if an error occurs during finalization
      */
-    public void finalizeBatch(long lastOffset, long batchStartOffset) throws Exception {
+    public void finalizeBatch(long targetOffset, long batchStartOffset) throws Exception {
         // Write empty rows to all buckets to ensure they are synchronized to the same offset level
         // This single write per batch replaces multiple empty row writes during batch processing
-        indexRowCache.synchronizeAllBucketsToOffset(indexTableId, lastOffset, batchStartOffset);
+        indexRowCache.synchronizeAllBucketsToOffset(indexTableId, targetOffset, batchStartOffset);
     }
 
     private IndexedRow createIndexedRow(LogRecord walRecord, long offset) {

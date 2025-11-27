@@ -271,9 +271,10 @@ public final class IndexCacheWriter implements Closeable {
         for (LogRecordBatch batch : walRecords.batches()) {
             short schemaId = batch.schemaId();
 
-            // Record the batch start offset for gap filling lowerBound
-            long batchStartOffset = currentOffset;
-            long batchEndOffset = currentOffset;
+            // Use batch.baseLogOffset() as the authoritative source for batch start
+            // This is more explicit and handles any edge cases with offset discontinuities
+            long batchStartOffset = batch.baseLogOffset();
+            long batchEndOffset = batchStartOffset;
 
             try (LogRecordReadContext readContext =
                             LogRecordReadContext.createArrowReadContext(
@@ -290,25 +291,33 @@ public final class IndexCacheWriter implements Closeable {
             }
 
             // After processing all records in the batch, synchronize all buckets to the same offset
-            // level
-            // This ensures all buckets have consistent offset progression while minimizing empty
-            // row writes
-            if (batchEndOffset > batchStartOffset) {
-                // Diagnostic logging for debugging range gap issue
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug(
-                            "DataBucket {}: Finalizing batch - batchStartOffset={}, batchEndOffset={}, lastProcessedOffset={}",
-                            logTablet.getTableBucket(),
-                            batchStartOffset,
-                            batchEndOffset,
-                            batchEndOffset - 1);
-                }
-                for (TableCacheWriter indexWriter : tableTableCacheWriters) {
-                    indexWriter.finalizeBatch(batchEndOffset - 1, batchStartOffset);
-                }
+            // level. CRITICAL: Must synchronize even for empty batches to prevent range gaps.
+            // Empty batches (e.g., containing only state changes) still occupy offset space
+            // and must be tracked to ensure continuous offset progression across all index buckets.
+
+            // Use batch.lastLogOffset() as the target for synchronization.
+            // synchronizeAllBucketsToOffset(targetOffset) will expand Range to targetOffset+1,
+            // which equals batch.nextLogOffset(). This handles all cases including empty batches.
+            long lastOffset = batch.lastLogOffset();
+            long nextOffset = batch.nextLogOffset();
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "DataBucket {}: Finalizing batch - baseOffset={}, lastOffset={}, nextOffset={}, recordCount={}, processedEndOffset={}",
+                        logTablet.getTableBucket(),
+                        batch.baseLogOffset(),
+                        lastOffset,
+                        nextOffset,
+                        batch.getRecordCount(),
+                        batchEndOffset);
             }
 
-            currentOffset = batchEndOffset;
+            for (TableCacheWriter indexWriter : tableTableCacheWriters) {
+                // Use lastLogOffset to ensure Range endOffset becomes nextLogOffset
+                indexWriter.finalizeBatch(lastOffset, batchStartOffset);
+            }
+
+            currentOffset = nextOffset;
         }
         return currentOffset;
     }
