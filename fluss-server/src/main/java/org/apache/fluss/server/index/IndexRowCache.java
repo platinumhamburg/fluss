@@ -336,6 +336,16 @@ public final class IndexRowCache implements Closeable {
 
         IndexBucketRowCache[] indexBucketCaches = getIndexBucketRowCaches(indexTableId);
 
+        // Diagnostic logging for debugging range gap issue
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Synchronizing all {} buckets for index table {} to targetOffset={}, batchStartOffset={}",
+                    indexBucketCaches.length,
+                    indexTableId,
+                    targetOffset,
+                    batchStartOffset);
+        }
+
         try {
             // Write empty rows to all buckets to synchronize them to the target offset
             for (int bucketId = 0; bucketId < indexBucketCaches.length; bucketId++) {
