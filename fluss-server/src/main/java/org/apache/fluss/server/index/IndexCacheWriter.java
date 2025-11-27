@@ -150,12 +150,9 @@ public final class IndexCacheWriter implements Closeable {
             return;
         }
 
-        if (!appendInfo.offsetsMonotonic() || appendInfo.duplicated()) {
-            LOG.error(
-                    "Invalid appendInfo for hot data writing, skipping, tableBucket {}",
-                    logTablet.getTableBucket());
-            return;
-        }
+        // Note: We trust KvTablet's validation logic. If KvTablet allows writing (not duplicated),
+        // we should also write to IndexCache, regardless of offsetsMonotonic status.
+        // Extra validation here could cause inconsistency between log and index cache.
 
         if (LOG.isDebugEnabled()) {
             LOG.debug(
@@ -297,6 +294,15 @@ public final class IndexCacheWriter implements Closeable {
             // This ensures all buckets have consistent offset progression while minimizing empty
             // row writes
             if (batchEndOffset > batchStartOffset) {
+                // Diagnostic logging for debugging range gap issue
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "DataBucket {}: Finalizing batch - batchStartOffset={}, batchEndOffset={}, lastProcessedOffset={}",
+                            logTablet.getTableBucket(),
+                            batchStartOffset,
+                            batchEndOffset,
+                            batchEndOffset - 1);
+                }
                 for (TableCacheWriter indexWriter : tableTableCacheWriters) {
                     indexWriter.finalizeBatch(batchEndOffset - 1, batchStartOffset);
                 }
