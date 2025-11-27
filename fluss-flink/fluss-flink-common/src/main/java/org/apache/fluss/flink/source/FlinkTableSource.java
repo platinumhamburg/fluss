@@ -127,7 +127,6 @@ public class FlinkTableSource
     private final FlinkConnectorOptionsUtils.StartupOptions startupOptions;
 
     // options for lookup source
-    private final int lookupMaxRetryTimes;
     private final boolean lookupAsync;
     @Nullable private final LookupCache cache;
 
@@ -166,7 +165,6 @@ public class FlinkTableSource
             int[] partitionKeyIndexes,
             boolean streaming,
             FlinkConnectorOptionsUtils.StartupOptions startupOptions,
-            int lookupMaxRetryTimes,
             boolean lookupAsync,
             @Nullable LookupCache cache,
             long scanPartitionDiscoveryIntervalMs,
@@ -183,7 +181,6 @@ public class FlinkTableSource
         this.streaming = streaming;
         this.startupOptions = checkNotNull(startupOptions, "startupOptions must not be null");
 
-        this.lookupMaxRetryTimes = lookupMaxRetryTimes;
         this.lookupAsync = lookupAsync;
         this.cache = cache;
 
@@ -253,7 +250,6 @@ public class FlinkTableSource
                                 flussConfig,
                                 tableOutputType,
                                 primaryKeyIndexes,
-                                lookupMaxRetryTimes,
                                 projectedFields);
             } else if (limit > 0) {
                 results =
@@ -447,7 +443,6 @@ public class FlinkTableSource
                         partitionKeyIndexes,
                         streaming,
                         startupOptions,
-                        lookupMaxRetryTimes,
                         lookupAsync,
                         cache,
                         scanPartitionDiscoveryIntervalMs,

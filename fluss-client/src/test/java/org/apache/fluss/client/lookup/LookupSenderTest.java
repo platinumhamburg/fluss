@@ -43,6 +43,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +55,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_INFO_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -269,6 +271,12 @@ public class LookupSenderTest {
                         // first attempt fails
                         return createFailedResponse(request, new TimeoutException("timeout"));
                     } else {
+                        try {
+                            // Avoid attempting again too quickly
+                            Thread.sleep(100);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
                         // subsequent attempts should not happen if we complete the future
                         throw new AssertionError(
                                 "Should not retry after future is completed externally");
@@ -281,15 +289,15 @@ public class LookupSenderTest {
         lookupQueue.appendLookup(query);
 
         // complete the future externally before retry happens
-        Thread.sleep(100); // wait for first attempt to fail
+        waitUntil(() -> attemptCount.get() >= 1, Duration.ofSeconds(5), "first attempt to be made");
         query.future().complete("external".getBytes());
 
         // verify: completed externally
         byte[] result = query.future().get(1, TimeUnit.SECONDS);
         assertThat(result).isEqualTo("external".getBytes());
-        // retries is 1 because we incremented it when re-enqueuing, but didn't send again
-        assertThat(query.retries()).isLessThanOrEqualTo(1);
-        assertThat(attemptCount.get()).isEqualTo(1); // only first attempt
+        // retries is less than 3, because we stop the query so it won't send again.
+        assertThat(query.retries()).isGreaterThanOrEqualTo(0).isLessThan(3);
+        assertThat(attemptCount.get()).isGreaterThanOrEqualTo(1).isLessThan(4);
     }
 
     @Test

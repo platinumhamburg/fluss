@@ -316,7 +316,7 @@ class LookupSender implements Runnable {
             LookupBatch lookupBatch = lookupsByBucket.get(tableBucket);
             if (pbLookupRespForBucket.hasErrorCode()) {
                 ApiError error = ApiError.fromErrorMessage(pbLookupRespForBucket);
-                handleLookupError(tableBucket, destination, error, lookupBatch.lookups(), "");
+                handleLookupError(tableBucket, destination, error, lookupBatch.lookups(), "lookup");
             } else {
                 List<byte[]> byteValues =
                         pbLookupRespForBucket.getValuesList().stream()
@@ -353,7 +353,11 @@ class LookupSender implements Runnable {
             if (pbRespForBucket.hasErrorCode()) {
                 ApiError error = ApiError.fromErrorMessage(pbRespForBucket);
                 handleLookupError(
-                        tableBucket, destination, error, prefixLookupBatch.lookups(), "prefix ");
+                        tableBucket,
+                        destination,
+                        error,
+                        prefixLookupBatch.lookups(),
+                        "prefix lookup");
             } else {
                 List<List<byte[]>> result = new ArrayList<>(pbRespForBucket.getValueListsCount());
                 for (int i = 0; i < pbRespForBucket.getValueListsCount(); i++) {
@@ -374,7 +378,7 @@ class LookupSender implements Runnable {
         ApiError error = ApiError.fromThrowable(t);
         for (LookupBatch lookupBatch : lookupsByBucket.values()) {
             handleLookupError(
-                    lookupBatch.tableBucket(), destination, error, lookupBatch.lookups(), "");
+                    lookupBatch.tableBucket(), destination, error, lookupBatch.lookups(), "lookup");
         }
     }
 
@@ -387,7 +391,7 @@ class LookupSender implements Runnable {
                     destination,
                     error,
                     lookupBatch.lookups(),
-                    "prefix ");
+                    "prefix lookup");
         }
     }
 
@@ -446,7 +450,7 @@ class LookupSender implements Runnable {
         for (AbstractLookupQuery<?> lookup : lookups) {
             if (canRetry(lookup, error.exception())) {
                 LOG.warn(
-                        "Get error {}lookup response on table bucket {}, retrying ({} attempts left). Error: {}",
+                        "Get error {} response on table bucket {}, retrying ({} attempts left). Error: {}",
                         lookupType,
                         tableBucket,
                         maxRetries - lookup.retries(),
@@ -454,7 +458,7 @@ class LookupSender implements Runnable {
                 reEnqueueLookup(lookup);
             } else {
                 LOG.warn(
-                        "Get error {}lookup response on table bucket {}, fail. Error: {}",
+                        "Get error {} response on table bucket {}, fail. Error: {}",
                         lookupType,
                         tableBucket,
                         error.formatErrMsg());

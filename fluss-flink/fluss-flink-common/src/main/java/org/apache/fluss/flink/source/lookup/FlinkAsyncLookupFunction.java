@@ -120,7 +120,8 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
         RemainingFilter remainingFilter = lookupNormalizer.createRemainingFilter(keyRow);
         InternalRow flussKeyRow = lookupRow.replace(normalizedKeyRow);
 
-        // the retry mechanism is now handled by the underlying LookupClient layer
+        // the retry mechanism is now handled by the underlying LookupClient layer,
+        // we can't call lookuper.lookup() in whenComplete callback as lookuper is not thread-safe.
         CompletableFuture<Collection<RowData>> future = new CompletableFuture<>();
         lookuper.lookup(flussKeyRow)
                 .whenComplete(
