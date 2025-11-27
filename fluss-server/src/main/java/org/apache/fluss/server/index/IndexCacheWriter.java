@@ -304,7 +304,11 @@ public final class IndexCacheWriter implements Closeable {
                             batchEndOffset - 1);
                 }
                 for (TableCacheWriter indexWriter : tableTableCacheWriters) {
-                    indexWriter.finalizeBatch(batchEndOffset - 1, batchStartOffset);
+                    // Use batchEndOffset instead of batchEndOffset-1 to ensure proper range
+                    // expansion
+                    // This prevents range gaps when buckets with real data get skipped in
+                    // synchronization
+                    indexWriter.finalizeBatch(batchEndOffset, batchStartOffset);
                 }
             }
 
