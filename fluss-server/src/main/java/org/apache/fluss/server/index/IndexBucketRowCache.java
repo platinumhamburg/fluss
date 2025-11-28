@@ -146,7 +146,8 @@ public class IndexBucketRowCache implements Closeable {
                         } else if (logOffset > candidateRange.getEndOffset()) {
                             if (candidateRange.getEndOffset() < batchStartOffset) {
                                 targetRange =
-                                        createNewRangeForOffsetRange(batchStartOffset, logOffset);
+                                        createNewEmptyRangeForOffsetRange(
+                                                batchStartOffset, logOffset);
                             } else {
                                 candidateRange.expandRangeBoundaryToOffset(logOffset);
                                 targetRange = candidateRange;
@@ -164,7 +165,8 @@ public class IndexBucketRowCache implements Closeable {
                             return;
                         }
                     } else {
-                        targetRange = createNewRangeForOffsetRange(batchStartOffset, logOffset);
+                        targetRange =
+                                createNewEmptyRangeForOffsetRange(batchStartOffset, logOffset);
                     }
 
                     // Write data to the target range (only if not empty row)
@@ -532,7 +534,7 @@ public class IndexBucketRowCache implements Closeable {
      * @param endOffset the end offset (exclusive)
      * @return the newly created OffsetRange
      */
-    private OffsetRange createNewRangeForOffsetRange(long startOffset, long endOffset) {
+    private OffsetRange createNewEmptyRangeForOffsetRange(long startOffset, long endOffset) {
         OffsetRange newRange = new OffsetRange(startOffset, memoryPool);
         offsetRanges.put(startOffset, newRange);
         // Directly set the end offset for the entire range

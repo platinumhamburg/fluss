@@ -19,6 +19,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
@@ -558,7 +559,8 @@ public final class IndexRowCache implements Closeable {
         return fetchStates;
     }
 
-    private IndexBucketRowCache getBucketRowCache(long indexTableId, int bucketId)
+    @VisibleForTesting
+    IndexBucketRowCache getBucketRowCache(long indexTableId, int bucketId)
             throws IllegalArgumentException {
         IndexBucketRowCache[] bucketCaches = getIndexBucketRowCaches(indexTableId);
         if (bucketId < 0 || bucketId >= bucketCaches.length) {

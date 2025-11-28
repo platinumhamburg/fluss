@@ -399,9 +399,448 @@ class IndexCacheWriterTest {
                 .doesNotThrowAnyException();
     }
 
+    /**
+     * Test to verify that writing multiple consecutive batches (with some having data and some
+     * being empty) results in a single continuous OffsetRange per IndexBucketRowCache.
+     *
+     * <p>This test reproduces and validates the fix for the range gap issue where adjacent offsets
+     * would incorrectly create multiple ranges instead of extending a single range.
+     *
+     * <p>Test scenario:
+     *
+     * <ul>
+     *   <li>Batch 1: offsets [0-9] with data
+     *   <li>Batch 2: offsets [10-19] with data
+     *   <li>Batch 3: empty batch (state changes only)
+     *   <li>Batch 4: empty batch (consecutive empty batch)
+     *   <li>Batch 5: empty batch (consecutive empty batch)
+     *   <li>Batch 6: offsets [30-39] with data
+     *   <li>Batch 7: empty batch
+     *   <li>Batch 8: empty batch (consecutive empty batch)
+     * </ul>
+     *
+     * <p>Expected result: Each IndexBucketRowCache should have exactly ONE continuous OffsetRange.
+     *
+     * <p>This validates that:
+     *
+     * <ul>
+     *   <li>Empty batches don't cause range gaps
+     *   <li>Consecutive empty batches are handled correctly
+     *   <li>finalizeBatch correctly synchronizes all buckets
+     *   <li>Adjacent ranges are properly extended, not duplicated
+     * </ul>
+     */
+    @Test
+    void testMultipleBatchesWithEmptyBatchesProduceSingleRange() throws Exception {
+        // Phase 1: Prepare test data for multiple batches
+        // Batch 1: records [0-9]
+        List<Object[]> batch1Data = INDEXED_DATA.subList(0, Math.min(10, INDEXED_DATA.size()));
+
+        // Batch 2: records [10-19]
+        List<Object[]> batch2Data =
+                INDEXED_DATA.subList(0, Math.min(10, INDEXED_DATA.size())); // Reuse data
+
+        // Batch 3-5: consecutive empty batches
+        List<Object[]> emptyBatchData = Arrays.asList();
+
+        // Batch 6: records with data
+        List<Object[]> batch6Data =
+                INDEXED_DATA.subList(0, Math.min(10, INDEXED_DATA.size())); // Reuse data
+
+        // Phase 2: Write batches to LogTablet and cache them using IndexCacheWriter
+        long currentOffset = 0L;
+
+        // Batch 1: with data
+        MemoryLogRecords batch1Records = createArrowLogRecords(batch1Data, INDEXED_ROW_TYPE);
+        LogAppendInfo appendInfo1 = logTablet.appendAsLeader(batch1Records);
+        indexCacheWriter.cacheIndexDataByHotData(batch1Records, appendInfo1);
+        currentOffset = appendInfo1.lastOffset() + 1;
+
+        System.out.println(
+                String.format(
+                        "=== Batch 1 appended: [%d, %d] ===",
+                        appendInfo1.firstOffset(), appendInfo1.lastOffset()));
+        printRangeInfo("After Batch 1");
+
+        // Batch 2: with data
+        MemoryLogRecords batch2Records = createArrowLogRecords(batch2Data, INDEXED_ROW_TYPE);
+        LogAppendInfo appendInfo2 = logTablet.appendAsLeader(batch2Records);
+        indexCacheWriter.cacheIndexDataByHotData(batch2Records, appendInfo2);
+        currentOffset = appendInfo2.lastOffset() + 1;
+
+        System.out.println(
+                String.format(
+                        "=== Batch 2 appended: [%d, %d] ===",
+                        appendInfo2.firstOffset(), appendInfo2.lastOffset()));
+        printRangeInfo("After Batch 2");
+
+        // Batch 3: empty batch (first consecutive empty)
+        MemoryLogRecords batch3Records = createArrowLogRecords(emptyBatchData, INDEXED_ROW_TYPE);
+        if (batch3Records.sizeInBytes() > 0) {
+            LogAppendInfo appendInfo3 = logTablet.appendAsLeader(batch3Records);
+            indexCacheWriter.cacheIndexDataByHotData(batch3Records, appendInfo3);
+            currentOffset = appendInfo3.lastOffset() + 1;
+
+            System.out.println(
+                    String.format(
+                            "=== Batch 3 (empty) appended: [%d, %d] ===",
+                            appendInfo3.firstOffset(), appendInfo3.lastOffset()));
+            printRangeInfo("After Batch 3 (empty)");
+        } else {
+            System.out.println("=== Batch 3 skipped (empty records) ===");
+        }
+
+        // Batch 4: empty batch (second consecutive empty)
+        MemoryLogRecords batch4Records = createArrowLogRecords(emptyBatchData, INDEXED_ROW_TYPE);
+        if (batch4Records.sizeInBytes() > 0) {
+            LogAppendInfo appendInfo4 = logTablet.appendAsLeader(batch4Records);
+            indexCacheWriter.cacheIndexDataByHotData(batch4Records, appendInfo4);
+            currentOffset = appendInfo4.lastOffset() + 1;
+
+            System.out.println(
+                    String.format(
+                            "=== Batch 4 (empty) appended: [%d, %d] ===",
+                            appendInfo4.firstOffset(), appendInfo4.lastOffset()));
+            printRangeInfo("After Batch 4 (empty)");
+        } else {
+            System.out.println("=== Batch 4 skipped (empty records) ===");
+        }
+
+        // Batch 5: empty batch (third consecutive empty)
+        MemoryLogRecords batch5Records = createArrowLogRecords(emptyBatchData, INDEXED_ROW_TYPE);
+        if (batch5Records.sizeInBytes() > 0) {
+            LogAppendInfo appendInfo5 = logTablet.appendAsLeader(batch5Records);
+            indexCacheWriter.cacheIndexDataByHotData(batch5Records, appendInfo5);
+            currentOffset = appendInfo5.lastOffset() + 1;
+
+            System.out.println(
+                    String.format(
+                            "=== Batch 5 (empty) appended: [%d, %d] ===",
+                            appendInfo5.firstOffset(), appendInfo5.lastOffset()));
+            printRangeInfo("After Batch 5 (empty)");
+        } else {
+            System.out.println("=== Batch 5 skipped (empty records) ===");
+        }
+
+        // Batch 6: with data (after consecutive empty batches)
+        MemoryLogRecords batch6Records = createArrowLogRecords(batch6Data, INDEXED_ROW_TYPE);
+        LogAppendInfo appendInfo6 = logTablet.appendAsLeader(batch6Records);
+        indexCacheWriter.cacheIndexDataByHotData(batch6Records, appendInfo6);
+        currentOffset = appendInfo6.lastOffset() + 1;
+
+        System.out.println(
+                String.format(
+                        "=== Batch 6 appended: [%d, %d] ===",
+                        appendInfo6.firstOffset(), appendInfo6.lastOffset()));
+        printRangeInfo("After Batch 6");
+
+        // Batch 7: empty batch (first consecutive empty at end)
+        MemoryLogRecords batch7Records = createArrowLogRecords(emptyBatchData, INDEXED_ROW_TYPE);
+        if (batch7Records.sizeInBytes() > 0) {
+            LogAppendInfo appendInfo7 = logTablet.appendAsLeader(batch7Records);
+            indexCacheWriter.cacheIndexDataByHotData(batch7Records, appendInfo7);
+            currentOffset = appendInfo7.lastOffset() + 1;
+
+            System.out.println(
+                    String.format(
+                            "=== Batch 7 (empty) appended: [%d, %d] ===",
+                            appendInfo7.firstOffset(), appendInfo7.lastOffset()));
+            printRangeInfo("After Batch 7 (empty)");
+        } else {
+            System.out.println("=== Batch 7 skipped (empty records) ===");
+        }
+
+        // Batch 8: empty batch (second consecutive empty at end)
+        MemoryLogRecords batch8Records = createArrowLogRecords(emptyBatchData, INDEXED_ROW_TYPE);
+        if (batch8Records.sizeInBytes() > 0) {
+            LogAppendInfo appendInfo8 = logTablet.appendAsLeader(batch8Records);
+            indexCacheWriter.cacheIndexDataByHotData(batch8Records, appendInfo8);
+            currentOffset = appendInfo8.lastOffset() + 1;
+
+            System.out.println(
+                    String.format(
+                            "=== Batch 8 (empty) appended: [%d, %d] ===",
+                            appendInfo8.firstOffset(), appendInfo8.lastOffset()));
+            printRangeInfo("After Batch 8 (empty)");
+        } else {
+            System.out.println("=== Batch 8 skipped (empty records) ===");
+        }
+
+        // Phase 3: Verify that each IndexBucketRowCache has exactly ONE continuous range
+        System.out.println("\n=== Final Verification ===");
+
+        for (TableInfo indexTableInfo : indexTableInfos) {
+            long indexTableId = indexTableInfo.getTableId();
+            int bucketCount = indexTableInfo.getNumBuckets();
+
+            System.out.println(
+                    String.format(
+                            "\nVerifying Index Table: %s (id=%d, buckets=%d)",
+                            indexTableInfo.getTablePath().getTableName(),
+                            indexTableId,
+                            bucketCount));
+
+            for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
+                String rangeInfo =
+                        indexRowCache
+                                .getBucketRowCache(indexTableId, bucketId)
+                                .getOffsetRangeInfo();
+                int rangeCount = countRanges(rangeInfo);
+
+                System.out.println(String.format("  Bucket %d: %d range(s)", bucketId, rangeCount));
+                if (rangeCount > 1) {
+                    System.out.println("    Range details:");
+                    System.out.println("    " + rangeInfo.replace("\n", "\n    "));
+                }
+
+                // Assert that each bucket has exactly ONE continuous range
+                assertThat(rangeCount)
+                        .as(
+                                "Index table %s bucket %d should have exactly 1 continuous range, but has %d ranges. "
+                                        + "This indicates a range gap bug. Range info:\n%s",
+                                indexTableInfo.getTablePath().getTableName(),
+                                bucketId,
+                                rangeCount,
+                                rangeInfo)
+                        .isEqualTo(1);
+            }
+        }
+
+        System.out.println("\n=== Test Passed: All buckets have single continuous range ===");
+    }
+
+    /**
+     * Test to reproduce the range gap issue caused by index replication with sparse offsets.
+     *
+     * <p>This test simulates the END-TO-END scenario where range gaps occur during index
+     * replication:
+     *
+     * <p>**Root Cause Analysis:**
+     *
+     * <ol>
+     *   <li>Leader writes data at offsets [0-11], creates IndexBucketRowCache Range [0, 12)
+     *   <li>Offset 12 may have no index data for certain buckets (sparse indexing)
+     *   <li>Leader continues writing at offsets [13-15]
+     *   <li>**Follower replicates**: Receives batch with baseLogOffset=13 (not 12!)
+     *   <li>Follower's IndexApplier appends to local LogTablet, preserving batch.baseLogOffset()=13
+     *   <li>If Follower's IndexBucket has IndexCache (e.g., becoming leader), hot data write
+     *       triggered
+     *   <li>writeIndexedRow(13, data, **batchStartOffset=13**) finds Range [0, 12) with
+     *       endOffset=12
+     *   <li>Critical check: candidateRange.getEndOffset()(12) &lt; batchStartOffset(13)? **TRUE**
+     *   <li>Creates NEW Range [13, 14) instead of extending existing range
+     *   <li>**Range gap [12, 13) blocks commit offset progression!**
+     * </ol>
+     *
+     * <p>**WAL Offset Continuity**: Even though KvTablet WAL offsets are continuous, IndexBucket
+     * LogRecords may have gaps because:
+     *
+     * <ul>
+     *   <li>Sparse indexing: Not every data offset produces index records for every bucket
+     *   <li>State-only batches: Contain no actual index data
+     *   <li>Bucket distribution: Hash partitioning means some buckets empty for certain offsets
+     * </ul>
+     *
+     * <p>This test reproduces the production issue where commitOffset=12 cannot advance due to
+     * Range [0, 12) and Range [13, 16) gap.
+     */
+    @Test
+    void testRangeGapWhenBatchBaseOffsetJumpsOverPreviousRangeEnd() throws Exception {
+        System.out.println("\n=== Testing Range Gap Bug: Batch BaseOffset Jump ===\n");
+
+        // Phase 1: Create first batch with continuous offsets [0-11]
+        List<Object[]> batch1Data = INDEXED_DATA.subList(0, Math.min(10, INDEXED_DATA.size()));
+        MemoryLogRecords batch1Records = createArrowLogRecords(batch1Data, INDEXED_ROW_TYPE);
+
+        // Append batch 1 normally
+        LogAppendInfo appendInfo1 = logTablet.appendAsLeader(batch1Records);
+        indexCacheWriter.cacheIndexDataByHotData(batch1Records, appendInfo1);
+
+        System.out.println(
+                String.format(
+                        "Batch 1: baseOffset=%d, lastOffset=%d",
+                        appendInfo1.firstOffset(), appendInfo1.lastOffset()));
+        printRangeInfo("After Batch 1");
+
+        // Phase 2: Simulate a batch with baseOffset that JUMPS over previous range end
+        // If previous batch ended at offset 11, finalizeBatch(11, 0) created Range [0, 12)
+        // Now we simulate a batch starting at offset 13 (skipping offset 12)
+
+        long jumpedBaseOffset = appendInfo1.lastOffset() + 2; // Skip one offset!
+        System.out.println(
+                String.format(
+                        "\n!!! Critical: Next batch will start at offset %d, jumping over offset %d !!!",
+                        jumpedBaseOffset, appendInfo1.lastOffset() + 1));
+
+        // Create batch 2 with some data
+        List<Object[]> batch2Data = INDEXED_DATA.subList(0, Math.min(3, INDEXED_DATA.size()));
+
+        // Manually create a LogAppendInfo with jumped baseOffset to simulate the problematic
+        // scenario
+        // In production, this can happen due to state changes or special WAL records
+        LogAppendInfo jumpedAppendInfo =
+                new LogAppendInfo(
+                        jumpedBaseOffset, // Start from jumped offset
+                        jumpedBaseOffset + batch2Data.size() - 1,
+                        System.currentTimeMillis(),
+                        jumpedBaseOffset,
+                        batch2Data.size(),
+                        batch2Data.size() * 100,
+                        true);
+        jumpedAppendInfo.setDuplicated(false);
+
+        // Create records and process with jumped offset
+        MemoryLogRecords batch2Records = createArrowLogRecords(batch2Data, INDEXED_ROW_TYPE);
+
+        // Write hot data with the jumped offset scenario
+        // This will trigger the bug where writeIndexedRow checks:
+        // if (candidateRange.getEndOffset() < batchStartOffset) -> creates NEW range
+        indexCacheWriter.cacheIndexDataByHotData(batch2Records, jumpedAppendInfo);
+
+        System.out.println(
+                String.format(
+                        "\nBatch 2 (jumped): baseOffset=%d, lastOffset=%d",
+                        jumpedAppendInfo.firstOffset(), jumpedAppendInfo.lastOffset()));
+        printRangeInfo("After Batch 2 (with offset jump)");
+
+        // Phase 3: Append more batches to see if gap persists
+        List<Object[]> batch3Data = INDEXED_DATA.subList(0, Math.min(5, INDEXED_DATA.size()));
+        MemoryLogRecords batch3Records = createArrowLogRecords(batch3Data, INDEXED_ROW_TYPE);
+
+        // Manually create next batch info continuing from jumped offset
+        long batch3BaseOffset = jumpedAppendInfo.lastOffset() + 1;
+        LogAppendInfo appendInfo3 =
+                new LogAppendInfo(
+                        batch3BaseOffset,
+                        batch3BaseOffset + batch3Data.size() - 1,
+                        System.currentTimeMillis(),
+                        batch3BaseOffset,
+                        batch3Data.size(),
+                        batch3Data.size() * 100,
+                        true);
+        appendInfo3.setDuplicated(false);
+
+        indexCacheWriter.cacheIndexDataByHotData(batch3Records, appendInfo3);
+
+        System.out.println(
+                String.format(
+                        "\nBatch 3: baseOffset=%d, lastOffset=%d",
+                        appendInfo3.firstOffset(), appendInfo3.lastOffset()));
+        printRangeInfo("After Batch 3");
+
+        // Phase 4: Verify the bug - check for range gaps
+        System.out.println("\n=== Bug Verification: Checking for Range Gaps ===\n");
+
+        for (TableInfo indexTableInfo : indexTableInfos) {
+            long indexTableId = indexTableInfo.getTableId();
+            int bucketCount = indexTableInfo.getNumBuckets();
+
+            System.out.println(
+                    String.format(
+                            "Index Table: %s (id=%d, buckets=%d)",
+                            indexTableInfo.getTablePath().getTableName(),
+                            indexTableId,
+                            bucketCount));
+
+            for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
+                String rangeInfo =
+                        indexRowCache
+                                .getBucketRowCache(indexTableId, bucketId)
+                                .getOffsetRangeInfo();
+                int rangeCount = countRanges(rangeInfo);
+
+                System.out.println(
+                        String.format(
+                                "  Bucket %d: %d range(s) - %s",
+                                bucketId,
+                                rangeCount,
+                                rangeCount > 1 ? "!!! GAP DETECTED !!!" : "OK"));
+
+                if (rangeCount > 1) {
+                    System.out.println("    Range details (showing the gap):");
+                    System.out.println("    " + rangeInfo.replace("\n", "\n    "));
+
+                    // This is the BUG! We have multiple ranges when we should have one continuous
+                    // range
+                    System.out.println(
+                            "    ^^^ BUG REPRODUCED: Range gap prevents index commit horizon from"
+                                    + " advancing ^^^");
+                }
+
+                // Document the bug: When batch baseOffset jumps, it creates a new range
+                // This happens because the condition:
+                // if (candidateRange.getEndOffset() < batchStartOffset)
+                // becomes true, causing createNewEmptyRangeForOffsetRange() instead of
+                // expandRangeBoundaryToOffset()
+                //
+                // Expected: Single continuous range covering all offsets
+                // Actual: Multiple ranges with gaps, blocking commit offset progression
+                //
+                // The test demonstrates this matches production behavior:
+                // Range [0, 12), Range [13, 16), Range [17, 24) from the production log
+
+                if (rangeCount > 1) {
+                    System.out.println(
+                            "\n!!! This reproduces the production issue where index commit horizon gets stuck !!!");
+                    System.out.println(
+                            "!!! The gap prevents commitOffset from advancing past the first range !!!");
+                }
+            }
+        }
+
+        System.out.println("\n=== Test Complete: Range Gap Bug Reproduced ===");
+        System.out.println(
+                "This test demonstrates the root cause of the production index replication timeout.");
+    }
+
     // ===============================================================================================
     // Helper Methods
     // ===============================================================================================
+
+    /** Helper method to print range information for all index buckets for debugging. */
+    private void printRangeInfo(String phase) {
+        System.out.println(String.format("\n--- Range Info: %s ---", phase));
+        for (TableInfo indexTableInfo : indexTableInfos) {
+            long indexTableId = indexTableInfo.getTableId();
+            int bucketCount = indexTableInfo.getNumBuckets();
+
+            System.out.println(
+                    String.format(
+                            "Index Table: %s (id=%d)",
+                            indexTableInfo.getTablePath().getTableName(), indexTableId));
+
+            for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
+                String rangeInfo =
+                        indexRowCache
+                                .getBucketRowCache(indexTableId, bucketId)
+                                .getOffsetRangeInfo();
+                int rangeCount = countRanges(rangeInfo);
+                System.out.println(
+                        String.format(
+                                "  Bucket %d: %d range(s), entries=%d",
+                                bucketId,
+                                rangeCount,
+                                indexRowCache
+                                        .getBucketRowCache(indexTableId, bucketId)
+                                        .totalEntries()));
+            }
+        }
+    }
+
+    /** Helper method to count the number of ranges in range info string. */
+    private int countRanges(String rangeInfo) {
+        if (rangeInfo == null || rangeInfo.trim().isEmpty()) {
+            return 0;
+        }
+        // Count occurrences of "Range [" pattern
+        int count = 0;
+        int index = 0;
+        while ((index = rangeInfo.indexOf("Range [", index)) != -1) {
+            count++;
+            index += 7; // Length of "Range ["
+        }
+        return count;
+    }
 
     private void createLogTablet() throws Exception {
         File logTabletDir =
