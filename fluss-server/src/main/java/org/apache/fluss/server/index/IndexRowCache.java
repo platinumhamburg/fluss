@@ -104,6 +104,9 @@ public final class IndexRowCache implements Closeable {
     /** Map from index table id to fetch states (including commit offsets) for each bucket. */
     private final Map<Long, RemoteFetchState[]> bucketFetchStates = new HashMap<>();
 
+    /** The log tablet for accessing table path and other metadata. */
+    private final LogTablet logTablet;
+
     /** Whether this cache manager has been closed. */
     private boolean closed = false;
 
@@ -117,6 +120,7 @@ public final class IndexRowCache implements Closeable {
             MemorySegmentPool memoryPool,
             LogTablet logTablet,
             Map<Long, Integer> indexBucketDistribution) {
+        this.logTablet = logTablet;
         for (Map.Entry<Long, Integer> entry : indexBucketDistribution.entrySet()) {
             Long indexTableId = entry.getKey();
             int bucketCount = entry.getValue();
@@ -351,6 +355,7 @@ public final class IndexRowCache implements Closeable {
             // Write empty rows to all buckets to synchronize them to the target offset
             for (int bucketId = 0; bucketId < indexBucketCaches.length; bucketId++) {
                 IndexBucketRowCache bucketCache = indexBucketCaches[bucketId];
+
                 if (LOG.isTraceEnabled()) {
                     LOG.trace(
                             "Synchronizing bucket {} for index table {} to offset {}, batchStartOffset: {}",
@@ -360,6 +365,19 @@ public final class IndexRowCache implements Closeable {
                             batchStartOffset);
                 }
                 bucketCache.writeIndexedRow(targetOffset, null, null, batchStartOffset, null);
+
+                // DEBUG: Log result after synchronization
+                if (shouldLogDebug(bucketId)) {
+                    String rangeInfoAfter = bucketCache.getOffsetRangeInfo();
+                    LOG.info(
+                            "[RANGE_GAP_DEBUG] IndexRowCache synchronized: indexTableId={}, indexBucket={}, "
+                                    + "rangesAfter={}",
+                            indexTableId,
+                            bucketId,
+                            rangeInfoAfter.isEmpty()
+                                    ? "EMPTY"
+                                    : rangeInfoAfter.replace("\n", " | "));
+                }
             }
 
             if (LOG.isTraceEnabled()) {
@@ -377,6 +395,12 @@ public final class IndexRowCache implements Closeable {
                     e);
             throw e;
         }
+    }
+
+    private boolean shouldLogDebug(int bucketId) {
+        // Check table name from logTablet's tablePath
+        String tableName = logTablet.getTablePath().getTableName();
+        return "fls_dwd_tt_lg_trd_erp_wms_qk_ri".equals(tableName) && bucketId < 2;
     }
 
     /**

@@ -268,58 +268,87 @@ public final class IndexCacheWriter implements Closeable {
     private long distributeRecordsToCache(LogRecords walRecords, long firstOffset)
             throws Exception {
         long currentOffset = firstOffset;
-        for (LogRecordBatch batch : walRecords.batches()) {
-            short schemaId = batch.schemaId();
+        int batchIndex = 0;
+        try {
+            for (LogRecordBatch batch : walRecords.batches()) {
+                short schemaId = batch.schemaId();
 
-            // Use batch.baseLogOffset() as the authoritative source for batch start
-            // This is more explicit and handles any edge cases with offset discontinuities
-            long batchStartOffset = batch.baseLogOffset();
-            long batchEndOffset = batchStartOffset;
+                // Use batch.baseLogOffset() as the authoritative source for batch start
+                // This is more explicit and handles any edge cases with offset discontinuities
+                long batchStartOffset = batch.baseLogOffset();
+                long batchEndOffset = batchStartOffset;
 
-            try (LogRecordReadContext readContext =
-                            LogRecordReadContext.createArrowReadContext(
-                                    tableSchema.getRowType(), schemaId);
-                    CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
-                while (recordIterator.hasNext()) {
-                    LogRecord walRecord = recordIterator.next();
-                    // Process each record with batch mode (only write to target buckets)
-                    for (TableCacheWriter indexWriter : tableTableCacheWriters) {
-                        indexWriter.writeRecordInBatch(walRecord, batchEndOffset, batchStartOffset);
+                try (LogRecordReadContext readContext =
+                                LogRecordReadContext.createArrowReadContext(
+                                        tableSchema.getRowType(), schemaId);
+                        CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
+                    while (recordIterator.hasNext()) {
+                        LogRecord walRecord = recordIterator.next();
+                        // Process each record with batch mode (only write to target buckets)
+                        for (TableCacheWriter indexWriter : tableTableCacheWriters) {
+                            indexWriter.writeRecordInBatch(
+                                    walRecord, batchEndOffset, batchStartOffset);
+                        }
+                        batchEndOffset++;
                     }
-                    batchEndOffset++;
                 }
+
+                // After processing all records in the batch, synchronize all buckets to the same
+                // offset
+                // level. CRITICAL: Must synchronize even for empty batches to prevent range gaps.
+                // Empty batches (e.g., containing only state changes) still occupy offset space
+                // and must be tracked to ensure continuous offset progression across all index
+                // buckets.
+
+                // Use batch.lastLogOffset() as the target for synchronization.
+                // synchronizeAllBucketsToOffset(targetOffset) will expand Range to targetOffset+1,
+                // which equals batch.nextLogOffset(). This handles all cases including empty
+                // batches.
+                long lastOffset = batch.lastLogOffset();
+                long nextOffset = batch.nextLogOffset();
+
+                // DEBUG: Log finalizeBatch call
+                if (shouldLogDebug()) {
+                    LOG.info(
+                            "[RANGE_GAP_DEBUG] IndexCacheWriter finalizing batch {}: dataBucket={}, "
+                                    + "lastOffset={}, batchStartOffset={}, processedEndOffset={}",
+                            batchIndex,
+                            logTablet.getTableBucket(),
+                            lastOffset,
+                            batchStartOffset,
+                            batchEndOffset);
+                }
+
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "DataBucket {}: Finalizing batch - baseOffset={}, lastOffset={}, nextOffset={}, recordCount={}, processedEndOffset={}",
+                            logTablet.getTableBucket(),
+                            batch.baseLogOffset(),
+                            lastOffset,
+                            nextOffset,
+                            batch.getRecordCount(),
+                            batchEndOffset);
+                }
+
+                for (TableCacheWriter indexWriter : tableTableCacheWriters) {
+                    // Use lastLogOffset to ensure Range endOffset becomes nextLogOffset
+                    indexWriter.finalizeBatch(lastOffset, batchStartOffset);
+                }
+
+                currentOffset = nextOffset;
+                batchIndex++;
             }
-
-            // After processing all records in the batch, synchronize all buckets to the same offset
-            // level. CRITICAL: Must synchronize even for empty batches to prevent range gaps.
-            // Empty batches (e.g., containing only state changes) still occupy offset space
-            // and must be tracked to ensure continuous offset progression across all index buckets.
-
-            // Use batch.lastLogOffset() as the target for synchronization.
-            // synchronizeAllBucketsToOffset(targetOffset) will expand Range to targetOffset+1,
-            // which equals batch.nextLogOffset(). This handles all cases including empty batches.
-            long lastOffset = batch.lastLogOffset();
-            long nextOffset = batch.nextLogOffset();
-
-            if (LOG.isDebugEnabled()) {
-                LOG.debug(
-                        "DataBucket {}: Finalizing batch - baseOffset={}, lastOffset={}, nextOffset={}, recordCount={}, processedEndOffset={}",
-                        logTablet.getTableBucket(),
-                        batch.baseLogOffset(),
-                        lastOffset,
-                        nextOffset,
-                        batch.getRecordCount(),
-                        batchEndOffset);
-            }
-
-            for (TableCacheWriter indexWriter : tableTableCacheWriters) {
-                // Use lastLogOffset to ensure Range endOffset becomes nextLogOffset
-                indexWriter.finalizeBatch(lastOffset, batchStartOffset);
-            }
-
-            currentOffset = nextOffset;
+        } catch (Exception e) {
+            LOG.error("Error distributing records to cache", e);
+            throw e;
         }
         return currentOffset;
+    }
+
+    private boolean shouldLogDebug() {
+        String tableName = logTablet.getTablePath().getTableName();
+        int bucketId = logTablet.getTableBucket().getBucket();
+        return "fls_dwd_tt_lg_trd_erp_wms_qk_ri".equals(tableName) && bucketId < 3;
     }
 
     @Override

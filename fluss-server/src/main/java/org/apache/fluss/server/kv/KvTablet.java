@@ -447,6 +447,22 @@ public final class KvTablet {
                             // Only process hot data writing if the batch is not duplicated
                             IndexCache cache = this.indexCache;
                             if (cache != null) {
+                                // DEBUG: Log WAL generation for specific table
+                                if (shouldLogDebug()) {
+                                    LOG.info(
+                                            "[RANGE_GAP_DEBUG] KvTablet WAL generated: table={}, bucket={}, "
+                                                    + "firstOffset={}, lastOffset={}, numMessages={}, validBytes={}, "
+                                                    + "batchCount={}, logEndOffsetBefore={}",
+                                            physicalPath.getTablePath().getTableName(),
+                                            tableBucket.getBucket(),
+                                            logAppendInfo.firstOffset(),
+                                            logAppendInfo.lastOffset(),
+                                            logAppendInfo.numMessages(),
+                                            logAppendInfo.validBytes(),
+                                            countBatches(logRecords),
+                                            logEndOffsetOfPrevBatch);
+                                }
+
                                 // FIX: Deep copy logRecords for IndexCache to avoid use-after-free
                                 // The original logRecords shares memory with walBuilder. We need to
                                 // create an independent copy for IndexCache's asynchronous
@@ -523,6 +539,20 @@ public final class KvTablet {
             default:
                 throw new IllegalArgumentException("Unsupported log format: " + logFormat);
         }
+    }
+
+    private boolean shouldLogDebug() {
+        String tableName = physicalPath.getTablePath().getTableName();
+        int bucketId = tableBucket.getBucket();
+        return "fls_dwd_tt_lg_trd_erp_wms_qk_ri".equals(tableName) && bucketId < 2;
+    }
+
+    private int countBatches(MemoryLogRecords records) {
+        int count = 0;
+        for (org.apache.fluss.record.LogRecordBatch batch : records.batches()) {
+            count++;
+        }
+        return count;
     }
 
     public void flush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
