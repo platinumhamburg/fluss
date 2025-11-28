@@ -137,23 +137,93 @@ public class IndexBucketRowCache implements Closeable {
                     Map.Entry<Long, OffsetRange> floorEntry = offsetRanges.floorEntry(logOffset);
                     OffsetRange targetRange;
 
+                    // DEBUG: Log writeIndexedRow call for specific buckets
+                    if (shouldLogDebug()) {
+                        LOG.info(
+                                "[RANGE_GAP_DEBUG] IndexBucketRowCache.writeIndexedRow: indexBucket={}, "
+                                        + "logOffset={}, batchStartOffset={}, isEmptyRowWrite={}, "
+                                        + "floorEntry={}, existingRangeCount={}",
+                                indexBucket,
+                                logOffset,
+                                batchStartOffset,
+                                isEmptyRowWrite,
+                                floorEntry != null
+                                        ? String.format(
+                                                "[key=%d, range=[%d,%d)]",
+                                                floorEntry.getKey(),
+                                                floorEntry.getValue().getStartOffset(),
+                                                floorEntry.getValue().getEndOffset())
+                                        : "NULL",
+                                offsetRanges.size());
+                    }
+
                     if (floorEntry != null) {
                         OffsetRange candidateRange = floorEntry.getValue();
 
                         if (logOffset == candidateRange.getEndOffset()) {
                             // Adjacent write
                             targetRange = candidateRange;
+                            if (shouldLogDebug()) {
+                                LOG.info(
+                                        "[RANGE_GAP_DEBUG] Branch: ADJACENT_WRITE, indexBucket={}, "
+                                                + "logOffset={} == range.endOffset={}",
+                                        indexBucket,
+                                        logOffset,
+                                        candidateRange.getEndOffset());
+                            }
                         } else if (logOffset > candidateRange.getEndOffset()) {
                             if (candidateRange.getEndOffset() < batchStartOffset) {
+                                // BUG TRIGGER POINT!
+                                if (shouldLogDebug()) {
+                                    LOG.info(
+                                            "[RANGE_GAP_DEBUG] *** Branch: CREATE_NEW_RANGE (GAP!) ***, indexBucket={}, "
+                                                    + "logOffset={}, range.endOffset={}, batchStartOffset={}, "
+                                                    + "condition: {} < {} is TRUE, newRange=[{},{}), allRanges={}",
+                                            indexBucket,
+                                            logOffset,
+                                            candidateRange.getEndOffset(),
+                                            batchStartOffset,
+                                            candidateRange.getEndOffset(),
+                                            batchStartOffset,
+                                            batchStartOffset,
+                                            logOffset,
+                                            getAllRangesInfo());
+                                }
+                                LOG.warn(
+                                        "Creating new empty range for offset range for non contiguous write, maybe cause range gap: [{}, {})",
+                                        batchStartOffset,
+                                        logOffset);
                                 targetRange =
                                         createNewEmptyRangeForOffsetRange(
                                                 batchStartOffset, logOffset);
                             } else {
                                 candidateRange.expandRangeBoundaryToOffset(logOffset);
                                 targetRange = candidateRange;
+                                if (shouldLogDebug()) {
+                                    LOG.info(
+                                            "[RANGE_GAP_DEBUG] Branch: EXPAND_RANGE, indexBucket={}, "
+                                                    + "logOffset={}, range.endOffset={}, batchStartOffset={}, "
+                                                    + "condition: {} < {} is FALSE, expanding to {}",
+                                            indexBucket,
+                                            logOffset,
+                                            candidateRange.getEndOffset(),
+                                            batchStartOffset,
+                                            candidateRange.getEndOffset(),
+                                            batchStartOffset,
+                                            logOffset);
+                                }
                             }
                         } else {
                             // Data already exists in a range, ignore
+                            if (shouldLogDebug()) {
+                                LOG.info(
+                                        "[RANGE_GAP_DEBUG] Branch: SKIP_DUPLICATE, indexBucket={}, "
+                                                + "logOffset={} already in range [{}, {})",
+                                        indexBucket,
+                                        logOffset,
+                                        candidateRange.getStartOffset(),
+                                        candidateRange.getEndOffset());
+                            }
                             if (LOG.isTraceEnabled()) {
                                 LOG.trace(
                                         "Index bucket {} skipping logOffset {} (already in range [{}, {}))",
@@ -167,6 +237,16 @@ public class IndexBucketRowCache implements Closeable {
                     } else {
                         targetRange =
                                 createNewEmptyRangeForOffsetRange(batchStartOffset, logOffset);
+                        if (shouldLogDebug()) {
+                            LOG.info(
+                                    "[RANGE_GAP_DEBUG] Branch: CREATE_FIRST_RANGE, indexBucket={}, "
+                                            + "logOffset={}, batchStartOffset={}, newRange=[{},{})",
+                                    indexBucket,
+                                    logOffset,
+                                    batchStartOffset,
+                                    batchStartOffset,
+                                    logOffset);
+                        }
                     }
 
                     // Write data to the target range (only if not empty row)
@@ -190,6 +270,25 @@ public class IndexBucketRowCache implements Closeable {
                                 offsetRanges.size());
                     }
                 });
+    }
+
+    private boolean shouldLogDebug() {
+        // We can't get table name directly from TableBucket, so this method will be called
+        // only when the parent layer has already filtered by table name
+        int bucketId = indexBucket.getBucket();
+        return bucketId < 3;
+    }
+
+    private String getAllRangesInfo() {
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<Long, OffsetRange> entry : offsetRanges.entrySet()) {
+            sb.append("[")
+                    .append(entry.getValue().getStartOffset())
+                    .append(",")
+                    .append(entry.getValue().getEndOffset())
+                    .append(") ");
+        }
+        return sb.toString().trim();
     }
 
     /**

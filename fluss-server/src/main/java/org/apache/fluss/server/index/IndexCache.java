@@ -532,6 +532,22 @@ public final class IndexCache implements Closeable {
             return;
         }
 
+        // DEBUG: Log submission to PendingWriteQueue for specific table
+        if (shouldLogDebug()) {
+            int batchCount = 0;
+            for (org.apache.fluss.record.LogRecordBatch batch : walRecords.batches()) {
+                batchCount++;
+            }
+            LOG.info(
+                    "[RANGE_GAP_DEBUG] IndexCache submitting to PendingWriteQueue: dataBucket={}, "
+                            + "firstOffset={}, lastOffset={}, batchCount={}, queueSize={}",
+                    logTablet.getTableBucket(),
+                    appendInfo.firstOffset(),
+                    appendInfo.lastOffset(),
+                    batchCount,
+                    pendingWriteQueue.getQueueSize());
+        }
+
         // Create hot data write task and submit to unbounded pending write queue
         HotDataWrite hotDataWrite = new HotDataWrite(indexCacheWriter, walRecords, appendInfo);
         boolean submitted = pendingWriteQueue.submit(hotDataWrite);
@@ -543,6 +559,13 @@ public final class IndexCache implements Closeable {
                     appendInfo.firstOffset(),
                     appendInfo.lastOffset() + 1);
         }
+    }
+
+    private boolean shouldLogDebug() {
+        // Use tablePath from logTablet's tablePath field
+        String tableName = logTablet.getTablePath().getTableName();
+        int bucketId = logTablet.getTableBucket().getBucket();
+        return "fls_dwd_tt_lg_trd_erp_wms_qk_ri".equals(tableName) && bucketId < 3;
     }
 
     /**
