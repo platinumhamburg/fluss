@@ -98,7 +98,8 @@ public final class IndexCache implements Closeable {
 
     private volatile boolean closed = false;
 
-    private final PendingWriteQueue pendingWriteQueue;
+    private final IndexPendingWriteQueue pendingWriteQueue;
+    private final IndexPendingWriteQueuePool pendingWriteQueuePool;
 
     // For cold data loading on failover - batch loading support
     private final long logEndOffsetOnLeaderStart;
@@ -120,6 +121,7 @@ public final class IndexCache implements Closeable {
      * @param commitHorizonCallback callback for index commit horizon changes (can be null)
      * @param dataBucketLogEndOffset the log end offset of the data bucket at the time when this
      *     index cache is created (for cold data loading boundary)
+     * @param pendingWriteQueuePool the shared pending write queue pool
      * @param conf the server configuration
      */
     public IndexCache(
@@ -130,6 +132,7 @@ public final class IndexCache implements Closeable {
             TabletServerMetadataCache metadataCache,
             IndexCommitHorizonCallback commitHorizonCallback,
             long dataBucketLogEndOffset,
+            IndexPendingWriteQueuePool pendingWriteQueuePool,
             Configuration conf) {
         this.logTablet = checkNotNull(logTablet, "logTablet cannot be null");
         checkNotNull(memoryPool, "memoryPool cannot be null");
@@ -180,15 +183,13 @@ public final class IndexCache implements Closeable {
         MemorySize batchSize = conf.get(ConfigOptions.SERVER_INDEX_CACHE_COLD_LOAD_BATCH_SIZE);
         this.coldLoadBatchSize = batchSize.getBytes();
 
-        // Initialize unbounded pending write queue with guaranteed task execution
-        // to handle multi-index table scenarios where processing time increases proportionally
-        // with the number of indexes. All tasks will retry indefinitely until success.
+        // Create and register pending write queue with the shared pool
+        // The pool will handle scheduling across multiple queues with fair consumption
+        this.pendingWriteQueuePool = pendingWriteQueuePool;
         this.pendingWriteQueue =
-                new PendingWriteQueue(
-                        logTablet.getTableBucket().toString(),
-                        9192, // initial capacity hint
-                        100, // log error every 100 retries
-                        10); // retry every 10ms
+                new IndexPendingWriteQueue(
+                        logTablet.getTableBucket().toString(), 9192); // initial capacity hint
+        this.pendingWriteQueuePool.registerQueue(logTablet.getTableBucket(), pendingWriteQueue);
 
         LOG.info(
                 "IndexCache initialized with row-level cache architecture for data bucket {} with {} index definitions, "
@@ -667,8 +668,9 @@ public final class IndexCache implements Closeable {
 
         closed = true;
 
-        // Close the pending write queue
-        if (pendingWriteQueue != null) {
+        // Unregister and close the pending write queue
+        if (pendingWriteQueue != null && pendingWriteQueuePool != null) {
+            pendingWriteQueuePool.unregisterQueue(logTablet.getTableBucket());
             pendingWriteQueue.close();
         }
 

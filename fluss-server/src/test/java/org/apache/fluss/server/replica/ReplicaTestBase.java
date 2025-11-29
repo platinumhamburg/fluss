@@ -494,6 +494,7 @@ public class ReplicaTestBase {
                 manualClock,
                 remoteLogManager,
                 new TestingMemorySegmentPool(64 * 1024),
+                replicaManager.getPendingWriteQueuePool(),
                 conf);
     }
 

@@ -567,6 +567,16 @@ public class ConfigOptions {
                                     + "By limiting the batch size, memory pressure can be controlled during cold data loading. "
                                     + "The next batch will only be loaded after the current batch is consumed (indexCommitHorizon advances).");
 
+    public static final ConfigOption<Integer> SERVER_INDEX_PENDING_WRITE_THREADS =
+            key("server.index-cache.pending-write-threads")
+                    .intType()
+                    .defaultValue(16)
+                    .withDescription(
+                            "The number of worker threads in the PendingWriteQueuePool for processing index cache write operations. "
+                                    + "Each thread can handle multiple table buckets' pending write queues using fair scheduling. "
+                                    + "This fixed-size thread pool prevents thread explosion in multi-table scenarios. "
+                                    + "The default value of 16 is suitable for most use cases.");
+
     // ------------------------------------------------------------------
     // ZooKeeper Settings
     // ------------------------------------------------------------------

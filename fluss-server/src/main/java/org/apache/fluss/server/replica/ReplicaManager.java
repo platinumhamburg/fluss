@@ -75,6 +75,7 @@ import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.index.FetchIndexParams;
 import org.apache.fluss.server.index.IndexApplier;
 import org.apache.fluss.server.index.IndexCache;
+import org.apache.fluss.server.index.IndexPendingWriteQueuePool;
 import org.apache.fluss.server.index.IndexSegment;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
@@ -222,6 +223,9 @@ public class ReplicaManager {
     /** Unified index cache memory pool shared by all index components. */
     private final MemorySegmentPool indexCacheMemoryPool;
 
+    /** Unified pending write queue pool shared by all index caches. */
+    private final IndexPendingWriteQueuePool pendingWriteQueuePool;
+
     /**
      * Executor service for handling partition events asynchronously. This ensures that partition
      * event callbacks (e.g., adding/removing index fetcher targets) do not block the metadata cache
@@ -355,6 +359,11 @@ public class ReplicaManager {
 
         // Initialize unified index cache memory pool
         this.indexCacheMemoryPool = LazyMemorySegmentPool.createIndexCacheBufferPool(conf);
+
+        // Initialize unified pending write queue pool with fixed-size threads
+        int threadCount = conf.get(ConfigOptions.SERVER_INDEX_PENDING_WRITE_THREADS);
+        this.pendingWriteQueuePool = new IndexPendingWriteQueuePool(threadCount);
+
         registerMetrics();
     }
 
@@ -455,6 +464,10 @@ public class ReplicaManager {
 
     public MemorySegmentPool getIndexCacheMemoryPool() {
         return indexCacheMemoryPool;
+    }
+
+    public IndexPendingWriteQueuePool getPendingWriteQueuePool() {
+        return pendingWriteQueuePool;
     }
 
     private long physicalStorageLocalSize() {
@@ -2174,6 +2187,7 @@ public class ReplicaManager {
                                 clock,
                                 remoteLogManager,
                                 indexCacheMemoryPool,
+                                pendingWriteQueuePool,
                                 conf);
                 allReplicas.put(tb, new OnlineReplica(replica));
                 replicaOpt = Optional.of(replica);
@@ -2279,6 +2293,9 @@ public class ReplicaManager {
             partitionEventExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
+
+        // Close pending write queue pool
+        pendingWriteQueuePool.close();
 
         // Close the resources for snapshot kv
         kvSnapshotResource.close();

@@ -55,6 +55,7 @@ import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexApplier;
 import org.apache.fluss.server.index.IndexCache;
+import org.apache.fluss.server.index.IndexPendingWriteQueuePool;
 import org.apache.fluss.server.index.IndexSegment;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
@@ -178,6 +179,8 @@ public final class Replica {
     private final AdjustIsrManager adjustIsrManager;
     /** Unified index cache memory pool shared by all index components. */
     private final MemorySegmentPool indexCacheMemoryPool;
+    /** Unified pending write queue pool shared by all index caches. */
+    private final IndexPendingWriteQueuePool pendingWriteQueuePool;
 
     private final Schema schema;
     private final TableConfig tableConfig;
@@ -245,6 +248,7 @@ public final class Replica {
             Clock clock,
             @Nullable RemoteLogManager remoteLogManager,
             MemorySegmentPool indexCacheMemoryPool,
+            IndexPendingWriteQueuePool pendingWriteQueuePool,
             Configuration conf)
             throws Exception {
         this.physicalPath = physicalPath;
@@ -263,6 +267,7 @@ public final class Replica {
         this.fatalErrorHandler = fatalErrorHandler;
         this.bucketMetricGroup = bucketMetricGroup;
         this.indexCacheMemoryPool = indexCacheMemoryPool;
+        this.pendingWriteQueuePool = pendingWriteQueuePool;
         this.schema = tableInfo.getSchema();
         this.tableConfig = tableInfo.getTableConfig();
         this.logFormat = tableConfig.getLogFormat();
@@ -844,6 +849,7 @@ public final class Replica {
                         metadataCache,
                         horizonCallback,
                         dataBucketLogEndOffset,
+                        pendingWriteQueuePool,
                         conf);
 
         try {

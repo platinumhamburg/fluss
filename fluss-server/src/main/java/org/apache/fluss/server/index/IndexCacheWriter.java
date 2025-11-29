@@ -332,7 +332,7 @@ public final class IndexCacheWriter implements Closeable {
 
                 for (TableCacheWriter indexWriter : tableTableCacheWriters) {
                     // Use lastLogOffset to ensure Range endOffset becomes nextLogOffset
-                    indexWriter.finalizeBatch(lastOffset, batchStartOffset);
+                    indexWriter.finalizeBatch(nextOffset - 1, batchStartOffset);
                 }
 
                 currentOffset = nextOffset;
