@@ -23,11 +23,13 @@ import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
@@ -697,6 +699,10 @@ public final class IndexCache implements Closeable {
      * <p>During main table creation, index tables are created after the main table. This method
      * implements retry logic to wait for index table creation to complete.
      *
+     * <p>Important: If the main data table itself is not found (deleted), this method fails
+     * immediately without retry to prevent deadlock scenarios where makeLeader holds a lock while
+     * stopReplica (triggered by table deletion) waits for the same lock.
+     *
      * @param metadataCache the metadata cache
      * @param dataTablePhysicalPath the physical path of the data table
      * @return list of index table infos
@@ -711,11 +717,12 @@ public final class IndexCache implements Closeable {
         final long retryIntervalMs = 1000;
 
         Exception lastException = null;
+        TablePath dataTablePath = dataTablePhysicalPath.getTablePath();
 
         for (int attempt = 0; attempt < maxRetries; attempt++) {
             try {
                 List<TableInfo> indexTableInfos =
-                        metadataCache.getRelatedIndexTables(dataTablePhysicalPath.getTablePath());
+                        metadataCache.getRelatedIndexTables(dataTablePath);
 
                 if (attempt > 0) {
                     LOG.info(
@@ -729,8 +736,27 @@ public final class IndexCache implements Closeable {
             } catch (Exception e) {
                 lastException = e;
 
+                // Check if any table (main table or index table) does not exist
+                // If TableNotExistException is thrown, it means either:
+                // 1. Main data table has been deleted - should fail immediately
+                // 2. Index table has been deleted - should fail immediately
+                // In both cases, fail immediately to release the lock and avoid deadlock
+                // with stopReplica operation that is trying to delete the table
+                if (e instanceof TableNotExistException) {
+                    LOG.error(
+                            "Table does not exist (likely deleted during leader election). "
+                                    + "Failing immediately to avoid deadlock. Data bucket: {}, Error: {}",
+                            logTablet.getTableBucket(),
+                            e.getMessage());
+                    throw new Exception(
+                            "Table does not exist for data bucket "
+                                    + logTablet.getTableBucket()
+                                    + ". Cannot initialize IndexCache.",
+                            e);
+                }
+
                 if (attempt == maxRetries - 1) {
-                    // Either not retryable or max attempts reached
+                    // Max attempts reached
                     break;
                 }
 
