@@ -339,42 +339,44 @@ public class IndexFetcherManager {
      * should be called while holding the lock.
      *
      * @param targetsToRemove collection of targets to remove
-     * @param indexBucket the index bucket these targets belong to
+     * @param indexBucket the index bucket these targets belong to (only used for logging)
      */
     @GuardedBy("lock")
     private void removeFetchers(
             Iterable<IndexFetcherTarget> targetsToRemove, TableBucket indexBucket) {
         // Group targets by fetcher thread
-        Map<ServerIdAndFetcherId, Set<TableBucket>> fetcherToIndexBuckets = new HashMap<>();
+        Map<ServerIdAndFetcherId, Set<DataIndexTableBucket>> fetcherToDataIndexBuckets =
+                new HashMap<>();
 
         for (IndexFetcherTarget target : targetsToRemove) {
             DataIndexTableBucket dataIndexBucket = target.getDataIndexTableBucket();
             ServerIdAndFetcherId fetcherId = dataIndexBucketToFetcher.get(dataIndexBucket);
 
             if (fetcherId != null) {
-                fetcherToIndexBuckets
+                fetcherToDataIndexBuckets
                         .computeIfAbsent(fetcherId, k -> new HashSet<>())
-                        .add(indexBucket);
+                        .add(dataIndexBucket);
             }
 
             // Clean up mapping immediately
             dataIndexBucketToFetcher.remove(dataIndexBucket);
         }
 
-        // Remove buckets from each fetcher thread
-        for (Map.Entry<ServerIdAndFetcherId, Set<TableBucket>> entry :
-                fetcherToIndexBuckets.entrySet()) {
+        // Remove specific data-index buckets from each fetcher thread
+        for (Map.Entry<ServerIdAndFetcherId, Set<DataIndexTableBucket>> entry :
+                fetcherToDataIndexBuckets.entrySet()) {
             ServerIdAndFetcherId fetcherId = entry.getKey();
-            Set<TableBucket> indexBucketsToRemove = entry.getValue();
+            Set<DataIndexTableBucket> dataIndexBucketsToRemove = entry.getValue();
 
             IndexFetcherThread fetcherThread = indexFetcherThreadMap.get(fetcherId);
             if (fetcherThread != null) {
-                fetcherThread.removeIndexBuckets(indexBucketsToRemove);
+                fetcherThread.removeIf(dataIndexBucketsToRemove::contains);
                 LOG.debug(
-                        "Removed index buckets {} from fetcher thread (server={}, fetcher={})",
-                        indexBucketsToRemove,
+                        "Removed {} data-index buckets from fetcher thread (server={}, fetcher={}) for index bucket {}",
+                        dataIndexBucketsToRemove.size(),
                         fetcherId.getServerId(),
-                        fetcherId.getFetcherId());
+                        fetcherId.getFetcherId(),
+                        indexBucket);
             }
         }
     }
@@ -472,9 +474,19 @@ public class IndexFetcherManager {
                         failedCount++;
                     } else {
                         LOG.warn(
-                                "Fetch failure for data-index bucket {} but no target exists",
-                                dataIndexBucket);
+                                "Fetch failure for data-index bucket {} but no data bucket target exists for index bucket {}. "
+                                        + "This bucket will not be retried. Reason: {}",
+                                dataIndexBucket,
+                                indexBucket,
+                                reason);
                     }
+                } else {
+                    LOG.warn(
+                            "Fetch failure for data-index bucket {} but index bucket {} has no targets registered. "
+                                    + "This bucket will not be retried. Reason: {}",
+                            dataIndexBucket,
+                            indexBucket,
+                            reason);
                 }
             }
         }
