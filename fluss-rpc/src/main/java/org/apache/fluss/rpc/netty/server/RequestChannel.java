@@ -24,18 +24,17 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.concurrent.ThreadSafe;
 
-import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * A non-blocking queue channel that can receive requests and send responses.
+ * A queue channel that can receive requests and send responses.
  *
- * <p>Uses an unbounded ConcurrentLinkedQueue to ensure that putRequest() never blocks, preventing
+ * <p>Uses an unbounded LinkedBlockingQueue to ensure that putRequest() never blocks, preventing
  * EventLoop threads from being blocked. Backpressure is applied at the TCP level by pausing channel
  * reads when the queue size exceeds the backpressure threshold.
  *
@@ -47,8 +46,8 @@ import java.util.concurrent.locks.ReentrantLock;
 public class RequestChannel {
     private static final Logger LOG = LoggerFactory.getLogger(RequestChannel.class);
 
-    /** Unbounded non-blocking queue to hold incoming requests. Never blocks on put. */
-    protected final Queue<RpcRequest> requestQueue;
+    /** Unbounded blocking queue to hold incoming requests. Never blocks on put. */
+    protected final BlockingQueue<RpcRequest> requestQueue;
 
     /**
      * The threshold at which backpressure should be applied (pausing channel reads). When queue
@@ -93,7 +92,7 @@ public class RequestChannel {
     private final ReentrantLock backpressureLock = new ReentrantLock();
 
     public RequestChannel(int backpressureThreshold) {
-        this.requestQueue = new ConcurrentLinkedQueue<>();
+        this.requestQueue = new LinkedBlockingQueue<>();
         this.backpressureThreshold = backpressureThreshold;
         this.resumeThreshold = backpressureThreshold / 2;
     }
@@ -132,45 +131,20 @@ public class RequestChannel {
      * successfully polling a request, attempts to resume paused channels if the queue size has
      * dropped below the resume threshold.
      *
-     * <p>This method uses non-blocking polling with busy-waiting to avoid blocking the thread. The
-     * implementation uses LockSupport.parkNanos for efficient waiting.
-     *
      * @return the head of this queue, or null if the specified waiting time elapses before an
      *     element is available.
      */
     public RpcRequest pollRequest(long timeoutMs) {
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        RpcRequest request = null;
-
-        // Try immediate poll first (fast path)
-        request = requestQueue.poll();
-        if (request != null) {
-            tryResumeChannels();
-            return request;
-        }
-
-        // If queue is empty, wait with exponential backoff to avoid excessive CPU usage
-        long parkTime = 1000L; // Start with 1 microsecond
-        while (request == null && System.nanoTime() < deadline) {
-            // Check for interruption
-            if (Thread.currentThread().isInterrupted()) {
-                Thread.currentThread().interrupt();
-                return null;
+        try {
+            RpcRequest request = requestQueue.poll(timeoutMs, TimeUnit.MILLISECONDS);
+            if (request != null) {
+                tryResumeChannels();
             }
-
-            // Park for a short time, then check again
-            LockSupport.parkNanos(parkTime);
-            request = requestQueue.poll();
-
-            // Exponential backoff with cap (max 1ms) to balance between responsiveness and CPU
-            // usage
-            parkTime = Math.min(parkTime * 2, TimeUnit.MILLISECONDS.toNanos(1));
+            return request;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
         }
-
-        if (request != null) {
-            tryResumeChannels();
-        }
-        return request;
     }
 
     /** Get the number of requests in the queue. */
@@ -193,12 +167,14 @@ public class RequestChannel {
     public void registerChannel(Channel channel) {
         associatedChannels.add(channel);
 
-        LOG.debug(
-                "Registered channel {} to RequestChannel (backpressure threshold: {}, associated channels: {}, backpressure active: {})",
-                channel.remoteAddress(),
-                backpressureThreshold,
-                associatedChannels.size(),
-                isBackpressureActive);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Registered channel {} to RequestChannel (backpressure threshold: {}, associated channels: {}, backpressure active: {})",
+                    channel.remoteAddress(),
+                    backpressureThreshold,
+                    associatedChannels.size(),
+                    isBackpressureActive);
+        }
     }
 
     /**
@@ -209,11 +185,13 @@ public class RequestChannel {
      */
     public void unregisterChannel(Channel channel) {
         associatedChannels.remove(channel);
-        LOG.debug(
-                "Unregistered channel {} from RequestChannel (associated channels: {}, backpressure active: {})",
-                channel.remoteAddress(),
-                associatedChannels.size(),
-                isBackpressureActive);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Unregistered channel {} from RequestChannel (associated channels: {}, backpressure active: {})",
+                    channel.remoteAddress(),
+                    associatedChannels.size(),
+                    isBackpressureActive);
+        }
     }
 
     /**
@@ -264,19 +242,21 @@ public class RequestChannel {
             isBackpressureActive = true;
 
             for (Channel channel : associatedChannels) {
-                // Submit to the channel's EventLoop to ensure thread safety
-                channel.eventLoop()
-                        .execute(
-                                () -> {
-                                    if (channel.config().isAutoRead()) {
-                                        channel.config().setAutoRead(false);
-                                        LOG.warn(
-                                                "Queue size ({}) exceeded backpressure threshold ({}), paused channel: {}",
-                                                requestsCount(),
-                                                backpressureThreshold,
-                                                channel.remoteAddress());
-                                    }
-                                });
+                if (channel.isActive()) {
+                    // Submit to the channel's EventLoop to ensure thread safety
+                    channel.eventLoop()
+                            .execute(
+                                    () -> {
+                                        if (channel.isActive() && channel.config().isAutoRead()) {
+                                            channel.config().setAutoRead(false);
+                                            LOG.warn(
+                                                    "Queue size ({}) exceeded backpressure threshold ({}), paused channel: {}",
+                                                    requestsCount(),
+                                                    backpressureThreshold,
+                                                    channel.remoteAddress());
+                                        }
+                                    });
+                }
             }
         } finally {
             backpressureLock.unlock();
