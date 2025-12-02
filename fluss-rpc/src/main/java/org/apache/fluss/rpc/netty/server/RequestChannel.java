@@ -137,7 +137,7 @@ public class RequestChannel {
     public RpcRequest pollRequest(long timeoutMs) {
         try {
             RpcRequest request = requestQueue.poll(timeoutMs, TimeUnit.MILLISECONDS);
-            if (request != null) {
+            if (isBackpressureActive) {
                 tryResumeChannels();
             }
             return request;
@@ -218,9 +218,12 @@ public class RequestChannel {
      * <p>Uses a lock to protect the entire operation (state check + state change + task submission)
      * as an atomic unit. This prevents race conditions with resume operations and channel
      * registrations.
+     *
+     * <p>TODO: In the future, consider pausing only a subset of channels instead of all channels to
+     * reduce the impact on upstream traffic. A selective pause strategy could minimize disruption
+     * to the overall system while still providing effective backpressure control.
      */
     private void pauseAllChannelsIfNeeded() {
-        // Fast path: quick return if queue not full yet (no lock contention)
         if (!shouldApplyBackpressure()) {
             return;
         }
@@ -231,11 +234,6 @@ public class RequestChannel {
             // Check if already in backpressure state
             if (isBackpressureActive) {
                 return; // Already paused, nothing to do
-            }
-
-            // Double-check: queue size might have changed while waiting for lock
-            if (!shouldApplyBackpressure()) {
-                return; // Condition no longer met
             }
 
             // Activate backpressure and pause all channels
@@ -272,7 +270,6 @@ public class RequestChannel {
      * registrations.
      */
     private void tryResumeChannels() {
-        // Fast path: quick return if queue still too full (no lock contention)
         if (!shouldResumeChannels()) {
             return;
         }
@@ -283,11 +280,6 @@ public class RequestChannel {
             // Check if backpressure is not active
             if (!isBackpressureActive) {
                 return; // Already resumed, nothing to do
-            }
-
-            // Double-check: queue size might have changed while waiting for lock
-            if (!shouldResumeChannels()) {
-                return; // Condition no longer met
             }
 
             // Deactivate backpressure and resume all channels
