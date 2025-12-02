@@ -1312,7 +1312,7 @@ public class ReplicaManager {
                     logReadResult.getFetchLogResultForBucket();
             if (fetchLogResultForBucket.failed()) {
                 // Check if this is an expected error (like NOT_LEADER_OR_FOLLOWER,
-                // UNKNOWN_TABLE_OR_BUCKET, LOG_OFFSET_OUT_OF_RANGE) which should not
+                // UNKNOWN_TABLE_OR_BUCKET) which should not
                 // short-circuit the entire fetch request.
                 Errors error = fetchLogResultForBucket.getError().error();
                 if (isNonCriticalFetchError(error)) {
