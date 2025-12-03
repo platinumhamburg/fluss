@@ -39,6 +39,7 @@ import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.time.Duration;
@@ -86,17 +87,33 @@ public class WriterClient {
     private final IdempotenceManager idempotenceManager;
     private final WriterMetricGroup writerMetricGroup;
     private final DynamicPartitionCreator dynamicPartitionCreator;
+    private final BucketOffsetTracker bucketOffsetTracker;
+
+    // Lock owner ID for server-side column lock validation on KV writes
+    // Note: This is only used by Sender to include in PutKv requests for server-side validation.
+    // Client-side lock management is handled by UpsertWriterImpl independently.
+    private final String lockOwnerId;
 
     public WriterClient(
             Configuration conf,
             MetadataUpdater metadataUpdater,
             ClientMetricGroup clientMetricGroup,
             Admin admin) {
+        this(conf, metadataUpdater, clientMetricGroup, admin, null);
+    }
+
+    public WriterClient(
+            Configuration conf,
+            MetadataUpdater metadataUpdater,
+            ClientMetricGroup clientMetricGroup,
+            Admin admin,
+            @Nullable String lockOwnerId) {
         int maxRequestSizeLocal = -1;
         IdempotenceManager idempotenceManagerLocal = null;
         try {
             this.conf = conf;
             this.metadataUpdater = metadataUpdater;
+            this.lockOwnerId = lockOwnerId;
             maxRequestSizeLocal =
                     (int) conf.get(ConfigOptions.CLIENT_WRITER_REQUEST_MAX_SIZE).getBytes();
             this.maxRequestSize = maxRequestSizeLocal;
@@ -109,6 +126,7 @@ public class WriterClient {
             this.accumulator =
                     new RecordAccumulator(
                             conf, idempotenceManager, writerMetricGroup, SystemClock.getInstance());
+            this.bucketOffsetTracker = new BucketOffsetTracker();
             this.sender = newSender(acks, retries);
             this.ioThreadPool = createThreadPool();
             ioThreadPool.submit(sender);
@@ -138,6 +156,62 @@ public class WriterClient {
      */
     public void send(WriteRecord record, WriteCallback callback) {
         doSend(record, callback);
+    }
+
+    /**
+     * Set the overwrite mode for all subsequent write operations.
+     *
+     * <p>This method sets the overwrite mode in the accumulator, which will be used for all new
+     * batches created after this call. Note that this does not affect existing batches that are
+     * already in progress.
+     *
+     * @param overwriteMode true to enable overwrite mode, false to disable it
+     */
+    public void setOverwriteMode(boolean overwriteMode) {
+        accumulator.setOverwriteMode(overwriteMode);
+    }
+
+    /**
+     * Get the lock owner ID for this writer client.
+     *
+     * <p>The lock owner ID is used for server-side column lock validation on KV write operations.
+     * When set, all PutKv requests will include this ID for server-side validation.
+     *
+     * <p>Note: This is NOT used for client-side lock management. Client-side lock management (e.g.,
+     * during undo recovery) is handled independently by UpsertWriterImpl.
+     *
+     * @return the lock owner ID, or null if not set
+     */
+    @Nullable
+    public String getLockOwnerId() {
+        return lockOwnerId;
+    }
+
+    /**
+     * Close all in-progress batches and flush them.
+     *
+     * <p>This method closes all batches that are currently being accumulated (i.e., not yet full)
+     * and then flushes them to ensure they are sent. This is useful when switching overwrite mode,
+     * as it ensures all batches with the old mode are sent before creating new batches with the new
+     * mode.
+     */
+    public void closeInProgressBatchesAndFlush() {
+        LOG.trace("Closing in-progress batches and flushing.");
+        long start = System.currentTimeMillis();
+        accumulator.closeAllInProgressBatches();
+        accumulator.beginFlush();
+        try {
+            accumulator.awaitFlushCompletion();
+        } catch (InterruptedException e) {
+            throw new FlussRuntimeException(
+                    String.format(
+                            "Flush interrupted after %d ms. Writer may be in inconsistent state",
+                            System.currentTimeMillis() - start),
+                    e);
+        }
+        LOG.trace(
+                "Closed in-progress batches and flushed in {} ms.",
+                System.currentTimeMillis() - start);
     }
 
     /**
@@ -200,6 +274,7 @@ public class WriterClient {
                         physicalTablePath,
                         bucketId,
                         prevBucketId);
+                // Column lock already acquired for this table/partition
                 result = accumulator.append(record, callback, cluster, bucketId, false);
             }
 
@@ -300,7 +375,18 @@ public class WriterClient {
                 retries,
                 metadataUpdater,
                 idempotenceManager,
-                writerMetricGroup);
+                writerMetricGroup,
+                bucketOffsetTracker,
+                this);
+    }
+
+    /**
+     * Get the bucket offset tracker for this writer client.
+     *
+     * @return the bucket offset tracker
+     */
+    public BucketOffsetTracker getBucketOffsetTracker() {
+        return bucketOffsetTracker;
     }
 
     public void close(Duration timeout) {
@@ -332,6 +418,7 @@ public class WriterClient {
         if (sender != null) {
             sender.forceClose();
         }
+
         LOG.info("Writer closed.");
     }
 

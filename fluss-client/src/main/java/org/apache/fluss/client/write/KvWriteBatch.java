@@ -50,6 +50,7 @@ public class KvWriteBatch extends WriteBatch {
     private final AbstractPagedOutputView outputView;
     private final KvRecordBatchBuilder recordsBuilder;
     private final @Nullable int[] targetColumns;
+    private final boolean isOverwrite;
 
     public KvWriteBatch(
             int bucketId,
@@ -59,12 +60,15 @@ public class KvWriteBatch extends WriteBatch {
             int writeLimit,
             AbstractPagedOutputView outputView,
             @Nullable int[] targetColumns,
+            boolean isOverwrite,
             long createdMs) {
         super(bucketId, physicalTablePath, createdMs);
         this.outputView = outputView;
         this.recordsBuilder =
                 KvRecordBatchBuilder.builder(schemaId, writeLimit, outputView, kvFormat);
+        this.recordsBuilder.setOverwrite(isOverwrite);
         this.targetColumns = targetColumns;
+        this.isOverwrite = isOverwrite;
     }
 
     @Override
@@ -97,6 +101,11 @@ public class KvWriteBatch extends WriteBatch {
     @Nullable
     public int[] getTargetColumns() {
         return targetColumns;
+    }
+
+    @Override
+    public boolean isOverwrite() {
+        return isOverwrite;
     }
 
     @Override
@@ -149,6 +158,7 @@ public class KvWriteBatch extends WriteBatch {
         recordsBuilder.abort();
     }
 
+    @Override
     public void resetWriterState(long writerId, int batchSequence) {
         super.resetWriterState(writerId, batchSequence);
         recordsBuilder.resetWriterState(writerId, batchSequence);

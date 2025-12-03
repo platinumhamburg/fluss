@@ -28,6 +28,7 @@ import org.apache.fluss.client.token.DefaultSecurityTokenManager;
 import org.apache.fluss.client.token.DefaultSecurityTokenProvider;
 import org.apache.fluss.client.token.SecurityTokenManager;
 import org.apache.fluss.client.token.SecurityTokenProvider;
+import org.apache.fluss.client.write.ClientColumnLockManager;
 import org.apache.fluss.client.write.WriterClient;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -61,6 +62,7 @@ public final class FlussConnection implements Connection {
     private volatile LookupClient lookupClient;
     private volatile RemoteFileDownloader remoteFileDownloader;
     private volatile SecurityTokenManager securityTokenManager;
+    private volatile ClientColumnLockManager columnLockManager;
 
     FlussConnection(Configuration conf) {
         this(conf, MetricRegistry.create(conf, null));
@@ -120,9 +122,17 @@ public final class FlussConnection implements Connection {
         if (writerClient == null) {
             synchronized (this) {
                 if (writerClient == null) {
+                    // Read lock owner ID from configuration if provided
+                    String lockOwnerId =
+                            conf.getOptional(ConfigOptions.CLIENT_WRITER_LOCK_OWNER_ID)
+                                    .orElse(null);
                     writerClient =
                             new WriterClient(
-                                    conf, metadataUpdater, clientMetricGroup, this.getAdmin());
+                                    conf,
+                                    metadataUpdater,
+                                    clientMetricGroup,
+                                    this.getAdmin(),
+                                    lockOwnerId);
                 }
             }
         }
@@ -175,6 +185,26 @@ public final class FlussConnection implements Connection {
         return remoteFileDownloader;
     }
 
+    /**
+     * Get or create the column lock manager for this connection.
+     *
+     * <p>The column lock manager is shared across all writers created from this connection. This
+     * ensures unified management of column locks for the same table, including lock acquisition,
+     * release, and renewal.
+     *
+     * @return the column lock manager
+     */
+    public ClientColumnLockManager getOrCreateColumnLockManager() {
+        if (columnLockManager == null) {
+            synchronized (this) {
+                if (columnLockManager == null) {
+                    columnLockManager = new ClientColumnLockManager(metadataUpdater, conf);
+                }
+            }
+        }
+        return columnLockManager;
+    }
+
     @Override
     public void close() throws Exception {
         if (writerClient != null) {
@@ -189,6 +219,15 @@ public final class FlussConnection implements Connection {
 
         if (remoteFileDownloader != null) {
             remoteFileDownloader.close();
+        }
+
+        if (columnLockManager != null) {
+            try {
+                columnLockManager.close();
+            } catch (Exception e) {
+                // Log warning but continue closing other resources
+                // to ensure all resources are properly cleaned up
+            }
         }
 
         if (securityTokenManager != null) {

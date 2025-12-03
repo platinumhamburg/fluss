@@ -182,12 +182,23 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_MERGE_ENGINE));
         boolean sinkIgnoreDelete = tableOptions.get(FlinkConnectorOptions.SINK_IGNORE_DELETE);
 
+        // For primary key tables, keyed shuffle must be enabled to ensure state redistribution
+        // on rescale. This is required for exactly-once semantics with checkpoint/restore.
+        int[] primaryKeyIndexes = context.getPrimaryKeyIndexes();
+        boolean shuffleByBucket = tableOptions.get(FlinkConnectorOptions.SINK_BUCKET_SHUFFLE);
+        if (primaryKeyIndexes.length > 0 && !shuffleByBucket) {
+            throw new IllegalArgumentException(
+                    "For primary key tables, 'sink.bucket-shuffle' must be enabled (default: true). "
+                            + "Disabling keyed shuffle breaks exactly-once guarantees because state cannot "
+                            + "be correctly redistributed on rescale.");
+        }
+
         return new FlinkTableSink(
                 toFlussTablePath(context.getObjectIdentifier()),
                 toFlussClientConfig(
                         context.getCatalogTable().getOptions(), context.getConfiguration()),
                 rowType,
-                context.getPrimaryKeyIndexes(),
+                primaryKeyIndexes,
                 partitionKeys,
                 isStreamingMode,
                 mergeEngineType,
@@ -196,7 +207,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(toFlinkOption(TABLE_DELETE_BEHAVIOR)),
                 tableOptions.get(FlinkConnectorOptions.BUCKET_NUMBER),
                 getBucketKeys(tableOptions),
-                tableOptions.get(FlinkConnectorOptions.SINK_BUCKET_SHUFFLE));
+                shuffleByBucket);
     }
 
     @Override

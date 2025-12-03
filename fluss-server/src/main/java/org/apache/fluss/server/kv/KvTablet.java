@@ -45,7 +45,9 @@ import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.TruncateReason;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
+import org.apache.fluss.server.kv.rowmerger.AggregateRowMerger;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
+import org.apache.fluss.server.kv.rowmerger.aggregate.FieldAggregator;
 import org.apache.fluss.server.kv.snapshot.KvFileHandleAndLocalPath;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotDataUploader;
 import org.apache.fluss.server.kv.snapshot.RocksIncrementalSnapshot;
@@ -260,7 +262,13 @@ public final class KvTablet {
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
                     short schemaId = kvRecords.schemaId();
-                    RowMerger currentMerger = rowMerger.configureTargetColumns(targetColumns);
+                    // Use overwrite merger if overwrite mode is enabled, otherwise use normal
+                    // merger
+                    boolean overwrite = kvRecords.isOverwrite();
+                    RowMerger currentMerger =
+                            overwrite
+                                    ? createOverwriteMerger().configureTargetColumns(targetColumns)
+                                    : rowMerger.configureTargetColumns(targetColumns);
                     RowType rowType = schema.getRowType();
                     WalBuilder walBuilder = createWalBuilder(schemaId, rowType);
                     walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
@@ -316,29 +324,33 @@ public final class KvTablet {
                             } else {
                                 // upsert operation
                                 byte[] oldValue = getFromBufferOrKv(key);
-                                // it's update
+                                BinaryRow inputRow = kvRecord.getRow();
+                                BinaryRow newRow;
+
+                                // use merge engine for both normal and overwrite modes
                                 if (oldValue != null) {
+                                    // it's update
                                     BinaryRow oldRow = valueDecoder.decodeValue(oldValue).row;
-                                    BinaryRow inputRow = kvRecord.getRow();
-                                    BinaryRow newRow = currentMerger.merge(oldRow, inputRow);
+                                    newRow = currentMerger.merge(oldRow, inputRow);
                                     if (newRow == oldRow) {
                                         // newRow is the same to oldRow, means nothing
-                                        // happens (no update/delete), and input should be ignored
+                                        // happens (no update/delete), and input should be
+                                        // ignored
                                         continue;
                                     }
                                     walBuilder.append(ChangeType.UPDATE_BEFORE, oldRow);
                                     walBuilder.append(ChangeType.UPDATE_AFTER, newRow);
-                                    // logOffset is for -U, logOffset + 1 is for +U, we need to use
-                                    // the log offset for +U
+                                    // logOffset is for -U, logOffset + 1 is for +U, we need to
+                                    // use the log offset for +U
                                     byte[] encodedNewRow =
                                             ValueEncoder.encodeValue(schemaId, newRow);
                                     kvPreWriteBuffer.put(key, encodedNewRow, logOffset + 1);
                                     logOffset += 2;
                                 } else {
                                     // it's insert
-                                    // TODO: we should add guarantees that all non-specified columns
-                                    //  of the input row are set to null.
-                                    BinaryRow newRow = kvRecord.getRow();
+                                    // TODO: we should add guarantees that all non-specified
+                                    // columns of the input row are set to null.
+                                    newRow = inputRow;
                                     walBuilder.append(ChangeType.INSERT, newRow);
                                     byte[] encodedNewRow =
                                             ValueEncoder.encodeValue(schemaId, newRow);
@@ -551,5 +563,45 @@ public final class KvTablet {
     @VisibleForTesting
     public RocksDBKv getRocksDBKv() {
         return rocksDBKv;
+    }
+
+    /**
+     * Creates a row merger for overwrite mode. The merger uses last_value aggregation for all
+     * non-primary key columns and primary-key aggregation for primary key columns. This enables
+     * partial update and partial delete semantics.
+     *
+     * @return a configured {@link RowMerger} for overwrite mode
+     */
+    private RowMerger createOverwriteMerger() {
+        RowType rowType = schema.getRowType();
+        int fieldCount = rowType.getFieldCount();
+
+        // Create aggregators: last_value for all columns (primary keys will use primary-key)
+        FieldAggregator[] aggregators = new FieldAggregator[fieldCount];
+
+        // Set primary key columns to use FieldPrimaryKeyAgg
+        java.util.Set<Integer> primaryKeySet = new java.util.HashSet<>();
+        for (int pkIndex : schema.getPrimaryKeyIndexes()) {
+            primaryKeySet.add(pkIndex);
+        }
+
+        for (int i = 0; i < fieldCount; i++) {
+            DataType fieldType = rowType.getChildren().get(i);
+
+            if (primaryKeySet.contains(i)) {
+                // Use FieldPrimaryKeyAgg for primary key columns
+                aggregators[i] =
+                        new org.apache.fluss.server.kv.rowmerger.aggregate.FieldPrimaryKeyAgg(
+                                "primary-key", fieldType);
+            } else {
+                // Use FieldLastValueAgg for non-primary key columns
+                aggregators[i] =
+                        new org.apache.fluss.server.kv.rowmerger.aggregate.FieldLastValueAgg(
+                                "last_value", fieldType);
+            }
+        }
+
+        // Create AggregateRowMerger with removeRecordOnDelete=false to support partial delete
+        return new AggregateRowMerger(rowType, aggregators, false, DeleteBehavior.ALLOW, kvFormat);
     }
 }

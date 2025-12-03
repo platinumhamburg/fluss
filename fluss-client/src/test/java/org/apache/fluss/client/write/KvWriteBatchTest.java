@@ -219,6 +219,7 @@ class KvWriteBatchTest {
                 writeLimit,
                 outputView,
                 null,
+                false,
                 System.currentTimeMillis());
     }
 

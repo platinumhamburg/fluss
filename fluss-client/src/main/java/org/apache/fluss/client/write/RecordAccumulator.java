@@ -81,6 +81,9 @@ public final class RecordAccumulator {
     private final AtomicInteger appendsInProgress;
     private final int batchSize;
 
+    /** Current overwrite mode for all new batches. */
+    private volatile boolean overwriteMode = false;
+
     /**
      * An artificial delay time to add before declaring a records instance that isn't full ready for
      * sending. This allows time for more records to arrive. Setting a non-zero lingerMs will trade
@@ -360,6 +363,45 @@ public final class RecordAccumulator {
     }
 
     /**
+     * Set the overwrite mode for all subsequent batches.
+     *
+     * <p>This method sets the overwrite mode that will be used for all new batches created after
+     * this call. It does not affect existing batches that are already in progress.
+     *
+     * @param overwriteMode true to enable overwrite mode, false to disable it
+     */
+    public void setOverwriteMode(boolean overwriteMode) {
+        this.overwriteMode = overwriteMode;
+    }
+
+    /**
+     * Close all in-progress batches to force them to be sent.
+     *
+     * <p>This method closes the last batch in each deque (the one currently being accumulated),
+     * making it ready to be drained and sent. This is useful when switching overwrite mode, as we
+     * need to ensure all batches with the old mode are sent before creating new batches with the
+     * new mode.
+     */
+    public void closeAllInProgressBatches() {
+        for (BucketAndWriteBatches bucketAndWriteBatches : writeBatches.values()) {
+            for (Deque<WriteBatch> deque : bucketAndWriteBatches.batches.values()) {
+                synchronized (deque) {
+                    if (!deque.isEmpty()) {
+                        WriteBatch lastBatch = deque.peekLast();
+                        if (lastBatch != null && !lastBatch.isClosed()) {
+                            try {
+                                lastBatch.close();
+                            } catch (Exception e) {
+                                LOG.error("Error closing batch", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * Initiate the flushing of data from the accumulator...this makes all requests immediately
      * ready.
      */
@@ -596,6 +638,7 @@ public final class RecordAccumulator {
                             outputView.getPreAllocatedSize(),
                             outputView,
                             writeRecord.getTargetColumns(),
+                            overwriteMode,
                             clock.milliseconds());
         } else if (writeFormat == WriteFormat.ARROW_LOG) {
             ArrowWriter arrowWriter =
