@@ -113,6 +113,23 @@ public class TableBucketStateMachine {
                 buckets.stream()
                         .filter(tableBucket -> !coordinatorContext.isToBeDeleted(tableBucket))
                         .collect(Collectors.toSet());
+
+        // For offline buckets, clear the offline marker for replicas in ISR to enable recovery.
+        // This prevents deadlock where ISR contains live replicas but they are marked offline.
+        for (TableBucket bucket : buckets) {
+            if (coordinatorContext.getBucketState(bucket) == BucketState.OfflineBucket) {
+                coordinatorContext
+                        .getBucketLeaderAndIsr(bucket)
+                        .ifPresent(
+                                leaderAndIsr -> {
+                                    for (int replicaId : leaderAndIsr.isr()) {
+                                        coordinatorContext.removeOfflineBucketForReplica(
+                                                bucket, replicaId);
+                                    }
+                                });
+            }
+        }
+
         handleStateChange(buckets, BucketState.OnlineBucket);
     }
 

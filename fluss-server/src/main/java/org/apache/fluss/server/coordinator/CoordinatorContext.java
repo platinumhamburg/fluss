@@ -176,6 +176,23 @@ public class CoordinatorContext {
         replicasOnOffline.remove(serverId);
     }
 
+    /**
+     * Remove the offline marker for a specific bucket on a specific replica. This is used to enable
+     * recovery of offline buckets when their ISR replicas are actually alive.
+     *
+     * @param tableBucket the table bucket
+     * @param serverId the server id
+     */
+    public void removeOfflineBucketForReplica(TableBucket tableBucket, int serverId) {
+        Set<TableBucket> tableBuckets = replicasOnOffline.get(serverId);
+        if (tableBuckets != null) {
+            tableBuckets.remove(tableBucket);
+            if (tableBuckets.isEmpty()) {
+                replicasOnOffline.remove(serverId);
+            }
+        }
+    }
+
     public Map<Long, TablePath> allTables() {
         return tablePathById;
     }
