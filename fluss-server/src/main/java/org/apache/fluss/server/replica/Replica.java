@@ -1422,6 +1422,10 @@ public final class Replica {
 
         // update isr info.
         isrState = new IsrState.CommittedIsrState(isr);
+
+        // Clear any pending ISR update requests when the replica state is updated through
+        // leader election. This prevents stale requests from blocking future ISR updates.
+        adjustIsrManager.clearPendingRequest(tableBucket);
     }
 
     private void updateFollowerFetchState(
@@ -1965,6 +1969,9 @@ public final class Replica {
                                                     proposedIsrState,
                                                     tableBucket,
                                                     isrState);
+                                            // Clear the pending request from AdjustIsrManager to
+                                            // allow future ISR updates to proceed.
+                                            adjustIsrManager.clearPendingRequest(tableBucket);
                                         } else if (leaderAndIsr != null) {
                                             hwIncremented.set(
                                                     handleAdjustIsrUpdate(

@@ -184,6 +184,22 @@ public class AdjustIsrManager {
         }
     }
 
+    /**
+     * Clear a pending ISR update request for a specific bucket. This is used to clean up stale
+     * requests when the replica state has been updated through other mechanisms (e.g., leader
+     * election) before receiving the AdjustIsr response.
+     *
+     * @param tableBucket the table bucket to clear pending request for
+     */
+    public void clearPendingRequest(TableBucket tableBucket) {
+        AdjustIsrItem removed = unsentAdjustIsrMap.remove(tableBucket);
+        if (removed != null) {
+            LOG.info(
+                    "Cleared pending ISR update request for bucket {} to prevent state leak",
+                    tableBucket);
+        }
+    }
+
     /** per bucket leader and isr data with future result callback. */
     @VisibleForTesting
     protected static class AdjustIsrItem {
