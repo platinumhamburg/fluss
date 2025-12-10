@@ -855,10 +855,77 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
         replicaStateMachine.handleStateChanges(replicas, OnlineReplica);
 
+        // Repair buckets that are in deadlock state: leader = NO_LEADER but single ISR member
+        // which is the recovered tablet server. This happens when a replica was the only ISR
+        // member and went offline, causing leader to be set to -1 but ISR kept unchanged.
+        repairBucketsWithNoLeaderButSingleIsr(tabletServerId);
+
         // when a new tablet server comes up, we trigger leader election for all new
         // and offline partitions to see if those tablet servers become leaders for some/all
         // of those
         tableBucketStateMachine.triggerOnlineBucketStateChange();
+    }
+
+    /**
+     * Repair buckets that have NO_LEADER but a single ISR member which is the recovered tablet
+     * server. This prevents deadlock where the only ISR member went offline and came back, but
+     * leader remains -1.
+     *
+     * @param tabletServerId the tablet server id that just came online
+     */
+    private void repairBucketsWithNoLeaderButSingleIsr(int tabletServerId) {
+        Map<TableBucket, LeaderAndIsr> bucketsToRepair = new HashMap<>();
+
+        for (Map.Entry<TableBucket, LeaderAndIsr> entry :
+                coordinatorContext.bucketLeaderAndIsr().entrySet()) {
+            TableBucket bucket = entry.getKey();
+            LeaderAndIsr leaderAndIsr = entry.getValue();
+
+            // Find buckets with:
+            // 1. leader = NO_LEADER (-1)
+            // 2. ISR size = 1
+            // 3. The only ISR member is the recovered tablet server
+            if (leaderAndIsr.leader() == LeaderAndIsr.NO_LEADER
+                    && leaderAndIsr.isr().size() == 1
+                    && leaderAndIsr.isr().get(0) == tabletServerId) {
+
+                // Restore the tablet server as leader with incremented leader epoch
+                LeaderAndIsr repairedLeaderAndIsr =
+                        new LeaderAndIsr(
+                                tabletServerId,
+                                leaderAndIsr.leaderEpoch() + 1,
+                                leaderAndIsr.isr(),
+                                coordinatorContext.getCoordinatorEpoch(),
+                                leaderAndIsr.bucketEpoch() + 1);
+
+                bucketsToRepair.put(bucket, repairedLeaderAndIsr);
+
+                LOG.info(
+                        "Detected bucket {} with NO_LEADER but single ISR member {} which just came online. "
+                                + "Repairing LeaderAndIsr to restore it as leader: {}",
+                        bucket,
+                        tabletServerId,
+                        repairedLeaderAndIsr);
+            }
+        }
+
+        if (!bucketsToRepair.isEmpty()) {
+            try {
+                // Update LeaderAndIsr in ZooKeeper
+                zooKeeperClient.batchUpdateLeaderAndIsr(bucketsToRepair);
+                // Update in memory
+                bucketsToRepair.forEach(coordinatorContext::putBucketLeaderAndIsr);
+                LOG.info(
+                        "Successfully repaired {} buckets with NO_LEADER to restore tablet server {} as leader.",
+                        bucketsToRepair.size(),
+                        tabletServerId);
+            } catch (Exception e) {
+                LOG.error(
+                        "Failed to repair buckets with NO_LEADER for tablet server {}.",
+                        tabletServerId,
+                        e);
+            }
+        }
     }
 
     private void processDeadTabletServer(DeadTabletServerEvent deadTabletServerEvent) {

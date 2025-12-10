@@ -91,8 +91,11 @@ public class TableBucketStateMachine {
                             .map(
                                     leaderAndIsr -> {
                                         // ONLINE if the leader is alive, otherwise, it's OFFLINE
-                                        if (coordinatorContext.isReplicaOnline(
-                                                leaderAndIsr.leader(), tableBucket)) {
+                                        int leader = leaderAndIsr.leader();
+                                        // NO_LEADER (-1) means there's no leader, should be OFFLINE
+                                        if (leader != LeaderAndIsr.NO_LEADER
+                                                && coordinatorContext.isReplicaOnline(
+                                                        leader, tableBucket)) {
                                             return BucketState.OnlineBucket;
                                         } else {
                                             return BucketState.OfflineBucket;
@@ -116,6 +119,7 @@ public class TableBucketStateMachine {
 
         // For offline buckets, clear the offline marker for replicas in ISR to enable recovery.
         // This prevents deadlock where ISR contains live replicas but they are marked offline.
+        // We only clear the marker if the TabletServer is actually live.
         for (TableBucket bucket : buckets) {
             if (coordinatorContext.getBucketState(bucket) == BucketState.OfflineBucket) {
                 coordinatorContext
@@ -123,8 +127,17 @@ public class TableBucketStateMachine {
                         .ifPresent(
                                 leaderAndIsr -> {
                                     for (int replicaId : leaderAndIsr.isr()) {
-                                        coordinatorContext.removeOfflineBucketForReplica(
-                                                bucket, replicaId);
+                                        if (coordinatorContext
+                                                .getLiveTabletServers()
+                                                .containsKey(replicaId)) {
+                                            coordinatorContext.removeOfflineBucketForReplica(
+                                                    bucket, replicaId);
+                                            LOG.info(
+                                                    "Cleared offline marker for ISR replica {} of bucket {} "
+                                                            + "since TabletServer is live, enabling leader election recovery.",
+                                                    replicaId,
+                                                    stringifyBucket(bucket));
+                                        }
                                     }
                                 });
             }
@@ -604,6 +617,21 @@ public class TableBucketStateMachine {
             LeaderAndIsr leaderAndIsr,
             ReplicaLeaderElectionStrategy electionStrategy) {
         List<Integer> assignment = coordinatorContext.getAssignment(tableBucket);
+
+        // Before filtering, clear offline markers for ISR members whose TabletServers are online.
+        // This prevents deadlock where ISR members are wrongly marked offline due to transient
+        // issues.
+        List<Integer> isr = leaderAndIsr.isr();
+        for (int isrMember : isr) {
+            if (coordinatorContext.getLiveTabletServers().containsKey(isrMember)) {
+                coordinatorContext.removeOfflineBucketForReplica(tableBucket, isrMember);
+                LOG.info(
+                        "Cleared offline marker for ISR member {} of bucket {} before election since TabletServer is live.",
+                        isrMember,
+                        stringifyBucket(tableBucket));
+            }
+        }
+
         // filter out the live servers
         List<Integer> liveReplicas =
                 assignment.stream()
