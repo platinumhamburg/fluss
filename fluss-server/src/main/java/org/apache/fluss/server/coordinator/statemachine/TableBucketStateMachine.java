@@ -627,8 +627,12 @@ public class TableBucketStateMachine {
 
         if (!resultOpt.isPresent()) {
             LOG.error(
-                    "The leader election for table bucket {} is empty.",
-                    stringifyBucket(tableBucket));
+                    "The leader election for table bucket {} is empty, assignment: {}, live replicas: {}, leaderAndIsr: {}, strategy: {}",
+                    stringifyBucket(tableBucket),
+                    assignment,
+                    liveReplicas,
+                    leaderAndIsr,
+                    electionStrategy);
             return Optional.empty();
         }
         return resultOpt;
