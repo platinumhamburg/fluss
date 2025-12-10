@@ -156,10 +156,26 @@ public class CoordinatorContext {
     }
 
     public boolean isReplicaOnline(int serverId, TableBucket tableBucket) {
-        return liveTabletServerSet().contains(serverId)
-                && !replicasOnOffline
-                        .getOrDefault(serverId, Collections.emptySet())
-                        .contains(tableBucket);
+        Set<Integer> liveServers = liveTabletServerSet();
+        if (!liveServers.contains(serverId)) {
+            LOG.warn(
+                    "Replica {} of bucket {} is offline: TabletServer {} is not in live servers {}.",
+                    serverId,
+                    tableBucket,
+                    serverId,
+                    liveServers);
+            return false;
+        }
+        Set<TableBucket> offlineBuckets =
+                replicasOnOffline.getOrDefault(serverId, Collections.emptySet());
+        if (offlineBuckets.contains(tableBucket)) {
+            LOG.warn(
+                    "Replica {} of bucket {} is offline: bucket is marked as offline on this server.",
+                    serverId,
+                    tableBucket);
+            return false;
+        }
+        return true;
     }
 
     public int getOfflineBucketCount() {
