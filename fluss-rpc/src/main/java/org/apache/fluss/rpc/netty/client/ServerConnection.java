@@ -71,7 +71,7 @@ final class ServerConnection {
     private static final Logger LOG = LoggerFactory.getLogger(ServerConnection.class);
 
     /** Default request timeout in milliseconds. */
-    private static final long DEFAULT_REQUEST_TIMEOUT_MS = 60_000L;
+    private static final long DEFAULT_REQUEST_TIMEOUT_MS = 600_000L;
 
     private final ServerNode node;
 
