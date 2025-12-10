@@ -1021,6 +1021,26 @@ public class ConfigOptions {
                                     + " Dynamic partition strategy refers to creating partitions based on the data "
                                     + "being written for partitioned table if the wrote partition don't exists.");
 
+    public static final ConfigOption<Duration> CLIENT_COLUMN_LOCK_TTL =
+            key("client.column-lock.ttl")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "The Time-To-Live (TTL) for column locks acquired by the client. "
+                                    + "Locks are automatically renewed before expiration. "
+                                    + "Shorter TTL values are useful for testing but may increase network overhead in production.");
+
+    public static final ConfigOption<String> CLIENT_WRITER_LOCK_OWNER_ID =
+            key("client.writer.lock-owner-id")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The lock owner ID for column lock validation on KV write operations. "
+                                    + "This ID is set at WriterClient initialization time and is immutable. "
+                                    + "When set, all PutKv requests will include this ID for server-side column lock validation. "
+                                    + "If not set, the writer will operate without column lock enforcement. "
+                                    + "This is typically used for coordinating concurrent partial updates to the same table.");
+
     public static final ConfigOption<Duration> CLIENT_REQUEST_TIMEOUT =
             key("client.request-timeout")
                     .durationType()
@@ -1400,6 +1420,17 @@ public class ConfigOptions {
                     .withDescription(
                             "The column name of the version column for the `versioned` merge engine. "
                                     + "If the merge engine is set to `versioned`, the version column must be set.");
+
+    public static final ConfigOption<Boolean> TABLE_COLUMN_LOCK_ENABLED =
+            key("table.column-lock.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to enable column lock management for write operations on this table. "
+                                    + "When enabled, writers must specify a lock owner ID and acquire column locks "
+                                    + "before writing to the table. This ensures exclusive access to columns and "
+                                    + "prevents concurrent modifications that could violate consistency constraints. "
+                                    + "Disabled by default.");
 
     /**
      * Prefix for aggregate merge engine configuration options.

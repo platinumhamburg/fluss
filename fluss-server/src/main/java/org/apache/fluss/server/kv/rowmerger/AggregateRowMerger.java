@@ -30,6 +30,7 @@ import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.server.kv.rowmerger.aggregate.FieldAggregator;
+import org.apache.fluss.server.kv.rowmerger.aggregate.FieldPrimaryKeyAgg;
 import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
@@ -246,9 +247,45 @@ public class AggregateRowMerger implements RowMerger {
             if (removeRecordOnDelete) {
                 return null; // Remove the entire row
             }
-            throw new UnsupportedOperationException(
-                    "DELETE is not supported for aggregate merge engine. "
-                            + "Configure 'table.aggregation.remove-record-on-delete' to true if needed.");
+
+            BinaryRow oldRow = oldValue.row;
+
+            // Partial delete: set target columns to null (except primary keys)
+            // Check if all non-primary key columns will be null after deletion
+            boolean allNonPkNull = true;
+            for (int i = 0; i < fieldCount; i++) {
+                // Skip primary key columns
+                // Note: Primary key fields use FieldPrimaryKeyAgg, we can identify them
+                if (aggregators[i] instanceof FieldPrimaryKeyAgg) {
+                    continue;
+                }
+
+                // Check if non-target, non-primary columns have non-null values
+                if (!targetColumnsBitSet.get(i) && fieldGetters[i].getFieldOrNull(oldRow) != null) {
+                    allNonPkNull = false;
+                    break;
+                }
+            }
+
+            if (allNonPkNull) {
+                // All non-primary key columns are null, delete the entire row
+                return null;
+            }
+
+            // Perform partial deletion: set target non-primary key columns to null
+            rowEncoder.startNewRow();
+            for (int i = 0; i < fieldCount; i++) {
+                boolean isPrimaryKey = aggregators[i] instanceof FieldPrimaryKeyAgg;
+                if (targetColumnsBitSet.get(i) && !isPrimaryKey) {
+                    // Set target non-primary key columns to null
+                    rowEncoder.encodeField(i, null);
+                } else {
+                    // Keep other columns unchanged
+                    rowEncoder.encodeField(i, fieldGetters[i].getFieldOrNull(oldRow));
+                }
+            }
+            BinaryRow resultRow = rowEncoder.finishRow();
+            return new BinaryValue(schemaId, resultRow);
         }
 
         @Override

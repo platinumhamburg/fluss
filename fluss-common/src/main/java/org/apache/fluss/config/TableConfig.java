@@ -188,4 +188,15 @@ public class TableConfig {
     public AutoPartitionStrategy getAutoPartitionStrategy() {
         return AutoPartitionStrategy.from(config);
     }
+
+    /**
+     * Gets the value for a given {@link ConfigOption}.
+     *
+     * @param option the config option
+     * @param <T> the type of the value
+     * @return the value of the config option
+     */
+    public <T> T get(ConfigOption<T> option) {
+        return config.get(option);
+    }
 }
