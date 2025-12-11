@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.coordinator.statemachine;
 
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
@@ -209,10 +210,14 @@ public class TableBucketStateMachine {
                     partitionName =
                             coordinatorContext.getPartitionName(tableBucket.getPartitionId());
                     if (partitionName == null) {
-                        LOG.error(
-                                "Can't find partition name for partition: {}.",
-                                tableBucket.getBucket());
-                        logFailedStateChange(tableBucket, currentState, targetState);
+                        logFailedStateChange(
+                                tableBucket,
+                                currentState,
+                                targetState,
+                                new PartitionNotExistException(
+                                        String.format(
+                                                "Can't find partition name for partition: {}.",
+                                                tableBucket.getBucket())));
                         return;
                     }
                 }
@@ -222,7 +227,11 @@ public class TableBucketStateMachine {
                     Optional<ElectionResult> optionalElectionResult =
                             initLeaderForTableBuckets(tableBucket, assignedServers);
                     if (!optionalElectionResult.isPresent()) {
-                        logFailedStateChange(tableBucket, currentState, targetState);
+                        logFailedStateChange(
+                                tableBucket,
+                                currentState,
+                                targetState,
+                                new RuntimeException("Elect Result is empty."));
                     } else {
                         // transmit state
                         doStateChange(tableBucket, targetState);
@@ -244,7 +253,11 @@ public class TableBucketStateMachine {
                             electNewLeaderForTableBuckets(
                                     tableBucket, replicaLeaderElectionStrategy);
                     if (!optionalElectionResult.isPresent()) {
-                        logFailedStateChange(tableBucket, currentState, targetState);
+                        logFailedStateChange(
+                                tableBucket,
+                                currentState,
+                                targetState,
+                                new RuntimeException("Elect result is empty."));
                     } else {
                         // transmit state
                         doStateChange(tableBucket, targetState);
@@ -337,10 +350,14 @@ public class TableBucketStateMachine {
             if (tableBucket.getPartitionId() != null) {
                 partitionName = coordinatorContext.getPartitionName(tableBucket.getPartitionId());
                 if (partitionName == null) {
-                    LOG.error(
-                            "Can't find partition name for partition: {}.",
-                            tableBucket.getBucket());
-                    logFailedStateChange(tableBucket, currentState, BucketState.OnlineBucket);
+                    logFailedStateChange(
+                            tableBucket,
+                            currentState,
+                            BucketState.OnlineBucket,
+                            new PartitionNotExistException(
+                                    String.format(
+                                            "Can't find partition name for partition: {}.",
+                                            tableBucket.getBucket())));
                     continue;
                 }
             }
@@ -350,7 +367,11 @@ public class TableBucketStateMachine {
             Optional<ElectionResult> optionalElectionResult =
                     doInitElectionForBucket(tableBucket, assignedServers);
             if (!optionalElectionResult.isPresent()) {
-                logFailedStateChange(tableBucket, currentState, BucketState.OnlineBucket);
+                logFailedStateChange(
+                        tableBucket,
+                        currentState,
+                        BucketState.OnlineBucket,
+                        new RuntimeException("Elect result is empty."));
                 continue;
             }
             ElectionResult electionResult = optionalElectionResult.get();
@@ -506,7 +527,11 @@ public class TableBucketStateMachine {
             return true;
         } else {
             logInvalidTransition(tableBucket, curState, targetState);
-            logFailedStateChange(tableBucket, curState, targetState);
+            logFailedStateChange(
+                    tableBucket,
+                    curState,
+                    targetState,
+                    new IllegalStateException("Invalid TableBucket State Transition."));
             return false;
         }
     }
@@ -537,12 +562,16 @@ public class TableBucketStateMachine {
     }
 
     private void logFailedStateChange(
-            TableBucket tableBucket, BucketState currState, BucketState targetState) {
+            TableBucket tableBucket,
+            BucketState currState,
+            BucketState targetState,
+            Throwable reason) {
         LOG.error(
                 "Fail to change state for table bucket {} from {} to {}.",
                 stringifyBucket(tableBucket),
                 currState,
-                targetState);
+                targetState,
+                reason);
     }
 
     private void logSuccessfulStateChange(
@@ -610,8 +639,12 @@ public class TableBucketStateMachine {
 
         if (!resultOpt.isPresent()) {
             LOG.error(
-                    "The leader election for table bucket {} is empty.",
-                    stringifyBucket(tableBucket));
+                    "The leader election for table bucket {} is empty, assignment: {}, live replicas: {}, leaderAndIsr: {}, strategy: {}",
+                    stringifyBucket(tableBucket),
+                    assignment,
+                    liveReplicas,
+                    leaderAndIsr,
+                    electionStrategy);
             return Optional.empty();
         }
         return resultOpt;

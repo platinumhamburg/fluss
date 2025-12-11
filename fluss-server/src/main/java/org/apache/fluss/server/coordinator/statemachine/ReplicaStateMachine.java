@@ -221,8 +221,7 @@ public class ReplicaStateMachine {
                                 try {
                                     partitionName = getPartitionName(tableBucket);
                                 } catch (PartitionNotExistException e) {
-                                    LOG.error(e.getMessage());
-                                    logFailedSateChange(replica, currentState, targetState);
+                                    logFailedSateChange(replica, currentState, targetState, e);
                                     return;
                                 }
 
@@ -282,11 +281,11 @@ public class ReplicaStateMachine {
                         try {
                             partitionName = getPartitionName(tableBucket);
                         } catch (PartitionNotExistException e) {
-                            LOG.error(e.getMessage());
                             logFailedSateChange(
                                     tableBucketReplica,
                                     coordinatorContext.getReplicaState(tableBucketReplica),
-                                    targetState);
+                                    targetState,
+                                    e);
                             continue;
                         }
                         // send leader request to the replica server
@@ -343,7 +342,12 @@ public class ReplicaStateMachine {
                                 return true;
                             } else {
                                 logInvalidTransition(replica, curState, targetState);
-                                logFailedSateChange(replica, curState, targetState);
+                                logFailedSateChange(
+                                        replica,
+                                        curState,
+                                        targetState,
+                                        new IllegalStateException(
+                                                "Invalid Replica State Transition."));
                                 return false;
                             }
                         })
@@ -376,12 +380,16 @@ public class ReplicaStateMachine {
     }
 
     private void logFailedSateChange(
-            TableBucketReplica replica, ReplicaState currState, ReplicaState targetState) {
+            TableBucketReplica replica,
+            ReplicaState currState,
+            ReplicaState targetState,
+            Throwable reason) {
         LOG.error(
                 "Fail to change state for table bucket replica {} from {} to {}.",
                 stringifyReplica(replica),
                 currState,
-                targetState);
+                targetState,
+                reason);
     }
 
     private void logSuccessfulStateChange(
