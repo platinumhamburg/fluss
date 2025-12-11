@@ -221,7 +221,8 @@ public class ReplicaStateMachine {
                                 try {
                                     partitionName = getPartitionName(tableBucket);
                                 } catch (PartitionNotExistException e) {
-                                    logFailedSateChange(replica, currentState, targetState, e);
+                                    logFailedSateChange(
+                                            replica, currentState, targetState, e.getMessage());
                                     return;
                                 }
 
@@ -285,7 +286,7 @@ public class ReplicaStateMachine {
                                     tableBucketReplica,
                                     coordinatorContext.getReplicaState(tableBucketReplica),
                                     targetState,
-                                    e);
+                                    e.getMessage());
                             continue;
                         }
                         // send leader request to the replica server
@@ -346,8 +347,7 @@ public class ReplicaStateMachine {
                                         replica,
                                         curState,
                                         targetState,
-                                        new IllegalStateException(
-                                                "Invalid Replica State Transition."));
+                                        "Invalid Replica State Transition.");
                                 return false;
                             }
                         })
@@ -383,9 +383,9 @@ public class ReplicaStateMachine {
             TableBucketReplica replica,
             ReplicaState currState,
             ReplicaState targetState,
-            Throwable reason) {
+            String reason) {
         LOG.error(
-                "Fail to change state for table bucket replica {} from {} to {}.",
+                "Fail to change state for table bucket replica {} from {} to {}, reason: {}.",
                 stringifyReplica(replica),
                 currState,
                 targetState,

@@ -17,7 +17,6 @@
 
 package org.apache.fluss.server.coordinator.statemachine;
 
-import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
@@ -214,10 +213,9 @@ public class TableBucketStateMachine {
                                 tableBucket,
                                 currentState,
                                 targetState,
-                                new PartitionNotExistException(
-                                        String.format(
-                                                "Can't find partition name for partition: {}.",
-                                                tableBucket.getBucket())));
+                                String.format(
+                                        "Can't find partition name for partition: %s.",
+                                        tableBucket.getBucket()));
                         return;
                     }
                 }
@@ -228,10 +226,7 @@ public class TableBucketStateMachine {
                             initLeaderForTableBuckets(tableBucket, assignedServers);
                     if (!optionalElectionResult.isPresent()) {
                         logFailedStateChange(
-                                tableBucket,
-                                currentState,
-                                targetState,
-                                new RuntimeException("Elect Result is empty."));
+                                tableBucket, currentState, targetState, "Elect Result is empty.");
                     } else {
                         // transmit state
                         doStateChange(tableBucket, targetState);
@@ -254,10 +249,7 @@ public class TableBucketStateMachine {
                                     tableBucket, replicaLeaderElectionStrategy);
                     if (!optionalElectionResult.isPresent()) {
                         logFailedStateChange(
-                                tableBucket,
-                                currentState,
-                                targetState,
-                                new RuntimeException("Elect result is empty."));
+                                tableBucket, currentState, targetState, "Elect result is empty.");
                     } else {
                         // transmit state
                         doStateChange(tableBucket, targetState);
@@ -354,10 +346,9 @@ public class TableBucketStateMachine {
                             tableBucket,
                             currentState,
                             BucketState.OnlineBucket,
-                            new PartitionNotExistException(
-                                    String.format(
-                                            "Can't find partition name for partition: {}.",
-                                            tableBucket.getBucket())));
+                            String.format(
+                                    "Can't find partition name for partition: %s.",
+                                    tableBucket.getBucket()));
                     continue;
                 }
             }
@@ -371,7 +362,7 @@ public class TableBucketStateMachine {
                         tableBucket,
                         currentState,
                         BucketState.OnlineBucket,
-                        new RuntimeException("Elect result is empty."));
+                        "Elect result is empty.");
                 continue;
             }
             ElectionResult electionResult = optionalElectionResult.get();
@@ -528,10 +519,7 @@ public class TableBucketStateMachine {
         } else {
             logInvalidTransition(tableBucket, curState, targetState);
             logFailedStateChange(
-                    tableBucket,
-                    curState,
-                    targetState,
-                    new IllegalStateException("Invalid TableBucket State Transition."));
+                    tableBucket, curState, targetState, "Invalid TableBucket State Transition.");
             return false;
         }
     }
@@ -565,9 +553,9 @@ public class TableBucketStateMachine {
             TableBucket tableBucket,
             BucketState currState,
             BucketState targetState,
-            Throwable reason) {
+            String reason) {
         LOG.error(
-                "Fail to change state for table bucket {} from {} to {}.",
+                "Fail to change state for table bucket {} from {} to {}, reason: {}",
                 stringifyBucket(tableBucket),
                 currState,
                 targetState,
