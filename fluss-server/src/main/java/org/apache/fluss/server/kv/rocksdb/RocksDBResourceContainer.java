@@ -33,6 +33,7 @@ import org.rocksdb.CompressionType;
 import org.rocksdb.DBOptions;
 import org.rocksdb.InfoLogLevel;
 import org.rocksdb.PlainTableConfig;
+import org.rocksdb.RateLimiter;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.Statistics;
 import org.rocksdb.TableFormatConfig;
@@ -73,22 +74,33 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
     private final boolean enableStatistics;
 
+    /** The shared rate limiter for all RocksDB instances. */
+    @Nullable private final RateLimiter sharedRateLimiter;
+
     /** The handles to be closed when the container is closed. */
     private final ArrayList<AutoCloseable> handlesToClose;
 
     @VisibleForTesting
     RocksDBResourceContainer() {
-        this(new Configuration(), null, false);
+        this(new Configuration(), null, false, null);
     }
 
     public RocksDBResourceContainer(ReadableConfig configuration, @Nullable File instanceBasePath) {
-        this(configuration, instanceBasePath, false);
+        this(configuration, instanceBasePath, false, null);
     }
 
     public RocksDBResourceContainer(
             ReadableConfig configuration,
             @Nullable File instanceBasePath,
             boolean enableStatistics) {
+        this(configuration, instanceBasePath, enableStatistics, null);
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            @Nullable RateLimiter sharedRateLimiter) {
         this.configuration = configuration;
 
         this.instanceRocksDBPath =
@@ -96,6 +108,7 @@ public class RocksDBResourceContainer implements AutoCloseable {
                         ? RocksDBKvBuilder.getInstanceRocksDBPath(instanceBasePath)
                         : null;
         this.enableStatistics = enableStatistics;
+        this.sharedRateLimiter = sharedRateLimiter;
 
         this.handlesToClose = new ArrayList<>();
     }
@@ -116,6 +129,11 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
         // add necessary default options
         opt = opt.setCreateIfMissing(true);
+
+        // set shared rate limiter if provided
+        if (sharedRateLimiter != null) {
+            opt.setRateLimiter(sharedRateLimiter);
+        }
 
         if (enableStatistics) {
             Statistics statistics = new Statistics();

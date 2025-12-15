@@ -189,7 +189,8 @@ public final class KvTablet {
                 rowMerger,
                 arrowCompressionInfo,
                 schemaGetter,
-                changelogImage);
+                changelogImage,
+                null);
     }
 
     public static KvTablet create(
@@ -207,7 +208,39 @@ public final class KvTablet {
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage)
             throws IOException {
-        RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir);
+        return create(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvTabletDir,
+                serverConf,
+                serverMetricGroup,
+                arrowBufferAllocator,
+                memorySegmentPool,
+                kvFormat,
+                rowMerger,
+                arrowCompressionInfo,
+                schemaGetter,
+                null);
+    }
+
+    public static KvTablet create(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File kvTabletDir,
+            Configuration serverConf,
+            TabletServerMetricGroup serverMetricGroup,
+            BufferAllocator arrowBufferAllocator,
+            MemorySegmentPool memorySegmentPool,
+            KvFormat kvFormat,
+            RowMerger rowMerger,
+            ArrowCompressionInfo arrowCompressionInfo,
+            SchemaGetter schemaGetter,
+            ChangelogImage changelogImage,
+            @Nullable org.rocksdb.RateLimiter sharedRateLimiter)
+            throws IOException {
+        RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter);
         return new KvTablet(
                 tablePath,
                 tableBucket,
@@ -226,10 +259,13 @@ public final class KvTablet {
                 changelogImage);
     }
 
-    private static RocksDBKv buildRocksDBKv(Configuration configuration, File kvDir)
+    private static RocksDBKv buildRocksDBKv(
+            Configuration configuration,
+            File kvDir,
+            org.rocksdb.RateLimiter sharedRateLimiter)
             throws IOException {
         RocksDBResourceContainer rocksDBResourceContainer =
-                new RocksDBResourceContainer(configuration, kvDir);
+                new RocksDBResourceContainer(configuration, kvDir, false, sharedRateLimiter);
         RocksDBKvBuilder rocksDBKvBuilder =
                 new RocksDBKvBuilder(
                         kvDir,

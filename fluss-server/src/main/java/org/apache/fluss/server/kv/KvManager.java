@@ -20,7 +20,10 @@ package org.apache.fluss.server.kv;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.config.cluster.ServerReconfigurable;
+import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -45,6 +48,9 @@ import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.MapUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
+import org.rocksdb.RateLimiter;
+import org.rocksdb.RateLimiterMode;
+import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -65,7 +71,7 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
  * the individual instances.
  */
 @ThreadSafe
-public final class KvManager extends TabletManagerBase {
+public final class KvManager extends TabletManagerBase implements ServerReconfigurable {
 
     private static final Logger LOG = LoggerFactory.getLogger(KvManager.class);
     private final LogManager logManager;
@@ -89,6 +95,14 @@ public final class KvManager extends TabletManagerBase {
 
     private final FileSystem remoteFileSystem;
 
+    /**
+     * The shared rate limiter for all RocksDB instances to control flush and compaction write rate.
+     */
+    private final RateLimiter sharedRocksDBRateLimiter;
+
+    /** Current shared rate limiter configuration in bytes per second. */
+    private volatile long currentSharedRateLimitBytesPerSec;
+
     private KvManager(
             File dataDir,
             Configuration conf,
@@ -105,6 +119,27 @@ public final class KvManager extends TabletManagerBase {
         this.remoteKvDir = FlussPaths.remoteKvDir(conf);
         this.remoteFileSystem = remoteKvDir.getFileSystem();
         this.serverMetricGroup = tabletServerMetricGroup;
+        this.sharedRocksDBRateLimiter = createSharedRateLimiter(conf);
+        this.currentSharedRateLimitBytesPerSec =
+                conf.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
+    }
+
+    private static RateLimiter createSharedRateLimiter(Configuration conf) {
+        long sharedRateLimitBytesPerSecond =
+                conf.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
+        if (sharedRateLimitBytesPerSecond <= 0) {
+            // shared rate limiting is disabled
+            return null;
+        }
+        RocksDB.loadLibrary();
+        // create a shared rate limiter with specified rate limit
+        // refill_period_us is set to 100ms, fairness is set to 10
+        return new RateLimiter(
+                sharedRateLimitBytesPerSecond,
+                RateLimiter.DEFAULT_REFILL_PERIOD_MICROS,
+                RateLimiter.DEFAULT_FAIRNESS,
+                RateLimiterMode.WRITES_ONLY,
+                false);
     }
 
     public static KvManager create(
@@ -140,6 +175,9 @@ public final class KvManager extends TabletManagerBase {
         }
         arrowBufferAllocator.close();
         memorySegmentPool.close();
+        if (sharedRocksDBRateLimiter != null) {
+            sharedRocksDBRateLimiter.close();
+        }
         LOG.info("Shut down KvManager complete.");
     }
 
@@ -176,6 +214,8 @@ public final class KvManager extends TabletManagerBase {
                     RowMerger merger = RowMerger.create(tableConfig, kvFormat);
                     KvTablet tablet =
                             KvTablet.create(
+                                    tablePath,
+                                    tableBucket,
                                     logTablet,
                                     tabletDir,
                                     conf,
@@ -186,7 +226,8 @@ public final class KvManager extends TabletManagerBase {
                                     merger,
                                     arrowCompressionInfo,
                                     schemaGetter,
-                                    tableConfig.getChangelogImage());
+                                    tableConfig.getChangelogImage(),
+                                    sharedRocksDBRateLimiter);
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -294,7 +335,8 @@ public final class KvManager extends TabletManagerBase {
                         rowMerger,
                         tableConfig.getArrowCompressionInfo(),
                         schemaGetter,
-                        tableConfig.getChangelogImage());
+                        tableConfig.getChangelogImage(),
+                        sharedRocksDBRateLimiter);
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(
@@ -325,6 +367,93 @@ public final class KvManager extends TabletManagerBase {
                     "Delete table's remote bucket snapshot dir of {} failed.",
                     remoteKvTabletDir,
                     e);
+        }
+    }
+
+    // ============ ServerReconfigurable Implementation ============
+
+    @Override
+    public void validate(Configuration newConfig) throws ConfigException {
+        long newSharedRateLimitBytes =
+                newConfig.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
+
+        // If shared rate limiter is not enabled, only allow keeping it at 0
+        if (sharedRocksDBRateLimiter == null) {
+            if (newSharedRateLimitBytes > 0) {
+                throw new ConfigException(
+                        "Cannot enable shared RocksDB rate limiter dynamically. "
+                                + "RateLimiter was not enabled at server startup. "
+                                + "To enable shared rate limiter, please set '"
+                                + ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()
+                                + "' to a positive value in server configuration and restart.");
+            }
+            return;
+        }
+
+        // If already enabled, don't allow disabling it
+        if (newSharedRateLimitBytes <= 0) {
+            throw new ConfigException(
+                    "Cannot disable shared RocksDB rate limiter dynamically. "
+                            + "To disable it, please restart the server with '"
+                            + ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()
+                            + "' set to 0. Dynamic disabling is not supported.");
+        }
+
+        // Reasonable range check
+        long minRate = MemorySize.parse("1mb").getBytes(); // 1MB/s
+        long maxRate = MemorySize.parse("10gb").getBytes(); // 10GB/s
+
+        if (newSharedRateLimitBytes < minRate || newSharedRateLimitBytes > maxRate) {
+            LOG.warn(
+                    "Shared RocksDB rate limit {} bytes/sec is outside recommended range [{} bytes/sec, {} bytes/sec]",
+                    newSharedRateLimitBytes,
+                    minRate,
+                    maxRate);
+        }
+
+        LOG.info(
+                "Validation passed for new shared RocksDB rate limiter config: {} bytes/sec ({})",
+                newSharedRateLimitBytes,
+                new MemorySize(newSharedRateLimitBytes).toHumanReadableString());
+    }
+
+    @Override
+    public void reconfigure(Configuration newConfig) throws ConfigException {
+        long newSharedRateLimitBytes =
+                newConfig.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
+
+        // If shared rate limiter is not enabled, skip reconfiguration
+        if (sharedRocksDBRateLimiter == null) {
+            LOG.info("Shared RocksDB rate limiter is not enabled, skip reconfiguration");
+            return;
+        }
+
+        // If value hasn't changed, skip
+        if (newSharedRateLimitBytes == currentSharedRateLimitBytesPerSec) {
+            LOG.debug(
+                    "Shared RocksDB rate limiter config unchanged: {} bytes/sec",
+                    newSharedRateLimitBytes);
+            return;
+        }
+
+        long oldValue = currentSharedRateLimitBytesPerSec;
+
+        try {
+            // Apply new configuration using RocksDB API (thread-safe)
+            sharedRocksDBRateLimiter.setBytesPerSecond(newSharedRateLimitBytes);
+            currentSharedRateLimitBytesPerSec = newSharedRateLimitBytes;
+
+            LOG.info(
+                    "Shared RocksDB rate limiter reconfigured: {} bytes/sec ({}) -> {} bytes/sec ({})",
+                    oldValue,
+                    new MemorySize(oldValue).toHumanReadableString(),
+                    newSharedRateLimitBytes,
+                    new MemorySize(newSharedRateLimitBytes).toHumanReadableString());
+
+        } catch (Exception e) {
+            // If setting fails, throw ConfigException to trigger rollback
+            throw new ConfigException(
+                    "Failed to reconfigure shared RocksDB rate limiter: " + e.getMessage(), e);
         }
     }
 }

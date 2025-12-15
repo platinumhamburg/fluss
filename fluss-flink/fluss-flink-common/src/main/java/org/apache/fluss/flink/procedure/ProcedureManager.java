@@ -69,7 +69,11 @@ public class ProcedureManager {
     private enum ProcedureEnum {
         ADD_ACL("sys.add_acl", AddAclProcedure.class),
         DROP_ACL("sys.drop_acl", DropAclProcedure.class),
-        List_ACL("sys.list_acl", ListAclProcedure.class);
+        List_ACL("sys.list_acl", ListAclProcedure.class),
+        SET_SHARED_ROCKSDB_RATE_LIMITER(
+                "sys.set_shared_rocksdb_rate_limiter", SetSharedRocksDBRateLimiterProcedure.class),
+        GET_SHARED_ROCKSDB_RATE_LIMITER(
+                "sys.get_shared_rocksdb_rate_limiter", GetSharedRocksDBRateLimiterProcedure.class);
 
         private final String path;
         private final Class<? extends ProcedureBase> procedureClass;

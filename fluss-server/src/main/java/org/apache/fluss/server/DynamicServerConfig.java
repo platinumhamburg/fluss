@@ -26,6 +26,7 @@ import org.apache.fluss.utils.MapUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -35,6 +36,7 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
+import static org.apache.fluss.config.ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC;
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
 
@@ -49,7 +51,9 @@ class DynamicServerConfig {
 
     private static final Logger LOG = LoggerFactory.getLogger(DynamicServerConfig.class);
     private static final Set<String> ALLOWED_CONFIG_KEYS =
-            Collections.singleton(DATALAKE_FORMAT.key());
+            new HashSet<>(
+                    Arrays.asList(
+                            DATALAKE_FORMAT.key(), KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()));
     private static final Set<String> ALLOWED_CONFIG_PREFIXES = Collections.singleton("datalake.");
 
     private final ReadWriteLock lock = new ReentrantReadWriteLock();

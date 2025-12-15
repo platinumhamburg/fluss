@@ -1576,6 +1576,16 @@ public class ConfigOptions {
                             "The max size of the consumed memory for RocksDB batch write, "
                                     + "will flush just based on item count if this config set to 0.");
 
+    public static final ConfigOption<MemorySize> KV_SHARED_RATE_LIMITER_BYTES_PER_SEC =
+            key("kv.rocksdb.shared-rate-limiter.bytes-per-sec")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("100mb"))
+                    .withDescription(
+                            "The shared rate limit in bytes per second for RocksDB flush and compaction operations "
+                                    + "across all RocksDB instances in the TabletServer. "
+                                    + "All KV tablets share a single global RateLimiter to prevent disk IO from being saturated. "
+                                    + "The default value is `100MB/s`. Set to 0 to disable rate limiting.");
+
     // --------------------------------------------------------------------------
     // Provided configurable ColumnFamilyOptions within Fluss
     // --------------------------------------------------------------------------
