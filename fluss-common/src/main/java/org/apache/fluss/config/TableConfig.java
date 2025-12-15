@@ -19,6 +19,7 @@ package org.apache.fluss.config;
 
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionInfo;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
@@ -118,12 +119,11 @@ public class TableConfig {
     }
 
     /**
-     * Whether to ignore UPDATE_BEFORE records in changelog for the primary key table. When false
-     * (default), update operations produce both UPDATE_BEFORE and UPDATE_AFTER records. When true,
-     * update operations only produce UPDATE_AFTER records.
+     * Gets the changelog image mode of the table. The changelog image mode defines what information
+     * is included in the changelog for update operations.
      */
-    public boolean isChangelogIgnoreUpdateBefore() {
-        return config.get(ConfigOptions.TABLE_CHANGELOG_IGNORE_UPDATE_BEFORE);
+    public ChangelogImage getChangelogImage() {
+        return config.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
     }
 
     /** Gets the Arrow compression type and compression level of the table. */

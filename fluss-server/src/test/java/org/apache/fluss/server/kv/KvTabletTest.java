@@ -191,7 +191,7 @@ class KvTabletTest {
                 rowMerger,
                 DEFAULT_COMPRESSION,
                 schemaGetter,
-                tableConf.isChangelogIgnoreUpdateBefore());
+                tableConf.getChangelogImage());
     }
 
     @Test
@@ -1045,10 +1045,10 @@ class KvTabletTest {
     }
 
     @Test
-    void testIgnoreUpdateBefore() throws Exception {
-        // Ignore UPDATE_BEFORE - should not be produced
+    void testChangelogImageNoUpdateBefore() throws Exception {
+        // WAL mode - INSERT and UPDATE both produce UPDATE_AFTER, no UPDATE_BEFORE
         Map<String, String> config = new HashMap<>();
-        config.put("table.changelog.ignore-update-before", "true");
+        config.put("table.changelog.image", "WAL");
         initLogTabletAndKvTablet(DATA1_SCHEMA_PK, config);
         RowType rowType = DATA1_SCHEMA_PK.getRowType();
 
@@ -1061,7 +1061,7 @@ class KvTabletTest {
         kvTablet.putAsLeader(kvRecordBatch1, null);
         long endOffset = logTablet.localLogEndOffset();
 
-        // Verify inserts produce +U (since we skip oldValue check, all are UPDATE_AFTER)
+        // Verify inserts produce +U (WAL mode converts INSERT to UPDATE_AFTER)
         LogRecords actualLogRecords = readLogRecords();
         MemoryLogRecords expectedLogs =
                 logRecords(
@@ -1110,10 +1110,10 @@ class KvTabletTest {
     }
 
     @Test
-    void testIgnoreUpdateBeforeWithPartialUpdate() throws Exception {
-        // Ignore UPDATE_BEFORE with partial update - still need to fetch oldValue
+    void testChangelogImageNoUpdateBeforeWithPartialUpdate() throws Exception {
+        // WAL mode with partial update - still need to fetch oldValue
         Map<String, String> config = new HashMap<>();
-        config.put("table.changelog.ignore-update-before", "true");
+        config.put("table.changelog.image", "WAL");
         initLogTabletAndKvTablet(DATA2_SCHEMA, config);
         RowType rowType = DATA2_SCHEMA.getRowType();
         KvRecordTestUtils.KvRecordFactory data2kvRecordFactory =
@@ -1144,7 +1144,7 @@ class KvTabletTest {
                                 "k1".getBytes(), new Object[] {1, "v1", null}));
         kvTablet.putAsLeader(kvRecordBatch2, new int[] {0, 1});
 
-        // Verify update only produces +U (no -U since changelog producer is disabled)
+        // Verify update only produces +U (no -U since using WAL mode)
         actualLogRecords = readLogRecords(endOffset);
         expectedLogs =
                 logRecords(

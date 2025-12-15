@@ -31,6 +31,7 @@ import org.apache.fluss.flink.utils.PushdownUtils;
 import org.apache.fluss.flink.utils.PushdownUtils.FieldEqual;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.TablePath;
@@ -209,28 +210,26 @@ public class FlinkTableSource
                     Configuration tableConf = Configuration.fromMap(tableOptions);
                     DeleteBehavior deleteBehavior =
                             tableConf.get(ConfigOptions.TABLE_DELETE_BEHAVIOR);
-                    boolean ignoreUpdateBefore =
-                            tableConf.get(ConfigOptions.TABLE_CHANGELOG_IGNORE_UPDATE_BEFORE);
-                    if (ignoreUpdateBefore) {
-                        // When ignoring UPDATE_BEFORE, only produce INSERT, UPDATE_AFTER (and
-                        // DELETE if allowed)
+                    ChangelogImage changelogImage =
+                            tableConf.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
+                    if (changelogImage == ChangelogImage.WAL) {
+                        // When using WAL mode, only produce UPDATE_AFTER (and DELETE if allowed)
+                        // Note: INSERT operations are also converted to UPDATE_AFTER in WAL mode
                         if (deleteBehavior == DeleteBehavior.ALLOW) {
                             // DELETE is still produced when delete behavior is allowed
                             return ChangelogMode.newBuilder()
-                                    .addContainedKind(RowKind.INSERT)
                                     .addContainedKind(RowKind.UPDATE_AFTER)
                                     .addContainedKind(RowKind.DELETE)
                                     .build();
                         } else {
                             // No DELETE when delete operations are ignored or disabled
                             return ChangelogMode.newBuilder()
-                                    .addContainedKind(RowKind.INSERT)
                                     .addContainedKind(RowKind.UPDATE_AFTER)
                                     .build();
                         }
                     }
 
-                    // Not ignoring UPDATE_BEFORE, produce full changelog
+                    // Using FULL mode, produce full changelog
                     if (deleteBehavior == DeleteBehavior.ALLOW) {
                         return ChangelogMode.all();
                     } else {

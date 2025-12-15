@@ -186,7 +186,7 @@ public final class KvManager extends TabletManagerBase {
                                     merger,
                                     arrowCompressionInfo,
                                     schemaGetter,
-                                    tableConfig.isChangelogIgnoreUpdateBefore());
+                                    tableConfig.getChangelogImage());
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -294,7 +294,7 @@ public final class KvManager extends TabletManagerBase {
                         rowMerger,
                         tableConfig.getArrowCompressionInfo(),
                         schemaGetter,
-                        tableConfig.isChangelogIgnoreUpdateBefore());
+                        tableConfig.getChangelogImage());
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(

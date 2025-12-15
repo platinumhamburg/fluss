@@ -20,6 +20,7 @@ package org.apache.fluss.config;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionType;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
@@ -1423,15 +1424,17 @@ public class ConfigOptions {
                                     + "The auto increment column can only be used in primary-key table. The data type of the auto increment column must be INT or BIGINT."
                                     + "Currently a table can have only one auto-increment column.");
 
-    public static final ConfigOption<Boolean> TABLE_CHANGELOG_IGNORE_UPDATE_BEFORE =
-            key("table.changelog.ignore-update-before")
-                    .booleanType()
-                    .defaultValue(false)
+    public static final ConfigOption<ChangelogImage> TABLE_CHANGELOG_IMAGE =
+            key("table.changelog.image")
+                    .enumType(ChangelogImage.class)
+                    .defaultValue(ChangelogImage.FULL)
                     .withDescription(
-                            "Whether to ignore UPDATE_BEFORE records in changelog for the primary key table. "
-                                    + "When disabled (default), update operations produce both UPDATE_BEFORE and UPDATE_AFTER records. "
-                                    + "When enabled, update operations only produce UPDATE_AFTER records, "
-                                    + "which reduces storage and transmission costs but loses the ability to track previous values. "
+                            "Defines the changelog image mode for the primary key table. "
+                                    + "This configuration is inspired by similar settings in database systems like MySQL's binlog_row_image and PostgreSQL's replica identity. "
+                                    + "The supported modes are `FULL` (default) and `WAL`. "
+                                    + "The `FULL` mode produces both UPDATE_BEFORE and UPDATE_AFTER records for update operations, capturing complete information about updates and allowing tracking of previous values. "
+                                    + "The `WAL` mode emits only UPDATE_AFTER records for both INSERT and UPDATE operations, without UPDATE_BEFORE records. This is similar to database WAL (Write-Ahead Log) behavior. "
+                                    + "DELETE records are emitted if allowed. This mode reduces storage and transmission costs but loses the ability to distinguish between inserts and updates, and to track previous values. "
                                     + "This option only affects primary key tables.");
 
     // ------------------------------------------------------------------------
