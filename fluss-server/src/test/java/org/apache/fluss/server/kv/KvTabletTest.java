@@ -1045,8 +1045,9 @@ class KvTabletTest {
     }
 
     @Test
-    void testChangelogImageNoUpdateBefore() throws Exception {
-        // WAL mode - INSERT and UPDATE both produce UPDATE_AFTER, no UPDATE_BEFORE
+    void testWalModeChangelogImageNoUpdateBefore() throws Exception {
+        // WAL mode - no UPDATE_BEFORE. With default merge engine and full row update,
+        // optimization converts INSERT to UPDATE_AFTER
         Map<String, String> config = new HashMap<>();
         config.put("table.changelog.image", "WAL");
         initLogTabletAndKvTablet(DATA1_SCHEMA_PK, config);
@@ -1061,7 +1062,8 @@ class KvTabletTest {
         kvTablet.putAsLeader(kvRecordBatch1, null);
         long endOffset = logTablet.localLogEndOffset();
 
-        // Verify inserts produce +U (WAL mode converts INSERT to UPDATE_AFTER)
+        // Verify inserts produce +U (optimization in WAL mode with default merge engine and full
+        // row update)
         LogRecords actualLogRecords = readLogRecords();
         MemoryLogRecords expectedLogs =
                 logRecords(
@@ -1110,8 +1112,9 @@ class KvTabletTest {
     }
 
     @Test
-    void testChangelogImageNoUpdateBeforeWithPartialUpdate() throws Exception {
-        // WAL mode with partial update - still need to fetch oldValue
+    void testWalModeChangelogImageNoUpdateBeforeWithPartialUpdate() throws Exception {
+        // WAL mode with partial update - INSERT produces INSERT, UPDATE produces UPDATE_AFTER
+        // only (no optimization applied)
         Map<String, String> config = new HashMap<>();
         config.put("table.changelog.image", "WAL");
         initLogTabletAndKvTablet(DATA2_SCHEMA, config);

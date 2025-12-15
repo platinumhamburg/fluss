@@ -444,10 +444,10 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
-        // Optimization: when using NO_UPDATE_BEFORE mode and merger is
-        // DefaultRowMerger (full update, not partial update), we can skip
-        // fetching old value for better performance since it always returns
-        // new value.
+        // Optimization: when using WAL mode and merger is DefaultRowMerger (full update, not
+        // partial update), we can skip fetching old value for better performance since it
+        // always returns new value. In this case, both INSERT and UPDATE will produce
+        // UPDATE_AFTER.
         if (changelogImage == ChangelogImage.WAL && currentMerger instanceof DefaultRowMerger) {
             return applyUpdate(key, null, currentValue, walBuilder, latestSchemaRow, logOffset);
         }
@@ -487,10 +487,7 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
-        // In WAL mode, INSERT operations are also emitted as UPDATE_AFTER
-        ChangeType changeType =
-                changelogImage == ChangelogImage.WAL ? ChangeType.UPDATE_AFTER : ChangeType.INSERT;
-        walBuilder.append(changeType, latestSchemaRow.replaceRow(currentValue.row));
+        walBuilder.append(ChangeType.INSERT, latestSchemaRow.replaceRow(currentValue.row));
         kvPreWriteBuffer.put(key, currentValue.encodeValue(), logOffset);
         return logOffset + 1;
     }

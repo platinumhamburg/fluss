@@ -213,17 +213,20 @@ public class FlinkTableSource
                     ChangelogImage changelogImage =
                             tableConf.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
                     if (changelogImage == ChangelogImage.WAL) {
-                        // When using WAL mode, only produce UPDATE_AFTER (and DELETE if allowed)
-                        // Note: INSERT operations are also converted to UPDATE_AFTER in WAL mode
+                        // When using WAL mode, produce INSERT and UPDATE_AFTER (and DELETE if
+                        // allowed), without UPDATE_BEFORE. Note: with default merge engine and full
+                        // row updates, an optimization converts INSERT to UPDATE_AFTER.
                         if (deleteBehavior == DeleteBehavior.ALLOW) {
                             // DELETE is still produced when delete behavior is allowed
                             return ChangelogMode.newBuilder()
+                                    .addContainedKind(RowKind.INSERT)
                                     .addContainedKind(RowKind.UPDATE_AFTER)
                                     .addContainedKind(RowKind.DELETE)
                                     .build();
                         } else {
                             // No DELETE when delete operations are ignored or disabled
                             return ChangelogMode.newBuilder()
+                                    .addContainedKind(RowKind.INSERT)
                                     .addContainedKind(RowKind.UPDATE_AFTER)
                                     .build();
                         }

@@ -35,11 +35,12 @@ public enum ChangelogImage {
     FULL,
 
     /**
-     * WAL mode produces only UPDATE_AFTER records for both INSERT and UPDATE operations, without
-     * UPDATE_BEFORE records. This mode is similar to database WAL (Write-Ahead Log) behavior, where
-     * all inserts and updates are represented as UPDATE_AFTER events. DELETE records are emitted if
-     * allowed. This mode reduces storage and transmission costs but loses the ability to
-     * distinguish between inserts and updates, and to track previous values.
+     * WAL mode does not produce UPDATE_BEFORE records. Only INSERT, UPDATE_AFTER (and DELETE if
+     * allowed) records are emitted. When WAL mode is enabled with default merge engine (no merge
+     * engine configured) and full row updates (not partial update), an optimization is applied to
+     * skip looking up old values, and in this case INSERT operations are converted to UPDATE_AFTER
+     * events, similar to database WAL (Write-Ahead Log) behavior. This mode reduces storage and
+     * transmission costs but loses the ability to track previous values.
      */
     WAL;
 
