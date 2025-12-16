@@ -23,6 +23,7 @@ import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
+import org.apache.fluss.server.kv.KvConfigValidator;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
@@ -46,6 +47,7 @@ import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
 import static org.apache.fluss.metadata.DataLakeFormat.PAIMON;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link DynamicConfigManager}. */
@@ -252,6 +254,101 @@ public class DynamicConfigChangeTest {
             dynamicConfigManager.register(lakeCatalogDynamicLoader);
             // Startup dynamic manager even is not matched now.
             dynamicConfigManager.startup();
+            assertThat(lakeCatalogDynamicLoader.getLakeCatalogContainer().getDataLakeFormat())
+                    .isEqualTo(PAIMON);
+        }
+    }
+
+    @Test
+    void testConfigValidatorPreventInvalidConfig() throws Exception {
+        // Setup: rate limiter disabled at startup
+        Configuration configuration = new Configuration();
+        configuration.setString(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(), "0b");
+
+        DynamicConfigManager dynamicConfigManager =
+                new DynamicConfigManager(zookeeperClient, configuration, true);
+
+        // Register ConfigValidator - this validates before ServerReconfigurable
+        dynamicConfigManager.registerValidator(new KvConfigValidator(configuration));
+        dynamicConfigManager.startup();
+
+        // Try to enable rate limiter dynamically - should be rejected by validator
+        assertThatThrownBy(
+                        () ->
+                                dynamicConfigManager.alterConfigs(
+                                        Collections.singletonList(
+                                                new AlterConfig(
+                                                        ConfigOptions
+                                                                .KV_SHARED_RATE_LIMITER_BYTES_PER_SEC
+                                                                .key(),
+                                                        "100MB",
+                                                        AlterConfigOpType.SET))))
+                .isInstanceOf(ConfigException.class)
+                .hasMessageContaining("Cannot enable shared RocksDB rate limiter dynamically");
+    }
+
+    @Test
+    void testConfigValidatorAllowsValidChange() throws Exception {
+        // Setup: rate limiter enabled at startup
+        Configuration configuration = new Configuration();
+        configuration.setString(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(), "100MB");
+
+        DynamicConfigManager dynamicConfigManager =
+                new DynamicConfigManager(zookeeperClient, configuration, true);
+
+        // Register ConfigValidator
+        dynamicConfigManager.registerValidator(new KvConfigValidator(configuration));
+        dynamicConfigManager.startup();
+
+        // Adjust rate limiter value - should succeed
+        assertThatCode(
+                        () ->
+                                dynamicConfigManager.alterConfigs(
+                                        Collections.singletonList(
+                                                new AlterConfig(
+                                                        ConfigOptions
+                                                                .KV_SHARED_RATE_LIMITER_BYTES_PER_SEC
+                                                                .key(),
+                                                        "200MB",
+                                                        AlterConfigOpType.SET))))
+                .doesNotThrowAnyException();
+
+        // Verify config was persisted to ZK
+        Map<String, String> zkConfig = zookeeperClient.fetchEntityConfig();
+        assertThat(zkConfig.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
+                .isEqualTo("200MB");
+    }
+
+    @Test
+    void testConfigValidatorWithMultipleValidators() throws Exception {
+        Configuration configuration = new Configuration();
+        configuration.setString(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(), "100MB");
+
+        try (LakeCatalogDynamicLoader lakeCatalogDynamicLoader =
+                new LakeCatalogDynamicLoader(configuration, null, true)) {
+            DynamicConfigManager dynamicConfigManager =
+                    new DynamicConfigManager(zookeeperClient, configuration, true);
+
+            // Register multiple validators and reconfigurables
+            dynamicConfigManager.registerValidator(new KvConfigValidator(configuration));
+            dynamicConfigManager.register(lakeCatalogDynamicLoader);
+            dynamicConfigManager.startup();
+
+            // Change multiple configs - both validators should be invoked
+            dynamicConfigManager.alterConfigs(
+                    Arrays.asList(
+                            new AlterConfig(
+                                    ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(),
+                                    "200MB",
+                                    AlterConfigOpType.SET),
+                            new AlterConfig(
+                                    DATALAKE_FORMAT.key(), "paimon", AlterConfigOpType.SET)));
+
+            // Verify both configs were applied
+            Map<String, String> zkConfig = zookeeperClient.fetchEntityConfig();
+            assertThat(zkConfig.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
+                    .isEqualTo("200MB");
+            assertThat(zkConfig.get(DATALAKE_FORMAT.key())).isEqualTo("paimon");
             assertThat(lakeCatalogDynamicLoader.getLakeCatalogContainer().getDataLakeFormat())
                     .isEqualTo(PAIMON);
         }

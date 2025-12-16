@@ -70,10 +70,8 @@ public class ProcedureManager {
         ADD_ACL("sys.add_acl", AddAclProcedure.class),
         DROP_ACL("sys.drop_acl", DropAclProcedure.class),
         List_ACL("sys.list_acl", ListAclProcedure.class),
-        SET_SHARED_ROCKSDB_RATE_LIMITER(
-                "sys.set_shared_rocksdb_rate_limiter", SetSharedRocksDBRateLimiterProcedure.class),
-        GET_SHARED_ROCKSDB_RATE_LIMITER(
-                "sys.get_shared_rocksdb_rate_limiter", GetSharedRocksDBRateLimiterProcedure.class);
+        SET_CLUSTER_CONFIG("sys.set_cluster_config", SetClusterConfigProcedure.class),
+        GET_CLUSTER_CONFIG("sys.get_cluster_config", GetClusterConfigProcedure.class);
 
         private final String path;
         private final Class<? extends ProcedureBase> procedureClass;

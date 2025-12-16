@@ -103,6 +103,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     /** Current shared rate limiter configuration in bytes per second. */
     private volatile long currentSharedRateLimitBytesPerSec;
 
+    private volatile boolean isShutdown = false;
+
     private KvManager(
             File dataDir,
             Configuration conf,
@@ -165,6 +167,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     public void shutdown() {
         LOG.info("Shutting down KvManager");
+        isShutdown = true;
         List<KvTablet> kvs = new ArrayList<>(currentKvs.values());
         for (KvTablet kvTablet : kvs) {
             try {
@@ -374,47 +377,16 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     @Override
     public void validate(Configuration newConfig) throws ConfigException {
-        long newSharedRateLimitBytes =
-                newConfig.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
+        // Config validation is already handled by KvConfigValidator which is registered
+        // on both CoordinatorServer and TabletServer. Here we only need to check runtime state.
 
-        // If shared rate limiter is not enabled, only allow keeping it at 0
-        if (sharedRocksDBRateLimiter == null) {
-            if (newSharedRateLimitBytes > 0) {
-                throw new ConfigException(
-                        "Cannot enable shared RocksDB rate limiter dynamically. "
-                                + "RateLimiter was not enabled at server startup. "
-                                + "To enable shared rate limiter, please set '"
-                                + ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()
-                                + "' to a positive value in server configuration and restart.");
-            }
-            return;
+        // Check if KvManager is in a valid state to accept reconfiguration
+        if (isShutdown) {
+            throw new ConfigException("Cannot reconfigure KvManager during shutdown");
         }
 
-        // If already enabled, don't allow disabling it
-        if (newSharedRateLimitBytes <= 0) {
-            throw new ConfigException(
-                    "Cannot disable shared RocksDB rate limiter dynamically. "
-                            + "To disable it, please restart the server with '"
-                            + ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()
-                            + "' set to 0. Dynamic disabling is not supported.");
-        }
-
-        // Reasonable range check
-        long minRate = MemorySize.parse("1mb").getBytes(); // 1MB/s
-        long maxRate = MemorySize.parse("10gb").getBytes(); // 10GB/s
-
-        if (newSharedRateLimitBytes < minRate || newSharedRateLimitBytes > maxRate) {
-            LOG.warn(
-                    "Shared RocksDB rate limit {} bytes/sec is outside recommended range [{} bytes/sec, {} bytes/sec]",
-                    newSharedRateLimitBytes,
-                    minRate,
-                    maxRate);
-        }
-
-        LOG.info(
-                "Validation passed for new shared RocksDB rate limiter config: {} bytes/sec ({})",
-                newSharedRateLimitBytes,
-                new MemorySize(newSharedRateLimitBytes).toHumanReadableString());
+        // All config value validations are delegated to KvConfigValidator
+        LOG.debug("KvManager runtime state validation passed for reconfiguration");
     }
 
     @Override

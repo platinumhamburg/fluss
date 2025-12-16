@@ -94,9 +94,9 @@ public abstract class FlinkProcedureITCase {
                     Arrays.asList(
                             "+I[sys.add_acl]",
                             "+I[sys.drop_acl]",
-                            "+I[sys.get_shared_rocksdb_rate_limiter]",
+                            "+I[sys.get_cluster_config]",
                             "+I[sys.list_acl]",
-                            "+I[sys.set_shared_rocksdb_rate_limiter]");
+                            "+I[sys.set_cluster_config]");
             // make sure no more results is unread.
             assertResultsIgnoreOrder(showProceduresIterator, expectedShowProceduresResult, true);
         }
@@ -227,162 +227,6 @@ public abstract class FlinkProcedureITCase {
     }
 
     @Test
-    void testGetAndSetSharedRocksDBRateLimiter() throws Exception {
-        // Test get current shared rate limiter configuration
-        try (CloseableIterator<Row> getRateLimiterIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.get_shared_rocksdb_rate_limiter()",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(getRateLimiterIterator.hasNext()).isTrue();
-            Row row = getRateLimiterIterator.next();
-            String result = row.getField(0).toString();
-            // Should contain the initial value (100MB from config)
-            assertThat(result).contains("100");
-            assertThat(getRateLimiterIterator.hasNext()).isFalse();
-        }
-
-        // Test set shared rate limiter to 200MB
-        try (CloseableIterator<Row> setRateLimiterIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.set_shared_rocksdb_rate_limiter('200MB')",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(setRateLimiterIterator.hasNext()).isTrue();
-            Row row = setRateLimiterIterator.next();
-            String result = row.getField(0).toString();
-            assertThat(result).contains("Successfully");
-            assertThat(result).contains("200MB");
-            assertThat(setRateLimiterIterator.hasNext()).isFalse();
-        }
-
-        // Wait a moment for configuration to propagate
-        Thread.sleep(2000);
-
-        // Verify the change
-        try (CloseableIterator<Row> verifyIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.get_shared_rocksdb_rate_limiter()",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(verifyIterator.hasNext()).isTrue();
-            Row row = verifyIterator.next();
-            String result = row.getField(0).toString();
-            // Should now show 200MB
-            assertThat(result).contains("200");
-            assertThat(verifyIterator.hasNext()).isFalse();
-        }
-
-        // Test set shared rate limiter to 500MB
-        try (CloseableIterator<Row> set500MBIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.set_shared_rocksdb_rate_limiter('500MB')",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(set500MBIterator.hasNext()).isTrue();
-            Row row = set500MBIterator.next();
-            String result = row.getField(0).toString();
-            assertThat(result).contains("Successfully");
-            assertThat(result).contains("500MB");
-        }
-
-        Thread.sleep(2000);
-
-        // Final verification
-        try (CloseableIterator<Row> finalVerifyIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.get_shared_rocksdb_rate_limiter()",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(finalVerifyIterator.hasNext()).isTrue();
-            Row row = finalVerifyIterator.next();
-            String result = row.getField(0).toString();
-            assertThat(result).contains("500");
-        }
-    }
-
-    @Test
-    void testSetSharedRocksDBRateLimiterInvalidFormat() {
-        // Test invalid memory format
-        assertThatThrownBy(
-                        () ->
-                                tEnv.executeSql(
-                                                String.format(
-                                                        "CALL %s.sys.set_shared_rocksdb_rate_limiter('invalid')",
-                                                        CATALOG_NAME))
-                                        .collect())
-                .hasMessageContaining("Failed to set shared RocksDB rate limiter");
-    }
-
-    @Test
-    void testGetSharedRocksDBRateLimiterWithDisabledValue() throws Exception {
-        // Set shared rate limiter to 0 (disabled)
-        try (CloseableIterator<Row> setRateLimiterIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.set_shared_rocksdb_rate_limiter('0')",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(setRateLimiterIterator.hasNext()).isTrue();
-            Row row = setRateLimiterIterator.next();
-            String result = row.getField(0).toString();
-            assertThat(result).contains("Successfully");
-            assertThat(setRateLimiterIterator.hasNext()).isFalse();
-        }
-
-        // Wait for configuration to propagate
-        Thread.sleep(2000);
-
-        // Verify the value is 0 (disabled)
-        try (CloseableIterator<Row> getRateLimiterIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.get_shared_rocksdb_rate_limiter()",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(getRateLimiterIterator.hasNext()).isTrue();
-            Row row = getRateLimiterIterator.next();
-            String result = row.getField(0).toString();
-            // Should show disabled message
-            assertThat(result).contains("disabled");
-            assertThat(result).contains("0");
-            assertThat(getRateLimiterIterator.hasNext()).isFalse();
-        }
-
-        // Restore to previous value
-        tEnv.executeSql(
-                        String.format(
-                                "CALL %s.sys.set_shared_rocksdb_rate_limiter('100MB')",
-                                CATALOG_NAME))
-                .collect()
-                .close();
-        Thread.sleep(2000);
-    }
-
-    @Test
-    void testGetSharedRocksDBRateLimiterWithSource() throws Exception {
-        // Get configuration with source information
-        try (CloseableIterator<Row> getRateLimiterIterator =
-                tEnv.executeSql(
-                                String.format(
-                                        "CALL %s.sys.get_shared_rocksdb_rate_limiter()",
-                                        CATALOG_NAME))
-                        .collect()) {
-            assertThat(getRateLimiterIterator.hasNext()).isTrue();
-            Row row = getRateLimiterIterator.next();
-            String result = row.getField(0).toString();
-            // Should contain rate limiter information
-            assertThat(result).contains("Shared RocksDB rate limiter");
-            assertThat(getRateLimiterIterator.hasNext()).isFalse();
-        }
-    }
-
-    @Test
     void testDisableAuthorization() throws Exception {
         String catalogName = "disable_acl_catalog";
         FlussClusterExtension flussClusterExtension = FlussClusterExtension.builder().build();
@@ -418,6 +262,120 @@ public abstract class FlinkProcedureITCase {
         } finally {
             flussClusterExtension.close();
         }
+    }
+
+    @Test
+    void testGetClusterConfig() throws Exception {
+        // Get specific config
+        try (CloseableIterator<Row> resultIterator =
+                tEnv.executeSql(
+                                String.format(
+                                        "Call %s.sys.get_cluster_config('%s')",
+                                        CATALOG_NAME,
+                                        ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
+                        .collect()) {
+            List<Row> results = CollectionUtil.iteratorToList(resultIterator);
+            assertThat(results).hasSize(1);
+            Row row = results.get(0);
+            assertThat(row.getField(0))
+                    .isEqualTo(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key());
+            assertThat(row.getField(1)).isEqualTo("100 mb");
+            assertThat(row.getField(2)).isNotNull(); // config_source
+        }
+
+        // Get all configs
+        try (CloseableIterator<Row> resultIterator =
+                tEnv.executeSql(String.format("Call %s.sys.get_cluster_config()", CATALOG_NAME))
+                        .collect()) {
+            List<Row> results = CollectionUtil.iteratorToList(resultIterator);
+            assertThat(results).isNotEmpty();
+        }
+
+        // Get non-existent config
+        try (CloseableIterator<Row> resultIterator =
+                tEnv.executeSql(
+                                String.format(
+                                        "Call %s.sys.get_cluster_config('non.existent.config')",
+                                        CATALOG_NAME))
+                        .collect()) {
+            List<Row> results = CollectionUtil.iteratorToList(resultIterator);
+            assertThat(results).hasSize(1);
+            assertThat(results.get(0).getField(0))
+                    .asString()
+                    .contains("Configuration key 'non.existent.config' not found");
+        }
+    }
+
+    @Test
+    void testSetClusterConfig() throws Exception {
+        // Test setting a valid config
+        try (CloseableIterator<Row> resultIterator =
+                tEnv.executeSql(
+                                String.format(
+                                        "Call %s.sys.set_cluster_config('%s', '200MB')",
+                                        CATALOG_NAME,
+                                        ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
+                        .collect()) {
+            List<Row> results = CollectionUtil.iteratorToList(resultIterator);
+            assertThat(results).hasSize(1);
+            assertThat(results.get(0).getField(0))
+                    .asString()
+                    .contains("Successfully set to '200MB'")
+                    .contains(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key());
+        }
+
+        // Verify the config was actually set
+        try (CloseableIterator<Row> resultIterator =
+                tEnv.executeSql(
+                                String.format(
+                                        "Call %s.sys.get_cluster_config('%s')",
+                                        CATALOG_NAME,
+                                        ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
+                        .collect()) {
+            List<Row> results = CollectionUtil.iteratorToList(resultIterator);
+            assertThat(results).hasSize(1);
+            assertThat(results.get(0).getField(1)).isEqualTo("200MB");
+        }
+    }
+
+    @Test
+    void testDeleteClusterConfig() throws Exception {
+        // First set a config
+        tEnv.executeSql(
+                        String.format(
+                                "Call %s.sys.set_cluster_config('%s', 'paimon')",
+                                CATALOG_NAME, ConfigOptions.DATALAKE_FORMAT.key()))
+                .await();
+
+        // Delete the config (reset to default) - omitting the value parameter
+        try (CloseableIterator<Row> resultIterator =
+                tEnv.executeSql(
+                                String.format(
+                                        "Call %s.sys.set_cluster_config('%s')",
+                                        CATALOG_NAME, ConfigOptions.DATALAKE_FORMAT.key()))
+                        .collect()) {
+            List<Row> results = CollectionUtil.iteratorToList(resultIterator);
+            assertThat(results).hasSize(1);
+            assertThat(results.get(0).getField(0))
+                    .asString()
+                    .contains("Successfully deleted")
+                    .contains(ConfigOptions.DATALAKE_FORMAT.key());
+        }
+    }
+
+    @Test
+    void testSetClusterConfigValidation() throws Exception {
+        // Try to set an invalid config (not allowed for dynamic change)
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                                String.format(
+                                                        "Call %s.sys.set_cluster_config('invalid.config.key', 'value')",
+                                                        CATALOG_NAME))
+                                        .await())
+                .rootCause()
+                .hasMessageContaining(
+                        "The config key invalid.config.key is not allowed to be changed dynamically");
     }
 
     private static Configuration initConfig() {
