@@ -100,7 +100,7 @@ public class SetClusterConfigProcedure extends ProcedureBase {
                 operationDesc = String.format("set to '%s'", configValue);
             }
 
-            // Construct configuration modification operation
+            // Construct configuration modification operation.
             AlterConfig alterConfig = new AlterConfig(configKey, configValue, opType);
 
             // Call Admin API to modify cluster configuration
