@@ -71,5 +71,16 @@ public interface ValueRecordBatch {
          * @param schemaId the schema of the kv records
          */
         RowDecoder getRowDecoder(int schemaId);
+
+        /**
+         * Returns the offset of schema id in the value bytes. For normal value format, schema id is
+         * at offset 0. For TsValue format (index tables), schema id is at offset 8 (after
+         * timestamp).
+         *
+         * @return the byte offset of schema id
+         */
+        default int getSchemaIdOffset() {
+            return 0;
+        }
     }
 }
