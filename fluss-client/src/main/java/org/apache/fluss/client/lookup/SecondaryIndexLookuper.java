@@ -329,12 +329,12 @@ public class SecondaryIndexLookuper implements Lookuper {
                             }
 
                             if (nullResults > 0) {
-                                if (LOG.isTraceEnabled()) {
-                                    LOG.trace(
-                                            "Found {} null results in batch of size {}, indicating potential data inconsistency",
-                                            nullResults,
-                                            batch.size());
-                                }
+                                LOG.warn(
+                                        "Found {} null results in batch of size {}, indicating potential data inconsistency, lookup key: {}",
+                                        nullResults,
+                                        batch.size(),
+                                        StringUtils.internalRowDebugString(
+                                                lookupRowType, lookupKey));
                             }
 
                             return null; // Void return type
