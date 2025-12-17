@@ -21,6 +21,7 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.row.decode.RowDecoder;
+import org.apache.fluss.row.encode.TsValueEncoder;
 import org.apache.fluss.types.DataType;
 
 import java.util.HashMap;
@@ -31,16 +32,24 @@ public class ValueRecordReadContext implements ValueRecordBatch.ReadContext {
     private final Map<Integer, RowDecoder> rowDecoderCache;
     private final SchemaGetter schemaGetter;
     private final KvFormat kvFormat;
+    private final boolean shouldUseTsDecoding;
 
-    private ValueRecordReadContext(SchemaGetter schemaGetter, KvFormat kvFormat) {
+    private ValueRecordReadContext(
+            SchemaGetter schemaGetter, KvFormat kvFormat, boolean shouldUseTsDecoding) {
         this.rowDecoderCache = new HashMap<>();
         this.schemaGetter = schemaGetter;
         this.kvFormat = kvFormat;
+        this.shouldUseTsDecoding = shouldUseTsDecoding;
     }
 
     public static ValueRecordReadContext createReadContext(
             SchemaGetter schemaGetter, KvFormat kvFormat) {
-        return new ValueRecordReadContext(schemaGetter, kvFormat);
+        return new ValueRecordReadContext(schemaGetter, kvFormat, false);
+    }
+
+    public static ValueRecordReadContext createReadContext(
+            SchemaGetter schemaGetter, KvFormat kvFormat, boolean shouldUseTsDecoding) {
+        return new ValueRecordReadContext(schemaGetter, kvFormat, shouldUseTsDecoding);
     }
 
     @Override
@@ -52,5 +61,12 @@ public class ValueRecordReadContext implements ValueRecordBatch.ReadContext {
                     return RowDecoder.create(
                             kvFormat, schema.getRowType().getChildren().toArray(new DataType[0]));
                 });
+    }
+
+    @Override
+    public int getSchemaIdOffset() {
+        // For TsValue format (index tables), schema id is at offset 8 (after timestamp)
+        // For normal value format, schema id is at offset 0
+        return shouldUseTsDecoding ? TsValueEncoder.TS_LENGTH : 0;
     }
 }

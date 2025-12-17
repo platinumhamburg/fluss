@@ -580,6 +580,137 @@ class FlussTableITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testLimitScanPartitionedIndexTable() throws Exception {
+        // This test verifies that limit scan works correctly for index tables of partitioned
+        // tables.
+        // The issue is that when scanning an index table directly, it may fail with
+        // SchemaNotExistException if the schema getter is not correctly initialized.
+
+        // Step 1: Create a partitioned table with global secondary indexes
+        createTable(
+                TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                PARTITIONED_INDEXED_TABLE_DESCRIPTOR,
+                false);
+
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Table mainTable = conn.getTable(TestData.PARTITIONED_INDEXED_TABLE_PATH);
+
+            // Step 2: Create partitions
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2023"),
+                            false)
+                    .get();
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2024"),
+                            false)
+                    .get();
+
+            // Wait for partitions to be ready (2 pre-created + 2 manually created)
+            FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 4);
+
+            // Step 3: Write data to the partitioned main table
+            UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
+
+            int insertSize = 10;
+            // Insert test data across different partitions
+            for (int i = 0; i < insertSize; i++) {
+                String year = i % 2 == 0 ? "2023" : "2024";
+                upsertWriter.upsert(row(i, "name" + i, "email" + i + "@example.com", year)).get();
+            }
+
+            // Step 4: Wait for index data to be replicated from main table
+            // Give some time for index replication to complete
+            Thread.sleep(10000);
+
+            // Get index tables and test limit scan on them
+            Table nameIndexTable = conn.getTable(TestData.PARTITIONED_IDX_NAME_TABLE_PATH);
+            assertThat(nameIndexTable).isNotNull();
+
+            Table emailIndexTable = conn.getTable(TestData.PARTITIONED_IDX_EMAIL_TABLE_PATH);
+            assertThat(emailIndexTable).isNotNull();
+
+            // Get index table IDs for creating scanners
+            long nameIndexTableId = nameIndexTable.getTableInfo().getTableId();
+            long emailIndexTableId = emailIndexTable.getTableInfo().getTableId();
+
+            // Step 5: Perform limit scan on the name index table
+            int limitSize = 5;
+            TableBucket nameIndexBucket = new TableBucket(nameIndexTableId, 0);
+            List<InternalRow> nameIndexRows =
+                    collectRows(
+                            nameIndexTable
+                                    .newScan()
+                                    .limit(limitSize)
+                                    .createBatchScanner(nameIndexBucket));
+
+            // Verify that we got up to limitSize rows from the name index table
+            assertThat(nameIndexRows.size()).isLessThanOrEqualTo(limitSize);
+
+            // Verify the schema of the name index table rows
+            // Index table schema: name (STRING), id (INT), year (STRING), __offset (BIGINT)
+            for (InternalRow row : nameIndexRows) {
+                assertThat(row.getFieldCount()).isEqualTo(4);
+                // name field should not be null
+                assertThat(row.isNullAt(0)).isFalse();
+                // id field should not be null
+                assertThat(row.isNullAt(1)).isFalse();
+                // year field should not be null
+                assertThat(row.isNullAt(2)).isFalse();
+                // __offset field should not be null
+                assertThat(row.isNullAt(3)).isFalse();
+            }
+
+            // Step 6: Perform limit scan on the email index table
+            TableBucket emailIndexBucket = new TableBucket(emailIndexTableId, 0);
+            List<InternalRow> emailIndexRows =
+                    collectRows(
+                            emailIndexTable
+                                    .newScan()
+                                    .limit(limitSize)
+                                    .createBatchScanner(emailIndexBucket));
+
+            // Verify that we got up to limitSize rows from the email index table
+            assertThat(emailIndexRows.size()).isLessThanOrEqualTo(limitSize);
+
+            // Verify the schema of the email index table rows
+            // Index table schema: email (STRING), id (INT), year (STRING), __offset (BIGINT)
+            for (InternalRow row : emailIndexRows) {
+                assertThat(row.getFieldCount()).isEqualTo(4);
+                // email field should not be null
+                assertThat(row.isNullAt(0)).isFalse();
+                // id field should not be null
+                assertThat(row.isNullAt(1)).isFalse();
+                // year field should not be null
+                assertThat(row.isNullAt(2)).isFalse();
+                // __offset field should not be null
+                assertThat(row.isNullAt(3)).isFalse();
+            }
+
+            // Step 7: Test limit scan with projection on index table
+            int[] projectedFields = new int[] {0, 1}; // name/email and id columns
+            List<InternalRow> projectedNameIndexRows =
+                    collectRows(
+                            nameIndexTable
+                                    .newScan()
+                                    .limit(limitSize)
+                                    .project(projectedFields)
+                                    .createBatchScanner(nameIndexBucket));
+
+            assertThat(projectedNameIndexRows.size()).isLessThanOrEqualTo(limitSize);
+            for (InternalRow row : projectedNameIndexRows) {
+                assertThat(row.getFieldCount()).isEqualTo(2);
+                // name field should not be null
+                assertThat(row.isNullAt(0)).isFalse();
+                // id field should not be null
+                assertThat(row.isNullAt(1)).isFalse();
+            }
+        }
+    }
+
+    @Test
     void testPartialPutAndDelete() throws Exception {
         Schema schema =
                 Schema.newBuilder()

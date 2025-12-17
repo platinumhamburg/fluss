@@ -79,13 +79,16 @@ public class DefaultValueRecord implements ValueRecord {
     public static DefaultValueRecord readFrom(
             MemorySegment segment, int position, ValueRecordBatch.ReadContext readContext) {
         int sizeInBytesWithoutLength = segment.getInt(position + LENGTH_OFFSET);
-        short schemaId = segment.getShort(position + SCHEMA_ID_OFFSET);
+        // Get schema id offset from read context to support both normal value and TsValue formats
+        int schemaIdOffset = LENGTH_LENGTH + readContext.getSchemaIdOffset();
+        short schemaId = segment.getShort(position + schemaIdOffset);
         RowDecoder decoder = readContext.getRowDecoder(schemaId);
-        BinaryRow value =
-                decoder.decode(
-                        segment,
-                        position + VALUE_OFFSET,
-                        sizeInBytesWithoutLength - SCHEMA_ID_LENGTH);
+        // Row data starts after schema id
+        int rowDataOffset = schemaIdOffset + SCHEMA_ID_LENGTH;
+        // Row data size is total size minus prefix (timestamp if any + schema id)
+        int rowDataSize =
+                sizeInBytesWithoutLength - readContext.getSchemaIdOffset() - SCHEMA_ID_LENGTH;
+        BinaryRow value = decoder.decode(segment, position + rowDataOffset, rowDataSize);
         return new DefaultValueRecord(schemaId, value);
     }
 }

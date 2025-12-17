@@ -92,6 +92,7 @@ public final class IndexApplier implements Closeable {
     private final TabletServerMetricGroup serverMetricGroup;
     private final SchemaGetter schemaGetter;
     private final TableMetricGroup tableMetricGroup;
+    private final short indexTableSchemaId;
 
     // Lock for protecting internal state
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
@@ -123,6 +124,7 @@ public final class IndexApplier implements Closeable {
 
         // Get latest schema for initializing RowType and KeyEncoder
         Schema indexTableSchema = schemaGetter.getLatestSchemaInfo().getSchema();
+        this.indexTableSchemaId = (short) schemaGetter.getLatestSchemaInfo().getSchemaId();
 
         // Extract RowType from Schema
         this.indexRowType = indexTableSchema.getRowType();
@@ -459,9 +461,10 @@ public final class IndexApplier implements Closeable {
                     // Use the sequentially allocated index bucket offset
                     // Use original timestamp from extracted list instead of record.timestamp()
                     // which was overwritten by LogTablet
+                    // Use index table's schema id instead of main table's schema id
                     long originalTimestamp = originalTimestamps.get(timestampIndex);
                     writeIndexRecordToPreWriteBuffer(
-                            batch.schemaId(), record, currentIndexOffset, originalTimestamp);
+                            indexTableSchemaId, record, currentIndexOffset, originalTimestamp);
                     currentIndexOffset++;
                     totalRecordCount++;
                     timestampIndex++;

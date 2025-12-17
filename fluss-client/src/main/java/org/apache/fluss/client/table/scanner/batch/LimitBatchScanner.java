@@ -157,8 +157,10 @@ public class LimitBatchScanner implements BatchScanner {
         if (tableInfo.hasPrimaryKey()) {
             DefaultValueRecordBatch valueRecords =
                     DefaultValueRecordBatch.pointToByteBuffer(recordsBuffer);
+            // Create read context with TsValue support for index tables
             ValueRecordReadContext readContext =
-                    ValueRecordReadContext.createReadContext(schemaGetter, kvFormat);
+                    ValueRecordReadContext.createReadContext(
+                            schemaGetter, kvFormat, shouldUseTsDecoding);
             for (ValueRecord record : valueRecords.records(readContext)) {
                 InternalRow row = record.getRow();
                 if (targetSchemaId != record.schemaId()) {
