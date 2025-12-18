@@ -294,6 +294,7 @@ public final class KvTablet {
                     short latestSchemaId = (short) schemaInfo.getSchemaId();
                     validateSchemaId(kvRecords.schemaId(), latestSchemaId);
 
+                    // we only support ADD COLUMN, so targetColumns is fine to be used directly
                     RowMerger currentMerger =
                             rowMerger.configureTargetColumns(
                                     targetColumns, latestSchemaId, latestSchema);
@@ -301,7 +302,11 @@ public final class KvTablet {
                     RowType latestRowType = latestSchema.getRowType();
                     WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType);
                     walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
+                    // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
+                    // only has fewer ending columns than latest schema, so we pad nulls to
+                    // the end of the BinaryRow to get the latest schema row.
                     PaddingRow latestSchemaRow = new PaddingRow(latestRowType.getFieldCount());
+                    // get offset to track the offset corresponded to the kv record
                     long logEndOffsetOfPrevBatch = logTablet.localLogEndOffset();
 
                     try {
@@ -325,6 +330,8 @@ public final class KvTablet {
                         // the CDC log offset by 1.
                         LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
 
+                        // if the batch is duplicated, we should truncate the kvPreWriteBuffer
+                        // already written.
                         if (logAppendInfo.duplicated()) {
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
@@ -340,6 +347,7 @@ public final class KvTablet {
                         kvPreWriteBuffer.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.ERROR);
                         throw t;
                     } finally {
+                        // deallocate the memory and arrow writer used by the wal builder
                         walBuilder.deallocate();
                     }
                 });
@@ -347,6 +355,7 @@ public final class KvTablet {
 
     private void validateSchemaId(short schemaIdOfNewData, short latestSchemaId) {
         if (schemaIdOfNewData > latestSchemaId || schemaIdOfNewData < 0) {
+            // TODO: we may need to support retriable exception here
             throw new SchemaNotExistException(
                     "Invalid schema id: "
                             + schemaIdOfNewData
@@ -355,7 +364,7 @@ public final class KvTablet {
         }
     }
 
-    private long processKvRecords(
+    private void processKvRecords(
             KvRecordBatch kvRecords,
             short schemaIdOfNewData,
             RowMerger currentMerger,
@@ -365,6 +374,7 @@ public final class KvTablet {
             throws Exception {
         long logOffset = startLogOffset;
 
+        // TODO: reuse the read context and decoder
         KvRecordBatch.ReadContext readContext =
                 KvRecordReadContext.createReadContext(kvFormat, schemaGetter);
         ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
@@ -396,8 +406,6 @@ public final class KvTablet {
                                 logOffset);
             }
         }
-
-        return logOffset;
     }
 
     private long processDeletion(
@@ -410,6 +418,7 @@ public final class KvTablet {
             throws Exception {
         DeleteBehavior deleteBehavior = currentMerger.deleteBehavior();
         if (deleteBehavior == DeleteBehavior.IGNORE) {
+            // skip delete rows if the merger doesn't support yet
             return logOffset;
         } else if (deleteBehavior == DeleteBehavior.DISABLE) {
             throw new DeletionDisabledException(
@@ -428,6 +437,7 @@ public final class KvTablet {
         BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
         BinaryValue newValue = currentMerger.delete(oldValue);
 
+        // if newValue is null, it means the row should be deleted
         if (newValue == null) {
             return applyDelete(key, oldValue, walBuilder, latestSchemaRow, logOffset);
         } else {
