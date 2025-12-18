@@ -21,6 +21,7 @@ import org.apache.fluss.cluster.BucketLocation;
 import org.apache.fluss.cluster.Cluster;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.ServerType;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.StaleMetadataException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -48,8 +49,10 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 
@@ -92,6 +95,27 @@ public class MetadataUtils {
                 gateway, true, cluster, tablePaths, tablePartitionNames, tablePartitionIds);
     }
 
+    /**
+     * Async version of sendMetadataRequestAndRebuildCluster. This is used to avoid deadlock when
+     * called from Netty IO threads.
+     */
+    public static CompletableFuture<Cluster> sendMetadataRequestAndRebuildClusterAsync(
+            Cluster cluster,
+            RpcClient client,
+            @Nullable Set<TablePath> tablePaths,
+            @Nullable Collection<PhysicalTablePath> tablePartitionNames,
+            @Nullable Collection<Long> tablePartitionIds) {
+        AdminReadOnlyGateway gateway =
+                GatewayClientProxy.createGatewayProxy(
+                        () ->
+                                getOneAvailableTabletServerNode(
+                                        cluster, java.util.Collections.emptySet()),
+                        client,
+                        AdminReadOnlyGateway.class);
+        return sendMetadataRequestAndRebuildClusterAsync(
+                gateway, true, cluster, tablePaths, tablePartitionNames, tablePartitionIds);
+    }
+
     /** maybe partial update cluster. */
     public static Cluster sendMetadataRequestAndRebuildCluster(
             AdminReadOnlyGateway gateway,
@@ -101,68 +125,91 @@ public class MetadataUtils {
             @Nullable Collection<PhysicalTablePath> tablePartitions,
             @Nullable Collection<Long> tablePartitionIds)
             throws ExecutionException, InterruptedException, TimeoutException {
+        return sendMetadataRequestAndRebuildClusterAsync(
+                        gateway,
+                        partialUpdate,
+                        originCluster,
+                        tablePaths,
+                        tablePartitions,
+                        tablePartitionIds)
+                .get();
+    }
+
+    /** Async version of sendMetadataRequestAndRebuildCluster. */
+    public static CompletableFuture<Cluster> sendMetadataRequestAndRebuildClusterAsync(
+            AdminReadOnlyGateway gateway,
+            boolean partialUpdate,
+            Cluster originCluster,
+            @Nullable Set<TablePath> tablePaths,
+            @Nullable Collection<PhysicalTablePath> tablePartitions,
+            @Nullable Collection<Long> tablePartitionIds) {
         MetadataRequest metadataRequest =
                 ClientRpcMessageUtils.makeMetadataRequest(
                         tablePaths, tablePartitions, tablePartitionIds);
         return gateway.metadata(metadataRequest)
                 .thenApply(
-                        response -> {
-                            // Update the alive table servers.
-                            Map<Integer, ServerNode> newAliveTabletServers =
-                                    getAliveTabletServers(response);
-                            // when talking to the startup tablet
-                            // server, it maybe receive empty metadata, we'll consider it as
-                            // stale metadata and throw StaleMetadataException which will cause
-                            // to retry later.
-                            if (newAliveTabletServers.isEmpty()) {
-                                throw new StaleMetadataException("Alive tablet server is empty.");
-                            }
-                            ServerNode coordinatorServer = getCoordinatorServer(response);
+                        response ->
+                                mergeMetadataResponseIntoCluster(
+                                        originCluster, response, !partialUpdate));
+    }
 
-                            Map<TablePath, Long> newTablePathToTableId;
-                            Map<TablePath, TableInfo> newTablePathToTableInfo;
-                            Map<PhysicalTablePath, List<BucketLocation>> newBucketLocations;
-                            Map<PhysicalTablePath, Long> newPartitionIdByPath;
+    /**
+     * Merge metadata response into the given cluster. This method performs incremental merge to
+     * avoid lost update issues in concurrent scenarios.
+     *
+     * @param currentCluster the current cluster state to merge into
+     * @param response the metadata response from server
+     * @param isFullUpdate whether this is a full update (replace all) or partial update (merge)
+     * @return new cluster with merged metadata
+     */
+    public static Cluster mergeMetadataResponseIntoCluster(
+            Cluster currentCluster, MetadataResponse response, boolean isFullUpdate) {
+        // Update the alive table servers.
+        Map<Integer, ServerNode> newAliveTabletServers = getAliveTabletServers(response);
+        // when talking to the startup tablet
+        // server, it maybe receive empty metadata, we'll consider it as
+        // stale metadata and throw StaleMetadataException which will cause
+        // to retry later.
+        if (newAliveTabletServers.isEmpty()) {
+            throw new StaleMetadataException("Alive tablet server is empty.");
+        }
+        ServerNode coordinatorServer = getCoordinatorServer(response);
 
-                            NewTableMetadata newTableMetadata =
-                                    getTableMetadataToUpdate(originCluster, response);
+        Map<TablePath, Long> newTablePathToTableId;
+        Map<TablePath, TableInfo> newTablePathToTableInfo;
+        Map<PhysicalTablePath, List<BucketLocation>> newBucketLocations;
+        Map<PhysicalTablePath, Long> newPartitionIdByPath;
 
-                            if (partialUpdate) {
-                                // If partial update, we will clear the to be updated table out ot
-                                // the origin cluster.
-                                newTablePathToTableId =
-                                        new HashMap<>(originCluster.getTableIdByPath());
-                                newTablePathToTableInfo =
-                                        new HashMap<>(originCluster.getTableInfoByPath());
-                                newBucketLocations =
-                                        new HashMap<>(originCluster.getBucketLocationsByPath());
-                                newPartitionIdByPath =
-                                        new HashMap<>(originCluster.getPartitionIdByPath());
+        // Extract metadata from response, using currentCluster to resolve table IDs
+        NewTableMetadata newTableMetadata = getTableMetadataToUpdate(currentCluster, response);
 
-                                newTablePathToTableId.putAll(newTableMetadata.tablePathToTableId);
-                                newTablePathToTableInfo.putAll(
-                                        newTableMetadata.tablePathToTableInfo);
-                                newBucketLocations.putAll(newTableMetadata.bucketLocations);
-                                newPartitionIdByPath.putAll(newTableMetadata.partitionIdByPath);
+        if (!isFullUpdate) {
+            // Partial update: merge new metadata into current cluster state
+            newTablePathToTableId = new HashMap<>(currentCluster.getTableIdByPath());
+            newTablePathToTableInfo = new HashMap<>(currentCluster.getTableInfoByPath());
+            newBucketLocations = new HashMap<>(currentCluster.getBucketLocationsByPath());
+            newPartitionIdByPath = new HashMap<>(currentCluster.getPartitionIdByPath());
 
-                            } else {
-                                // If full update, we will clear all tables info out ot the origin
-                                // cluster.
-                                newTablePathToTableId = newTableMetadata.tablePathToTableId;
-                                newTablePathToTableInfo = newTableMetadata.tablePathToTableInfo;
-                                newBucketLocations = newTableMetadata.bucketLocations;
-                                newPartitionIdByPath = newTableMetadata.partitionIdByPath;
-                            }
+            newTablePathToTableId.putAll(newTableMetadata.tablePathToTableId);
+            newTablePathToTableInfo.putAll(newTableMetadata.tablePathToTableInfo);
+            newBucketLocations.putAll(newTableMetadata.bucketLocations);
+            newPartitionIdByPath.putAll(newTableMetadata.partitionIdByPath);
 
-                            return new Cluster(
-                                    newAliveTabletServers,
-                                    coordinatorServer,
-                                    newBucketLocations,
-                                    newTablePathToTableId,
-                                    newPartitionIdByPath,
-                                    newTablePathToTableInfo);
-                        })
-                .get();
+        } else {
+            // Full update: replace all metadata
+            newTablePathToTableId = newTableMetadata.tablePathToTableId;
+            newTablePathToTableInfo = newTableMetadata.tablePathToTableInfo;
+            newBucketLocations = newTableMetadata.bucketLocations;
+            newPartitionIdByPath = newTableMetadata.partitionIdByPath;
+        }
+
+        return new Cluster(
+                newAliveTabletServers,
+                coordinatorServer,
+                newBucketLocations,
+                newTablePathToTableId,
+                newPartitionIdByPath,
+                newTablePathToTableInfo);
     }
 
     private static NewTableMetadata getTableMetadataToUpdate(
@@ -212,8 +259,35 @@ public class MetadataUtils {
         pbPartitionMetadataList.forEach(
                 pbPartitionMetadata -> {
                     long tableId = pbPartitionMetadata.getTableId();
-                    // the table path should be initialized at begin
-                    TablePath tablePath = cluster.getTablePathOrElseThrow(tableId);
+                    // Get table path from new metadata first, if not found, get from cluster cache.
+                    // This handles the case where partition metadata is returned but corresponding
+                    // table metadata is not included in the response (e.g., when only requesting
+                    // partition update). The cluster parameter now always contains the latest state
+                    // (after fixing lost update issue from commit 1534e17c), but we still check
+                    // response first for completeness.
+                    TablePath tablePath = null;
+                    for (Map.Entry<TablePath, Long> entry : newTablePathToTableId.entrySet()) {
+                        if (entry.getValue().equals(tableId)) {
+                            tablePath = entry.getKey();
+                            break;
+                        }
+                    }
+
+                    if (tablePath == null) {
+                        // Table metadata not in response, try to get from cluster cache
+                        Optional<TablePath> tablePathOpt = cluster.getTablePath(tableId);
+                        if (!tablePathOpt.isPresent()) {
+                            // If table is not found in both response and cache, the partition
+                            // metadata cannot be processed. Throw exception to indicate the issue.
+                            throw new PartitionNotExistException(
+                                    String.format(
+                                            "%s(p=%s) not found in cluster.",
+                                            "[table with id " + tableId + "]",
+                                            pbPartitionMetadata.getPartitionName()));
+                        }
+                        tablePath = tablePathOpt.get();
+                    }
+
                     PhysicalTablePath physicalTablePath =
                             PhysicalTablePath.of(tablePath, pbPartitionMetadata.getPartitionName());
                     newPartitionIdByPath.put(

@@ -20,7 +20,7 @@ package org.apache.fluss.client.lookup;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.metrics.LookuperMetricGroup;
-import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
@@ -356,14 +356,19 @@ public class SecondaryIndexLookuper implements Lookuper {
                         "Error happened during main table lookup for sk:%s, pk:%s",
                         StringUtils.internalRowDebugString(lookupRowType, lookupKey),
                         StringUtils.internalRowDebugString(primaryKeyRowType, primaryKey));
-        LOG.error(errorMessage, throwable);
-        if (ExceptionUtils.findThrowable(throwable, UnknownTableOrBucketException.class)
-                .isPresent()) {
-            return new LookupResult((InternalRow) null);
-        } else if (ExceptionUtils.findThrowable(throwable, IllegalArgumentException.class)
-                .isPresent()) {
+
+        // Handle recoverable exceptions by returning empty result
+        if (ExceptionUtils.findThrowable(throwable, PartitionNotExistException.class).isPresent()) {
+            // This can happen when main table partition has been deleted (TTL)
+            // but index table still has references due to different retention mechanisms
+            LOG.warn(
+                    "Partition not found during main table lookup for sk:{}, pk:{}. "
+                            + "This may indicate index-main table retention mismatch.",
+                    StringUtils.internalRowDebugString(lookupRowType, lookupKey),
+                    StringUtils.internalRowDebugString(primaryKeyRowType, primaryKey));
             return new LookupResult((InternalRow) null);
         } else {
+            LOG.error(errorMessage, throwable);
             throw new RuntimeException(errorMessage, throwable);
         }
     }

@@ -40,6 +40,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
+
 /** Testing class for metadata updater. */
 public class TestingMetadataUpdater extends MetadataUpdater {
     private static final ServerNode COORDINATOR =
@@ -133,8 +135,18 @@ public class TestingMetadataUpdater extends MetadataUpdater {
         }
     }
 
-    public void updateCluster(Cluster cluster) {
-        this.cluster = cluster;
+    public void updateCluster(Cluster newCluster) {
+        setCluster(newCluster);
+    }
+
+    /** Helper method to set cluster for testing. */
+    private void setCluster(Cluster newCluster) {
+        inWriteLock(
+                clusterRWLock,
+                () -> {
+                    super.cluster = newCluster;
+                    return null;
+                });
     }
 
     public void setResponseLogicId(int serverId, int responseLogicId) {
@@ -143,9 +155,10 @@ public class TestingMetadataUpdater extends MetadataUpdater {
 
     @Override
     public void checkAndUpdateTableMetadata(Set<TablePath> tablePaths) {
+        Cluster currentCluster = getCluster();
         Set<TablePath> needUpdateTablePaths =
                 tablePaths.stream()
-                        .filter(tablePath -> !cluster.getTable(tablePath).isPresent())
+                        .filter(tablePath -> !currentCluster.getTable(tablePath).isPresent())
                         .collect(Collectors.toSet());
         if (!needUpdateTablePaths.isEmpty()) {
             throw new IllegalStateException(
@@ -167,7 +180,7 @@ public class TestingMetadataUpdater extends MetadataUpdater {
 
     @Override
     public TabletServerGateway newTabletServerClientForNode(int serverId) {
-        if (cluster.getTabletServer(serverId) == null) {
+        if (getCluster().getTabletServer(serverId) == null) {
             return null;
         } else {
             return tabletServerGatewayMap.get(serverId);
@@ -218,13 +231,13 @@ public class TestingMetadataUpdater extends MetadataUpdater {
                     tableIdByPath.put(tablePath, tableId);
                     tableInfoByPath.put(tablePath, tableInfo);
                 });
-        cluster =
+        setCluster(
                 new Cluster(
                         tabletServerMap,
                         coordinatorServer,
                         tablePathToBucketLocations,
                         tableIdByPath,
                         Collections.emptyMap(),
-                        tableInfoByPath);
+                        tableInfoByPath));
     }
 }

@@ -218,6 +218,9 @@ public final class FlussConnection implements Connection {
             securityTokenManager.stop();
         }
 
+        // Close metadata updater to release scheduler and pending requests
+        metadataUpdater.close();
+
         clientMetricGroup.close();
         rpcClient.close();
         metricRegistry.closeAsync().get();
