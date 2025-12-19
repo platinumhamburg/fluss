@@ -46,7 +46,7 @@ public enum ChangelogImage {
 
     /** Creates a {@link ChangelogImage} from the given string. */
     public static ChangelogImage fromString(String image) {
-        switch (image.toUpperCase().replace("-", "_")) {
+        switch (image.toUpperCase()) {
             case "FULL":
                 return FULL;
             case "WAL":

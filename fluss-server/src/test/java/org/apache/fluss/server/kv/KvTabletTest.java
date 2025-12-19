@@ -1147,14 +1147,32 @@ class KvTabletTest {
                                 "k1".getBytes(), new Object[] {1, "v1", null}));
         kvTablet.putAsLeader(kvRecordBatch2, new int[] {0, 1});
 
+        endOffset = logTablet.localLogEndOffset();
         // Verify update only produces +U (no -U since using WAL mode)
+        actualLogRecords = readLogRecords(endOffset - 1);
+        expectedLogs =
+                logRecords(
+                        rowType,
+                        endOffset - 1,
+                        Collections.singletonList(ChangeType.UPDATE_AFTER),
+                        Collections.singletonList(new Object[] {1, "v1", null}));
+        checkEqual(actualLogRecords, Collections.singletonList(expectedLogs), rowType);
+
+        // Update with partial columns (column c) - column b value should be retained
+        KvRecordBatch kvRecordBatch3 =
+                kvRecordBatchFactory.ofRecords(
+                        data2kvRecordFactory.ofRecord(
+                                "k1".getBytes(), new Object[] {1, null, "hello"}));
+        kvTablet.putAsLeader(kvRecordBatch3, new int[] {0, 2});
+
+        // Verify update produces +U with column b retained as "v1" and column c set to "hello"
         actualLogRecords = readLogRecords(endOffset);
         expectedLogs =
                 logRecords(
                         rowType,
                         endOffset,
                         Collections.singletonList(ChangeType.UPDATE_AFTER),
-                        Collections.singletonList(new Object[] {1, "v1", null}));
+                        Collections.singletonList(new Object[] {1, "v1", "hello"}));
         checkEqual(actualLogRecords, Collections.singletonList(expectedLogs), rowType);
     }
 
