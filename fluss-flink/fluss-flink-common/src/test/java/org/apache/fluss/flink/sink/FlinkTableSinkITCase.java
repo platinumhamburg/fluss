@@ -66,6 +66,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertQueryResultExactOrder;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertResultsIgnoreOrder;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsWithTimeout;
 import static org.apache.fluss.flink.utils.FlinkTestBase.waitUntilPartitions;
@@ -1387,6 +1388,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
 
     @Test
     void testWalModeWithDefaultMergeEngineAndAggregation() throws Exception {
+        // use single parallelism to make result ordering stable
         tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
 
         String tableName = "wal_mode_pk_table";
@@ -1430,17 +1432,17 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
         // a ChangelogNormalize operator is inserted before aggregation
         assertThat(aggPlan).contains("ChangelogNormalize");
 
-        // Execute the aggregation and verify the result
-        CloseableIterator<Row> aggIter = tEnv.executeSql(aggQuery).collect();
-
         // Expected aggregation results:
         // Category A: 120 (id=1) + 180 (id=3) = 300
         // Category B: 200 (id=2) = 200 (id=4 was deleted)
         List<String> expectedAggResults =
                 Arrays.asList(
                         "+I[A, 100]",
+                        "+I[B, 200]",
                         "-U[A, 100]",
                         "+U[A, 250]",
+                        "-U[B, 200]",
+                        "+U[B, 450]",
                         "-U[A, 250]",
                         "+U[A, 150]",
                         "-U[A, 150]",
@@ -1449,13 +1451,10 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         "+U[A, 120]",
                         "-U[A, 120]",
                         "+U[A, 300]",
-                        "+I[B, 200]",
-                        "-U[B, 200]",
-                        "+U[B, 450]",
                         "-U[B, 450]",
                         "+U[B, 200]");
 
         // Collect results with timeout
-        assertResultsIgnoreOrder(aggIter, expectedAggResults, true);
+        assertQueryResultExactOrder(tEnv, aggQuery, expectedAggResults);
     }
 }
