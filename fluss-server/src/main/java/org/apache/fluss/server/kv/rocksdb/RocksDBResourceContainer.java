@@ -75,7 +75,7 @@ public class RocksDBResourceContainer implements AutoCloseable {
     private final boolean enableStatistics;
 
     /** The shared rate limiter for all RocksDB instances. */
-    @Nullable private final RateLimiter sharedRateLimiter;
+    private final RateLimiter sharedRateLimiter;
 
     /** The handles to be closed when the container is closed. */
     private final ArrayList<AutoCloseable> handlesToClose;
@@ -100,7 +100,7 @@ public class RocksDBResourceContainer implements AutoCloseable {
             ReadableConfig configuration,
             @Nullable File instanceBasePath,
             boolean enableStatistics,
-            @Nullable RateLimiter sharedRateLimiter) {
+            RateLimiter sharedRateLimiter) {
         this.configuration = configuration;
 
         this.instanceRocksDBPath =
