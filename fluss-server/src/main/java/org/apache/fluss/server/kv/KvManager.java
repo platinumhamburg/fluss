@@ -129,12 +129,12 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     private static RateLimiter createSharedRateLimiter(Configuration conf) {
         long sharedRateLimitBytesPerSecond =
                 conf.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
-        if (sharedRateLimitBytesPerSecond <= 0) {
-            // shared rate limiting is disabled
-            return null;
-        }
+
         RocksDB.loadLibrary();
-        // create a shared rate limiter with specified rate limit
+        // Always create a shared rate limiter with the configured rate limit.
+        // The rate limiter is always enabled with a default value of Long.MAX_VALUE (effectively
+        // unlimited).
+        // This avoids the overhead of dynamically enabling/disabling the rate limiter.
         // refill_period_us is set to 100ms, fairness is set to 10
         return new RateLimiter(
                 sharedRateLimitBytesPerSecond,
@@ -394,12 +394,6 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         long newSharedRateLimitBytes =
                 newConfig.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
 
-        // If shared rate limiter is not enabled, skip reconfiguration
-        if (sharedRocksDBRateLimiter == null) {
-            LOG.info("Shared RocksDB rate limiter is not enabled, skip reconfiguration");
-            return;
-        }
-
         // If value hasn't changed, skip
         if (newSharedRateLimitBytes == currentSharedRateLimitBytesPerSec) {
             LOG.debug(
@@ -412,6 +406,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
         try {
             // Apply new configuration using RocksDB API (thread-safe)
+            // The rate limiter is always enabled, so we can safely reconfigure it
             sharedRocksDBRateLimiter.setBytesPerSecond(newSharedRateLimitBytes);
             currentSharedRateLimitBytesPerSec = newSharedRateLimitBytes;
 

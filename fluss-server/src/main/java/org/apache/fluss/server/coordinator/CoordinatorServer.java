@@ -33,7 +33,6 @@ import org.apache.fluss.server.DynamicConfigManager;
 import org.apache.fluss.server.ServerBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.authorizer.AuthorizerLoader;
-import org.apache.fluss.server.kv.KvConfigValidator;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.apache.fluss.server.metrics.ServerMetricUtils;
@@ -174,10 +173,6 @@ public class CoordinatorServer extends ServerBase {
 
             this.lakeCatalogDynamicLoader = new LakeCatalogDynamicLoader(conf, pluginManager, true);
             this.dynamicConfigManager = new DynamicConfigManager(zkClient, conf, true);
-
-            // Register config validators for stateless validation
-            // This allows coordinator to validate KV configs even though it doesn't have KvManager
-            dynamicConfigManager.registerValidator(new KvConfigValidator(conf));
 
             // Register server reconfigurable components
             dynamicConfigManager.register(lakeCatalogDynamicLoader);

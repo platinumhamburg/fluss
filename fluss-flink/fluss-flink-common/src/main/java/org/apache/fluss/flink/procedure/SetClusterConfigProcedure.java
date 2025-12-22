@@ -45,12 +45,12 @@ import java.util.Collections;
  *
  * <pre>
  * -- Set a configuration
- * CALL sys.set_cluster_config('kv.shared-rate-limiter.bytes-per-sec', '200MB');
+ * CALL sys.set_cluster_config('kv.rocksdb.shared-rate-limiter.bytes-per-sec', '200MB');
  * CALL sys.set_cluster_config('datalake.format', 'paimon');
  *
  * -- Delete a configuration (reset to default)
- * CALL sys.set_cluster_config('kv.shared-rate-limiter.bytes-per-sec', NULL);
- * CALL sys.set_cluster_config('kv.shared-rate-limiter.bytes-per-sec', '');
+ * CALL sys.set_cluster_config('kv.rocksdb.shared-rate-limiter.bytes-per-sec', NULL);
+ * CALL sys.set_cluster_config('kv.rocksdb.shared-rate-limiter.bytes-per-sec', '');
  * </pre>
  *
  * <p><b>Note:</b> Not all configurations support dynamic changes. The server will validate the

@@ -23,7 +23,6 @@ import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
-import org.apache.fluss.server.kv.KvConfigValidator;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
@@ -260,19 +259,17 @@ public class DynamicConfigChangeTest {
     }
 
     @Test
-    void testConfigValidatorPreventInvalidConfig() throws Exception {
-        // Setup: rate limiter disabled at startup
+    void testPreventInvalidConfig() throws Exception {
+        // Test that generic type validation prevents invalid config values
         Configuration configuration = new Configuration();
-        configuration.setString(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(), "0b");
+        configuration.setString(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(), "100MB");
 
         DynamicConfigManager dynamicConfigManager =
                 new DynamicConfigManager(zookeeperClient, configuration, true);
-
-        // Register ConfigValidator - this validates before ServerReconfigurable
-        dynamicConfigManager.registerValidator(new KvConfigValidator(configuration));
         dynamicConfigManager.startup();
 
-        // Try to enable rate limiter dynamically - should be rejected by validator
+        // Try to set rate limiter to an invalid value - should be rejected by generic type
+        // validation
         assertThatThrownBy(
                         () ->
                                 dynamicConfigManager.alterConfigs(
@@ -281,23 +278,20 @@ public class DynamicConfigChangeTest {
                                                         ConfigOptions
                                                                 .KV_SHARED_RATE_LIMITER_BYTES_PER_SEC
                                                                 .key(),
-                                                        "100MB",
+                                                        "invalid_value",
                                                         AlterConfigOpType.SET))))
                 .isInstanceOf(ConfigException.class)
-                .hasMessageContaining("Cannot enable shared RocksDB rate limiter dynamically");
+                .hasMessageContaining("Invalid value");
     }
 
     @Test
     void testConfigValidatorAllowsValidChange() throws Exception {
-        // Setup: rate limiter enabled at startup
+        // Test that generic type validation allows valid config values
         Configuration configuration = new Configuration();
         configuration.setString(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(), "100MB");
 
         DynamicConfigManager dynamicConfigManager =
                 new DynamicConfigManager(zookeeperClient, configuration, true);
-
-        // Register ConfigValidator
-        dynamicConfigManager.registerValidator(new KvConfigValidator(configuration));
         dynamicConfigManager.startup();
 
         // Adjust rate limiter value - should succeed
@@ -329,12 +323,11 @@ public class DynamicConfigChangeTest {
             DynamicConfigManager dynamicConfigManager =
                     new DynamicConfigManager(zookeeperClient, configuration, true);
 
-            // Register multiple validators and reconfigurables
-            dynamicConfigManager.registerValidator(new KvConfigValidator(configuration));
+            // Register reconfigurables - generic type validation works automatically
             dynamicConfigManager.register(lakeCatalogDynamicLoader);
             dynamicConfigManager.startup();
 
-            // Change multiple configs - both validators should be invoked
+            // Change multiple configs - generic validation applies to all
             dynamicConfigManager.alterConfigs(
                     Arrays.asList(
                             new AlterConfig(

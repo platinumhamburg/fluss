@@ -45,7 +45,7 @@ import java.util.List;
  *
  * <pre>
  * -- Get a specific configuration
- * CALL sys.get_cluster_config('kv.shared-rate-limiter.bytes-per-sec');
+ * CALL sys.get_cluster_config('kv.rocksdb.shared-rate-limiter.bytes-per-sec');
  *
  * -- Get all cluster configurations
  * CALL sys.get_cluster_config();
@@ -86,10 +86,6 @@ public class GetClusterConfigProcedure extends ProcedureBase {
                                     entry.value(),
                                     entry.source() != null ? entry.source().name() : "UNKNOWN"));
                 }
-
-                if (results.isEmpty()) {
-                    return new Row[] {Row.of("No cluster configurations found", null, null)};
-                }
             } else {
                 // Find specific configuration
                 for (ConfigEntry entry : configs) {
@@ -103,15 +99,6 @@ public class GetClusterConfigProcedure extends ProcedureBase {
                                                 : "UNKNOWN"));
                         break;
                     }
-                }
-
-                if (results.isEmpty()) {
-                    return new Row[] {
-                        Row.of(
-                                String.format("Configuration key '%s' not found", configKey),
-                                null,
-                                null)
-                    };
                 }
             }
 

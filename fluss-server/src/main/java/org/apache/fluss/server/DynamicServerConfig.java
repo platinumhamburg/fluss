@@ -18,6 +18,8 @@
 package org.apache.fluss.server;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.config.ConfigOption;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.cluster.ConfigValidator;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
@@ -65,7 +67,7 @@ class DynamicServerConfig {
             serverReconfigures = MapUtils.newConcurrentHashMap();
 
     /** Registered stateless config validators, organized by config key for efficient lookup. */
-    private final Map<String, List<ConfigValidator>> configValidatorsByKey =
+    private final Map<String, List<ConfigValidator<?>>> configValidatorsByKey =
             MapUtils.newConcurrentHashMap();
 
     /** The initial configuration items when the server starts from server.yaml. */
@@ -107,7 +109,7 @@ class DynamicServerConfig {
      *
      * @param validator the config validator to register
      */
-    void registerValidator(ConfigValidator validator) {
+    void registerValidator(ConfigValidator<?> validator) {
         String configKey = validator.configKey();
         configValidatorsByKey
                 .computeIfAbsent(configKey, k -> new CopyOnWriteArrayList<>())
@@ -146,93 +148,185 @@ class DynamicServerConfig {
 
     private void updateCurrentConfig(Map<String, String> newDynamicConfigs, boolean skipErrorConfig)
             throws Exception {
+        // Step 1: Validate all changed configs and collect valid ones
+        Map<String, String> validatedChanges = validateConfigs(newDynamicConfigs, skipErrorConfig);
+
+        // No valid changes, return early
+        if (validatedChanges.isEmpty()) {
+            return;
+        }
+
+        // Step 2: Build new configuration with validated changes
         Map<String, String> newProps = new HashMap<>(initialConfigMap);
-        overrideProps(newProps, newDynamicConfigs);
+        overrideProps(newProps, validatedChanges);
         Configuration newConfig = Configuration.fromMap(newProps);
+
+        // No effective change, return early
+        if (newProps.equals(currentConfigMap)) {
+            return;
+        }
+
+        // Step 3: Apply new configuration to all ServerReconfigurable instances
+        applyToServerReconfigurables(newConfig, skipErrorConfig);
+
+        // Step 4: Update current state
+        currentConfig = newConfig;
+        currentConfigMap.clear();
+        dynamicConfigs.clear();
+        currentConfigMap.putAll(newProps);
+        dynamicConfigs.putAll(validatedChanges);
+        LOG.info("Dynamic configs changed: {}", validatedChanges);
+    }
+
+    /**
+     * Validates all config changes and returns only the valid ones.
+     *
+     * @param newDynamicConfigs configs to validate
+     * @param skipErrorConfig whether to skip invalid configs
+     * @return validated configs (only changed ones)
+     * @throws ConfigException if validation fails and skipErrorConfig is false
+     */
+    private Map<String, String> validateConfigs(
+            Map<String, String> newDynamicConfigs, boolean skipErrorConfig) throws ConfigException {
+        Map<String, String> validatedChanges = new HashMap<>();
+        Set<String> skippedConfigs = new HashSet<>();
+
+        for (Map.Entry<String, String> entry : newDynamicConfigs.entrySet()) {
+            String configKey = entry.getKey();
+            String newValueStr = entry.getValue();
+            String oldValueStr = currentConfigMap.get(configKey);
+
+            // Skip if value unchanged
+            if (Objects.equals(oldValueStr, newValueStr)) {
+                continue;
+            }
+
+            try {
+                validateSingleConfig(configKey, oldValueStr, newValueStr);
+                validatedChanges.put(configKey, newValueStr);
+            } catch (ConfigException e) {
+                LOG.error(
+                        "Config validation failed for '{}': {} -> {}. {}",
+                        configKey,
+                        oldValueStr,
+                        newValueStr,
+                        e.getMessage());
+                if (skipErrorConfig) {
+                    skippedConfigs.add(configKey);
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        if (!skippedConfigs.isEmpty()) {
+            LOG.warn("Skipped invalid configs: {}", skippedConfigs);
+        }
+
+        return validatedChanges;
+    }
+
+    /**
+     * Validates a single config entry including type parsing and business validation.
+     *
+     * @param configKey config key
+     * @param oldValueStr old value string
+     * @param newValueStr new value string
+     * @throws ConfigException if validation fails
+     */
+    private void validateSingleConfig(String configKey, String oldValueStr, String newValueStr)
+            throws ConfigException {
+        // Get ConfigOption for type information
+        ConfigOption<?> configOption = ConfigOptions.getConfigOption(configKey);
+        if (configOption == null) {
+            throw new ConfigException(
+                    String.format("No ConfigOption found for config key: %s", configKey));
+        }
+
+        // Parse and validate type
+        Configuration tempConfig = new Configuration();
+        Object newValue = null;
+        if (newValueStr != null) {
+            tempConfig.setString(configKey, newValueStr);
+            try {
+                newValue = tempConfig.getOptional(configOption).get();
+            } catch (Exception e) {
+                throw new ConfigException(
+                        String.format(
+                                "Cannot parse '%s' as %s for config '%s'",
+                                newValueStr,
+                                configOption.isList()
+                                        ? "List<" + configOption.getClazz().getSimpleName() + ">"
+                                        : configOption.getClazz().getSimpleName(),
+                                configKey),
+                        e);
+            }
+        }
+
+        // Business validation with registered validators (if any)
+        List<ConfigValidator<?>> validators = configValidatorsByKey.get(configKey);
+        if (validators != null && !validators.isEmpty()) {
+            Object oldValue =
+                    oldValueStr != null
+                            ? currentConfig.getOptional(configOption).orElse(null)
+                            : null;
+            for (ConfigValidator<?> validator : validators) {
+                invokeValidator(validator, oldValue, newValue);
+            }
+        }
+    }
+
+    /**
+     * Applies new configuration to all ServerReconfigurable instances with rollback support.
+     *
+     * @param newConfig new configuration to apply
+     * @param skipErrorConfig whether to skip errors
+     * @throws Exception if apply fails and skipErrorConfig is false
+     */
+    private void applyToServerReconfigurables(Configuration newConfig, boolean skipErrorConfig)
+            throws Exception {
         Configuration oldConfig = currentConfig;
-        Set<ServerReconfigurable> appliedServerReconfigurableSet = new HashSet<>();
-        if (!newProps.equals(currentConfigMap)) {
-            // Run stateless validators first - only for changed keys
-            for (Map.Entry<String, List<ConfigValidator>> entry :
-                    configValidatorsByKey.entrySet()) {
-                String configKey = entry.getKey();
-                List<ConfigValidator> validators = entry.getValue();
+        Set<ServerReconfigurable> appliedSet = new HashSet<>();
 
-                // Get old and new values, considering defaults from initial config
-                String oldValue = currentConfigMap.get(configKey);
-                String newValue = newProps.get(configKey);
-
-                // If oldValue is null but the key exists in initial config, use initial value
-                // This handles the case where a config was never dynamically changed
-                if (oldValue == null && initialConfigMap.containsKey(configKey)) {
-                    oldValue = initialConfigMap.get(configKey);
-                }
-
-                // Only validate if the value actually changed
-                if (!Objects.equals(oldValue, newValue)) {
-                    for (ConfigValidator validator : validators) {
-                        try {
-                            validator.validate(oldValue, newValue);
-                        } catch (ConfigException e) {
-                            LOG.error(
-                                    "Config validation failed for key '{}': {} -> {}",
-                                    configKey,
-                                    oldValue,
-                                    newValue,
-                                    e);
-                            if (!skipErrorConfig) {
-                                throw e;
-                            }
-                        }
-                    }
+        // Validate all first
+        for (ServerReconfigurable reconfigurable : serverReconfigures.values()) {
+            try {
+                reconfigurable.validate(newConfig);
+            } catch (ConfigException e) {
+                LOG.error(
+                        "Validation failed for {}: {}",
+                        reconfigurable.getClass().getSimpleName(),
+                        e.getMessage(),
+                        e);
+                if (!skipErrorConfig) {
+                    throw e;
                 }
             }
+        }
 
-            serverReconfigures
-                    .values()
-                    .forEach(
-                            serverReconfigurable -> {
-                                try {
-                                    serverReconfigurable.validate(newConfig);
-                                } catch (ConfigException e) {
-                                    LOG.error(
-                                            "Validate new dynamic config error and will roll back all the applied config.",
-                                            e);
-                                    if (!skipErrorConfig) {
-                                        throw e;
-                                    }
-                                }
-                            });
-
-            Exception throwable = null;
-            for (ServerReconfigurable serverReconfigurable : serverReconfigures.values()) {
-                try {
-                    serverReconfigurable.reconfigure(newConfig);
-                    appliedServerReconfigurableSet.add(serverReconfigurable);
-                } catch (ConfigException e) {
-                    LOG.error(
-                            "Apply new dynamic error and will roll back all the applied config.",
-                            e);
-                    if (!skipErrorConfig) {
-                        throwable = e;
-                        break;
-                    }
+        // Apply to all instances
+        Exception throwable = null;
+        for (ServerReconfigurable reconfigurable : serverReconfigures.values()) {
+            try {
+                reconfigurable.reconfigure(newConfig);
+                appliedSet.add(reconfigurable);
+            } catch (ConfigException e) {
+                LOG.error(
+                        "Reconfiguration failed for {}: {}",
+                        reconfigurable.getClass().getSimpleName(),
+                        e.getMessage(),
+                        e);
+                if (!skipErrorConfig) {
+                    throwable = e;
+                    break;
                 }
             }
+        }
 
-            // rollback to old config if there is an error.
-            if (throwable != null) {
-                appliedServerReconfigurableSet.forEach(
-                        serverReconfigurable -> serverReconfigurable.reconfigure(oldConfig));
-                throw throwable;
-            }
-
-            currentConfig = newConfig;
-            currentConfigMap.clear();
-            dynamicConfigs.clear();
-            currentConfigMap.putAll(newProps);
-            dynamicConfigs.putAll(newDynamicConfigs);
-            LOG.info("Dynamic configs changed: {}", newDynamicConfigs);
+        // Rollback if there was an error
+        if (throwable != null) {
+            appliedSet.forEach(r -> r.reconfigure(oldConfig));
+            throw throwable;
         }
     }
 
@@ -245,5 +339,22 @@ class DynamicServerConfig {
                         props.put(key, value);
                     }
                 });
+    }
+
+    /**
+     * Invokes validator with strongly-typed values.
+     *
+     * @param validator the config validator to invoke
+     * @param oldValue the old typed value
+     * @param newValue the new typed value
+     * @throws ConfigException if validation fails
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void invokeValidator(ConfigValidator<?> validator, Object oldValue, Object newValue)
+            throws ConfigException {
+        // Invoke validator with typed values
+        // We suppress unchecked warning because we trust that the validator
+        // is registered for the correct type matching the ConfigOption
+        ((ConfigValidator) validator).validate(oldValue, newValue);
     }
 }

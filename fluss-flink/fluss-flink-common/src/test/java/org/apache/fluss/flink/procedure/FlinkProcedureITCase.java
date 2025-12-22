@@ -29,7 +29,6 @@ import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.CollectionUtil;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -85,31 +84,6 @@ public abstract class FlinkProcedureITCase {
                         CATALOG_NAME, bootstrapServers);
         tEnv.executeSql(catalogDDL).await();
         tEnv.executeSql("use catalog " + CATALOG_NAME);
-    }
-
-    @AfterEach
-    void after() throws Exception {
-        // Clean up any dynamic config changes made during the test
-        // to ensure tests don't affect each other
-        if (tEnv != null) {
-            try {
-                // Delete dynamic configs that might have been modified during tests
-                // This resets them to their initial static configuration values
-                tEnv.executeSql(
-                                String.format(
-                                        "Call %s.sys.set_cluster_config('%s')",
-                                        CATALOG_NAME,
-                                        ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
-                        .await();
-                tEnv.executeSql(
-                                String.format(
-                                        "Call %s.sys.set_cluster_config('%s')",
-                                        CATALOG_NAME, ConfigOptions.DATALAKE_FORMAT.key()))
-                        .await();
-            } catch (Exception e) {
-                // Ignore cleanup errors to avoid masking test failures
-            }
-        }
     }
 
     @Test
@@ -330,6 +304,14 @@ public abstract class FlinkProcedureITCase {
                     .asString()
                     .contains("Configuration key 'non.existent.config' not found");
         }
+
+        // reset cluster configs.
+        tEnv.executeSql(
+                        String.format(
+                                "Call %s.sys.set_cluster_config('%s')",
+                                CATALOG_NAME,
+                                ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
+                .await();
     }
 
     @Test
@@ -362,6 +344,14 @@ public abstract class FlinkProcedureITCase {
             assertThat(results).hasSize(1);
             assertThat(results.get(0).getField(1)).isEqualTo("200MB");
         }
+
+        // reset cluster configs.
+        tEnv.executeSql(
+                        String.format(
+                                "Call %s.sys.set_cluster_config('%s')",
+                                CATALOG_NAME,
+                                ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key()))
+                .await();
     }
 
     @Test

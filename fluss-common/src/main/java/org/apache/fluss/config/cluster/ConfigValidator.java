@@ -39,9 +39,15 @@ import javax.annotation.Nullable;
  *
  * <p>This interface is designed to be stateless and thread-safe. Implementations should not rely on
  * any mutable component state.
+ *
+ * <p><b>Type-safe validation:</b> The validator receives strongly-typed values that have already
+ * been parsed and validated for basic type correctness. This avoids redundant string parsing and
+ * allows validators to focus on business logic validation.
+ *
+ * @param <T> the type of the configuration value being validated
  */
 @PublicEvolving
-public interface ConfigValidator {
+public interface ConfigValidator<T> {
 
     /**
      * Returns the configuration key this validator monitors.
@@ -68,5 +74,5 @@ public interface ConfigValidator {
      * @throws ConfigException if the configuration change is invalid, with a descriptive error
      *     message explaining why the change cannot be applied
      */
-    void validate(@Nullable String oldValue, @Nullable String newValue) throws ConfigException;
+    void validate(@Nullable T oldValue, @Nullable T newValue) throws ConfigException;
 }

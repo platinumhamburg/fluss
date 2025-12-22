@@ -15,10 +15,10 @@ From Fluss version 0.8 onwards, some of the server configs can be updated withou
 Currently, the supported dynamically updatable server configurations include:
 - `datalake.format`: Enable lakehouse storage by specifying the lakehouse format, e.g., `paimon`, `iceberg`.
 - Options with prefix `datalake.${datalake.format}`
-- `kv.shared-rate-limiter-bytes-per-sec`: Control RocksDB flush and compaction write rate shared across all RocksDB instances on the TabletServer.
+- `kv.rocksdb.shared-rate-limiter.bytes-per-sec`: Control RocksDB flush and compaction write rate shared across all RocksDB instances on the TabletServer. The rate limiter is always enabled. Set to a lower value (e.g., 100MB) to limit the rate, or a very high value to effectively disable rate limiting.
 
 
-You can update the configuration of a cluster with [Java client](apis/java-client.md) or [Flink Stored Procedures](#using-flink-stored-procedures).
+You can update the configuration of a cluster with [Java client](#using-java-client.md) or [Flink Stored Procedures](#using-flink-stored-procedures).
 
 ### Using Java Client
 
@@ -38,7 +38,7 @@ admin.alterClusterConfigs(
 // Set RocksDB shared rate limiter to 200MB/sec
 admin.alterClusterConfigs(
         Collections.singletonList(
-                new AlterConfig("kv.shared-rate-limiter-bytes-per-sec", "209715200", AlterConfigOpType.SET)));
+                new AlterConfig(KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(), "200MB", AlterConfigOpType.SET)));
 ```
 
 The `AlterConfig` class contains three properties:
@@ -52,30 +52,42 @@ For certain configurations, Fluss provides convenient Flink stored procedures th
 
 #### Managing RocksDB Rate Limiter
 
-You can dynamically adjust the shared RocksDB rate limiter for all TabletServers using Flink stored procedures:
+You can dynamically adjust the shared RocksDB rate limiter for all TabletServers using Flink stored procedures.
+
+The rate limiter is always enabled. Very high values (e.g., Long.MAX_VALUE, which is the default) effectively disable rate limiting with negligible performance overhead.
 
 **Set Shared RocksDB Rate Limiter:**
 ```sql title="Flink SQL"
 -- Set rate limiter to 200MB/sec (recommended, use named argument, only supported since Flink 1.19)
-CALL fluss_catalog.sys.set_shared_rocksdb_rate_limiter(rate_limit => '200MB');
+CALL fluss_catalog.sys.set_cluster_config(
+  config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec',
+  config_value => '200MB'
+);
 
--- Set rate limiter to 500MB/sec (use indexed argument)
-CALL fluss_catalog.sys.set_shared_rocksdb_rate_limiter('500MB');
+-- Set rate limiter to a very high value to effectively disable rate limiting
+CALL fluss_catalog.sys.set_cluster_config(
+  config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec',
+  config_value => '1TB'
+);
 
--- Disable rate limiter
-CALL fluss_catalog.sys.set_shared_rocksdb_rate_limiter('0MB');
+-- Reset to default value (Long.MAX_VALUE)
+CALL fluss_catalog.sys.set_cluster_config(
+  config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec'
+);
 ```
 
 **Get Current Shared RocksDB Rate Limiter:**
 ```sql title="Flink SQL"
 -- Query current rate limiter setting
-CALL fluss_catalog.sys.get_shared_rocksdb_rate_limiter();
+CALL fluss_catalog.sys.get_cluster_config(
+  config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec'
+);
 ```
 
 The rate limiter controls the write rate of RocksDB flush and compaction operations across all RocksDB instances on each TabletServer. This helps prevent I/O saturation during heavy write loads.
 
 :::tip
-The RocksDB rate limiter is shared across all RocksDB instances on a TabletServer, providing server-level control over disk I/O from RocksDB operations. Adjusting this value can help balance performance and resource utilization during peak loads.
+The RocksDB rate limiter is always enabled and shared across all RocksDB instances on a TabletServer, providing server-level control over disk I/O from RocksDB operations. The default value is Long.MAX_VALUE (effectively unlimited). Adjusting this value to a lower limit (e.g., 100MB/s) can help balance performance and resource utilization during peak loads.
 :::
 
 
