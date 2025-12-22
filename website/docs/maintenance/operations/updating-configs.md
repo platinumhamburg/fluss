@@ -58,28 +58,34 @@ The rate limiter is always enabled. Very high values (e.g., Long.MAX_VALUE, whic
 
 **Set Shared RocksDB Rate Limiter:**
 ```sql title="Flink SQL"
--- Set rate limiter to 200MB/sec (recommended, use named argument, only supported since Flink 1.19)
-CALL fluss_catalog.sys.set_cluster_config(
+-- Use the Fluss catalog (replace 'fluss_catalog' with your catalog name if different)
+USE fluss_catalog;
+
+-- Set rate limiter to 200MB/sec
+CALL sys.set_cluster_config(
   config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec',
   config_value => '200MB'
 );
 
 -- Set rate limiter to a very high value to effectively disable rate limiting
-CALL fluss_catalog.sys.set_cluster_config(
+CALL sys.set_cluster_config(
   config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec',
   config_value => '1TB'
 );
 
 -- Reset to default value (Long.MAX_VALUE)
-CALL fluss_catalog.sys.set_cluster_config(
+CALL sys.set_cluster_config(
   config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec'
 );
 ```
 
 **Get Current Shared RocksDB Rate Limiter:**
 ```sql title="Flink SQL"
+-- Use the Fluss catalog (replace 'fluss_catalog' with your catalog name if different)
+USE fluss_catalog;
+
 -- Query current rate limiter setting
-CALL fluss_catalog.sys.get_cluster_config(
+CALL sys.get_cluster_config(
   config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec'
 );
 ```

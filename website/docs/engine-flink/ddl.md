@@ -450,6 +450,9 @@ CALL [catalog_name.]sys.add_acl(
 **Example:**
 
 ```sql title="Flink SQL"
+-- Use the Fluss catalog (replace 'fluss_catalog' with your catalog name if different)
+USE fluss_catalog;
+
 -- Grant read permission to user Alice from any host
 CALL sys.add_acl(
   resource => 'CLUSTER',
@@ -492,6 +495,9 @@ All parameters accept the same values as `add_acl`. You can use `'ANY'` as a wil
 **Example:**
 
 ```sql title="Flink SQL"
+-- Use the Fluss catalog (replace 'fluss_catalog' with your catalog name if different)
+USE fluss_catalog;
+
 -- Remove a specific ACL entry
 CALL sys.drop_acl(
   resource => 'CLUSTER',
@@ -536,6 +542,9 @@ All parameters accept the same values as `add_acl`. Use `'ANY'` as a wildcard to
 **Example:**
 
 ```sql title="Flink SQL"
+-- Use the Fluss catalog (replace 'fluss_catalog' with your catalog name if different)
+USE fluss_catalog;
+
 -- List all ACL entries
 CALL sys.list_acl(resource => 'ANY');
 
@@ -582,6 +591,9 @@ CALL [catalog_name.]sys.get_cluster_config()
 **Example:**
 
 ```sql title="Flink SQL"
+-- Use the Fluss catalog (replace 'fluss_catalog' with your catalog name if different)
+USE fluss_catalog;
+
 -- Get a specific configuration
 CALL sys.get_cluster_config(
   config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec'
@@ -623,6 +635,9 @@ CALL [catalog_name.]sys.set_cluster_config(config_key => 'STRING')
 **Example:**
 
 ```sql title="Flink SQL"
+-- Use the Fluss catalog (replace 'fluss_catalog' with your catalog name if different)
+USE fluss_catalog;
+
 -- Set RocksDB rate limiter
 CALL sys.set_cluster_config(
   config_key => 'kv.rocksdb.shared-rate-limiter.bytes-per-sec',
