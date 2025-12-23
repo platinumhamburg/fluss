@@ -18,7 +18,7 @@ Currently, the supported dynamically updatable server configurations include:
 - `kv.rocksdb.shared-rate-limiter.bytes-per-sec`: Control RocksDB flush and compaction write rate shared across all RocksDB instances on the TabletServer. The rate limiter is always enabled. Set to a lower value (e.g., 100MB) to limit the rate, or a very high value to effectively disable rate limiting.
 
 
-You can update the configuration of a cluster with [Java client](#using-java-client) or [Flink Stored Procedures](../../engine-flink/ddl/procedures.md#cluster-configuration-procedures).
+You can update the configuration of a cluster with [Java client](#using-java-client) or [Flink Procedures](../../engine-flink/procedures.md#cluster-configuration-procedures).
 
 ### Using Java Client
 
@@ -48,11 +48,11 @@ The `AlterConfig` class contains three properties:
 
 ### Using Flink Stored Procedures
 
-For certain configurations, Fluss provides convenient Flink stored procedures that can be called directly from Flink SQL. See [Procedures](engine-flink/ddl/procedures.md#cluster-configuration-procedures) for detailed documentation on using `get_cluster_config` and `set_cluster_config` procedures.
+For certain configurations, Fluss provides convenient Flink stored procedures that can be called directly from Flink SQL. See [Procedures](engine-flink/procedures.md#cluster-configuration-procedures) for detailed documentation on using `get_cluster_config` and `set_cluster_config` procedures.
 
 ## Updating Table Configs
 
-The connector options on a table including [Storage Options](engine-flink/options.md#storage-options) can be updated dynamically by [ALTER TABLE ... SET](engine-flink/ddl/index.md#alter-table) statement. See the example below:
+The connector options on a table including [Storage Options](engine-flink/options.md#storage-options) can be updated dynamically by [ALTER TABLE ... SET](engine-flink/ddl.md#alter-table) statement. See the example below:
 
 ```sql
 -- Enable lakehouse storage for the given table

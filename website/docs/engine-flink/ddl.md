@@ -27,7 +27,7 @@ The following properties can be set if using the Fluss catalog:
 | bootstrap.servers              | required | (none)    | Comma separated list of Fluss servers.                                                                                                                                                                                 |
 | default-database               | optional | fluss     | The default database to use when switching to this catalog.                                                                                                                                                            |
 | client.security.protocol       | optional | PLAINTEXT | The security protocol used to communicate with brokers. Currently, only `PLAINTEXT` and `SASL` are supported, the configuration value is case insensitive.                                                             |
-| `client.security.{protocol}.*` | optional | (none)    | Client-side configuration properties for a specific authentication protocol. E.g., client.security.sasl.jaas.config. More Details in [authentication](../../security/authentication.md)                                   |
+| `client.security.{protocol}.*` | optional | (none)    | Client-side configuration properties for a specific authentication protocol. E.g., client.security.sasl.jaas.config. More Details in [authentication](../security/authentication.md)                                   |
 | `{lake-format}.*`              | optional | (none)    | Extra properties to be passed to the lake catalog. This is useful for configuring sensitive settings, such as the username and password required for lake catalog authentication. E.g., `paimon.jdbc.password = pass`. |
 
 The following statements assume that the current catalog has been switched to the Fluss catalog using the `USE CATALOG <catalog_name>` statement.
@@ -125,7 +125,7 @@ CREATE TABLE my_part_log_table (
 Fluss partitioned table supports dynamic partition creation, which means you can write data into a partition without pre-creating it.
 You can use the `INSERT INTO` statement to write data into a partitioned table, and Fluss will automatically create the partition if it does not exist.
 See the [Dynamic Partitioning](table-design/data-distribution/partitioning.md#dynamic-partitioning) for more details.
-But you can still use the [Add Partition](engine-flink/ddl/index.md#add-partition) statement to manually add partitions if needed.
+But you can still use the [Add Partition](engine-flink/ddl.md#add-partition) statement to manually add partitions if needed.
 :::
 
 #### Multi-Fields Partitioned Table

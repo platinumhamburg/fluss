@@ -1,6 +1,6 @@
 ---
 title: Connector Options
-sidebar_position: 8
+sidebar_position: 9
 ---
 
 # Connector Options
@@ -57,7 +57,7 @@ Using `ALTER TABLE ... SET` statement to modify the table options. For example, 
 ALTER TABLE log_table SET ('table.datalake.enable' = 'true');
 ```
 
-See more details about [ALTER TABLE ... SET](engine-flink/ddl/index.md#set-properties) and [ALTER TABLE ... RESET](engine-flink/ddl/index.md#reset-properties) documentation.
+See more details about [ALTER TABLE ... SET](engine-flink/ddl.md#set-properties) and [ALTER TABLE ... RESET](engine-flink/ddl.md#reset-properties) documentation.
 
 ## Storage Options
 

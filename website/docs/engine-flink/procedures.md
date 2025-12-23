@@ -18,9 +18,9 @@ SHOW PROCEDURES;
 
 ## Access Control Procedures
 
-Fluss provides procedures to manage Access Control Lists (ACLs) for security and authorization.
+Fluss provides procedures to manage Access Control Lists (ACLs) for security and authorization. See the [Security](../security/overview.md) documentation for more details.
 
-## add_acl
+### add_acl
 
 Add an ACL entry to grant permissions to a principal.
 
@@ -69,7 +69,7 @@ CALL sys.add_acl(
 );
 ```
 
-## drop_acl
+### drop_acl
 
 Remove an ACL entry to revoke permissions.
 
@@ -114,7 +114,7 @@ CALL sys.drop_acl(
 );
 ```
 
-## list_acl
+### list_acl
 
 List ACL entries matching the specified filters.
 
@@ -162,7 +162,7 @@ CALL sys.list_acl(
 
 Fluss provides procedures to dynamically manage cluster configurations without requiring a server restart.
 
-## get_cluster_config
+### get_cluster_config
 
 Retrieve cluster configuration values.
 
@@ -200,7 +200,7 @@ CALL sys.get_cluster_config(
 CALL sys.get_cluster_config();
 ```
 
-## set_cluster_config
+### set_cluster_config
 
 Set or delete a cluster configuration dynamically.
 
