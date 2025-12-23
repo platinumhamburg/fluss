@@ -74,6 +74,39 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 public final class KvManager extends TabletManagerBase implements ServerReconfigurable {
 
     private static final Logger LOG = LoggerFactory.getLogger(KvManager.class);
+
+    /**
+     * Default global rate limiter with unlimited rate (Long.MAX_VALUE bytes per second).
+     *
+     * <p>This is used by RocksDBResourceContainer when no rate limiter is explicitly provided,
+     * ensuring the API is safer and more robust by avoiding null checks throughout the code.
+     */
+    private static final RateLimiter DEFAULT_RATE_LIMITER = createDefaultRateLimiter();
+
+    /**
+     * Creates a default rate limiter with unlimited rate (Long.MAX_VALUE bytes per second).
+     *
+     * @return a default rate limiter instance
+     */
+    private static RateLimiter createDefaultRateLimiter() {
+        RocksDB.loadLibrary();
+        // Create a rate limiter with unlimited rate (effectively no limit)
+        // Using default refill period and fairness values
+        return new RateLimiter(Long.MAX_VALUE);
+    }
+
+    /**
+     * Returns the default global rate limiter with unlimited rate.
+     *
+     * <p>This method provides access to the default rate limiter for use in
+     * RocksDBResourceContainer when no rate limiter is explicitly provided.
+     *
+     * @return the default rate limiter instance
+     */
+    public static RateLimiter getDefaultRateLimiter() {
+        return DEFAULT_RATE_LIMITER;
+    }
+
     private final LogManager logManager;
 
     private final TabletServerMetricGroup serverMetricGroup;

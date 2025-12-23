@@ -22,6 +22,7 @@ import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.ReadableConfig;
+import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
 
@@ -48,6 +49,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
@@ -82,18 +85,18 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
     @VisibleForTesting
     RocksDBResourceContainer() {
-        this(new Configuration(), null, false, null);
+        this(new Configuration(), null, false, KvManager.getDefaultRateLimiter());
     }
 
     public RocksDBResourceContainer(ReadableConfig configuration, @Nullable File instanceBasePath) {
-        this(configuration, instanceBasePath, false, null);
+        this(configuration, instanceBasePath, false, KvManager.getDefaultRateLimiter());
     }
 
     public RocksDBResourceContainer(
             ReadableConfig configuration,
             @Nullable File instanceBasePath,
             boolean enableStatistics) {
-        this(configuration, instanceBasePath, enableStatistics, null);
+        this(configuration, instanceBasePath, enableStatistics, KvManager.getDefaultRateLimiter());
     }
 
     public RocksDBResourceContainer(
@@ -108,7 +111,8 @@ public class RocksDBResourceContainer implements AutoCloseable {
                         ? RocksDBKvBuilder.getInstanceRocksDBPath(instanceBasePath)
                         : null;
         this.enableStatistics = enableStatistics;
-        this.sharedRateLimiter = sharedRateLimiter;
+        this.sharedRateLimiter =
+                checkNotNull(sharedRateLimiter, "sharedRateLimiter must not be null");
 
         this.handlesToClose = new ArrayList<>();
     }
@@ -130,10 +134,8 @@ public class RocksDBResourceContainer implements AutoCloseable {
         // add necessary default options
         opt = opt.setCreateIfMissing(true);
 
-        // set shared rate limiter if provided
-        if (sharedRateLimiter != null) {
-            opt.setRateLimiter(sharedRateLimiter);
-        }
+        // set shared rate limiter
+        opt.setRateLimiter(sharedRateLimiter);
 
         if (enableStatistics) {
             Statistics statistics = new Statistics();

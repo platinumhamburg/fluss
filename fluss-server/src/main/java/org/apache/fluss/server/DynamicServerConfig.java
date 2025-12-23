@@ -154,6 +154,7 @@ class DynamicServerConfig {
 
         // Early return if no effective changes
         if (effectiveChanges.isEmpty()) {
+            LOG.info("No effective config changes detected for: {}", newDynamicConfigs);
             return;
         }
 
@@ -166,7 +167,7 @@ class DynamicServerConfig {
 
         // Update internal state
         updateInternalState(newConfig, newConfigMap, newDynamicConfigs);
-        LOG.info("Dynamic configs changed: {}", newDynamicConfigs);
+        LOG.info("Dynamic configs changed: {}", effectiveChanges);
     }
 
     /**
@@ -345,14 +346,17 @@ class DynamicServerConfig {
             try {
                 newValue = tempConfig.getOptional(configOption).get();
             } catch (Exception e) {
+                String causeMessage =
+                        e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                 throw new ConfigException(
                         String.format(
-                                "Cannot parse '%s' as %s for config '%s'",
+                                "Cannot parse '%s' as %s for config '%s': %s",
                                 newValueStr,
                                 configOption.isList()
                                         ? "List<" + configOption.getClazz().getSimpleName() + ">"
                                         : configOption.getClazz().getSimpleName(),
-                                configKey),
+                                configKey,
+                                causeMessage),
                         e);
             }
         }

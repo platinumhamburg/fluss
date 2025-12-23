@@ -22,19 +22,19 @@ For Flink's Table API, Fluss supports the following features:
 
 | Feature Support                                   | Flink | Notes                                  |
 |---------------------------------------------------|-------|----------------------------------------|
-| [SQL Create Catalog](ddl.md#create-catalog)       | ✔️    |                                        |
-| [SQL Create Database](ddl.md#create-database)     | ✔️    |                                        |
-| [SQL Drop Database](ddl.md#drop-database)         | ✔️    |                                        |
-| [SQL Create Table](ddl.md#create-table)           | ✔️    |                                        |
-| [SQL Create Table Like](ddl.md#create-table-like) | ✔️    |                                        |
-| [SQL Drop Table](ddl.md#drop-table)               | ✔️    |                                        |
-| [SQL Create Materialized Table](ddl.md#materialized-table) | ✔️    | Continuous refresh mode only |
-| [SQL Alter Materialized Table](ddl.md#alter-materialized-table) | ✔️    | Suspend/Resume support |
-| [SQL Drop Materialized Table](ddl.md#drop-materialized-table) | ✔️    |                                        |
-| [SQL Show Partitions](ddl.md#show-partitions)     | ✔️    |                                        |
-| [SQL Add Partition](ddl.md#add-partition)         | ✔️    |                                        |
-| [SQL Drop Partition](ddl.md#drop-partition)       | ✔️    |                                        |
-| [Procedures](ddl.md#procedures)                   | ✔️    | ACL management and cluster configuration |
+| [SQL Create Catalog](ddl/index.md#create-catalog)       | ✔️    |                                        |
+| [SQL Create Database](ddl/index.md#create-database)     | ✔️    |                                        |
+| [SQL Drop Database](ddl/index.md#drop-database)         | ✔️    |                                        |
+| [SQL Create Table](ddl/index.md#create-table)           | ✔️    |                                        |
+| [SQL Create Table Like](ddl/index.md#create-table-like) | ✔️    |                                        |
+| [SQL Drop Table](ddl/index.md#drop-table)               | ✔️    |                                        |
+| [SQL Create Materialized Table](ddl/index.md#materialized-table) | ✔️    | Continuous refresh mode only |
+| [SQL Alter Materialized Table](ddl/index.md#alter-materialized-table) | ✔️    | Suspend/Resume support |
+| [SQL Drop Materialized Table](ddl/index.md#drop-materialized-table) | ✔️    |                                        |
+| [SQL Show Partitions](ddl/index.md#show-partitions)     | ✔️    |                                        |
+| [SQL Add Partition](ddl/index.md#add-partition)         | ✔️    |                                        |
+| [SQL Drop Partition](ddl/index.md#drop-partition)       | ✔️    |                                        |
+| [Procedures](ddl/index.md#procedures)                   | ✔️    | ACL management and cluster configuration |
 | [SQL Select](reads.md)                            | ✔️    | Support both streaming and batch mode. |
 | [SQL Limit](reads.md#limit-read)                  | ✔️    | Only for Log Table                     |
 | [SQL Insert Into](writes.md)                      | ✔️    | Support both streaming and batch mode. |
