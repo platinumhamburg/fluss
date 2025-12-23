@@ -148,82 +148,165 @@ class DynamicServerConfig {
 
     private void updateCurrentConfig(Map<String, String> newDynamicConfigs, boolean skipErrorConfig)
             throws Exception {
-        // Step 1: Validate all changed configs and collect valid ones
-        Map<String, String> validatedChanges = validateConfigs(newDynamicConfigs, skipErrorConfig);
+        // Compute effective config changes (merge with initial configs)
+        Map<String, String> effectiveChanges =
+                computeEffectiveChanges(newDynamicConfigs, skipErrorConfig);
 
-        // No valid changes, return early
-        if (validatedChanges.isEmpty()) {
+        // Early return if no effective changes
+        if (effectiveChanges.isEmpty()) {
             return;
         }
 
-        // Step 2: Build new configuration with validated changes
-        Map<String, String> newProps = new HashMap<>(initialConfigMap);
-        overrideProps(newProps, validatedChanges);
-        Configuration newConfig = Configuration.fromMap(newProps);
+        // Build new configuration by merging initial + dynamic configs
+        Map<String, String> newConfigMap = buildConfigMap(effectiveChanges);
+        Configuration newConfig = Configuration.fromMap(newConfigMap);
 
-        // No effective change, return early
-        if (newProps.equals(currentConfigMap)) {
-            return;
-        }
-
-        // Step 3: Apply new configuration to all ServerReconfigurable instances
+        // Apply changes to all registered ServerReconfigurable instances
         applyToServerReconfigurables(newConfig, skipErrorConfig);
 
-        // Step 4: Update current state
-        currentConfig = newConfig;
-        currentConfigMap.clear();
-        dynamicConfigs.clear();
-        currentConfigMap.putAll(newProps);
-        dynamicConfigs.putAll(validatedChanges);
-        LOG.info("Dynamic configs changed: {}", validatedChanges);
+        // Update internal state
+        updateInternalState(newConfig, newConfigMap, newDynamicConfigs);
+        LOG.info("Dynamic configs changed: {}", newDynamicConfigs);
     }
 
     /**
-     * Validates all config changes and returns only the valid ones.
+     * Computes effective config changes by validating new configs and handling deletions.
      *
-     * @param newDynamicConfigs configs to validate
+     * @param newDynamicConfigs new dynamic configs from ZooKeeper
      * @param skipErrorConfig whether to skip invalid configs
-     * @return validated configs (only changed ones)
+     * @return map of config changes that passed validation
      * @throws ConfigException if validation fails and skipErrorConfig is false
      */
-    private Map<String, String> validateConfigs(
+    private Map<String, String> computeEffectiveChanges(
             Map<String, String> newDynamicConfigs, boolean skipErrorConfig) throws ConfigException {
-        Map<String, String> validatedChanges = new HashMap<>();
+        Map<String, String> effectiveChanges = new HashMap<>();
         Set<String> skippedConfigs = new HashSet<>();
 
-        for (Map.Entry<String, String> entry : newDynamicConfigs.entrySet()) {
-            String configKey = entry.getKey();
-            String newValueStr = entry.getValue();
-            String oldValueStr = currentConfigMap.get(configKey);
+        // Process deleted configs: restore to initial value or remove
+        processDeletions(newDynamicConfigs, effectiveChanges, skippedConfigs, skipErrorConfig);
 
-            // Skip if value unchanged
-            if (Objects.equals(oldValueStr, newValueStr)) {
-                continue;
-            }
-
-            try {
-                validateSingleConfig(configKey, oldValueStr, newValueStr);
-                validatedChanges.put(configKey, newValueStr);
-            } catch (ConfigException e) {
-                LOG.error(
-                        "Config validation failed for '{}': {} -> {}. {}",
-                        configKey,
-                        oldValueStr,
-                        newValueStr,
-                        e.getMessage());
-                if (skipErrorConfig) {
-                    skippedConfigs.add(configKey);
-                } else {
-                    throw e;
-                }
-            }
-        }
+        // Process added/modified configs
+        processModifications(newDynamicConfigs, effectiveChanges, skippedConfigs, skipErrorConfig);
 
         if (!skippedConfigs.isEmpty()) {
             LOG.warn("Skipped invalid configs: {}", skippedConfigs);
         }
 
-        return validatedChanges;
+        return effectiveChanges;
+    }
+
+    /** Processes config deletions by restoring to initial values or removing them. */
+    private void processDeletions(
+            Map<String, String> newDynamicConfigs,
+            Map<String, String> effectiveChanges,
+            Set<String> skippedConfigs,
+            boolean skipErrorConfig)
+            throws ConfigException {
+        for (String configKey : dynamicConfigs.keySet()) {
+            if (newDynamicConfigs.containsKey(configKey)) {
+                continue; // Not deleted
+            }
+
+            String currentValue = currentConfigMap.get(configKey);
+            String initialValue = initialConfigMap.get(configKey);
+
+            // Determine target value: initial value or null (removal)
+            String targetValue = initialValue;
+
+            // Skip if no change needed (already at initial value)
+            if (Objects.equals(currentValue, targetValue)) {
+                continue;
+            }
+
+            // Validate the change
+            if (validateConfigChange(
+                    configKey, currentValue, targetValue, skippedConfigs, skipErrorConfig)) {
+                effectiveChanges.put(configKey, targetValue);
+            }
+        }
+    }
+
+    /** Processes config additions and modifications. */
+    private void processModifications(
+            Map<String, String> newDynamicConfigs,
+            Map<String, String> effectiveChanges,
+            Set<String> skippedConfigs,
+            boolean skipErrorConfig)
+            throws ConfigException {
+        for (Map.Entry<String, String> entry : newDynamicConfigs.entrySet()) {
+            String configKey = entry.getKey();
+            String newValue = entry.getValue();
+            String currentValue = currentConfigMap.get(configKey);
+
+            // Skip if value unchanged
+            if (Objects.equals(currentValue, newValue)) {
+                continue;
+            }
+
+            // Validate and add to effective changes
+            if (validateConfigChange(
+                    configKey, currentValue, newValue, skippedConfigs, skipErrorConfig)) {
+                effectiveChanges.put(configKey, newValue);
+            }
+        }
+    }
+
+    /**
+     * Validates a single config change.
+     *
+     * @return true if validation passed, false if skipped due to error
+     * @throws ConfigException if validation fails and skipErrorConfig is false
+     */
+    private boolean validateConfigChange(
+            String configKey,
+            String oldValue,
+            String newValue,
+            Set<String> skippedConfigs,
+            boolean skipErrorConfig)
+            throws ConfigException {
+        try {
+            validateSingleConfig(configKey, oldValue, newValue);
+            return true;
+        } catch (ConfigException e) {
+            LOG.error(
+                    "Config validation failed for '{}': {} -> {}. {}",
+                    configKey,
+                    oldValue,
+                    newValue,
+                    e.getMessage());
+            if (skipErrorConfig) {
+                skippedConfigs.add(configKey);
+                return false;
+            } else {
+                throw e;
+            }
+        }
+    }
+
+    /** Builds final config map by merging initial configs with effective changes. */
+    private Map<String, String> buildConfigMap(Map<String, String> effectiveChanges) {
+        Map<String, String> configMap = new HashMap<>(initialConfigMap);
+        effectiveChanges.forEach(
+                (key, value) -> {
+                    if (value == null) {
+                        configMap.remove(key);
+                    } else {
+                        configMap.put(key, value);
+                    }
+                });
+        return configMap;
+    }
+
+    /** Updates internal state after successful reconfiguration. */
+    private void updateInternalState(
+            Configuration newConfig,
+            Map<String, String> newConfigMap,
+            Map<String, String> newDynamicConfigs) {
+        currentConfig = newConfig;
+        currentConfigMap.clear();
+        currentConfigMap.putAll(newConfigMap);
+        dynamicConfigs.clear();
+        dynamicConfigs.putAll(newDynamicConfigs);
     }
 
     /**
@@ -238,15 +321,26 @@ class DynamicServerConfig {
             throws ConfigException {
         // Get ConfigOption for type information
         ConfigOption<?> configOption = ConfigOptions.getConfigOption(configKey);
-        if (configOption == null) {
+
+        // For configs with allowed prefixes (like "datalake."), skip ConfigOption validation
+        // and rely on ServerReconfigurable's business validation
+        boolean hasPrefixConfig = false;
+        for (String prefix : ALLOWED_CONFIG_PREFIXES) {
+            if (configKey.startsWith(prefix)) {
+                hasPrefixConfig = true;
+                break;
+            }
+        }
+
+        if (configOption == null && !hasPrefixConfig) {
             throw new ConfigException(
                     String.format("No ConfigOption found for config key: %s", configKey));
         }
 
-        // Parse and validate type
-        Configuration tempConfig = new Configuration();
+        // Parse and validate type only if ConfigOption exists
         Object newValue = null;
-        if (newValueStr != null) {
+        if (configOption != null && newValueStr != null) {
+            Configuration tempConfig = new Configuration();
             tempConfig.setString(configKey, newValueStr);
             try {
                 newValue = tempConfig.getOptional(configOption).get();
@@ -265,7 +359,7 @@ class DynamicServerConfig {
 
         // Business validation with registered validators (if any)
         List<ConfigValidator<?>> validators = configValidatorsByKey.get(configKey);
-        if (validators != null && !validators.isEmpty()) {
+        if (validators != null && !validators.isEmpty() && configOption != null) {
             Object oldValue =
                     oldValueStr != null
                             ? currentConfig.getOptional(configOption).orElse(null)
@@ -328,17 +422,6 @@ class DynamicServerConfig {
             appliedSet.forEach(r -> r.reconfigure(oldConfig));
             throw throwable;
         }
-    }
-
-    private void overrideProps(Map<String, String> props, Map<String, String> propsOverride) {
-        propsOverride.forEach(
-                (key, value) -> {
-                    if (value == null) {
-                        props.remove(key);
-                    } else {
-                        props.put(key, value);
-                    }
-                });
     }
 
     /**

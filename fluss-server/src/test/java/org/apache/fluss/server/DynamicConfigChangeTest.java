@@ -174,7 +174,7 @@ public class DynamicConfigChangeTest {
                                                             "unknown",
                                                             AlterConfigOpType.SET))))
                     .hasMessageContaining(
-                            "Could not parse value 'unknown' for key 'datalake.format'");
+                            "Cannot parse 'unknown' as DataLakeFormat for config 'datalake.format'");
 
             assertThat(lakeCatalogDynamicLoader.getLakeCatalogContainer().getDataLakeFormat())
                     .isNull();
@@ -281,7 +281,8 @@ public class DynamicConfigChangeTest {
                                                         "invalid_value",
                                                         AlterConfigOpType.SET))))
                 .isInstanceOf(ConfigException.class)
-                .hasMessageContaining("Invalid value");
+                .hasMessageContaining(
+                        "Cannot parse 'invalid_value' as MemorySize for config 'kv.rocksdb.shared-rate-limiter.bytes-per-sec'");
     }
 
     @Test

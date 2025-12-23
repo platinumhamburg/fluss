@@ -299,10 +299,7 @@ public abstract class FlinkProcedureITCase {
                                         CATALOG_NAME))
                         .collect()) {
             List<Row> results = CollectionUtil.iteratorToList(resultIterator);
-            assertThat(results).hasSize(1);
-            assertThat(results.get(0).getField(0))
-                    .asString()
-                    .contains("Configuration key 'non.existent.config' not found");
+            assertThat(results).hasSize(0);
         }
 
         // reset cluster configs.
