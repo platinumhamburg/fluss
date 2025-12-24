@@ -143,10 +143,17 @@ public class PaimonRowAsFlussRow implements InternalRow {
 
     @Override
     public InternalArray getArray(int pos) {
-        // TODO: Support Array type conversion from Paimon to Fluss
-        throw new UnsupportedOperationException();
+        return new PaimonArrayAsFlussArray(paimonRow.getArray(pos));
     }
 
-    // TODO: Support Map type conversion from Paimon to Fluss
-    // TODO: Support Row type conversion from Paimon to Fluss
+    // TODO: Add Map type support in future
+    // @Override
+    // public InternalMap getMap(int pos) {
+    //     return new PaimonMapAsFlussMap(paimonRow.getMap(pos));
+    // }
+
+    @Override
+    public InternalRow getRow(int pos, int numFields) {
+        return new PaimonRowAsFlussRow(paimonRow.getRow(pos, numFields));
+    }
 }
