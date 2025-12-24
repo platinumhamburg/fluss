@@ -23,7 +23,10 @@ import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FileUtils;
 
 import org.rocksdb.Checkpoint;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.FlushOptions;
 import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -161,10 +164,29 @@ public class RocksIncrementalSnapshot implements AutoCloseable {
     }
 
     private void takeDBNativeSnapshot(@Nonnull File outputDirectory) throws Exception {
+        // Trigger compaction before creating checkpoint to optimize snapshot size
         // create hard links of living files in the output path
-        try (ResourceGuard.Lease ignored = rocksDBResourceGuard.acquireResource();
-                Checkpoint snapshot = Checkpoint.create(db)) {
-            snapshot.createCheckpoint(outputDirectory.toString());
+        try (ResourceGuard.Lease ignored = rocksDBResourceGuard.acquireResource()) {
+            LOG.debug("Triggering compaction before incremental snapshot checkpoint");
+            ColumnFamilyHandle defaultColumnFamilyHandle = db.getDefaultColumnFamily();
+            // Flush first to ensure data is in SST files for compaction
+            FlushOptions flushOptions = new FlushOptions();
+            flushOptions.setWaitForFlush(true);
+            try {
+                db.flush(flushOptions, defaultColumnFamilyHandle);
+                // Compact the entire range (null, null means compact everything)
+                db.compactRange(defaultColumnFamilyHandle);
+                LOG.debug("Compaction completed before incremental snapshot checkpoint");
+            } catch (RocksDBException e) {
+                throw new IOException("Failed to compact RocksDB before snapshot", e);
+            } finally {
+                flushOptions.close();
+            }
+
+            // Create checkpoint after compaction completes
+            try (Checkpoint snapshot = Checkpoint.create(db)) {
+                snapshot.createCheckpoint(outputDirectory.toString());
+            }
         } catch (Exception ex) {
             Exception exception = ex;
             try {
