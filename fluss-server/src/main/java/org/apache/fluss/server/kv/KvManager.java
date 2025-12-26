@@ -173,7 +173,7 @@ public final class KvManager extends TabletManagerBase {
                     }
 
                     File tabletDir = getOrCreateTabletDir(tablePath, tableBucket);
-                    RowMerger merger = RowMerger.create(tableConfig, kvFormat);
+                    RowMerger merger = RowMerger.create(tableConfig, kvFormat, schemaGetter);
                     KvTablet tablet =
                             KvTablet.create(
                                     logTablet,
@@ -279,7 +279,8 @@ public final class KvManager extends TabletManagerBase {
         TableInfo tableInfo = getTableInfo(zkClient, tablePath);
 
         TableConfig tableConfig = tableInfo.getTableConfig();
-        RowMerger rowMerger = RowMerger.create(tableConfig, tableConfig.getKvFormat());
+        RowMerger rowMerger =
+                RowMerger.create(tableConfig, tableConfig.getKvFormat(), schemaGetter);
         KvTablet kvTablet =
                 KvTablet.create(
                         physicalTablePath,
