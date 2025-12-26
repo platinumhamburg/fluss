@@ -18,6 +18,7 @@
 package org.apache.fluss.utils.json;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
@@ -37,6 +38,7 @@ public class ColumnJsonSerde
     static final String ID = "id";
     static final String DATA_TYPE = "data_type";
     static final String COMMENT = "comment";
+    static final String AGG_FUNCTION = "agg_function";
 
     @Override
     public void serialize(Schema.Column column, JsonGenerator generator) throws IOException {
@@ -49,6 +51,9 @@ public class ColumnJsonSerde
         if (column.getComment().isPresent()) {
             generator.writeStringField(COMMENT, column.getComment().get());
         }
+        if (column.getAggFunction().isPresent()) {
+            generator.writeStringField(AGG_FUNCTION, column.getAggFunction().get().getIdentifier());
+        }
         generator.writeNumberField(ID, column.getColumnId());
 
         generator.writeEndObject();
@@ -60,10 +65,16 @@ public class ColumnJsonSerde
 
         DataType dataType = DataTypeJsonSerde.INSTANCE.deserialize(node.get(DATA_TYPE));
 
+        AggFunction aggFunction = null;
+        if (node.hasNonNull(AGG_FUNCTION)) {
+            aggFunction = AggFunction.fromString(node.get(AGG_FUNCTION).asText());
+        }
+
         return new Schema.Column(
                 columnName,
                 dataType,
                 node.hasNonNull(COMMENT) ? node.get(COMMENT).asText() : null,
-                node.has(ID) ? node.get(ID).asInt() : UNKNOWN_COLUMN_ID);
+                node.has(ID) ? node.get(ID).asInt() : UNKNOWN_COLUMN_ID,
+                aggFunction);
     }
 }

@@ -121,4 +121,103 @@ class TableSchemaTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("Auto increment column can only be used in primary-key table.");
     }
+
+    @Test
+    void testSchemaBuilderColumnWithAggFunction() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("sum_val", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("max_val", DataTypes.INT(), AggFunction.MAX)
+                        .column("min_val", DataTypes.INT(), AggFunction.MIN)
+                        .column("last_val", DataTypes.STRING(), AggFunction.LAST_VALUE)
+                        .column(
+                                "last_non_null",
+                                DataTypes.STRING(),
+                                AggFunction.LAST_VALUE_IGNORE_NULLS)
+                        .column("first_val", DataTypes.STRING(), AggFunction.FIRST_VALUE)
+                        .column(
+                                "first_non_null",
+                                DataTypes.STRING(),
+                                AggFunction.FIRST_VALUE_IGNORE_NULLS)
+                        .column("listagg_val", DataTypes.STRING(), AggFunction.LISTAGG)
+                        .column("string_agg_val", DataTypes.STRING(), AggFunction.STRING_AGG)
+                        .column("bool_and_val", DataTypes.BOOLEAN(), AggFunction.BOOL_AND)
+                        .column("bool_or_val", DataTypes.BOOLEAN(), AggFunction.BOOL_OR)
+                        .primaryKey("id")
+                        .build();
+
+        assertThat(schema.getAggFunction("sum_val").get()).isEqualTo(AggFunction.SUM);
+        assertThat(schema.getAggFunction("max_val").get()).isEqualTo(AggFunction.MAX);
+        assertThat(schema.getAggFunction("min_val").get()).isEqualTo(AggFunction.MIN);
+        assertThat(schema.getAggFunction("last_val").get()).isEqualTo(AggFunction.LAST_VALUE);
+        assertThat(schema.getAggFunction("last_non_null").get())
+                .isEqualTo(AggFunction.LAST_VALUE_IGNORE_NULLS);
+        assertThat(schema.getAggFunction("first_val").get()).isEqualTo(AggFunction.FIRST_VALUE);
+        assertThat(schema.getAggFunction("first_non_null").get())
+                .isEqualTo(AggFunction.FIRST_VALUE_IGNORE_NULLS);
+        assertThat(schema.getAggFunction("listagg_val").get()).isEqualTo(AggFunction.LISTAGG);
+        assertThat(schema.getAggFunction("string_agg_val").get()).isEqualTo(AggFunction.STRING_AGG);
+        assertThat(schema.getAggFunction("bool_and_val").get()).isEqualTo(AggFunction.BOOL_AND);
+        assertThat(schema.getAggFunction("bool_or_val").get()).isEqualTo(AggFunction.BOOL_OR);
+    }
+
+    @Test
+    void testSchemaBuilderColumnWithAggFunctionThrowsExceptionForPrimaryKey() {
+        assertThatThrownBy(
+                        () ->
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .column("value", DataTypes.BIGINT(), AggFunction.SUM)
+                                        .primaryKey("id")
+                                        .column("id", DataTypes.INT(), AggFunction.SUM)
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Cannot set aggregation function for primary key column");
+    }
+
+    @Test
+    void testSchemaEqualityWithAggFunction() {
+        Schema schema1 =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.BIGINT(), AggFunction.SUM)
+                        .primaryKey("id")
+                        .build();
+
+        Schema schema2 =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.BIGINT(), AggFunction.SUM)
+                        .primaryKey("id")
+                        .build();
+
+        Schema schema3 =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.BIGINT(), AggFunction.MAX)
+                        .primaryKey("id")
+                        .build();
+
+        assertThat(schema1).isEqualTo(schema2);
+        assertThat(schema1).isNotEqualTo(schema3);
+    }
+
+    @Test
+    void testSchemaFromSchemaPreservesAggFunction() {
+        Schema original =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("max_val", DataTypes.INT(), AggFunction.MAX)
+                        .primaryKey("id")
+                        .build();
+
+        Schema copied = Schema.newBuilder().fromSchema(original).build();
+
+        assertThat(copied.getAggFunction("value")).isPresent();
+        assertThat(copied.getAggFunction("value").get()).isEqualTo(AggFunction.SUM);
+        assertThat(copied.getAggFunction("max_val")).isPresent();
+        assertThat(copied.getAggFunction("max_val").get()).isEqualTo(AggFunction.MAX);
+    }
 }

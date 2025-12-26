@@ -106,6 +106,19 @@ public final class Schema implements Serializable {
         return rowType;
     }
 
+    /**
+     * Gets the aggregation function for a specific column.
+     *
+     * @param columnName the column name
+     * @return the aggregation function, or empty if not configured
+     */
+    public Optional<AggFunction> getAggFunction(String columnName) {
+        return columns.stream()
+                .filter(col -> col.getName().equals(columnName))
+                .findFirst()
+                .flatMap(Column::getAggFunction);
+    }
+
     /** Returns the primary key indexes, if any, otherwise returns an empty array. */
     public int[] getPrimaryKeyIndexes() {
         final List<String> columns = getColumnNames();
@@ -282,10 +295,16 @@ public final class Schema implements Serializable {
             } else {
                 // if all columnId is not set, this maybe from old version schema. Just use its
                 // position as columnId.
-                inputColumns.forEach(
-                        column ->
-                                this.column(column.columnName, column.dataType)
-                                        .withComment(column.comment));
+                for (Column column : inputColumns) {
+                    int newColumnId = highestFieldId.incrementAndGet();
+                    columns.add(
+                            new Column(
+                                    column.columnName,
+                                    column.dataType,
+                                    column.comment,
+                                    newColumnId,
+                                    column.aggFunction));
+                }
             }
 
             return this;
@@ -303,7 +322,47 @@ public final class Schema implements Serializable {
         public Builder column(String columnName, DataType dataType) {
             checkNotNull(columnName, "Column name must not be null.");
             checkNotNull(dataType, "Data type must not be null.");
-            columns.add(new Column(columnName, dataType, null, highestFieldId.incrementAndGet()));
+            columns.add(
+                    new Column(columnName, dataType, null, highestFieldId.incrementAndGet(), null));
+            return this;
+        }
+
+        /**
+         * Declares a column with aggregation function that is appended to this schema.
+         *
+         * <p>This method associates an aggregation function with a non-primary key column. It is
+         * only applicable when the table uses aggregation merge engine.
+         *
+         * <p>If aggregation function is not specified for a non-primary key column, it defaults to
+         * {@link AggFunction#LAST_VALUE_IGNORE_NULLS}.
+         *
+         * @param columnName the name of the column
+         * @param dataType the data type of the column
+         * @param aggFunction the aggregation function to apply
+         * @return the builder instance
+         * @throws IllegalArgumentException if column is a primary key
+         */
+        public Builder column(String columnName, DataType dataType, AggFunction aggFunction) {
+            checkNotNull(columnName, "Column name must not be null.");
+            checkNotNull(dataType, "Data type must not be null.");
+            checkNotNull(aggFunction, "Aggregation function must not be null.");
+
+            // Validate that this column is not a primary key
+            if (primaryKey != null && primaryKey.columnNames.contains(columnName)) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Cannot set aggregation function for primary key column '%s'. "
+                                        + "Primary key columns automatically use 'primary-key' aggregation.",
+                                columnName));
+            }
+
+            columns.add(
+                    new Column(
+                            columnName,
+                            dataType,
+                            null,
+                            highestFieldId.incrementAndGet(),
+                            aggFunction));
             return this;
         }
 
@@ -402,6 +461,21 @@ public final class Schema implements Serializable {
             checkState(
                     columns.stream().map(Column::getColumnId).distinct().count() == columns.size(),
                     "Column ids must be unique.");
+
+            // Validate that aggregation functions are only set for non-primary key columns
+            if (primaryKey != null) {
+                for (Column column : columns) {
+                    if (primaryKey.columnNames.contains(column.getName())
+                            && column.getAggFunction().isPresent()) {
+                        throw new IllegalArgumentException(
+                                String.format(
+                                        "Cannot set aggregation function for primary key column '%s'. "
+                                                + "Primary key columns automatically use 'primary-key' aggregation.",
+                                        column.getName()));
+                    }
+                }
+            }
+
             return new Schema(columns, primaryKey, highestFieldId.get(), autoIncrementColumnNames);
         }
     }
@@ -423,21 +497,32 @@ public final class Schema implements Serializable {
         private final String columnName;
         private final DataType dataType;
         private final @Nullable String comment;
+        private final @Nullable AggFunction aggFunction;
 
         public Column(String columnName, DataType dataType) {
-            this(columnName, dataType, null, UNKNOWN_COLUMN_ID);
+            this(columnName, dataType, null, UNKNOWN_COLUMN_ID, null);
         }
 
         public Column(String columnName, DataType dataType, @Nullable String comment) {
-            this(columnName, dataType, comment, UNKNOWN_COLUMN_ID);
+            this(columnName, dataType, comment, UNKNOWN_COLUMN_ID, null);
         }
 
         public Column(
                 String columnName, DataType dataType, @Nullable String comment, int columnId) {
+            this(columnName, dataType, comment, columnId, null);
+        }
+
+        public Column(
+                String columnName,
+                DataType dataType,
+                @Nullable String comment,
+                int columnId,
+                @Nullable AggFunction aggFunction) {
             this.columnName = columnName;
             this.dataType = dataType;
             this.comment = comment;
             this.columnId = columnId;
+            this.aggFunction = aggFunction;
         }
 
         public String getName() {
@@ -456,8 +541,21 @@ public final class Schema implements Serializable {
             return dataType;
         }
 
+        /**
+         * Gets the aggregation function for this column.
+         *
+         * @return the aggregation function, or empty if not configured
+         */
+        public Optional<AggFunction> getAggFunction() {
+            return Optional.ofNullable(aggFunction);
+        }
+
         public Column withComment(String comment) {
-            return new Column(columnName, dataType, comment, columnId);
+            return new Column(columnName, dataType, comment, columnId, aggFunction);
+        }
+
+        public Column withAggFunction(@Nullable AggFunction aggFunction) {
+            return new Column(columnName, dataType, comment, columnId, aggFunction);
         }
 
         @Override
@@ -486,12 +584,13 @@ public final class Schema implements Serializable {
             return Objects.equals(columnName, that.columnName)
                     && Objects.equals(dataType, that.dataType)
                     && Objects.equals(comment, that.comment)
-                    && Objects.equals(columnId, that.columnId);
+                    && Objects.equals(columnId, that.columnId)
+                    && Objects.equals(aggFunction, that.aggFunction);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(columnName, dataType, comment, columnId);
+            return Objects.hash(columnName, dataType, comment, columnId, aggFunction);
         }
     }
 
@@ -616,7 +715,8 @@ public final class Schema implements Serializable {
                                 column.getName(),
                                 column.getDataType().copy(false),
                                 column.getComment().isPresent() ? column.getComment().get() : null,
-                                column.getColumnId()));
+                                column.getColumnId(),
+                                column.getAggFunction().orElse(null)));
             } else {
                 newColumns.add(column);
             }
