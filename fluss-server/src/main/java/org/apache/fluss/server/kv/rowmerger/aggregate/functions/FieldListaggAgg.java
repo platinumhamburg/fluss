@@ -25,19 +25,21 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.types.StringType;
+import org.apache.fluss.utils.BinaryStringUtils;
 
 /** List aggregation aggregator - concatenates string values with a delimiter. */
 public class FieldListaggAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    private final String delimiter;
+    private final BinaryString delimiter;
 
     public FieldListaggAgg(String name, StringType dataType, TableConfig options, String field) {
         super(name, dataType);
         // Read delimiter from configuration: table.merge-engine.aggregate.<field>.listagg-delimiter
         // Default to comma if not configured
-        this.delimiter = options.getFieldListaggDelimiter(field);
+        // Cache delimiter as BinaryString to avoid repeated conversions
+        this.delimiter = BinaryString.fromString(options.getFieldListaggDelimiter(field));
     }
 
     @Override
@@ -49,8 +51,7 @@ public class FieldListaggAgg extends FieldAggregator {
         BinaryString mergeFieldSD = (BinaryString) accumulator;
         BinaryString inFieldSD = (BinaryString) inputField;
 
-        // Concatenate strings using simple string concatenation
-        String result = mergeFieldSD + delimiter + inFieldSD;
-        return BinaryString.fromString(result);
+        // Use optimized concat method to avoid string conversion and reduce memory allocation
+        return BinaryStringUtils.concat(mergeFieldSD, delimiter, inFieldSD);
     }
 }
