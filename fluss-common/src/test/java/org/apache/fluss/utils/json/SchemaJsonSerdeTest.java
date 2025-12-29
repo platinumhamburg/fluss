@@ -103,7 +103,7 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
                     .build();
 
     static final String SCHEMA_JSON_WITH_AGG =
-            "{\"version\":1,\"columns\":[{\"name\":\"product_id\",\"data_type\":{\"type\":\"BIGINT\",\"nullable\":false},\"id\":0},{\"name\":\"total_sales\",\"data_type\":{\"type\":\"BIGINT\"},\"agg_function\":\"sum\",\"id\":1},{\"name\":\"max_price\",\"data_type\":{\"type\":\"DECIMAL\",\"precision\":10,\"scale\":2},\"agg_function\":\"max\",\"id\":2},{\"name\":\"last_update_time\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"agg_function\":\"last_value_ignore_nulls\",\"id\":3}],\"primary_key\":[\"product_id\"],\"highest_field_id\":3}";
+            "{\"version\":1,\"columns\":[{\"name\":\"product_id\",\"data_type\":{\"type\":\"BIGINT\",\"nullable\":false},\"id\":0},{\"name\":\"total_sales\",\"data_type\":{\"type\":\"BIGINT\"},\"agg_function\":{\"type\":\"sum\"},\"id\":1},{\"name\":\"max_price\",\"data_type\":{\"type\":\"DECIMAL\",\"precision\":10,\"scale\":2},\"agg_function\":{\"type\":\"max\"},\"id\":2},{\"name\":\"last_update_time\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"agg_function\":{\"type\":\"last_value_ignore_nulls\"},\"id\":3}],\"primary_key\":[\"product_id\"],\"highest_field_id\":3}";
 
     SchemaJsonSerdeTest() {
         super(SchemaJsonSerde.INSTANCE);
@@ -158,9 +158,9 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
         // Test serialization
         byte[] jsonBytes = SCHEMA_WITH_AGG.toJsonBytes();
         String json = new String(jsonBytes, StandardCharsets.UTF_8);
-        assertThat(json).contains("\"agg_function\":\"sum\"");
-        assertThat(json).contains("\"agg_function\":\"max\"");
-        assertThat(json).contains("\"agg_function\":\"last_value_ignore_nulls\"");
+        assertThat(json).contains("\"agg_function\":{\"type\":\"sum\"}");
+        assertThat(json).contains("\"agg_function\":{\"type\":\"max\"}");
+        assertThat(json).contains("\"agg_function\":{\"type\":\"last_value_ignore_nulls\"}");
 
         // Test deserialization
         Schema deserialized = Schema.fromJsonBytes(jsonBytes);
