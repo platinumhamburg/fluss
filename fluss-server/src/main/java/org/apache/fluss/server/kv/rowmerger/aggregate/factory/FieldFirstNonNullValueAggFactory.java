@@ -22,7 +22,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
-import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldFirstNonNullValueAgg;
 import org.apache.fluss.types.DataType;
 
@@ -32,7 +32,8 @@ public class FieldFirstNonNullValueAggFactory implements FieldAggregatorFactory 
     public static final String NAME = "first_value_ignore_nulls";
 
     @Override
-    public FieldFirstNonNullValueAgg create(DataType fieldType, TableConfig options, String field) {
+    public FieldFirstNonNullValueAgg create(
+            DataType fieldType, AggFunction aggFunction, String field) {
         return new FieldFirstNonNullValueAgg(identifier(), fieldType);
     }
 

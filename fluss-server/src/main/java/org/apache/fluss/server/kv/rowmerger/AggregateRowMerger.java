@@ -61,7 +61,6 @@ public class AggregateRowMerger implements RowMerger {
 
     private final SchemaGetter schemaGetter;
     private final DeleteBehavior deleteBehavior;
-    private final boolean removeRecordOnDelete;
     private final AggregationContextCache contextCache;
 
     // Cache for PartialAggregateRowMerger instances to avoid repeated creation
@@ -71,9 +70,8 @@ public class AggregateRowMerger implements RowMerger {
             TableConfig tableConfig, KvFormat kvFormat, SchemaGetter schemaGetter) {
         this.schemaGetter = schemaGetter;
         // Extract configuration from TableConfig to ensure single source of truth
-        this.removeRecordOnDelete = tableConfig.getAggregationRemoveRecordOnDelete();
         this.deleteBehavior = tableConfig.getDeleteBehavior().orElse(DeleteBehavior.IGNORE);
-        this.contextCache = new AggregationContextCache(schemaGetter, tableConfig, kvFormat);
+        this.contextCache = new AggregationContextCache(schemaGetter, kvFormat);
         // Initialize cache with same settings as PartialUpdaterCache and AggregationContextCache
         this.partialMergerCache =
                 Caffeine.newBuilder()
@@ -116,13 +114,8 @@ public class AggregateRowMerger implements RowMerger {
 
     @Override
     public BinaryValue delete(BinaryValue oldValue) {
-        if (removeRecordOnDelete) {
-            // Remove the entire row
-            return null;
-        }
-        throw new UnsupportedOperationException(
-                "DELETE is not supported for aggregate merge engine. "
-                        + "Configure 'table.aggregation.remove-record-on-delete' to true if needed.");
+        // Remove the entire row (returns null to indicate deletion)
+        return null;
     }
 
     @Override
@@ -159,7 +152,6 @@ public class AggregateRowMerger implements RowMerger {
                     // Create the PartialAggregateRowMerger instance
                     return new PartialAggregateRowMerger(
                             targetColumnIdBitSet,
-                            removeRecordOnDelete,
                             deleteBehavior,
                             schemaGetter,
                             contextCache,
@@ -250,7 +242,6 @@ public class AggregateRowMerger implements RowMerger {
         private final BitSet targetColumnIdBitSet;
 
         private final DeleteBehavior deleteBehavior;
-        private final boolean removeRecordOnDelete;
 
         // Schema evolution support
         private final SchemaGetter schemaGetter;
@@ -264,14 +255,12 @@ public class AggregateRowMerger implements RowMerger {
 
         PartialAggregateRowMerger(
                 BitSet targetColumnIdBitSet,
-                boolean removeRecordOnDelete,
                 DeleteBehavior deleteBehavior,
                 SchemaGetter schemaGetter,
                 AggregationContextCache contextCache,
                 Schema schema,
                 short schemaId) {
             this.targetColumnIdBitSet = targetColumnIdBitSet;
-            this.removeRecordOnDelete = removeRecordOnDelete;
             this.deleteBehavior = deleteBehavior;
             this.schemaGetter = schemaGetter;
             this.contextCache = contextCache;
@@ -317,10 +306,6 @@ public class AggregateRowMerger implements RowMerger {
 
         @Override
         public BinaryValue delete(BinaryValue oldValue) {
-            if (removeRecordOnDelete) {
-                return null;
-            }
-
             // Fast path: if oldValue uses the same schema as target, use simple logic
             if (oldValue.schemaId == targetSchemaId) {
                 BitSet targetPosBitSet = getOrComputeTargetPosBitSet(targetSchemaId);

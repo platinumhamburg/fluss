@@ -71,8 +71,8 @@ Specify the aggregate function for each non-primary key field using the Schema A
 ```java
 Schema schema = Schema.newBuilder()
     .column("product_id", DataTypes.BIGINT())
-    .column("price", DataTypes.DOUBLE(), AggFunction.MAX)
-    .column("sales", DataTypes.BIGINT(), AggFunction.SUM)
+    .column("price", DataTypes.DOUBLE(), AggFunctions.MAX())
+    .column("sales", DataTypes.BIGINT(), AggFunctions.SUM())
     .column("last_update_time", DataTypes.TIMESTAMP(3))  // Defaults to LAST_VALUE_IGNORE_NULLS
     .primaryKey("product_id")
     .build();
@@ -155,8 +155,8 @@ Admin admin = conn.getAdmin();
 // Define schema with aggregation functions
 Schema schema = Schema.newBuilder()
     .column("product_id", DataTypes.BIGINT())
-    .column("price", DataTypes.DOUBLE(), AggFunction.MAX)
-    .column("sales", DataTypes.BIGINT(), AggFunction.SUM)
+    .column("price", DataTypes.DOUBLE(), AggFunctions.MAX())
+    .column("sales", DataTypes.BIGINT(), AggFunctions.SUM())
     .column("last_update_time", DataTypes.TIMESTAMP(3))  // Defaults to LAST_VALUE_IGNORE_NULLS
     .primaryKey("product_id")
     .build();
@@ -323,10 +323,21 @@ TableDescriptor.builder()
     .property("table.merge-engine", "aggregation")
     .build();
 
-// Input: (1, 'online', '2024-01-01 10:00:00'), (1, 'offline', '2024-01-01 11:00:00'), (1, null, '2024-01-01 12:00:00')
+// Step 1: Insert initial values
+// Input:  (1, 'online', '2024-01-01 10:00:00')
+// Result: (1, 'online', '2024-01-01 10:00:00')
+
+// Step 2: Upsert with new values
+// Input:  (1, 'offline', '2024-01-01 11:00:00')
+// Result: (1, 'offline', '2024-01-01 11:00:00')
+
+// Step 3: Upsert with null status - null overwrites the previous 'offline' value
+// Input:  (1, null, '2024-01-01 12:00:00')
 // Result: (1, null, '2024-01-01 12:00:00')
-// Note: null value overwrites the previous 'offline' value
+// Note: status becomes null (null overwrites previous value), last_login updated
 ```
+
+**Key behavior:** Null values overwrite existing values, treating null as a valid value to be stored.
 
 ### last_value_ignore_nulls
 
@@ -350,10 +361,22 @@ TableDescriptor.builder()
     .property("table.merge-engine", "aggregation")
     .build();
 
-// Input: (1, 'user@example.com', '123-456'), (1, null, '789-012')
+// Step 1: Insert initial values
+// Input:  (1, 'user@example.com', '123-456')
+// Result: (1, 'user@example.com', '123-456')
+
+// Step 2: Upsert with null email - null is ignored, email retains previous value
+// Input:  (1, null, '789-012')
 // Result: (1, 'user@example.com', '789-012')
-// Email remains 'user@example.com' because the second upsert had null email
+// Note: email remains 'user@example.com' (null was ignored), phone updated to '789-012'
+
+// Step 3: Upsert with null phone - null is ignored, phone retains previous value
+// Input:  (1, 'new@example.com', null)
+// Result: (1, 'new@example.com', '789-012')
+// Note: email updated to 'new@example.com', phone remains '789-012' (null was ignored)
 ```
+
+**Key behavior:** Null values do not overwrite existing non-null values, making this function ideal for maintaining the most recent valid data.
 
 ### first_value
 
@@ -414,20 +437,19 @@ Concatenates multiple string values into a single string with a delimiter.
 - **Supported Data Types**: STRING, CHAR
 - **Behavior**: Concatenates values using the specified delimiter
 - **Null Handling**: Null values are skipped
-- **Configuration**: Use `'table.merge-engine.aggregate.<field-name>.listagg-delimiter'` to specify a custom delimiter (default is comma `,`)
+- **Delimiter**: Specify delimiter directly in the aggregation function (default is comma `,`)
 
 **Example:**
 ```java
 Schema schema = Schema.newBuilder()
     .column("id", DataTypes.BIGINT())
-    .column("tags", DataTypes.STRING(), AggFunction.LISTAGG)
+    .column("tags", DataTypes.STRING(), AggFunctions.LISTAGG(";"))  // Specify delimiter inline
     .primaryKey("id")
     .build();
 
 TableDescriptor.builder()
     .schema(schema)
     .property("table.merge-engine", "aggregation")
-    .property("table.merge-engine.aggregate.tags.listagg-delimiter", ";")
     .build();
 
 // Input: (1, 'developer'), (1, 'java'), (1, 'flink')
@@ -441,20 +463,19 @@ Alias for `listagg`. Concatenates multiple string values into a single string wi
 - **Supported Data Types**: STRING, CHAR
 - **Behavior**: Same as `listagg` - concatenates values using the specified delimiter
 - **Null Handling**: Null values are skipped
-- **Configuration**: Use `'table.merge-engine.aggregate.<field-name>.listagg-delimiter'` to specify a custom delimiter (default is comma `,`)
+- **Delimiter**: Specify delimiter directly in the aggregation function (default is comma `,`)
 
 **Example:**
 ```java
 Schema schema = Schema.newBuilder()
     .column("id", DataTypes.BIGINT())
-    .column("tags", DataTypes.STRING(), AggFunction.STRING_AGG)
+    .column("tags", DataTypes.STRING(), AggFunctions.STRING_AGG(";"))  // Specify delimiter inline
     .primaryKey("id")
     .build();
 
 TableDescriptor.builder()
     .schema(schema)
     .property("table.merge-engine", "aggregation")
-    .property("table.merge-engine.aggregate.tags.listagg-delimiter", ";")
     .build();
 
 // Input: (1, 'developer'), (1, 'java'), (1, 'flink')
@@ -511,104 +532,73 @@ TableDescriptor.builder()
 // Result: (1, true) -- At least one value is true
 ```
 
-## Advanced Configuration
+## Delete Behavior
 
-### Default Aggregate Function
-
-You can set a default aggregate function for all non-primary key fields that don't have an explicitly specified function:
-
-```java
-Schema schema = Schema.newBuilder()
-    .column("id", DataTypes.BIGINT())
-    .column("col1", DataTypes.STRING())  // Defaults to LAST_VALUE_IGNORE_NULLS
-    .column("col2", DataTypes.BIGINT(), AggFunction.SUM)  // Explicitly set to SUM
-    .primaryKey("id")
-    .build();
-
-TableDescriptor.builder()
-    .schema(schema)
-    .property("table.merge-engine", "aggregation")
-    .build();
-```
-
-In this example:
-- `col2` uses `sum` aggregation (explicitly specified)
-- `col1` uses `last_value_ignore_nulls` as the default
-
-### Partial Update with Aggregation
-
-The aggregation merge engine supports partial updates through the UpsertWriter API. When performing a partial update:
-
-- **Target columns**: These columns will be aggregated according to their configured aggregate functions
-- **Non-target columns**: These columns will retain their existing values from the old row
-
-**Example:**
-
-```java
-Schema schema = Schema.newBuilder()
-    .column("id", DataTypes.BIGINT())
-    .column("count1", DataTypes.BIGINT(), AggFunction.SUM)
-    .column("count2", DataTypes.BIGINT(), AggFunction.SUM)
-    .column("sum1", DataTypes.DOUBLE(), AggFunction.SUM)
-    .column("sum2", DataTypes.DOUBLE(), AggFunction.SUM)
-    .primaryKey("id")
-    .build();
-
-TableDescriptor tableDescriptor = TableDescriptor.builder()
-    .schema(schema)
-    .property("table.merge-engine", "aggregation")
-    .build();
-
-// Create partial update writer targeting only id, count1, and sum1
-UpsertWriter partialWriter = table.newUpsert()
-    .partialUpdate("id", "count1", "sum1")
-    .createWriter();
-
-// When writing:
-// - count1 and sum1 will be aggregated with existing values
-// - count2 and sum2 will remain unchanged
-```
-
-**Use cases for partial aggregation**:
-1. **Independent metrics**: When different processes update different subsets of metrics for the same key
-2. **Reduced data transfer**: Only send the columns that need to be updated
-3. **Flexible pipelines**: Different data sources can contribute to different aggregated fields
-
-### Delete Behavior
-
-The aggregation merge engine provides limited support for delete operations. You can configure the behavior using the `'table.agg.remove-record-on-delete'` option:
+The aggregation merge engine provides limited support for delete operations. You can configure the behavior using the `'table.delete.behavior'` option:
 
 ```java
 TableDescriptor.builder()
     .schema(schema)
     .property("table.merge-engine", "aggregation")
-    .property("table.agg.remove-record-on-delete", "true")  // Default is false
+    .property("table.delete.behavior", "allow")  // Enable delete operations
     .build();
 ```
 
 **Configuration options**:
-- **`'table.agg.remove-record-on-delete' = 'false'`** (default): Delete operations will cause an error
-- **`'table.agg.remove-record-on-delete' = 'true'`**: Delete operations will remove the entire record from the table
+- **`'table.delete.behavior' = 'ignore'`** (default): Delete operations will be silently ignored without error
+- **`'table.delete.behavior' = 'disable'`**: Delete operations will be rejected with a clear error message
+- **`'table.delete.behavior' = 'allow'`**: Delete operations will remove records based on the update mode (see details below)
+
+### Delete Behavior with Different Update Modes
+
+When `'table.delete.behavior' = 'allow'`, the actual delete behavior depends on whether you are using **full update** or **partial update**:
+
+**Full Update (Default Write Mode)**:
+- Delete operations remove the **entire record** from the table
+- All aggregated values for that primary key are permanently lost
+
+**Example**:
+```java
+// Full update mode (default)
+UpsertWriter writer = table.newUpsert().createWriter();
+writer.delete(primaryKeyRow);  // Removes the entire record
+```
+
+**Partial Update Mode**:
+- Delete operations perform a **partial delete** on target columns only
+- **Target columns** (except primary key): Set to null
+- **Non-target columns**: Remain unchanged
+- **Special case**: If all non-target columns are null after the delete, the entire record is removed
+
+**Example**:
+```java
+// Partial update mode - only targeting specific columns
+UpsertWriter partialWriter = table.newUpsert()
+    .partialUpdate("id", "count1", "sum1")  // Target columns
+    .createWriter();
+
+// Delete will:
+// - Set count1 and sum1 to null
+// - Keep count2 and sum2 unchanged (non-target columns)
+// - Remove entire record only if count2 and sum2 are both null
+partialWriter.delete(primaryKeyRow);
+```
 
 :::note
-**Current Limitation**: The aggregation merge engine does not support retraction semantics (e.g., subtracting from a sum, reverting a max). Delete operations can only remove the entire record or be rejected.
+**Current Limitation**: The aggregation merge engine does not support retraction semantics (e.g., subtracting from a sum, reverting a max). 
+
+- **Full update mode**: Delete operations can only remove the entire record
+- **Partial update mode**: Delete operations can only null out target columns, not retract aggregated values
 
 Future versions may support fine-grained retraction by enhancing the protocol to carry row data with delete operations.
 :::
-
-## Performance Considerations
-
-1. **Choose Appropriate Aggregate Functions**: Select functions that match your use case to avoid unnecessary computations
-2. **Primary Key Design**: Use appropriate primary keys to ensure proper grouping of aggregated data
-3. **Null Handling**: Be aware of how each function handles null values to avoid unexpected results
-4. **Delete Handling**: If you need to handle delete operations, be aware that enabling `'table.agg.remove-record-on-delete' = 'true'` will remove entire records rather than retracting aggregated values
 
 ## Limitations
 
 :::warning Critical Limitations
 When using the `aggregation` merge engine, be aware of the following critical limitations:
 
-### 1. Exactly-Once Semantics
+### Exactly-Once Semantics
 
 When writing to an aggregate merge engine table using the Flink engine, Fluss does provide exactly-once guarantees. Thanks to Flink's checkpointing mechanism, in the event of a failure and recovery, the Flink connector automatically performs an undo operation to roll back the table state to what it was at the last successful checkpoint. This ensures no over-counting or under-counting: data remains consistent and accurate.
 
@@ -616,11 +606,6 @@ However, when using the Fluss client API directly (outside of Flink), exactly-on
 
 For detailed information about Exactly-Once implementation, please refer to: [FIP-21: Aggregation Merge Engine](https://cwiki.apache.org/confluence/display/FLUSS/FIP-21%3A+Aggregation+Merge+Engine)
 
-### 2. Delete Operations
-
-By default, delete operations will cause errors:
-- You must set `'table.agg.remove-record-on-delete' = 'true'` if you need to handle delete operations
-- This configuration will remove the entire aggregated record, not reverse individual aggregations
 :::
 
 ## See Also

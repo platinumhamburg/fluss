@@ -17,7 +17,7 @@
 
 package org.apache.fluss.utils.json;
 
-import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.types.DataTypes;
 
@@ -93,12 +93,12 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
     static final Schema SCHEMA_WITH_AGG =
             Schema.newBuilder()
                     .column("product_id", DataTypes.BIGINT().copy(false))
-                    .column("total_sales", DataTypes.BIGINT(), AggFunction.SUM)
-                    .column("max_price", DataTypes.DECIMAL(10, 2), AggFunction.MAX)
+                    .column("total_sales", DataTypes.BIGINT(), AggFunctions.SUM())
+                    .column("max_price", DataTypes.DECIMAL(10, 2), AggFunctions.MAX())
                     .column(
                             "last_update_time",
                             DataTypes.TIMESTAMP(),
-                            AggFunction.LAST_VALUE_IGNORE_NULLS)
+                            AggFunctions.LAST_VALUE_IGNORE_NULLS())
                     .primaryKey("product_id")
                     .build();
 
@@ -165,12 +165,12 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
         // Test deserialization
         Schema deserialized = Schema.fromJsonBytes(jsonBytes);
         assertThat(deserialized.getAggFunction("total_sales")).isPresent();
-        assertThat(deserialized.getAggFunction("total_sales").get()).isEqualTo(AggFunction.SUM);
+        assertThat(deserialized.getAggFunction("total_sales").get()).isEqualTo(AggFunctions.SUM());
         assertThat(deserialized.getAggFunction("max_price")).isPresent();
-        assertThat(deserialized.getAggFunction("max_price").get()).isEqualTo(AggFunction.MAX);
+        assertThat(deserialized.getAggFunction("max_price").get()).isEqualTo(AggFunctions.MAX());
         assertThat(deserialized.getAggFunction("last_update_time")).isPresent();
         assertThat(deserialized.getAggFunction("last_update_time").get())
-                .isEqualTo(AggFunction.LAST_VALUE_IGNORE_NULLS);
+                .isEqualTo(AggFunctions.LAST_VALUE_IGNORE_NULLS());
         assertThat(deserialized.getAggFunction("product_id"))
                 .isEmpty(); // Primary key has no agg function
 

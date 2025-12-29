@@ -22,7 +22,6 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
-import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.types.StringType;
 import org.apache.fluss.utils.BinaryStringUtils;
@@ -34,12 +33,10 @@ public class FieldListaggAgg extends FieldAggregator {
 
     private final BinaryString delimiter;
 
-    public FieldListaggAgg(String name, StringType dataType, TableConfig options, String field) {
+    public FieldListaggAgg(String name, StringType dataType, String delimiter) {
         super(name, dataType);
-        // Read delimiter from configuration: table.merge-engine.aggregate.<field>.listagg-delimiter
-        // Default to comma if not configured
         // Cache delimiter as BinaryString to avoid repeated conversions
-        this.delimiter = BinaryString.fromString(options.getFieldListaggDelimiter(field));
+        this.delimiter = BinaryString.fromString(delimiter);
     }
 
     @Override

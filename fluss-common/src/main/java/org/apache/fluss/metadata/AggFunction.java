@@ -19,93 +19,112 @@ package org.apache.fluss.metadata;
 
 import org.apache.fluss.annotation.PublicEvolving;
 
-import java.util.Locale;
+import javax.annotation.Nullable;
+
+import java.io.Serializable;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
 
 /**
- * Aggregation function for aggregate merge engine.
+ * Aggregation function with optional parameters for aggregate merge engine.
  *
- * <p>This enum represents all supported aggregation functions that can be applied to non-primary
- * key columns in aggregation merge engine tables.
+ * <p>This class represents a parameterized aggregation function that can be applied to non-primary
+ * key columns in aggregation merge engine tables. It encapsulates both the function type and
+ * function-specific parameters (e.g., delimiter for LISTAGG).
+ *
+ * <p>Use {@link AggFunctions} utility class to create instances:
+ *
+ * <pre>{@code
+ * AggFunction sumFunc = AggFunctions.SUM();
+ * AggFunction listaggFunc = AggFunctions.LISTAGG(";");
+ * }</pre>
+ *
+ * @since 0.9
  */
 @PublicEvolving
-public enum AggFunction {
-    // Numeric aggregation
-    SUM("sum"),
-    PRODUCT("product"),
-    MAX("max"),
-    MIN("min"),
+public final class AggFunction implements Serializable {
 
-    // Value selection
-    LAST_VALUE("last_value"),
-    LAST_VALUE_IGNORE_NULLS("last_value_ignore_nulls"),
-    FIRST_VALUE("first_value"),
-    FIRST_VALUE_IGNORE_NULLS("first_value_ignore_nulls"),
+    private static final long serialVersionUID = 1L;
 
-    // String aggregation
-    LISTAGG("listagg"),
-    STRING_AGG("string_agg"), // Alias for LISTAGG - maps to same factory
+    private final AggFunctionType type;
+    private final Map<String, String> parameters;
 
-    // Boolean aggregation
-    BOOL_AND("bool_and"),
-    BOOL_OR("bool_or");
-
-    private final String identifier;
-
-    AggFunction(String identifier) {
-        this.identifier = identifier;
+    /**
+     * Creates an aggregation function with the specified type and parameters.
+     *
+     * @param type the aggregation function type
+     * @param parameters the function parameters (nullable)
+     */
+    AggFunction(AggFunctionType type, @Nullable Map<String, String> parameters) {
+        this.type = Objects.requireNonNull(type, "Aggregation function type must not be null");
+        this.parameters =
+                parameters == null || parameters.isEmpty()
+                        ? Collections.emptyMap()
+                        : Collections.unmodifiableMap(new HashMap<>(parameters));
     }
 
     /**
-     * Returns the identifier string for this aggregation function.
+     * Returns the aggregation function type.
      *
-     * @return the identifier string
+     * @return the function type
      */
-    public String getIdentifier() {
-        return identifier;
+    public AggFunctionType getType() {
+        return type;
     }
 
     /**
-     * Converts a string to an AggFunction enum value.
+     * Returns the function parameters.
      *
-     * <p>This method supports multiple naming formats:
-     *
-     * <ul>
-     *   <li>Underscore format: "last_value_ignore_nulls"
-     *   <li>Hyphen format: "last-value-ignore-nulls"
-     *   <li>Case insensitive matching
-     * </ul>
-     *
-     * <p>Note: For string_agg, this will return STRING_AGG enum, but the server-side factory will
-     * map it to the same implementation as listagg.
-     *
-     * @param name the aggregation function name
-     * @return the AggFunction enum value, or null if not found
+     * @return an immutable map of parameters
      */
-    public static AggFunction fromString(String name) {
-        if (name == null || name.trim().isEmpty()) {
-            return null;
+    public Map<String, String> getParameters() {
+        return parameters;
+    }
+
+    /**
+     * Gets a specific parameter value.
+     *
+     * @param key the parameter key
+     * @return the parameter value, or null if not found
+     */
+    @Nullable
+    public String getParameter(String key) {
+        return parameters.get(key);
+    }
+
+    /**
+     * Checks if this function has any parameters.
+     *
+     * @return true if parameters are present, false otherwise
+     */
+    public boolean hasParameters() {
+        return !parameters.isEmpty();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
         }
-
-        // Normalize the input: convert hyphens to underscores and lowercase
-        String normalized = name.replace('-', '_').toLowerCase(Locale.ROOT).trim();
-
-        // Try direct match with identifier
-        for (AggFunction aggFunc : values()) {
-            if (aggFunc.identifier.equals(normalized)) {
-                return aggFunc;
-            }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
         }
-
-        return null;
+        AggFunction that = (AggFunction) o;
+        return type == that.type && parameters.equals(that.parameters);
     }
 
-    /**
-     * Converts this AggFunction to its string identifier.
-     *
-     * @return the identifier string
-     */
+    @Override
+    public int hashCode() {
+        return Objects.hash(type, parameters);
+    }
+
     @Override
     public String toString() {
-        return identifier;
+        if (parameters.isEmpty()) {
+            return type.getIdentifier();
+        }
+        return type.getIdentifier() + parameters;
     }
 }

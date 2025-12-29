@@ -17,6 +17,8 @@
 
 package org.apache.fluss.config;
 
+import org.apache.fluss.metadata.DeleteBehavior;
+
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -50,16 +52,21 @@ class TableConfigTest {
     }
 
     @Test
-    void testAggregationRemoveRecordOnDelete() {
+    void testDeleteBehavior() {
         Configuration conf = new Configuration();
         TableConfig tableConfig = new TableConfig(conf);
 
-        // Test default value (false)
-        assertThat(tableConfig.getAggregationRemoveRecordOnDelete()).isFalse();
+        // Test default value (empty optional since not set)
+        assertThat(tableConfig.getDeleteBehavior()).isEmpty();
 
         // Test configured value
-        conf.set(ConfigOptions.TABLE_AGG_REMOVE_RECORD_ON_DELETE, true);
+        conf.set(ConfigOptions.TABLE_DELETE_BEHAVIOR, DeleteBehavior.ALLOW);
         TableConfig tableConfig2 = new TableConfig(conf);
-        assertThat(tableConfig2.getAggregationRemoveRecordOnDelete()).isTrue();
+        assertThat(tableConfig2.getDeleteBehavior()).hasValue(DeleteBehavior.ALLOW);
+
+        // Test IGNORE
+        conf.set(ConfigOptions.TABLE_DELETE_BEHAVIOR, DeleteBehavior.IGNORE);
+        TableConfig tableConfig3 = new TableConfig(conf);
+        assertThat(tableConfig3.getDeleteBehavior()).hasValue(DeleteBehavior.IGNORE);
     }
 }

@@ -17,15 +17,14 @@
 
 package org.apache.fluss.server.kv.rowmerger.aggregate;
 
-import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.server.kv.rowmerger.aggregate.factory.FieldAggregatorFactory;
-import org.apache.fluss.server.kv.rowmerger.aggregate.factory.FieldLastNonNullValueAggFactory;
-import org.apache.fluss.server.kv.rowmerger.aggregate.factory.FieldPrimaryKeyAggFactory;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldAggregator;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
@@ -205,12 +204,10 @@ public class AggregationContext {
      * Create an aggregation context for a given schema.
      *
      * @param schema the schema
-     * @param tableConfig the table configuration
      * @param kvFormat the KV format
      * @return the aggregation context
      */
-    public static AggregationContext create(
-            Schema schema, TableConfig tableConfig, KvFormat kvFormat) {
+    public static AggregationContext create(Schema schema, KvFormat kvFormat) {
         RowType rowType = schema.getRowType();
         int fieldCount = rowType.getFieldCount();
 
@@ -222,7 +219,7 @@ public class AggregationContext {
         }
 
         // Create aggregators
-        FieldAggregator[] aggregators = createAggregators(schema, tableConfig);
+        FieldAggregator[] aggregators = createAggregators(schema);
 
         // Create row encoder
         RowEncoder rowEncoder = RowEncoder.create(kvFormat, rowType);
@@ -233,14 +230,13 @@ public class AggregationContext {
     /**
      * Creates an array of field aggregators for all fields in the schema.
      *
-     * <p>This method reads aggregation functions from the Schema object (preferred) and falls back
-     * to table configuration for backward compatibility.
+     * <p>This method reads aggregation functions from the Schema object and creates the appropriate
+     * aggregators with their parameters.
      *
      * @param schema the Schema object containing column definitions and aggregation functions
-     * @param tableConfig the table configuration (used as fallback for backward compatibility)
      * @return an array of field aggregators, one for each field
      */
-    private static FieldAggregator[] createAggregators(Schema schema, TableConfig tableConfig) {
+    private static FieldAggregator[] createAggregators(Schema schema) {
         RowType rowType = schema.getRowType();
         List<String> primaryKeys = schema.getPrimaryKeyColumnNames();
         List<String> fieldNames = rowType.getFieldNames();
@@ -252,19 +248,18 @@ public class AggregationContext {
             String fieldName = fieldNames.get(i);
             DataType fieldType = rowType.getTypeAt(i);
 
-            // Determine the aggregate function name for this field
-            String aggFuncName = getAggFuncName(fieldName, primaryKeys, schema);
+            // Get the aggregate function for this field
+            AggFunction aggFunc = getAggFunction(fieldName, primaryKeys, schema);
 
-            // Create the aggregator using the factory
-            aggregators[i] =
-                    FieldAggregatorFactory.create(fieldType, fieldName, aggFuncName, tableConfig);
+            // Create the aggregator using the factory with the parameterized function
+            aggregators[i] = FieldAggregatorFactory.create(fieldType, fieldName, aggFunc);
         }
 
         return aggregators;
     }
 
     /**
-     * Determines the aggregate function name for a field.
+     * Determines the aggregate function for a field.
      *
      * <p>The priority is:
      *
@@ -277,25 +272,23 @@ public class AggregationContext {
      * @param fieldName the field name
      * @param primaryKeys the list of primary key field names
      * @param schema the Schema object
-     * @return the aggregate function name to use
+     * @return the aggregate function to use
      */
-    private static String getAggFuncName(
+    private static AggFunction getAggFunction(
             String fieldName, List<String> primaryKeys, Schema schema) {
 
         // 1. Primary key fields don't aggregate
         if (primaryKeys.contains(fieldName)) {
-            // "primary-key"
-            return FieldPrimaryKeyAggFactory.NAME;
+            return AggFunctions.of(AggFunctionType.LAST_VALUE);
         }
 
         // 2. Check Schema for aggregation function (from Column)
         Optional<AggFunction> schemaAggFunc = schema.getAggFunction(fieldName);
         if (schemaAggFunc.isPresent()) {
-            return schemaAggFunc.get().getIdentifier();
+            return schemaAggFunc.get();
         }
 
         // 3. Final fallback - use default aggregation function
-        // "last_value_ignore_nulls"
-        return FieldLastNonNullValueAggFactory.NAME;
+        return AggFunctions.LAST_VALUE_IGNORE_NULLS();
     }
 }

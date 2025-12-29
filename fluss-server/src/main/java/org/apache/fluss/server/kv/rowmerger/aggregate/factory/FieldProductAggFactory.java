@@ -22,7 +22,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
-import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldProductAgg;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeFamily;
@@ -35,7 +35,7 @@ public class FieldProductAggFactory implements FieldAggregatorFactory {
     public static final String NAME = "product";
 
     @Override
-    public FieldProductAgg create(DataType fieldType, TableConfig options, String field) {
+    public FieldProductAgg create(DataType fieldType, AggFunction aggFunction, String field) {
         checkArgument(
                 fieldType.getTypeRoot().getFamilies().contains(DataTypeFamily.NUMERIC),
                 "Data type for product column must be 'NumericType' but was '%s'.",

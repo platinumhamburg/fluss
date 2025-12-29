@@ -22,7 +22,7 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
-import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -1022,9 +1022,9 @@ class KvTabletTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("a", DataTypes.INT())
-                        .column("count", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("max_val", DataTypes.INT(), AggFunction.MAX)
-                        .column("name", DataTypes.STRING(), AggFunction.LAST_VALUE)
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("max_val", DataTypes.INT(), AggFunctions.MAX())
+                        .column("name", DataTypes.STRING(), AggFunctions.LAST_VALUE())
                         .primaryKey("a")
                         .build();
 

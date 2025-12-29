@@ -19,7 +19,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate;
 
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
-import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.record.BinaryValue;
@@ -69,7 +69,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.SUM)
+                        .column("value", dataType, AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -111,7 +111,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.SUM)
+                        .column("value", dataType, AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -155,7 +155,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.PRODUCT)
+                        .column("value", dataType, AggFunctions.PRODUCT())
                         .primaryKey("id")
                         .build();
 
@@ -205,7 +205,7 @@ class FieldAggregatorParameterizedTest {
         Schema schemaMax =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.MAX)
+                        .column("value", dataType, AggFunctions.MAX())
                         .primaryKey("id")
                         .build();
 
@@ -225,7 +225,7 @@ class FieldAggregatorParameterizedTest {
         Schema schemaMin =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.MIN)
+                        .column("value", dataType, AggFunctions.MIN())
                         .primaryKey("id")
                         .build();
 
@@ -317,7 +317,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.LAST_VALUE)
+                        .column("value", dataType, AggFunctions.LAST_VALUE())
                         .primaryKey("id")
                         .build();
 
@@ -408,7 +408,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.LAST_VALUE_IGNORE_NULLS)
+                        .column("value", dataType, AggFunctions.LAST_VALUE_IGNORE_NULLS())
                         .primaryKey("id")
                         .build();
 
@@ -448,7 +448,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.FIRST_VALUE)
+                        .column("value", dataType, AggFunctions.FIRST_VALUE())
                         .primaryKey("id")
                         .build();
 
@@ -484,7 +484,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", dataType, AggFunction.FIRST_VALUE_IGNORE_NULLS)
+                        .column("value", dataType, AggFunctions.FIRST_VALUE_IGNORE_NULLS())
                         .primaryKey("id")
                         .build();
 
@@ -525,7 +525,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.BOOLEAN(), AggFunction.BOOL_AND)
+                        .column("value", DataTypes.BOOLEAN(), AggFunctions.BOOL_AND())
                         .primaryKey("id")
                         .build();
 
@@ -557,7 +557,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.BOOLEAN(), AggFunction.BOOL_OR)
+                        .column("value", DataTypes.BOOLEAN(), AggFunctions.BOOL_OR())
                         .primaryKey("id")
                         .build();
 
@@ -589,7 +589,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.BOOLEAN(), AggFunction.BOOL_AND)
+                        .column("value", DataTypes.BOOLEAN(), AggFunctions.BOOL_AND())
                         .primaryKey("id")
                         .build();
 
@@ -609,7 +609,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.BOOLEAN(), AggFunction.BOOL_OR)
+                        .column("value", DataTypes.BOOLEAN(), AggFunctions.BOOL_OR())
                         .primaryKey("id")
                         .build();
 
@@ -633,7 +633,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.STRING(), AggFunction.LISTAGG)
+                        .column("value", DataTypes.STRING(), AggFunctions.LISTAGG())
                         .primaryKey("id")
                         .build();
 
@@ -658,7 +658,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.STRING(), AggFunction.LISTAGG)
+                        .column("value", DataTypes.STRING(), AggFunctions.LISTAGG())
                         .primaryKey("id")
                         .build();
 
@@ -684,7 +684,7 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.STRING(), AggFunction.LISTAGG)
+                        .column("value", DataTypes.STRING(), AggFunctions.LISTAGG())
                         .primaryKey("id")
                         .build();
 

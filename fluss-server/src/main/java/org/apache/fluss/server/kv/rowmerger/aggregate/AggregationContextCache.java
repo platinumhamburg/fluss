@@ -17,7 +17,6 @@
 
 package org.apache.fluss.server.kv.rowmerger.aggregate;
 
-import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -35,13 +34,10 @@ public class AggregationContextCache {
 
     private final Cache<Integer, AggregationContext> contexts;
     private final SchemaGetter schemaGetter;
-    private final TableConfig tableConfig;
     private final KvFormat kvFormat;
 
-    public AggregationContextCache(
-            SchemaGetter schemaGetter, TableConfig tableConfig, KvFormat kvFormat) {
+    public AggregationContextCache(SchemaGetter schemaGetter, KvFormat kvFormat) {
         this.schemaGetter = schemaGetter;
-        this.tableConfig = tableConfig;
         this.kvFormat = kvFormat;
         // Limit cache size to prevent memory leak, and expire entries after 5 minutes of inactivity
         this.contexts =
@@ -81,7 +77,6 @@ public class AggregationContextCache {
      * @return the aggregation context
      */
     public AggregationContext getOrCreateContext(int schemaId, Schema schema) {
-        return contexts.get(
-                schemaId, k -> AggregationContext.create(schema, tableConfig, kvFormat));
+        return contexts.get(schemaId, k -> AggregationContext.create(schema, kvFormat));
     }
 }

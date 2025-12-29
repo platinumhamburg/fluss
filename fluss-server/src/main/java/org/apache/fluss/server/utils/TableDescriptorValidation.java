@@ -395,16 +395,24 @@ public class TableDescriptorValidation {
 
         // For tables with merge engines, automatically set appropriate delete behavior
         MergeEngineType mergeEngine = tableConf.get(ConfigOptions.TABLE_MERGE_ENGINE);
-        if (mergeEngine == MergeEngineType.FIRST_ROW || mergeEngine == MergeEngineType.VERSIONED) {
-            // For FIRST_ROW and VERSIONED merge engines, delete operations are not supported
-            // If user explicitly sets delete behavior to ALLOW, throw an exception
+        if (mergeEngine == MergeEngineType.FIRST_ROW
+                || mergeEngine == MergeEngineType.VERSIONED
+                || mergeEngine == MergeEngineType.AGGREGATE) {
+            // For FIRST_ROW, VERSIONED and AGGREGATE merge engines, delete operations are not
+            // supported by default
+            // If user explicitly sets delete behavior to ALLOW, validate it
             if (deleteBehaviorOptional.isPresent()
                     && deleteBehaviorOptional.get() == DeleteBehavior.ALLOW) {
-                throw new InvalidConfigException(
-                        String.format(
-                                "Table with '%s' merge engine does not support delete operations. "
-                                        + "The 'table.delete.behavior' config must be set to 'ignore' or 'disable', but got 'allow'.",
-                                mergeEngine));
+                // For FIRST_ROW and VERSIONED, ALLOW is not permitted
+                if (mergeEngine == MergeEngineType.FIRST_ROW
+                        || mergeEngine == MergeEngineType.VERSIONED) {
+                    throw new InvalidConfigException(
+                            String.format(
+                                    "Table with '%s' merge engine does not support delete operations. "
+                                            + "The 'table.delete.behavior' config must be set to 'ignore' or 'disable', but got 'allow'.",
+                                    mergeEngine));
+                }
+                // For AGGREGATE, ALLOW is permitted (removes entire record)
             }
         }
     }

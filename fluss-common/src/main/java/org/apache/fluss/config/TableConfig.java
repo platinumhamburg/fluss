@@ -119,15 +119,6 @@ public class TableConfig {
     }
 
     /**
-     * Whether to remove record on delete for aggregate merge engine.
-     *
-     * @return true if record should be removed on delete, false otherwise
-     */
-    public boolean getAggregationRemoveRecordOnDelete() {
-        return config.get(ConfigOptions.TABLE_AGG_REMOVE_RECORD_ON_DELETE);
-    }
-
-    /**
      * Gets the listagg delimiter for a specific field in aggregate merge engine.
      *
      * <p>This method dynamically constructs the ConfigOption for field-specific delimiter. The

@@ -22,7 +22,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
-import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldAggregator;
 import org.apache.fluss.types.DataType;
 
@@ -34,14 +34,14 @@ import java.util.ServiceLoader;
 public interface FieldAggregatorFactory {
 
     /**
-     * Creates a field aggregator.
+     * Creates a field aggregator with parameters from AggFunction.
      *
      * @param fieldType the data type of the field
-     * @param options the table configuration
+     * @param aggFunction the aggregation function with parameters
      * @param field the field name
      * @return the field aggregator
      */
-    FieldAggregator create(DataType fieldType, TableConfig options, String field);
+    FieldAggregator create(DataType fieldType, AggFunction aggFunction, String field);
 
     /**
      * Returns the unique identifier for this factory.
@@ -51,25 +51,24 @@ public interface FieldAggregatorFactory {
     String identifier();
 
     /**
-     * Creates a field aggregator for the given field.
+     * Creates a field aggregator for the given field with parameterized aggregate function.
      *
      * @param fieldType the data type of the field
      * @param fieldName the field name
-     * @param aggFuncName the aggregation function name
-     * @param options the table configuration
+     * @param aggFunction the aggregation function with parameters
      * @return the field aggregator
      */
-    static FieldAggregator create(
-            DataType fieldType, String fieldName, String aggFuncName, TableConfig options) {
-        FieldAggregatorFactory factory = getFactory(aggFuncName);
+    static FieldAggregator create(DataType fieldType, String fieldName, AggFunction aggFunction) {
+        String identifier = aggFunction.getType().getIdentifier();
+        FieldAggregatorFactory factory = getFactory(identifier);
         if (factory == null) {
             throw new IllegalArgumentException(
                     String.format(
                             "Unsupported aggregation function: %s or spell aggregate function incorrectly!",
-                            aggFuncName));
+                            identifier));
         }
 
-        return factory.create(fieldType, options, fieldName);
+        return factory.create(fieldType, aggFunction, fieldName);
     }
 
     /**

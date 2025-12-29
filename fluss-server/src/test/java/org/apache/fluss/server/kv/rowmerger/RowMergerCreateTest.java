@@ -20,7 +20,7 @@ package org.apache.fluss.server.kv.rowmerger;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
-import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.MergeEngineType;
@@ -49,7 +49,7 @@ class RowMergerCreateTest {
     private static final Schema TEST_SCHEMA =
             Schema.newBuilder()
                     .column("id", DataTypes.INT())
-                    .column("value", DataTypes.BIGINT(), AggFunction.SUM)
+                    .column("value", DataTypes.BIGINT(), AggFunctions.SUM())
                     .primaryKey("id")
                     .build();
 
@@ -62,7 +62,7 @@ class RowMergerCreateTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.BIGINT(), AggFunction.MAX)
+                        .column("value", DataTypes.BIGINT(), AggFunctions.MAX())
                         .primaryKey("id")
                         .build();
 
@@ -86,18 +86,19 @@ class RowMergerCreateTest {
     }
 
     @Test
-    void testCreateAggregateRowMergerWithRemoveRecordOnDelete() {
+    void testCreateAggregateRowMergerWithDeleteBehaviorAllow() {
         Configuration conf = new Configuration();
         conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATE.name());
-        conf.setBoolean(ConfigOptions.TABLE_AGG_REMOVE_RECORD_ON_DELETE, true);
+        conf.set(ConfigOptions.TABLE_DELETE_BEHAVIOR, DeleteBehavior.ALLOW);
         TableConfig tableConfig = new TableConfig(conf);
 
         RowMerger merger =
                 RowMerger.create(tableConfig, KvFormat.COMPACTED, createSchemaGetter(TEST_SCHEMA));
 
         assertThat(merger).isInstanceOf(AggregateRowMerger.class);
+        assertThat(merger.deleteBehavior()).isEqualTo(DeleteBehavior.ALLOW);
 
-        // Verify delete behavior
+        // Verify delete behavior - should remove the record
         BinaryRow row = compactedRow(TEST_SCHEMA.getRowType(), new Object[] {1, 10L});
         BinaryValue deleted = merger.delete(toBinaryValue(row));
 
@@ -187,10 +188,10 @@ class RowMergerCreateTest {
                 Schema.newBuilder()
                         .column("id1", DataTypes.INT())
                         .column("id2", DataTypes.STRING())
-                        .column("sum_count", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("max_val", DataTypes.INT(), AggFunction.MAX)
-                        .column("min_val", DataTypes.INT(), AggFunction.MIN)
-                        .column("last_name", DataTypes.STRING(), AggFunction.LAST_VALUE)
+                        .column("sum_count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("max_val", DataTypes.INT(), AggFunctions.MAX())
+                        .column("min_val", DataTypes.INT(), AggFunctions.MIN())
+                        .column("last_name", DataTypes.STRING(), AggFunctions.LAST_VALUE())
                         .primaryKey("id1", "id2")
                         .build();
 

@@ -22,7 +22,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
-import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldListaggAgg;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.StringType;
@@ -39,14 +39,22 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 public class FieldStringAggFactory implements FieldAggregatorFactory {
 
     public static final String NAME = "string_agg";
+    private static final String DEFAULT_DELIMITER = ",";
 
     @Override
-    public FieldListaggAgg create(DataType fieldType, TableConfig options, String field) {
+    public FieldListaggAgg create(DataType fieldType, AggFunction aggFunction, String field) {
         checkArgument(
                 fieldType instanceof StringType,
                 "Data type for string_agg column must be 'StringType' but was '%s'.",
                 fieldType);
-        return new FieldListaggAgg(identifier(), (StringType) fieldType, options, field);
+
+        // Get delimiter from function parameters, default to comma
+        String delimiter = aggFunction.getParameter("delimiter");
+        if (delimiter == null) {
+            delimiter = DEFAULT_DELIMITER;
+        }
+
+        return new FieldListaggAgg(identifier(), (StringType) fieldType, delimiter);
     }
 
     @Override

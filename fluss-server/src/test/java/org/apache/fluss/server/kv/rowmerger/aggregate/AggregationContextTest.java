@@ -19,7 +19,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate;
 
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
-import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldBoolAndAgg;
@@ -53,8 +53,7 @@ class AggregationContextTest {
                         .build();
 
         TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregationContext context =
-                AggregationContext.create(schema, tableConfig, KvFormat.COMPACTED);
+        AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
 
         // First field is primary key, should use FieldPrimaryKeyAgg
         assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
@@ -68,13 +67,12 @@ class AggregationContextTest {
                 Schema.newBuilder()
                         .column("id1", DataTypes.INT())
                         .column("id2", DataTypes.STRING())
-                        .column("value", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("value", DataTypes.BIGINT(), AggFunctions.SUM())
                         .primaryKey("id1", "id2")
                         .build();
 
         TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregationContext context =
-                AggregationContext.create(schema, tableConfig, KvFormat.COMPACTED);
+        AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
 
         // Both primary key fields should not be aggregated
         assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
@@ -93,8 +91,7 @@ class AggregationContextTest {
 
         // No configuration at all
         TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregationContext context =
-                AggregationContext.create(schema, tableConfig, KvFormat.COMPACTED);
+        AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
 
         assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
         // Should default to last_value_ignore_nulls
@@ -106,30 +103,29 @@ class AggregationContextTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("sum_col", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("product_col", DataTypes.DOUBLE(), AggFunction.PRODUCT)
-                        .column("max_col", DataTypes.INT(), AggFunction.MAX)
-                        .column("min_col", DataTypes.INT(), AggFunction.MIN)
-                        .column("last_val_col", DataTypes.STRING(), AggFunction.LAST_VALUE)
+                        .column("sum_col", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("product_col", DataTypes.DOUBLE(), AggFunctions.PRODUCT())
+                        .column("max_col", DataTypes.INT(), AggFunctions.MAX())
+                        .column("min_col", DataTypes.INT(), AggFunctions.MIN())
+                        .column("last_val_col", DataTypes.STRING(), AggFunctions.LAST_VALUE())
                         .column(
                                 "last_nonnull_col",
                                 DataTypes.STRING(),
-                                AggFunction.LAST_VALUE_IGNORE_NULLS)
-                        .column("first_val_col", DataTypes.STRING(), AggFunction.FIRST_VALUE)
+                                AggFunctions.LAST_VALUE_IGNORE_NULLS())
+                        .column("first_val_col", DataTypes.STRING(), AggFunctions.FIRST_VALUE())
                         .column(
                                 "first_nonnull_col",
                                 DataTypes.STRING(),
-                                AggFunction.FIRST_VALUE_IGNORE_NULLS)
-                        .column("bool_and_col", DataTypes.BOOLEAN(), AggFunction.BOOL_AND)
-                        .column("bool_or_col", DataTypes.BOOLEAN(), AggFunction.BOOL_OR)
-                        .column("listagg_col", DataTypes.STRING(), AggFunction.LISTAGG)
-                        .column("string_agg_col", DataTypes.STRING(), AggFunction.STRING_AGG)
+                                AggFunctions.FIRST_VALUE_IGNORE_NULLS())
+                        .column("bool_and_col", DataTypes.BOOLEAN(), AggFunctions.BOOL_AND())
+                        .column("bool_or_col", DataTypes.BOOLEAN(), AggFunctions.BOOL_OR())
+                        .column("listagg_col", DataTypes.STRING(), AggFunctions.LISTAGG())
+                        .column("string_agg_col", DataTypes.STRING(), AggFunctions.STRING_AGG())
                         .primaryKey("id")
                         .build();
 
         TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregationContext context =
-                AggregationContext.create(schema, tableConfig, KvFormat.COMPACTED);
+        AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
 
         assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
         assertThat(context.getAggregators()[1]).isInstanceOf(FieldSumAgg.class);

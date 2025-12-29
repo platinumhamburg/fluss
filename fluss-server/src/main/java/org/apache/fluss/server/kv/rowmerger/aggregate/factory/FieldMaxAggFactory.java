@@ -22,7 +22,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
-import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldMaxAgg;
 import org.apache.fluss.types.DataType;
 
@@ -32,7 +32,7 @@ public class FieldMaxAggFactory implements FieldAggregatorFactory {
     public static final String NAME = "max";
 
     @Override
-    public FieldMaxAgg create(DataType fieldType, TableConfig options, String field) {
+    public FieldMaxAgg create(DataType fieldType, AggFunction aggFunction, String field) {
         return new FieldMaxAgg(identifier(), fieldType);
     }
 

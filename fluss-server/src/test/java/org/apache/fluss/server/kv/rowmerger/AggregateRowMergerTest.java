@@ -20,7 +20,7 @@ package org.apache.fluss.server.kv.rowmerger;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
-import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
@@ -34,7 +34,6 @@ import org.junit.jupiter.api.Test;
 
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link AggregateRowMerger}. */
 class AggregateRowMergerTest {
@@ -48,8 +47,8 @@ class AggregateRowMergerTest {
     private static final Schema SCHEMA_SUM =
             Schema.newBuilder()
                     .column("id", DataTypes.INT())
-                    .column("count", DataTypes.BIGINT(), AggFunction.SUM)
-                    .column("total", DataTypes.DOUBLE(), AggFunction.SUM)
+                    .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
+                    .column("total", DataTypes.DOUBLE(), AggFunctions.SUM())
                     .primaryKey("id")
                     .build();
 
@@ -61,10 +60,10 @@ class AggregateRowMergerTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("sum_count", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("sum_total", DataTypes.DOUBLE(), AggFunction.SUM)
-                        .column("max_val", DataTypes.INT(), AggFunction.MAX)
-                        .column("min_val", DataTypes.INT(), AggFunction.MIN)
+                        .column("sum_count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("sum_total", DataTypes.DOUBLE(), AggFunctions.SUM())
+                        .column("max_val", DataTypes.INT(), AggFunctions.MAX())
+                        .column("min_val", DataTypes.INT(), AggFunctions.MIN())
                         .column("name", DataTypes.STRING()) // defaults to last_value_ignore_nulls
                         .primaryKey("id")
                         .build();
@@ -112,7 +111,7 @@ class AggregateRowMergerTest {
     @Test
     void testDeleteBehaviorRemoveRecord() {
         Configuration conf = new Configuration();
-        conf.setBoolean(ConfigOptions.TABLE_AGG_REMOVE_RECORD_ON_DELETE, true);
+        conf.set(ConfigOptions.TABLE_DELETE_BEHAVIOR, DeleteBehavior.ALLOW);
         TableConfig tableConfig = new TableConfig(conf);
 
         AggregateRowMerger merger = createMerger(SCHEMA_SUM, tableConfig);
@@ -124,24 +123,24 @@ class AggregateRowMergerTest {
         // Enhanced assertion: verify complete removal
         assertThat(deleted).isNull();
         // Verify deleteBehavior is correctly configured
-        assertThat(merger.deleteBehavior()).isEqualTo(DeleteBehavior.IGNORE);
+        assertThat(merger.deleteBehavior()).isEqualTo(DeleteBehavior.ALLOW);
     }
 
     @Test
     void testDeleteBehaviorNotAllowed() {
-        // removeRecordOnDelete is false by default
+        // deleteBehavior defaults to IGNORE
         TableConfig tableConfig = new TableConfig(new Configuration());
 
         AggregateRowMerger merger = createMerger(SCHEMA_SUM, tableConfig);
 
-        BinaryRow row = compactedRow(ROW_TYPE_SUM, new Object[] {1, 5L, 10.5});
-
-        // Enhanced assertion: verify exception details and deleteBehavior
+        // Enhanced assertion: verify deleteBehavior
         assertThat(merger.deleteBehavior()).isEqualTo(DeleteBehavior.IGNORE);
-        assertThatThrownBy(() -> merger.delete(toBinaryValue(row)))
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("DELETE is not supported")
-                .hasMessageContaining("table.aggregation.remove-record-on-delete");
+        // Delete method should not be called when deleteBehavior is IGNORE,
+        // as KvTablet.processDeletion() will skip it.
+        // However, if called directly, it will remove the record.
+        BinaryRow row = compactedRow(ROW_TYPE_SUM, new Object[] {1, 5L, 10.5});
+        BinaryValue deleted = merger.delete(toBinaryValue(row));
+        assertThat(deleted).isNull();
     }
 
     @Test
@@ -149,7 +148,7 @@ class AggregateRowMergerTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("value", DataTypes.BIGINT(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -177,8 +176,8 @@ class AggregateRowMergerTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("count", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("total", DataTypes.DOUBLE(), AggFunction.SUM)
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("total", DataTypes.DOUBLE(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -222,24 +221,13 @@ class AggregateRowMergerTest {
     }
 
     @Test
-    void testDeleteBehavior() {
-        Configuration conf = new Configuration();
-        conf.setString(ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), "IGNORE");
-        TableConfig tableConfig = new TableConfig(conf);
-
-        AggregateRowMerger merger = createMerger(SCHEMA_SUM, tableConfig);
-
-        assertThat(merger.deleteBehavior()).isEqualTo(DeleteBehavior.IGNORE);
-    }
-
-    @Test
     void testPartialUpdateWithSchemaEvolutionAddColumn() {
         // Create old schema: id(columnId=0), count(columnId=1), total(columnId=2)
         Schema oldSchema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("count", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("total", DataTypes.DOUBLE(), AggFunction.SUM)
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("total", DataTypes.DOUBLE(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -257,21 +245,21 @@ class AggregateRowMergerTest {
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 1,
-                                                AggFunction.SUM),
+                                                AggFunctions.SUM()),
                                         // total: preserve columnId=2
                                         new Schema.Column(
                                                 "total",
                                                 DataTypes.DOUBLE(),
                                                 null,
                                                 2,
-                                                AggFunction.SUM),
+                                                AggFunctions.SUM()),
                                         // new_field: new column with columnId=3
                                         new Schema.Column(
                                                 "new_field",
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 3,
-                                                AggFunction.SUM)))
+                                                AggFunctions.SUM())))
                         .primaryKey("id")
                         .build();
 
@@ -329,7 +317,7 @@ class AggregateRowMergerTest {
         Schema oldSchema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("count", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -347,14 +335,14 @@ class AggregateRowMergerTest {
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 1,
-                                                AggFunction.SUM),
+                                                AggFunctions.SUM()),
                                         // new_field: new column with columnId=2
                                         new Schema.Column(
                                                 "new_field",
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 2,
-                                                AggFunction.SUM)))
+                                                AggFunctions.SUM())))
                         .primaryKey("id")
                         .build();
 
@@ -405,8 +393,8 @@ class AggregateRowMergerTest {
         Schema oldSchema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("sum_count", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("max_val", DataTypes.INT(), AggFunction.MAX)
+                        .column("sum_count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("max_val", DataTypes.INT(), AggFunctions.MAX())
                         .primaryKey("id")
                         .build();
 
@@ -424,28 +412,28 @@ class AggregateRowMergerTest {
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 1,
-                                                AggFunction.SUM),
+                                                AggFunctions.SUM()),
                                         // max_val: preserve columnId=2
                                         new Schema.Column(
                                                 "max_val",
                                                 DataTypes.INT(),
                                                 null,
                                                 2,
-                                                AggFunction.MAX),
+                                                AggFunctions.MAX()),
                                         // min_val: new column with columnId=3
                                         new Schema.Column(
                                                 "min_val",
                                                 DataTypes.INT(),
                                                 null,
                                                 3,
-                                                AggFunction.MIN),
+                                                AggFunctions.MIN()),
                                         // new_sum: new column with columnId=4
                                         new Schema.Column(
                                                 "new_sum",
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 4,
-                                                AggFunction.SUM)))
+                                                AggFunctions.SUM())))
                         .primaryKey("id")
                         .build();
 
@@ -512,13 +500,17 @@ class AggregateRowMergerTest {
                                 java.util.Arrays.asList(
                                         new Schema.Column("id", DataTypes.INT(), null, 0),
                                         new Schema.Column(
-                                                "age", DataTypes.INT(), null, 2, AggFunction.SUM),
+                                                "age",
+                                                DataTypes.INT(),
+                                                null,
+                                                2,
+                                                AggFunctions.SUM()),
                                         new Schema.Column(
                                                 "name",
                                                 DataTypes.STRING(),
                                                 null,
                                                 1,
-                                                AggFunction.LAST_VALUE)))
+                                                AggFunctions.LAST_VALUE())))
                         .primaryKey("id")
                         .build();
 
@@ -563,7 +555,7 @@ class AggregateRowMergerTest {
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("dropped", DataTypes.STRING())
-                        .column("count", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -578,7 +570,7 @@ class AggregateRowMergerTest {
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 2,
-                                                AggFunction.SUM)))
+                                                AggFunctions.SUM())))
                         .primaryKey("id")
                         .build();
 
@@ -627,7 +619,7 @@ class AggregateRowMergerTest {
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 2,
-                                                AggFunction.SUM)))
+                                                AggFunctions.SUM())))
                         .primaryKey("id")
                         .highestFieldId((short) 2)
                         .build();
@@ -643,13 +635,13 @@ class AggregateRowMergerTest {
                                                 DataTypes.STRING(),
                                                 null,
                                                 1,
-                                                AggFunction.LAST_VALUE),
+                                                AggFunctions.LAST_VALUE()),
                                         new Schema.Column(
                                                 "count",
                                                 DataTypes.BIGINT(),
                                                 null,
                                                 2,
-                                                AggFunction.SUM)))
+                                                AggFunctions.SUM())))
                         .primaryKey("id")
                         .build();
 
@@ -692,9 +684,9 @@ class AggregateRowMergerTest {
         Schema oldSchema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("a", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("b", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("c", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("a", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("b", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("c", DataTypes.BIGINT(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
@@ -705,11 +697,23 @@ class AggregateRowMergerTest {
                                 java.util.Arrays.asList(
                                         new Schema.Column("id", DataTypes.INT(), null, 0),
                                         new Schema.Column(
-                                                "c", DataTypes.BIGINT(), null, 3, AggFunction.SUM),
+                                                "c",
+                                                DataTypes.BIGINT(),
+                                                null,
+                                                3,
+                                                AggFunctions.SUM()),
                                         new Schema.Column(
-                                                "b", DataTypes.BIGINT(), null, 2, AggFunction.SUM),
+                                                "b",
+                                                DataTypes.BIGINT(),
+                                                null,
+                                                2,
+                                                AggFunctions.SUM()),
                                         new Schema.Column(
-                                                "a", DataTypes.BIGINT(), null, 1, AggFunction.SUM)))
+                                                "a",
+                                                DataTypes.BIGINT(),
+                                                null,
+                                                1,
+                                                AggFunctions.SUM())))
                         .primaryKey("id")
                         .build();
 
@@ -762,19 +766,20 @@ class AggregateRowMergerTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("target_sum", DataTypes.BIGINT(), AggFunction.SUM)
-                        .column("target_max", DataTypes.INT(), AggFunction.MAX)
+                        .column("target_sum", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .column("target_max", DataTypes.INT(), AggFunctions.MAX())
                         .column("non_target", DataTypes.STRING())
-                        .column("non_target_count", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("non_target_count", DataTypes.BIGINT(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
 
         short schemaId = SCHEMA_ID;
 
-        // ========== Scenario 1: removeRecordOnDelete = true ==========
+        // ========== Scenario 1: deleteBehavior = ALLOW, partial delete with non-target values
+        // ==========
         {
             Configuration conf = new Configuration();
-            conf.setBoolean(ConfigOptions.TABLE_AGG_REMOVE_RECORD_ON_DELETE, true);
+            conf.set(ConfigOptions.TABLE_DELETE_BEHAVIOR, DeleteBehavior.ALLOW);
             TableConfig tableConfig = new TableConfig(conf);
 
             AggregateRowMerger merger = createMerger(schema, tableConfig);
@@ -785,31 +790,28 @@ class AggregateRowMergerTest {
                     compactedRow(schema.getRowType(), new Object[] {1, 100L, 50, "keep", 200L});
             BinaryValue oldValue = new BinaryValue(schemaId, row);
 
-            // Should return null (remove entire record)
             BinaryValue deleted = partialMerger.delete(oldValue);
-            assertThat(deleted).isNull();
+
+            // Should perform partial delete: target columns (except PK) set to null, non-target
+            // columns kept
+            assertThat(deleted).isNotNull();
+            assertThat(deleted.schemaId).isEqualTo(schemaId);
+            assertThat(deleted.row.getFieldCount()).isEqualTo(5);
+
+            // Primary key should be kept
+            assertThat(deleted.row.getInt(0)).isEqualTo(1);
+
+            // Target columns (non-PK) should be set to null
+            assertThat(deleted.row.isNullAt(1)).isTrue(); // target_sum
+            assertThat(deleted.row.isNullAt(2)).isTrue(); // target_max
+
+            // Non-target columns should be kept unchanged
+            assertThat(deleted.row.getString(3).toString()).isEqualTo("keep");
+            assertThat(deleted.row.getLong(4)).isEqualTo(200L);
         }
 
-        // ========== Scenario 2: removeRecordOnDelete = false, all non-target columns are null
-        // ==========
-        {
-            TableConfig tableConfig = new TableConfig(new Configuration());
-            AggregateRowMerger merger = createMerger(schema, tableConfig);
-            RowMerger partialMerger =
-                    merger.configureTargetColumns(new int[] {0, 1, 2}, schemaId, schema);
-
-            // Row with only target columns having values, non-target columns are null
-            BinaryRow row =
-                    compactedRow(schema.getRowType(), new Object[] {1, 100L, 50, null, null});
-            BinaryValue oldValue = new BinaryValue(schemaId, row);
-
-            // Should return null (delete entire row since all non-target columns are null)
-            BinaryValue deleted = partialMerger.delete(oldValue);
-            assertThat(deleted).isNull();
-        }
-
-        // ========== Scenario 3: removeRecordOnDelete = false, partial delete (non-target columns
-        // have values) ==========
+        // ========== Scenario 2: deleteBehavior = IGNORE (default), partial delete with non-target
+        // values ==========
         {
             TableConfig tableConfig = new TableConfig(new Configuration());
             AggregateRowMerger merger = createMerger(schema, tableConfig);
@@ -842,36 +844,8 @@ class AggregateRowMergerTest {
             assertThat(deleted.row.getLong(4)).isEqualTo(200L);
         }
 
-        // ========== Scenario 4: removeRecordOnDelete = false, target columns include only primary
-        // key ==========
-        {
-            TableConfig tableConfig = new TableConfig(new Configuration());
-            AggregateRowMerger merger = createMerger(schema, tableConfig);
-            // Only primary key in target columns
-            RowMerger partialMerger =
-                    merger.configureTargetColumns(new int[] {0}, schemaId, schema);
-
-            BinaryRow row =
-                    compactedRow(schema.getRowType(), new Object[] {1, 100L, 50, "keep", 200L});
-            BinaryValue oldValue = new BinaryValue(schemaId, row);
-
-            BinaryValue deleted = partialMerger.delete(oldValue);
-
-            // Since only PK is in target columns, and PK cannot be deleted,
-            // all non-target columns should be checked
-            // non_target and non_target_count have values, so should perform partial delete
-            assertThat(deleted).isNotNull();
-            assertThat(deleted.schemaId).isEqualTo(schemaId);
-            // All columns should be kept (no target columns to delete except PK which is protected)
-            assertThat(deleted.row.getInt(0)).isEqualTo(1);
-            assertThat(deleted.row.getLong(1)).isEqualTo(100L);
-            assertThat(deleted.row.getInt(2)).isEqualTo(50);
-            assertThat(deleted.row.getString(3).toString()).isEqualTo("keep");
-            assertThat(deleted.row.getLong(4)).isEqualTo(200L);
-        }
-
-        // ========== Scenario 5: removeRecordOnDelete = false, all non-target columns are null but
-        // target has non-PK ==========
+        // ========== Scenario 3: deleteBehavior = IGNORE (default), all non-target columns are null
+        // ==========
         {
             TableConfig tableConfig = new TableConfig(new Configuration());
             AggregateRowMerger merger = createMerger(schema, tableConfig);
@@ -890,14 +864,14 @@ class AggregateRowMergerTest {
             assertThat(deleted).isNull();
         }
 
-        // ========== Scenario 6: removeRecordOnDelete = false, Schema Evolution + Partial Delete
-        // ==========
+        // ========== Scenario 4: deleteBehavior = IGNORE (default), Schema Evolution + Partial
+        // Delete ==========
         {
             // Old schema: id(columnId=0), target_sum(columnId=1), non_target(columnId=2)
             Schema oldSchema =
                     Schema.newBuilder()
                             .column("id", DataTypes.INT())
-                            .column("target_sum", DataTypes.BIGINT(), AggFunction.SUM)
+                            .column("target_sum", DataTypes.BIGINT(), AggFunctions.SUM())
                             .column("non_target", DataTypes.STRING())
                             .primaryKey("id")
                             .build();
@@ -917,14 +891,14 @@ class AggregateRowMergerTest {
                                                     DataTypes.BIGINT(),
                                                     null,
                                                     1,
-                                                    AggFunction.SUM),
+                                                    AggFunctions.SUM()),
                                             // target_max: new column with columnId=3
                                             new Schema.Column(
                                                     "target_max",
                                                     DataTypes.INT(),
                                                     null,
                                                     3,
-                                                    AggFunction.MAX),
+                                                    AggFunctions.MAX()),
                                             // non_target: preserve columnId=2
                                             new Schema.Column(
                                                     "non_target", DataTypes.STRING(), null, 2),
@@ -934,7 +908,7 @@ class AggregateRowMergerTest {
                                                     DataTypes.BIGINT(),
                                                     null,
                                                     4,
-                                                    AggFunction.SUM)))
+                                                    AggFunctions.SUM())))
                             .primaryKey("id")
                             .build();
 
@@ -981,13 +955,14 @@ class AggregateRowMergerTest {
             assertThat(deleted.row.isNullAt(4)).isTrue();
         }
 
-        // ========== Scenario 7: removeRecordOnDelete = false, composite primary key ==========
+        // ========== Scenario 5: deleteBehavior = IGNORE (default), composite primary key
+        // ==========
         {
             Schema compositePkSchema =
                     Schema.newBuilder()
                             .column("id1", DataTypes.INT())
                             .column("id2", DataTypes.STRING())
-                            .column("target_sum", DataTypes.BIGINT(), AggFunction.SUM)
+                            .column("target_sum", DataTypes.BIGINT(), AggFunctions.SUM())
                             .column("non_target", DataTypes.STRING())
                             .primaryKey("id1", "id2")
                             .build();

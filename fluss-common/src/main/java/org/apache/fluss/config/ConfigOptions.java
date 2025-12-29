@@ -1443,14 +1443,6 @@ public class ConfigOptions {
                                     + "If not set, 'last_value_ignore_nulls' will be used as default. "
                                     + "Field-specific aggregate functions can be configured using 'table.merge-engine.aggregate.<field-name>'.");
 
-    public static final ConfigOption<Boolean> TABLE_AGG_REMOVE_RECORD_ON_DELETE =
-            key("table.aggregation.remove-record-on-delete")
-                    .booleanType()
-                    .defaultValue(false)
-                    .withDescription(
-                            "Whether to remove the entire record when receiving a DELETE operation in aggregate merge engine. "
-                                    + "By default, DELETE operations are not supported in aggregate merge engine.");
-
     public static final ConfigOption<DeleteBehavior> TABLE_DELETE_BEHAVIOR =
             key("table.delete.behavior")
                     .enumType(DeleteBehavior.class)
@@ -1458,10 +1450,11 @@ public class ConfigOptions {
                     .withDescription(
                             "Defines the delete behavior for the primary key table. "
                                     + "The supported delete behaviors are `allow`, `ignore`, and `disable`. "
-                                    + "The `allow` behavior allows normal delete operations (default). "
+                                    + "The `allow` behavior allows normal delete operations (default for default merge engine). "
                                     + "The `ignore` behavior silently skips delete requests without error. "
                                     + "The `disable` behavior rejects delete requests with a clear error message. "
-                                    + "For tables with FIRST_ROW or VERSIONED merge engines, this option defaults to `ignore`.");
+                                    + "For tables with FIRST_ROW, VERSIONED, or AGGREGATE merge engines, this option defaults to `ignore`. "
+                                    + "Note: For AGGREGATE merge engine, when set to `allow`, delete operations will remove the entire record.");
 
     public static final ConfigOption<String> TABLE_AUTO_INCREMENT_FIELDS =
             key("table.auto-increment.fields")
