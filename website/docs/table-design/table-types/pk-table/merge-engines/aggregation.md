@@ -10,7 +10,11 @@ sidebar_position: 5
 
 The **Aggregation Merge Engine** is designed for scenarios where users only care about aggregated results rather than individual records. It aggregates each value field with the latest data one by one under the same primary key according to the specified aggregate function.
 
-Each field not part of the primary keys can be assigned an aggregate function using the Schema API (recommended) or connector options (`'fields.<field-name>.agg'`). If no function is specified for a field, it will use `last_value_ignore_nulls` aggregation as the default behavior.
+Each field not part of the primary keys can be assigned an aggregate function. The recommended way depends on the client you are working with:
+- For **Flink SQL** or **Spark SQL**, use DDL and connector options (`'fields.<field-name>.agg'`)
+- For **Java clients**, use the Schema API
+
+If no function is specified for a field, it will use `last_value_ignore_nulls` aggregation as the default behavior.
 
 This merge engine is useful for real-time aggregation scenarios such as:
 - Computing running totals and statistics
@@ -20,21 +24,117 @@ This merge engine is useful for real-time aggregation scenarios such as:
 
 ## Configuration
 
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<Tabs>
+<TabItem value="flink-sql" label="Flink SQL" default>
+
 To enable the aggregation merge engine, set the following table property:
 
-```
-'table.merge-engine' = 'aggregation'
+```sql
+CREATE TABLE product_stats (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT,
+    last_update_time TIMESTAMP(3),
+    PRIMARY KEY (product_id) NOT ENFORCED
+) WITH (
+    'connector' = 'fluss',
+    'table.merge-engine' = 'aggregation',
+    'fields.price.agg' = 'max',
+    'fields.sales.agg' = 'sum'
+    -- last_update_time defaults to 'last_value_ignore_nulls'
+);
 ```
 
-Then specify the aggregate function for each non-primary key field using connector options:
+Specify the aggregate function for each non-primary key field using connector options:
 
 ```
 'fields.<field-name>.agg' = '<function-name>'
 ```
 
-**Note**: The recommended way is to use Schema API (see section "API Usage" below). The connector option is provided as an alternative for connector-specific scenarios.
+</TabItem>
+<TabItem value="java-client" label="Java Client">
 
-## API Usage
+To enable the aggregation merge engine, set the following table property:
+
+```java
+TableDescriptor tableDescriptor = TableDescriptor.builder()
+    .schema(schema)
+    .property("table.merge-engine", "aggregation")
+    .build();
+```
+
+Specify the aggregate function for each non-primary key field using the Schema API:
+
+```java
+Schema schema = Schema.newBuilder()
+    .column("product_id", DataTypes.BIGINT())
+    .column("price", DataTypes.DOUBLE(), AggFunction.MAX)
+    .column("sales", DataTypes.BIGINT(), AggFunction.SUM)
+    .column("last_update_time", DataTypes.TIMESTAMP(3))  // Defaults to LAST_VALUE_IGNORE_NULLS
+    .primaryKey("product_id")
+    .build();
+```
+
+</TabItem>
+</Tabs>
+
+## Usage Examples
+
+<Tabs>
+<TabItem value="flink-sql" label="Flink SQL" default>
+
+### Creating a Table with Aggregation
+
+```sql
+CREATE TABLE product_stats (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT,
+    last_update_time TIMESTAMP(3),
+    PRIMARY KEY (product_id) NOT ENFORCED
+) WITH (
+    'connector' = 'fluss',
+    'table.merge-engine' = 'aggregation',
+    'fields.price.agg' = 'max',
+    'fields.sales.agg' = 'sum'
+    -- last_update_time defaults to 'last_value_ignore_nulls'
+);
+```
+
+### Writing Data
+
+```sql
+-- Insert data - these will be aggregated
+INSERT INTO product_stats VALUES
+    (1, 23.0, 15, TIMESTAMP '2024-01-01 10:00:00'),
+    (1, 30.2, 20, TIMESTAMP '2024-01-01 11:00:00');  -- Same primary key - triggers aggregation
+```
+
+### Querying Results
+
+```sql
+SELECT * FROM product_stats;
+```
+
+**Result after aggregation:**
+```
++------------+-------+-------+---------------------+
+| product_id | price | sales | last_update_time     |
++------------+-------+-------+---------------------+
+|          1 |  30.2 |    35 | 2024-01-01 11:00:00 |
++------------+-------+-------+---------------------+
+```
+
+- `product_id`: 1
+- `price`: 30.2 (max of 23.0 and 30.2)
+- `sales`: 35 (sum of 15 and 20)
+- `last_update_time`: 2024-01-01 11:00:00 (last non-null value)
+
+</TabItem>
+<TabItem value="java-client" label="Java Client">
 
 ### Creating a Table with Aggregation
 
@@ -46,14 +146,13 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.metadata.AggFunction;
 
 // Create connection
 Connection conn = Connection.create(config);
 Admin admin = conn.getAdmin();
 
-// Define schema with aggregation functions (recommended way)
-import org.apache.fluss.metadata.AggFunction;
-
+// Define schema with aggregation functions
 Schema schema = Schema.newBuilder()
     .column("product_id", DataTypes.BIGINT())
     .column("price", DataTypes.DOUBLE(), AggFunction.MAX)
@@ -93,6 +192,9 @@ writer.flush();
 - `price`: 30.2 (max of 23.0 and 30.2)
 - `sales`: 35 (sum of 15 and 20)
 - `last_update_time`: timestamp2 (last non-null value)
+
+</TabItem>
+</Tabs>
 
 ## Supported Aggregate Functions
 
@@ -221,8 +323,9 @@ TableDescriptor.builder()
     .property("table.merge-engine", "aggregation")
     .build();
 
-// Input: (1, 'online', '2024-01-01 10:00:00'), (1, 'offline', '2024-01-01 11:00:00')
-// Result: (1, 'offline', '2024-01-01 11:00:00')
+// Input: (1, 'online', '2024-01-01 10:00:00'), (1, 'offline', '2024-01-01 11:00:00'), (1, null, '2024-01-01 12:00:00')
+// Result: (1, null, '2024-01-01 12:00:00')
+// Note: null value overwrites the previous 'offline' value
 ```
 
 ### last_value_ignore_nulls
@@ -457,9 +560,8 @@ TableDescriptor tableDescriptor = TableDescriptor.builder()
     .build();
 
 // Create partial update writer targeting only id, count1, and sum1
-int[] targetColumns = new int[]{0, 1, 3}; // id, count1, sum1
 UpsertWriter partialWriter = table.newUpsert()
-    .withPartialUpdate(targetColumns)
+    .partialUpdate("id", "count1", "sum1")
     .createWriter();
 
 // When writing:
@@ -508,9 +610,9 @@ When using the `aggregation` merge engine, be aware of the following critical li
 
 ### 1. Exactly-Once Semantics
 
-**Fluss engine does not natively support transactional writes, and therefore does not directly support Exactly-Once semantics at the storage layer.**
+When writing to an aggregate merge engine table using the Flink engine, Fluss does provide exactly-once guarantees. Thanks to Flink's checkpointing mechanism, in the event of a failure and recovery, the Flink connector automatically performs an undo operation to roll back the table state to what it was at the last successful checkpoint. This ensures no over-counting or under-counting: data remains consistent and accurate.
 
-Exactly-Once semantics should be achieved through integration with compute engines (e.g., Flink, Spark). For example, after failover, undo operations can be generated for invalid writes to achieve rollback.
+However, when using the Fluss client API directly (outside of Flink), exactly-once is not provided out of the box. In such cases, users must implement their own recovery logic (similar to what the Flink connector does) by explicitly resetting the table state to a previous version by performing undo operations.
 
 For detailed information about Exactly-Once implementation, please refer to: [FIP-21: Aggregation Merge Engine](https://cwiki.apache.org/confluence/display/FLUSS/FIP-21%3A+Aggregation+Merge+Engine)
 
@@ -519,10 +621,6 @@ For detailed information about Exactly-Once implementation, please refer to: [FI
 By default, delete operations will cause errors:
 - You must set `'table.agg.remove-record-on-delete' = 'true'` if you need to handle delete operations
 - This configuration will remove the entire aggregated record, not reverse individual aggregations
-
-### 3. Data Type Restrictions
-
-Each aggregate function supports specific data types (see function documentation above)
 :::
 
 ## See Also
