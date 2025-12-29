@@ -1,7 +1,7 @@
 ---
 sidebar_label: Aggregation
 title: Aggregation Merge Engine
-sidebar_position: 4
+sidebar_position: 5
 ---
 
 # Aggregation Merge Engine
