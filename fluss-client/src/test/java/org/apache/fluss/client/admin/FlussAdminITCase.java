@@ -52,10 +52,10 @@ import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.exception.TooManyPartitionsException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.FsPathAndFileName;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
 import org.apache.fluss.metadata.DeleteBehavior;
-import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PartitionInfo;
@@ -514,12 +514,11 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertThat(tableInfo2.getTableConfig().getDeleteBehavior()).hasValue(DeleteBehavior.IGNORE);
 
         // Test 2.5: AGGREGATE merge engine - should set delete behavior to IGNORE
-        TablePath tablePathAggregate =
-                TablePath.of("fluss", "test_ignore_delete_for_aggregate");
+        TablePath tablePathAggregate = TablePath.of("fluss", "test_ignore_delete_for_aggregate");
         Schema aggregateSchema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("count", DataTypes.BIGINT(), AggFunction.SUM)
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
         Map<String, String> propertiesAggregate = new HashMap<>();
