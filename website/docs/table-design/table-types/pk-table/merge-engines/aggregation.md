@@ -102,7 +102,7 @@ Fluss currently supports the following aggregate functions:
 
 Aggregates values by computing the sum across multiple rows.
 
-- **Supported Data Types**: TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, DECIMAL
+- **Supported Data Types**: `TINYINT`, `SMALLINT`, `INT`, `BIGINT`, `FLOAT`, `DOUBLE`, `DECIMAL`
 - **Behavior**: Adds incoming values to the accumulator
 - **Null Handling**: Null values are ignored
 
