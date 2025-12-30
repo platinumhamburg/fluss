@@ -26,6 +26,7 @@ import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TooManyBucketsException;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
@@ -38,9 +39,6 @@ import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.StringUtils;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -62,8 +60,6 @@ import static org.apache.fluss.utils.PartitionUtils.PARTITION_KEY_SUPPORTED_TYPE
 /** Validator of {@link TableDescriptor}. */
 public class TableDescriptorValidation {
 
-    private static final Logger LOG = LoggerFactory.getLogger(TableDescriptorValidation.class);
-
     private static final Set<String> SYSTEM_COLUMNS =
             Collections.unmodifiableSet(
                     new LinkedHashSet<>(
@@ -77,8 +73,8 @@ public class TableDescriptorValidation {
 
     /** Validate table descriptor to create is valid and contain all necessary information. */
     public static void validateTableDescriptor(TableDescriptor tableDescriptor, int maxBucketNum) {
-        boolean hasPrimaryKey = tableDescriptor.getSchema().getPrimaryKey().isPresent();
-        RowType schema = tableDescriptor.getSchema().getRowType();
+        Schema schema = tableDescriptor.getSchema();
+        boolean hasPrimaryKey = schema.getPrimaryKey().isPresent();
         Configuration tableConf = Configuration.fromMap(tableDescriptor.getProperties());
 
         // check properties should only contain table.* options,
@@ -113,8 +109,8 @@ public class TableDescriptorValidation {
         checkMergeEngine(tableConf, hasPrimaryKey, schema);
         checkDeleteBehavior(tableConf, hasPrimaryKey);
         checkTieredLog(tableConf);
-        checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema);
-        checkSystemColumns(schema);
+        checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema.getRowType());
+        checkSystemColumns(schema.getRowType());
     }
 
     public static void validateAlterTableProperties(
@@ -251,7 +247,7 @@ public class TableDescriptorValidation {
     }
 
     private static void checkMergeEngine(
-            Configuration tableConf, boolean hasPrimaryKey, RowType schema) {
+            Configuration tableConf, boolean hasPrimaryKey, Schema schema) {
         MergeEngineType mergeEngine = tableConf.get(ConfigOptions.TABLE_MERGE_ENGINE);
         if (mergeEngine != null) {
             if (!hasPrimaryKey) {
@@ -267,7 +263,8 @@ public class TableDescriptorValidation {
                                     "'%s' must be set for versioned merge engine.",
                                     ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key()));
                 }
-                int columnIndex = schema.getFieldIndex(versionColumn.get());
+                RowType rowType = schema.getRowType();
+                int columnIndex = rowType.getFieldIndex(versionColumn.get());
                 if (columnIndex < 0) {
                     throw new InvalidConfigException(
                             String.format(
@@ -280,7 +277,7 @@ public class TableDescriptorValidation {
                                 DataTypeRoot.BIGINT,
                                 DataTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE,
                                 DataTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE);
-                DataType columnType = schema.getTypeAt(columnIndex);
+                DataType columnType = rowType.getTypeAt(columnIndex);
                 if (!supportedTypes.contains(columnType.getTypeRoot())) {
                     throw new InvalidConfigException(
                             String.format(
@@ -289,6 +286,45 @@ public class TableDescriptorValidation {
                                             + ", but got %s.",
                                     versionColumn.get(), columnType));
                 }
+            } else if (mergeEngine == MergeEngineType.AGGREGATION) {
+                // Validate aggregation function parameters for aggregation merge engine
+                validateAggregationFunctionParameters(schema);
+            }
+        }
+    }
+
+    /**
+     * Validates aggregation function parameters in the schema.
+     *
+     * <p>This method delegates to {@link AggFunction#validate()} to ensure all parameters are valid
+     * according to the function's requirements.
+     *
+     * @param schema the schema to validate
+     * @throws InvalidConfigException if any aggregation function has invalid parameters
+     */
+    private static void validateAggregationFunctionParameters(Schema schema) {
+        // Get primary key columns for early exit
+        List<String> primaryKeys = schema.getPrimaryKeyColumnNames();
+
+        for (Schema.Column column : schema.getColumns()) {
+            // Skip primary key columns (they don't use user-defined aggregation functions)
+            if (primaryKeys.contains(column.getName())) {
+                continue;
+            }
+
+            Optional<AggFunction> aggFunctionOpt = column.getAggFunction();
+            if (!aggFunctionOpt.isPresent()) {
+                continue;
+            }
+
+            // Validate aggregation function parameters
+            try {
+                aggFunctionOpt.get().validate();
+            } catch (IllegalArgumentException e) {
+                throw new InvalidConfigException(
+                        String.format(
+                                "Invalid aggregation function for column '%s': %s",
+                                column.getName(), e.getMessage()));
             }
         }
     }

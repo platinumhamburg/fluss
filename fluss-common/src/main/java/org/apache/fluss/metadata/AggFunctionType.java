@@ -19,7 +19,9 @@ package org.apache.fluss.metadata;
 
 import org.apache.fluss.annotation.PublicEvolving;
 
+import java.util.Collections;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * Aggregation function type for aggregate merge engine.
@@ -48,6 +50,66 @@ public enum AggFunctionType {
     // Boolean aggregation
     BOOL_AND,
     BOOL_OR;
+
+    /** Parameter name for delimiter used in LISTAGG and STRING_AGG functions. */
+    public static final String PARAM_DELIMITER = "delimiter";
+
+    /**
+     * Returns the set of supported parameter names for this aggregation function.
+     *
+     * @return an immutable set of parameter names
+     */
+    public Set<String> getSupportedParameters() {
+        switch (this) {
+            case LISTAGG:
+            case STRING_AGG:
+                // LISTAGG and STRING_AGG support optional "delimiter" parameter
+                return Collections.singleton(PARAM_DELIMITER);
+            default:
+                // All other functions do not accept parameters
+                return Collections.emptySet();
+        }
+    }
+
+    /**
+     * Validates a parameter value for this aggregation function.
+     *
+     * @param parameterName the parameter name
+     * @param parameterValue the parameter value
+     * @throws IllegalArgumentException if the parameter value is invalid
+     */
+    public void validateParameter(String parameterName, String parameterValue) {
+        // Check if parameter is supported
+        if (!getSupportedParameters().contains(parameterName)) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Parameter '%s' is not supported for aggregation function '%s'. "
+                                    + "Supported parameters: %s",
+                            parameterName,
+                            this,
+                            getSupportedParameters().isEmpty()
+                                    ? "none"
+                                    : getSupportedParameters()));
+        }
+
+        // Validate parameter value based on function type and parameter name
+        switch (this) {
+            case LISTAGG:
+            case STRING_AGG:
+                if (PARAM_DELIMITER.equals(parameterName)) {
+                    if (parameterValue == null || parameterValue.isEmpty()) {
+                        throw new IllegalArgumentException(
+                                String.format(
+                                        "Parameter '%s' for aggregation function '%s' must be a non-empty string",
+                                        parameterName, this));
+                    }
+                }
+                break;
+            default:
+                // No validation needed for other functions (they don't have parameters)
+                break;
+        }
+    }
 
     /**
      * Converts a string to an AggFunctionType enum value.

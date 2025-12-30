@@ -103,6 +103,24 @@ public final class AggFunction implements Serializable {
         return !parameters.isEmpty();
     }
 
+    /**
+     * Validates all parameters of this aggregation function.
+     *
+     * <p>This method checks that:
+     *
+     * <ul>
+     *   <li>All parameter names are supported by the function type
+     *   <li>All parameter values are valid
+     * </ul>
+     *
+     * @throws IllegalArgumentException if any parameter is invalid
+     */
+    public void validate() {
+        for (Map.Entry<String, String> entry : parameters.entrySet()) {
+            type.validateParameter(entry.getKey(), entry.getValue());
+        }
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
