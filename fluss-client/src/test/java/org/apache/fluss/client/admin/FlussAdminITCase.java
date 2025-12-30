@@ -513,7 +513,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         TableInfo tableInfo2 = admin.getTableInfo(tablePath2).join();
         assertThat(tableInfo2.getTableConfig().getDeleteBehavior()).hasValue(DeleteBehavior.IGNORE);
 
-        // Test 2.5: AGGREGATE merge engine - should set delete behavior to IGNORE
+        // Test 2.5: AGGREGATION merge engine - should set delete behavior to IGNORE
         TablePath tablePathAggregate = TablePath.of("fluss", "test_ignore_delete_for_aggregate");
         Schema aggregateSchema =
                 Schema.newBuilder()
@@ -535,7 +535,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertThat(tableInfoAggregate.getTableConfig().getDeleteBehavior())
                 .hasValue(DeleteBehavior.IGNORE);
 
-        // Test 2.6: AGGREGATE merge engine with delete behavior explicitly set to ALLOW - should
+        // Test 2.6: AGGREGATION merge engine with delete behavior explicitly set to ALLOW - should
         // be allowed
         TablePath tablePathAggregateAllow =
                 TablePath.of("fluss", "test_allow_delete_for_aggregate");

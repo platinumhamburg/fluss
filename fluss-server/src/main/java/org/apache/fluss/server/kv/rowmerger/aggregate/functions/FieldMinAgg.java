@@ -30,8 +30,8 @@ public class FieldMinAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    public FieldMinAgg(String name, DataType dataType) {
-        super(name, dataType);
+    public FieldMinAgg(DataType dataType) {
+        super(dataType);
     }
 
     @Override

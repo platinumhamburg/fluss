@@ -23,6 +23,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldBoolOrAgg;
 import org.apache.fluss.types.BooleanType;
 import org.apache.fluss.types.DataType;
@@ -32,19 +33,17 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 /** Factory for {@link FieldBoolOrAgg}. */
 public class FieldBoolOrAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "bool_or";
-
     @Override
-    public FieldBoolOrAgg create(DataType fieldType, AggFunction aggFunction, String field) {
+    public FieldBoolOrAgg create(DataType fieldType, AggFunction aggFunction) {
         checkArgument(
                 fieldType instanceof BooleanType,
                 "Data type for bool_or column must be 'BooleanType' but was '%s'.",
                 fieldType);
-        return new FieldBoolOrAgg(identifier(), (BooleanType) fieldType);
+        return new FieldBoolOrAgg((BooleanType) fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.BOOL_OR.toString();
     }
 }

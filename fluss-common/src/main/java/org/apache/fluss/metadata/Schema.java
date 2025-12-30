@@ -334,27 +334,17 @@ public final class Schema implements Serializable {
          * only applicable when the table uses aggregation merge engine.
          *
          * <p>If aggregation function is not specified for a non-primary key column, it defaults to
-         * {@link AggFunction#LAST_VALUE_IGNORE_NULLS}.
+         * {@link AggFunctions#LAST_VALUE_IGNORE_NULLS}.
          *
          * @param columnName the name of the column
          * @param dataType the data type of the column
          * @param aggFunction the aggregation function to apply
          * @return the builder instance
-         * @throws IllegalArgumentException if column is a primary key
          */
         public Builder column(String columnName, DataType dataType, AggFunction aggFunction) {
             checkNotNull(columnName, "Column name must not be null.");
             checkNotNull(dataType, "Data type must not be null.");
             checkNotNull(aggFunction, "Aggregation function must not be null.");
-
-            // Validate that this column is not a primary key
-            if (primaryKey != null && primaryKey.columnNames.contains(columnName)) {
-                throw new IllegalArgumentException(
-                        String.format(
-                                "Cannot set aggregation function for primary key column '%s'. "
-                                        + "Primary key columns automatically use 'primary-key' aggregation.",
-                                columnName));
-            }
 
             columns.add(
                     new Column(
@@ -461,20 +451,6 @@ public final class Schema implements Serializable {
             checkState(
                     columns.stream().map(Column::getColumnId).distinct().count() == columns.size(),
                     "Column ids must be unique.");
-
-            // Validate that aggregation functions are only set for non-primary key columns
-            if (primaryKey != null) {
-                for (Column column : columns) {
-                    if (primaryKey.columnNames.contains(column.getName())
-                            && column.getAggFunction().isPresent()) {
-                        throw new IllegalArgumentException(
-                                String.format(
-                                        "Cannot set aggregation function for primary key column '%s'. "
-                                                + "Primary key columns automatically use 'primary-key' aggregation.",
-                                        column.getName()));
-                    }
-                }
-            }
 
             return new Schema(columns, primaryKey, highestFieldId.get(), autoIncrementColumnNames);
         }
@@ -697,6 +673,18 @@ public final class Schema implements Serializable {
                     !pkSet.contains(autoIncrementColumn),
                     "Auto increment column can not be used as the primary key.");
         }
+
+        // Validate that aggregation functions are only set for non-primary key columns
+        for (Column column : columns) {
+            if (pkSet.contains(column.getName()) && column.getAggFunction().isPresent()) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Cannot set aggregation function for primary key column '%s'. "
+                                        + "Primary key columns automatically use 'primary-key' aggregation.",
+                                column.getName()));
+            }
+        }
+
         List<Column> newColumns = new ArrayList<>();
         for (Column column : columns) {
             if (autoIncrementColumnNames.contains(column.getName())) {

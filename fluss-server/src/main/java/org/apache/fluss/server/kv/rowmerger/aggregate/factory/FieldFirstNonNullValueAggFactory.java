@@ -23,22 +23,20 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldFirstNonNullValueAgg;
 import org.apache.fluss.types.DataType;
 
 /** Factory for {@link FieldFirstNonNullValueAgg}. */
 public class FieldFirstNonNullValueAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "first_value_ignore_nulls";
-
     @Override
-    public FieldFirstNonNullValueAgg create(
-            DataType fieldType, AggFunction aggFunction, String field) {
-        return new FieldFirstNonNullValueAgg(identifier(), fieldType);
+    public FieldFirstNonNullValueAgg create(DataType fieldType, AggFunction aggFunction) {
+        return new FieldFirstNonNullValueAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.FIRST_VALUE_IGNORE_NULLS.toString();
     }
 }

@@ -23,21 +23,20 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldFirstValueAgg;
 import org.apache.fluss.types.DataType;
 
 /** Factory for {@link FieldFirstValueAgg}. */
 public class FieldFirstValueAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "first_value";
-
     @Override
-    public FieldFirstValueAgg create(DataType fieldType, AggFunction aggFunction, String field) {
-        return new FieldFirstValueAgg(identifier(), fieldType);
+    public FieldFirstValueAgg create(DataType fieldType, AggFunction aggFunction) {
+        return new FieldFirstValueAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.FIRST_VALUE.toString();
     }
 }

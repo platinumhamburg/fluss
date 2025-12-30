@@ -23,6 +23,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldSumAgg;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeFamily;
@@ -32,19 +33,17 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 /** Factory for {@link FieldSumAgg}. */
 public class FieldSumAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "sum";
-
     @Override
-    public FieldSumAgg create(DataType fieldType, AggFunction aggFunction, String field) {
+    public FieldSumAgg create(DataType fieldType, AggFunction aggFunction) {
         checkArgument(
                 fieldType.getTypeRoot().getFamilies().contains(DataTypeFamily.NUMERIC),
                 "Data type for sum column must be 'NumericType' but was '%s'.",
                 fieldType);
-        return new FieldSumAgg(identifier(), fieldType);
+        return new FieldSumAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.SUM.toString();
     }
 }

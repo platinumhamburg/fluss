@@ -23,22 +23,20 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldLastNonNullValueAgg;
 import org.apache.fluss.types.DataType;
 
 /** Factory for {@link FieldLastNonNullValueAgg}. */
 public class FieldLastNonNullValueAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "last_value_ignore_nulls";
-
     @Override
-    public FieldLastNonNullValueAgg create(
-            DataType fieldType, AggFunction aggFunction, String field) {
-        return new FieldLastNonNullValueAgg(identifier(), fieldType);
+    public FieldLastNonNullValueAgg create(DataType fieldType, AggFunction aggFunction) {
+        return new FieldLastNonNullValueAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.LAST_VALUE_IGNORE_NULLS.toString();
     }
 }

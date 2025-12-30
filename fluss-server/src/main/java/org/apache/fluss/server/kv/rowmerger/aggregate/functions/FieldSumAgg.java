@@ -31,8 +31,8 @@ public class FieldSumAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    public FieldSumAgg(String name, DataType dataType) {
-        super(name, dataType);
+    public FieldSumAgg(DataType dataType) {
+        super(dataType);
     }
 
     @Override

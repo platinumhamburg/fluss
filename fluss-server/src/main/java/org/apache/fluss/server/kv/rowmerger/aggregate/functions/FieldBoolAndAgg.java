@@ -29,8 +29,8 @@ public class FieldBoolAndAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    public FieldBoolAndAgg(String name, BooleanType dataType) {
-        super(name, dataType);
+    public FieldBoolAndAgg(BooleanType dataType) {
+        super(dataType);
     }
 
     @Override

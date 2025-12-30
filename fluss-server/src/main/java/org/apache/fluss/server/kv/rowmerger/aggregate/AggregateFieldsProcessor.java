@@ -45,27 +45,64 @@ public final class AggregateFieldsProcessor {
     private AggregateFieldsProcessor() {}
 
     /**
-     * Aggregate all fields from old and new rows (full aggregation).
+     * Aggregate all fields from old and new rows with explicit target schema (full aggregation).
      *
-     * <p>This method handles schema evolution by matching fields using column IDs. When both
-     * schemas are identical, uses a fast path that avoids column ID lookup.
+     * <p>This variant allows specifying a different target schema for the output, which is useful
+     * when the client's newValue uses an outdated schema but we want to output using the latest
+     * server schema.
+     *
+     * <p>This method handles schema evolution by matching fields using column IDs across three
+     * potentially different schemas: old row schema, new row schema, and target output schema.
      *
      * @param oldRow the old row
      * @param newRow the new row
-     * @param oldContext context for the old schema
-     * @param newContext context for the new schema
-     * @param encoder the row encoder to encode results
+     * @param oldContext context for the old row schema
+     * @param newInputContext context for the new row schema (for reading newRow)
+     * @param targetContext context for the target output schema
+     * @param encoder the row encoder to encode results (should match targetContext)
      */
-    public static void aggregateAllFields(
+    public static void aggregateAllFieldsWithTargetSchema(
             BinaryRow oldRow,
             BinaryRow newRow,
             AggregationContext oldContext,
-            AggregationContext newContext,
+            AggregationContext newInputContext,
+            AggregationContext targetContext,
             RowEncoder encoder) {
-        if (newContext == oldContext) {
-            aggregateAllFieldsWithSameSchema(oldRow, newRow, newContext, encoder);
-        } else {
-            aggregateAllFieldsWithDifferentSchema(oldRow, newRow, oldContext, newContext, encoder);
+        // Fast path: all three schemas are the same
+        if (targetContext == oldContext && targetContext == newInputContext) {
+            aggregateAllFieldsWithSameSchema(oldRow, newRow, targetContext, encoder);
+            return;
+        }
+
+        // General path: iterate over target schema columns and aggregate using column ID matching
+        InternalRow.FieldGetter[] oldFieldGetters = oldContext.getFieldGetters();
+        InternalRow.FieldGetter[] newFieldGetters = newInputContext.getFieldGetters();
+        FieldAggregator[] targetAggregators = targetContext.getAggregators();
+        List<Schema.Column> targetColumns = targetContext.getSchema().getColumns();
+
+        for (int targetIdx = 0; targetIdx < targetColumns.size(); targetIdx++) {
+            Schema.Column targetColumn = targetColumns.get(targetIdx);
+            int columnId = targetColumn.getColumnId();
+
+            // Find corresponding fields in old and new schemas using column ID
+            Integer oldIdx = oldContext.getFieldIndex(columnId);
+            Integer newIdx = newInputContext.getFieldIndex(columnId);
+
+            // Get field getters (use NULL_FIELD_GETTER if column doesn't exist in that schema)
+            InternalRow.FieldGetter oldFieldGetter =
+                    (oldIdx != null) ? oldFieldGetters[oldIdx] : NULL_FIELD_GETTER;
+            InternalRow.FieldGetter newFieldGetter =
+                    (newIdx != null) ? newFieldGetters[newIdx] : NULL_FIELD_GETTER;
+
+            // Aggregate and encode using target schema's aggregator
+            aggregateAndEncode(
+                    oldFieldGetter,
+                    newFieldGetter,
+                    oldRow,
+                    newRow,
+                    targetAggregators[targetIdx],
+                    targetIdx,
+                    encoder);
         }
     }
 
@@ -111,33 +148,78 @@ public final class AggregateFieldsProcessor {
     }
 
     /**
-     * Aggregate target fields from old and new rows (partial aggregation).
+     * Aggregate target fields from old and new rows with explicit target schema (partial
+     * aggregation).
+     *
+     * <p>This variant allows specifying a different target schema for the output, which is useful
+     * when the client's newValue uses an outdated schema but we want to output using the latest
+     * server schema.
      *
      * <p>For target columns, aggregate with the aggregation function. For non-target columns, keep
-     * the old value unchanged. For new columns that don't exist in old schema, copy from newRow.
-     *
-     * <p>When both schemas are identical, uses a fast path that avoids column ID lookup.
+     * the old value unchanged. For columns that don't exist in old schema, copy from newRow. For
+     * columns that exist only in target schema, set to null.
      *
      * @param oldRow the old row
      * @param newRow the new row
-     * @param oldContext context for the old schema
-     * @param newContext context for the new schema
+     * @param oldContext context for the old row schema
+     * @param newInputContext context for the new row schema (for reading newRow)
+     * @param targetContext context for the target output schema
      * @param targetColumnIdBitSet BitSet marking target columns by column ID
-     * @param encoder the row encoder to encode results
+     * @param encoder the row encoder to encode results (should match targetContext)
      */
-    public static void aggregateTargetFields(
+    public static void aggregateTargetFieldsWithTargetSchema(
             BinaryRow oldRow,
             BinaryRow newRow,
             AggregationContext oldContext,
-            AggregationContext newContext,
+            AggregationContext newInputContext,
+            AggregationContext targetContext,
             BitSet targetColumnIdBitSet,
             RowEncoder encoder) {
-        if (newContext == oldContext) {
+        // Fast path: all three schemas are the same
+        if (targetContext == oldContext && targetContext == newInputContext) {
             aggregateTargetFieldsWithSameSchema(
-                    oldRow, newRow, newContext, targetColumnIdBitSet, encoder);
-        } else {
-            aggregateTargetFieldsWithDifferentSchema(
-                    oldRow, newRow, oldContext, newContext, targetColumnIdBitSet, encoder);
+                    oldRow, newRow, targetContext, targetColumnIdBitSet, encoder);
+            return;
+        }
+
+        // General path: iterate over target schema columns
+        InternalRow.FieldGetter[] oldFieldGetters = oldContext.getFieldGetters();
+        InternalRow.FieldGetter[] newFieldGetters = newInputContext.getFieldGetters();
+        FieldAggregator[] targetAggregators = targetContext.getAggregators();
+        List<Schema.Column> targetColumns = targetContext.getSchema().getColumns();
+
+        for (int targetIdx = 0; targetIdx < targetColumns.size(); targetIdx++) {
+            Schema.Column targetColumn = targetColumns.get(targetIdx);
+            int columnId = targetColumn.getColumnId();
+
+            // Find corresponding fields in old and new schemas using column ID
+            Integer oldIdx = oldContext.getFieldIndex(columnId);
+            Integer newIdx = newInputContext.getFieldIndex(columnId);
+
+            if (targetColumnIdBitSet.get(columnId)) {
+                // Target column: aggregate and encode
+                InternalRow.FieldGetter oldFieldGetter =
+                        (oldIdx != null) ? oldFieldGetters[oldIdx] : NULL_FIELD_GETTER;
+                InternalRow.FieldGetter newFieldGetter =
+                        (newIdx != null) ? newFieldGetters[newIdx] : NULL_FIELD_GETTER;
+                aggregateAndEncode(
+                        oldFieldGetter,
+                        newFieldGetter,
+                        oldRow,
+                        newRow,
+                        targetAggregators[targetIdx],
+                        targetIdx,
+                        encoder);
+            } else if (oldIdx != null) {
+                // Non-target column that exists in old schema: copy old value
+                copyOldValueAndEncode(oldFieldGetters[oldIdx], oldRow, targetIdx, encoder);
+            } else if (newIdx != null) {
+                // New column that doesn't exist in old schema: copy from newRow
+                encoder.encodeField(targetIdx, newFieldGetters[newIdx].getFieldOrNull(newRow));
+            } else {
+                // Column exists only in target schema: set to null
+                encoder.encodeField(targetIdx, null);
+            }
         }
     }
 
@@ -160,44 +242,6 @@ public final class AggregateFieldsProcessor {
                     newRow,
                     aggregators[idx],
                     idx,
-                    encoder);
-        }
-    }
-
-    /**
-     * Aggregate all fields when old and new schemas differ (schema evolution).
-     *
-     * <p>Slow path: requires column ID matching to find corresponding fields between schemas.
-     */
-    private static void aggregateAllFieldsWithDifferentSchema(
-            BinaryRow oldRow,
-            BinaryRow newRow,
-            AggregationContext oldContext,
-            AggregationContext newContext,
-            RowEncoder encoder) {
-        InternalRow.FieldGetter[] newFieldGetters = newContext.getFieldGetters();
-        InternalRow.FieldGetter[] oldFieldGetters = oldContext.getFieldGetters();
-        FieldAggregator[] newAggregators = newContext.getAggregators();
-        List<Schema.Column> newColumns = newContext.getSchema().getColumns();
-
-        for (int newIdx = 0; newIdx < newColumns.size(); newIdx++) {
-            Schema.Column newColumn = newColumns.get(newIdx);
-            int columnId = newColumn.getColumnId();
-
-            // Find the corresponding field in old schema using column ID
-            Integer oldIdx = oldContext.getFieldIndex(columnId);
-
-            // Use old field getter if column exists in old schema, otherwise use null getter
-            InternalRow.FieldGetter oldFieldGetter =
-                    (oldIdx != null) ? oldFieldGetters[oldIdx] : NULL_FIELD_GETTER;
-
-            aggregateAndEncode(
-                    oldFieldGetter,
-                    newFieldGetters[newIdx],
-                    oldRow,
-                    newRow,
-                    newAggregators[newIdx],
-                    newIdx,
                     encoder);
         }
     }
@@ -234,52 +278,6 @@ public final class AggregateFieldsProcessor {
             } else {
                 // Non-target column: encode old value
                 copyOldValueAndEncode(fieldGetters[idx], oldRow, idx, encoder);
-            }
-        }
-    }
-
-    /**
-     * Aggregate target fields when old and new schemas differ (schema evolution).
-     *
-     * <p>Slow path: requires column ID matching to find corresponding fields between schemas.
-     */
-    private static void aggregateTargetFieldsWithDifferentSchema(
-            BinaryRow oldRow,
-            BinaryRow newRow,
-            AggregationContext oldContext,
-            AggregationContext newContext,
-            BitSet targetColumnIdBitSet,
-            RowEncoder encoder) {
-        InternalRow.FieldGetter[] oldFieldGetters = oldContext.getFieldGetters();
-        InternalRow.FieldGetter[] newFieldGetters = newContext.getFieldGetters();
-        FieldAggregator[] newAggregators = newContext.getAggregators();
-        List<Schema.Column> newColumns = newContext.getSchema().getColumns();
-
-        for (int newIdx = 0; newIdx < newColumns.size(); newIdx++) {
-            Schema.Column newColumn = newColumns.get(newIdx);
-            int columnId = newColumn.getColumnId();
-
-            // Find the corresponding field in old schema using column ID
-            Integer oldIdx = oldContext.getFieldIndex(columnId);
-
-            if (targetColumnIdBitSet.get(columnId)) {
-                // Target column: aggregate and encode
-                InternalRow.FieldGetter oldFieldGetter =
-                        (oldIdx != null) ? oldFieldGetters[oldIdx] : NULL_FIELD_GETTER;
-                aggregateAndEncode(
-                        oldFieldGetter,
-                        newFieldGetters[newIdx],
-                        oldRow,
-                        newRow,
-                        newAggregators[newIdx],
-                        newIdx,
-                        encoder);
-            } else if (oldIdx == null) {
-                // New column that doesn't exist in old schema: encode from newRow
-                encoder.encodeField(newIdx, newFieldGetters[newIdx].getFieldOrNull(newRow));
-            } else {
-                // Non-target column that exists in old schema: encode old value
-                copyOldValueAndEncode(oldFieldGetters[oldIdx], oldRow, newIdx, encoder);
             }
         }
     }
@@ -373,8 +371,12 @@ public final class AggregateFieldsProcessor {
      * @return true if at least one non-target column has a non-null value
      */
     public static boolean hasNonTargetNonNullField(BinaryRow row, BitSet targetPosBitSet) {
-        for (int pos = 0; pos < row.getFieldCount(); pos++) {
-            if (!targetPosBitSet.get(pos) && !row.isNullAt(pos)) {
+        int fieldCount = row.getFieldCount();
+        // Use nextClearBit to iterate over non-target fields (bits not set in targetPosBitSet)
+        for (int pos = targetPosBitSet.nextClearBit(0);
+                pos < fieldCount;
+                pos = targetPosBitSet.nextClearBit(pos + 1)) {
+            if (!row.isNullAt(pos)) {
                 return true;
             }
         }

@@ -30,39 +30,24 @@ import java.util.Locale;
 @PublicEvolving
 public enum AggFunctionType {
     // Numeric aggregation
-    SUM("sum"),
-    PRODUCT("product"),
-    MAX("max"),
-    MIN("min"),
+    SUM,
+    PRODUCT,
+    MAX,
+    MIN,
 
     // Value selection
-    LAST_VALUE("last_value"),
-    LAST_VALUE_IGNORE_NULLS("last_value_ignore_nulls"),
-    FIRST_VALUE("first_value"),
-    FIRST_VALUE_IGNORE_NULLS("first_value_ignore_nulls"),
+    LAST_VALUE,
+    LAST_VALUE_IGNORE_NULLS,
+    FIRST_VALUE,
+    FIRST_VALUE_IGNORE_NULLS,
 
     // String aggregation
-    LISTAGG("listagg"),
-    STRING_AGG("string_agg"), // Alias for LISTAGG - maps to same factory
+    LISTAGG,
+    STRING_AGG, // Alias for LISTAGG - maps to same factory
 
     // Boolean aggregation
-    BOOL_AND("bool_and"),
-    BOOL_OR("bool_or");
-
-    private final String identifier;
-
-    AggFunctionType(String identifier) {
-        this.identifier = identifier;
-    }
-
-    /**
-     * Returns the identifier string for this aggregation function type.
-     *
-     * @return the identifier string
-     */
-    public String getIdentifier() {
-        return identifier;
-    }
+    BOOL_AND,
+    BOOL_OR;
 
     /**
      * Converts a string to an AggFunctionType enum value.
@@ -86,26 +71,25 @@ public enum AggFunctionType {
             return null;
         }
 
-        // Normalize the input: convert hyphens to underscores and lowercase
-        String normalized = name.replace('-', '_').toLowerCase(Locale.ROOT).trim();
+        // Normalize the input: convert hyphens to underscores and uppercase
+        String normalized = name.replace('-', '_').toUpperCase(Locale.ROOT).trim();
 
-        // Try direct match with identifier
-        for (AggFunctionType aggFunc : values()) {
-            if (aggFunc.identifier.equals(normalized)) {
-                return aggFunc;
-            }
+        try {
+            return AggFunctionType.valueOf(normalized);
+        } catch (IllegalArgumentException e) {
+            return null;
         }
-
-        return null;
     }
 
     /**
      * Converts this AggFunctionType to its string identifier.
      *
+     * <p>The identifier is the lowercase name with underscores, e.g., "sum", "last_value".
+     *
      * @return the identifier string
      */
     @Override
     public String toString() {
-        return identifier;
+        return name().toLowerCase(Locale.ROOT);
     }
 }

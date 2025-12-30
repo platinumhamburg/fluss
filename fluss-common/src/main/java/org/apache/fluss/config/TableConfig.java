@@ -118,28 +118,6 @@ public class TableConfig {
         return config.getOptional(ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN);
     }
 
-    /**
-     * Gets the listagg delimiter for a specific field in aggregate merge engine.
-     *
-     * <p>This method dynamically constructs the ConfigOption for field-specific delimiter. The
-     * configuration key pattern is: table.merge-engine.aggregate.{fieldName}.listagg-delimiter
-     *
-     * @param fieldName the field name
-     * @return the delimiter string, default to comma if not configured
-     */
-    public String getFieldListaggDelimiter(String fieldName) {
-        return config.get(
-                ConfigBuilder.key(
-                                "table.merge-engine.aggregate." + fieldName + ".listagg-delimiter")
-                        .stringType()
-                        .defaultValue(",")
-                        .withDescription(
-                                "Delimiter for listagg aggregation function of field '"
-                                        + fieldName
-                                        + "' in aggregate merge engine. "
-                                        + "Default is comma ','."));
-    }
-
     /** Gets the delete behavior of the table. */
     public Optional<DeleteBehavior> getDeleteBehavior() {
         return config.getOptional(ConfigOptions.TABLE_DELETE_BEHAVIOR);

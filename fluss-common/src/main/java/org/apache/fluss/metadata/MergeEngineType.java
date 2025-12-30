@@ -61,7 +61,7 @@ public enum MergeEngineType {
      *
      * @since 0.9
      */
-    AGGREGATE;
+    AGGREGATION;
 
     /** Creates a {@link MergeEngineType} from the given string. */
     public static MergeEngineType fromString(String type) {
@@ -70,8 +70,8 @@ public enum MergeEngineType {
                 return FIRST_ROW;
             case "VERSIONED":
                 return VERSIONED;
-            case "AGGREGATE":
-                return AGGREGATE;
+            case "AGGREGATION":
+                return AGGREGATION;
             default:
                 throw new IllegalArgumentException("Unsupported merge engine type: " + type);
         }

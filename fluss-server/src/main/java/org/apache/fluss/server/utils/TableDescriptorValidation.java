@@ -84,11 +84,11 @@ public class TableDescriptorValidation {
         // check properties should only contain table.* options,
         // and this cluster know it, and value is valid
         for (String key : tableConf.keySet()) {
-            // Reject old format aggregate function configuration
-            // (table.merge-engine.aggregate.<field-name>)
+            // Reject old format aggregation function configuration
+            // (table.merge-engine.aggregation.<field-name>)
             // Allow sub-options (e.g., listagg-delimiter) which are validated when read
-            if (key.startsWith("table.merge-engine.aggregate.")) {
-                String remainder = key.substring("table.merge-engine.aggregate.".length());
+            if (key.startsWith("table.merge-engine.aggregation.")) {
+                String remainder = key.substring("table.merge-engine.aggregation.".length());
                 String[] parts = remainder.split("\\.", 2);
                 // If no sub-option (parts.length < 2), it's old format aggregate function config -
                 // reject it
@@ -397,8 +397,8 @@ public class TableDescriptorValidation {
         MergeEngineType mergeEngine = tableConf.get(ConfigOptions.TABLE_MERGE_ENGINE);
         if (mergeEngine == MergeEngineType.FIRST_ROW
                 || mergeEngine == MergeEngineType.VERSIONED
-                || mergeEngine == MergeEngineType.AGGREGATE) {
-            // For FIRST_ROW, VERSIONED and AGGREGATE merge engines, delete operations are not
+                || mergeEngine == MergeEngineType.AGGREGATION) {
+            // For FIRST_ROW, VERSIONED and AGGREGATION merge engines, delete operations are not
             // supported by default
             // If user explicitly sets delete behavior to ALLOW, validate it
             if (deleteBehaviorOptional.isPresent()
@@ -412,7 +412,7 @@ public class TableDescriptorValidation {
                                             + "The 'table.delete.behavior' config must be set to 'ignore' or 'disable', but got 'allow'.",
                                     mergeEngine));
                 }
-                // For AGGREGATE, ALLOW is permitted (removes entire record)
+                // For AGGREGATION, ALLOW is permitted (removes entire record)
             }
         }
     }

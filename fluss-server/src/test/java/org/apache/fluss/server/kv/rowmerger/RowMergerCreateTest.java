@@ -67,7 +67,7 @@ class RowMergerCreateTest {
                         .build();
 
         Configuration conf = new Configuration();
-        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATE.name());
+        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATION.name());
         TableConfig tableConfig = new TableConfig(conf);
 
         RowMerger merger =
@@ -88,7 +88,7 @@ class RowMergerCreateTest {
     @Test
     void testCreateAggregateRowMergerWithDeleteBehaviorAllow() {
         Configuration conf = new Configuration();
-        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATE.name());
+        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATION.name());
         conf.set(ConfigOptions.TABLE_DELETE_BEHAVIOR, DeleteBehavior.ALLOW);
         TableConfig tableConfig = new TableConfig(conf);
 
@@ -108,7 +108,7 @@ class RowMergerCreateTest {
     @Test
     void testCreateAggregateRowMergerWithDeleteBehavior() {
         Configuration conf = new Configuration();
-        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATE.name());
+        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATION.name());
         conf.setString(ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), DeleteBehavior.IGNORE.name());
         TableConfig tableConfig = new TableConfig(conf);
 
@@ -196,7 +196,7 @@ class RowMergerCreateTest {
                         .build();
 
         Configuration conf = new Configuration();
-        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATE.name());
+        conf.setString(ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.AGGREGATION.name());
         TableConfig tableConfig = new TableConfig(conf);
 
         RowMerger merger =
@@ -212,7 +212,7 @@ class RowMergerCreateTest {
         // Test case-insensitive merge engine type
         conf.setString(
                 ConfigOptions.TABLE_MERGE_ENGINE.key(),
-                MergeEngineType.AGGREGATE.name().toLowerCase());
+                MergeEngineType.AGGREGATION.name().toLowerCase());
         TableConfig tableConfig = new TableConfig(conf);
 
         RowMerger merger =

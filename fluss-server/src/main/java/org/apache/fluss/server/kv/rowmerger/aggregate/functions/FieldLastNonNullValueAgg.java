@@ -32,8 +32,8 @@ public class FieldLastNonNullValueAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    public FieldLastNonNullValueAgg(String name, DataType dataType) {
-        super(name, dataType);
+    public FieldLastNonNullValueAgg(DataType dataType) {
+        super(dataType);
     }
 
     @Override

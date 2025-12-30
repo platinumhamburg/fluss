@@ -30,8 +30,8 @@ public class FieldMaxAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    public FieldMaxAgg(String name, DataType dataType) {
-        super(name, dataType);
+    public FieldMaxAgg(DataType dataType) {
+        super(dataType);
     }
 
     @Override

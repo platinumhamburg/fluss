@@ -34,10 +34,8 @@ public abstract class FieldAggregator implements Serializable {
 
     protected final DataType fieldType;
     protected final DataTypeRoot typeRoot;
-    protected final String name;
 
-    public FieldAggregator(String name, DataType dataType) {
-        this.name = name;
+    public FieldAggregator(DataType dataType) {
         this.fieldType = dataType;
         this.typeRoot = dataType.getTypeRoot();
     }

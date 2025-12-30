@@ -23,6 +23,7 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldProductAgg;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeFamily;
@@ -32,19 +33,17 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 /** Factory for {@link FieldProductAgg}. */
 public class FieldProductAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "product";
-
     @Override
-    public FieldProductAgg create(DataType fieldType, AggFunction aggFunction, String field) {
+    public FieldProductAgg create(DataType fieldType, AggFunction aggFunction) {
         checkArgument(
                 fieldType.getTypeRoot().getFamilies().contains(DataTypeFamily.NUMERIC),
                 "Data type for product column must be 'NumericType' but was '%s'.",
                 fieldType);
-        return new FieldProductAgg(identifier(), fieldType);
+        return new FieldProductAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.PRODUCT.toString();
     }
 }

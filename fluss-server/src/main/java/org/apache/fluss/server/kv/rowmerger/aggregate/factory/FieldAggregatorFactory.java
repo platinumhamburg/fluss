@@ -23,11 +23,11 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldAggregator;
 import org.apache.fluss.types.DataType;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.EnumMap;
 import java.util.ServiceLoader;
 
 /** Factory interface for creating {@link FieldAggregator} instances. */
@@ -38,10 +38,9 @@ public interface FieldAggregatorFactory {
      *
      * @param fieldType the data type of the field
      * @param aggFunction the aggregation function with parameters
-     * @param field the field name
      * @return the field aggregator
      */
-    FieldAggregator create(DataType fieldType, AggFunction aggFunction, String field);
+    FieldAggregator create(DataType fieldType, AggFunction aggFunction);
 
     /**
      * Returns the unique identifier for this factory.
@@ -51,43 +50,22 @@ public interface FieldAggregatorFactory {
     String identifier();
 
     /**
-     * Creates a field aggregator for the given field with parameterized aggregate function.
+     * Gets a factory by its aggregation function type.
      *
-     * @param fieldType the data type of the field
-     * @param fieldName the field name
-     * @param aggFunction the aggregation function with parameters
-     * @return the field aggregator
-     */
-    static FieldAggregator create(DataType fieldType, String fieldName, AggFunction aggFunction) {
-        String identifier = aggFunction.getType().getIdentifier();
-        FieldAggregatorFactory factory = getFactory(identifier);
-        if (factory == null) {
-            throw new IllegalArgumentException(
-                    String.format(
-                            "Unsupported aggregation function: %s or spell aggregate function incorrectly!",
-                            identifier));
-        }
-
-        return factory.create(fieldType, aggFunction, fieldName);
-    }
-
-    /**
-     * Gets a factory by its identifier using SPI.
-     *
-     * @param identifier the identifier string
+     * @param type the aggregation function type
      * @return the factory, or null if not found
      */
-    static FieldAggregatorFactory getFactory(String identifier) {
-        return FactoryRegistry.INSTANCE.getFactory(identifier);
+    static FieldAggregatorFactory getFactory(AggFunctionType type) {
+        return FactoryRegistry.INSTANCE.getFactory(type);
     }
 
     /** Registry for field aggregator factories using Java SPI. */
     class FactoryRegistry {
         private static final FactoryRegistry INSTANCE = new FactoryRegistry();
-        private final Map<String, FieldAggregatorFactory> factories;
+        private final EnumMap<AggFunctionType, FieldAggregatorFactory> factories;
 
         private FactoryRegistry() {
-            this.factories = new HashMap<>();
+            this.factories = new EnumMap<>(AggFunctionType.class);
             loadFactories();
         }
 
@@ -97,12 +75,16 @@ public interface FieldAggregatorFactory {
                             FieldAggregatorFactory.class,
                             FieldAggregatorFactory.class.getClassLoader());
             for (FieldAggregatorFactory factory : loader) {
-                factories.put(factory.identifier(), factory);
+                // Map factory identifier to AggFunctionType
+                AggFunctionType type = AggFunctionType.fromString(factory.identifier());
+                if (type != null) {
+                    factories.put(type, factory);
+                }
             }
         }
 
-        FieldAggregatorFactory getFactory(String identifier) {
-            return factories.get(identifier);
+        FieldAggregatorFactory getFactory(AggFunctionType type) {
+            return factories.get(type);
         }
     }
 }

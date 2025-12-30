@@ -123,8 +123,8 @@ public final class AggFunction implements Serializable {
     @Override
     public String toString() {
         if (parameters.isEmpty()) {
-            return type.getIdentifier();
+            return type.toString();
         }
-        return type.getIdentifier() + parameters;
+        return type.toString() + parameters;
     }
 }

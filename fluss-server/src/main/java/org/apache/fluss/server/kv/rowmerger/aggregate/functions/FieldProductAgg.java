@@ -34,8 +34,8 @@ public class FieldProductAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    public FieldProductAgg(String name, DataType dataType) {
-        super(name, dataType);
+    public FieldProductAgg(DataType dataType) {
+        super(dataType);
     }
 
     @Override

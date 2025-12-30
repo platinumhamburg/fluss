@@ -29,8 +29,8 @@ public class FieldFirstNonNullValueAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
-    public FieldFirstNonNullValueAgg(String name, DataType dataType) {
-        super(name, dataType);
+    public FieldFirstNonNullValueAgg(DataType dataType) {
+        super(dataType);
     }
 
     @Override

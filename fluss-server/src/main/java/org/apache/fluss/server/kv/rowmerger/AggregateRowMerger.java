@@ -35,6 +35,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
@@ -87,29 +88,24 @@ public class AggregateRowMerger implements RowMerger {
             return newValue;
         }
 
+        // Get the latest schema ID from server (not from client's newValue which may be outdated)
+        short targetSchemaId = (short) schemaGetter.getLatestSchemaInfo().getSchemaId();
+
         // Get contexts for schema evolution support
-        // Optimize: reuse context when schemaId is the same, and avoid Tuple2 allocation
-        AggregationContext oldContext;
-        AggregationContext newContext;
+        AggregationContext oldContext = contextCache.getContext(oldValue.schemaId);
+        AggregationContext newContext = contextCache.getContext(newValue.schemaId);
+        AggregationContext targetContext = contextCache.getContext(targetSchemaId);
 
-        if (oldValue.schemaId == newValue.schemaId) {
-            // Same schema: reuse the same context to avoid duplicate lookup
-            newContext = contextCache.getContext(newValue.schemaId);
-            oldContext = newContext;
-        } else {
-            // Different schemas: need separate lookups
-            oldContext = contextCache.getContext(oldValue.schemaId);
-            newContext = contextCache.getContext(newValue.schemaId);
-        }
-
-        // Use row encoder for aggregation
-        RowEncoder encoder = newContext.getRowEncoder();
+        // Use target schema encoder to ensure merged row uses latest schema
+        RowEncoder encoder = targetContext.getRowEncoder();
         encoder.startNewRow();
-        AggregateFieldsProcessor.aggregateAllFields(
-                oldValue.row, newValue.row, oldContext, newContext, encoder);
+
+        // Aggregate using target schema context to ensure output uses server's latest schema
+        AggregateFieldsProcessor.aggregateAllFieldsWithTargetSchema(
+                oldValue.row, newValue.row, oldContext, newContext, targetContext, encoder);
         BinaryRow mergedRow = encoder.finishRow();
 
-        return new BinaryValue(newValue.schemaId, mergedRow);
+        return new BinaryValue(targetSchemaId, mergedRow);
     }
 
     @Override
@@ -136,6 +132,8 @@ public class AggregateRowMerger implements RowMerger {
         return partialMergerCache.get(
                 cacheKey,
                 k -> {
+                    // TODO: targetColumns should already be column IDs and not necessary to do
+                    // the conversion. Consider refactoring to pass column IDs directly.
                     // Convert target column indices to column IDs
                     List<Schema.Column> columns = schema.getColumns();
                     Set<Integer> targetColumnIds = new HashSet<>();
@@ -180,10 +178,7 @@ public class AggregateRowMerger implements RowMerger {
 
         private int computeHashCode() {
             int result = schemaId;
-            // Use a simple rolling hash for array content
-            for (int col : targetColumns) {
-                result = 31 * result + col;
-            }
+            result = 31 * result + Arrays.hashCode(targetColumns);
             return result;
         }
 
@@ -196,18 +191,8 @@ public class AggregateRowMerger implements RowMerger {
                 return false;
             }
             CacheKey cacheKey = (CacheKey) o;
-            if (schemaId != cacheKey.schemaId) {
-                return false;
-            }
-            if (targetColumns.length != cacheKey.targetColumns.length) {
-                return false;
-            }
-            for (int i = 0; i < targetColumns.length; i++) {
-                if (targetColumns[i] != cacheKey.targetColumns[i]) {
-                    return false;
-                }
-            }
-            return true;
+            return schemaId == cacheKey.schemaId
+                    && Arrays.equals(targetColumns, cacheKey.targetColumns);
         }
 
         @Override
@@ -288,20 +273,24 @@ public class AggregateRowMerger implements RowMerger {
             // Get contexts for schema evolution support
             AggregationContext oldContext = contextCache.getContext(oldValue.schemaId);
             AggregationContext newContext = contextCache.getContext(newValue.schemaId);
+            AggregationContext targetContext = contextCache.getContext(targetSchemaId);
 
-            // Use row encoder for partial update
-            RowEncoder encoder = newContext.getRowEncoder();
+            // Use target schema encoder to ensure merged row uses latest schema
+            RowEncoder encoder = targetContext.getRowEncoder();
             encoder.startNewRow();
-            AggregateFieldsProcessor.aggregateTargetFields(
+
+            // Aggregate using target schema to ensure output uses server's latest schema
+            AggregateFieldsProcessor.aggregateTargetFieldsWithTargetSchema(
                     oldValue.row,
                     newValue.row,
                     oldContext,
                     newContext,
+                    targetContext,
                     targetColumnIdBitSet,
                     encoder);
             BinaryRow mergedRow = encoder.finishRow();
 
-            return new BinaryValue(newValue.schemaId, mergedRow);
+            return new BinaryValue(targetSchemaId, mergedRow);
         }
 
         @Override

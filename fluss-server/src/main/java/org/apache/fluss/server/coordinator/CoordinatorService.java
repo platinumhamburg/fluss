@@ -468,7 +468,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 tableConf.getOptional(ConfigOptions.TABLE_MERGE_ENGINE).orElse(null);
         if (mergeEngine == MergeEngineType.FIRST_ROW
                 || mergeEngine == MergeEngineType.VERSIONED
-                || mergeEngine == MergeEngineType.AGGREGATE) {
+                || mergeEngine == MergeEngineType.AGGREGATION) {
             if (tableDescriptor.hasPrimaryKey()
                     && !tableConf.getOptional(ConfigOptions.TABLE_DELETE_BEHAVIOR).isPresent()) {
                 Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());

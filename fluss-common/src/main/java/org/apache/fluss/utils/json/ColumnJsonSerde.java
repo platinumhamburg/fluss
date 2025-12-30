@@ -61,7 +61,7 @@ public class ColumnJsonSerde
         if (column.getAggFunction().isPresent()) {
             AggFunction aggFunc = column.getAggFunction().get();
             generator.writeObjectFieldStart(AGG_FUNCTION);
-            generator.writeStringField(AGG_FUNCTION_TYPE, aggFunc.getType().getIdentifier());
+            generator.writeStringField(AGG_FUNCTION_TYPE, aggFunc.getType().toString());
             if (aggFunc.hasParameters()) {
                 generator.writeObjectFieldStart(AGG_FUNCTION_PARAMS);
                 for (Map.Entry<String, String> entry : aggFunc.getParameters().entrySet()) {

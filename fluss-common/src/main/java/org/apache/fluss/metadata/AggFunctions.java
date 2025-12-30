@@ -165,6 +165,13 @@ public final class AggFunctions {
     // ===================================================================================
 
     /**
+     * Default delimiter for LISTAGG and STRING_AGG aggregation functions.
+     *
+     * @since 0.9
+     */
+    public static final String DEFAULT_LISTAGG_DELIMITER = ",";
+
+    /**
      * Creates a LISTAGG aggregation function with default comma delimiter.
      *
      * <p>Concatenates multiple string values into a single string with a delimiter.
@@ -173,10 +180,10 @@ public final class AggFunctions {
      *
      * <p>Null handling: Null values are skipped
      *
-     * @return a LISTAGG aggregation function with comma delimiter
+     * @return a LISTAGG aggregation function with default delimiter
      */
     public static AggFunction LISTAGG() {
-        return LISTAGG(",");
+        return new AggFunction(AggFunctionType.LISTAGG, null);
     }
 
     /**
@@ -207,10 +214,10 @@ public final class AggFunctions {
      *
      * <p>Null handling: Null values are skipped
      *
-     * @return a STRING_AGG aggregation function with comma delimiter
+     * @return a STRING_AGG aggregation function with default delimiter
      */
     public static AggFunction STRING_AGG() {
-        return STRING_AGG(",");
+        return new AggFunction(AggFunctionType.STRING_AGG, null);
     }
 
     /**

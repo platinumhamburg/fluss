@@ -23,6 +23,8 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldListaggAgg;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.StringType;
@@ -32,11 +34,8 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 /** Factory for {@link FieldListaggAgg}. */
 public class FieldListaggAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "listagg";
-    private static final String DEFAULT_DELIMITER = ",";
-
     @Override
-    public FieldListaggAgg create(DataType fieldType, AggFunction aggFunction, String field) {
+    public FieldListaggAgg create(DataType fieldType, AggFunction aggFunction) {
         checkArgument(
                 fieldType instanceof StringType,
                 "Data type for listagg column must be 'StringType' but was '%s'.",
@@ -45,14 +44,14 @@ public class FieldListaggAggFactory implements FieldAggregatorFactory {
         // Get delimiter from function parameters, default to comma
         String delimiter = aggFunction.getParameter("delimiter");
         if (delimiter == null) {
-            delimiter = DEFAULT_DELIMITER;
+            delimiter = AggFunctions.DEFAULT_LISTAGG_DELIMITER;
         }
 
-        return new FieldListaggAgg(identifier(), (StringType) fieldType, delimiter);
+        return new FieldListaggAgg((StringType) fieldType, delimiter);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.LISTAGG.toString();
     }
 }

@@ -31,7 +31,6 @@ import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldLastValueAg
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldListaggAgg;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldMaxAgg;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldMinAgg;
-import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldPrimaryKeyAgg;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldProductAgg;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldSumAgg;
 import org.apache.fluss.types.DataTypes;
@@ -42,61 +41,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for aggregator creation in {@link AggregationContext}. */
 class AggregationContextTest {
-
-    @Test
-    void testPrimaryKeyFieldsNotAggregated() {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column("value", DataTypes.BIGINT())
-                        .primaryKey("id")
-                        .build();
-
-        TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
-
-        // First field is primary key, should use FieldPrimaryKeyAgg
-        assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
-        // Second field should use default (last_value_ignore_nulls)
-        assertThat(context.getAggregators()[1]).isInstanceOf(FieldLastNonNullValueAgg.class);
-    }
-
-    @Test
-    void testCompositePrimaryKey() {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id1", DataTypes.INT())
-                        .column("id2", DataTypes.STRING())
-                        .column("value", DataTypes.BIGINT(), AggFunctions.SUM())
-                        .primaryKey("id1", "id2")
-                        .build();
-
-        TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
-
-        // Both primary key fields should not be aggregated
-        assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
-        assertThat(context.getAggregators()[1]).isInstanceOf(FieldPrimaryKeyAgg.class);
-        assertThat(context.getAggregators()[2]).isInstanceOf(FieldSumAgg.class);
-    }
-
-    @Test
-    void testNoConfigurationUsesLastNonNullValue() {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column("value", DataTypes.STRING())
-                        .primaryKey("id")
-                        .build();
-
-        // No configuration at all
-        TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
-
-        assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
-        // Should default to last_value_ignore_nulls
-        assertThat(context.getAggregators()[1]).isInstanceOf(FieldLastNonNullValueAgg.class);
-    }
 
     @Test
     void testAllAggregatorTypesFromSchema() {
@@ -127,7 +71,8 @@ class AggregationContextTest {
         TableConfig tableConfig = new TableConfig(new Configuration());
         AggregationContext context = AggregationContext.create(schema, KvFormat.COMPACTED);
 
-        assertThat(context.getAggregators()[0]).isInstanceOf(FieldPrimaryKeyAgg.class);
+        // Primary key field should use FieldLastValueAgg (not aggregated)
+        assertThat(context.getAggregators()[0]).isInstanceOf(FieldLastValueAgg.class);
         assertThat(context.getAggregators()[1]).isInstanceOf(FieldSumAgg.class);
         assertThat(context.getAggregators()[2]).isInstanceOf(FieldProductAgg.class);
         assertThat(context.getAggregators()[3]).isInstanceOf(FieldMaxAgg.class);

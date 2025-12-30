@@ -33,8 +33,8 @@ public class FieldListaggAgg extends FieldAggregator {
 
     private final BinaryString delimiter;
 
-    public FieldListaggAgg(String name, StringType dataType, String delimiter) {
-        super(name, dataType);
+    public FieldListaggAgg(StringType dataType, String delimiter) {
+        super(dataType);
         // Cache delimiter as BinaryString to avoid repeated conversions
         this.delimiter = BinaryString.fromString(delimiter);
     }

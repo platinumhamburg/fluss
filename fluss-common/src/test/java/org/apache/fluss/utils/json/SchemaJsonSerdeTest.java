@@ -99,11 +99,14 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
                             "last_update_time",
                             DataTypes.TIMESTAMP(),
                             AggFunctions.LAST_VALUE_IGNORE_NULLS())
+                    .column("tags", DataTypes.STRING(), AggFunctions.LISTAGG(";"))
+                    .column("categories", DataTypes.STRING(), AggFunctions.STRING_AGG("|"))
+                    .column("labels", DataTypes.STRING(), AggFunctions.LISTAGG())
                     .primaryKey("product_id")
                     .build();
 
     static final String SCHEMA_JSON_WITH_AGG =
-            "{\"version\":1,\"columns\":[{\"name\":\"product_id\",\"data_type\":{\"type\":\"BIGINT\",\"nullable\":false},\"id\":0},{\"name\":\"total_sales\",\"data_type\":{\"type\":\"BIGINT\"},\"agg_function\":{\"type\":\"sum\"},\"id\":1},{\"name\":\"max_price\",\"data_type\":{\"type\":\"DECIMAL\",\"precision\":10,\"scale\":2},\"agg_function\":{\"type\":\"max\"},\"id\":2},{\"name\":\"last_update_time\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"agg_function\":{\"type\":\"last_value_ignore_nulls\"},\"id\":3}],\"primary_key\":[\"product_id\"],\"highest_field_id\":3}";
+            "{\"version\":1,\"columns\":[{\"name\":\"product_id\",\"data_type\":{\"type\":\"BIGINT\",\"nullable\":false},\"id\":0},{\"name\":\"total_sales\",\"data_type\":{\"type\":\"BIGINT\"},\"agg_function\":{\"type\":\"sum\"},\"id\":1},{\"name\":\"max_price\",\"data_type\":{\"type\":\"DECIMAL\",\"precision\":10,\"scale\":2},\"agg_function\":{\"type\":\"max\"},\"id\":2},{\"name\":\"last_update_time\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"agg_function\":{\"type\":\"last_value_ignore_nulls\"},\"id\":3},{\"name\":\"tags\",\"data_type\":{\"type\":\"STRING\"},\"agg_function\":{\"type\":\"listagg\",\"parameters\":{\"delimiter\":\";\"}},\"id\":4},{\"name\":\"categories\",\"data_type\":{\"type\":\"STRING\"},\"agg_function\":{\"type\":\"string_agg\",\"parameters\":{\"delimiter\":\"|\"}},\"id\":5},{\"name\":\"labels\",\"data_type\":{\"type\":\"STRING\"},\"agg_function\":{\"type\":\"listagg\"},\"id\":6}],\"primary_key\":[\"product_id\"],\"highest_field_id\":6}";
 
     SchemaJsonSerdeTest() {
         super(SchemaJsonSerde.INSTANCE);
@@ -151,44 +154,5 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
                 "{\"version\":1,\"columns\":[{\"name\":\"a\",\"data_type\":{\"type\":\"BIGINT\"},\"comment\":\"a is first column\"},{\"name\":\"b\",\"data_type\":{\"type\":\"STRING\"},\"comment\":\"b is second column\"},{\"name\":\"c\",\"data_type\":{\"type\":\"TIMESTAMP_WITHOUT_TIME_ZONE\",\"precision\":6},\"comment\":\"c is third column\"}]}";
 
         return new String[] {oldSchemaJson1, oldSchemaJson2, oldSchemaJson2, oldSchemaJson3};
-    }
-
-    @Test
-    void testSchemaWithAggregationFunctions() {
-        // Test serialization
-        byte[] jsonBytes = SCHEMA_WITH_AGG.toJsonBytes();
-        String json = new String(jsonBytes, StandardCharsets.UTF_8);
-        assertThat(json).contains("\"agg_function\":{\"type\":\"sum\"}");
-        assertThat(json).contains("\"agg_function\":{\"type\":\"max\"}");
-        assertThat(json).contains("\"agg_function\":{\"type\":\"last_value_ignore_nulls\"}");
-
-        // Test deserialization
-        Schema deserialized = Schema.fromJsonBytes(jsonBytes);
-        assertThat(deserialized.getAggFunction("total_sales")).isPresent();
-        assertThat(deserialized.getAggFunction("total_sales").get()).isEqualTo(AggFunctions.SUM());
-        assertThat(deserialized.getAggFunction("max_price")).isPresent();
-        assertThat(deserialized.getAggFunction("max_price").get()).isEqualTo(AggFunctions.MAX());
-        assertThat(deserialized.getAggFunction("last_update_time")).isPresent();
-        assertThat(deserialized.getAggFunction("last_update_time").get())
-                .isEqualTo(AggFunctions.LAST_VALUE_IGNORE_NULLS());
-        assertThat(deserialized.getAggFunction("product_id"))
-                .isEmpty(); // Primary key has no agg function
-
-        // Test round-trip
-        assertThat(deserialized).isEqualTo(SCHEMA_WITH_AGG);
-    }
-
-    @Test
-    void testSchemaWithoutAggregationFunctions() {
-        // Test that schema without aggregation functions serializes correctly
-        byte[] jsonBytes = SCHEMA_0.toJsonBytes();
-        String json = new String(jsonBytes, StandardCharsets.UTF_8);
-        assertThat(json).doesNotContain("agg_function");
-
-        // Test deserialization
-        Schema deserialized = Schema.fromJsonBytes(jsonBytes);
-        assertThat(deserialized.getAggFunction("a")).isEmpty();
-        assertThat(deserialized.getAggFunction("b")).isEmpty();
-        assertThat(deserialized.getAggFunction("c")).isEmpty();
     }
 }

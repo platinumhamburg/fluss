@@ -1029,7 +1029,7 @@ class KvTabletTest {
                         .build();
 
         Map<String, String> config = new HashMap<>();
-        config.put("table.merge-engine", "aggregate");
+        config.put("table.merge-engine", "aggregation");
 
         TablePath tablePath = TablePath.of("testDb", "test_aggregate_merge_engine");
         initLogTabletAndKvTablet(tablePath, schema, config);

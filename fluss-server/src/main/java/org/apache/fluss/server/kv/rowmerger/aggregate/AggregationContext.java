@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.kv.rowmerger.aggregate;
 
+import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.metadata.AggFunctions;
@@ -33,7 +34,6 @@ import java.util.BitSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 /**
  * Context for aggregation operations, containing field getters, aggregators, and encoder for a
@@ -138,7 +138,7 @@ public class AggregationContext {
      * key columns must be nullable (for partial update semantics)
      *
      * @param targetColumnIdBitSet BitSet of target column IDs
-     * @throws org.apache.fluss.exception.InvalidTargetColumnException if validation fails
+     * @throws InvalidTargetColumnException if validation fails
      */
     public void sanityCheckTargetColumns(BitSet targetColumnIdBitSet) {
         // Build target column position set from targetColumnIds
@@ -156,7 +156,7 @@ public class AggregationContext {
         // Check 1: target columns must contain all primary key columns
         for (int pkIndex : schema.getPrimaryKeyIndexes()) {
             if (!targetColumnPosBitSet.get(pkIndex)) {
-                throw new org.apache.fluss.exception.InvalidTargetColumnException(
+                throw new InvalidTargetColumnException(
                         String.format(
                                 "The target write columns must contain the primary key columns %s.",
                                 schema.getColumnNames(schema.getPrimaryKeyIndexes())));
@@ -167,7 +167,7 @@ public class AggregationContext {
         for (int i = 0; i < fieldDataTypes.length; i++) {
             if (!primaryKeyColsBitSet.get(i)) {
                 if (!fieldDataTypes[i].isNullable()) {
-                    throw new org.apache.fluss.exception.InvalidTargetColumnException(
+                    throw new InvalidTargetColumnException(
                             String.format(
                                     "Partial aggregate requires all columns except primary key to be nullable, "
                                             + "but column %s is NOT NULL.",
@@ -251,8 +251,16 @@ public class AggregationContext {
             // Get the aggregate function for this field
             AggFunction aggFunc = getAggFunction(fieldName, primaryKeys, schema);
 
-            // Create the aggregator using the factory with the parameterized function
-            aggregators[i] = FieldAggregatorFactory.create(fieldType, fieldName, aggFunc);
+            // Get the factory for this aggregation function type and create the aggregator
+            AggFunctionType type = aggFunc.getType();
+            FieldAggregatorFactory factory = FieldAggregatorFactory.getFactory(type);
+            if (factory == null) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Unsupported aggregation function: %s or spell aggregate function incorrectly!",
+                                type));
+            }
+            aggregators[i] = factory.create(fieldType, aggFunc);
         }
 
         return aggregators;
@@ -264,7 +272,7 @@ public class AggregationContext {
      * <p>The priority is:
      *
      * <ol>
-     *   <li>Primary key fields use "primary-key" (no aggregation)
+     *   <li>Primary key fields use "last_value" (no aggregation)
      *   <li>Schema.getAggFunction() - aggregation function defined in Schema (from Column)
      *   <li>Final fallback: "last_value_ignore_nulls"
      * </ol>
@@ -282,13 +290,7 @@ public class AggregationContext {
             return AggFunctions.of(AggFunctionType.LAST_VALUE);
         }
 
-        // 2. Check Schema for aggregation function (from Column)
-        Optional<AggFunction> schemaAggFunc = schema.getAggFunction(fieldName);
-        if (schemaAggFunc.isPresent()) {
-            return schemaAggFunc.get();
-        }
-
-        // 3. Final fallback - use default aggregation function
-        return AggFunctions.LAST_VALUE_IGNORE_NULLS();
+        // 2. Check Schema for aggregation function, or use default fallback
+        return schema.getAggFunction(fieldName).orElseGet(AggFunctions::LAST_VALUE_IGNORE_NULLS);
     }
 }

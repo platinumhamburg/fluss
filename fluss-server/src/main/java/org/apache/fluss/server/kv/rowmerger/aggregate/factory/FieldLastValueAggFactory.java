@@ -23,21 +23,20 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldLastValueAgg;
 import org.apache.fluss.types.DataType;
 
 /** Factory for {@link FieldLastValueAgg}. */
 public class FieldLastValueAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "last_value";
-
     @Override
-    public FieldLastValueAgg create(DataType fieldType, AggFunction aggFunction, String field) {
-        return new FieldLastValueAgg(identifier(), fieldType);
+    public FieldLastValueAgg create(DataType fieldType, AggFunction aggFunction) {
+        return new FieldLastValueAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.LAST_VALUE.toString();
     }
 }

@@ -658,12 +658,11 @@ class FieldAggregatorParameterizedTest {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("value", DataTypes.STRING(), AggFunctions.LISTAGG())
+                        .column("value", DataTypes.STRING(), AggFunctions.LISTAGG("|"))
                         .primaryKey("id")
                         .build();
 
         Configuration conf = new Configuration();
-        conf.setString("table.merge-engine.aggregate.value.listagg-delimiter", "|");
         TableConfig tableConfig = new TableConfig(conf);
 
         AggregateRowMerger merger = createMerger(schema, tableConfig);

@@ -97,7 +97,7 @@ public interface RowMerger {
                                         ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key()));
                     }
                     return new VersionedRowMerger(versionColumn.get(), deleteBehavior);
-                case AGGREGATE:
+                case AGGREGATION:
                     return new AggregateRowMerger(tableConf, kvFormat, schemaGetter);
                 default:
                     throw new IllegalArgumentException(

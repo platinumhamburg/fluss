@@ -23,21 +23,20 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldMaxAgg;
 import org.apache.fluss.types.DataType;
 
 /** Factory for {@link FieldMaxAgg}. */
 public class FieldMaxAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "max";
-
     @Override
-    public FieldMaxAgg create(DataType fieldType, AggFunction aggFunction, String field) {
-        return new FieldMaxAgg(identifier(), fieldType);
+    public FieldMaxAgg create(DataType fieldType, AggFunction aggFunction) {
+        return new FieldMaxAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.MAX.toString();
     }
 }

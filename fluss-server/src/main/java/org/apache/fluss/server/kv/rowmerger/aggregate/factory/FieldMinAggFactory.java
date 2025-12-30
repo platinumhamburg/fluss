@@ -23,21 +23,20 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.factory;
  * additional information regarding copyright ownership. */
 
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldMinAgg;
 import org.apache.fluss.types.DataType;
 
 /** Factory for {@link FieldMinAgg}. */
 public class FieldMinAggFactory implements FieldAggregatorFactory {
 
-    public static final String NAME = "min";
-
     @Override
-    public FieldMinAgg create(DataType fieldType, AggFunction aggFunction, String field) {
-        return new FieldMinAgg(identifier(), fieldType);
+    public FieldMinAgg create(DataType fieldType, AggFunction aggFunction) {
+        return new FieldMinAgg(fieldType);
     }
 
     @Override
     public String identifier() {
-        return NAME;
+        return AggFunctionType.MIN.toString();
     }
 }

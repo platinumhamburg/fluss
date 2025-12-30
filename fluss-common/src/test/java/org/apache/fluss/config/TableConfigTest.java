@@ -27,31 +27,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TableConfigTest {
 
     @Test
-    void testGetFieldListaggDelimiterWithDefaultValue() {
-        Configuration conf = new Configuration();
-        TableConfig tableConfig = new TableConfig(conf);
-
-        // Test default delimiter (comma)
-        assertThat(tableConfig.getFieldListaggDelimiter("tags")).isEqualTo(",");
-        assertThat(tableConfig.getFieldListaggDelimiter("values")).isEqualTo(",");
-    }
-
-    @Test
-    void testGetFieldListaggDelimiterWithSpecialCharacters() {
-        Configuration conf = new Configuration();
-        conf.setString("table.merge-engine.aggregate.field1.listagg-delimiter", "||");
-        conf.setString("table.merge-engine.aggregate.field2.listagg-delimiter", " - ");
-        conf.setString("table.merge-engine.aggregate.field3.listagg-delimiter", "\t");
-
-        TableConfig tableConfig = new TableConfig(conf);
-
-        // Test special character delimiters
-        assertThat(tableConfig.getFieldListaggDelimiter("field1")).isEqualTo("||");
-        assertThat(tableConfig.getFieldListaggDelimiter("field2")).isEqualTo(" - ");
-        assertThat(tableConfig.getFieldListaggDelimiter("field3")).isEqualTo("\t");
-    }
-
-    @Test
     void testDeleteBehavior() {
         Configuration conf = new Configuration();
         TableConfig tableConfig = new TableConfig(conf);
