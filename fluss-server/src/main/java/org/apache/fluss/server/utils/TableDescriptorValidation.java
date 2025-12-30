@@ -84,24 +84,6 @@ public class TableDescriptorValidation {
         // check properties should only contain table.* options,
         // and this cluster know it, and value is valid
         for (String key : tableConf.keySet()) {
-            // Reject old format aggregation function configuration
-            // (table.merge-engine.aggregation.<field-name>)
-            // Allow sub-options (e.g., listagg-delimiter) which are validated when read
-            if (key.startsWith("table.merge-engine.aggregation.")) {
-                String remainder = key.substring("table.merge-engine.aggregation.".length());
-                String[] parts = remainder.split("\\.", 2);
-                // If no sub-option (parts.length < 2), it's old format aggregate function config -
-                // reject it
-                if (parts.length < 2) {
-                    throw new InvalidConfigException(
-                            String.format(
-                                    "Aggregation function should be defined in Schema via Column, not via configuration '%s'. "
-                                            + "Please use Schema.column(name, dataType, aggFunction) instead.",
-                                    key));
-                }
-                // Sub-options (listagg-delimiter) are allowed and validated when read
-                continue;
-            }
 
             if (!TABLE_OPTIONS.containsKey(key)) {
                 if (isTableStorageConfig(key)) {
