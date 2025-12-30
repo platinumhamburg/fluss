@@ -24,6 +24,7 @@ import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.GenericArray;
 import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.InternalArray;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
@@ -260,6 +261,141 @@ class ArrowReaderWriterTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessage(
                             "The arrow batch size is full and it shouldn't accept writing new rows, it's a bug.");
+        }
+    }
+
+    /**
+     * Test complex array scenarios to fix issue #2164: IndexOutOfBoundsException when writing rows
+     * with array columns where row count is less than INITIAL_CAPACITY (1024) but total array
+     * element count exceeds it.
+     *
+     * <p>The bug occurred because ArrowArrayWriter incorrectly passed the parent's handleSafe flag
+     * (based on row count) to element writers, while element indices are based on cumulative
+     * element count across all rows, not row count.
+     *
+     * <p>This test verifies the fix by covering multiple edge cases: 1. Multiple independent Array
+     * columns with independent offset counters 2. Nested Arrays with recursive offset tracking 3.
+     * Array columns mixed with non-Array columns.
+     *
+     * <p>Each ArrowArrayWriter maintains its own independent offset counter and correctly
+     * determines handleSafe based on element indices, not row indices.
+     */
+    @Test
+    void testComplexArrayScenarios() throws IOException {
+        // Scenario 1: Multiple Array columns + non-Array columns
+        RowType complexSchema =
+                DataTypes.ROW(
+                        DataTypes.FIELD("id", DataTypes.INT()),
+                        DataTypes.FIELD("tags", DataTypes.ARRAY(DataTypes.INT())),
+                        DataTypes.FIELD("name", DataTypes.STRING()),
+                        DataTypes.FIELD("scores", DataTypes.ARRAY(DataTypes.FLOAT())),
+                        DataTypes.FIELD(
+                                "matrix", DataTypes.ARRAY(DataTypes.ARRAY(DataTypes.INT()))));
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                VectorSchemaRoot root =
+                        VectorSchemaRoot.create(
+                                ArrowUtils.toArrowSchema(complexSchema), allocator);
+                ArrowWriterPool provider = new ArrowWriterPool(allocator);
+                ArrowWriter writer =
+                        provider.getOrCreateWriter(
+                                1L, 1, Integer.MAX_VALUE, complexSchema, NO_COMPRESSION)) {
+
+            // Write 100 rows with varying array sizes
+            // - tags: 15 elements per row → 100 * 15 = 1500 total (> 1024)
+            // - scores: 20 elements per row → 100 * 20 = 2000 total (> 1024)
+            // - matrix: 5 outer arrays, 10 inner elements each → 100 * 5 * 10 = 5000 total (> 1024)
+            // But row count: 100 < 1024
+
+            int numRows = 100;
+            for (int i = 0; i < numRows; i++) {
+                // Create tags array (15 elements)
+                Integer[] tagsData = new Integer[15];
+                for (int j = 0; j < 15; j++) {
+                    tagsData[j] = i * 15 + j;
+                }
+
+                // Create scores array (20 elements)
+                Float[] scoresData = new Float[20];
+                for (int j = 0; j < 20; j++) {
+                    scoresData[j] = i * 20.0f + j * 0.1f;
+                }
+
+                // Create nested array (5 outer arrays, each with 10 elements)
+                GenericArray[] matrixData = new GenericArray[5];
+                for (int j = 0; j < 5; j++) {
+                    Integer[] innerArray = new Integer[10];
+                    for (int k = 0; k < 10; k++) {
+                        innerArray[k] = i * 50 + j * 10 + k;
+                    }
+                    matrixData[j] = GenericArray.of(innerArray);
+                }
+
+                InternalRow row =
+                        GenericRow.of(
+                                i,
+                                GenericArray.of(tagsData),
+                                fromString("name_" + i),
+                                GenericArray.of(scoresData),
+                                GenericArray.of(matrixData));
+
+                // This should not throw IndexOutOfBoundsException
+                writer.writeRow(row);
+            }
+
+            // Verify all rows were written successfully
+            assertThat(writer.getRecordsCount()).isEqualTo(numRows);
+
+            // Serialize and verify we can read back the data correctly
+            AbstractPagedOutputView pagedOutputView =
+                    new ManagedPagedOutputView(new TestingMemorySegmentPool(100 * 1024));
+            int size =
+                    writer.serializeToOutputView(
+                            pagedOutputView, arrowChangeTypeOffset(CURRENT_LOG_MAGIC_VALUE));
+            int heapMemorySize = Math.max(size, writer.estimatedSizeInBytes());
+            MemorySegment segment = MemorySegment.allocateHeapMemory(heapMemorySize);
+
+            MemorySegment firstSegment = pagedOutputView.getCurrentSegment();
+            firstSegment.copyTo(arrowChangeTypeOffset(CURRENT_LOG_MAGIC_VALUE), segment, 0, size);
+
+            ArrowReader reader =
+                    ArrowUtils.createArrowReader(segment, 0, size, root, allocator, complexSchema);
+
+            // Verify data integrity for first and last rows
+            for (int rowId : new int[] {0, numRows - 1}) {
+                ColumnarRow row = reader.read(rowId);
+                row.setRowId(rowId);
+
+                // Verify id
+                assertThat(row.getInt(0)).isEqualTo(rowId);
+
+                // Verify tags array
+                InternalArray tags = row.getArray(1);
+                assertThat(tags.size()).isEqualTo(15);
+                assertThat(tags.getInt(0)).isEqualTo(rowId * 15);
+                assertThat(tags.getInt(14)).isEqualTo(rowId * 15 + 14);
+
+                // Verify name
+                assertThat(row.getString(2).toString()).isEqualTo("name_" + rowId);
+
+                // Verify scores array
+                InternalArray scores = row.getArray(3);
+                assertThat(scores.size()).isEqualTo(20);
+                assertThat(scores.getFloat(0)).isEqualTo(rowId * 20.0f);
+
+                // Verify nested array (matrix)
+                InternalArray matrix = row.getArray(4);
+                assertThat(matrix.size()).isEqualTo(5);
+                InternalArray firstInnerArray = matrix.getArray(0);
+                assertThat(firstInnerArray.size()).isEqualTo(10);
+                assertThat(firstInnerArray.getInt(0)).isEqualTo(rowId * 50);
+                assertThat(firstInnerArray.getInt(9)).isEqualTo(rowId * 50 + 9);
+
+                InternalArray lastInnerArray = matrix.getArray(4);
+                assertThat(lastInnerArray.size()).isEqualTo(10);
+                assertThat(lastInnerArray.getInt(0)).isEqualTo(rowId * 50 + 40);
+                assertThat(lastInnerArray.getInt(9)).isEqualTo(rowId * 50 + 49);
+            }
         }
     }
 }
