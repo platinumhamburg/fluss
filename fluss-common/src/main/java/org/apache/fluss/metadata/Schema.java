@@ -676,7 +676,8 @@ public final class Schema implements Serializable {
 
         // Validate that aggregation functions are only set for non-primary key columns
         for (Column column : columns) {
-            if (pkSet.contains(column.getName()) && column.getAggFunction().isPresent()) {
+            // check presentation first for better performance
+            if (column.getAggFunction().isPresent() && pkSet.contains(column.getName())) {
                 throw new IllegalArgumentException(
                         String.format(
                                 "Cannot set aggregation function for primary key column '%s'. "

@@ -213,11 +213,11 @@ public final class AggregateFieldsProcessor {
             } else if (oldIdx != null) {
                 // Non-target column that exists in old schema: copy old value
                 copyOldValueAndEncode(oldFieldGetters[oldIdx], oldRow, targetIdx, encoder);
-            } else if (newIdx != null) {
-                // New column that doesn't exist in old schema: copy from newRow
-                encoder.encodeField(targetIdx, newFieldGetters[newIdx].getFieldOrNull(newRow));
             } else {
-                // Column exists only in target schema: set to null
+                // Non-target column that doesn't exist in old schema: set to null
+                // NOTE: In partial aggregation, non-target columns should not use values from
+                // newRow, even if they exist in newRow's schema, as only target columns are
+                // aggregated
                 encoder.encodeField(targetIdx, null);
             }
         }

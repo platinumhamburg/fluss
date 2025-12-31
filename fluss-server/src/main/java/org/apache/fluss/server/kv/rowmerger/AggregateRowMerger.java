@@ -67,6 +67,9 @@ public class AggregateRowMerger implements RowMerger {
     // Cache for PartialAggregateRowMerger instances to avoid repeated creation
     private final Cache<CacheKey, PartialAggregateRowMerger> partialMergerCache;
 
+    // the current target schema id which is updated before merge() operation
+    private short targetSchemaId;
+
     public AggregateRowMerger(
             TableConfig tableConfig, KvFormat kvFormat, SchemaGetter schemaGetter) {
         this.schemaGetter = schemaGetter;
@@ -87,9 +90,6 @@ public class AggregateRowMerger implements RowMerger {
         if (oldValue == null || oldValue.row == null) {
             return newValue;
         }
-
-        // Get the latest schema ID from server (not from client's newValue which may be outdated)
-        short targetSchemaId = (short) schemaGetter.getLatestSchemaInfo().getSchemaId();
 
         // Get contexts for schema evolution support
         AggregationContext oldContext = contextCache.getContext(oldValue.schemaId);
@@ -121,21 +121,25 @@ public class AggregateRowMerger implements RowMerger {
 
     @Override
     public RowMerger configureTargetColumns(
-            @Nullable int[] targetColumns, short schemaId, Schema schema) {
+            @Nullable int[] targetColumns, short latestSchemaId, Schema latestSchema) {
         if (targetColumns == null) {
+            this.targetSchemaId = latestSchemaId;
             return this;
         }
 
         // Use cache to get or create PartialAggregateRowMerger
         // This avoids repeated object creation and BitSet construction
-        CacheKey cacheKey = new CacheKey(schemaId, targetColumns);
+        CacheKey cacheKey = new CacheKey(latestSchemaId, targetColumns);
         return partialMergerCache.get(
                 cacheKey,
                 k -> {
-                    // TODO: targetColumns should already be column IDs and not necessary to do
-                    // the conversion. Consider refactoring to pass column IDs directly.
-                    // Convert target column indices to column IDs
-                    List<Schema.Column> columns = schema.getColumns();
+                    // TODO: Currently, this conversion is broken when DROP COLUMN is supported,
+                    //  because `targetColumns` still references column indexes from an outdated
+                    //  schema, which no longer align with the current (latest) schema.
+                    //  In #2239, we plan to refactor `targetColumns` to use column IDs instead of
+                    //  indexes. Once that change is in place, this conversion logic can be safely
+                    //  removed.
+                    List<Schema.Column> columns = latestSchema.getColumns();
                     Set<Integer> targetColumnIds = new HashSet<>();
                     for (int colIdx : targetColumns) {
                         targetColumnIds.add(columns.get(colIdx).getColumnId());
@@ -153,8 +157,8 @@ public class AggregateRowMerger implements RowMerger {
                             deleteBehavior,
                             schemaGetter,
                             contextCache,
-                            schema,
-                            schemaId);
+                            latestSchema,
+                            latestSchemaId);
                 });
     }
 
@@ -350,7 +354,7 @@ public class AggregateRowMerger implements RowMerger {
 
         @Override
         public RowMerger configureTargetColumns(
-                @Nullable int[] targetColumns, short schemaId, Schema schema) {
+                @Nullable int[] targetColumns, short latestSchemaId, Schema latestSchema) {
             throw new IllegalStateException(
                     "PartialAggregateRowMerger does not support reconfigure target merge columns.");
         }

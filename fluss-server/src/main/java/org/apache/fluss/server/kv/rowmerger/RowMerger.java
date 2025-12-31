@@ -66,10 +66,11 @@ public interface RowMerger {
      * Dynamically configure the target columns to merge and return the effective merger.
      *
      * @param targetColumns the partial update target column positions, null means full update
-     * @param schemaId the schema id used to generate new rows
-     * @param schema the schema used to generate new rows
+     * @param latestShemaId the schema id used to generate new rows
+     * @param latestSchema the schema used to generate new rows
      */
-    RowMerger configureTargetColumns(@Nullable int[] targetColumns, short schemaId, Schema schema);
+    RowMerger configureTargetColumns(
+            @Nullable int[] targetColumns, short latestShemaId, Schema latestSchema);
 
     /**
      * Create a row merger based on the given configuration.

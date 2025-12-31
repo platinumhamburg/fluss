@@ -307,8 +307,9 @@ class AggregateRowMergerTest {
         // Verify non-target column is truly unchanged
         assertThat(merged.row.getDouble(2)).isEqualTo(oldRow.getDouble(2));
 
-        // Verify new field: not in targetColumns, so should be copied from newValue
-        assertThat(merged.row.getLong(3)).isEqualTo(20L); // new_field from newValue
+        // Verify new field: not in targetColumns and not in old schema, so should be null
+        // In partial aggregation, non-target columns should not use values from newRow
+        assertThat(merged.row.isNullAt(3)).isTrue(); // new_field should be null
     }
 
     @Test
