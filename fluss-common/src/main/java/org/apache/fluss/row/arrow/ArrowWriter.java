@@ -57,7 +57,7 @@ public class ArrowWriter implements AutoCloseable {
      * The initial capacity of the vectors which are used to store the rows. The capacity will be
      * expanded automatically if the rows exceed the initial capacity.
      */
-    private static final int INITIAL_CAPACITY = 1024;
+    public static final int INITIAL_CAPACITY = 1024;
 
     /**
      * The buffer usage ratio which is used to determine whether the writer is full. The writer is
