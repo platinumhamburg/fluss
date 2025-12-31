@@ -224,7 +224,7 @@ public class RocksDBMetrics implements AutoCloseable {
                 return 0L;
             }
 
-            // Create cache set for memory usage calculation
+            // Create cache set for memory usage calculation.
             // If blockCache is null, pass null to MemoryUtil (will only count memtables, etc.)
             Set<Cache> caches = null;
             if (blockCache != null) {

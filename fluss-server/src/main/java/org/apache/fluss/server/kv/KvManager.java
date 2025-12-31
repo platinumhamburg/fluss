@@ -314,8 +314,6 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             try {
                 // Unregister RocksDB metrics from TableMetricGroup
                 serverMetricGroup.unregisterRocksDBMetrics(tablePath, tableBucket);
-                // Remove bucket metric group and clean up table metric group if needed
-                serverMetricGroup.removeTableBucketMetricGroup(tablePath, tableBucket);
 
                 dropKvTablet.drop();
                 if (dropKvTablet.getPartitionName() == null) {
