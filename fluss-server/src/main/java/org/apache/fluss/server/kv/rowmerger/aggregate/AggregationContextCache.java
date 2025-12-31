@@ -59,6 +59,10 @@ public class AggregationContextCache {
      * @throws IllegalStateException if schema is not found
      */
     public AggregationContext getContext(short schemaId) {
+        if (schemaId < 0) {
+            throw new IllegalArgumentException(
+                    "Schema ID must be non-negative, but got: " + schemaId);
+        }
         Schema schema = schemaGetter.getSchema(schemaId);
         if (schema == null) {
             throw new IllegalStateException(String.format("Schema with ID %d not found", schemaId));

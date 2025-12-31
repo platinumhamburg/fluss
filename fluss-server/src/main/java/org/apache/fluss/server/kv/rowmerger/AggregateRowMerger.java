@@ -68,7 +68,7 @@ public class AggregateRowMerger implements RowMerger {
     private final Cache<CacheKey, PartialAggregateRowMerger> partialMergerCache;
 
     // the current target schema id which is updated before merge() operation
-    private short targetSchemaId;
+    private short targetSchemaId = -1;
 
     public AggregateRowMerger(
             TableConfig tableConfig, KvFormat kvFormat, SchemaGetter schemaGetter) {

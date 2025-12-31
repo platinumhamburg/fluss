@@ -70,6 +70,7 @@ class AggregateRowMergerTest {
 
         TableConfig tableConfig = new TableConfig(new Configuration());
         AggregateRowMerger merger = createMerger(schema, tableConfig);
+        merger.configureTargetColumns(null, SCHEMA_ID, schema);
         RowType rowType = schema.getRowType();
 
         // First row: id=1, sum_count=5, sum_total=10.5, max_val=10, min_val=3, name="Alice"
@@ -155,6 +156,7 @@ class AggregateRowMergerTest {
         TableConfig tableConfig = new TableConfig(new Configuration());
 
         AggregateRowMerger merger = createMerger(schema, tableConfig);
+        merger.configureTargetColumns(null, SCHEMA_ID, schema);
 
         // First row: id=1, value=null
         BinaryRow row1 = compactedRow(schema.getRowType(), new Object[] {1, null});
@@ -453,6 +455,7 @@ class AggregateRowMergerTest {
         TableConfig tableConfig = new TableConfig(new Configuration());
         AggregateRowMerger merger =
                 new AggregateRowMerger(tableConfig, tableConfig.getKvFormat(), schemaGetter);
+        merger.configureTargetColumns(null, newSchemaId, newSchema);
 
         // Create old row with old schema: id=1, sum_count=100, max_val=50
         BinaryRow oldRow = compactedRow(oldSchema.getRowType(), new Object[] {1, 100L, 50});
@@ -526,6 +529,7 @@ class AggregateRowMergerTest {
         TableConfig tableConfig = new TableConfig(new Configuration());
         AggregateRowMerger merger =
                 new AggregateRowMerger(tableConfig, tableConfig.getKvFormat(), schemaGetter);
+        merger.configureTargetColumns(null, newSchemaId, newSchema);
 
         // Old row: id=1, name="Alice", age=20
         BinaryRow oldRow = compactedRow(oldSchema.getRowType(), new Object[] {1, "Alice", 20});
@@ -586,6 +590,7 @@ class AggregateRowMergerTest {
         TableConfig tableConfig = new TableConfig(new Configuration());
         AggregateRowMerger merger =
                 new AggregateRowMerger(tableConfig, tableConfig.getKvFormat(), schemaGetter);
+        merger.configureTargetColumns(null, newSchemaId, newSchema);
 
         // Old row: id=1, dropped="ignore", count=100
         BinaryRow oldRow = compactedRow(oldSchema.getRowType(), new Object[] {1, "ignore", 100L});
@@ -657,6 +662,7 @@ class AggregateRowMergerTest {
         TableConfig tableConfig = new TableConfig(new Configuration());
         AggregateRowMerger merger =
                 new AggregateRowMerger(tableConfig, tableConfig.getKvFormat(), schemaGetter);
+        merger.configureTargetColumns(null, newSchemaId, newSchema);
 
         // Old row: id=1, count=100
         BinaryRow oldRow = compactedRow(oldSchema.getRowType(), new Object[] {1, 100L});
