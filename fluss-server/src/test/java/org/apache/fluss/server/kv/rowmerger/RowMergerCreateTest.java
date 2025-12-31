@@ -76,6 +76,9 @@ class RowMergerCreateTest {
 
         assertThat(merger).isInstanceOf(AggregateRowMerger.class);
 
+        // Configure target schema before merge
+        merger.configureTargetColumns(null, SCHEMA_ID, schema);
+
         // Verify max aggregation
         BinaryRow row1 = compactedRow(schema.getRowType(), new Object[] {1, 10L});
         BinaryRow row2 = compactedRow(schema.getRowType(), new Object[] {1, 20L});
