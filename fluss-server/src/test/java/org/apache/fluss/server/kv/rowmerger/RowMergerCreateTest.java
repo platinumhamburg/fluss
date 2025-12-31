@@ -72,6 +72,7 @@ class RowMergerCreateTest {
 
         RowMerger merger =
                 RowMerger.create(tableConfig, KvFormat.COMPACTED, createSchemaGetter(schema));
+        merger.configureTargetColumns(null, SCHEMA_ID, schema);
 
         assertThat(merger).isInstanceOf(AggregateRowMerger.class);
 

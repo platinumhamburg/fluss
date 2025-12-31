@@ -710,7 +710,10 @@ class FieldAggregatorParameterizedTest {
     private AggregateRowMerger createMerger(Schema schema, TableConfig tableConfig) {
         TestingSchemaGetter schemaGetter =
                 new TestingSchemaGetter(new SchemaInfo(schema, (short) 1));
-        return new AggregateRowMerger(tableConfig, tableConfig.getKvFormat(), schemaGetter);
+        AggregateRowMerger merger =
+                new AggregateRowMerger(tableConfig, tableConfig.getKvFormat(), schemaGetter);
+        merger.configureTargetColumns(null, (short) 1, schema);
+        return merger;
     }
 
     private void assertAggregatedValue(BinaryRow row, int pos, DataType dataType, Object expected) {
