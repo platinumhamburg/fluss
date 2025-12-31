@@ -278,6 +278,19 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         tableMetricGroup.registerRocksDBMetrics(tableBucket, rocksDBMetrics);
     }
 
+    /**
+     * Unregister RocksDB metrics for a specific table bucket.
+     *
+     * @param tablePath the table path
+     * @param tableBucket the table bucket
+     */
+    public void unregisterRocksDBMetrics(TablePath tablePath, TableBucket tableBucket) {
+        TableMetricGroup tableMetricGroup = metricGroupByTable.get(tablePath);
+        if (tableMetricGroup != null) {
+            tableMetricGroup.unregisterRocksDBMetrics(tableBucket);
+        }
+    }
+
     public void removeTableBucketMetricGroup(TablePath tablePath, TableBucket bucket) {
         // get the metric group of the table
         TableMetricGroup tableMetricGroup = metricGroupByTable.get(tablePath);
