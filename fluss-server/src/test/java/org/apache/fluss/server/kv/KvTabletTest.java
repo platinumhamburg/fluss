@@ -66,6 +66,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.rocksdb.IOStatsContext;
+import org.rocksdb.PerfContext;
+import org.rocksdb.PerfLevel;
 
 import javax.annotation.Nullable;
 
@@ -1240,5 +1243,94 @@ class KvTabletTest {
 
     private Value valueOf(BinaryRow row) {
         return Value.of(ValueEncoder.encodeValue(schemaId, row));
+    }
+
+    @Test
+    void testGetWithPerfContext() throws Exception {
+        // Initialize kv tablet
+        initLogTabletAndKvTablet(DATA1_SCHEMA, new HashMap<>());
+
+        // Put some data first
+        KvRecordBatch kvRecordBatch =
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, "v1"}),
+                        kvRecordFactory.ofRecord("k2".getBytes(), new Object[] {2, "v2"}));
+        kvTablet.putAsLeader(kvRecordBatch, null);
+        kvTablet.flush(logTablet.localLogEndOffset(), (error) -> {});
+
+        // Enable PerfContext for performance monitoring
+        try (PerfContext perfCtx = PerfContext.enable(PerfLevel.ENABLE_TIME_EXCEPT_FOR_MUTEX)) {
+            IOStatsContext ioCtx = IOStatsContext.current();
+
+            // Reset counters before operation
+            perfCtx.reset();
+            ioCtx.reset();
+
+            // Perform get operation
+            byte[] result1 = kvTablet.get("k1".getBytes());
+            assertThat(result1).isNotNull();
+
+            // Get performance statistics
+            long blockCacheHits = perfCtx.blockCacheHitCount();
+            long blockReads = perfCtx.blockReadCount();
+            long userKeyComparisons = perfCtx.userKeyComparisonCount();
+            long memtableReadTime = perfCtx.getFromMemtableTime();
+            long fileReadTime = perfCtx.getFromOutputFilesTime();
+
+            // Get I/O statistics
+            long bytesRead = ioCtx.bytesRead();
+            long readNanos = ioCtx.readNanos();
+
+            // Verify that perf context is working (just check that values are non-negative)
+            // This test is mainly to ensure compilation passes
+            assertThat(blockCacheHits).isGreaterThanOrEqualTo(0);
+            assertThat(blockReads).isGreaterThanOrEqualTo(0);
+            assertThat(userKeyComparisons).isGreaterThanOrEqualTo(0);
+            assertThat(memtableReadTime).isGreaterThanOrEqualTo(0);
+            assertThat(fileReadTime).isGreaterThanOrEqualTo(0);
+            assertThat(bytesRead).isGreaterThanOrEqualTo(0);
+            assertThat(readNanos).isGreaterThanOrEqualTo(0);
+
+            // Test get from pre-write buffer (should be fast)
+            KvRecordBatch kvRecordBatch2 =
+                    kvRecordBatchFactory.ofRecords(
+                            kvRecordFactory.ofRecord("k3".getBytes(), new Object[] {3, "v3"}));
+            kvTablet.putAsLeader(kvRecordBatch2, null);
+
+            // Reset before second get
+            perfCtx.reset();
+            ioCtx.reset();
+
+            // Get from pre-write buffer (not flushed yet)
+            byte[] result2 = kvTablet.get("k3".getBytes());
+            assertThat(result2).isNotNull();
+
+            // Check perf context again
+            long blockCacheHits2 = perfCtx.blockCacheHitCount();
+            long blockReads2 = perfCtx.blockReadCount();
+
+            // Verify perf context values
+            assertThat(blockCacheHits2).isGreaterThanOrEqualTo(0);
+            assertThat(blockReads2).isGreaterThanOrEqualTo(0);
+
+            // Test slow request scenario - get non-existent key (may trigger slow path)
+            perfCtx.reset();
+            ioCtx.reset();
+            byte[] result3 = kvTablet.get("non_existent_key".getBytes());
+            // Result should be null for non-existent key
+            assertThat(result3).isNull();
+
+            // Verify perf context collected statistics
+            long blockCacheHits3 = perfCtx.blockCacheHitCount();
+            long blockReads3 = perfCtx.blockReadCount();
+            assertThat(blockCacheHits3).isGreaterThanOrEqualTo(0);
+            assertThat(blockReads3).isGreaterThanOrEqualTo(0);
+
+            // Test report methods
+            String perfReport = perfCtx.reportNonZero();
+            String ioReport = ioCtx.reportNonZero();
+            assertThat(perfReport).isNotNull();
+            assertThat(ioReport).isNotNull();
+        }
     }
 }

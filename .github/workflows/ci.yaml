@@ -22,6 +22,7 @@ on:
       - main
       - release-**
       - ci-**
+      - rocks-perf
     paths-ignore:
       - 'website/**'
       - '**/*.md'

@@ -68,6 +68,9 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.FileUtils;
 
+import org.rocksdb.IOStatsContext;
+import org.rocksdb.PerfContext;
+import org.rocksdb.PerfLevel;
 import org.rocksdb.RateLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -580,6 +583,80 @@ public final class KvTablet {
             return rocksDBKv.get(key.get());
         }
         return value.get();
+    }
+
+    /**
+     * Get value by key from kv tablet with performance monitoring. For slow requests (>1ms),
+     * performance details will be logged.
+     *
+     * @param key the key to get
+     * @return the value associated with the key, or null if not found
+     * @throws IOException if an I/O error occurs
+     */
+    @Nullable
+    public byte[] get(byte[] key) throws IOException {
+        return inReadLock(
+                kvLock,
+                () -> {
+                    rocksDBKv.checkIfRocksDBClosed();
+
+                    // Get current thread's performance context
+                    PerfContext perfCtx = PerfContext.current();
+                    IOStatsContext ioCtx = IOStatsContext.current();
+
+                    // Save original perf level
+                    PerfLevel originalLevel = perfCtx.getPerfLevel();
+                    boolean perfWasEnabled = perfCtx.isEnabled();
+
+                    // Enable performance monitoring if not already enabled
+                    // Use ENABLE_TIME_EXCEPT_FOR_MUTEX to avoid high overhead from mutex
+                    if (!perfWasEnabled || originalLevel == PerfLevel.DISABLE) {
+                        perfCtx.setPerfLevel(PerfLevel.ENABLE_TIME_EXCEPT_FOR_MUTEX);
+                    }
+
+                    // Reset counters before operation
+                    perfCtx.reset();
+                    ioCtx.reset();
+
+                    // Record start time
+                    long startTime = System.nanoTime();
+
+                    try {
+                        // Get from pre-write buffer first, then from RocksDB
+                        KvPreWriteBuffer.Key wrapKey = KvPreWriteBuffer.Key.of(key);
+                        KvPreWriteBuffer.Value value = kvPreWriteBuffer.get(wrapKey);
+                        byte[] result;
+                        if (value == null) {
+                            result = rocksDBKv.get(key);
+                        } else {
+                            result = value.get();
+                        }
+
+                        // Calculate elapsed time
+                        long elapsedNanos = System.nanoTime() - startTime;
+                        long elapsedMs = elapsedNanos / 1_000_000;
+
+                        // Log perf details for slow requests (>1ms)
+                        if (elapsedMs > 1) {
+                            LOG.warn(
+                                    "Slow get request detected for table bucket {}: elapsed {} ms ({} ns), key size {} bytes. "
+                                            + "PerfContext: {}, IOStatsContext: {}",
+                                    tableBucket,
+                                    elapsedMs,
+                                    elapsedNanos,
+                                    key != null ? key.length : 0,
+                                    perfCtx.reportNonZero(),
+                                    ioCtx.reportNonZero());
+                        }
+
+                        return result;
+                    } finally {
+                        // Restore original perf level if we changed it
+                        if (!perfWasEnabled || originalLevel == PerfLevel.DISABLE) {
+                            perfCtx.setPerfLevel(originalLevel);
+                        }
+                    }
+                });
     }
 
     public List<byte[]> multiGet(List<byte[]> keys) throws IOException {
