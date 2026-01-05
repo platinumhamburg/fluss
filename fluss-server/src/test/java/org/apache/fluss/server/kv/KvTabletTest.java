@@ -47,7 +47,7 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.KvEntry;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Value;
-import org.apache.fluss.server.kv.rocksdb.RocksDBMetrics;
+import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogAppendInfo;
@@ -1249,24 +1249,25 @@ class KvTabletTest {
         // Initialize tablet with schema
         initLogTabletAndKvTablet(DATA1_SCHEMA_PK, new HashMap<>());
 
-        // Get RocksDB metrics
-        RocksDBMetrics metrics = kvTablet.getRocksDBMetrics();
-        assertThat(metrics).as("RocksDB metrics should be available").isNotNull();
+        // Get RocksDB statistics
+        RocksDBStatistics statistics = kvTablet.getRocksDBStatistics();
+        assertThat(statistics).as("RocksDB statistics should be available").isNotNull();
 
         // Verify statistics is properly initialized
         org.rocksdb.Statistics stats = kvTablet.getRocksDBKv().getStatistics();
         assertThat(stats).as("RocksDB Statistics should be enabled").isNotNull();
 
         // All metrics should start at 0 for a fresh database
-        assertThat(metrics.getBytesWritten()).isEqualTo(0);
-        assertThat(metrics.getBytesRead()).isEqualTo(0);
-        assertThat(metrics.getFlushBytesWritten()).isEqualTo(0);
-        assertThat(metrics.getWriteLatencyMicros()).isEqualTo(0);
-        assertThat(metrics.getGetLatencyMicros()).isEqualTo(0);
-        assertThat(metrics.getNumFilesAtLevel0()).isEqualTo(0);
-        assertThat(metrics.getFlushPending()).isEqualTo(0);
-        assertThat(metrics.getCompactionPending()).isEqualTo(0);
-        assertThat(metrics.getTotalMemoryUsage()).isGreaterThan(0); // Block cache is pre-allocated
+        assertThat(statistics.getBytesWritten()).isEqualTo(0);
+        assertThat(statistics.getBytesRead()).isEqualTo(0);
+        assertThat(statistics.getFlushBytesWritten()).isEqualTo(0);
+        assertThat(statistics.getWriteLatencyMicros()).isEqualTo(0);
+        assertThat(statistics.getGetLatencyMicros()).isEqualTo(0);
+        assertThat(statistics.getNumFilesAtLevel0()).isEqualTo(0);
+        assertThat(statistics.getFlushPending()).isEqualTo(0);
+        assertThat(statistics.getCompactionPending()).isEqualTo(0);
+        assertThat(statistics.getTotalMemoryUsage())
+                .isGreaterThan(0); // Block cache is pre-allocated
 
         // ========== Phase 1: Write and Flush ==========
         int numRecords = 10000;
@@ -1280,32 +1281,34 @@ class KvTabletTest {
         kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
 
         // After write and flush: must have written data to RocksDB
-        long bytesWrittenAfterFlush = metrics.getBytesWritten();
+        long bytesWrittenAfterFlush = statistics.getBytesWritten();
         assertThat(bytesWrittenAfterFlush)
                 .as("Must write data to RocksDB after flush")
                 .isGreaterThan(0);
 
         // Flush must have written bytes (memtable to SST file)
-        long flushBytesWritten = metrics.getFlushBytesWritten();
+        long flushBytesWritten = statistics.getFlushBytesWritten();
         // Note: FLUSH_WRITE_BYTES may not be tracked in all configurations
         assertThat(flushBytesWritten)
                 .as("Flush bytes written is non-negative")
                 .isGreaterThanOrEqualTo(0);
 
         // Write latency must be tracked for write operations
-        long writeLatency = metrics.getWriteLatencyMicros();
+        long writeLatency = statistics.getWriteLatencyMicros();
         assertThat(writeLatency)
                 .as("Write latency must be > 0 after write operations")
                 .isGreaterThan(0);
 
         // After flush, there should be at least 1 L0 file (unless immediate compaction occurred)
-        long numL0Files = metrics.getNumFilesAtLevel0();
+        long numL0Files = statistics.getNumFilesAtLevel0();
         assertThat(numL0Files)
                 .as("Should have L0 files after flush (or 0 if compacted)")
                 .isGreaterThanOrEqualTo(0);
 
         // Flush pending must be 0 after flush completes
-        assertThat(metrics.getFlushPending()).as("No pending flush after completion").isEqualTo(0);
+        assertThat(statistics.getFlushPending())
+                .as("No pending flush after completion")
+                .isEqualTo(0);
 
         // ========== Phase 2: Read Operations ==========
         List<byte[]> keysToRead = new ArrayList<>();
@@ -1316,13 +1319,13 @@ class KvTabletTest {
         assertThat(readValues).hasSize(100);
 
         // After reads: get latency must be tracked
-        long getLatency = metrics.getGetLatencyMicros();
+        long getLatency = statistics.getGetLatencyMicros();
         assertThat(getLatency)
                 .as("Get latency must be tracked after read operations")
                 .isGreaterThan(0);
 
         // Bytes read may increase (depending on cache hits)
-        long bytesRead = metrics.getBytesRead();
+        long bytesRead = statistics.getBytesRead();
         // Note: bytesRead could be 0 if all data was served from block cache
         assertThat(bytesRead).as("Bytes read is non-negative").isGreaterThanOrEqualTo(0);
 
@@ -1337,15 +1340,15 @@ class KvTabletTest {
         kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
 
         // Bytes written must increase with more data
-        long bytesWrittenAfterSecondFlush = metrics.getBytesWritten();
+        long bytesWrittenAfterSecondFlush = statistics.getBytesWritten();
         assertThat(bytesWrittenAfterSecondFlush)
                 .as("Bytes written must increase with second batch")
                 .isGreaterThan(bytesWrittenAfterFlush);
 
         // ========== Phase 4: Manual Compaction ==========
-        long compactionBytesReadBefore = metrics.getCompactionBytesRead();
-        long compactionBytesWrittenBefore = metrics.getCompactionBytesWritten();
-        long compactionTimeBefore = metrics.getCompactionTimeMicros();
+        long compactionBytesReadBefore = statistics.getCompactionBytesRead();
+        long compactionBytesWrittenBefore = statistics.getCompactionBytesWritten();
+        long compactionTimeBefore = statistics.getCompactionTimeMicros();
 
         // Trigger manual compaction
         try {
@@ -1355,9 +1358,9 @@ class KvTabletTest {
         }
 
         // After compaction: verify compaction metrics increased
-        long compactionBytesReadAfter = metrics.getCompactionBytesRead();
-        long compactionBytesWrittenAfter = metrics.getCompactionBytesWritten();
-        long compactionTimeAfter = metrics.getCompactionTimeMicros();
+        long compactionBytesReadAfter = statistics.getCompactionBytesRead();
+        long compactionBytesWrittenAfter = statistics.getCompactionBytesWritten();
+        long compactionTimeAfter = statistics.getCompactionTimeMicros();
 
         // If any compaction occurred, all three metrics should increase
         boolean compactionOccurred =
@@ -1378,30 +1381,30 @@ class KvTabletTest {
         }
 
         // Compaction pending must be 0 after compaction completes
-        assertThat(metrics.getCompactionPending())
+        assertThat(statistics.getCompactionPending())
                 .as("No pending compaction after completion")
                 .isEqualTo(0);
 
         // ========== Phase 5: Verify Final State Before Close ==========
         // Bytes written must be positive after all operations
-        assertThat(metrics.getBytesWritten())
+        assertThat(statistics.getBytesWritten())
                 .as("Total bytes written must be positive")
                 .isGreaterThan(0);
 
         // Write and get latency must be positive (operations occurred)
-        assertThat(metrics.getWriteLatencyMicros())
+        assertThat(statistics.getWriteLatencyMicros())
                 .as("Write latency must be positive after writes")
                 .isGreaterThan(0);
-        assertThat(metrics.getGetLatencyMicros())
+        assertThat(statistics.getGetLatencyMicros())
                 .as("Get latency must be positive after reads")
                 .isGreaterThan(0);
 
         // No pending operations
-        assertThat(metrics.getFlushPending()).isEqualTo(0);
-        assertThat(metrics.getCompactionPending()).isEqualTo(0);
+        assertThat(statistics.getFlushPending()).isEqualTo(0);
+        assertThat(statistics.getCompactionPending()).isEqualTo(0);
 
         // Memory usage should be reasonable (> 0 due to block cache + memtables)
-        assertThat(metrics.getTotalMemoryUsage())
+        assertThat(statistics.getTotalMemoryUsage())
                 .as("Total memory usage must be positive")
                 .isGreaterThan(0);
 
@@ -1409,17 +1412,17 @@ class KvTabletTest {
         kvTablet.close();
 
         // After close: all metrics must return 0 (ResourceGuard protection)
-        assertThat(metrics.getBytesWritten()).isEqualTo(0);
-        assertThat(metrics.getBytesRead()).isEqualTo(0);
-        assertThat(metrics.getFlushBytesWritten()).isEqualTo(0);
-        assertThat(metrics.getWriteLatencyMicros()).isEqualTo(0);
-        assertThat(metrics.getGetLatencyMicros()).isEqualTo(0);
-        assertThat(metrics.getNumFilesAtLevel0()).isEqualTo(0);
-        assertThat(metrics.getFlushPending()).isEqualTo(0);
-        assertThat(metrics.getCompactionPending()).isEqualTo(0);
-        assertThat(metrics.getCompactionBytesRead()).isEqualTo(0);
-        assertThat(metrics.getCompactionBytesWritten()).isEqualTo(0);
-        assertThat(metrics.getCompactionTimeMicros()).isEqualTo(0);
-        assertThat(metrics.getTotalMemoryUsage()).isEqualTo(0);
+        assertThat(statistics.getBytesWritten()).isEqualTo(0);
+        assertThat(statistics.getBytesRead()).isEqualTo(0);
+        assertThat(statistics.getFlushBytesWritten()).isEqualTo(0);
+        assertThat(statistics.getWriteLatencyMicros()).isEqualTo(0);
+        assertThat(statistics.getGetLatencyMicros()).isEqualTo(0);
+        assertThat(statistics.getNumFilesAtLevel0()).isEqualTo(0);
+        assertThat(statistics.getFlushPending()).isEqualTo(0);
+        assertThat(statistics.getCompactionPending()).isEqualTo(0);
+        assertThat(statistics.getCompactionBytesRead()).isEqualTo(0);
+        assertThat(statistics.getCompactionBytesWritten()).isEqualTo(0);
+        assertThat(statistics.getCompactionTimeMicros()).isEqualTo(0);
+        assertThat(statistics.getTotalMemoryUsage()).isEqualTo(0);
     }
 }

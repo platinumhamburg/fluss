@@ -40,18 +40,20 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Manages RocksDB metrics for a single KvTablet.
+ * Collects and provides access to RocksDB statistics for a single KvTablet.
  *
- * <p>This class encapsulates all RocksDB-specific metric access logic, providing semantic methods
- * to access various RocksDB statistics and properties. Upper layers should use these methods
- * instead of directly accessing RocksDB properties with string names.
+ * <p>This class encapsulates low-level RocksDB statistics collection, providing semantic methods to
+ * access various RocksDB statistics and properties. It does NOT register Fluss metrics directly;
+ * instead, upper layers (e.g., TableMetricGroup) consume these statistics to compute and register
+ * actual Fluss Metrics.
  *
  * <p>Thread-safety: This class uses RocksDB's ResourceGuard to ensure safe concurrent access. All
- * metric read operations acquire the resource guard to prevent accessing closed RocksDB instances.
+ * statistics read operations acquire the resource guard to prevent accessing closed RocksDB
+ * instances.
  */
-public class RocksDBMetrics implements AutoCloseable {
+public class RocksDBStatistics implements AutoCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(RocksDBMetrics.class);
+    private static final Logger LOG = LoggerFactory.getLogger(RocksDBStatistics.class);
 
     private final RocksDB db;
     @Nullable private final Statistics statistics;
@@ -59,7 +61,7 @@ public class RocksDBMetrics implements AutoCloseable {
     private final ColumnFamilyHandle defaultColumnFamilyHandle;
     @Nullable private final Cache blockCache;
 
-    public RocksDBMetrics(
+    public RocksDBStatistics(
             RocksDB db,
             @Nullable Statistics statistics,
             ResourceGuard resourceGuard,
@@ -368,7 +370,7 @@ public class RocksDBMetrics implements AutoCloseable {
 
     @Override
     public void close() {
-        // No resources to clean up, metrics are managed by TableMetricGroup
-        LOG.debug("RocksDB metrics accessor closed");
+        // No resources to clean up, statistics are managed by TableMetricGroup
+        LOG.debug("RocksDB statistics accessor closed");
     }
 }

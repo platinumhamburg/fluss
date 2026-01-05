@@ -27,12 +27,13 @@ import org.apache.fluss.metrics.NoOpCounter;
 import org.apache.fluss.metrics.ThreadSafeSimpleCounter;
 import org.apache.fluss.metrics.groups.AbstractMetricGroup;
 import org.apache.fluss.metrics.registry.MetricRegistry;
-import org.apache.fluss.server.kv.rocksdb.RocksDBMetrics;
+import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
+import org.apache.fluss.utils.MapUtils;
 
 import javax.annotation.Nullable;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.metrics.utils.MetricGroupUtils.makeScope;
 
@@ -42,11 +43,7 @@ import static org.apache.fluss.metrics.utils.MetricGroupUtils.makeScope;
  */
 public class TableMetricGroup extends AbstractMetricGroup {
 
-    private final Map<TableBucket, BucketMetricGroup> buckets = new HashMap<>();
-
-    // Directly manage RocksDB metrics for aggregation
-    // This is cleaner than passing through BucketMetricGroup
-    private final Map<TableBucket, RocksDBMetrics> rocksDBMetricsMap = new HashMap<>();
+    private final Map<TableBucket, BucketMetricGroup> buckets = MapUtils.newConcurrentHashMap();
 
     private final TablePath tablePath;
 
@@ -244,43 +241,8 @@ public class TableMetricGroup extends AbstractMetricGroup {
     public void removeBucketMetricGroup(TableBucket tableBucket) {
         BucketMetricGroup metricGroup = buckets.remove(tableBucket);
         if (metricGroup != null) {
+            // BucketMetricGroup.close() will automatically clean up RocksDB statistics
             metricGroup.close();
-        }
-        // Also remove RocksDB metrics if exists
-        RocksDBMetrics rocksDBMetrics = rocksDBMetricsMap.remove(tableBucket);
-        if (rocksDBMetrics != null) {
-            try {
-                rocksDBMetrics.close();
-            } catch (Exception e) {
-                // Ignore close errors
-            }
-        }
-    }
-
-    /**
-     * Register RocksDB metrics for a bucket. This allows table-level aggregation without
-     * registering bucket-level metrics.
-     *
-     * @param tableBucket the table bucket
-     * @param rocksDBMetrics the RocksDB metrics accessor
-     */
-    public void registerRocksDBMetrics(TableBucket tableBucket, RocksDBMetrics rocksDBMetrics) {
-        rocksDBMetricsMap.put(tableBucket, rocksDBMetrics);
-    }
-
-    /**
-     * Unregister RocksDB metrics for a bucket.
-     *
-     * @param tableBucket the table bucket
-     */
-    public void unregisterRocksDBMetrics(TableBucket tableBucket) {
-        RocksDBMetrics rocksDBMetrics = rocksDBMetricsMap.remove(tableBucket);
-        if (rocksDBMetrics != null) {
-            try {
-                rocksDBMetrics.close();
-            } catch (Exception e) {
-                // Ignore close errors
-            }
         }
     }
 
@@ -293,12 +255,18 @@ public class TableMetricGroup extends AbstractMetricGroup {
     }
 
     /**
-     * Get the RocksDB metrics map for server-level aggregation.
+     * Get all RocksDB statistics from bucket metric groups for table-level and server-level
+     * aggregation.
      *
-     * @return the map of RocksDB metrics
+     * <p>This method dynamically collects statistics from all buckets, allowing automatic cleanup
+     * when buckets are removed without maintaining a separate map.
+     *
+     * @return stream of RocksDB statistics from all buckets in this table
      */
-    public Map<TableBucket, RocksDBMetrics> getRocksDBMetricsMap() {
-        return rocksDBMetricsMap;
+    public Stream<RocksDBStatistics> allRocksDBStatistics() {
+        return buckets.values().stream()
+                .map(BucketMetricGroup::getRocksDBStatistics)
+                .filter(stats -> stats != null);
     }
 
     public TabletServerMetricGroup getServerMetricGroup() {
@@ -316,83 +284,77 @@ public class TableMetricGroup extends AbstractMetricGroup {
         gauge(
                 MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getWriteStallMicros)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getWriteStallMicros)
                                 .max()
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getGetLatencyMicros)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getGetLatencyMicros)
                                 .max()
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getWriteLatencyMicros)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getWriteLatencyMicros)
                                 .max()
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_NUM_FILES_AT_LEVEL0_MAX,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getNumFilesAtLevel0)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getNumFilesAtLevel0)
                                 .max()
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_FLUSH_PENDING_MAX,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getFlushPending)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getFlushPending)
                                 .max()
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_PENDING_MAX,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getCompactionPending)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionPending)
                                 .max()
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getCompactionTimeMicros)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionTimeMicros)
                                 .max()
                                 .orElse(0L));
 
         // Sum aggregation metrics - track the total value across all buckets
         gauge(
                 MetricNames.ROCKSDB_BYTES_READ_TOTAL,
-                () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getBytesRead)
-                                .sum());
+                () -> allRocksDBStatistics().mapToLong(RocksDBStatistics::getBytesRead).sum());
         gauge(
                 MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL,
-                () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getBytesWritten)
-                                .sum());
+                () -> allRocksDBStatistics().mapToLong(RocksDBStatistics::getBytesWritten).sum());
         gauge(
                 MetricNames.ROCKSDB_FLUSH_BYTES_WRITTEN_TOTAL,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getFlushBytesWritten)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getFlushBytesWritten)
                                 .sum());
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_BYTES_READ_TOTAL,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getCompactionBytesRead)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionBytesRead)
                                 .sum());
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_BYTES_WRITTEN_TOTAL,
                 () ->
-                        rocksDBMetricsMap.values().stream()
-                                .mapToLong(RocksDBMetrics::getCompactionBytesWritten)
+                        allRocksDBStatistics()
+                                .mapToLong(RocksDBStatistics::getCompactionBytesWritten)
                                 .sum());
     }
 
