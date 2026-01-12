@@ -24,6 +24,8 @@ import org.apache.fluss.metadata.AggFunctions;
 import org.apache.flink.configuration.Configuration;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -54,7 +56,7 @@ class FlinkAggFunctionParserTest {
     void testParseFunctionWithParameters() {
         Configuration options = new Configuration();
         options.setString("fields.tags.agg", "listagg");
-        options.setString("fields.tags.agg.params.delimiter", ";");
+        options.setString("fields.tags.listagg.delimiter", ";");
 
         Optional<AggFunction> result = FlinkAggFunctionParser.parseAggFunction("tags", options);
 
@@ -69,7 +71,7 @@ class FlinkAggFunctionParserTest {
         Configuration options = new Configuration();
         options.setString("fields.col1.agg", "sum");
         options.setString("fields.col2.agg", "listagg");
-        options.setString("fields.col2.agg.params.delimiter", "|"); // This should not affect col1
+        options.setString("fields.col2.listagg.delimiter", "|"); // This should not affect col1
 
         Optional<AggFunction> col1Func = FlinkAggFunctionParser.parseAggFunction("col1", options);
         Optional<AggFunction> col2Func = FlinkAggFunctionParser.parseAggFunction("col2", options);
@@ -113,7 +115,7 @@ class FlinkAggFunctionParserTest {
     @Test
     void testRoundTripConversion() {
         // Test that parse and format are inverse operations
-        java.util.Map<String, String> options = new java.util.HashMap<>();
+        Map<String, String> options = new HashMap<>();
 
         // Format functions to options
         FlinkAggFunctionParser.formatAggFunctionToOptions("col1", AggFunctions.SUM(), options);

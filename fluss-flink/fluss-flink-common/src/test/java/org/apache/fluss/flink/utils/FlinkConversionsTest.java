@@ -469,7 +469,7 @@ public class FlinkConversionsTest {
 
     @Test
     void testAggregationFunctionRoundTrip() {
-        // Test Flink → Fluss → Flink conversion preserves aggregation functions
+        // Test Flink → Fluss → Flink conversion preserves aggregation functions.
         ResolvedSchema schema =
                 new ResolvedSchema(
                         Arrays.asList(
@@ -486,7 +486,7 @@ public class FlinkConversionsTest {
         options.put("table.merge-engine", "aggregation");
         options.put("fields.sum_val.agg", "sum");
         options.put("fields.tags.agg", "listagg");
-        options.put("fields.tags.agg.params.delimiter", "|");
+        options.put("fields.tags.listagg.delimiter", "|");
 
         CatalogTable flinkTable =
                 CatalogTable.of(
@@ -513,11 +513,7 @@ public class FlinkConversionsTest {
         CatalogTable convertedFlinkTable = (CatalogTable) FlinkConversions.toFlinkTable(tableInfo);
 
         // Verify aggregation functions are preserved
-        assertThat(convertedFlinkTable.getOptions())
-                .containsEntry("table.merge-engine", "aggregation")
-                .containsEntry("fields.sum_val.agg", "sum")
-                .containsEntry("fields.tags.agg", "listagg")
-                .containsEntry("fields.tags.agg.params.delimiter", "|");
+        assertThat(convertedFlinkTable.getOptions()).containsAllEntriesOf(options);
     }
 
     /** Test refresh handler for testing purpose. */

@@ -39,21 +39,20 @@ import java.util.stream.Collectors;
  *
  * <pre>
  * fields.&lt;column&gt;.agg = &lt;function_name&gt;
- * fields.&lt;column&gt;.agg.params.&lt;param_name&gt; = &lt;param_value&gt;
+ * fields.&lt;column&gt;.&lt;function_name&gt;.&lt;param_name&gt; = &lt;param_value&gt;
  * </pre>
  *
  * <p>Examples:
  *
  * <pre>
  * 'fields.tags.agg' = 'listagg'
- * 'fields.tags.agg.params.delimiter' = ';'
+ * 'fields.tags.listagg.delimiter' = ';'
  * </pre>
  */
 public class FlinkAggFunctionParser {
 
     private static final String AGG_PREFIX = "fields.";
     private static final String AGG_SUFFIX = ".agg";
-    private static final String PARAMS_SUFFIX = ".params";
 
     /**
      * Parse aggregation function for a column.
@@ -71,10 +70,9 @@ public class FlinkAggFunctionParser {
         String funcName = options.getString(columnFuncKey, null);
         AggFunctionType type = parseAggFunctionType(funcName, columnName);
 
-        // Collect column-level parameters: fields.<column>.agg.params.*
+        // Collect column-level parameters: fields.<column>.<function_name>.*
         Map<String, String> params =
-                collectParameters(
-                        AGG_PREFIX + columnName + AGG_SUFFIX + PARAMS_SUFFIX + ".", options);
+                collectParameters(AGG_PREFIX + columnName + "." + funcName + ".", options);
 
         return Optional.of(createAggFunction(type, params, columnName));
     }
@@ -88,19 +86,19 @@ public class FlinkAggFunctionParser {
      *
      * <pre>
      * fields.&lt;column&gt;.agg = &lt;function_name&gt;
-     * fields.&lt;column&gt;.agg.params.&lt;param&gt; = &lt;value&gt;
+     * fields.&lt;column&gt;.&lt;function_name&gt;.&lt;param&gt; = &lt;value&gt;
      * </pre>
      */
     public static void formatAggFunctionToOptions(
             String columnName, AggFunction aggFunction, Map<String, String> options) {
         // Set function name
         String funcKey = AGG_PREFIX + columnName + AGG_SUFFIX;
-        options.put(funcKey, aggFunction.getType().toString());
+        String funcName = aggFunction.getType().toString();
+        options.put(funcKey, funcName);
 
-        // Set parameters
+        // Set parameters: fields.<column>.<function_name>.<param>
         for (Map.Entry<String, String> param : aggFunction.getParameters().entrySet()) {
-            String paramKey =
-                    AGG_PREFIX + columnName + AGG_SUFFIX + PARAMS_SUFFIX + "." + param.getKey();
+            String paramKey = AGG_PREFIX + columnName + "." + funcName + "." + param.getKey();
             options.put(paramKey, param.getValue());
         }
     }
@@ -148,11 +146,11 @@ public class FlinkAggFunctionParser {
     /**
      * Collect parameters with given prefix.
      *
-     * <p>For prefix "fields.tags.agg.", collects:
+     * <p>For prefix "fields.tags.listagg.", collects:
      *
      * <ul>
-     *   <li>fields.tags.agg.delimiter → delimiter
-     *   <li>fields.tags.agg.xxx → xxx
+     *   <li>fields.tags.listagg.delimiter → delimiter
+     *   <li>fields.tags.listagg.xxx → xxx
      * </ul>
      */
     @VisibleForTesting

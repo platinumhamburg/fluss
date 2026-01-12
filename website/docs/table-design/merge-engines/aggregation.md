@@ -57,7 +57,7 @@ For functions that require parameters (e.g., `listagg` with custom delimiter):
 
 ```sql
 'fields.<field-name>.agg' = '<function-name>',
-'fields.<field-name>.agg.params.<param-name>' = '<param-value>'
+'fields.<field-name>.<function-name>.<param-name>' = '<param-value>'
 ```
 
 </TabItem>
@@ -721,7 +721,7 @@ CREATE TABLE test_listagg  (
     'table.merge-engine' = 'aggregation',
     'fields.tags1.agg' = 'listagg',
     'fields.tags2.agg' = 'listagg',
-    'fields.tags2.agg.params.delimiter' = ';'   -- Specify delimiter as parameter
+    'fields.tags2.listagg.delimiter' = ';'   -- Specify delimiter as parameter
 );
 
 INSERT INTO test_listagg VALUES
@@ -783,7 +783,7 @@ CREATE TABLE test_string_agg  (
     'table.merge-engine' = 'aggregation',
     'fields.tags1.agg' = 'string_agg',
     'fields.tags2.agg' = 'string_agg',
-    'fields.tags2.agg.params.delimiter' = ';'   -- Specify delimiter as parameter
+    'fields.tags2.string_agg.delimiter' = ';'   -- Specify delimiter as parameter
 );
 
 INSERT INTO test_string_agg VALUES

@@ -1263,7 +1263,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         + "'fields.bool_and_val.agg' = 'bool_and', "
                         + "'fields.bool_or_val.agg' = 'bool_or', "
                         + "'fields.listagg_val.agg' = 'listagg', "
-                        + "'fields.listagg_val.agg.params.delimiter' = '|')");
+                        + "'fields.listagg_val.listagg.delimiter' = '|')");
 
         // Insert first batch - initial values
         tEnv.executeSql(
