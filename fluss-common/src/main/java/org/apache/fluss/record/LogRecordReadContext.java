@@ -60,6 +60,9 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
     // whether the projection is push downed to the server side and the returned data is pruned.
     private final boolean projectionPushDowned;
     private final SchemaGetter schemaGetter;
+    // whether the recordBatchFilter is push downed to the server side and the returned data is
+    // filtered.
+    private final boolean filterPushDowned;
     private final ConcurrentHashMap<Integer, VectorSchemaRoot> vectorSchemaRootMap =
             MapUtils.newConcurrentHashMap();
 
@@ -68,10 +71,38 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
             boolean readFromRemote,
             @Nullable Projection projection,
             SchemaGetter schemaGetter) {
+        return createReadContext(tableInfo, readFromRemote, projection, false, schemaGetter);
+    }
+
+    public static LogRecordReadContext createReadContext(
+            TableInfo tableInfo, boolean readFromRemote, @Nullable Projection projection) {
+        return createReadContext(tableInfo, readFromRemote, projection, false);
+    }
+
+    /**
+     * Creates a LogRecordReadContext for the given table information, projection information and
+     * filter information.
+     */
+    public static LogRecordReadContext createReadContext(
+            TableInfo tableInfo,
+            boolean readFromRemote,
+            @Nullable Projection projection,
+            boolean hasFilter) {
+        return createReadContext(tableInfo, readFromRemote, projection, hasFilter, null);
+    }
+
+    public static LogRecordReadContext createReadContext(
+            TableInfo tableInfo,
+            boolean readFromRemote,
+            @Nullable Projection projection,
+            boolean hasFilter,
+            SchemaGetter schemaGetter) {
         RowType rowType = tableInfo.getRowType();
         LogFormat logFormat = tableInfo.getTableConfig().getLogFormat();
         // only for arrow log format, the projection can be push downed to the server side
         boolean projectionPushDowned = projection != null && logFormat == LogFormat.ARROW;
+        // recordBatchFilter can be push downed to the server side when hasFilter is true
+        boolean filterPushDowned = hasFilter && !readFromRemote;
         int schemaId = tableInfo.getSchemaId();
         if (projection == null) {
             // set a default dummy projection to simplify code
@@ -84,7 +115,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
                 // so set the rowType as is.
                 int[] selectedFields = projection.getProjection();
                 return createArrowReadContext(
-                        rowType, schemaId, selectedFields, false, schemaGetter);
+                        rowType, schemaId, selectedFields, false, filterPushDowned, schemaGetter);
             } else {
                 // arrow data that returned from server has been projected (in order)
                 RowType projectedRowType = projection.projectInOrder(rowType);
@@ -95,6 +126,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
                         schemaId,
                         selectedFields,
                         projectionPushDowned,
+                        filterPushDowned,
                         schemaGetter);
             }
         } else if (logFormat == LogFormat.INDEXED) {
@@ -109,10 +141,17 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
     }
 
     private static LogRecordReadContext createArrowReadContext(
+            RowType dataRowType, int schemaId, int[] selectedFields, boolean projectionPushDowned) {
+        return createArrowReadContext(
+                dataRowType, schemaId, selectedFields, projectionPushDowned, false, null);
+    }
+
+    private static LogRecordReadContext createArrowReadContext(
             RowType dataRowType,
             int schemaId,
             int[] selectedFields,
             boolean projectionPushDowned,
+            boolean filterPushDowned,
             SchemaGetter schemaGetter) {
         // TODO: use a more reasonable memory limit
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
@@ -124,6 +163,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
                 allocator,
                 fieldGetters,
                 projectionPushDowned,
+                filterPushDowned,
                 schemaGetter);
     }
 
@@ -139,7 +179,8 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
     public static LogRecordReadContext createArrowReadContext(
             RowType rowType, int schemaId, SchemaGetter schemaGetter) {
         int[] selectedFields = IntStream.range(0, rowType.getFieldCount()).toArray();
-        return createArrowReadContext(rowType, schemaId, selectedFields, false, schemaGetter);
+        return createArrowReadContext(
+                rowType, schemaId, selectedFields, false, false, schemaGetter);
     }
 
     @VisibleForTesting
@@ -150,7 +191,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
             boolean projectionPushDowned) {
         int[] selectedFields = IntStream.range(0, rowType.getFieldCount()).toArray();
         return createArrowReadContext(
-                rowType, schemaId, selectedFields, projectionPushDowned, schemaGetter);
+                rowType, schemaId, selectedFields, projectionPushDowned, false, schemaGetter);
     }
 
     /**
@@ -187,7 +228,34 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
         FieldGetter[] fieldGetters = buildProjectedFieldGetters(rowType, selectedFields);
         // for INDEXED log format, the projection is NEVER push downed to the server side
         return new LogRecordReadContext(
-                LogFormat.INDEXED, rowType, schemaId, null, fieldGetters, false, schemaGetter);
+                LogFormat.INDEXED,
+                rowType,
+                schemaId,
+                null,
+                fieldGetters,
+                false,
+                false,
+                schemaGetter);
+    }
+
+    public static LogRecordReadContext createIndexedReadContext(
+            RowType rowType, int schemaId, int[] selectedFields) {
+        return createIndexedReadContext(rowType, schemaId, selectedFields, false);
+    }
+
+    public static LogRecordReadContext createIndexedReadContext(
+            RowType rowType, int schemaId, int[] selectedFields, boolean filterPushDowned) {
+        FieldGetter[] fieldGetters = buildProjectedFieldGetters(rowType, selectedFields);
+        // for INDEXED log format, the projection is NEVER push downed to the server side
+        return new LogRecordReadContext(
+                LogFormat.INDEXED,
+                rowType,
+                schemaId,
+                null,
+                fieldGetters,
+                false,
+                filterPushDowned,
+                null);
     }
 
     /**
@@ -202,7 +270,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
         FieldGetter[] fieldGetters = buildProjectedFieldGetters(rowType, selectedFields);
         // for COMPACTED log format, the projection is NEVER push downed to the server side
         return new LogRecordReadContext(
-                LogFormat.COMPACTED, rowType, schemaId, null, fieldGetters, false, null);
+                LogFormat.COMPACTED, rowType, schemaId, null, fieldGetters, false, false, null);
     }
 
     private LogRecordReadContext(
@@ -212,6 +280,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
             BufferAllocator bufferAllocator,
             FieldGetter[] selectedFieldGetters,
             boolean projectionPushDowned,
+            boolean filterPushDowned,
             SchemaGetter schemaGetter) {
         this.logFormat = logFormat;
         this.dataRowType = targetDataRowType;
@@ -220,6 +289,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
         this.selectedFieldGetters = selectedFieldGetters;
         this.projectionPushDowned = projectionPushDowned;
         this.schemaGetter = schemaGetter;
+        this.filterPushDowned = filterPushDowned;
     }
 
     @Override
@@ -245,6 +315,19 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
     /** Whether the projection is push downed to the server side and the returned data is pruned. */
     public boolean isProjectionPushDowned() {
         return projectionPushDowned;
+    }
+
+    /**
+     * Whether the recordBatchFilter is push downed to the server side and the returned data is
+     * filtered.
+     */
+    public boolean isFilterPushDowned() {
+        return filterPushDowned;
+    }
+
+    /** Get the schema ID of the table. */
+    public int getSchemaId() {
+        return targetSchemaId;
     }
 
     @Override
