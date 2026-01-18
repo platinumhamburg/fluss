@@ -63,6 +63,24 @@ class FlinkAggFunctionParserTest {
         assertThat(result).isPresent();
         assertThat(result.get().getType()).isEqualTo(AggFunctionType.LISTAGG);
         assertThat(result.get().getParameter("delimiter")).contains(";");
+
+        Map<String, String> newOptions = new HashMap<>();
+        FlinkAggFunctionParser.formatAggFunctionToOptions(
+                "tags", AggFunctions.LISTAGG(";"), newOptions);
+        assertThat(newOptions).isEqualTo(options.toMap());
+    }
+
+    @Test
+    void testParseFunctionWithUpperCaseName() {
+        Configuration options = new Configuration();
+        options.setString("fields.tags.agg", "LISTAGG");
+        options.setString("fields.tags.listagg.delimiter", ";");
+
+        Optional<AggFunction> result = FlinkAggFunctionParser.parseAggFunction("tags", options);
+
+        assertThat(result).isPresent();
+        assertThat(result.get().getType()).isEqualTo(AggFunctionType.LISTAGG);
+        assertThat(result.get().getParameter("delimiter")).contains(";");
     }
 
     @Test

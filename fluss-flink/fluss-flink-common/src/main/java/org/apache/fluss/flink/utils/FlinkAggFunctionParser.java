@@ -67,7 +67,8 @@ public class FlinkAggFunctionParser {
             return Optional.empty();
         }
 
-        String funcName = options.getString(columnFuncKey, null);
+        // convert to lower case for consistent parameter option key
+        String funcName = options.getString(columnFuncKey, null).toLowerCase();
         AggFunctionType type = parseAggFunctionType(funcName, columnName);
 
         // Collect column-level parameters: fields.<column>.<function_name>.*
@@ -93,6 +94,7 @@ public class FlinkAggFunctionParser {
             String columnName, AggFunction aggFunction, Map<String, String> options) {
         // Set function name
         String funcKey = AGG_PREFIX + columnName + AGG_SUFFIX;
+        // funcName has already in lower case
         String funcName = aggFunction.getType().toString();
         options.put(funcKey, funcName);
 

@@ -70,7 +70,6 @@ import static org.apache.flink.table.utils.EncodingUtils.decodeBase64ToBytes;
 import static org.apache.flink.table.utils.EncodingUtils.encodeBytesToBase64;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
-import static org.apache.fluss.config.ConfigOptions.TABLE_AUTO_INCREMENT_FIELDS;
 import static org.apache.fluss.config.ConfigOptions.TABLE_MERGE_ENGINE;
 import static org.apache.fluss.config.FlussConfigUtils.isTableStorageConfig;
 import static org.apache.fluss.flink.FlinkConnectorOptions.AUTO_INCREMENT_FIELDS;
