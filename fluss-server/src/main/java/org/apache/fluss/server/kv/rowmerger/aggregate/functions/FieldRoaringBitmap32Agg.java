@@ -22,8 +22,8 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
+import org.apache.fluss.server.utils.RoaringBitmapUtils;
 import org.apache.fluss.types.DataType;
-import org.apache.fluss.utils.RoaringBitmapUtils;
 
 import org.roaringbitmap.RoaringBitmap;
 

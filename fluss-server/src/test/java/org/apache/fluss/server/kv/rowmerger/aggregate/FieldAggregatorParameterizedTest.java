@@ -29,10 +29,10 @@ import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.server.kv.rowmerger.AggregateRowMerger;
+import org.apache.fluss.server.utils.RoaringBitmapUtils;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeChecks;
 import org.apache.fluss.types.DataTypes;
-import org.apache.fluss.utils.RoaringBitmapUtils;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;

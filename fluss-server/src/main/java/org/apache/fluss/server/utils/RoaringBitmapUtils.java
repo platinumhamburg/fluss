@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.utils;
+package org.apache.fluss.server.utils;
 
 import org.roaringbitmap.RoaringBitmap;
 import org.roaringbitmap.longlong.Roaring64Bitmap;
@@ -35,6 +35,12 @@ public final class RoaringBitmapUtils {
         // Utility class, no instantiation
     }
 
+    /**
+     * Serializes a 32-bit RoaringBitmap to a byte array using ByteBuffer.
+     *
+     * <p>Uses ByteBuffer as recommended by the RoaringBitmap Javadoc: "This is the preferred method
+     * to serialize to a byte array (byte[])".
+     */
     public static byte[] serializeRoaringBitmap32(RoaringBitmap bitmap) throws IOException {
         bitmap.runOptimize();
         ByteBuffer buffer = ByteBuffer.allocate(bitmap.serializedSizeInBytes());
@@ -47,6 +53,13 @@ public final class RoaringBitmapUtils {
         bitmap.deserialize(ByteBuffer.wrap(bytes));
     }
 
+    /**
+     * Serializes a 64-bit Roaring64Bitmap to a byte array using DataOutputStream.
+     *
+     * <p>Note: Unlike RoaringBitmap (32-bit), Roaring64Bitmap does not provide a
+     * serialize(ByteBuffer) method. It only supports serialize(DataOutput), hence the different
+     * serialization strategy.
+     */
     public static byte[] serializeRoaringBitmap64(Roaring64Bitmap bitmap) throws IOException {
         bitmap.runOptimize();
         try (ByteArrayOutputStream output = new ByteArrayOutputStream();
