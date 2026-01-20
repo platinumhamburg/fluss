@@ -21,9 +21,7 @@ package org.apache.fluss.server.utils;
 import org.roaringbitmap.RoaringBitmap;
 import org.roaringbitmap.longlong.Roaring64Bitmap;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -71,9 +69,6 @@ public final class RoaringBitmapUtils {
 
     public static void deserializeRoaringBitmap64(Roaring64Bitmap bitmap, byte[] bytes)
             throws IOException {
-        try (ByteArrayInputStream input = new ByteArrayInputStream(bytes);
-                DataInputStream dataInput = new DataInputStream(input)) {
-            bitmap.deserialize(dataInput);
-        }
+        bitmap.deserialize(ByteBuffer.wrap(bytes));
     }
 }
