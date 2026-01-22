@@ -1063,3 +1063,46 @@ message PbBucketOffset {
   required int32 bucket_id = 2;
   optional int64 log_end_offset = 4;
 }
+
+// ------------------------------------------------------------------------------------------
+// Producer Offset Snapshot Management
+// ------------------------------------------------------------------------------------------
+
+// Register producer offset snapshot request and response
+message RegisterProducerOffsetsRequest {
+  required string producer_id = 1;
+  repeated PbTableBucketOffset bucket_offsets = 2;
+  optional int64 ttl_ms = 3;
+}
+
+message RegisterProducerOffsetsResponse {
+  // Result of registration: 0 = CREATED (new snapshot), 1 = ALREADY_EXISTS (snapshot existed)
+  optional int32 result = 1;
+}
+
+// Get producer offset snapshot request and response
+message GetProducerOffsetsRequest {
+  required string producer_id = 1;
+}
+
+message GetProducerOffsetsResponse {
+  optional string producer_id = 1;
+  optional int64 expiration_time = 2;
+  repeated PbTableOffsets table_offsets = 3;
+}
+
+// Delete producer offset snapshot request and response
+message DeleteProducerOffsetsRequest {
+  required string producer_id = 1;
+}
+
+message DeleteProducerOffsetsResponse {
+}
+
+// Helper message for bucket offsets in producer snapshot
+message PbTableBucketOffset {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  required int64 offset = 4;
+}

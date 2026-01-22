@@ -26,6 +26,8 @@ import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.security.acl.ResourceType;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableJsonSerde;
+import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerSnapshotJsonSerde;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -838,6 +840,69 @@ public final class ZkData {
 
         public static RebalanceTask decode(byte[] json) {
             return JsonSerdeUtils.readValue(json, RebalanceTaskJsonSerde.INSTANCE);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // ZNodes under "/producers/"
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * The znode for producers. This is the root node for all producer offset snapshots. The znode
+     * path is:
+     *
+     * <p>/producers
+     */
+    public static final class ProducersZNode {
+        public static String path() {
+            return "/producers";
+        }
+    }
+
+    /**
+     * The znode for a specific producer's offset snapshot. The znode path is:
+     *
+     * <p>/producers/[producerId]
+     *
+     * <p>This znode stores {@link ProducerSnapshot} which contains:
+     *
+     * <ul>
+     *   <li>expiration_time: TTL for automatic cleanup
+     *   <li>tables: List of table offset metadata with paths to remote offset files
+     * </ul>
+     *
+     * <p>The actual offset data is stored in remote storage (e.g., OSS/S3) and referenced by the
+     * file paths in the metadata.
+     */
+    public static final class ProducerIdZNode {
+        /**
+         * Returns the ZK path for the producer snapshot znode.
+         *
+         * @param producerId the producer ID (typically Flink job ID)
+         * @return the ZK path
+         */
+        public static String path(String producerId) {
+            return ProducersZNode.path() + "/" + producerId;
+        }
+
+        /**
+         * Encodes a ProducerSnapshot to JSON bytes for storage in ZK.
+         *
+         * @param snapshot the ProducerSnapshot to encode
+         * @return the encoded bytes
+         */
+        public static byte[] encode(ProducerSnapshot snapshot) {
+            return JsonSerdeUtils.writeValueAsBytes(snapshot, ProducerSnapshotJsonSerde.INSTANCE);
+        }
+
+        /**
+         * Decodes JSON bytes from ZK to a ProducerSnapshot.
+         *
+         * @param json the JSON bytes from ZK
+         * @return the decoded ProducerSnapshot
+         */
+        public static ProducerSnapshot decode(byte[] json) {
+            return JsonSerdeUtils.readValue(json, ProducerSnapshotJsonSerde.INSTANCE);
         }
     }
 }

@@ -66,6 +66,8 @@ import org.apache.fluss.server.zk.data.ZkData.PartitionIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionSequenceIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionsZNode;
+import org.apache.fluss.server.zk.data.ZkData.ProducerIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.ProducersZNode;
 import org.apache.fluss.server.zk.data.ZkData.RebalanceZNode;
 import org.apache.fluss.server.zk.data.ZkData.ResourceAclNode;
 import org.apache.fluss.server.zk.data.ZkData.SchemaZNode;
@@ -80,6 +82,7 @@ import org.apache.fluss.server.zk.data.ZkData.TablesZNode;
 import org.apache.fluss.server.zk.data.ZkData.WriterIdZNode;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFramework;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.BackgroundCallback;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.CuratorEvent;
@@ -1589,5 +1592,96 @@ public class ZooKeeperClient implements AutoCloseable {
             }
         }
         return result;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Producer Offset Snapshot
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Register a producer offset snapshot to ZK.
+     *
+     * <p>This method creates a new ZK node for the producer snapshot. If a snapshot already exists
+     * for the given producer ID, this method will fail with {@link
+     * KeeperException.NodeExistsException}.
+     *
+     * @param producerId the producer ID (typically Flink job ID)
+     * @param snapshot the producer snapshot containing expiration time and table offset metadata
+     * @throws Exception if the operation fails or if a snapshot already exists
+     */
+    public void registerProducerSnapshot(String producerId, ProducerSnapshot snapshot)
+            throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, ProducerIdZNode.encode(snapshot));
+        LOG.info("Registered producer snapshot for producer {} at path {}.", producerId, path);
+    }
+
+    /**
+     * Tries to atomically register a producer offset snapshot to ZK.
+     *
+     * <p>This method leverages ZooKeeper's atomic create operation to ensure that only one
+     * concurrent request can successfully create the snapshot. If a snapshot already exists for the
+     * given producer ID, this method returns false instead of throwing an exception.
+     *
+     * @param producerId the producer ID (typically Flink job ID)
+     * @param snapshot the producer snapshot containing expiration time and table offset metadata
+     * @return true if the snapshot was created successfully, false if a snapshot already exists
+     * @throws Exception if the operation fails for reasons other than node already existing
+     */
+    public boolean tryRegisterProducerSnapshot(String producerId, ProducerSnapshot snapshot)
+            throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        try {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(path, ProducerIdZNode.encode(snapshot));
+            LOG.info("Registered producer snapshot for producer {} at path {}.", producerId, path);
+            return true;
+        } catch (KeeperException.NodeExistsException e) {
+            LOG.debug(
+                    "Producer snapshot already exists for producer {} at path {}, "
+                            + "returning false.",
+                    producerId,
+                    path);
+            return false;
+        }
+    }
+
+    /**
+     * Gets the {@link ProducerSnapshot} for the given producer ID.
+     *
+     * @param producerId the producer ID
+     * @return an Optional containing the ProducerSnapshot if it exists, empty otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<ProducerSnapshot> getProducerSnapshot(String producerId) throws Exception {
+        String zkPath = ProducerIdZNode.path(producerId);
+        return getOrEmpty(zkPath).map(ProducerIdZNode::decode);
+    }
+
+    /**
+     * Deletes the producer offset snapshot for the given producer ID.
+     *
+     * @param producerId the producer ID
+     * @throws Exception if the operation fails
+     */
+    public void deleteProducerSnapshot(String producerId) throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        zkClient.delete().forPath(path);
+        LOG.info("Deleted producer snapshot for producer {} at path {}.", producerId, path);
+    }
+
+    /**
+     * Lists all producer IDs that have registered snapshots.
+     *
+     * @return list of producer IDs
+     * @throws Exception if the operation fails
+     */
+    public List<String> listProducerIds() throws Exception {
+        return getChildren(ProducersZNode.path());
     }
 }
