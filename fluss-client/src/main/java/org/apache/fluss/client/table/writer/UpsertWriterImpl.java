@@ -30,6 +30,7 @@ import org.apache.fluss.row.compacted.CompactedRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.row.indexed.IndexedRow;
+import org.apache.fluss.rpc.protocol.AggMode;
 import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
@@ -55,11 +56,25 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
     private final FieldGetter[] fieldGetters;
     private final TableInfo tableInfo;
 
+    /**
+     * The aggregation mode for this writer. This controls how the server handles data aggregation.
+     */
+    private final AggMode aggMode;
+
     UpsertWriterImpl(
             TablePath tablePath,
             TableInfo tableInfo,
             @Nullable int[] partialUpdateColumns,
             WriterClient writerClient) {
+        this(tablePath, tableInfo, partialUpdateColumns, writerClient, AggMode.AGGREGATE);
+    }
+
+    UpsertWriterImpl(
+            TablePath tablePath,
+            TableInfo tableInfo,
+            @Nullable int[] partialUpdateColumns,
+            WriterClient writerClient,
+            AggMode aggMode) {
         super(tablePath, tableInfo, writerClient);
         RowType rowType = tableInfo.getRowType();
         sanityCheck(
@@ -88,7 +103,16 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
         this.writeFormat = WriteFormat.fromKvFormat(this.kvFormat);
         this.rowEncoder = RowEncoder.create(kvFormat, rowType);
         this.fieldGetters = InternalRow.createFieldGetters(rowType);
+
         this.tableInfo = tableInfo;
+
+        // LOCAL_AGGREGATE is reserved for future implementation
+        if (aggMode == AggMode.LOCAL_AGGREGATE) {
+            throw new UnsupportedOperationException(
+                    "LOCAL_AGGREGATE mode is not yet supported. "
+                            + "Please use AGGREGATE or OVERWRITE mode.");
+        }
+        this.aggMode = aggMode;
     }
 
     private static void sanityCheck(
@@ -173,7 +197,8 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
                         key,
                         bucketKey,
                         writeFormat,
-                        targetColumns);
+                        targetColumns,
+                        aggMode);
         return send(record).thenApply(ignored -> UPSERT_SUCCESS);
     }
 
@@ -196,7 +221,8 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
                         key,
                         bucketKey,
                         writeFormat,
-                        targetColumns);
+                        targetColumns,
+                        aggMode);
         return send(record).thenApply(ignored -> DELETE_SUCCESS);
     }
 
