@@ -263,6 +263,16 @@ public class Sender implements Runnable {
         }
     }
 
+    /** Complete batch with bucket and offset info (for KV batches). */
+    private void completeBatch(ReadyWriteBatch readyWriteBatch, TableBucket bucket, long offset) {
+        if (idempotenceManager.idempotenceEnabled()) {
+            idempotenceManager.handleCompletedBatch(readyWriteBatch);
+        }
+        if (readyWriteBatch.writeBatch().complete(bucket, offset)) {
+            maybeRemoveAndDeallocateBatch(readyWriteBatch);
+        }
+    }
+
     private void failBatch(
             ReadyWriteBatch batch, Exception exception, boolean adjustBatchSequences) {
         if (batch.writeBatch().completeExceptionally(exception)) {
@@ -492,7 +502,10 @@ public class Sender implements Runnable {
                                 writeBatch, ApiError.fromErrorMessage(respForBucket));
                 invalidMetadataTablesSet.addAll(invalidMetadataTables);
             } else {
-                completeBatch(writeBatch);
+                // Get high watermark (changelog end offset) from response for KV batches
+                long highWatermark =
+                        respForBucket.hasHighWatermark() ? respForBucket.getHighWatermark() : -1;
+                completeBatch(writeBatch, tb, highWatermark);
             }
         }
         metadataUpdater.invalidPhysicalTableBucketMeta(invalidMetadataTablesSet);

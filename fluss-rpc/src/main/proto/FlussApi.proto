@@ -746,6 +746,9 @@ message PbPutKvRespForBucket {
   required int32 bucket_id = 2;
   optional int32 error_code = 3;
   optional string error_message = 4;
+  // the high watermark of the changelog after this write
+  // this is used for exactly-once semantics to track checkpoint offsets
+  optional int64 high_watermark = 5;
 }
 
 message PbLookupReqForBucket {

@@ -18,7 +18,10 @@
 package org.apache.fluss.client.table.writer;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.row.InternalRow;
+
+import javax.annotation.Nullable;
 
 /**
  * The result of upserting a record ({@link UpsertWriter#upsert(InternalRow)}).
@@ -27,6 +30,42 @@ import org.apache.fluss.row.InternalRow;
  */
 @PublicEvolving
 public class UpsertResult {
-    // currently, it's an empty class, it will be a compatible evolution if it extends
-    // to have offset, timestamp, etc. in the future
+
+    private final @Nullable TableBucket bucket;
+    private final long offset;
+
+    /**
+     * Creates a result with bucket and offset information.
+     *
+     * @param bucket the bucket this record was written to
+     * @param offset the offset (high_watermark) after this write
+     */
+    public UpsertResult(@Nullable TableBucket bucket, long offset) {
+        this.bucket = bucket;
+        this.offset = offset;
+    }
+
+    /**
+     * Returns the bucket this record was written to.
+     *
+     * @return the bucket, or null if not available
+     */
+    @Nullable
+    public TableBucket getBucket() {
+        return bucket;
+    }
+
+    /**
+     * Returns the offset (high_watermark) after this write.
+     *
+     * @return the offset, or -1 if not available
+     */
+    public long getOffset() {
+        return offset;
+    }
+
+    /** Creates an empty result (for testing purposes). */
+    public static UpsertResult empty() {
+        return new UpsertResult(null, -1);
+    }
 }

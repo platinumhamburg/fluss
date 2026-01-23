@@ -1024,6 +1024,13 @@ public class ServerRpcMessageUtils {
 
             if (bucketResult.failed()) {
                 putKvBucket.setError(bucketResult.getErrorCode(), bucketResult.getErrorMessage());
+            } else {
+                // set high watermark for successful writes
+                // this is used for exactly-once semantics to track checkpoint offsets
+                long highWatermark = bucketResult.getWriteLogEndOffset();
+                if (highWatermark >= 0) {
+                    putKvBucket.setHighWatermark(highWatermark);
+                }
             }
             putKvRespForBucketList.add(putKvBucket);
         }

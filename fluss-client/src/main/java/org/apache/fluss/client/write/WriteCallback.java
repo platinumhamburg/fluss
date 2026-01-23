@@ -18,6 +18,7 @@
 package org.apache.fluss.client.write;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.metadata.TableBucket;
 
 import javax.annotation.Nullable;
 
@@ -29,5 +30,13 @@ import javax.annotation.Nullable;
 @Internal
 public interface WriteCallback {
 
-    void onCompletion(@Nullable Exception exception);
+    /**
+     * Called when the write operation completes.
+     *
+     * @param bucket the bucket this record was written to, or null if not available (e.g., log
+     *     tables)
+     * @param offset the offset after this write, or -1 if not available
+     * @param exception the exception if the write failed, or null if successful
+     */
+    void onCompletion(@Nullable TableBucket bucket, long offset, @Nullable Exception exception);
 }
