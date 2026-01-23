@@ -57,6 +57,7 @@ import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
 import org.apache.fluss.rpc.messages.CreateTableRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
@@ -65,6 +66,7 @@ import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataRequest;
 import org.apache.fluss.rpc.messages.GetLatestKvSnapshotsRequest;
 import org.apache.fluss.rpc.messages.GetLatestLakeSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetTableInfoRequest;
 import org.apache.fluss.rpc.messages.GetTableSchemaRequest;
 import org.apache.fluss.rpc.messages.ListAclsRequest;
@@ -78,9 +80,13 @@ import org.apache.fluss.rpc.messages.ListTablesResponse;
 import org.apache.fluss.rpc.messages.PbAlterConfig;
 import org.apache.fluss.rpc.messages.PbListOffsetsRespForBucket;
 import org.apache.fluss.rpc.messages.PbPartitionSpec;
+import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
+import org.apache.fluss.rpc.messages.PbTableBucketOffset;
 import org.apache.fluss.rpc.messages.PbTablePath;
 import org.apache.fluss.rpc.messages.RebalanceRequest;
 import org.apache.fluss.rpc.messages.RebalanceResponse;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.RegisterResult;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.TableExistsRequest;
 import org.apache.fluss.rpc.messages.TableExistsResponse;
@@ -586,6 +592,83 @@ public class FlussAdmin implements Admin {
         }
 
         return gateway.cancelRebalance(request).thenApply(r -> null);
+    }
+
+    // ==================================================================================
+    // Producer Offset Management APIs (for Exactly-Once Semantics)
+    // ==================================================================================
+
+    @Override
+    public CompletableFuture<RegisterResult> registerProducerOffsets(
+            String producerId, Map<TableBucket, Long> offsets) {
+        checkNotNull(producerId, "producerId must not be null");
+        checkNotNull(offsets, "offsets must not be null");
+
+        RegisterProducerOffsetsRequest request = new RegisterProducerOffsetsRequest();
+        request.setProducerId(producerId);
+
+        // Convert TableBucket offsets to PbTableBucketOffset
+        for (Map.Entry<TableBucket, Long> entry : offsets.entrySet()) {
+            TableBucket bucket = entry.getKey();
+            PbTableBucketOffset pbOffset =
+                    request.addBucketOffset()
+                            .setTableId(bucket.getTableId())
+                            .setBucketId(bucket.getBucket())
+                            .setOffset(entry.getValue());
+            if (bucket.getPartitionId() != null) {
+                pbOffset.setPartitionId(bucket.getPartitionId());
+            }
+        }
+
+        return gateway.registerProducerOffsets(request)
+                .thenApply(
+                        response -> {
+                            int code =
+                                    response.hasResult()
+                                            ? response.getResult()
+                                            : RegisterResult.CREATED.getCode();
+                            return RegisterResult.fromCode(code);
+                        });
+    }
+
+    @Override
+    public CompletableFuture<ProducerOffsetsResult> getProducerOffsets(String producerId) {
+        checkNotNull(producerId, "producerId must not be null");
+
+        GetProducerOffsetsRequest request = new GetProducerOffsetsRequest();
+        request.setProducerId(producerId);
+
+        return gateway.getProducerOffsets(request)
+                .thenApply(
+                        response -> {
+                            if (!response.hasProducerId()) {
+                                return null;
+                            }
+
+                            Map<Long, Map<TableBucket, Long>> tableOffsets = new HashMap<>();
+                            for (PbProducerTableOffsets pbTableOffsets :
+                                    response.getTableOffsetsList()) {
+                                long tableId = pbTableOffsets.getTableId();
+                                tableOffsets.put(
+                                        tableId,
+                                        ClientRpcMessageUtils.toTableBucketOffsets(pbTableOffsets));
+                            }
+
+                            long expirationTime =
+                                    response.hasExpirationTime() ? response.getExpirationTime() : 0;
+                            return new ProducerOffsetsResult(
+                                    response.getProducerId(), tableOffsets, expirationTime);
+                        });
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteProducerOffsets(String producerId) {
+        checkNotNull(producerId, "producerId must not be null");
+
+        DeleteProducerOffsetsRequest request = new DeleteProducerOffsetsRequest();
+        request.setProducerId(producerId);
+
+        return gateway.deleteProducerOffsets(request).thenApply(r -> null);
     }
 
     @Override

@@ -542,4 +542,50 @@ public class ClientRpcMessageUtils {
                                                 pbDescribeConfig.getConfigSource())))
                 .collect(Collectors.toList());
     }
+
+    /**
+     * Parses a PbTableOffsets into a map of TableBucket to offset.
+     *
+     * @param pbTableOffsets the protobuf table offsets
+     * @return map of TableBucket to offset
+     */
+    public static Map<TableBucket, Long> toTableBucketOffsets(
+            org.apache.fluss.rpc.messages.PbTableOffsets pbTableOffsets) {
+        Map<TableBucket, Long> bucketOffsets = new HashMap<>();
+        long tableId = pbTableOffsets.getTableId();
+
+        for (org.apache.fluss.rpc.messages.PbBucketOffset pbBucketOffset :
+                pbTableOffsets.getBucketOffsetsList()) {
+            Long partitionId =
+                    pbBucketOffset.hasPartitionId() ? pbBucketOffset.getPartitionId() : null;
+            TableBucket bucket =
+                    new TableBucket(tableId, partitionId, pbBucketOffset.getBucketId());
+            bucketOffsets.put(bucket, pbBucketOffset.getLogEndOffset());
+        }
+
+        return bucketOffsets;
+    }
+
+    /**
+     * Parses a PbProducerTableOffsets into a map of TableBucket to offset.
+     *
+     * @param pbTableOffsets the protobuf producer table offsets
+     * @return map of TableBucket to offset
+     */
+    public static Map<TableBucket, Long> toTableBucketOffsets(
+            org.apache.fluss.rpc.messages.PbProducerTableOffsets pbTableOffsets) {
+        Map<TableBucket, Long> bucketOffsets = new HashMap<>();
+        long tableId = pbTableOffsets.getTableId();
+
+        for (org.apache.fluss.rpc.messages.PbBucketOffset pbBucketOffset :
+                pbTableOffsets.getBucketOffsetsList()) {
+            Long partitionId =
+                    pbBucketOffset.hasPartitionId() ? pbBucketOffset.getPartitionId() : null;
+            TableBucket bucket =
+                    new TableBucket(tableId, partitionId, pbBucketOffset.getBucketId());
+            bucketOffsets.put(bucket, pbBucketOffset.getLogEndOffset());
+        }
+
+        return bucketOffsets;
+    }
 }
