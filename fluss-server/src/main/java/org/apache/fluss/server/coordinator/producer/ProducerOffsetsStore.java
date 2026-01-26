@@ -18,6 +18,7 @@
 
 package org.apache.fluss.server.coordinator.producer;
 
+import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FSDataOutputStream;
 import org.apache.fluss.fs.FileStatus;
@@ -36,7 +37,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -350,8 +350,7 @@ public class ProducerOffsetsStore {
                 () -> {
                     FileSystem fs = path.getFileSystem();
                     if (!fs.exists(path)) {
-                        // FileNotFoundException will not be retried by executeIOWithRetry
-                        throw new FileNotFoundException("Offsets file not found: " + path);
+                        throw new FlussRuntimeException("Offsets file not found: " + path);
                     }
                     try (FSDataInputStream in = fs.open(path);
                             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
