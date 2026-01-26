@@ -1611,7 +1611,7 @@ public class ZooKeeperClient implements AutoCloseable {
      * @return true if the snapshot was created successfully, false if a snapshot already exists
      * @throws Exception if the operation fails for reasons other than node already existing
      */
-    public boolean tryRegisterProducerSnapshot(String producerId, ProducerOffsets producerOffsets)
+    public boolean tryRegisterProducerOffsets(String producerId, ProducerOffsets producerOffsets)
             throws Exception {
         String path = ProducerIdZNode.path(producerId);
         try {
@@ -1638,7 +1638,7 @@ public class ZooKeeperClient implements AutoCloseable {
      * @return an Optional containing the ProducerOffsets if it exists, empty otherwise
      * @throws Exception if the operation fails
      */
-    public Optional<ProducerOffsets> getProducerSnapshot(String producerId) throws Exception {
+    public Optional<ProducerOffsets> getProducerOffsets(String producerId) throws Exception {
         String zkPath = ProducerIdZNode.path(producerId);
         return getOrEmpty(zkPath).map(ProducerIdZNode::decode);
     }
@@ -1649,10 +1649,10 @@ public class ZooKeeperClient implements AutoCloseable {
      * @param producerId the producer ID
      * @throws Exception if the operation fails
      */
-    public void deleteProducerSnapshot(String producerId) throws Exception {
+    public void deleteProducerOffsets(String producerId) throws Exception {
         String path = ProducerIdZNode.path(producerId);
         zkClient.delete().forPath(path);
-        LOG.info("Deleted producer snapshot for producer {} at path {}.", producerId, path);
+        LOG.info("Deleted producer offsets snapshot for producer {} at path {}.", producerId, path);
     }
 
     /**
@@ -1666,7 +1666,7 @@ public class ZooKeeperClient implements AutoCloseable {
      *     otherwise
      * @throws Exception if the operation fails
      */
-    public Optional<Tuple2<ProducerOffsets, Integer>> getProducerSnapshotWithVersion(
+    public Optional<Tuple2<ProducerOffsets, Integer>> getProducerOffsetsWithVersion(
             String producerId) throws Exception {
         String zkPath = ProducerIdZNode.path(producerId);
         try {

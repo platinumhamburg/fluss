@@ -141,7 +141,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
             long expirationTime = currentTimeMs + effectiveTtlMs;
 
             // Step 1: Try to atomically create the snapshot (common case)
-            if (offsetsStore.tryStoreSnapshot(producerId, offsets, expirationTime)) {
+            if (offsetsStore.tryStoreOffsets(producerId, offsets, expirationTime)) {
                 return true;
             }
 
@@ -187,11 +187,11 @@ public class ProducerOffsetsManager implements AutoCloseable {
             throws Exception {
 
         Optional<Tuple2<ProducerOffsets, Integer>> existingWithVersion =
-                offsetsStore.getSnapshotMetadataWithVersion(producerId);
+                offsetsStore.getOffsetsMetadataWithVersion(producerId);
 
         // Case 1: Snapshot was deleted between our create attempt and this check
         if (!existingWithVersion.isPresent()) {
-            return offsetsStore.tryStoreSnapshot(producerId, offsets, expirationTime)
+            return offsetsStore.tryStoreOffsets(producerId, offsets, expirationTime)
                     ? RegisterAttemptResult.CREATED
                     : RegisterAttemptResult.RETRY;
         }
@@ -246,7 +246,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
         }
 
         // Successfully deleted, try to create new snapshot
-        if (offsetsStore.tryStoreSnapshot(producerId, offsets, expirationTime)) {
+        if (offsetsStore.tryStoreOffsets(producerId, offsets, expirationTime)) {
             return RegisterAttemptResult.CREATED;
         }
 
@@ -269,7 +269,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
      */
     private RegisterAttemptResult checkCurrentSnapshotState(String producerId, long currentTimeMs)
             throws Exception {
-        Optional<ProducerOffsets> producerOffsets = offsetsStore.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> producerOffsets = offsetsStore.getOffsetsMetadata(producerId);
 
         if (isValidSnapshot(producerOffsets, currentTimeMs)) {
             LOG.info(
@@ -304,16 +304,16 @@ public class ProducerOffsetsManager implements AutoCloseable {
     }
 
     /**
-     * Gets the snapshot metadata for a producer.
+     * Gets the offsets snapshot metadata for a producer.
      *
      * @param producerId the producer ID
-     * @return Optional containing the snapshot if exists
+     * @return Optional containing the offsets snapshot if exists
      * @throws IllegalArgumentException if producerId is invalid
      * @throws Exception if the operation fails
      */
-    public Optional<ProducerOffsets> getSnapshotMetadata(String producerId) throws Exception {
+    public Optional<ProducerOffsets> getOffsetsMetadata(String producerId) throws Exception {
         validateProducerId(producerId);
-        return offsetsStore.getSnapshotMetadata(producerId);
+        return offsetsStore.getOffsetsMetadata(producerId);
     }
 
     /**
@@ -324,7 +324,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
      * @throws IllegalArgumentException if producerId is invalid
      * @throws Exception if the operation fails
      */
-    public Map<TableBucket, Long> getOffsets(String producerId) throws Exception {
+    public Map<TableBucket, Long> readOffsets(String producerId) throws Exception {
         validateProducerId(producerId);
         return offsetsStore.readOffsets(producerId);
     }
@@ -405,7 +405,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
         for (String producerId : producerIds) {
             try {
                 Optional<Tuple2<ProducerOffsets, Integer>> snapshotWithVersion =
-                        offsetsStore.getSnapshotMetadataWithVersion(producerId);
+                        offsetsStore.getOffsetsMetadataWithVersion(producerId);
                 if (!snapshotWithVersion.isPresent()) {
                     continue;
                 }
@@ -507,8 +507,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
         Set<String> validFilePaths = new HashSet<>();
         for (String producerId : validProducerIds) {
             try {
-                Optional<ProducerOffsets> optSnapshot =
-                        offsetsStore.getSnapshotMetadata(producerId);
+                Optional<ProducerOffsets> optSnapshot = offsetsStore.getOffsetsMetadata(producerId);
                 if (optSnapshot.isPresent()) {
                     for (ProducerOffsets.TableOffsetMetadata tableMetadata :
                             optSnapshot.get().getTableOffsets()) {

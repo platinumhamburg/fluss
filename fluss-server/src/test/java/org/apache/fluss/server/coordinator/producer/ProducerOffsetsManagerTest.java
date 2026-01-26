@@ -88,7 +88,7 @@ class ProducerOffsetsManagerTest {
         boolean created = manager.registerSnapshot(producerId, offsets, null);
 
         assertThat(created).isTrue();
-        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = manager.getOffsetsMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getExpirationTime())
                 .isGreaterThanOrEqualTo(System.currentTimeMillis());
@@ -108,7 +108,7 @@ class ProducerOffsetsManagerTest {
         assertThat(manager.registerSnapshot(producerId, offsets2, null)).isFalse();
 
         // Original offsets should be preserved
-        Map<TableBucket, Long> retrieved = manager.getOffsets(producerId);
+        Map<TableBucket, Long> retrieved = manager.readOffsets(producerId);
         assertThat(retrieved).containsKey(new TableBucket(1L, 0));
         assertThat(retrieved).doesNotContainKey(new TableBucket(99L, 0));
     }
@@ -123,7 +123,7 @@ class ProducerOffsetsManagerTest {
         manager.registerSnapshot(producerId, offsets, customTtlMs);
         long afterRegister = System.currentTimeMillis();
 
-        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = manager.getOffsetsMetadata(producerId);
         assertThat(snapshot).isPresent();
         long expirationTime = snapshot.get().getExpirationTime();
         assertThat(expirationTime).isGreaterThanOrEqualTo(beforeRegister + customTtlMs);
@@ -145,10 +145,10 @@ class ProducerOffsetsManagerTest {
 
         // Register with very short TTL (already expired)
         long expiredTtlMs = -1000; // Already expired
-        store.tryStoreSnapshot(producerId, offsets1, System.currentTimeMillis() + expiredTtlMs);
+        store.tryStoreOffsets(producerId, offsets1, System.currentTimeMillis() + expiredTtlMs);
 
         // Verify it's expired
-        Optional<ProducerOffsets> expiredSnapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> expiredSnapshot = manager.getOffsetsMetadata(producerId);
         assertThat(expiredSnapshot).isPresent();
         assertThat(expiredSnapshot.get().isExpired(System.currentTimeMillis())).isTrue();
 
@@ -157,7 +157,7 @@ class ProducerOffsetsManagerTest {
         assertThat(created).isTrue();
 
         // Verify new offsets
-        Map<TableBucket, Long> retrieved = manager.getOffsets(producerId);
+        Map<TableBucket, Long> retrieved = manager.readOffsets(producerId);
         assertThat(retrieved).containsKey(new TableBucket(2L, 0));
         assertThat(retrieved).doesNotContainKey(new TableBucket(1L, 0));
     }
@@ -167,38 +167,38 @@ class ProducerOffsetsManagerTest {
     // ------------------------------------------------------------------------
 
     @Test
-    void testGetSnapshotMetadata() throws Exception {
+    void testGetOffsetsMetadata() throws Exception {
         String producerId = "test-manager-get-metadata";
         Map<TableBucket, Long> offsets = createTestOffsets();
 
         manager.registerSnapshot(producerId, offsets, null);
 
-        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = manager.getOffsetsMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getTableOffsets()).isNotEmpty();
     }
 
     @Test
-    void testGetSnapshotMetadataNonExistent() throws Exception {
-        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata("non-existent-producer");
+    void testGetOffsetsMetadataNonExistent() throws Exception {
+        Optional<ProducerOffsets> snapshot = manager.getOffsetsMetadata("non-existent-producer");
         assertThat(snapshot).isEmpty();
     }
 
     @Test
-    void testGetOffsets() throws Exception {
+    void testReadOffsets() throws Exception {
         String producerId = "test-manager-get-offsets";
         Map<TableBucket, Long> offsets = createTestOffsets();
 
         manager.registerSnapshot(producerId, offsets, null);
 
-        Map<TableBucket, Long> retrieved = manager.getOffsets(producerId);
+        Map<TableBucket, Long> retrieved = manager.readOffsets(producerId);
         assertThat(retrieved).hasSize(offsets.size());
         assertThat(retrieved.get(new TableBucket(1L, 0))).isEqualTo(100L);
     }
 
     @Test
-    void testGetOffsetsNonExistent() throws Exception {
-        Map<TableBucket, Long> offsets = manager.getOffsets("non-existent-producer");
+    void testReadOffsetsNonExistent() throws Exception {
+        Map<TableBucket, Long> offsets = manager.readOffsets("non-existent-producer");
         assertThat(offsets).isEmpty();
     }
 
@@ -208,12 +208,12 @@ class ProducerOffsetsManagerTest {
         Map<TableBucket, Long> offsets = createTestOffsets();
 
         manager.registerSnapshot(producerId, offsets, null);
-        assertThat(manager.getSnapshotMetadata(producerId)).isPresent();
+        assertThat(manager.getOffsetsMetadata(producerId)).isPresent();
 
         manager.deleteSnapshot(producerId);
 
-        assertThat(manager.getSnapshotMetadata(producerId)).isEmpty();
-        assertThat(manager.getOffsets(producerId)).isEmpty();
+        assertThat(manager.getOffsetsMetadata(producerId)).isEmpty();
+        assertThat(manager.readOffsets(producerId)).isEmpty();
     }
 
     @Test
@@ -233,7 +233,7 @@ class ProducerOffsetsManagerTest {
 
         // Create an expired snapshot
         Map<TableBucket, Long> offsets = createTestOffsets();
-        store.tryStoreSnapshot(expiredProducerId, offsets, System.currentTimeMillis() - 1000);
+        store.tryStoreOffsets(expiredProducerId, offsets, System.currentTimeMillis() - 1000);
 
         // Create a valid snapshot
         manager.registerSnapshot(validProducerId, offsets, null);
@@ -242,8 +242,8 @@ class ProducerOffsetsManagerTest {
         int cleanedCount = manager.cleanupExpiredSnapshots();
 
         assertThat(cleanedCount).isEqualTo(1);
-        assertThat(manager.getSnapshotMetadata(expiredProducerId)).isEmpty();
-        assertThat(manager.getSnapshotMetadata(validProducerId)).isPresent();
+        assertThat(manager.getOffsetsMetadata(expiredProducerId)).isEmpty();
+        assertThat(manager.getOffsetsMetadata(validProducerId)).isPresent();
     }
 
     @Test
@@ -291,27 +291,27 @@ class ProducerOffsetsManagerTest {
     }
 
     @Test
-    void testGetSnapshotMetadataWithInvalidProducerId() {
+    void testGetOffsetsMetadataWithInvalidProducerId() {
         // Null producer ID
-        assertThatThrownBy(() -> manager.getSnapshotMetadata(null))
+        assertThatThrownBy(() -> manager.getOffsetsMetadata(null))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid producer ID");
 
         // Invalid characters
-        assertThatThrownBy(() -> manager.getSnapshotMetadata("invalid@producer"))
+        assertThatThrownBy(() -> manager.getOffsetsMetadata("invalid@producer"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid producer ID");
     }
 
     @Test
-    void testGetOffsetsWithInvalidProducerId() {
+    void testReadOffsetsWithInvalidProducerId() {
         // Null producer ID
-        assertThatThrownBy(() -> manager.getOffsets(null))
+        assertThatThrownBy(() -> manager.readOffsets(null))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid producer ID");
 
         // Invalid characters
-        assertThatThrownBy(() -> manager.getOffsets("invalid producer"))
+        assertThatThrownBy(() -> manager.readOffsets("invalid producer"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid producer ID");
     }
@@ -376,7 +376,7 @@ class ProducerOffsetsManagerTest {
         assertThat(existsCount.get()).isEqualTo(numThreads - 1);
 
         // Verify snapshot exists
-        assertThat(manager.getSnapshotMetadata(producerId)).isPresent();
+        assertThat(manager.getOffsetsMetadata(producerId)).isPresent();
     }
 
     @Test
@@ -419,7 +419,7 @@ class ProducerOffsetsManagerTest {
 
         // Verify all snapshots exist
         for (int i = 0; i < numProducers; i++) {
-            assertThat(manager.getSnapshotMetadata("test-concurrent-diff-" + i)).isPresent();
+            assertThat(manager.getOffsetsMetadata("test-concurrent-diff-" + i)).isPresent();
         }
     }
 

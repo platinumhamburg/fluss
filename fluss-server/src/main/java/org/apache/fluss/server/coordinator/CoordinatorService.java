@@ -270,6 +270,9 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         if (authorizer != null) {
             TablePath tablePath;
             try {
+                // TODO: this will block on the coordinator event thread, consider refactor
+                //  CoordinatorMetadataCache to hold the mapping of table_id to table_path, and then
+                //  we don't need this async request.
                 AccessContextEvent<TablePath> getTablePathEvent =
                         new AccessContextEvent<>(ctx -> ctx.getTablePathById(tableId));
                 eventManagerSupplier.get().put(getTablePathEvent);
@@ -1068,14 +1071,14 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 () -> {
                     try {
                         Optional<ProducerOffsets> optSnapshot =
-                                producerOffsetsManager.getSnapshotMetadata(producerId);
+                                producerOffsetsManager.getOffsetsMetadata(producerId);
                         if (!optSnapshot.isPresent()) {
                             return new GetProducerOffsetsResponse();
                         }
 
                         ProducerOffsets snapshot = optSnapshot.get();
                         Map<TableBucket, Long> allOffsets =
-                                producerOffsetsManager.getOffsets(producerId);
+                                producerOffsetsManager.readOffsets(producerId);
                         Map<Long, Map<TableBucket, Long>> offsetsByTable =
                                 groupOffsetsByTableId(allOffsets);
 
@@ -1123,7 +1126,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                         // Authorization: require WRITE permission on all tables in the snapshot
                         if (authorizer != null) {
                             Map<TableBucket, Long> offsets =
-                                    producerOffsetsManager.getOffsets(producerId);
+                                    producerOffsetsManager.readOffsets(producerId);
                             // Extract unique table IDs from the snapshot
                             Set<Long> tableIds =
                                     offsets.keySet().stream()

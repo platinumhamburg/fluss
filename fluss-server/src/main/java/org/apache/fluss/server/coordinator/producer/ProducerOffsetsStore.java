@@ -106,7 +106,7 @@ public class ProducerOffsetsStore {
      * @throws IOException if file operations fail
      * @throws Exception if ZK operations fail
      */
-    public boolean tryStoreSnapshot(
+    public boolean tryStoreOffsets(
             String producerId, Map<TableBucket, Long> offsets, long expirationTime)
             throws Exception {
 
@@ -124,7 +124,7 @@ public class ProducerOffsetsStore {
 
             // Atomically create ZK metadata
             ProducerOffsets producerOffsets = new ProducerOffsets(expirationTime, tableMetadatas);
-            boolean created = zkClient.tryRegisterProducerSnapshot(producerId, producerOffsets);
+            boolean created = zkClient.tryRegisterProducerOffsets(producerId, producerOffsets);
 
             if (!created) {
                 LOG.info(
@@ -153,13 +153,13 @@ public class ProducerOffsetsStore {
         }
     }
 
-    /** Gets the snapshot metadata for a producer. */
-    public Optional<ProducerOffsets> getSnapshotMetadata(String producerId) throws Exception {
-        return zkClient.getProducerSnapshot(producerId);
+    /** Gets the offset snapshot metadata for a producer. */
+    public Optional<ProducerOffsets> getOffsetsMetadata(String producerId) throws Exception {
+        return zkClient.getProducerOffsets(producerId);
     }
 
     /**
-     * Gets the snapshot metadata for a producer along with its ZK version.
+     * Gets the offset snapshot metadata for a producer along with its ZK version.
      *
      * <p>The version can be used for conditional deletes to handle concurrent modifications safely.
      *
@@ -167,9 +167,9 @@ public class ProducerOffsetsStore {
      * @return Optional containing a Tuple2 of (ProducerOffsets, version) if exists
      * @throws Exception if the operation fails
      */
-    public Optional<Tuple2<ProducerOffsets, Integer>> getSnapshotMetadataWithVersion(
+    public Optional<Tuple2<ProducerOffsets, Integer>> getOffsetsMetadataWithVersion(
             String producerId) throws Exception {
-        return zkClient.getProducerSnapshotWithVersion(producerId);
+        return zkClient.getProducerOffsetsWithVersion(producerId);
     }
 
     /**
@@ -179,7 +179,7 @@ public class ProducerOffsetsStore {
      * @throws Exception if ZK operations fail
      */
     public Map<TableBucket, Long> readOffsets(String producerId) throws Exception {
-        Optional<ProducerOffsets> optSnapshot = zkClient.getProducerSnapshot(producerId);
+        Optional<ProducerOffsets> optSnapshot = zkClient.getProducerOffsets(producerId);
         if (!optSnapshot.isPresent()) {
             return new HashMap<>();
         }
@@ -193,7 +193,7 @@ public class ProducerOffsetsStore {
 
     /** Deletes a producer snapshot (both ZK metadata and remote files). */
     public void deleteSnapshot(String producerId) throws Exception {
-        Optional<ProducerOffsets> optSnapshot = zkClient.getProducerSnapshot(producerId);
+        Optional<ProducerOffsets> optSnapshot = zkClient.getProducerOffsets(producerId);
         if (!optSnapshot.isPresent()) {
             LOG.debug("No snapshot found for producer {}", producerId);
             return;
@@ -205,7 +205,7 @@ public class ProducerOffsetsStore {
         }
 
         // Delete ZK metadata
-        zkClient.deleteProducerSnapshot(producerId);
+        zkClient.deleteProducerOffsets(producerId);
         LOG.info("Deleted snapshot for producer {}", producerId);
     }
 
@@ -350,6 +350,7 @@ public class ProducerOffsetsStore {
                 () -> {
                     FileSystem fs = path.getFileSystem();
                     if (!fs.exists(path)) {
+                        // intend to use FlussRuntimeException here to avoid retrying
                         throw new FlussRuntimeException("Offsets file not found: " + path);
                     }
                     try (FSDataInputStream in = fs.open(path);

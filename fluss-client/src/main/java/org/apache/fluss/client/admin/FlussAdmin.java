@@ -107,6 +107,7 @@ import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeCreatePart
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeDropPartitionRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeListOffsetsRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makePbPartitionSpec;
+import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeRegisterProducerOffsetsRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.toConfigEntries;
 import static org.apache.fluss.client.utils.MetadataUtils.sendMetadataRequestAndRebuildCluster;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindings;
@@ -601,8 +602,7 @@ public class FlussAdmin implements Admin {
         checkNotNull(offsets, "offsets must not be null");
 
         return gateway.registerProducerOffsets(
-                        ClientRpcMessageUtils.makeRegisterProducerOffsetsRequest(
-                                producerId, offsets))
+                        makeRegisterProducerOffsetsRequest(producerId, offsets))
                 .thenApply(
                         response -> {
                             int code =

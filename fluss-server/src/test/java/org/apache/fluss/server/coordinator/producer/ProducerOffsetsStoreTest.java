@@ -61,7 +61,7 @@ class ProducerOffsetsStoreTest {
     }
 
     @Test
-    void testTryStoreSnapshotSuccess() throws Exception {
+    void testTryStoreOffsetsSuccess() throws Exception {
         String producerId = "test-producer-store";
         Map<TableBucket, Long> offsets = new HashMap<>();
         offsets.put(new TableBucket(1L, 0), 100L);
@@ -71,18 +71,18 @@ class ProducerOffsetsStoreTest {
         long expirationTime = System.currentTimeMillis() + 3600000;
 
         // First store should succeed
-        boolean created = store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        boolean created = store.tryStoreOffsets(producerId, offsets, expirationTime);
         assertThat(created).isTrue();
 
         // Verify metadata was stored
-        Optional<ProducerOffsets> snapshot = store.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = store.getOffsetsMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getExpirationTime()).isEqualTo(expirationTime);
         assertThat(snapshot.get().getTableOffsets()).hasSize(2); // 2 tables
     }
 
     @Test
-    void testTryStoreSnapshotAlreadyExists() throws Exception {
+    void testTryStoreOffsetsAlreadyExists() throws Exception {
         String producerId = "test-producer-exists";
         Map<TableBucket, Long> offsets1 = new HashMap<>();
         offsets1.put(new TableBucket(1L, 0), 100L);
@@ -93,10 +93,10 @@ class ProducerOffsetsStoreTest {
         long expirationTime = System.currentTimeMillis() + 3600000;
 
         // First store should succeed
-        assertThat(store.tryStoreSnapshot(producerId, offsets1, expirationTime)).isTrue();
+        assertThat(store.tryStoreOffsets(producerId, offsets1, expirationTime)).isTrue();
 
         // Second store should return false (already exists)
-        assertThat(store.tryStoreSnapshot(producerId, offsets2, expirationTime)).isFalse();
+        assertThat(store.tryStoreOffsets(producerId, offsets2, expirationTime)).isFalse();
 
         // Original offsets should be preserved
         Map<TableBucket, Long> retrieved = store.readOffsets(producerId);
@@ -113,7 +113,7 @@ class ProducerOffsetsStoreTest {
         offsets.put(new TableBucket(3L, 100L, 0), 400L); // partitioned table
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
         // Read offsets back
         Map<TableBucket, Long> retrieved = store.readOffsets(producerId);
@@ -133,16 +133,16 @@ class ProducerOffsetsStoreTest {
         offsets.put(new TableBucket(1L, 0), 100L);
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
         // Verify it exists
-        assertThat(store.getSnapshotMetadata(producerId)).isPresent();
+        assertThat(store.getOffsetsMetadata(producerId)).isPresent();
 
         // Delete
         store.deleteSnapshot(producerId);
 
         // Verify it's gone
-        assertThat(store.getSnapshotMetadata(producerId)).isEmpty();
+        assertThat(store.getOffsetsMetadata(producerId)).isEmpty();
         assertThat(store.readOffsets(producerId)).isEmpty();
     }
 
@@ -162,9 +162,9 @@ class ProducerOffsetsStoreTest {
         offsets.put(new TableBucket(1L, 0), 100L);
         long expirationTime = System.currentTimeMillis() + 3600000;
 
-        store.tryStoreSnapshot(prefix + "producer-1", offsets, expirationTime);
-        store.tryStoreSnapshot(prefix + "producer-2", offsets, expirationTime);
-        store.tryStoreSnapshot(prefix + "producer-3", offsets, expirationTime);
+        store.tryStoreOffsets(prefix + "producer-1", offsets, expirationTime);
+        store.tryStoreOffsets(prefix + "producer-2", offsets, expirationTime);
+        store.tryStoreOffsets(prefix + "producer-3", offsets, expirationTime);
 
         List<String> producerIds = store.listProducerIds();
         assertThat(producerIds)
@@ -189,7 +189,7 @@ class ProducerOffsetsStoreTest {
         offsets.put(new TableBucket(2L, 20L, 0), 300L);
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
         Map<TableBucket, Long> retrieved = store.readOffsets(producerId);
         assertThat(retrieved).isEqualTo(offsets);
@@ -203,9 +203,9 @@ class ProducerOffsetsStoreTest {
 
         // Create snapshot that expires in the past
         long pastExpirationTime = System.currentTimeMillis() - 1000;
-        store.tryStoreSnapshot(producerId, offsets, pastExpirationTime);
+        store.tryStoreOffsets(producerId, offsets, pastExpirationTime);
 
-        Optional<ProducerOffsets> snapshot = store.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = store.getOffsetsMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().isExpired(System.currentTimeMillis())).isTrue();
     }
@@ -216,9 +216,9 @@ class ProducerOffsetsStoreTest {
         Map<TableBucket, Long> offsets = new HashMap<>();
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
-        Optional<ProducerOffsets> snapshot = store.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = store.getOffsetsMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getTableOffsets()).isEmpty();
 
@@ -231,17 +231,17 @@ class ProducerOffsetsStoreTest {
     // ------------------------------------------------------------------------
 
     @Test
-    void testGetSnapshotMetadataWithVersion() throws Exception {
+    void testGetOffsetsMetadataWithVersion() throws Exception {
         String producerId = "test-producer-version";
         Map<TableBucket, Long> offsets = new HashMap<>();
         offsets.put(new TableBucket(1L, 0), 100L);
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
         // Get with version
         Optional<Tuple2<ProducerOffsets, Integer>> result =
-                store.getSnapshotMetadataWithVersion(producerId);
+                store.getOffsetsMetadataWithVersion(producerId);
 
         assertThat(result).isPresent();
         assertThat(result.get().f0.getExpirationTime()).isEqualTo(expirationTime);
@@ -249,9 +249,9 @@ class ProducerOffsetsStoreTest {
     }
 
     @Test
-    void testGetSnapshotMetadataWithVersionNonExistent() throws Exception {
+    void testGetOffsetsMetadataWithVersionNonExistent() throws Exception {
         Optional<Tuple2<ProducerOffsets, Integer>> result =
-                store.getSnapshotMetadataWithVersion("non-existent-producer");
+                store.getOffsetsMetadataWithVersion("non-existent-producer");
 
         assertThat(result).isEmpty();
     }
@@ -263,11 +263,11 @@ class ProducerOffsetsStoreTest {
         offsets.put(new TableBucket(1L, 0), 100L);
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
         // Get current version
         Optional<Tuple2<ProducerOffsets, Integer>> result =
-                store.getSnapshotMetadataWithVersion(producerId);
+                store.getOffsetsMetadataWithVersion(producerId);
         assertThat(result).isPresent();
         int version = result.get().f1;
         ProducerOffsets snapshot = result.get().f0;
@@ -277,7 +277,7 @@ class ProducerOffsetsStoreTest {
         assertThat(deleted).isTrue();
 
         // Verify deleted
-        assertThat(store.getSnapshotMetadata(producerId)).isEmpty();
+        assertThat(store.getOffsetsMetadata(producerId)).isEmpty();
     }
 
     @Test
@@ -287,11 +287,11 @@ class ProducerOffsetsStoreTest {
         offsets.put(new TableBucket(1L, 0), 100L);
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
         // Get current version
         Optional<Tuple2<ProducerOffsets, Integer>> result =
-                store.getSnapshotMetadataWithVersion(producerId);
+                store.getOffsetsMetadataWithVersion(producerId);
         assertThat(result).isPresent();
         ProducerOffsets snapshot = result.get().f0;
 
@@ -301,7 +301,7 @@ class ProducerOffsetsStoreTest {
         assertThat(deleted).isFalse();
 
         // Snapshot should still exist
-        assertThat(store.getSnapshotMetadata(producerId)).isPresent();
+        assertThat(store.getOffsetsMetadata(producerId)).isPresent();
     }
 
     @Test
@@ -311,11 +311,11 @@ class ProducerOffsetsStoreTest {
         offsets.put(new TableBucket(1L, 0), 100L);
 
         long expirationTime = System.currentTimeMillis() + 3600000;
-        store.tryStoreSnapshot(producerId, offsets, expirationTime);
+        store.tryStoreOffsets(producerId, offsets, expirationTime);
 
         // Get snapshot info
         Optional<Tuple2<ProducerOffsets, Integer>> result =
-                store.getSnapshotMetadataWithVersion(producerId);
+                store.getOffsetsMetadataWithVersion(producerId);
         assertThat(result).isPresent();
         ProducerOffsets snapshot = result.get().f0;
 
