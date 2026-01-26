@@ -98,7 +98,7 @@ import org.apache.fluss.rpc.messages.PbAlterConfig;
 import org.apache.fluss.rpc.messages.PbHeartbeatReqForTable;
 import org.apache.fluss.rpc.messages.PbHeartbeatRespForTable;
 import org.apache.fluss.rpc.messages.PbPrepareLakeTableRespForTable;
-import org.apache.fluss.rpc.messages.PbTableBucketOffset;
+import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
 import org.apache.fluss.rpc.messages.PbTableOffsets;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotResponse;
@@ -143,6 +143,7 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metadata.CoordinatorMetadataProvider;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
@@ -167,6 +168,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Supplier;
@@ -1016,28 +1018,21 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<RegisterProducerOffsetsResponse> registerProducerOffsets(
             RegisterProducerOffsetsRequest request) {
-        // Authorization: require WRITE permission on cluster
+        // Authorization: require WRITE permission on all tables in the request
         if (authorizer != null) {
-            authorizer.authorize(currentSession(), OperationType.WRITE, Resource.cluster());
+            for (PbProducerTableOffsets tableOffsets : request.getTableOffsetsList()) {
+                long tableId = tableOffsets.getTableId();
+                authorizeTable(OperationType.WRITE, tableId);
+            }
         }
 
         return CompletableFuture.supplyAsync(
                 () -> {
                     try {
                         String producerId = request.getProducerId();
-                        Map<TableBucket, Long> offsets = new HashMap<>();
-
-                        // Convert PbTableBucketOffset to TableBucket offsets
-                        for (PbTableBucketOffset pbOffset : request.getBucketOffsetsList()) {
-                            Long partitionId =
-                                    pbOffset.hasPartitionId() ? pbOffset.getPartitionId() : null;
-                            TableBucket bucket =
-                                    new TableBucket(
-                                            pbOffset.getTableId(),
-                                            partitionId,
-                                            pbOffset.getBucketId());
-                            offsets.put(bucket, pbOffset.getOffset());
-                        }
+                        Map<TableBucket, Long> offsets =
+                                ServerRpcMessageUtils.toTableBucketOffsets(
+                                        request.getTableOffsetsList());
 
                         // Use custom TTL if provided, otherwise use default (null means use
                         // manager's default)
@@ -1068,11 +1063,6 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<GetProducerOffsetsResponse> getProducerOffsets(
             GetProducerOffsetsRequest request) {
-        // Authorization: require READ permission on cluster
-        if (authorizer != null) {
-            authorizer.authorize(currentSession(), OperationType.READ, Resource.cluster());
-        }
-
         String producerId = request.getProducerId();
 
         return CompletableFuture.supplyAsync(
@@ -1089,6 +1079,21 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                 producerSnapshotManager.getOffsets(producerId);
                         Map<Long, Map<TableBucket, Long>> offsetsByTable =
                                 groupOffsetsByTableId(allOffsets);
+
+                        // Authorization: filter tables by READ permission
+                        if (authorizer != null) {
+                            offsetsByTable
+                                    .keySet()
+                                    .removeIf(
+                                            tableId -> {
+                                                try {
+                                                    authorizeTable(OperationType.READ, tableId);
+                                                    return false; // keep this table
+                                                } catch (Exception e) {
+                                                    return true; // remove this table
+                                                }
+                                            });
+                        }
 
                         GetProducerOffsetsResponse response = new GetProducerOffsetsResponse();
                         response.setProducerId(producerId);
@@ -1111,15 +1116,26 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<DeleteProducerOffsetsResponse> deleteProducerOffsets(
             DeleteProducerOffsetsRequest request) {
-        // Authorization: require WRITE permission on cluster
-        if (authorizer != null) {
-            authorizer.authorize(currentSession(), OperationType.WRITE, Resource.cluster());
-        }
-
         return CompletableFuture.supplyAsync(
                 () -> {
                     try {
                         String producerId = request.getProducerId();
+
+                        // Authorization: require WRITE permission on all tables in the snapshot
+                        if (authorizer != null) {
+                            Map<TableBucket, Long> offsets =
+                                    producerSnapshotManager.getOffsets(producerId);
+                            // Extract unique table IDs from the snapshot
+                            Set<Long> tableIds =
+                                    offsets.keySet().stream()
+                                            .map(TableBucket::getTableId)
+                                            .collect(Collectors.toSet());
+                            // Check WRITE permission for each table
+                            for (Long tableId : tableIds) {
+                                authorizeTable(OperationType.WRITE, tableId);
+                            }
+                        }
+
                         producerSnapshotManager.deleteSnapshot(producerId);
                         return new DeleteProducerOffsetsResponse();
                     } catch (Exception e) {

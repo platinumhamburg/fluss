@@ -18,7 +18,6 @@
 package org.apache.fluss.client.admin;
 
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.rpc.messages.RegisterResult;
 
 import org.junit.jupiter.api.Test;
 

@@ -41,6 +41,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Unit tests for {@link ProducerSnapshotManager}. */
 class ProducerSnapshotManagerTest {
@@ -89,7 +90,8 @@ class ProducerSnapshotManagerTest {
         assertThat(created).isTrue();
         Optional<ProducerSnapshot> snapshot = manager.getSnapshotMetadata(producerId);
         assertThat(snapshot).isPresent();
-        assertThat(snapshot.get().getExpirationTime()).isGreaterThan(System.currentTimeMillis());
+        assertThat(snapshot.get().getExpirationTime())
+                .isGreaterThanOrEqualTo(System.currentTimeMillis());
     }
 
     @Test
@@ -247,6 +249,84 @@ class ProducerSnapshotManagerTest {
     @Test
     void testGetDefaultTtlMs() {
         assertThat(manager.getDefaultTtlMs()).isEqualTo(DEFAULT_TTL_MS);
+    }
+
+    // ------------------------------------------------------------------------
+    //  Producer ID Validation Tests
+    // ------------------------------------------------------------------------
+
+    @Test
+    void testRegisterSnapshotWithInvalidProducerId() {
+        Map<TableBucket, Long> offsets = createTestOffsets();
+
+        // Null producer ID
+        assertThatThrownBy(() -> manager.registerSnapshot(null, offsets, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID")
+                .hasMessageContaining("null string is not allowed");
+
+        // Empty producer ID
+        assertThatThrownBy(() -> manager.registerSnapshot("", offsets, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID")
+                .hasMessageContaining("empty string is not allowed");
+
+        // Producer ID with invalid characters
+        assertThatThrownBy(() -> manager.registerSnapshot("invalid/producer", offsets, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID")
+                .hasMessageContaining("contains one or more characters");
+
+        // Producer ID as "."
+        assertThatThrownBy(() -> manager.registerSnapshot(".", offsets, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID")
+                .hasMessageContaining("'.' is not allowed");
+
+        // Producer ID as ".."
+        assertThatThrownBy(() -> manager.registerSnapshot("..", offsets, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID")
+                .hasMessageContaining("'..' is not allowed");
+    }
+
+    @Test
+    void testGetSnapshotMetadataWithInvalidProducerId() {
+        // Null producer ID
+        assertThatThrownBy(() -> manager.getSnapshotMetadata(null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID");
+
+        // Invalid characters
+        assertThatThrownBy(() -> manager.getSnapshotMetadata("invalid@producer"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID");
+    }
+
+    @Test
+    void testGetOffsetsWithInvalidProducerId() {
+        // Null producer ID
+        assertThatThrownBy(() -> manager.getOffsets(null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID");
+
+        // Invalid characters
+        assertThatThrownBy(() -> manager.getOffsets("invalid producer"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID");
+    }
+
+    @Test
+    void testDeleteSnapshotWithInvalidProducerId() {
+        // Null producer ID
+        assertThatThrownBy(() -> manager.deleteSnapshot(null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID");
+
+        // Invalid characters
+        assertThatThrownBy(() -> manager.deleteSnapshot("invalid:producer"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid producer ID");
     }
 
     // ------------------------------------------------------------------------

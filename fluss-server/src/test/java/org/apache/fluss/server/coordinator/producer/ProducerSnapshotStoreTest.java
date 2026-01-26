@@ -100,7 +100,7 @@ class ProducerSnapshotStoreTest {
 
         // Original offsets should be preserved
         Map<TableBucket, Long> retrieved = store.readOffsets(producerId);
-        assertThat(retrieved.get(new TableBucket(1L, 0))).isEqualTo(100L);
+        assertThat(retrieved).isEqualTo(offsets1);
     }
 
     @Test
@@ -117,11 +117,7 @@ class ProducerSnapshotStoreTest {
 
         // Read offsets back
         Map<TableBucket, Long> retrieved = store.readOffsets(producerId);
-        assertThat(retrieved).hasSize(4);
-        assertThat(retrieved.get(new TableBucket(1L, 0))).isEqualTo(100L);
-        assertThat(retrieved.get(new TableBucket(1L, 1))).isEqualTo(200L);
-        assertThat(retrieved.get(new TableBucket(2L, 0))).isEqualTo(300L);
-        assertThat(retrieved.get(new TableBucket(3L, 100L, 0))).isEqualTo(400L);
+        assertThat(retrieved).isEqualTo(offsets);
     }
 
     @Test
@@ -196,11 +192,7 @@ class ProducerSnapshotStoreTest {
         store.tryStoreSnapshot(producerId, offsets, expirationTime);
 
         Map<TableBucket, Long> retrieved = store.readOffsets(producerId);
-        assertThat(retrieved).hasSize(4);
-        assertThat(retrieved.get(new TableBucket(1L, 0))).isEqualTo(100L);
-        assertThat(retrieved.get(new TableBucket(2L, 10L, 0))).isEqualTo(200L);
-        assertThat(retrieved.get(new TableBucket(2L, 10L, 1))).isEqualTo(201L);
-        assertThat(retrieved.get(new TableBucket(2L, 20L, 0))).isEqualTo(300L);
+        assertThat(retrieved).isEqualTo(offsets);
     }
 
     @Test

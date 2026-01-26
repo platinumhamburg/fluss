@@ -25,6 +25,7 @@ import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
@@ -76,8 +77,8 @@ public class ProducerSnapshotManager implements AutoCloseable {
     public ProducerSnapshotManager(Configuration conf, ZooKeeperClient zkClient) {
         this(
                 new ProducerSnapshotStore(zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR)),
-                conf.get(ConfigOptions.COORDINATOR_PRODUCER_SNAPSHOT_TTL).toMillis(),
-                conf.get(ConfigOptions.COORDINATOR_PRODUCER_SNAPSHOT_CLEANUP_INTERVAL).toMillis());
+                conf.get(ConfigOptions.COORDINATOR_PRODUCER_OFFSETS_TTL).toMillis(),
+                conf.get(ConfigOptions.COORDINATOR_PRODUCER_OFFSETS_CLEANUP_INTERVAL).toMillis());
     }
 
     @VisibleForTesting
@@ -123,10 +124,15 @@ public class ProducerSnapshotManager implements AutoCloseable {
      * @param ttlMs TTL in milliseconds for the snapshot, or null to use default
      * @return true if a new snapshot was created (CREATED), false if snapshot already existed
      *     (ALREADY_EXISTS)
+     * @throws IllegalArgumentException if producerId is invalid (null, empty, contains invalid
+     *     characters, etc.)
      * @throws Exception if the operation fails
      */
     public boolean registerSnapshot(String producerId, Map<TableBucket, Long> offsets, Long ttlMs)
             throws Exception {
+        // Validate producerId as it will be used as both file name and ZK node name
+        validateProducerId(producerId);
+
         long effectiveTtlMs = ttlMs != null ? ttlMs : defaultTtlMs;
 
         // Use loop instead of recursion to avoid stack overflow risk
@@ -302,9 +308,11 @@ public class ProducerSnapshotManager implements AutoCloseable {
      *
      * @param producerId the producer ID
      * @return Optional containing the snapshot if exists
+     * @throws IllegalArgumentException if producerId is invalid
      * @throws Exception if the operation fails
      */
     public Optional<ProducerSnapshot> getSnapshotMetadata(String producerId) throws Exception {
+        validateProducerId(producerId);
         return snapshotStore.getSnapshotMetadata(producerId);
     }
 
@@ -313,9 +321,11 @@ public class ProducerSnapshotManager implements AutoCloseable {
      *
      * @param producerId the producer ID
      * @return map of TableBucket to offset, or empty map if no snapshot exists
+     * @throws IllegalArgumentException if producerId is invalid
      * @throws Exception if the operation fails
      */
     public Map<TableBucket, Long> getOffsets(String producerId) throws Exception {
+        validateProducerId(producerId);
         return snapshotStore.readOffsets(producerId);
     }
 
@@ -323,9 +333,11 @@ public class ProducerSnapshotManager implements AutoCloseable {
      * Deletes a producer snapshot.
      *
      * @param producerId the producer ID
+     * @throws IllegalArgumentException if producerId is invalid
      * @throws Exception if the operation fails
      */
     public void deleteSnapshot(String producerId) throws Exception {
+        validateProducerId(producerId);
         snapshotStore.deleteSnapshot(producerId);
     }
 
@@ -336,6 +348,24 @@ public class ProducerSnapshotManager implements AutoCloseable {
      */
     public long getDefaultTtlMs() {
         return defaultTtlMs;
+    }
+
+    // ------------------------------------------------------------------------
+    //  Validation
+    // ------------------------------------------------------------------------
+
+    /**
+     * Validates that a producer ID is valid for use as both a file name and ZK node name.
+     *
+     * @param producerId the producer ID to validate
+     * @throws IllegalArgumentException if producerId is invalid
+     */
+    private void validateProducerId(String producerId) {
+        String invalidReason = TablePath.detectInvalidName(producerId);
+        if (invalidReason != null) {
+            throw new IllegalArgumentException(
+                    "Invalid producer ID '" + producerId + "': " + invalidReason);
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -374,12 +404,30 @@ public class ProducerSnapshotManager implements AutoCloseable {
 
         for (String producerId : producerIds) {
             try {
-                Optional<ProducerSnapshot> optSnapshot =
-                        snapshotStore.getSnapshotMetadata(producerId);
-                if (isExpiredSnapshot(optSnapshot, currentTime)) {
-                    snapshotStore.deleteSnapshot(producerId);
-                    cleanedCount++;
-                    LOG.debug("Cleaned up expired snapshot for producer {}", producerId);
+                Optional<Tuple2<ProducerSnapshot, Integer>> snapshotWithVersion =
+                        snapshotStore.getSnapshotMetadataWithVersion(producerId);
+                if (!snapshotWithVersion.isPresent()) {
+                    continue;
+                }
+
+                ProducerSnapshot snapshot = snapshotWithVersion.get().f0;
+                int version = snapshotWithVersion.get().f1;
+
+                if (snapshot.isExpired(currentTime)) {
+                    // Use version-based delete to avoid deleting snapshots updated just now
+                    boolean deleted =
+                            snapshotStore.deleteSnapshotIfVersion(producerId, snapshot, version);
+                    if (deleted) {
+                        cleanedCount++;
+                        LOG.debug(
+                                "Cleaned up expired snapshot for producer {} (version {})",
+                                producerId,
+                                version);
+                    } else {
+                        LOG.debug(
+                                "Skip cleanup for producer {} due to version mismatch (snapshot was updated)",
+                                producerId);
+                    }
                 }
             } catch (Exception e) {
                 LOG.warn("Failed to cleanup snapshot for producer {}", producerId, e);
@@ -387,17 +435,6 @@ public class ProducerSnapshotManager implements AutoCloseable {
         }
 
         return cleanedCount;
-    }
-
-    /**
-     * Checks if a snapshot is present and expired.
-     *
-     * @param snapshot the optional snapshot
-     * @param currentTimeMs the current time for expiration check
-     * @return true if snapshot exists and is expired
-     */
-    private boolean isExpiredSnapshot(Optional<ProducerSnapshot> snapshot, long currentTimeMs) {
-        return snapshot.isPresent() && snapshot.get().isExpired(currentTimeMs);
     }
 
     /**

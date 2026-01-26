@@ -355,28 +355,25 @@ public class ConfigOptions {
                                     + "This option is deprecated. Please use server.io-pool.size instead.");
 
     /**
-     * The TTL (time-to-live) for producer offset snapshots. Snapshots older than this TTL will be
+     * The TTL (time-to-live) for producer offsets. Producer offsets older than this TTL will be
      * automatically cleaned up by the coordinator server.
      */
-    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_SNAPSHOT_TTL =
-            key("coordinator.producer-snapshot.ttl")
+    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_OFFSETS_TTL =
+            key("coordinator.producer-offsets.ttl")
                     .durationType()
                     .defaultValue(Duration.ofHours(24))
                     .withDescription(
-                            "The TTL (time-to-live) for producer offset snapshots. "
-                                    + "Snapshots older than this TTL will be automatically cleaned up "
+                            "The TTL (time-to-live) for producer offsets. "
+                                    + "Producer offsets older than this TTL will be automatically cleaned up "
                                     + "by the coordinator server. Default is 24 hours.");
 
-    /**
-     * The interval for cleaning up expired producer offset snapshots and orphan files in remote
-     * storage.
-     */
-    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_SNAPSHOT_CLEANUP_INTERVAL =
-            key("coordinator.producer-snapshot.cleanup-interval")
+    /** The interval for cleaning up expired producer offsets and orphan files in remote storage. */
+    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_OFFSETS_CLEANUP_INTERVAL =
+            key("coordinator.producer-offsets.cleanup-interval")
                     .durationType()
                     .defaultValue(Duration.ofHours(1))
                     .withDescription(
-                            "The interval for cleaning up expired producer offset snapshots "
+                            "The interval for cleaning up expired producer offsets "
                                     + "and orphan files in remote storage. Default is 1 hour.");
 
     // ------------------------------------------------------------------------

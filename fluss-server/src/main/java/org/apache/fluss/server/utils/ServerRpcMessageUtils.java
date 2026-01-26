@@ -1949,4 +1949,26 @@ public class ServerRpcMessageUtils {
         result.addAll(errors);
         return result;
     }
+
+    /**
+     * Converts a list of PbProducerTableOffsets to a map of TableBucket to offset.
+     *
+     * @param tableOffsetsList the list of PbProducerTableOffsets
+     * @return map of TableBucket to offset
+     */
+    public static Map<TableBucket, Long> toTableBucketOffsets(
+            List<PbProducerTableOffsets> tableOffsetsList) {
+        Map<TableBucket, Long> offsets = new HashMap<>();
+        for (PbProducerTableOffsets pbTableOffsets : tableOffsetsList) {
+            long tableId = pbTableOffsets.getTableId();
+            for (PbBucketOffset pbBucketOffset : pbTableOffsets.getBucketOffsetsList()) {
+                Long partitionId =
+                        pbBucketOffset.hasPartitionId() ? pbBucketOffset.getPartitionId() : null;
+                TableBucket bucket =
+                        new TableBucket(tableId, partitionId, pbBucketOffset.getBucketId());
+                offsets.put(bucket, pbBucketOffset.getLogEndOffset());
+            }
+        }
+        return offsets;
+    }
 }

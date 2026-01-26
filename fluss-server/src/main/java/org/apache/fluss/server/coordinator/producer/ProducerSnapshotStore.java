@@ -26,6 +26,7 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.RetryUtils;
 import org.apache.fluss.utils.json.TableBucketOffsets;
@@ -35,6 +36,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -101,7 +103,8 @@ public class ProducerSnapshotStore {
      * @param offsets map of TableBucket to offset
      * @param expirationTime the expiration timestamp in milliseconds
      * @return true if created, false if already existed
-     * @throws Exception if the operation fails
+     * @throws IOException if file operations fail
+     * @throws Exception if ZK operations fail
      */
     public boolean tryStoreSnapshot(
             String producerId, Map<TableBucket, Long> offsets, long expirationTime)
@@ -169,7 +172,12 @@ public class ProducerSnapshotStore {
         return zkClient.getProducerSnapshotWithVersion(producerId);
     }
 
-    /** Reads all offsets for a producer from remote storage. */
+    /**
+     * Reads all offsets for a producer from remote storage.
+     *
+     * @throws IOException if file reading fails
+     * @throws Exception if ZK operations fail
+     */
     public Map<TableBucket, Long> readOffsets(String producerId) throws Exception {
         Optional<ProducerSnapshot> optSnapshot = zkClient.getProducerSnapshot(producerId);
         if (!optSnapshot.isPresent()) {
@@ -247,7 +255,7 @@ public class ProducerSnapshotStore {
 
     /** Gets the base directory for producer snapshots in remote storage. */
     public FsPath getProducersDirectory() {
-        return new FsPath(remoteDataDir + "/producers");
+        return FlussPaths.remoteProducersDir(remoteDataDir);
     }
 
     /**
@@ -307,13 +315,9 @@ public class ProducerSnapshotStore {
     private FsPath writeOffsetsFile(String producerId, long tableId, Map<TableBucket, Long> offsets)
             throws IOException {
 
-        String fileName = UUID.randomUUID() + ".offsets";
         FsPath path =
-                new FsPath(
-                        new FsPath(
-                                new FsPath(new FsPath(remoteDataDir, "producers"), producerId),
-                                String.valueOf(tableId)),
-                        fileName);
+                FlussPaths.remoteProducerOffsetsPath(
+                        remoteDataDir, producerId, tableId, UUID.randomUUID());
 
         byte[] data = new TableBucketOffsets(tableId, offsets).toJsonBytes();
 
@@ -345,7 +349,8 @@ public class ProducerSnapshotStore {
                 () -> {
                     FileSystem fs = path.getFileSystem();
                     if (!fs.exists(path)) {
-                        throw new IOException("Offsets file not found: " + path);
+                        // FileNotFoundException will not be retried by executeIOWithRetry
+                        throw new FileNotFoundException("Offsets file not found: " + path);
                     }
                     try (FSDataInputStream in = fs.open(path);
                             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
