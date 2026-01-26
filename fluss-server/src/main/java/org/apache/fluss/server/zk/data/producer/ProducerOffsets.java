@@ -37,9 +37,9 @@ import java.util.Objects;
  * <p>The actual offset data is stored in remote storage (e.g., OSS/S3) and referenced by the file
  * paths in {@link TableOffsetMetadata}.
  *
- * @see ProducerSnapshotJsonSerde for JSON serialization and deserialization
+ * @see ProducerOffsetsJsonSerde for JSON serialization and deserialization
  */
-public class ProducerSnapshot {
+public class ProducerOffsets {
 
     /** The expiration time in milliseconds since epoch for TTL management. */
     private final long expirationTime;
@@ -48,12 +48,12 @@ public class ProducerSnapshot {
     private final List<TableOffsetMetadata> tableOffsets;
 
     /**
-     * Creates a new ProducerSnapshot.
+     * Creates a new ProducerOffsets.
      *
      * @param expirationTime the expiration time in milliseconds since epoch
      * @param tableOffsets list of table offset metadata
      */
-    public ProducerSnapshot(long expirationTime, List<TableOffsetMetadata> tableOffsets) {
+    public ProducerOffsets(long expirationTime, List<TableOffsetMetadata> tableOffsets) {
         this.expirationTime = expirationTime;
         this.tableOffsets = tableOffsets;
     }
@@ -91,10 +91,10 @@ public class ProducerSnapshot {
         if (this == o) {
             return true;
         }
-        if (!(o instanceof ProducerSnapshot)) {
+        if (!(o instanceof ProducerOffsets)) {
             return false;
         }
-        ProducerSnapshot that = (ProducerSnapshot) o;
+        ProducerOffsets that = (ProducerOffsets) o;
         return expirationTime == that.expirationTime
                 && Objects.equals(tableOffsets, that.tableOffsets);
     }
@@ -106,7 +106,7 @@ public class ProducerSnapshot {
 
     @Override
     public String toString() {
-        return "ProducerSnapshot{"
+        return "ProducerOffsets{"
                 + "expirationTime="
                 + expirationTime
                 + ", tableOffsets="

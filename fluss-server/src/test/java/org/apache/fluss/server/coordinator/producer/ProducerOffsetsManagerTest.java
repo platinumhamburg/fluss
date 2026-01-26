@@ -22,7 +22,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -43,8 +43,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Unit tests for {@link ProducerSnapshotManager}. */
-class ProducerSnapshotManagerTest {
+/** Unit tests for {@link ProducerOffsetsManager}. */
+class ProducerOffsetsManagerTest {
 
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
@@ -55,8 +55,8 @@ class ProducerSnapshotManagerTest {
 
     @TempDir Path tempDir;
 
-    private ProducerSnapshotManager manager;
-    private ProducerSnapshotStore store;
+    private ProducerOffsetsManager manager;
+    private ProducerOffsetsStore store;
     private ZooKeeperClient zkClient;
 
     private static final long DEFAULT_TTL_MS = 3600000; // 1 hour
@@ -65,8 +65,8 @@ class ProducerSnapshotManagerTest {
     @BeforeEach
     void setUp() {
         zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        store = new ProducerSnapshotStore(zkClient, tempDir.toString());
-        manager = new ProducerSnapshotManager(store, DEFAULT_TTL_MS, CLEANUP_INTERVAL_MS);
+        store = new ProducerOffsetsStore(zkClient, tempDir.toString());
+        manager = new ProducerOffsetsManager(store, DEFAULT_TTL_MS, CLEANUP_INTERVAL_MS);
     }
 
     @AfterEach
@@ -88,7 +88,7 @@ class ProducerSnapshotManagerTest {
         boolean created = manager.registerSnapshot(producerId, offsets, null);
 
         assertThat(created).isTrue();
-        Optional<ProducerSnapshot> snapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getExpirationTime())
                 .isGreaterThanOrEqualTo(System.currentTimeMillis());
@@ -123,7 +123,7 @@ class ProducerSnapshotManagerTest {
         manager.registerSnapshot(producerId, offsets, customTtlMs);
         long afterRegister = System.currentTimeMillis();
 
-        Optional<ProducerSnapshot> snapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata(producerId);
         assertThat(snapshot).isPresent();
         long expirationTime = snapshot.get().getExpirationTime();
         assertThat(expirationTime).isGreaterThanOrEqualTo(beforeRegister + customTtlMs);
@@ -148,7 +148,7 @@ class ProducerSnapshotManagerTest {
         store.tryStoreSnapshot(producerId, offsets1, System.currentTimeMillis() + expiredTtlMs);
 
         // Verify it's expired
-        Optional<ProducerSnapshot> expiredSnapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> expiredSnapshot = manager.getSnapshotMetadata(producerId);
         assertThat(expiredSnapshot).isPresent();
         assertThat(expiredSnapshot.get().isExpired(System.currentTimeMillis())).isTrue();
 
@@ -173,14 +173,14 @@ class ProducerSnapshotManagerTest {
 
         manager.registerSnapshot(producerId, offsets, null);
 
-        Optional<ProducerSnapshot> snapshot = manager.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getTableOffsets()).isNotEmpty();
     }
 
     @Test
     void testGetSnapshotMetadataNonExistent() throws Exception {
-        Optional<ProducerSnapshot> snapshot = manager.getSnapshotMetadata("non-existent-producer");
+        Optional<ProducerOffsets> snapshot = manager.getSnapshotMetadata("non-existent-producer");
         assertThat(snapshot).isEmpty();
     }
 

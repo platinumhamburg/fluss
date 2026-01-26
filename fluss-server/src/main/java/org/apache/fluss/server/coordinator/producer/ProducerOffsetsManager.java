@@ -27,7 +27,7 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -60,31 +60,31 @@ import java.util.concurrent.TimeUnit;
  * <p>The manager uses a background scheduler to periodically clean up expired snapshots and orphan
  * files. The cleanup interval and snapshot TTL are configurable.
  *
- * @see ProducerSnapshotStore for low-level storage operations
+ * @see ProducerOffsetsStore for low-level storage operations
  */
-public class ProducerSnapshotManager implements AutoCloseable {
+public class ProducerOffsetsManager implements AutoCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(ProducerSnapshotManager.class);
+    private static final Logger LOG = LoggerFactory.getLogger(ProducerOffsetsManager.class);
 
     /** Maximum number of attempts for snapshot registration to avoid infinite loops. */
     private static final int MAX_REGISTER_ATTEMPTS = 3;
 
-    private final ProducerSnapshotStore snapshotStore;
+    private final ProducerOffsetsStore offsetsStore;
     private final long defaultTtlMs;
     private final long cleanupIntervalMs;
     private final ScheduledExecutorService cleanupScheduler;
 
-    public ProducerSnapshotManager(Configuration conf, ZooKeeperClient zkClient) {
+    public ProducerOffsetsManager(Configuration conf, ZooKeeperClient zkClient) {
         this(
-                new ProducerSnapshotStore(zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR)),
+                new ProducerOffsetsStore(zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR)),
                 conf.get(ConfigOptions.COORDINATOR_PRODUCER_OFFSETS_TTL).toMillis(),
                 conf.get(ConfigOptions.COORDINATOR_PRODUCER_OFFSETS_CLEANUP_INTERVAL).toMillis());
     }
 
     @VisibleForTesting
-    ProducerSnapshotManager(
-            ProducerSnapshotStore snapshotStore, long defaultTtlMs, long cleanupIntervalMs) {
-        this.snapshotStore = snapshotStore;
+    ProducerOffsetsManager(
+            ProducerOffsetsStore offsetsStore, long defaultTtlMs, long cleanupIntervalMs) {
+        this.offsetsStore = offsetsStore;
         this.defaultTtlMs = defaultTtlMs;
         this.cleanupIntervalMs = cleanupIntervalMs;
         this.cleanupScheduler =
@@ -141,7 +141,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
             long expirationTime = currentTimeMs + effectiveTtlMs;
 
             // Step 1: Try to atomically create the snapshot (common case)
-            if (snapshotStore.tryStoreSnapshot(producerId, offsets, expirationTime)) {
+            if (offsetsStore.tryStoreSnapshot(producerId, offsets, expirationTime)) {
                 return true;
             }
 
@@ -186,17 +186,17 @@ public class ProducerSnapshotManager implements AutoCloseable {
             long currentTimeMs)
             throws Exception {
 
-        Optional<Tuple2<ProducerSnapshot, Integer>> existingWithVersion =
-                snapshotStore.getSnapshotMetadataWithVersion(producerId);
+        Optional<Tuple2<ProducerOffsets, Integer>> existingWithVersion =
+                offsetsStore.getSnapshotMetadataWithVersion(producerId);
 
         // Case 1: Snapshot was deleted between our create attempt and this check
         if (!existingWithVersion.isPresent()) {
-            return snapshotStore.tryStoreSnapshot(producerId, offsets, expirationTime)
+            return offsetsStore.tryStoreSnapshot(producerId, offsets, expirationTime)
                     ? RegisterAttemptResult.CREATED
                     : RegisterAttemptResult.RETRY;
         }
 
-        ProducerSnapshot existingSnapshot = existingWithVersion.get().f0;
+        ProducerOffsets existingSnapshot = existingWithVersion.get().f0;
         int version = existingWithVersion.get().f1;
 
         // Case 2: Valid (non-expired) snapshot exists
@@ -223,7 +223,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
             String producerId,
             Map<TableBucket, Long> offsets,
             long expirationTime,
-            ProducerSnapshot expiredSnapshot,
+            ProducerOffsets expiredSnapshot,
             int version,
             long currentTimeMs)
             throws Exception {
@@ -235,7 +235,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
 
         // Try version-based conditional delete
         boolean deleted =
-                snapshotStore.deleteSnapshotIfVersion(producerId, expiredSnapshot, version);
+                offsetsStore.deleteSnapshotIfVersion(producerId, expiredSnapshot, version);
 
         if (!deleted) {
             // Version mismatch - another process modified the snapshot
@@ -246,7 +246,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
         }
 
         // Successfully deleted, try to create new snapshot
-        if (snapshotStore.tryStoreSnapshot(producerId, offsets, expirationTime)) {
+        if (offsetsStore.tryStoreSnapshot(producerId, offsets, expirationTime)) {
             return RegisterAttemptResult.CREATED;
         }
 
@@ -269,9 +269,9 @@ public class ProducerSnapshotManager implements AutoCloseable {
      */
     private RegisterAttemptResult checkCurrentSnapshotState(String producerId, long currentTimeMs)
             throws Exception {
-        Optional<ProducerSnapshot> snapshot = snapshotStore.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> producerOffsets = offsetsStore.getSnapshotMetadata(producerId);
 
-        if (isValidSnapshot(snapshot, currentTimeMs)) {
+        if (isValidSnapshot(producerOffsets, currentTimeMs)) {
             LOG.info(
                     "Valid snapshot exists for producer {} after concurrent modification",
                     producerId);
@@ -285,12 +285,12 @@ public class ProducerSnapshotManager implements AutoCloseable {
     /**
      * Checks if a snapshot is present and not expired.
      *
-     * @param snapshot the optional snapshot
+     * @param producerOffsets the optional snapshot
      * @param currentTimeMs the current time for expiration check
      * @return true if snapshot exists and is not expired
      */
-    private boolean isValidSnapshot(Optional<ProducerSnapshot> snapshot, long currentTimeMs) {
-        return snapshot.isPresent() && !snapshot.get().isExpired(currentTimeMs);
+    private boolean isValidSnapshot(Optional<ProducerOffsets> producerOffsets, long currentTimeMs) {
+        return producerOffsets.isPresent() && !producerOffsets.get().isExpired(currentTimeMs);
     }
 
     /** Result of a single registration attempt. */
@@ -311,9 +311,9 @@ public class ProducerSnapshotManager implements AutoCloseable {
      * @throws IllegalArgumentException if producerId is invalid
      * @throws Exception if the operation fails
      */
-    public Optional<ProducerSnapshot> getSnapshotMetadata(String producerId) throws Exception {
+    public Optional<ProducerOffsets> getSnapshotMetadata(String producerId) throws Exception {
         validateProducerId(producerId);
-        return snapshotStore.getSnapshotMetadata(producerId);
+        return offsetsStore.getSnapshotMetadata(producerId);
     }
 
     /**
@@ -326,7 +326,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
      */
     public Map<TableBucket, Long> getOffsets(String producerId) throws Exception {
         validateProducerId(producerId);
-        return snapshotStore.readOffsets(producerId);
+        return offsetsStore.readOffsets(producerId);
     }
 
     /**
@@ -338,7 +338,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
      */
     public void deleteSnapshot(String producerId) throws Exception {
         validateProducerId(producerId);
-        snapshotStore.deleteSnapshot(producerId);
+        offsetsStore.deleteSnapshot(producerId);
     }
 
     /**
@@ -398,25 +398,26 @@ public class ProducerSnapshotManager implements AutoCloseable {
      */
     @VisibleForTesting
     int cleanupExpiredSnapshots() throws Exception {
-        List<String> producerIds = snapshotStore.listProducerIds();
+        List<String> producerIds = offsetsStore.listProducerIds();
         int cleanedCount = 0;
         long currentTime = System.currentTimeMillis();
 
         for (String producerId : producerIds) {
             try {
-                Optional<Tuple2<ProducerSnapshot, Integer>> snapshotWithVersion =
-                        snapshotStore.getSnapshotMetadataWithVersion(producerId);
+                Optional<Tuple2<ProducerOffsets, Integer>> snapshotWithVersion =
+                        offsetsStore.getSnapshotMetadataWithVersion(producerId);
                 if (!snapshotWithVersion.isPresent()) {
                     continue;
                 }
 
-                ProducerSnapshot snapshot = snapshotWithVersion.get().f0;
+                ProducerOffsets producerOffsets = snapshotWithVersion.get().f0;
                 int version = snapshotWithVersion.get().f1;
 
-                if (snapshot.isExpired(currentTime)) {
+                if (producerOffsets.isExpired(currentTime)) {
                     // Use version-based delete to avoid deleting snapshots updated just now
                     boolean deleted =
-                            snapshotStore.deleteSnapshotIfVersion(producerId, snapshot, version);
+                            offsetsStore.deleteSnapshotIfVersion(
+                                    producerId, producerOffsets, version);
                     if (deleted) {
                         cleanedCount++;
                         LOG.debug(
@@ -453,7 +454,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
      */
     @VisibleForTesting
     int cleanupOrphanFiles() throws Exception {
-        FsPath producersDir = snapshotStore.getProducersDirectory();
+        FsPath producersDir = offsetsStore.getProducersDirectory();
         FileSystem fileSystem = producersDir.getFileSystem();
 
         if (!fileSystem.exists(producersDir)) {
@@ -462,7 +463,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
         }
 
         // Get all producer IDs from ZK (these are valid)
-        Set<String> validProducerIds = new HashSet<>(snapshotStore.listProducerIds());
+        Set<String> validProducerIds = new HashSet<>(offsetsStore.listProducerIds());
 
         // Collect all valid file paths from ZK metadata
         Set<String> validFilePaths = collectValidFilePaths(validProducerIds);
@@ -488,7 +489,7 @@ public class ProducerSnapshotManager implements AutoCloseable {
                         "Found orphan producer directory {} (no ZK metadata), cleaning up",
                         producerId);
                 cleanedCount +=
-                        snapshotStore.deleteDirectoryRecursively(
+                        offsetsStore.deleteDirectoryRecursively(
                                 fileSystem, producerDirStatus.getPath());
                 continue;
             }
@@ -506,10 +507,10 @@ public class ProducerSnapshotManager implements AutoCloseable {
         Set<String> validFilePaths = new HashSet<>();
         for (String producerId : validProducerIds) {
             try {
-                Optional<ProducerSnapshot> optSnapshot =
-                        snapshotStore.getSnapshotMetadata(producerId);
+                Optional<ProducerOffsets> optSnapshot =
+                        offsetsStore.getSnapshotMetadata(producerId);
                 if (optSnapshot.isPresent()) {
-                    for (ProducerSnapshot.TableOffsetMetadata tableMetadata :
+                    for (ProducerOffsets.TableOffsetMetadata tableMetadata :
                             optSnapshot.get().getTableOffsets()) {
                         validFilePaths.add(tableMetadata.getOffsetsPath().toString());
                     }

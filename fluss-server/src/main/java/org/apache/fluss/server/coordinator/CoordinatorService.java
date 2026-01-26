@@ -134,7 +134,7 @@ import org.apache.fluss.server.coordinator.event.EventManager;
 import org.apache.fluss.server.coordinator.event.ListRebalanceProgressEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
-import org.apache.fluss.server.coordinator.producer.ProducerSnapshotManager;
+import org.apache.fluss.server.coordinator.producer.ProducerOffsetsManager;
 import org.apache.fluss.server.coordinator.rebalance.goal.Goal;
 import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.LakeTieringTableInfo;
@@ -151,7 +151,7 @@ import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 import org.apache.fluss.utils.json.TableBucketOffsets;
@@ -212,7 +212,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
     private final ExecutorService ioExecutor;
     private final LakeTableHelper lakeTableHelper;
-    private final ProducerSnapshotManager producerSnapshotManager;
+    private final ProducerOffsetsManager producerOffsetsManager;
 
     public CoordinatorService(
             Configuration conf,
@@ -250,8 +250,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 new LakeTableHelper(zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR));
 
         // Initialize and start the producer snapshot manager
-        this.producerSnapshotManager = new ProducerSnapshotManager(conf, zkClient);
-        this.producerSnapshotManager.start();
+        this.producerOffsetsManager = new ProducerOffsetsManager(conf, zkClient);
+        this.producerOffsetsManager.start();
     }
 
     @Override
@@ -261,7 +261,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
     @Override
     public void shutdown() {
-        IOUtils.closeQuietly(producerSnapshotManager, "producer snapshot manager");
+        IOUtils.closeQuietly(producerOffsetsManager, "producer snapshot manager");
         IOUtils.closeQuietly(lakeCatalogDynamicLoader, "lake catalog");
     }
 
@@ -1040,8 +1040,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
                         // Register with atomic "check and register" semantics
                         boolean created =
-                                producerSnapshotManager.registerSnapshot(
-                                        producerId, offsets, ttlMs);
+                                producerOffsetsManager.registerSnapshot(producerId, offsets, ttlMs);
 
                         RegisterProducerOffsetsResponse response =
                                 new RegisterProducerOffsetsResponse();
@@ -1068,15 +1067,15 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         return CompletableFuture.supplyAsync(
                 () -> {
                     try {
-                        Optional<ProducerSnapshot> optSnapshot =
-                                producerSnapshotManager.getSnapshotMetadata(producerId);
+                        Optional<ProducerOffsets> optSnapshot =
+                                producerOffsetsManager.getSnapshotMetadata(producerId);
                         if (!optSnapshot.isPresent()) {
                             return new GetProducerOffsetsResponse();
                         }
 
-                        ProducerSnapshot snapshot = optSnapshot.get();
+                        ProducerOffsets snapshot = optSnapshot.get();
                         Map<TableBucket, Long> allOffsets =
-                                producerSnapshotManager.getOffsets(producerId);
+                                producerOffsetsManager.getOffsets(producerId);
                         Map<Long, Map<TableBucket, Long>> offsetsByTable =
                                 groupOffsetsByTableId(allOffsets);
 
@@ -1124,7 +1123,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                         // Authorization: require WRITE permission on all tables in the snapshot
                         if (authorizer != null) {
                             Map<TableBucket, Long> offsets =
-                                    producerSnapshotManager.getOffsets(producerId);
+                                    producerOffsetsManager.getOffsets(producerId);
                             // Extract unique table IDs from the snapshot
                             Set<Long> tableIds =
                                     offsets.keySet().stream()
@@ -1136,7 +1135,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                             }
                         }
 
-                        producerSnapshotManager.deleteSnapshot(producerId);
+                        producerOffsetsManager.deleteSnapshot(producerId);
                         return new DeleteProducerOffsetsResponse();
                     } catch (Exception e) {
                         throw new RuntimeException(

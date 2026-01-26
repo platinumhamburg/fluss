@@ -24,29 +24,29 @@ import org.apache.fluss.utils.json.JsonSerdeTestBase;
 import java.util.Arrays;
 import java.util.Collections;
 
-/** Tests for {@link ProducerSnapshotJsonSerde}. */
-class ProducerSnapshotJsonSerdeTest extends JsonSerdeTestBase<ProducerSnapshot> {
+/** Tests for {@link ProducerOffsetsJsonSerde}. */
+class ProducerOffsetsJsonSerdeTest extends JsonSerdeTestBase<ProducerOffsets> {
 
-    ProducerSnapshotJsonSerdeTest() {
-        super(ProducerSnapshotJsonSerde.INSTANCE);
+    ProducerOffsetsJsonSerdeTest() {
+        super(ProducerOffsetsJsonSerde.INSTANCE);
     }
 
     @Override
-    protected ProducerSnapshot[] createObjects() {
+    protected ProducerOffsets[] createObjects() {
         // Empty snapshot
-        ProducerSnapshot empty = new ProducerSnapshot(1735538268000L, Collections.emptyList());
+        ProducerOffsets empty = new ProducerOffsets(1735538268000L, Collections.emptyList());
 
         // Snapshot with multiple tables and different file system schemes
-        ProducerSnapshot withTables =
-                new ProducerSnapshot(
+        ProducerOffsets withTables =
+                new ProducerOffsets(
                         1735538268000L,
                         Arrays.asList(
-                                new ProducerSnapshot.TableOffsetMetadata(
+                                new ProducerOffsets.TableOffsetMetadata(
                                         100L, new FsPath("oss://bucket/path/uuid1.offsets")),
-                                new ProducerSnapshot.TableOffsetMetadata(
+                                new ProducerOffsets.TableOffsetMetadata(
                                         200L, new FsPath("s3://bucket/path/uuid2.offsets"))));
 
-        return new ProducerSnapshot[] {empty, withTables};
+        return new ProducerOffsets[] {empty, withTables};
     }
 
     @Override

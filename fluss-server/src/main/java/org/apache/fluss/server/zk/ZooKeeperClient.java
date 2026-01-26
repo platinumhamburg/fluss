@@ -82,7 +82,7 @@ import org.apache.fluss.server.zk.data.ZkData.TablesZNode;
 import org.apache.fluss.server.zk.data.ZkData.WriterIdZNode;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFramework;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.BackgroundCallback;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.CuratorEvent;
@@ -1606,18 +1606,19 @@ public class ZooKeeperClient implements AutoCloseable {
      * given producer ID, this method returns false instead of throwing an exception.
      *
      * @param producerId the producer ID (typically Flink job ID)
-     * @param snapshot the producer snapshot containing expiration time and table offset metadata
+     * @param producerOffsets the producer offsets containing expiration time and table offset
+     *     metadata
      * @return true if the snapshot was created successfully, false if a snapshot already exists
      * @throws Exception if the operation fails for reasons other than node already existing
      */
-    public boolean tryRegisterProducerSnapshot(String producerId, ProducerSnapshot snapshot)
+    public boolean tryRegisterProducerSnapshot(String producerId, ProducerOffsets producerOffsets)
             throws Exception {
         String path = ProducerIdZNode.path(producerId);
         try {
             zkClient.create()
                     .creatingParentsIfNeeded()
                     .withMode(CreateMode.PERSISTENT)
-                    .forPath(path, ProducerIdZNode.encode(snapshot));
+                    .forPath(path, ProducerIdZNode.encode(producerOffsets));
             LOG.info("Registered producer snapshot for producer {} at path {}.", producerId, path);
             return true;
         } catch (KeeperException.NodeExistsException e) {
@@ -1631,13 +1632,13 @@ public class ZooKeeperClient implements AutoCloseable {
     }
 
     /**
-     * Gets the {@link ProducerSnapshot} for the given producer ID.
+     * Gets the {@link ProducerOffsets} for the given producer ID.
      *
      * @param producerId the producer ID
-     * @return an Optional containing the ProducerSnapshot if it exists, empty otherwise
+     * @return an Optional containing the ProducerOffsets if it exists, empty otherwise
      * @throws Exception if the operation fails
      */
-    public Optional<ProducerSnapshot> getProducerSnapshot(String producerId) throws Exception {
+    public Optional<ProducerOffsets> getProducerSnapshot(String producerId) throws Exception {
         String zkPath = ProducerIdZNode.path(producerId);
         return getOrEmpty(zkPath).map(ProducerIdZNode::decode);
     }
@@ -1655,17 +1656,17 @@ public class ZooKeeperClient implements AutoCloseable {
     }
 
     /**
-     * Gets the {@link ProducerSnapshot} for the given producer ID along with its ZK version.
+     * Gets the {@link ProducerOffsets} for the given producer ID along with its ZK version.
      *
      * <p>The version can be used for conditional updates/deletes to handle concurrent modifications
      * safely.
      *
      * @param producerId the producer ID
-     * @return an Optional containing a Tuple2 of (ProducerSnapshot, version) if it exists, empty
+     * @return an Optional containing a Tuple2 of (ProducerOffsets, version) if it exists, empty
      *     otherwise
      * @throws Exception if the operation fails
      */
-    public Optional<Tuple2<ProducerSnapshot, Integer>> getProducerSnapshotWithVersion(
+    public Optional<Tuple2<ProducerOffsets, Integer>> getProducerSnapshotWithVersion(
             String producerId) throws Exception {
         String zkPath = ProducerIdZNode.path(producerId);
         try {

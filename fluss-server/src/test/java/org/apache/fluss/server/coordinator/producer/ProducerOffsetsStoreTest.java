@@ -23,7 +23,7 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -39,8 +39,8 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Unit tests for {@link ProducerSnapshotStore}. */
-class ProducerSnapshotStoreTest {
+/** Unit tests for {@link ProducerOffsetsStore}. */
+class ProducerOffsetsStoreTest {
 
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
@@ -51,13 +51,13 @@ class ProducerSnapshotStoreTest {
 
     @TempDir Path tempDir;
 
-    private ProducerSnapshotStore store;
+    private ProducerOffsetsStore store;
     private ZooKeeperClient zkClient;
 
     @BeforeEach
     void setUp() {
         zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        store = new ProducerSnapshotStore(zkClient, tempDir.toString());
+        store = new ProducerOffsetsStore(zkClient, tempDir.toString());
     }
 
     @Test
@@ -75,7 +75,7 @@ class ProducerSnapshotStoreTest {
         assertThat(created).isTrue();
 
         // Verify metadata was stored
-        Optional<ProducerSnapshot> snapshot = store.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = store.getSnapshotMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getExpirationTime()).isEqualTo(expirationTime);
         assertThat(snapshot.get().getTableOffsets()).hasSize(2); // 2 tables
@@ -205,7 +205,7 @@ class ProducerSnapshotStoreTest {
         long pastExpirationTime = System.currentTimeMillis() - 1000;
         store.tryStoreSnapshot(producerId, offsets, pastExpirationTime);
 
-        Optional<ProducerSnapshot> snapshot = store.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = store.getSnapshotMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().isExpired(System.currentTimeMillis())).isTrue();
     }
@@ -218,7 +218,7 @@ class ProducerSnapshotStoreTest {
         long expirationTime = System.currentTimeMillis() + 3600000;
         store.tryStoreSnapshot(producerId, offsets, expirationTime);
 
-        Optional<ProducerSnapshot> snapshot = store.getSnapshotMetadata(producerId);
+        Optional<ProducerOffsets> snapshot = store.getSnapshotMetadata(producerId);
         assertThat(snapshot).isPresent();
         assertThat(snapshot.get().getTableOffsets()).isEmpty();
 
@@ -240,7 +240,7 @@ class ProducerSnapshotStoreTest {
         store.tryStoreSnapshot(producerId, offsets, expirationTime);
 
         // Get with version
-        Optional<Tuple2<ProducerSnapshot, Integer>> result =
+        Optional<Tuple2<ProducerOffsets, Integer>> result =
                 store.getSnapshotMetadataWithVersion(producerId);
 
         assertThat(result).isPresent();
@@ -250,7 +250,7 @@ class ProducerSnapshotStoreTest {
 
     @Test
     void testGetSnapshotMetadataWithVersionNonExistent() throws Exception {
-        Optional<Tuple2<ProducerSnapshot, Integer>> result =
+        Optional<Tuple2<ProducerOffsets, Integer>> result =
                 store.getSnapshotMetadataWithVersion("non-existent-producer");
 
         assertThat(result).isEmpty();
@@ -266,11 +266,11 @@ class ProducerSnapshotStoreTest {
         store.tryStoreSnapshot(producerId, offsets, expirationTime);
 
         // Get current version
-        Optional<Tuple2<ProducerSnapshot, Integer>> result =
+        Optional<Tuple2<ProducerOffsets, Integer>> result =
                 store.getSnapshotMetadataWithVersion(producerId);
         assertThat(result).isPresent();
         int version = result.get().f1;
-        ProducerSnapshot snapshot = result.get().f0;
+        ProducerOffsets snapshot = result.get().f0;
 
         // Delete with correct version should succeed
         boolean deleted = store.deleteSnapshotIfVersion(producerId, snapshot, version);
@@ -290,10 +290,10 @@ class ProducerSnapshotStoreTest {
         store.tryStoreSnapshot(producerId, offsets, expirationTime);
 
         // Get current version
-        Optional<Tuple2<ProducerSnapshot, Integer>> result =
+        Optional<Tuple2<ProducerOffsets, Integer>> result =
                 store.getSnapshotMetadataWithVersion(producerId);
         assertThat(result).isPresent();
-        ProducerSnapshot snapshot = result.get().f0;
+        ProducerOffsets snapshot = result.get().f0;
 
         // Delete with wrong version should fail
         int wrongVersion = 999;
@@ -314,10 +314,10 @@ class ProducerSnapshotStoreTest {
         store.tryStoreSnapshot(producerId, offsets, expirationTime);
 
         // Get snapshot info
-        Optional<Tuple2<ProducerSnapshot, Integer>> result =
+        Optional<Tuple2<ProducerOffsets, Integer>> result =
                 store.getSnapshotMetadataWithVersion(producerId);
         assertThat(result).isPresent();
-        ProducerSnapshot snapshot = result.get().f0;
+        ProducerOffsets snapshot = result.get().f0;
 
         // Delete first
         store.deleteSnapshot(producerId);

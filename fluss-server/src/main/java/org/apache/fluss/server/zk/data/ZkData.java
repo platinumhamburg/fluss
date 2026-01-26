@@ -26,8 +26,8 @@ import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.security.acl.ResourceType;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableJsonSerde;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshotJsonSerde;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsetsJsonSerde;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -864,7 +864,7 @@ public final class ZkData {
      *
      * <p>/producers/[producerId]
      *
-     * <p>This znode stores {@link ProducerSnapshot} which contains:
+     * <p>This znode stores {@link ProducerOffsets} which contains:
      *
      * <ul>
      *   <li>expiration_time: TTL for automatic cleanup
@@ -886,23 +886,24 @@ public final class ZkData {
         }
 
         /**
-         * Encodes a ProducerSnapshot to JSON bytes for storage in ZK.
+         * Encodes a ProducerOffsets to JSON bytes for storage in ZK.
          *
-         * @param snapshot the ProducerSnapshot to encode
+         * @param producerOffsets the ProducerOffsets to encode
          * @return the encoded bytes
          */
-        public static byte[] encode(ProducerSnapshot snapshot) {
-            return JsonSerdeUtils.writeValueAsBytes(snapshot, ProducerSnapshotJsonSerde.INSTANCE);
+        public static byte[] encode(ProducerOffsets producerOffsets) {
+            return JsonSerdeUtils.writeValueAsBytes(
+                    producerOffsets, ProducerOffsetsJsonSerde.INSTANCE);
         }
 
         /**
-         * Decodes JSON bytes from ZK to a ProducerSnapshot.
+         * Decodes JSON bytes from ZK to a ProducerOffsets.
          *
          * @param json the JSON bytes from ZK
-         * @return the decoded ProducerSnapshot
+         * @return the decoded ProducerOffsets
          */
-        public static ProducerSnapshot decode(byte[] json) {
-            return JsonSerdeUtils.readValue(json, ProducerSnapshotJsonSerde.INSTANCE);
+        public static ProducerOffsets decode(byte[] json) {
+            return JsonSerdeUtils.readValue(json, ProducerOffsetsJsonSerde.INSTANCE);
         }
     }
 }

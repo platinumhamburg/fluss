@@ -25,7 +25,7 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.data.producer.ProducerSnapshot;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.RetryUtils;
@@ -58,11 +58,11 @@ import java.util.UUID;
  * </ul>
  *
  * <p>This class is stateless and thread-safe. Lifecycle management should be handled by {@link
- * ProducerSnapshotManager}.
+ * ProducerOffsetsManager}.
  */
-public class ProducerSnapshotStore {
+public class ProducerOffsetsStore {
 
-    private static final Logger LOG = LoggerFactory.getLogger(ProducerSnapshotStore.class);
+    private static final Logger LOG = LoggerFactory.getLogger(ProducerOffsetsStore.class);
 
     private static final int MAX_RETRIES = 3;
     private static final long INITIAL_BACKOFF_MS = 100;
@@ -71,7 +71,7 @@ public class ProducerSnapshotStore {
     private final ZooKeeperClient zkClient;
     private final String remoteDataDir;
 
-    public ProducerSnapshotStore(ZooKeeperClient zkClient, String remoteDataDir) {
+    public ProducerOffsetsStore(ZooKeeperClient zkClient, String remoteDataDir) {
         this.zkClient = zkClient;
         this.remoteDataDir = remoteDataDir;
     }
@@ -95,7 +95,7 @@ public class ProducerSnapshotStore {
      *   <li>The alternative (ZK first, then files) would leave ZK metadata pointing to non-existent
      *       files, which is worse
      *   <li>Orphan files are harmless and will be cleaned up by {@link
-     *       ProducerSnapshotManager#cleanupOrphanFiles()}
+     *       ProducerOffsetsManager#cleanupOrphanFiles()}
      *   <li>A unified orphan file cleanup mechanism will handle these cases in the future
      * </ul>
      *
@@ -111,7 +111,7 @@ public class ProducerSnapshotStore {
             throws Exception {
 
         Map<Long, Map<TableBucket, Long>> offsetsByTable = groupOffsetsByTable(offsets);
-        List<ProducerSnapshot.TableOffsetMetadata> tableMetadatas = new ArrayList<>();
+        List<ProducerOffsets.TableOffsetMetadata> tableMetadatas = new ArrayList<>();
         List<FsPath> createdFiles = new ArrayList<>();
 
         try {
@@ -119,12 +119,12 @@ public class ProducerSnapshotStore {
             for (Map.Entry<Long, Map<TableBucket, Long>> entry : offsetsByTable.entrySet()) {
                 FsPath path = writeOffsetsFile(producerId, entry.getKey(), entry.getValue());
                 createdFiles.add(path);
-                tableMetadatas.add(new ProducerSnapshot.TableOffsetMetadata(entry.getKey(), path));
+                tableMetadatas.add(new ProducerOffsets.TableOffsetMetadata(entry.getKey(), path));
             }
 
             // Atomically create ZK metadata
-            ProducerSnapshot snapshot = new ProducerSnapshot(expirationTime, tableMetadatas);
-            boolean created = zkClient.tryRegisterProducerSnapshot(producerId, snapshot);
+            ProducerOffsets producerOffsets = new ProducerOffsets(expirationTime, tableMetadatas);
+            boolean created = zkClient.tryRegisterProducerSnapshot(producerId, producerOffsets);
 
             if (!created) {
                 LOG.info(
@@ -154,7 +154,7 @@ public class ProducerSnapshotStore {
     }
 
     /** Gets the snapshot metadata for a producer. */
-    public Optional<ProducerSnapshot> getSnapshotMetadata(String producerId) throws Exception {
+    public Optional<ProducerOffsets> getSnapshotMetadata(String producerId) throws Exception {
         return zkClient.getProducerSnapshot(producerId);
     }
 
@@ -164,10 +164,10 @@ public class ProducerSnapshotStore {
      * <p>The version can be used for conditional deletes to handle concurrent modifications safely.
      *
      * @param producerId the producer ID
-     * @return Optional containing a Tuple2 of (ProducerSnapshot, version) if exists
+     * @return Optional containing a Tuple2 of (ProducerOffsets, version) if exists
      * @throws Exception if the operation fails
      */
-    public Optional<Tuple2<ProducerSnapshot, Integer>> getSnapshotMetadataWithVersion(
+    public Optional<Tuple2<ProducerOffsets, Integer>> getSnapshotMetadataWithVersion(
             String producerId) throws Exception {
         return zkClient.getProducerSnapshotWithVersion(producerId);
     }
@@ -179,13 +179,13 @@ public class ProducerSnapshotStore {
      * @throws Exception if ZK operations fail
      */
     public Map<TableBucket, Long> readOffsets(String producerId) throws Exception {
-        Optional<ProducerSnapshot> optSnapshot = zkClient.getProducerSnapshot(producerId);
+        Optional<ProducerOffsets> optSnapshot = zkClient.getProducerSnapshot(producerId);
         if (!optSnapshot.isPresent()) {
             return new HashMap<>();
         }
 
         Map<TableBucket, Long> allOffsets = new HashMap<>();
-        for (ProducerSnapshot.TableOffsetMetadata metadata : optSnapshot.get().getTableOffsets()) {
+        for (ProducerOffsets.TableOffsetMetadata metadata : optSnapshot.get().getTableOffsets()) {
             allOffsets.putAll(readOffsetsFile(metadata.getOffsetsPath()));
         }
         return allOffsets;
@@ -193,14 +193,14 @@ public class ProducerSnapshotStore {
 
     /** Deletes a producer snapshot (both ZK metadata and remote files). */
     public void deleteSnapshot(String producerId) throws Exception {
-        Optional<ProducerSnapshot> optSnapshot = zkClient.getProducerSnapshot(producerId);
+        Optional<ProducerOffsets> optSnapshot = zkClient.getProducerSnapshot(producerId);
         if (!optSnapshot.isPresent()) {
             LOG.debug("No snapshot found for producer {}", producerId);
             return;
         }
 
         // Delete remote files
-        for (ProducerSnapshot.TableOffsetMetadata metadata : optSnapshot.get().getTableOffsets()) {
+        for (ProducerOffsets.TableOffsetMetadata metadata : optSnapshot.get().getTableOffsets()) {
             deleteRemoteFile(metadata.getOffsetsPath());
         }
 
@@ -216,13 +216,14 @@ public class ProducerSnapshotStore {
      * process has modified the snapshot since it was read.
      *
      * @param producerId the producer ID
-     * @param snapshot the snapshot to delete (used to get file paths)
+     * @param producerOffsets the snapshot to delete (used to get file paths)
      * @param expectedVersion the expected ZK version
      * @return true if deleted successfully, false if version mismatch
      * @throws Exception if the operation fails for reasons other than version mismatch
      */
     public boolean deleteSnapshotIfVersion(
-            String producerId, ProducerSnapshot snapshot, int expectedVersion) throws Exception {
+            String producerId, ProducerOffsets producerOffsets, int expectedVersion)
+            throws Exception {
         // First try to delete ZK metadata with version check
         boolean deleted = zkClient.deleteProducerSnapshotIfVersion(producerId, expectedVersion);
         if (!deleted) {
@@ -236,7 +237,7 @@ public class ProducerSnapshotStore {
         // ZK metadata deleted successfully, now clean up remote files
         // Even if file deletion fails, the snapshot is already gone from ZK
         // Orphan files will be cleaned up by the periodic cleanup task
-        for (ProducerSnapshot.TableOffsetMetadata metadata : snapshot.getTableOffsets()) {
+        for (ProducerOffsets.TableOffsetMetadata metadata : producerOffsets.getTableOffsets()) {
             deleteRemoteFile(metadata.getOffsetsPath());
         }
 

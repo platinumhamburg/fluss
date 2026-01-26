@@ -30,7 +30,7 @@ import java.util.Iterator;
 import java.util.List;
 
 /**
- * JSON serializer and deserializer for {@link ProducerSnapshot}.
+ * JSON serializer and deserializer for {@link ProducerOffsets}.
  *
  * <p>The serialized format is:
  *
@@ -47,10 +47,10 @@ import java.util.List;
  * }
  * }</pre>
  */
-public class ProducerSnapshotJsonSerde
-        implements JsonSerializer<ProducerSnapshot>, JsonDeserializer<ProducerSnapshot> {
+public class ProducerOffsetsJsonSerde
+        implements JsonSerializer<ProducerOffsets>, JsonDeserializer<ProducerOffsets> {
 
-    public static final ProducerSnapshotJsonSerde INSTANCE = new ProducerSnapshotJsonSerde();
+    public static final ProducerOffsetsJsonSerde INSTANCE = new ProducerOffsetsJsonSerde();
 
     private static final String VERSION_KEY = "version";
     private static final String EXPIRATION_TIME_KEY = "expiration_time";
@@ -61,14 +61,15 @@ public class ProducerSnapshotJsonSerde
     private static final int CURRENT_VERSION = 1;
 
     @Override
-    public void serialize(ProducerSnapshot snapshot, JsonGenerator generator) throws IOException {
+    public void serialize(ProducerOffsets producerOffsets, JsonGenerator generator)
+            throws IOException {
         generator.writeStartObject();
 
         generator.writeNumberField(VERSION_KEY, CURRENT_VERSION);
-        generator.writeNumberField(EXPIRATION_TIME_KEY, snapshot.getExpirationTime());
+        generator.writeNumberField(EXPIRATION_TIME_KEY, producerOffsets.getExpirationTime());
 
         generator.writeArrayFieldStart(TABLES_KEY);
-        for (ProducerSnapshot.TableOffsetMetadata tableOffset : snapshot.getTableOffsets()) {
+        for (ProducerOffsets.TableOffsetMetadata tableOffset : producerOffsets.getTableOffsets()) {
             generator.writeStartObject();
             generator.writeNumberField(TABLE_ID_KEY, tableOffset.getTableId());
             generator.writeStringField(OFFSETS_PATH_KEY, tableOffset.getOffsetsPath().toString());
@@ -80,11 +81,11 @@ public class ProducerSnapshotJsonSerde
     }
 
     @Override
-    public ProducerSnapshot deserialize(JsonNode node) {
+    public ProducerOffsets deserialize(JsonNode node) {
         int version = node.get(VERSION_KEY).asInt();
         if (version != CURRENT_VERSION) {
             throw new IllegalArgumentException(
-                    "Unsupported ProducerSnapshot version: "
+                    "Unsupported ProducerOffsets version: "
                             + version
                             + ", expected: "
                             + CURRENT_VERSION);
@@ -92,7 +93,7 @@ public class ProducerSnapshotJsonSerde
 
         long expirationTime = node.get(EXPIRATION_TIME_KEY).asLong();
 
-        List<ProducerSnapshot.TableOffsetMetadata> tableOffsets = new ArrayList<>();
+        List<ProducerOffsets.TableOffsetMetadata> tableOffsets = new ArrayList<>();
         JsonNode tablesNode = node.get(TABLES_KEY);
         if (tablesNode != null && tablesNode.isArray()) {
             Iterator<JsonNode> elements = tablesNode.elements();
@@ -101,10 +102,10 @@ public class ProducerSnapshotJsonSerde
                 long tableId = tableNode.get(TABLE_ID_KEY).asLong();
                 String offsetsPath = tableNode.get(OFFSETS_PATH_KEY).asText();
                 tableOffsets.add(
-                        new ProducerSnapshot.TableOffsetMetadata(tableId, new FsPath(offsetsPath)));
+                        new ProducerOffsets.TableOffsetMetadata(tableId, new FsPath(offsetsPath)));
             }
         }
 
-        return new ProducerSnapshot(expirationTime, tableOffsets);
+        return new ProducerOffsets(expirationTime, tableOffsets);
     }
 }
