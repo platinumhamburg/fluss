@@ -26,6 +26,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
+import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidDatabaseException;
@@ -106,7 +107,6 @@ import org.apache.fluss.rpc.messages.RebalanceRequest;
 import org.apache.fluss.rpc.messages.RebalanceResponse;
 import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
-import org.apache.fluss.rpc.messages.RegisterResult;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
 import org.apache.fluss.rpc.netty.server.Session;
@@ -1047,13 +1047,15 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
                         RegisterProducerOffsetsResponse response =
                                 new RegisterProducerOffsetsResponse();
-                        response.setResult(
-                                created
-                                        ? RegisterResult.CREATED.getCode()
-                                        : RegisterResult.ALREADY_EXISTS.getCode());
+                        // Aligns with RegisterResult enum in fluss-client:
+                        // 0 = CREATED, 1 = ALREADY_EXISTS
+                        response.setResult(created ? 0 : 1);
                         return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
                     } catch (Exception e) {
-                        throw new RuntimeException(
+                        throw new UnknownServerException(
                                 "Failed to register producer offsets for producer "
                                         + request.getProducerId(),
                                 e);
@@ -1107,8 +1109,11 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                         }
 
                         return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
                     } catch (Exception e) {
-                        throw new RuntimeException(
+                        throw new UnknownServerException(
                                 "Failed to get producer offsets for producer " + producerId, e);
                     }
                 },
@@ -1140,8 +1145,11 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
                         producerOffsetsManager.deleteSnapshot(producerId);
                         return new DeleteProducerOffsetsResponse();
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
                     } catch (Exception e) {
-                        throw new RuntimeException(
+                        throw new UnknownServerException(
                                 "Failed to delete producer offsets for producer "
                                         + request.getProducerId(),
                                 e);

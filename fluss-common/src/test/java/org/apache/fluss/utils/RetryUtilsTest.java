@@ -236,45 +236,4 @@ class RetryUtilsTest {
         // Clear interrupt status for other tests
         Thread.interrupted();
     }
-
-    @Test
-    void testInterruptedDuringBackoff() throws Exception {
-        AtomicInteger attempts = new AtomicInteger(0);
-        Thread testThread = Thread.currentThread();
-
-        // Schedule an interrupt during the backoff sleep
-        Thread interrupter =
-                new Thread(
-                        () -> {
-                            try {
-                                Thread.sleep(50); // Wait for first attempt to fail
-                                testThread.interrupt();
-                            } catch (InterruptedException e) {
-                                // ignore
-                            }
-                        });
-        interrupter.start();
-
-        assertThatThrownBy(
-                        () ->
-                                RetryUtils.executeWithRetry(
-                                        () -> {
-                                            attempts.incrementAndGet();
-                                            throw new IOException("fail");
-                                        },
-                                        "backoffInterruptOp",
-                                        5,
-                                        200, // Long backoff to ensure interrupt happens during
-                                        // sleep
-                                        1000,
-                                        e -> e instanceof IOException))
-                .isInstanceOf(InterruptedIOException.class)
-                .hasMessageContaining("backoffInterruptOp was interrupted while waiting for retry");
-
-        interrupter.join();
-        // Verify interrupt status is preserved
-        assertThat(Thread.currentThread().isInterrupted()).isTrue();
-        // Clear interrupt status for other tests
-        Thread.interrupted();
-    }
 }

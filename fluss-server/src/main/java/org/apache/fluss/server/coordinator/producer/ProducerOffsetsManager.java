@@ -21,6 +21,7 @@ package org.apache.fluss.server.coordinator.producer;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.InvalidProducerIdException;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -124,7 +125,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
      * @param ttlMs TTL in milliseconds for the snapshot, or null to use default
      * @return true if a new snapshot was created (CREATED), false if snapshot already existed
      *     (ALREADY_EXISTS)
-     * @throws IllegalArgumentException if producerId is invalid (null, empty, contains invalid
+     * @throws InvalidProducerIdException if producerId is invalid (null, empty, contains invalid
      *     characters, etc.)
      * @throws Exception if the operation fails
      */
@@ -308,7 +309,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
      *
      * @param producerId the producer ID
      * @return Optional containing the offsets snapshot if exists
-     * @throws IllegalArgumentException if producerId is invalid
+     * @throws InvalidProducerIdException if producerId is invalid
      * @throws Exception if the operation fails
      */
     public Optional<ProducerOffsets> getOffsetsMetadata(String producerId) throws Exception {
@@ -321,7 +322,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
      *
      * @param producerId the producer ID
      * @return map of TableBucket to offset, or empty map if no snapshot exists
-     * @throws IllegalArgumentException if producerId is invalid
+     * @throws InvalidProducerIdException if producerId is invalid
      * @throws Exception if the operation fails
      */
     public Map<TableBucket, Long> readOffsets(String producerId) throws Exception {
@@ -333,7 +334,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
      * Deletes a producer snapshot.
      *
      * @param producerId the producer ID
-     * @throws IllegalArgumentException if producerId is invalid
+     * @throws InvalidProducerIdException if producerId is invalid
      * @throws Exception if the operation fails
      */
     public void deleteSnapshot(String producerId) throws Exception {
@@ -358,12 +359,12 @@ public class ProducerOffsetsManager implements AutoCloseable {
      * Validates that a producer ID is valid for use as both a file name and ZK node name.
      *
      * @param producerId the producer ID to validate
-     * @throws IllegalArgumentException if producerId is invalid
+     * @throws InvalidProducerIdException if producerId is invalid
      */
     private void validateProducerId(String producerId) {
         String invalidReason = TablePath.detectInvalidName(producerId);
         if (invalidReason != null) {
-            throw new IllegalArgumentException(
+            throw new InvalidProducerIdException(
                     "Invalid producer ID '" + producerId + "': " + invalidReason);
         }
     }

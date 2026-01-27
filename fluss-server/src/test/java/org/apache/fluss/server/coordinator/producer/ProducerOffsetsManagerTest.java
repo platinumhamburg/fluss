@@ -19,6 +19,7 @@
 package org.apache.fluss.server.coordinator.producer;
 
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.InvalidProducerIdException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -261,31 +262,31 @@ class ProducerOffsetsManagerTest {
 
         // Null producer ID
         assertThatThrownBy(() -> manager.registerSnapshot(null, offsets, null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID")
                 .hasMessageContaining("null string is not allowed");
 
         // Empty producer ID
         assertThatThrownBy(() -> manager.registerSnapshot("", offsets, null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID")
                 .hasMessageContaining("empty string is not allowed");
 
         // Producer ID with invalid characters
         assertThatThrownBy(() -> manager.registerSnapshot("invalid/producer", offsets, null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID")
                 .hasMessageContaining("contains one or more characters");
 
         // Producer ID as "."
         assertThatThrownBy(() -> manager.registerSnapshot(".", offsets, null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID")
                 .hasMessageContaining("'.' is not allowed");
 
         // Producer ID as ".."
         assertThatThrownBy(() -> manager.registerSnapshot("..", offsets, null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID")
                 .hasMessageContaining("'..' is not allowed");
     }
@@ -294,12 +295,12 @@ class ProducerOffsetsManagerTest {
     void testGetOffsetsMetadataWithInvalidProducerId() {
         // Null producer ID
         assertThatThrownBy(() -> manager.getOffsetsMetadata(null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID");
 
         // Invalid characters
         assertThatThrownBy(() -> manager.getOffsetsMetadata("invalid@producer"))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID");
     }
 
@@ -307,12 +308,12 @@ class ProducerOffsetsManagerTest {
     void testReadOffsetsWithInvalidProducerId() {
         // Null producer ID
         assertThatThrownBy(() -> manager.readOffsets(null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID");
 
         // Invalid characters
         assertThatThrownBy(() -> manager.readOffsets("invalid producer"))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID");
     }
 
@@ -320,12 +321,12 @@ class ProducerOffsetsManagerTest {
     void testDeleteSnapshotWithInvalidProducerId() {
         // Null producer ID
         assertThatThrownBy(() -> manager.deleteSnapshot(null))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID");
 
         // Invalid characters
         assertThatThrownBy(() -> manager.deleteSnapshot("invalid:producer"))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(InvalidProducerIdException.class)
                 .hasMessageContaining("Invalid producer ID");
     }
 
