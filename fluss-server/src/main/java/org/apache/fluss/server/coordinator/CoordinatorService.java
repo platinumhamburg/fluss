@@ -268,29 +268,40 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public void authorizeTable(OperationType operationType, long tableId) {
         if (authorizer != null) {
-            TablePath tablePath;
-            try {
-                // TODO: this will block on the coordinator event thread, consider refactor
-                //  CoordinatorMetadataCache to hold the mapping of table_id to table_path, and then
-                //  we don't need this async request.
-                AccessContextEvent<TablePath> getTablePathEvent =
-                        new AccessContextEvent<>(ctx -> ctx.getTablePathById(tableId));
-                eventManagerSupplier.get().put(getTablePathEvent);
-                tablePath = getTablePathEvent.getResultFuture().get();
-            } catch (Exception e) {
-                throw new UnknownServerException("Failed to get table path by ID " + tableId, e);
-            }
-
-            if (tablePath == null) {
-                throw new UnknownTableOrBucketException(
-                        String.format(
-                                "This server %s does not know this table ID %s. This may happen when the table "
-                                        + "metadata cache in the server is not updated yet.",
-                                name(), tableId));
-            }
-
-            authorizeTable(operationType, tablePath);
+            authorizeTableWithSession(currentSession(), operationType, tableId);
         }
+    }
+
+    /**
+     * Authorize table access with an explicitly provided session.
+     *
+     * <p>This method is used for async operations where the session must be captured before
+     * entering the async block, since currentSession() relies on thread-local storage.
+     */
+    private void authorizeTableWithSession(
+            Session session, OperationType operationType, long tableId) {
+        TablePath tablePath;
+        try {
+            // TODO: this will block on the coordinator event thread, consider refactor
+            //  CoordinatorMetadataCache to hold the mapping of table_id to table_path, and then
+            //  we don't need this async request.
+            AccessContextEvent<TablePath> getTablePathEvent =
+                    new AccessContextEvent<>(ctx -> ctx.getTablePathById(tableId));
+            eventManagerSupplier.get().put(getTablePathEvent);
+            tablePath = getTablePathEvent.getResultFuture().get();
+        } catch (Exception e) {
+            throw new UnknownServerException("Failed to get table path by ID " + tableId, e);
+        }
+
+        if (tablePath == null) {
+            throw new UnknownTableOrBucketException(
+                    String.format(
+                            "This server %s does not know this table ID %s. This may happen when the table "
+                                    + "metadata cache in the server is not updated yet.",
+                            name(), tableId));
+        }
+
+        authorizer.authorize(session, operationType, Resource.table(tablePath));
     }
 
     @Override
@@ -1068,6 +1079,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     public CompletableFuture<GetProducerOffsetsResponse> getProducerOffsets(
             GetProducerOffsetsRequest request) {
         String producerId = request.getProducerId();
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
 
         return CompletableFuture.supplyAsync(
                 () -> {
@@ -1091,7 +1104,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                     .removeIf(
                                             tableId -> {
                                                 try {
-                                                    authorizeTable(OperationType.READ, tableId);
+                                                    authorizeTableWithSession(
+                                                            session, OperationType.READ, tableId);
                                                     return false; // keep this table
                                                 } catch (Exception e) {
                                                     return true; // remove this table
@@ -1123,6 +1137,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<DeleteProducerOffsetsResponse> deleteProducerOffsets(
             DeleteProducerOffsetsRequest request) {
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
         return CompletableFuture.supplyAsync(
                 () -> {
                     try {
@@ -1139,7 +1155,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                             .collect(Collectors.toSet());
                             // Check WRITE permission for each table
                             for (Long tableId : tableIds) {
-                                authorizeTable(OperationType.WRITE, tableId);
+                                authorizeTableWithSession(session, OperationType.WRITE, tableId);
                             }
                         }
 
