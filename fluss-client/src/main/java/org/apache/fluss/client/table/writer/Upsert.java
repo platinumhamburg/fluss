@@ -18,7 +18,7 @@
 package org.apache.fluss.client.table.writer;
 
 import org.apache.fluss.annotation.PublicEvolving;
-import org.apache.fluss.rpc.protocol.AggMode;
+import org.apache.fluss.rpc.protocol.MergeMode;
 
 import javax.annotation.Nullable;
 
@@ -27,7 +27,7 @@ import javax.annotation.Nullable;
  * Table.
  *
  * <p>{@link Upsert} objects are immutable and can be shared between threads. Refinement methods,
- * like {@link #partialUpdate(int[])} and {@link #aggregationMode(AggMode)}, create new Upsert
+ * like {@link #partialUpdate(int[])} and {@link #mergeMode(MergeMode)}, create new Upsert
  * instances.
  *
  * @since 0.6
@@ -59,43 +59,48 @@ public interface Upsert {
     Upsert partialUpdate(String... targetColumnNames);
 
     /**
-     * Specify aggregation mode for the UpsertWriter and returns a new Upsert instance.
+     * Specify merge mode for the UpsertWriter and returns a new Upsert instance.
      *
-     * <p>This method controls how the created UpsertWriter handles data aggregation:
+     * <p>This method controls how the created UpsertWriter handles data merging for tables with
+     * merge engines:
      *
      * <ul>
-     *   <li>{@link AggMode#AGGREGATE} (default): Data is aggregated through server-side merge
-     *       engine
-     *   <li>{@link AggMode#OVERWRITE}: Data directly overwrites values, bypassing merge engine (for
-     *       undo recovery)
-     *   <li>{@link AggMode#LOCAL_AGGREGATE}: Client-side pre-aggregation before server-side
-     *       aggregation (reserved for future implementation, not yet supported)
+     *   <li>{@link MergeMode#DEFAULT} (default): Data is merged through the server-side merge
+     *       engine. The behavior depends on the configured merge engine type:
+     *       <ul>
+     *         <li>For aggregation merge engine: applies aggregation functions (e.g., SUM, MAX,
+     *             MIN).
+     *         <li>For first-row merge engine: retains the first observed row.
+     *         <li>For versioned merge engine: keeps the row with the highest version.
+     *       </ul>
+     *   <li>{@link MergeMode#OVERWRITE}: Data directly overwrites values, bypassing the merge
+     *       engine. This is useful for undo/recovery operations to restore exact historical values.
      * </ul>
      *
      * <p>Example usage:
      *
      * <pre>{@code
-     * // Normal aggregation mode (default)
+     * // Default merge mode
      * UpsertWriter normalWriter = table.newUpsert()
-     *     .aggregationMode(AggMode.AGGREGATE)
+     *     .mergeMode(MergeMode.DEFAULT)
      *     .createWriter();
      *
      * // Overwrite mode for undo recovery
      * UpsertWriter undoWriter = table.newUpsert()
-     *     .aggregationMode(AggMode.OVERWRITE)
+     *     .mergeMode(MergeMode.OVERWRITE)
      *     .createWriter();
      * }</pre>
      *
-     * @param mode the aggregation mode
-     * @return a new Upsert instance with the specified aggregation mode
+     * @param mode the merge mode
+     * @return a new Upsert instance with the specified merge mode
      * @since 0.9
      */
-    Upsert aggregationMode(AggMode mode);
+    Upsert mergeMode(MergeMode mode);
 
     /**
      * Create a new {@link UpsertWriter} using {@code InternalRow} with the optional {@link
-     * #partialUpdate(String...)} and {@link #aggregationMode(AggMode)} information to upsert and
-     * delete data to a Primary Key Table.
+     * #partialUpdate(String...)} and {@link #mergeMode(MergeMode)} information to upsert and delete
+     * data to a Primary Key Table.
      */
     UpsertWriter createWriter();
 

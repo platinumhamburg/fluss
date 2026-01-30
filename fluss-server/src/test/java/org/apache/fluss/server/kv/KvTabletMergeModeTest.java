@@ -35,7 +35,7 @@ import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.TestingSchemaGetter;
-import org.apache.fluss.rpc.protocol.AggMode;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
@@ -69,12 +69,12 @@ import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecor
 import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
 
 /**
- * Tests for {@link KvTablet} with {@link AggMode} support.
+ * Tests for {@link KvTablet} with {@link MergeMode} support.
  *
  * <p>These tests verify that OVERWRITE mode correctly bypasses the merge engine and directly
  * replaces values, which is essential for undo recovery scenarios.
  */
-class KvTabletAggModeTest {
+class KvTabletMergeModeTest {
 
     private static final short SCHEMA_ID = 1;
 
@@ -109,7 +109,7 @@ class KvTabletAggModeTest {
         Map<String, String> config = new HashMap<>();
         config.put("table.merge-engine", "aggregation");
 
-        TablePath tablePath = TablePath.of("testDb", "test_agg_mode");
+        TablePath tablePath = TablePath.of("testDb", "test_merge_mode");
         PhysicalTablePath physicalTablePath = PhysicalTablePath.of(tablePath);
         schemaGetter = new TestingSchemaGetter(new SchemaInfo(AGG_SCHEMA, SCHEMA_ID));
 
@@ -172,26 +172,26 @@ class KvTabletAggModeTest {
         }
     }
 
-    // ==================== AGGREGATE Mode Tests ====================
+    // ==================== DEFAULT Mode Tests ====================
 
     @Test
-    void testAggregateModeAppliesMergeEngine() throws Exception {
+    void testDefaultModeAppliesMergeEngine() throws Exception {
         // Insert initial record: id=1, count=10, max_val=100, name="Alice"
         KvRecordBatch batch1 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 100, "Alice"}));
-        kvTablet.putAsLeader(batch1, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch1, null, MergeMode.DEFAULT);
 
         long endOffset = logTablet.localLogEndOffset();
 
-        // Update with AGGREGATE mode: count should be summed, max_val should take max
+        // Update with DEFAULT mode: count should be summed, max_val should take max
         // id=1, count=5, max_val=150, name="Bob"
         KvRecordBatch batch2 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 5L, 150, "Bob"}));
-        kvTablet.putAsLeader(batch2, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch2, null, MergeMode.DEFAULT);
 
         // Verify CDC log shows aggregated values
         LogRecords actualLogRecords = readLogRecords(endOffset);
@@ -216,12 +216,12 @@ class KvTabletAggModeTest {
 
     @Test
     void testOverwriteModeBypassesMergeEngine() throws Exception {
-        // Insert initial record with AGGREGATE mode
+        // Insert initial record with DEFAULT mode
         KvRecordBatch batch1 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 100, "Alice"}));
-        kvTablet.putAsLeader(batch1, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch1, null, MergeMode.DEFAULT);
 
         long endOffset = logTablet.localLogEndOffset();
 
@@ -230,7 +230,7 @@ class KvTabletAggModeTest {
         KvRecordBatch batch2 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, 5L, 50, "Bob"}));
-        kvTablet.putAsLeader(batch2, null, AggMode.OVERWRITE);
+        kvTablet.putAsLeader(batch2, null, MergeMode.OVERWRITE);
 
         // Verify CDC log shows directly replaced values (not aggregated)
         LogRecords actualLogRecords = readLogRecords(endOffset);
@@ -266,14 +266,14 @@ class KvTabletAggModeTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 100L, 500, "Original"}));
-        kvTablet.putAsLeader(initialBatch, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(initialBatch, null, MergeMode.DEFAULT);
 
         // Step 2: Simulate some aggregation operations
         KvRecordBatch updateBatch =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 50L, 600, "Updated"}));
-        kvTablet.putAsLeader(updateBatch, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(updateBatch, null, MergeMode.DEFAULT);
 
         long beforeUndoOffset = logTablet.localLogEndOffset();
 
@@ -282,7 +282,7 @@ class KvTabletAggModeTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 100L, 500, "Original"}));
-        kvTablet.putAsLeader(undoBatch, null, AggMode.OVERWRITE);
+        kvTablet.putAsLeader(undoBatch, null, MergeMode.OVERWRITE);
 
         // Verify the undo operation produced correct CDC log
         LogRecords actualLogRecords = readLogRecords(beforeUndoOffset);
@@ -309,7 +309,7 @@ class KvTabletAggModeTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 100, "Alice"}));
-        kvTablet.putAsLeader(batch, null, AggMode.OVERWRITE);
+        kvTablet.putAsLeader(batch, null, MergeMode.OVERWRITE);
 
         LogRecords actualLogRecords = readLogRecords(0);
         MemoryLogRecords expectedLogs =
@@ -331,14 +331,14 @@ class KvTabletAggModeTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 100, "Alice"}));
-        kvTablet.putAsLeader(batch1, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch1, null, MergeMode.DEFAULT);
 
         long endOffset = logTablet.localLogEndOffset();
 
         // Delete with OVERWRITE mode
         KvRecordBatch deleteBatch =
                 kvRecordBatchFactory.ofRecords(kvRecordFactory.ofRecord("k1".getBytes(), null));
-        kvTablet.putAsLeader(deleteBatch, null, AggMode.OVERWRITE);
+        kvTablet.putAsLeader(deleteBatch, null, MergeMode.OVERWRITE);
 
         // Verify DELETE is produced
         LogRecords actualLogRecords = readLogRecords(endOffset);
@@ -355,38 +355,38 @@ class KvTabletAggModeTest {
     }
 
     @Test
-    void testMixedAggModeOperations() throws Exception {
-        // Test interleaved AGGREGATE and OVERWRITE operations
+    void testMixedMergeModeOperations() throws Exception {
+        // Test interleaved DEFAULT and OVERWRITE operations
 
-        // 1. Insert with AGGREGATE
+        // 1. Insert with DEFAULT
         KvRecordBatch batch1 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 100, "v1"}));
-        kvTablet.putAsLeader(batch1, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch1, null, MergeMode.DEFAULT);
 
-        // 2. Update with AGGREGATE (should aggregate)
+        // 2. Update with DEFAULT (should aggregate)
         KvRecordBatch batch2 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, 5L, 150, "v2"}));
-        kvTablet.putAsLeader(batch2, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch2, null, MergeMode.DEFAULT);
 
-        long afterAggOffset = logTablet.localLogEndOffset();
+        long afterDefaultOffset = logTablet.localLogEndOffset();
 
         // 3. Overwrite with specific value
         KvRecordBatch batch3 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, 20L, 80, "v3"}));
-        kvTablet.putAsLeader(batch3, null, AggMode.OVERWRITE);
+        kvTablet.putAsLeader(batch3, null, MergeMode.OVERWRITE);
 
         long afterOverwriteOffset = logTablet.localLogEndOffset();
 
-        // 4. Continue with AGGREGATE (should aggregate from overwritten value)
+        // 4. Continue with DEFAULT (should aggregate from overwritten value)
         KvRecordBatch batch4 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 200, "v4"}));
-        kvTablet.putAsLeader(batch4, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch4, null, MergeMode.DEFAULT);
 
         // Verify the final aggregation is based on overwritten value
         LogRecords actualLogRecords = readLogRecords(afterOverwriteOffset);
@@ -414,7 +414,7 @@ class KvTabletAggModeTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 100, "Alice"}));
-        kvTablet.putAsLeader(batch1, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch1, null, MergeMode.DEFAULT);
 
         long endOffset = logTablet.localLogEndOffset();
 
@@ -424,7 +424,7 @@ class KvTabletAggModeTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 5L, null, null}));
-        kvTablet.putAsLeader(batch2, targetColumns, AggMode.OVERWRITE);
+        kvTablet.putAsLeader(batch2, targetColumns, MergeMode.OVERWRITE);
 
         // Verify partial update with OVERWRITE: count should be replaced (not aggregated)
         LogRecords actualLogRecords = readLogRecords(endOffset);
@@ -455,7 +455,7 @@ class KvTabletAggModeTest {
                         kvRecordFactory.ofRecord(
                                 "k2".getBytes(), new Object[] {2, 20L, 200, "Bob"}));
         KvRecordBatch batch1 = kvRecordBatchFactory.ofRecords(initialRecords);
-        kvTablet.putAsLeader(batch1, null, AggMode.AGGREGATE);
+        kvTablet.putAsLeader(batch1, null, MergeMode.DEFAULT);
 
         long endOffset = logTablet.localLogEndOffset();
 
@@ -467,7 +467,7 @@ class KvTabletAggModeTest {
                         kvRecordFactory.ofRecord(
                                 "k2".getBytes(), new Object[] {2, 8L, 80, "Bob2"}));
         KvRecordBatch batch2 = kvRecordBatchFactory.ofRecords(overwriteRecords);
-        kvTablet.putAsLeader(batch2, null, AggMode.OVERWRITE);
+        kvTablet.putAsLeader(batch2, null, MergeMode.OVERWRITE);
 
         // Verify both keys are overwritten (not aggregated)
         LogRecords actualLogRecords = readLogRecords(endOffset);
@@ -492,16 +492,16 @@ class KvTabletAggModeTest {
                 .isEqualTo(expectedLogs);
     }
 
-    // ==================== Default AggMode Tests ====================
+    // ==================== Default MergeMode Tests ====================
 
     @Test
-    void testDefaultAggModeIsAggregate() throws Exception {
-        // Insert initial record using default (no aggMode parameter)
+    void testDefaultMergeModeIsDefault() throws Exception {
+        // Insert initial record using default (no mergeMode parameter)
         KvRecordBatch batch1 =
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 10L, 100, "Alice"}));
-        kvTablet.putAsLeader(batch1, null); // Using overload without aggMode
+        kvTablet.putAsLeader(batch1, null); // Using overload without mergeMode
 
         long endOffset = logTablet.localLogEndOffset();
 
@@ -510,9 +510,9 @@ class KvTabletAggModeTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord(
                                 "k1".getBytes(), new Object[] {1, 5L, 150, "Bob"}));
-        kvTablet.putAsLeader(batch2, null); // Using overload without aggMode
+        kvTablet.putAsLeader(batch2, null); // Using overload without mergeMode
 
-        // Verify aggregation happened (proving default is AGGREGATE)
+        // Verify aggregation happened (proving default is DEFAULT)
         LogRecords actualLogRecords = readLogRecords(endOffset);
         MemoryLogRecords expectedLogs =
                 logRecords(

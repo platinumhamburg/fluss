@@ -22,7 +22,6 @@ import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.record.bytesview.BytesView;
-import org.apache.fluss.rpc.protocol.AggMode;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -120,15 +119,6 @@ public abstract class WriteBatch {
     public abstract int batchSequence();
 
     public abstract void abortRecordAppends();
-
-    /**
-     * Get the aggregation mode for this batch (only applicable to KV batches).
-     *
-     * @return the aggregation mode, defaults to AGGREGATE for log batches
-     */
-    public AggMode getAggMode() {
-        return AggMode.AGGREGATE;
-    }
 
     public boolean hasBatchSequence() {
         return batchSequence() != NO_BATCH_SEQUENCE;

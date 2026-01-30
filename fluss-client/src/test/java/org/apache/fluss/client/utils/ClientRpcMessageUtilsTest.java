@@ -25,7 +25,7 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
-import org.apache.fluss.rpc.protocol.AggMode;
+import org.apache.fluss.rpc.protocol.MergeMode;
 
 import org.junit.jupiter.api.Test;
 
@@ -42,7 +42,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Tests for {@link ClientRpcMessageUtils}.
  *
- * <p>Focuses on AggMode consistency validation in makePutKvRequest.
+ * <p>Focuses on MergeMode consistency validation in makePutKvRequest.
  */
 class ClientRpcMessageUtilsTest {
 
@@ -51,10 +51,10 @@ class ClientRpcMessageUtilsTest {
     private static final int TIMEOUT_MS = 30000;
 
     @Test
-    void testMakePutKvRequestWithConsistentAggMode() throws Exception {
-        // Create two batches with same aggMode (AGGREGATE)
-        KvWriteBatch batch1 = createKvWriteBatch(0, AggMode.AGGREGATE);
-        KvWriteBatch batch2 = createKvWriteBatch(1, AggMode.AGGREGATE);
+    void testMakePutKvRequestWithConsistentMergeMode() throws Exception {
+        // Create two batches with same mergeMode (DEFAULT)
+        KvWriteBatch batch1 = createKvWriteBatch(0, MergeMode.DEFAULT);
+        KvWriteBatch batch2 = createKvWriteBatch(1, MergeMode.DEFAULT);
 
         List<ReadyWriteBatch> readyBatches =
                 Arrays.asList(
@@ -65,16 +65,16 @@ class ClientRpcMessageUtilsTest {
         PutKvRequest request =
                 ClientRpcMessageUtils.makePutKvRequest(TABLE_ID, ACKS, TIMEOUT_MS, readyBatches);
 
-        // Verify aggMode is set correctly in request
+        // Verify mergeMode is set correctly in request
         assertThat(request.hasAggMode()).isTrue();
-        assertThat(request.getAggMode()).isEqualTo(AggMode.AGGREGATE.getProtoValue());
+        assertThat(request.getAggMode()).isEqualTo(MergeMode.DEFAULT.getProtoValue());
     }
 
     @Test
     void testMakePutKvRequestWithOverwriteMode() throws Exception {
         // Create batches with OVERWRITE mode
-        KvWriteBatch batch1 = createKvWriteBatch(0, AggMode.OVERWRITE);
-        KvWriteBatch batch2 = createKvWriteBatch(1, AggMode.OVERWRITE);
+        KvWriteBatch batch1 = createKvWriteBatch(0, MergeMode.OVERWRITE);
+        KvWriteBatch batch2 = createKvWriteBatch(1, MergeMode.OVERWRITE);
 
         List<ReadyWriteBatch> readyBatches =
                 Arrays.asList(
@@ -86,36 +86,36 @@ class ClientRpcMessageUtilsTest {
 
         // Verify OVERWRITE mode is set correctly
         assertThat(request.hasAggMode()).isTrue();
-        assertThat(request.getAggMode()).isEqualTo(AggMode.OVERWRITE.getProtoValue());
+        assertThat(request.getAggMode()).isEqualTo(MergeMode.OVERWRITE.getProtoValue());
     }
 
     @Test
-    void testMakePutKvRequestWithInconsistentAggMode() throws Exception {
-        // Create batches with different aggModes
-        KvWriteBatch aggregateBatch = createKvWriteBatch(0, AggMode.AGGREGATE);
-        KvWriteBatch overwriteBatch = createKvWriteBatch(1, AggMode.OVERWRITE);
+    void testMakePutKvRequestWithInconsistentMergeMode() throws Exception {
+        // Create batches with different mergeModes
+        KvWriteBatch defaultBatch = createKvWriteBatch(0, MergeMode.DEFAULT);
+        KvWriteBatch overwriteBatch = createKvWriteBatch(1, MergeMode.OVERWRITE);
 
         List<ReadyWriteBatch> readyBatches =
                 Arrays.asList(
-                        new ReadyWriteBatch(new TableBucket(TABLE_ID, 0), aggregateBatch),
+                        new ReadyWriteBatch(new TableBucket(TABLE_ID, 0), defaultBatch),
                         new ReadyWriteBatch(new TableBucket(TABLE_ID, 1), overwriteBatch));
 
-        // Should throw exception due to inconsistent aggMode
+        // Should throw exception due to inconsistent mergeMode
         assertThatThrownBy(
                         () ->
                                 ClientRpcMessageUtils.makePutKvRequest(
                                         TABLE_ID, ACKS, TIMEOUT_MS, readyBatches))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(
-                        "All the write batches to make put kv request should have the same aggMode")
-                .hasMessageContaining("AGGREGATE")
+                        "All the write batches to make put kv request should have the same mergeMode")
+                .hasMessageContaining("DEFAULT")
                 .hasMessageContaining("OVERWRITE");
     }
 
     @Test
     void testMakePutKvRequestWithSingleBatch() throws Exception {
         // Single batch should always succeed
-        KvWriteBatch batch = createKvWriteBatch(0, AggMode.OVERWRITE);
+        KvWriteBatch batch = createKvWriteBatch(0, MergeMode.OVERWRITE);
 
         List<ReadyWriteBatch> readyBatches =
                 Collections.singletonList(new ReadyWriteBatch(new TableBucket(TABLE_ID, 0), batch));
@@ -123,10 +123,10 @@ class ClientRpcMessageUtilsTest {
         PutKvRequest request =
                 ClientRpcMessageUtils.makePutKvRequest(TABLE_ID, ACKS, TIMEOUT_MS, readyBatches);
 
-        assertThat(request.getAggMode()).isEqualTo(AggMode.OVERWRITE.getProtoValue());
+        assertThat(request.getAggMode()).isEqualTo(MergeMode.OVERWRITE.getProtoValue());
     }
 
-    private KvWriteBatch createKvWriteBatch(int bucketId, AggMode aggMode) throws Exception {
+    private KvWriteBatch createKvWriteBatch(int bucketId, MergeMode mergeMode) throws Exception {
         MemorySegment segment = MemorySegment.allocateHeapMemory(1024);
         PreAllocatedPagedOutputView outputView =
                 new PreAllocatedPagedOutputView(Collections.singletonList(segment));
@@ -138,7 +138,7 @@ class ClientRpcMessageUtilsTest {
                 Integer.MAX_VALUE,
                 outputView,
                 null,
-                aggMode,
+                mergeMode,
                 System.currentTimeMillis());
     }
 }

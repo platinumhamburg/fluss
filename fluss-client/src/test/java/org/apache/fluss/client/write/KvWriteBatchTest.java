@@ -33,7 +33,7 @@ import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
-import org.apache.fluss.rpc.protocol.AggMode;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.types.DataType;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -228,7 +228,7 @@ class KvWriteBatchTest {
                 writeLimit,
                 outputView,
                 null,
-                AggMode.AGGREGATE,
+                MergeMode.DEFAULT,
                 System.currentTimeMillis());
     }
 
@@ -257,58 +257,60 @@ class KvWriteBatchTest {
         assertThat(kvRecord.getRow()).isEqualTo(row);
     }
 
-    // ==================== AggMode Tests ====================
+    // ==================== MergeMode Tests ====================
 
     @Test
-    void testAggModeConsistencyValidation() throws Exception {
-        // Create batch with AGGREGATE mode
-        KvWriteBatch aggregateBatch =
-                createKvWriteBatchWithAggMode(
-                        new TableBucket(DATA1_TABLE_ID_PK, 0), AggMode.AGGREGATE);
+    void testMergeModeConsistencyValidation() throws Exception {
+        // Create batch with DEFAULT mode
+        KvWriteBatch defaultBatch =
+                createKvWriteBatchWithMergeMode(
+                        new TableBucket(DATA1_TABLE_ID_PK, 0), MergeMode.DEFAULT);
 
-        // Append record with AGGREGATE mode should succeed
-        WriteRecord aggregateRecord = createWriteRecordWithAggMode(AggMode.AGGREGATE);
-        assertThat(aggregateBatch.tryAppend(aggregateRecord, newWriteCallback())).isTrue();
+        // Append record with DEFAULT mode should succeed
+        WriteRecord defaultRecord = createWriteRecordWithMergeMode(MergeMode.DEFAULT);
+        assertThat(defaultBatch.tryAppend(defaultRecord, newWriteCallback())).isTrue();
 
         // Append record with OVERWRITE mode should fail
-        WriteRecord overwriteRecord = createWriteRecordWithAggMode(AggMode.OVERWRITE);
-        assertThatThrownBy(() -> aggregateBatch.tryAppend(overwriteRecord, newWriteCallback()))
+        WriteRecord overwriteRecord = createWriteRecordWithMergeMode(MergeMode.OVERWRITE);
+        assertThatThrownBy(() -> defaultBatch.tryAppend(overwriteRecord, newWriteCallback()))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("Cannot mix records with different aggMode in the same batch")
-                .hasMessageContaining("Batch aggMode: AGGREGATE")
-                .hasMessageContaining("Record aggMode: OVERWRITE");
+                .hasMessageContaining(
+                        "Cannot mix records with different mergeMode in the same batch")
+                .hasMessageContaining("Batch mergeMode: DEFAULT")
+                .hasMessageContaining("Record mergeMode: OVERWRITE");
     }
 
     @Test
     void testOverwriteModeBatch() throws Exception {
         // Create batch with OVERWRITE mode
         KvWriteBatch overwriteBatch =
-                createKvWriteBatchWithAggMode(
-                        new TableBucket(DATA1_TABLE_ID_PK, 0), AggMode.OVERWRITE);
+                createKvWriteBatchWithMergeMode(
+                        new TableBucket(DATA1_TABLE_ID_PK, 0), MergeMode.OVERWRITE);
 
-        // Verify batch has correct aggMode
-        assertThat(overwriteBatch.getAggMode()).isEqualTo(AggMode.OVERWRITE);
+        // Verify batch has correct mergeMode
+        assertThat(overwriteBatch.getMergeMode()).isEqualTo(MergeMode.OVERWRITE);
 
         // Append record with OVERWRITE mode should succeed
-        WriteRecord overwriteRecord = createWriteRecordWithAggMode(AggMode.OVERWRITE);
+        WriteRecord overwriteRecord = createWriteRecordWithMergeMode(MergeMode.OVERWRITE);
         assertThat(overwriteBatch.tryAppend(overwriteRecord, newWriteCallback())).isTrue();
 
-        // Append record with AGGREGATE mode should fail
-        WriteRecord aggregateRecord = createWriteRecordWithAggMode(AggMode.AGGREGATE);
-        assertThatThrownBy(() -> overwriteBatch.tryAppend(aggregateRecord, newWriteCallback()))
+        // Append record with DEFAULT mode should fail
+        WriteRecord defaultRecord = createWriteRecordWithMergeMode(MergeMode.DEFAULT);
+        assertThatThrownBy(() -> overwriteBatch.tryAppend(defaultRecord, newWriteCallback()))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("Cannot mix records with different aggMode in the same batch")
-                .hasMessageContaining("Batch aggMode: OVERWRITE")
-                .hasMessageContaining("Record aggMode: AGGREGATE");
+                .hasMessageContaining(
+                        "Cannot mix records with different mergeMode in the same batch")
+                .hasMessageContaining("Batch mergeMode: OVERWRITE")
+                .hasMessageContaining("Record mergeMode: DEFAULT");
     }
 
     @Test
-    void testDefaultAggModeIsAggregate() throws Exception {
+    void testDefaultMergeModeIsDefault() throws Exception {
         KvWriteBatch batch = createKvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
-        assertThat(batch.getAggMode()).isEqualTo(AggMode.AGGREGATE);
+        assertThat(batch.getMergeMode()).isEqualTo(MergeMode.DEFAULT);
     }
 
-    private KvWriteBatch createKvWriteBatchWithAggMode(TableBucket tb, AggMode aggMode)
+    private KvWriteBatch createKvWriteBatchWithMergeMode(TableBucket tb, MergeMode mergeMode)
             throws Exception {
         PreAllocatedPagedOutputView outputView =
                 new PreAllocatedPagedOutputView(
@@ -321,11 +323,11 @@ class KvWriteBatchTest {
                 Integer.MAX_VALUE,
                 outputView,
                 null,
-                aggMode,
+                mergeMode,
                 System.currentTimeMillis());
     }
 
-    private WriteRecord createWriteRecordWithAggMode(AggMode aggMode) {
+    private WriteRecord createWriteRecordWithMergeMode(MergeMode mergeMode) {
         return WriteRecord.forUpsert(
                 DATA1_TABLE_INFO_PK,
                 PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
@@ -334,6 +336,6 @@ class KvWriteBatchTest {
                 key,
                 WriteFormat.COMPACTED_KV,
                 null,
-                aggMode);
+                mergeMode);
     }
 }

@@ -45,7 +45,7 @@ import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
 import org.apache.fluss.row.encode.ValueDecoder;
-import org.apache.fluss.rpc.protocol.AggMode;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementUpdater;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
@@ -281,17 +281,17 @@ public final class KvTablet {
     }
 
     /**
-     * Put the KvRecordBatch into the kv storage with default AGGREGATE mode.
+     * Put the KvRecordBatch into the kv storage with default DEFAULT mode.
      *
      * <p>This is a convenience method that calls {@link #putAsLeader(KvRecordBatch, int[],
-     * AggMode)} with {@link AggMode#AGGREGATE}.
+     * MergeMode)} with {@link MergeMode#DEFAULT}.
      *
      * @param kvRecords the kv records to put into
      * @param targetColumns the target columns to put, null if put all columns
      */
     public LogAppendInfo putAsLeader(KvRecordBatch kvRecords, @Nullable int[] targetColumns)
             throws Exception {
-        return putAsLeader(kvRecords, targetColumns, AggMode.AGGREGATE);
+        return putAsLeader(kvRecords, targetColumns, MergeMode.DEFAULT);
     }
 
     /**
@@ -313,10 +313,10 @@ public final class KvTablet {
      *
      * @param kvRecords the kv records to put into
      * @param targetColumns the target columns to put, null if put all columns
-     * @param aggMode the aggregation mode (AGGREGATE or OVERWRITE)
+     * @param mergeMode the merge mode (DEFAULT or OVERWRITE)
      */
     public LogAppendInfo putAsLeader(
-            KvRecordBatch kvRecords, @Nullable int[] targetColumns, AggMode aggMode)
+            KvRecordBatch kvRecords, @Nullable int[] targetColumns, MergeMode mergeMode)
             throws Exception {
         return inWriteLock(
                 kvLock,
@@ -328,13 +328,13 @@ public final class KvTablet {
                     short latestSchemaId = (short) schemaInfo.getSchemaId();
                     validateSchemaId(kvRecords.schemaId(), latestSchemaId);
 
-                    // Determine the row merger based on aggMode:
-                    // - AGGREGATE: Use the configured merge engine (rowMerger)
+                    // Determine the row merger based on mergeMode:
+                    // - DEFAULT: Use the configured merge engine (rowMerger)
                     // - OVERWRITE: Bypass merge engine, use pre-created overwriteRowMerger
                     //   to directly replace values (for undo recovery scenarios)
                     // We only support ADD COLUMN, so targetColumns is fine to be used directly.
                     RowMerger currentMerger =
-                            (aggMode == AggMode.OVERWRITE)
+                            (mergeMode == MergeMode.OVERWRITE)
                                     ? overwriteRowMerger.configureTargetColumns(
                                             targetColumns, latestSchemaId, latestSchema)
                                     : rowMerger.configureTargetColumns(
