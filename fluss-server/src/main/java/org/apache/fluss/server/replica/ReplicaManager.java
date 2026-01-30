@@ -550,27 +550,6 @@ public class ReplicaManager {
     }
 
     /**
-     * Put kv records to leader replicas of the buckets with default DEFAULT mode.
-     *
-     * <p>This is a convenience method that calls {@link #putRecordsToKv(int, int, Map, int[],
-     * MergeMode, Consumer)} with {@link MergeMode#DEFAULT}.
-     */
-    public void putRecordsToKv(
-            int timeoutMs,
-            int requiredAcks,
-            Map<TableBucket, KvRecordBatch> entriesPerBucket,
-            @Nullable int[] targetColumns,
-            Consumer<List<PutKvResultForBucket>> responseCallback) {
-        putRecordsToKv(
-                timeoutMs,
-                requiredAcks,
-                entriesPerBucket,
-                targetColumns,
-                MergeMode.DEFAULT,
-                responseCallback);
-    }
-
-    /**
      * Put kv records to leader replicas of the buckets, the kv data will write to kv tablet and the
      * response callback need to wait for the cdc log to be replicated to other replicas if needed.
      *
