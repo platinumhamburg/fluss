@@ -1831,25 +1831,22 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             // First upsert - should return log end offset > 0
             UpsertResult upsertResult1 = upsertWriter.upsert(row(1, "a")).get();
             assertThat(upsertResult1.getBucket()).isEqualTo(expectedBucket);
-            assertThat(upsertResult1.getLogEndOffset()).isGreaterThan(0);
-            long firstOffset = upsertResult1.getLogEndOffset();
+            assertThat(upsertResult1.getLogEndOffset()).isEqualTo(1);
 
             // Second upsert - should return higher log end offset
             UpsertResult upsertResult2 = upsertWriter.upsert(row(2, "b")).get();
             assertThat(upsertResult2.getBucket()).isEqualTo(expectedBucket);
-            assertThat(upsertResult2.getLogEndOffset()).isGreaterThan(firstOffset);
-            long secondOffset = upsertResult2.getLogEndOffset();
+            assertThat(upsertResult2.getLogEndOffset()).isEqualTo(2);
 
             // Update existing key - should return higher log end offset
             UpsertResult upsertResult3 = upsertWriter.upsert(row(1, "aa")).get();
             assertThat(upsertResult3.getBucket()).isEqualTo(expectedBucket);
-            assertThat(upsertResult3.getLogEndOffset()).isGreaterThan(secondOffset);
-            long thirdOffset = upsertResult3.getLogEndOffset();
+            assertThat(upsertResult3.getLogEndOffset()).isEqualTo(4);
 
             // Delete - should return higher log end offset
             DeleteResult deleteResult = upsertWriter.delete(row(1, "aa")).get();
             assertThat(deleteResult.getBucket()).isEqualTo(expectedBucket);
-            assertThat(deleteResult.getLogEndOffset()).isGreaterThan(thirdOffset);
+            assertThat(deleteResult.getLogEndOffset()).isEqualTo(5);
 
             // Verify the data via lookup
             Lookuper lookuper = table.newLookup().createLookuper();
@@ -1872,7 +1869,7 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                         .build();
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder().schema(schema).distributedBy(1, "a").build();
-        createTable(tablePath, tableDescriptor, true);
+        long tableId = createTable(tablePath, tableDescriptor, true);
 
         // Configure small batch size to ensure records are batched together
         Configuration config = new Configuration(clientConf);
@@ -1897,18 +1894,16 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             UpsertResult result2 = future2.get();
             UpsertResult result3 = future3.get();
 
+            TableBucket expectedBucket = new TableBucket(tableId, 0);
             // All results should have valid bucket and log end offset
-            assertThat(result1.getBucket()).isNotNull();
-            assertThat(result1.getLogEndOffset()).isGreaterThan(0);
-            assertThat(result2.getBucket()).isNotNull();
-            assertThat(result2.getLogEndOffset()).isGreaterThan(0);
-            assertThat(result3.getBucket()).isNotNull();
-            assertThat(result3.getLogEndOffset()).isGreaterThan(0);
-
+            assertThat(result1.getBucket()).isEqualTo(expectedBucket);
+            assertThat(result2.getBucket()).isEqualTo(expectedBucket);
+            assertThat(result3.getBucket()).isEqualTo(expectedBucket);
             // Records in the same batch should have the same log end offset
             // (since they're sent to the same bucket)
-            assertThat(result1.getLogEndOffset()).isEqualTo(result2.getLogEndOffset());
-            assertThat(result2.getLogEndOffset()).isEqualTo(result3.getLogEndOffset());
+            assertThat(result1.getLogEndOffset()).isEqualTo(3);
+            assertThat(result2.getLogEndOffset()).isEqualTo(3);
+            assertThat(result3.getLogEndOffset()).isEqualTo(3);
         }
     }
 }

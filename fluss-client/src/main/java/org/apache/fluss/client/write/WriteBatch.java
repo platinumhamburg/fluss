@@ -55,12 +55,6 @@ public abstract class WriteBatch {
     protected int recordCount;
     private long drainedMs;
 
-    /** Result bucket for callbacks (set when batch completes with result info). */
-    @Nullable private TableBucket resultBucket;
-
-    /** Result log end offset for callbacks (set when batch completes with result info). */
-    private long resultLogEndOffset = -1;
-
     public WriteBatch(int bucketId, PhysicalTablePath physicalTablePath, long createdMs) {
         this.physicalTablePath = physicalTablePath;
         this.createdMs = createdMs;
@@ -152,7 +146,7 @@ public abstract class WriteBatch {
                 physicalTablePath,
                 bucketId,
                 exception);
-        completeFutureAndFireCallbacks(exception);
+        completeFutureAndFireCallbacks(null, -1, exception);
     }
 
     public boolean sequenceHasBeenReset() {
@@ -185,14 +179,12 @@ public abstract class WriteBatch {
 
     /** Complete the batch successfully (for log batches without offset tracking). */
     public boolean complete() {
-        return done(null);
+        return done(null, -1, null);
     }
 
     /** Complete the batch successfully with bucket and log end offset info (for KV batches). */
     public boolean complete(TableBucket bucket, long logEndOffset) {
-        this.resultBucket = bucket;
-        this.resultLogEndOffset = logEndOffset;
-        return done(null);
+        return done(bucket, logEndOffset, null);
     }
 
     /**
@@ -201,10 +193,13 @@ public abstract class WriteBatch {
      */
     public boolean completeExceptionally(Exception exception) {
         checkNotNull(exception);
-        return done(exception);
+        return done(null, -1, exception);
     }
 
-    private void completeFutureAndFireCallbacks(@Nullable Exception exception) {
+    private void completeFutureAndFireCallbacks(
+            @Nullable TableBucket resultBucket,
+            long resultLogEndOffset,
+            @Nullable Exception exception) {
         // execute callbacks with result info (for KV batches that track log end offsets)
         callbacks.forEach(
                 callback -> {
@@ -246,8 +241,16 @@ public abstract class WriteBatch {
      * called twice when an inflight batch expires before a response from the tablet server is
      * received. The batch's final state is set to FAILED. But it could succeed on the tablet server
      * and second time around batch.done() may try to set SUCCEEDED final state.
+     *
+     * @param resultBucket the table bucket of the batch written into
+     * @param resultLogEndOffset the log end offset after the batch write
+     * @param batchException the exception if the batch write failed, null otherwise
+     * @return true if this call set the final state, false if the final state was already set
      */
-    private boolean done(@Nullable Exception batchException) {
+    private boolean done(
+            @Nullable TableBucket resultBucket,
+            long resultLogEndOffset,
+            @Nullable Exception batchException) {
         final FinalState tryFinalState =
                 (batchException == null) ? FinalState.SUCCEEDED : FinalState.FAILED;
         if (tryFinalState == FinalState.SUCCEEDED) {
@@ -257,7 +260,7 @@ public abstract class WriteBatch {
         }
 
         if (finalState.compareAndSet(null, tryFinalState)) {
-            completeFutureAndFireCallbacks(batchException);
+            completeFutureAndFireCallbacks(resultBucket, resultLogEndOffset, batchException);
             return true;
         }
 
