@@ -191,8 +191,8 @@ public class UndoRecoveryCoordinator {
          *
          * @param checkpointOffset the checkpoint offset (start point, inclusive)
          * @param logEndOffset the log end offset (end point, exclusive)
-         * @throws IllegalArgumentException if offsets are negative, checkpointOffset >
-         *     logEndOffset, or checkpointOffset == logEndOffset (no recovery needed)
+         * @throws IllegalArgumentException if offsets are negative or checkpointOffset >
+         *     logEndOffset
          */
         public UndoOffsets(long checkpointOffset, long logEndOffset) {
             if (checkpointOffset < 0) {
@@ -209,13 +209,7 @@ public class UndoRecoveryCoordinator {
                                 "checkpointOffset (%d) must not be greater than logEndOffset (%d)",
                                 checkpointOffset, logEndOffset));
             }
-            if (checkpointOffset == logEndOffset) {
-                throw new IllegalArgumentException(
-                        String.format(
-                                "checkpointOffset (%d) equals logEndOffset (%d), no recovery needed. "
-                                        + "Caller should filter out buckets that don't need recovery.",
-                                checkpointOffset, logEndOffset));
-            }
+            // Note: checkpointOffset == logEndOffset is allowed, it simply means no recovery needed
             this.checkpointOffset = checkpointOffset;
             this.logEndOffset = logEndOffset;
         }
