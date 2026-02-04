@@ -167,6 +167,15 @@ public class RocksDBKv implements AutoCloseable {
         }
     }
 
+    /** Trigger a manual compaction for the default column family. This call is synchronous. */
+    public void compact() throws IOException {
+        try {
+            db.compactRange(defaultColumnFamilyHandle);
+        } catch (RocksDBException e) {
+            throw new IOException("Fail to compact RocksDB.", e);
+        }
+    }
+
     public void checkIfRocksDBClosed() {
         if (this.closed) {
             throw new FlussRuntimeException(

@@ -102,12 +102,15 @@ public class RemoteLogTestBase extends ReplicaTestBase {
         long nextOffset = segments.get(segmentIndex + 1).getBaseOffset();
         File writerIdSnapshotFile =
                 logTablet.writerStateManager().fetchSnapshot(nextOffset).orElse(null);
+        File bucketStateSnapshotFile =
+                logTablet.bucketStateManager().fetchSnapshot(nextOffset).orElse(null);
         LogSegmentFiles logSegmentFiles =
                 new LogSegmentFiles(
                         segment.getFileLogRecords().file().toPath(),
                         segment.offsetIndex().file().toPath(),
                         segment.timeIndex().file().toPath(),
-                        writerIdSnapshotFile.toPath());
+                        writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null,
+                        bucketStateSnapshotFile != null ? bucketStateSnapshotFile.toPath() : null);
 
         UUID remoteLogSegmentId = UUID.randomUUID();
         RemoteLogSegment remoteLogSegment =

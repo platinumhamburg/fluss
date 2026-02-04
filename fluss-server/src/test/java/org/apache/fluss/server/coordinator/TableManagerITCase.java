@@ -275,7 +275,7 @@ class TableManagerITCase {
         assertThatThrownBy(() -> adminGateway.dropTable(newDropTableRequest(db1, tb1, false)).get())
                 .cause()
                 .isInstanceOf(TableNotExistException.class)
-                .hasMessageContaining(String.format("Table %s does not exist.", tablePath));
+                .hasMessageContaining(String.format("Table '%s' does not exist.", tablePath));
 
         // drop a not exist table with ignore if not exists shouldn't throw exception
         adminGateway.dropTable(newDropTableRequest(db1, tb1, true)).get();

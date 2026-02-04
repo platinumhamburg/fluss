@@ -41,6 +41,7 @@ import org.apache.fluss.types.MapType;
 import org.apache.fluss.types.RowType;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /** Utility class for {@link org.apache.fluss.row.InternalRow} related operations. */
@@ -131,6 +132,55 @@ public class InternalRowUtils {
             return ((Decimal) o).copy();
         }
         return o;
+    }
+
+    /**
+     * Converts an {@link InternalRow} to a debug string representation.
+     *
+     * <p>This method uses pre-created {@link InternalRow.FieldGetter}s for efficient field access.
+     * For complex types (ARRAY, MAP, ROW), it shows type placeholders instead of full content.
+     *
+     * @param rowType the row type schema
+     * @param row the internal row to convert
+     * @return a debug string like "Row[field1: value1, field2: value2]"
+     */
+    public static String toDebugString(RowType rowType, InternalRow row) {
+        InternalRow.FieldGetter[] fieldGetters = InternalRow.createFieldGetters(rowType);
+        List<String> fieldNames = rowType.getFieldNames();
+
+        StringBuilder sb = new StringBuilder("Row[");
+        for (int i = 0; i < rowType.getFieldCount(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(fieldNames.get(i)).append(": ");
+            sb.append(
+                    fieldValueToString(fieldGetters[i].getFieldOrNull(row), rowType.getTypeAt(i)));
+        }
+        return sb.append("]").toString();
+    }
+
+    /** Converts a field value to its string representation for debug purposes. */
+    private static String fieldValueToString(Object value, org.apache.fluss.types.DataType type) {
+        if (value == null) {
+            return "null";
+        }
+        switch (type.getTypeRoot()) {
+            case CHAR:
+            case STRING:
+                return "'" + value + "'";
+            case BINARY:
+            case BYTES:
+                return "@bytes[" + ((byte[]) value).length + "]";
+            case ARRAY:
+                return "@array";
+            case MAP:
+                return "@map";
+            case ROW:
+                return "@row";
+            default:
+                return String.valueOf(value);
+        }
     }
 
     /**

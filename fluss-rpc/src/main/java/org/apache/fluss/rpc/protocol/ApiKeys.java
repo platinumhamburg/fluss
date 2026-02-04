@@ -97,7 +97,8 @@ public enum ApiKeys {
     PREPARE_LAKE_TABLE_SNAPSHOT(1052, 0, 0, PRIVATE),
     REGISTER_PRODUCER_OFFSETS(1053, 0, 0, PUBLIC),
     GET_PRODUCER_OFFSETS(1054, 0, 0, PUBLIC),
-    DELETE_PRODUCER_OFFSETS(1055, 0, 0, PUBLIC);
+    DELETE_PRODUCER_OFFSETS(1055, 0, 0, PUBLIC),
+    FETCH_INDEX(1056, 0, 0, PRIVATE);
 
     private static final Map<Integer, ApiKeys> ID_TO_TYPE =
             Arrays.stream(ApiKeys.values())

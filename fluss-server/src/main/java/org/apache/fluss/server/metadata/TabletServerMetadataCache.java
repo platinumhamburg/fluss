@@ -30,6 +30,9 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.tablet.TabletServer;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
@@ -43,6 +46,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_ID;
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_NAME;
@@ -52,6 +56,8 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /** The implement of {@link ServerMetadataCache} for {@link TabletServer}. */
 public class TabletServerMetadataCache implements ServerMetadataCache {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TabletServerMetadataCache.class);
 
     private final Lock metadataLock = new ReentrantLock();
 
@@ -116,11 +122,24 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
         return serverMetadataSnapshot.getPhysicalTablePath(partitionId);
     }
 
+    /**
+     * Efficiently retrieve only the leader ID for a given table bucket from cache. This method
+     * avoids constructing intermediate BucketMetadata objects for better performance.
+     *
+     * @param tableBucket the table bucket to query
+     * @return Optional containing the leader ID if found (may be -1 if no leader elected),
+     *     Optional.empty() if bucket not found in cache
+     */
+    public Optional<Integer> getBucketLeaderId(TableBucket tableBucket) {
+        return serverMetadataSnapshot.getBucketLeaderId(tableBucket);
+    }
+
     public Optional<TableMetadata> getTableMetadata(TablePath tablePath) {
         // Only get data from cache, do not access ZK.
         ServerMetadataSnapshot snapshot = serverMetadataSnapshot;
         OptionalLong tableIdOpt = snapshot.getTableId(tablePath);
         if (!tableIdOpt.isPresent()) {
+            LOG.debug("Table {} not found in metadata cache", tablePath);
             return Optional.empty();
         }
 
@@ -131,10 +150,19 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
             TableInfo tableInfo = metadataManager.getTable(tablePath);
             List<BucketMetadata> bucketMetadataList =
                     new ArrayList<>(snapshot.getBucketMetadataForTable(tableId).values());
+            LOG.debug(
+                    "Retrieved table metadata for {}: {} buckets",
+                    tablePath,
+                    bucketMetadataList.size());
             return Optional.of(new TableMetadata(tableInfo, bucketMetadataList));
         } catch (Exception e) {
             // If table doesn't exist in ZK but exists in cache, return empty
             // This maintains backward compatibility while fixing the semantic issue
+            LOG.warn(
+                    "Failed to retrieve table metadata from ZK for table {} (cached table ID: {}): {}",
+                    tablePath,
+                    tableId,
+                    e.getMessage());
             return Optional.empty();
         }
     }
@@ -214,9 +242,9 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                 bucketMetadataMapForTables.remove(removedTableId);
                             }
                         } else if (tablePath == DELETED_TABLE_PATH) {
-                            serverMetadataSnapshot
-                                    .getTablePath(tableId)
-                                    .ifPresent(tableIdByPath::remove);
+                            Optional<TablePath> removedTablePath =
+                                    serverMetadataSnapshot.getTablePath(tableId);
+                            removedTablePath.ifPresent(tableIdByPath::remove);
                             bucketMetadataMapForTables.remove(tableId);
                         } else {
                             tableIdByPath.put(tablePath, tableId);
@@ -256,12 +284,24 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                             Long removedPartitionId = partitionIdByPath.remove(physicalTablePath);
                             if (removedPartitionId != null) {
                                 bucketMetadataMapForPartitions.remove(removedPartitionId);
+                                LOG.info(
+                                        "Partition deleted: table={}, partitionName={}, partitionId={}",
+                                        tablePath,
+                                        partitionName,
+                                        removedPartitionId);
                             }
                         } else if (partitionName.equals(DELETED_PARTITION_NAME)) {
-                            serverMetadataSnapshot
-                                    .getPhysicalTablePath(partitionId)
-                                    .ifPresent(partitionIdByPath::remove);
+                            Optional<PhysicalTablePath> removedPartitionPath =
+                                    serverMetadataSnapshot.getPhysicalTablePath(partitionId);
+                            removedPartitionPath.ifPresent(partitionIdByPath::remove);
                             bucketMetadataMapForPartitions.remove(partitionId);
+                            LOG.info(
+                                    "Partition deleted by id: table={}, partitionId={}, partitionName={}",
+                                    tablePath,
+                                    partitionId,
+                                    removedPartitionPath
+                                            .map(PhysicalTablePath::getPartitionName)
+                                            .orElse("unknown"));
                         } else {
                             partitionIdByPath.put(physicalTablePath, partitionId);
                             partitionMetadata
@@ -275,6 +315,12 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                                             .put(
                                                                     bucketMetadata.getBucketId(),
                                                                     bucketMetadata));
+                            LOG.info(
+                                    "Partition created: table={}, partitionName={}, partitionId={}, buckets={}",
+                                    tablePath,
+                                    partitionName,
+                                    partitionId,
+                                    partitionMetadata.getBucketMetadataList().size());
                         }
                     }
 
@@ -288,6 +334,99 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                     bucketMetadataMapForTables,
                                     bucketMetadataMapForPartitions);
                 });
+    }
+
+    /**
+     * Get all related index tables for the specified data table. This method is used by
+     * ReplicaManager to obtain index metadata for data table replicas.
+     *
+     * <p>This method ensures all index tables defined in the schema are retrieved. If any index
+     * table is missing (not found in ZooKeeper), an exception is thrown to trigger retry at the
+     * caller level. This prevents silent data inconsistency where some index data would not be
+     * replicated.
+     *
+     * @param tablePath the path of the data table
+     * @return list of index table info, or empty list if no indexes
+     * @throws TableNotExistException if the main table or any index table does not exist
+     * @throws FlussRuntimeException if there is an error accessing ZooKeeper
+     */
+    public List<TableInfo> getRelatedIndexTables(TablePath tablePath) {
+        // Get the main table information from ZooKeeper
+        // This will throw TableNotExistException if the main table doesn't exist
+        TableInfo tableInfo = metadataManager.getTable(tablePath);
+        Schema schema = tableInfo.getSchema();
+        List<Schema.Index> indexes = schema.getIndexes();
+
+        if (indexes.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<TableInfo> indexTableInfoList = new ArrayList<>();
+
+        // Get info for each index table
+        // All index tables defined in the schema MUST exist, otherwise it indicates
+        // metadata inconsistency or index tables are still being created
+        for (Schema.Index index : indexes) {
+            TablePath indexTablePath = TablePath.forIndexTable(tablePath, index.getIndexName());
+            // metadataManager.getTable() will throw:
+            // - TableNotExistException if the index table doesn't exist (triggers retry)
+            // - FlussRuntimeException if there's a ZK access error (triggers retry)
+            TableInfo indexTableInfo = metadataManager.getTable(indexTablePath);
+            indexTableInfoList.add(indexTableInfo);
+        }
+
+        LOG.debug(
+                "Retrieved {} index tables for data table {}: {}",
+                indexTableInfoList.size(),
+                tablePath,
+                indexes.stream().map(Schema.Index::getIndexName).collect(Collectors.toList()));
+
+        return indexTableInfoList;
+    }
+
+    /**
+     * Get the data table information for the specified index table. This method is used by
+     * ReplicaManager to obtain data table metadata for index table replicas.
+     *
+     * <p>This method uses TablePath-based lookup via MetadataManager for efficient O(1) ZK access,
+     * with mainTableId validation for consistency.
+     *
+     * @param indexTablePath the path of the index table
+     * @return data table info or empty if not found or not an index table
+     * @throws TableNotExistException if the index table or main table does not exist
+     * @throws FlussRuntimeException if there is an error accessing ZooKeeper
+     */
+    public Optional<TableInfo> getMainTableForIndex(TablePath indexTablePath) {
+        // metadataManager.getTable() will throw TableNotExistException if table doesn't exist
+        TableInfo indexTableInfo = metadataManager.getTable(indexTablePath);
+
+        if (!indexTableInfo.isIndexTable()) {
+            return Optional.empty();
+        }
+
+        Optional<String> mainTableNameOpt = indexTableInfo.toTableDescriptor().getMainTableName();
+        if (!mainTableNameOpt.isPresent()) {
+            LOG.warn("Index table {} has no mainTableName configured", indexTablePath);
+            return Optional.empty();
+        }
+
+        TablePath mainTablePath =
+                new TablePath(indexTablePath.getDatabaseName(), mainTableNameOpt.get());
+        // metadataManager.getTable() will throw TableNotExistException if table doesn't exist
+        TableInfo mainTableInfo = metadataManager.getTable(mainTablePath);
+
+        OptionalLong expectedMainTableId = indexTableInfo.toTableDescriptor().getMainTableId();
+        if (expectedMainTableId.isPresent()
+                && mainTableInfo.getTableId() != expectedMainTableId.getAsLong()) {
+            LOG.warn(
+                    "Main table ID mismatch for index table {}: expected {}, actual {}",
+                    indexTablePath,
+                    expectedMainTableId.getAsLong(),
+                    mainTableInfo.getTableId());
+            return Optional.empty();
+        }
+
+        return Optional.of(mainTableInfo);
     }
 
     @VisibleForTesting

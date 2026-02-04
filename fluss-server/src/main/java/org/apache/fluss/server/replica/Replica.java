@@ -20,8 +20,10 @@ package org.apache.fluss.server.replica;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.InvalidUpdateVersionException;
@@ -30,7 +32,9 @@ import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -48,7 +52,12 @@ import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
+import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.index.IndexApplier;
+import org.apache.fluss.server.index.IndexDataProducer;
+import org.apache.fluss.server.index.IndexSegment;
+import org.apache.fluss.server.index.IndexWriteTaskScheduler;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
@@ -74,7 +83,6 @@ import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
-import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
@@ -93,6 +101,7 @@ import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.MapUtils;
 import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.concurrent.Scheduler;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
@@ -153,7 +162,8 @@ public final class Replica {
     private final CloseableRegistry closeableRegistry;
 
     private final int minInSyncReplicas;
-    private final ServerMetadataCache metadataCache;
+    private final TabletServerMetadataCache metadataCache;
+    private final Configuration conf;
     private final FatalErrorHandler fatalErrorHandler;
     private final BucketMetricGroup bucketMetricGroup;
 
@@ -166,6 +176,10 @@ public final class Replica {
     private final DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager;
     /** The manger to manger the isr expand and shrink. */
     private final AdjustIsrManager adjustIsrManager;
+    /** Unified index cache memory pool shared by all index components. */
+    private final MemorySegmentPool indexCacheMemoryPool;
+    /** Unified task scheduler shared by all index data producers. */
+    private final IndexWriteTaskScheduler taskScheduler;
 
     private final SchemaGetter schemaGetter;
     private final TableInfo tableInfo;
@@ -173,6 +187,12 @@ public final class Replica {
     // logFormat and arrowCompressionInfo are used in hot-path, so cache them here.
     private final LogFormat logFormat;
     private final ArrowCompressionInfo arrowCompressionInfo;
+    // Cache table type information to avoid repeated computation
+    private final boolean isTableWithIndexes;
+    private final boolean isIndexTable;
+    /** Scheduler for async operations like index producer initialization. */
+    private final Scheduler scheduler;
+
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
     private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
@@ -196,6 +216,16 @@ public final class Replica {
     private volatile @Nullable KvTablet kvTablet;
     private volatile @Nullable CloseableRegistry closeableRegistryForKv;
     private @Nullable PeriodicSnapshotManager kvSnapshotManager;
+
+    // null if no indexes or haven't become leader (IndexDataProducer for data tables with indexes)
+    // or index table not become leader (IndexApplier for index tables)
+    private volatile @Nullable IndexDataProducer indexDataProducer;
+    private volatile @Nullable IndexApplier indexApplier;
+    private volatile @Nullable CloseableRegistry closeableRegistryForIndexComponent;
+
+    // Sync index producer initialization retry settings
+    private static final long INIT_INDEX_PRODUCER_MAX_RETRY_DURATION_MS = 30_000; // 30 seconds
+    private static final long INIT_INDEX_PRODUCER_RETRY_DELAY_MS = 1000;
 
     // ------- metrics
     private Counter isrShrinks;
@@ -221,13 +251,19 @@ public final class Replica {
             FatalErrorHandler fatalErrorHandler,
             BucketMetricGroup bucketMetricGroup,
             TableInfo tableInfo,
-            Clock clock)
+            Clock clock,
+            @Nullable RemoteLogManager remoteLogManager,
+            MemorySegmentPool indexCacheMemoryPool,
+            IndexWriteTaskScheduler taskScheduler,
+            Scheduler scheduler,
+            Configuration conf)
             throws Exception {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logManager = logManager;
         this.kvManager = kvManager;
         this.metadataCache = metadataCache;
+        this.conf = conf;
         this.replicaMaxLagTime = replicaMaxLagTime;
         this.minInSyncReplicas = minInSyncReplicas;
         this.localTabletServerId = localTabletServerId;
@@ -243,9 +279,16 @@ public final class Replica {
                         tableInfo.getSchemaId(),
                         tableInfo.getSchema());
         this.tableInfo = tableInfo;
+        this.indexCacheMemoryPool = indexCacheMemoryPool;
+        this.taskScheduler = taskScheduler;
+        this.scheduler = scheduler;
         this.tableConfig = tableInfo.getTableConfig();
         this.logFormat = tableConfig.getLogFormat();
         this.arrowCompressionInfo = tableConfig.getArrowCompressionInfo();
+
+        // Initialize table type flags once to avoid repeated computation
+        this.isIndexTable = tableInfo.isIndexTable();
+        this.isTableWithIndexes = !isIndexTable && !tableInfo.getSchema().getIndexes().isEmpty();
         this.snapshotContext = snapshotContext;
         // create a closeable registry for the replica
         this.closeableRegistry = new CloseableRegistry();
@@ -269,6 +312,36 @@ public final class Replica {
         logicalStorageMetrics.gauge(
                 MetricNames.LOCAL_STORAGE_LOG_SIZE, this::logicalStorageLogSize);
         logicalStorageMetrics.gauge(MetricNames.LOCAL_STORAGE_KV_SIZE, this::logicalStorageKvSize);
+
+        // Register index replication lag supplier for tables with indexes.
+        // Each bucket registers its own lag calculator, and the TableMetricGroup
+        // will compute the maximum lag across all buckets.
+        if (isTableWithIndexes) {
+            TableMetricGroup tableMetricGroup = bucketMetricGroup.getTableMetricGroup();
+            tableMetricGroup.registerBucketIndexLagSupplier(
+                    tableBucket, this::getIndexReplicationLag);
+        }
+    }
+
+    /**
+     * Calculate the index replication lag for this bucket. The lag is defined as the difference
+     * between high watermark and index commit horizon.
+     *
+     * @return the replication lag, or 0 if index data producer is not available or not a leader
+     */
+    private long getIndexReplicationLag() {
+        IndexDataProducer producer = this.indexDataProducer;
+        if (!isLeader() || !isTableWithIndexes || producer == null) {
+            return 0L;
+        }
+
+        long highWatermark = logTablet.getHighWatermark();
+        long indexCommitHorizon = producer.getIndexCommitHorizon();
+
+        // If indexCommitHorizon is -1 (not initialized), return highWatermark as lag
+        return indexCommitHorizon < 0
+                ? highWatermark
+                : Math.max(0, highWatermark - indexCommitHorizon);
     }
 
     public long logicalStorageLogSize() {
@@ -497,6 +570,12 @@ public final class Replica {
         inWriteLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    // Unregister index lag supplier if this table has indexes
+                    if (isTableWithIndexes) {
+                        TableMetricGroup tableMetricGroup = bucketMetricGroup.getTableMetricGroup();
+                        tableMetricGroup.unregisterBucketIndexLagSupplier(tableBucket);
+                    }
+
                     if (isKvTable()) {
                         dropKv();
                     }
@@ -526,13 +605,143 @@ public final class Replica {
             registerLakeTieringMetrics();
         }
 
+        // Create index components first for proper lifecycle management
+        if (isTableWithIndexes || isIndexTable) {
+            resetIndexComponent();
+            initializeIndexComponents();
+        }
+
         if (isKvTable()) {
             // if it's become new leader, we must
             // first destroy the old kv tablet
             // if exist. Otherwise, it'll use still the old kv tablet which will cause data loss
             dropKv();
-            // now, we can create a new kv tablet
+            // now, we can create a new kv tablet (IndexDataProducer is already available if needed)
             createKv();
+
+            // Set IndexDataProducer on KvTablet for hot data caching
+            if (isTableWithIndexes && kvTablet != null && indexDataProducer != null) {
+                kvTablet.setIndexDataProducer(indexDataProducer);
+                LOG.info(
+                        "IndexDataProducer set on KvTablet for data bucket {} for hot data caching",
+                        tableBucket);
+            }
+        }
+
+        // Create IndexApplier for index table after KvTablet is ready
+        if (isIndexTable && closeableRegistryForIndexComponent != null) {
+            createIndexApplierSafely();
+        }
+    }
+
+    /** Initialize index components based on table type. */
+    private void initializeIndexComponents() {
+        if (isTableWithIndexes) {
+            createIndexDataProducerWithRetry();
+        }
+    }
+
+    /**
+     * Create IndexDataProducer with retry logic. Retries for up to 30 seconds. If all retries fail,
+     * throw exception to let coordinator re-elect leader.
+     */
+    private void createIndexDataProducerWithRetry() {
+        Exception lastException = null;
+        long startTime = System.currentTimeMillis();
+        int attempt = 0;
+
+        while (System.currentTimeMillis() - startTime < INIT_INDEX_PRODUCER_MAX_RETRY_DURATION_MS) {
+            attempt++;
+            try {
+                createIndexDataProducer();
+                LOG.info(
+                        "IndexDataProducer created successfully for data bucket {} with {} indexes (attempt {}, elapsed {}ms)",
+                        tableBucket,
+                        schemaGetter.getLatestSchemaInfo().getSchema().getIndexes().size(),
+                        attempt,
+                        System.currentTimeMillis() - startTime);
+                return;
+            } catch (TableNotExistException e) {
+                // Table doesn't exist, no point retrying
+                LOG.error("Table not exist for bucket {}, stopping initialization", tableBucket, e);
+                resetIndexComponent();
+                throw new FlussRuntimeException(
+                        "Failed to create IndexDataProducer for bucket "
+                                + tableBucket
+                                + ": table not exist",
+                        e);
+            } catch (Exception e) {
+                lastException = e;
+                long elapsed = System.currentTimeMillis() - startTime;
+                LOG.warn(
+                        "Failed to create IndexDataProducer for bucket {} (attempt {}, elapsed {}ms/{}ms)",
+                        tableBucket,
+                        attempt,
+                        elapsed,
+                        INIT_INDEX_PRODUCER_MAX_RETRY_DURATION_MS,
+                        e);
+
+                // Check if we have time for another retry
+                if (elapsed + INIT_INDEX_PRODUCER_RETRY_DELAY_MS
+                        < INIT_INDEX_PRODUCER_MAX_RETRY_DURATION_MS) {
+                    try {
+                        Thread.sleep(INIT_INDEX_PRODUCER_RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new FlussRuntimeException(
+                                "Interrupted while retrying IndexDataProducer initialization", ie);
+                    }
+                }
+            }
+        }
+        // All retries failed
+        resetIndexComponent();
+        throw new FlussRuntimeException(
+                "Failed to create IndexDataProducer for bucket "
+                        + tableBucket
+                        + " after "
+                        + attempt
+                        + " attempts over "
+                        + INIT_INDEX_PRODUCER_MAX_RETRY_DURATION_MS
+                        + "ms",
+                lastException);
+    }
+
+    /** Create IndexApplier with proper error handling. */
+    private void createIndexApplierSafely() {
+        try {
+            createIndexApplier();
+            if (indexApplier != null) {
+                LOG.info("IndexApplier created successfully for index bucket {}", tableBucket);
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to create IndexApplier for index bucket {}", tableBucket, e);
+            resetIndexComponent();
+            throw new RuntimeException(
+                    "Failed to create IndexApplier for bucket " + tableBucket, e);
+        }
+    }
+
+    private void resetIndexComponent() {
+        if (logTablet != null) {
+            logTablet.setIndexDataProducer(null);
+        }
+
+        if (closeableRegistry.unregisterCloseable(closeableRegistryForIndexComponent)) {
+            IOUtils.closeQuietly(closeableRegistryForIndexComponent);
+        }
+        indexDataProducer = null;
+        indexApplier = null;
+        closeableRegistryForIndexComponent = null;
+
+        // Then create new index components
+        try {
+            // Create closeable registry for index components
+            closeableRegistryForIndexComponent = new CloseableRegistry();
+            closeableRegistry.registerCloseable(closeableRegistryForIndexComponent);
+        } catch (IOException e) {
+            LOG.warn(
+                    "Failed to register closeable registry for index, may cause resource leak.", e);
         }
     }
 
@@ -559,6 +768,12 @@ public final class Replica {
         }
         if (lakeTieringMetricGroup != null) {
             lakeTieringMetricGroup.close();
+        }
+
+        // Drop index components when becoming follower
+        if (isTableWithIndexes || isIndexTable) {
+            LOG.info("Resetting index components for follower bucket {}", tableBucket);
+            resetIndexComponent();
         }
     }
 
@@ -593,6 +808,66 @@ public final class Replica {
                 isDataLakeEnabled);
     }
 
+    /**
+     * Get the IndexApplier for this replica if available. IndexApplier is only available for index
+     * table bucket leaders.
+     *
+     * @return the IndexApplier instance or null if not available
+     */
+    public IndexApplier getIndexApplier() {
+        return indexApplier;
+    }
+
+    /**
+     * Check if this replica represents an index table.
+     *
+     * @return true if this is an index table, false otherwise
+     */
+    public boolean isIndexTable() {
+        return isIndexTable;
+    }
+
+    /**
+     * Gets the IndexDataProducer for this replica.
+     *
+     * @return the IndexDataProducer, or null if not available
+     */
+    @Nullable
+    public IndexDataProducer getIndexDataProducer() {
+        return indexDataProducer;
+    }
+
+    public Tuple2<Integer, Optional<Map<TableBucket, IndexSegment>>> fetchIndex(
+            Map<TableBucket, FetchIndexReqInfo> indexBucketFetchInfo,
+            long minAdvanceOffset,
+            int maxBytes,
+            boolean forceFetch)
+            throws Exception {
+        checkNotNull(this.isLeader(), "Replica is not leader for bucket " + tableBucket);
+        IndexDataProducer producer =
+                checkNotNull(
+                        this.indexDataProducer,
+                        "IndexDataProducer is not available for bucket " + tableBucket);
+
+        Map<TableBucket, IndexDataProducer.FetchIndexParams> fetchParams =
+                buildFetchIndexParams(indexBucketFetchInfo);
+        return producer.fetchIndex(fetchParams, minAdvanceOffset, maxBytes, forceFetch);
+    }
+
+    private Map<TableBucket, IndexDataProducer.FetchIndexParams> buildFetchIndexParams(
+            Map<TableBucket, FetchIndexReqInfo> indexBucketFetchInfo) {
+        Map<TableBucket, IndexDataProducer.FetchIndexParams> fetchParams = new HashMap<>();
+        for (Map.Entry<TableBucket, FetchIndexReqInfo> entry : indexBucketFetchInfo.entrySet()) {
+            FetchIndexReqInfo reqInfo = entry.getValue();
+            // TODO: Get actual leader server ID from request context. For now, use -1.
+            fetchParams.put(
+                    entry.getKey(),
+                    new IndexDataProducer.FetchIndexParams(
+                            reqInfo.getFetchOffset(), reqInfo.getIndexCommitOffset(), -1));
+        }
+        return fetchParams;
+    }
+
     private void createKv() {
         try {
             // create a closeable registry for the closable related to kv
@@ -624,6 +899,98 @@ public final class Replica {
         startPeriodicKvSnapshot(snapshotUsed.orElse(null));
     }
 
+    private void createIndexDataProducer() {
+        // Create callback for index commit horizon changes
+        IndexDataProducer.IndexCommitHorizonCallback horizonCallback =
+                (newHorizon) -> {
+                    // Trigger KV flush when index commit horizon changes
+                    LogTablet logTablet = this.logTablet;
+                    if (logTablet != null) {
+                        long currentHW = logTablet.getHighWatermark();
+                        mayFlushKv(currentHW, newHorizon);
+                    }
+
+                    // Trigger DelayedWrite operation completion check when index commit horizon
+                    // changes
+                    // This ensures that DelayedWrite operations waiting for index synchronization
+                    // can be completed as soon as the index commit horizon advances
+                    DelayedTableBucketKey delayedTableBucketKey =
+                            new DelayedTableBucketKey(tableBucket);
+                    delayedWriteManager.checkAndComplete(delayedTableBucketKey);
+                };
+
+        CloseableRegistry registry = closeableRegistryForIndexComponent;
+        checkNotNull(registry, "CloseableRegistry should not be null");
+
+        // Get data bucket's log end offset for cold data loading boundary
+        // This represents the upper boundary of data that may need to be loaded as cold data
+        long dataBucketLogEndOffset = (logTablet != null) ? logTablet.localLogEndOffset() : 0L;
+
+        indexDataProducer =
+                new IndexDataProducer(
+                        logTablet,
+                        indexCacheMemoryPool,
+                        schemaGetter,
+                        physicalPath,
+                        metadataCache,
+                        horizonCallback,
+                        dataBucketLogEndOffset,
+                        taskScheduler,
+                        conf);
+
+        try {
+            registry.registerCloseable(indexDataProducer);
+        } catch (IOException e) {
+            LOG.warn("Failed to register IndexDataProducer", e);
+        }
+
+        // Set IndexDataProducer in LogTablet for visibility control
+        if (logTablet != null) {
+            logTablet.setIndexDataProducer(indexDataProducer);
+            LOG.info(
+                    "IndexDataProducer registered with LogTablet for visibility control: {}, dataBucketLogEndOffset: {}",
+                    tableBucket,
+                    dataBucketLogEndOffset);
+        }
+
+        // Set IndexDataProducer on KvTablet for hot data caching
+        if (kvTablet != null) {
+            kvTablet.setIndexDataProducer(indexDataProducer);
+            LOG.info(
+                    "IndexDataProducer set on KvTablet for data bucket {} for hot data caching",
+                    tableBucket);
+        }
+    }
+
+    // Hot data indexing logic has been moved to KvTablet for better code organization
+    // and to leverage existing KV processing logic for IndexedRow generation
+
+    private void createIndexApplier() {
+        if (kvTablet == null) {
+            LOG.warn(
+                    "KV tablet not available for index table {}, skipping IndexApplier creation",
+                    tableBucket);
+            return;
+        }
+        CloseableRegistry registry = closeableRegistryForIndexComponent;
+        checkNotNull(registry, "CloseableRegistry should not be null");
+
+        // This replica is for index table
+        indexApplier =
+                new IndexApplier(
+                        kvTablet,
+                        logTablet,
+                        schemaGetter,
+                        bucketMetricGroup.getTableMetricGroup(),
+                        bucketMetricGroup.getTableMetricGroup().getServerMetricGroup());
+
+        try {
+            registry.registerCloseable(indexApplier);
+        } catch (IOException e) {
+            LOG.warn("Failed to register IndexApplier", e);
+        }
+    }
+
     private void dropKv() {
         // close any closeable registry for kv
         if (closeableRegistry.unregisterCloseable(closeableRegistryForKv)) {
@@ -641,11 +1008,27 @@ public final class Replica {
         }
     }
 
-    private void mayFlushKv(long newHighWatermark) {
+    private void mayFlushKv(long highWatermark, long indexCommitHorizon) {
         KvTablet kvTablet = this.kvTablet;
-        if (kvTablet != null) {
-            kvTablet.flush(newHighWatermark, fatalErrorHandler);
+        if (kvTablet == null) {
+            return;
         }
+
+        // For tables with indexes, use minimum of HW and indexCommitHorizon for visibility control
+        IndexDataProducer producer = this.indexDataProducer;
+        long flushUpTo =
+                (producer != null) ? Math.min(highWatermark, indexCommitHorizon) : highWatermark;
+
+        if (producer != null && flushUpTo < highWatermark) {
+            LOG.trace(
+                    "KV flush limited by index commit horizon: HW={}, indexHorizon={}, effective={}, bucket={}",
+                    highWatermark,
+                    indexCommitHorizon,
+                    flushUpTo,
+                    tableBucket);
+        }
+
+        kvTablet.flush(flushUpTo, fatalErrorHandler);
     }
 
     /**
@@ -689,7 +1072,9 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet = kvManager.loadKv(tabletDir, schemaGetter);
+                kvTablet =
+                        kvManager.loadKv(
+                                tabletDir, schemaGetter, tableConfig.getCompactionFilterConfig());
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
@@ -709,7 +1094,8 @@ public final class Replica {
                                 tableConfig.getKvFormat(),
                                 schemaGetter,
                                 tableConfig,
-                                arrowCompressionInfo);
+                                arrowCompressionInfo,
+                                tableConfig.getCompactionFilterConfig());
             }
 
             logTablet.updateMinRetainOffset(restoreStartOffset);
@@ -975,6 +1361,9 @@ public final class Replica {
                         throw new KvStorageException(
                                 "Error while putting records to " + tableBucket, e);
                     }
+
+                    // Hot data indexing is now handled directly in KvTablet.putAsLeader()
+
                     // we may need to increment high watermark.
                     maybeIncrementLeaderHW(logTablet, clock.milliseconds());
                     return logAppendInfo;
@@ -1066,7 +1455,11 @@ public final class Replica {
         // and then update highWatermark.
         // TODO The flushKV and updateHighWatermark need to be atomic operation. See
         // https://github.com/apache/fluss/issues/513
-        mayFlushKv(newHighWatermark.getMessageOffset());
+        mayFlushKv(
+                newHighWatermark.getMessageOffset(),
+                this.indexDataProducer != null
+                        ? this.indexDataProducer.getIndexCommitHorizon()
+                        : Long.MAX_VALUE);
 
         Optional<LogOffsetMetadata> oldWatermark =
                 leaderLog.maybeIncrementHighWatermark(newHighWatermark);
@@ -1076,6 +1469,7 @@ public final class Replica {
                     oldWatermark.get(),
                     newHighWatermark,
                     tableBucket);
+
             return true;
         } else {
             return false;
@@ -1323,8 +1717,8 @@ public final class Replica {
             if (LOG.isTraceEnabled()) {
                 traceAckInfo(curMaximalIsr, requiredOffset);
             }
-
-            if (logTablet.getHighWatermark() >= requiredOffset) {
+            if (logTablet.getHighWatermark() >= requiredOffset
+                    && mayCheckIndexReplicaReachOffset(requiredOffset)) {
                 if (minInSyncReplicas <= curMaximalIsr.size()) {
                     return Tuple2.of(true, Errors.NONE);
                 } else {
@@ -1336,6 +1730,35 @@ public final class Replica {
         } else {
             return Tuple2.of(false, Errors.NOT_LEADER_OR_FOLLOWER);
         }
+    }
+
+    private boolean mayCheckIndexReplicaReachOffset(long requiredOffset) {
+        // For data tables with indexes, check IndexDataProducer's commit horizon
+        if (isTableWithIndexes) {
+            IndexDataProducer producer = this.indexDataProducer;
+            if (producer != null) {
+                long indexCommitHorizon = producer.getIndexCommitHorizon();
+                boolean satisfied = indexCommitHorizon >= requiredOffset;
+                if (!satisfied) {
+                    LOG.debug(
+                            "Index commit horizon {} has not reached required offset {} for bucket {}, "
+                                    + "DelayedWrite waiting for index synchronization",
+                            indexCommitHorizon,
+                            requiredOffset,
+                            tableBucket);
+                }
+                return satisfied;
+            } else {
+                // If IndexDataProducer is not available, we cannot guarantee index synchronization
+                LOG.warn(
+                        "IndexDataProducer not available for bucket {}, index synchronization check skipped",
+                        tableBucket);
+                return true;
+            }
+        }
+
+        // For tables without indexes, always allow
+        return true;
     }
 
     public long getOffset(RemoteLogManager remoteLogManager, ListOffsetsParam listOffsetsParam)
@@ -1531,6 +1954,7 @@ public final class Replica {
                                         LOG.info(
                                                 "Shrink ISR From {} to {} for bucket {}. Leader: (high watermark: {}, "
                                                         + "end offset: {}, out of sync replicas: {})",
+                                                tableBucket,
                                                 currentIstState.isr(),
                                                 newIsr,
                                                 tableBucket,
@@ -1690,7 +2114,8 @@ public final class Replica {
             isrState = new IsrState.CommittedIsrState(leaderAndIsr.isr());
             bucketEpoch = leaderAndIsr.bucketEpoch();
             LOG.info(
-                    "ISR updated to {} and bucket epoch updated to {} for bucket {}",
+                    "[{}] ISR updated to {} and bucket epoch updated to {} for bucket {}",
+                    tableBucket,
                     isrState.isr(),
                     bucketEpoch,
                     tableBucket);
@@ -1863,6 +2288,161 @@ public final class Replica {
 
     public boolean isUnderMinIsr() {
         return isLeader() && isrState.isr().size() < minInSyncReplicas;
+    }
+
+    /**
+     * Returns a detailed timeout diagnostics message for delayed write operation.
+     *
+     * @param requiredOffset the offset that delayed write is waiting for
+     * @return diagnostics message describing why the write operation timed out
+     */
+    public String getTimeoutDiagnostics(long requiredOffset) {
+        StringBuilder diagnostics = new StringBuilder();
+        diagnostics
+                .append("Delayed write operation timed out for table ")
+                .append(physicalPath)
+                .append(", bucket ")
+                .append(tableBucket)
+                .append(". Required offset: ")
+                .append(requiredOffset)
+                .append(". Diagnostics: ");
+
+        appendLogReplicationDiagnostics(diagnostics, requiredOffset);
+        appendIndexReplicationDiagnostics(diagnostics, requiredOffset);
+        appendIsrStatusDiagnostics(diagnostics);
+
+        return diagnostics.toString();
+    }
+
+    private void appendLogReplicationDiagnostics(StringBuilder diagnostics, long requiredOffset) {
+        long highWatermark = logTablet.getHighWatermark();
+        if (highWatermark < requiredOffset) {
+            diagnostics
+                    .append("[Log Replication] High watermark (")
+                    .append(highWatermark)
+                    .append(") has not reached required offset, lag: ")
+                    .append(requiredOffset - highWatermark)
+                    .append(" offsets. ");
+            appendFollowerReplicaDiagnostics(diagnostics, requiredOffset);
+        } else {
+            diagnostics
+                    .append("[Log Replication] High watermark (")
+                    .append(highWatermark)
+                    .append(") has reached required offset. ");
+        }
+    }
+
+    private void appendFollowerReplicaDiagnostics(StringBuilder diagnostics, long requiredOffset) {
+        List<String> followerInfoList = new ArrayList<>();
+        for (Integer replicaId : isrState.maximalIsr()) {
+            if (replicaId != localTabletServerId && followerReplicasMap.containsKey(replicaId)) {
+                FollowerReplica followerReplica = followerReplicasMap.get(replicaId);
+                long followerLogEndOffset = followerReplica.stateSnapshot().getLogEndOffset();
+                long followerLag = requiredOffset - followerLogEndOffset;
+                String status = followerLogEndOffset >= requiredOffset ? "synced" : "lagging";
+                followerInfoList.add(
+                        String.format(
+                                "server-%d: LEO=%d, lag=%d, status=%s",
+                                replicaId, followerLogEndOffset, followerLag, status));
+            }
+        }
+        if (!followerInfoList.isEmpty()) {
+            diagnostics
+                    .append("Follower replicas: ")
+                    .append(String.join(", ", followerInfoList))
+                    .append(". ");
+        }
+    }
+
+    private void appendIndexReplicationDiagnostics(StringBuilder diagnostics, long requiredOffset) {
+        if (!isTableWithIndexes) {
+            return;
+        }
+
+        IndexDataProducer producer = this.indexDataProducer;
+        if (producer == null) {
+            diagnostics.append("[Index Replication] IndexDataProducer is not available. ");
+            return;
+        }
+
+        long indexCommitHorizon = producer.getIndexCommitHorizon();
+        if (indexCommitHorizon < requiredOffset) {
+            diagnostics
+                    .append("[Index Replication] Index commit horizon (")
+                    .append(indexCommitHorizon)
+                    .append(") has not reached required offset, lag: ")
+                    .append(requiredOffset - indexCommitHorizon)
+                    .append(" offsets. ");
+            appendBlockingBucketDiagnostics(diagnostics, producer, requiredOffset);
+        } else {
+            diagnostics
+                    .append("[Index Replication] Index commit horizon (")
+                    .append(indexCommitHorizon)
+                    .append(") has reached required offset. ");
+        }
+    }
+
+    private void appendBlockingBucketDiagnostics(
+            StringBuilder diagnostics, IndexDataProducer producer, long requiredOffset) {
+        List<String> blockingBuckets = producer.getCacheManager().getBlockingBucketDiagnostics();
+        if (blockingBuckets.isEmpty()) {
+            return;
+        }
+
+        diagnostics.append("Blocking index buckets (at commit horizon): ");
+        for (String bucketDiag : blockingBuckets) {
+            diagnostics.append("\n  - ").append(bucketDiag);
+        }
+
+        diagnostics.append("\n========== Detailed Diagnostic for Blocking IndexBuckets ==========");
+        for (String bucketDiag : blockingBuckets) {
+            appendDetailedBucketDiagnostic(diagnostics, producer, bucketDiag, requiredOffset);
+        }
+        diagnostics.append("\n============================================. ");
+    }
+
+    private void appendDetailedBucketDiagnostic(
+            StringBuilder diagnostics,
+            IndexDataProducer producer,
+            String bucketDiag,
+            long requiredOffset) {
+        // Extract index bucket info from diagnostic string: "IndexBucket{tableId=X, bucket=Y}: ..."
+        try {
+            int tableIdStart = bucketDiag.indexOf("tableId=") + 8;
+            int tableIdEnd = bucketDiag.indexOf(",", tableIdStart);
+            int bucketIdStart = bucketDiag.indexOf("bucket=", tableIdEnd) + 7;
+            int bucketIdEnd = bucketDiag.indexOf("}", bucketIdStart);
+
+            if (tableIdStart > 8
+                    && tableIdEnd > tableIdStart
+                    && bucketIdStart > 7
+                    && bucketIdEnd > bucketIdStart) {
+                long indexTableId =
+                        Long.parseLong(bucketDiag.substring(tableIdStart, tableIdEnd).trim());
+                int indexBucketId =
+                        Integer.parseInt(bucketDiag.substring(bucketIdStart, bucketIdEnd).trim());
+                TableBucket indexBucket = new TableBucket(indexTableId, indexBucketId);
+                String detailedDiag =
+                        producer.getIndexBucketDiagnosticInfo(
+                                indexBucket, requiredOffset, requiredOffset + 1000);
+                diagnostics.append(detailedDiag);
+            }
+        } catch (Exception e) {
+            diagnostics.append("\n  [ERROR] Failed to parse bucket info for: ").append(bucketDiag);
+        }
+    }
+
+    private void appendIsrStatusDiagnostics(StringBuilder diagnostics) {
+        diagnostics
+                .append("[ISR Status] Current ISR: ")
+                .append(isrState.isr())
+                .append(", Maximal ISR: ")
+                .append(isrState.maximalIsr())
+                .append(", Min ISR required: ")
+                .append(minInSyncReplicas)
+                .append(", ISR size sufficient: ")
+                .append(isrState.maximalIsr().size() >= minInSyncReplicas)
+                .append(".");
     }
 
     private LogTablet localLogOrThrow(boolean requireLeader) {

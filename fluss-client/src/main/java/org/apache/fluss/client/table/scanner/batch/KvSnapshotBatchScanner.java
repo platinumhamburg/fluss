@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.table.scanner.RemoteFileDownloader;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.fs.FsPathAndFileName;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -84,6 +85,7 @@ public class KvSnapshotBatchScanner implements BatchScanner {
     private final Path snapshotLocalDirectory;
     private final RemoteFileDownloader remoteFileDownloader;
     private final KvFormat kvFormat;
+    private final CompactionFilterConfig compactionFilterConfig;
 
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -105,7 +107,8 @@ public class KvSnapshotBatchScanner implements BatchScanner {
             @Nullable int[] projectedFields,
             String scannerTmpDir,
             KvFormat kvFormat,
-            RemoteFileDownloader remoteFileDownloader) {
+            RemoteFileDownloader remoteFileDownloader,
+            CompactionFilterConfig compactionFilterConfig) {
         this.targetSchema = targetSchema;
         this.targetSchemaId = targetSchemaId;
         this.schemaGetter = schemaGetter;
@@ -113,6 +116,7 @@ public class KvSnapshotBatchScanner implements BatchScanner {
         this.fsPathAndFileNames = fsPathAndFileNames;
         this.projectedFields = projectedFields;
         this.kvFormat = kvFormat;
+        this.compactionFilterConfig = compactionFilterConfig;
         // create a directory to store the snapshot files
         this.snapshotLocalDirectory =
                 Paths.get(scannerTmpDir, String.format("kv-snapshots-%s", UUID.randomUUID()));
@@ -220,7 +224,8 @@ public class KvSnapshotBatchScanner implements BatchScanner {
                                                         projectedFields,
                                                         targetSchemaId,
                                                         targetSchema,
-                                                        schemaGetter);
+                                                        schemaGetter,
+                                                        compactionFilterConfig);
                                         readerIsReady.signalAll();
                                     } catch (Throwable e) {
                                         IOUtils.closeQuietly(closeableRegistry);

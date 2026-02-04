@@ -21,6 +21,9 @@ import java.util.Arrays;
 
 /** Utility class to convert objects into strings in vice-versa. */
 public class StringUtils {
+
+    public static final String EMPTY_STRING = "";
+
     /**
      * Checks if the string is null, empty, or contains only whitespace characters. A whitespace
      * character is defined via {@link Character#isWhitespace(char)}.

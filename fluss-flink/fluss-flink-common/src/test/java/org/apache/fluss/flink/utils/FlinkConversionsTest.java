@@ -384,6 +384,217 @@ public class FlinkConversionsTest {
     }
 
     @Test
+    void testGlobalSecondaryIndexesParsing() {
+        // Test normal case: parse indexes configuration correctly
+        ResolvedSchema schema =
+                new ResolvedSchema(
+                        Arrays.asList(
+                                Column.physical(
+                                        "order_id",
+                                        org.apache.flink.table.api.DataTypes.STRING().notNull()),
+                                Column.physical(
+                                        "customer_id",
+                                        org.apache.flink.table.api.DataTypes.STRING()),
+                                Column.physical(
+                                        "product_id",
+                                        org.apache.flink.table.api.DataTypes.STRING()),
+                                Column.physical(
+                                        "amount",
+                                        org.apache.flink.table.api.DataTypes.DECIMAL(10, 2))),
+                        Collections.emptyList(),
+                        UniqueConstraint.primaryKey(
+                                "PK_order_id", Collections.singletonList("order_id")));
+
+        Map<String, String> options = new HashMap<>();
+        options.put("table.secondary-index.columns", "customer_id;product_id,customer_id");
+        options.put("table.secondary-index.bucket.num", "5");
+
+        CatalogTable flinkTable =
+                CatalogTable.of(
+                        Schema.newBuilder().fromResolvedSchema(schema).build(),
+                        "test table with indexes",
+                        Collections.emptyList(),
+                        options);
+
+        TableDescriptor flussTable =
+                FlinkConversions.toFlussTable(new ResolvedCatalogTable(flinkTable, schema));
+
+        // Check that indexes are parsed correctly
+        org.apache.fluss.metadata.Schema flussSchema = flussTable.getSchema();
+        assertThat(flussSchema.getIndexes()).hasSize(2);
+
+        // Check first index (customer_id only)
+        org.apache.fluss.metadata.Schema.Index customerIdx =
+                flussSchema.getIndexes().stream()
+                        .filter(idx -> idx.getIndexName().equals("idx_customer_id"))
+                        .findFirst()
+                        .orElse(null);
+        assertThat(customerIdx).isNotNull();
+        assertThat(customerIdx.getColumnNames()).containsExactly("customer_id");
+
+        // Check second index (product_id,customer_id - auto-sorted to customer_id,product_id)
+        org.apache.fluss.metadata.Schema.Index productCustomerIdx =
+                flussSchema.getIndexes().stream()
+                        .filter(idx -> idx.getIndexName().equals("idx_customer_id_product_id"))
+                        .findFirst()
+                        .orElse(null);
+        assertThat(productCustomerIdx).isNotNull();
+        assertThat(productCustomerIdx.getColumnNames())
+                .containsExactly("product_id", "customer_id");
+    }
+
+    @Test
+    void testGlobalSecondaryIndexesWithDuplicateColumns() {
+        // Test error case: duplicate columns within the same index
+        ResolvedSchema schema =
+                new ResolvedSchema(
+                        Arrays.asList(
+                                Column.physical(
+                                        "order_id",
+                                        org.apache.flink.table.api.DataTypes.STRING().notNull()),
+                                Column.physical(
+                                        "customer_id",
+                                        org.apache.flink.table.api.DataTypes.STRING())),
+                        Collections.emptyList(),
+                        UniqueConstraint.primaryKey(
+                                "PK_order_id", Collections.singletonList("order_id")));
+
+        Map<String, String> options = new HashMap<>();
+        options.put(
+                "table.secondary-index.columns",
+                "customer_id,customer_id"); // Duplicate columns in same index
+
+        CatalogTable flinkTable =
+                CatalogTable.of(
+                        Schema.newBuilder().fromResolvedSchema(schema).build(),
+                        "test table",
+                        Collections.emptyList(),
+                        options);
+
+        assertThatThrownBy(
+                        () ->
+                                FlinkConversions.toFlussTable(
+                                        new ResolvedCatalogTable(flinkTable, schema)))
+                .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
+                .hasMessageContaining("contains duplicate columns");
+    }
+
+    @Test
+    void testGlobalSecondaryIndexesWithEmptyIndexConfig() {
+        // Test handling of empty index configuration (should be ignored)
+        ResolvedSchema schema =
+                new ResolvedSchema(
+                        Arrays.asList(
+                                Column.physical(
+                                        "order_id",
+                                        org.apache.flink.table.api.DataTypes.STRING().notNull()),
+                                Column.physical(
+                                        "customer_id",
+                                        org.apache.flink.table.api.DataTypes.STRING())),
+                        Collections.emptyList(),
+                        UniqueConstraint.primaryKey(
+                                "PK_order_id", Collections.singletonList("order_id")));
+
+        Map<String, String> options = new HashMap<>();
+        options.put(
+                "table.secondary-index.columns",
+                "customer_id;"); // One valid index and one empty index
+
+        CatalogTable flinkTable =
+                CatalogTable.of(
+                        Schema.newBuilder().fromResolvedSchema(schema).build(),
+                        "test table",
+                        Collections.emptyList(),
+                        options);
+
+        // Empty index config should be ignored, only valid index should be created
+        TableDescriptor flussTable =
+                FlinkConversions.toFlussTable(new ResolvedCatalogTable(flinkTable, schema));
+
+        org.apache.fluss.metadata.Schema flussSchema = flussTable.getSchema();
+        assertThat(flussSchema.getIndexes()).hasSize(1);
+        assertThat(flussSchema.getIndexes().get(0).getIndexName()).isEqualTo("idx_customer_id");
+    }
+
+    @Test
+    void testGlobalSecondaryIndexesWithWhitespaceColumns() {
+        // Test error case: columns with only whitespace
+        ResolvedSchema schema =
+                new ResolvedSchema(
+                        Arrays.asList(
+                                Column.physical(
+                                        "order_id",
+                                        org.apache.flink.table.api.DataTypes.STRING().notNull()),
+                                Column.physical(
+                                        "customer_id",
+                                        org.apache.flink.table.api.DataTypes.STRING())),
+                        Collections.emptyList(),
+                        UniqueConstraint.primaryKey(
+                                "PK_order_id", Collections.singletonList("order_id")));
+
+        Map<String, String> options = new HashMap<>();
+        options.put("table.secondary-index.columns", " , , "); // Only whitespace and commas
+
+        CatalogTable flinkTable =
+                CatalogTable.of(
+                        Schema.newBuilder().fromResolvedSchema(schema).build(),
+                        "test table",
+                        Collections.emptyList(),
+                        options);
+
+        assertThatThrownBy(
+                        () ->
+                                FlinkConversions.toFlussTable(
+                                        new ResolvedCatalogTable(flinkTable, schema)))
+                .isInstanceOf(org.apache.flink.table.catalog.exceptions.CatalogException.class)
+                .hasMessageContaining("must define at least one column");
+    }
+
+    @Test
+    void testGlobalSecondaryIndexesWithMultipleIndexes() {
+        // Test multiple indexes with new format
+        ResolvedSchema schema =
+                new ResolvedSchema(
+                        Arrays.asList(
+                                Column.physical(
+                                        "order_id",
+                                        org.apache.flink.table.api.DataTypes.STRING().notNull()),
+                                Column.physical(
+                                        "customer_id",
+                                        org.apache.flink.table.api.DataTypes.STRING()),
+                                Column.physical(
+                                        "product_id",
+                                        org.apache.flink.table.api.DataTypes.STRING())),
+                        Collections.emptyList(),
+                        UniqueConstraint.primaryKey(
+                                "PK_order_id", Collections.singletonList("order_id")));
+
+        Map<String, String> options = new HashMap<>();
+        options.put(
+                "table.secondary-index.columns", "customer_id;product_id;customer_id,product_id");
+
+        CatalogTable flinkTable =
+                CatalogTable.of(
+                        Schema.newBuilder().fromResolvedSchema(schema).build(),
+                        "test table",
+                        Collections.emptyList(),
+                        options);
+
+        // Should not throw exception
+        TableDescriptor flussTable =
+                FlinkConversions.toFlussTable(new ResolvedCatalogTable(flinkTable, schema));
+
+        org.apache.fluss.metadata.Schema flussSchema = flussTable.getSchema();
+        assertThat(flussSchema.getIndexes()).hasSize(3);
+
+        // Check the auto-generated index names
+        assertThat(flussSchema.getIndexes())
+                .extracting(org.apache.fluss.metadata.Schema.Index::getIndexName)
+                .containsExactlyInAnyOrder(
+                        "idx_customer_id", "idx_product_id", "idx_customer_id_product_id");
+    }
+
+    @Test
     void testFlinkMaterializedTableConversions() {
         ResolvedSchema schema =
                 new ResolvedSchema(

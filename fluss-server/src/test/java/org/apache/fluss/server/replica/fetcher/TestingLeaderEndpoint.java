@@ -20,14 +20,22 @@ package org.apache.fluss.server.replica.fetcher;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.BytesViewLogRecords;
 import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
+import org.apache.fluss.rpc.messages.FetchIndexResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.server.entity.DataBucketIndexFetchResult;
+import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.FetchReqInfo;
+import org.apache.fluss.server.index.FetchIndexParams;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
@@ -39,6 +47,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getFetchLogData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getIndexReqMap;
 import static org.apache.fluss.utils.function.ThrowingRunnable.unchecked;
 
 /** The leader end point used for test, which replica manager in local. */
@@ -100,6 +109,25 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
     }
 
     @Override
+    public CompletableFuture<FetchIndexData> fetchIndex(FetchIndexContext fetchIndexContext) {
+        CompletableFuture<FetchIndexData> response = new CompletableFuture<>();
+        FetchIndexRequest fetchIndexRequest = fetchIndexContext.getFetchIndexRequest();
+        Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> fetchIndexReqMap =
+                getIndexReqMap(fetchIndexRequest);
+        replicaManager.fetchIndexRecords(
+                new FetchIndexParams(
+                        fetchIndexRequest.getMaxBytes(),
+                        fetchIndexRequest.getMinAdvanceOffset(),
+                        fetchIndexRequest.getMaxWaitMs()),
+                fetchIndexReqMap,
+                result ->
+                        response.complete(
+                                new FetchIndexData(
+                                        new FetchIndexResponse(), processIndexResult(result))));
+        return response;
+    }
+
+    @Override
     public Optional<FetchLogContext> buildFetchLogContext(
             Map<TableBucket, BucketFetchStatus> replicas) {
         return RemoteLeaderEndpoint.buildFetchLogContext(
@@ -132,6 +160,103 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
                         result.put(tb, value);
                     }
                 });
+
+        return result;
+    }
+
+    /** Convert DataBucketIndexFetchResult to FetchIndexLogResultForBucket map. */
+    private Map<DataIndexTableBucket, FetchIndexLogResultForBucket> processIndexResult(
+            Map<TableBucket, DataBucketIndexFetchResult> fetchDataMap) {
+        Map<DataIndexTableBucket, FetchIndexLogResultForBucket> result = new HashMap<>();
+
+        for (Map.Entry<TableBucket, DataBucketIndexFetchResult> entry : fetchDataMap.entrySet()) {
+            TableBucket dataBucket = entry.getKey();
+            DataBucketIndexFetchResult dataBucketResult = entry.getValue();
+
+            Map<TableBucket, FetchIndexLogResultForBucket> indexBucketResults =
+                    dataBucketResult.getIndexBucketResults();
+
+            for (Map.Entry<TableBucket, FetchIndexLogResultForBucket> indexEntry :
+                    indexBucketResults.entrySet()) {
+                TableBucket indexBucket = indexEntry.getKey();
+                FetchIndexLogResultForBucket indexResult = indexEntry.getValue();
+
+                // Create DataIndexTableBucket as the key
+                DataIndexTableBucket dataIndexBucket =
+                        new DataIndexTableBucket(dataBucket, indexBucket);
+
+                // Convert FileLogRecords or BytesViewLogRecords to MemoryLogRecords if needed
+                // This simulates network serialization/deserialization
+                LogRecords logRecords = indexResult.recordsOrEmpty();
+                if (logRecords instanceof FileLogRecords) {
+                    FileLogRecords fileRecords = (FileLogRecords) logRecords;
+                    // convert FileLogRecords to MemoryLogRecords
+                    ByteBuffer buffer = ByteBuffer.allocate(fileRecords.sizeInBytes());
+                    unchecked(() -> fileRecords.readInto(buffer, 0)).run();
+                    MemoryLogRecords memRecords = MemoryLogRecords.pointToByteBuffer(buffer);
+
+                    FetchIndexLogResultForBucket convertedResult =
+                            new FetchIndexLogResultForBucket(
+                                    memRecords,
+                                    indexResult.getStartOffset(),
+                                    indexResult.getEndOffset(),
+                                    indexResult.isDataReady());
+                    result.put(dataIndexBucket, convertedResult);
+                } else if (logRecords instanceof BytesViewLogRecords) {
+                    // Convert BytesViewLogRecords to MemoryLogRecords
+                    // This simulates what happens during network transfer
+                    // We need to properly copy the bytes to a contiguous buffer
+                    BytesViewLogRecords bytesViewRecords = (BytesViewLogRecords) logRecords;
+                    int size = bytesViewRecords.sizeInBytes();
+                    ByteBuffer buffer = ByteBuffer.allocate(size);
+                    // Use shaded Netty's ByteBuf to properly read all bytes into the buffer
+                    org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf byteBuf =
+                            bytesViewRecords.getBytesView().getByteBuf();
+
+                    // Debug log
+                    System.out.println(
+                            "DEBUG TestingLeaderEndpoint: bytesViewRecords.size="
+                                    + size
+                                    + ", byteBuf.readableBytes="
+                                    + byteBuf.readableBytes()
+                                    + ", byteBuf.readerIndex="
+                                    + byteBuf.readerIndex());
+
+                    byteBuf.readBytes(buffer);
+                    buffer.flip();
+
+                    // Debug log after conversion
+                    System.out.println(
+                            "DEBUG TestingLeaderEndpoint: buffer.remaining="
+                                    + buffer.remaining()
+                                    + ", buffer.position="
+                                    + buffer.position()
+                                    + ", buffer.limit="
+                                    + buffer.limit());
+
+                    MemoryLogRecords memRecords = MemoryLogRecords.pointToByteBuffer(buffer);
+
+                    // Debug log final MemoryLogRecords
+                    System.out.println(
+                            "DEBUG TestingLeaderEndpoint: memRecords.sizeInBytes="
+                                    + memRecords.sizeInBytes()
+                                    + ", memRecords.position="
+                                    + memRecords.getPosition()
+                                    + ", segment.size="
+                                    + memRecords.getMemorySegment().size());
+
+                    FetchIndexLogResultForBucket convertedResult =
+                            new FetchIndexLogResultForBucket(
+                                    memRecords,
+                                    indexResult.getStartOffset(),
+                                    indexResult.getEndOffset(),
+                                    indexResult.isDataReady());
+                    result.put(dataIndexBucket, convertedResult);
+                } else {
+                    result.put(dataIndexBucket, indexResult);
+                }
+            }
+        }
 
         return result;
     }

@@ -17,12 +17,14 @@
 
 package org.apache.fluss.server.kv;
 
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metadata.TtlCompactionFilterConfig;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -39,6 +41,7 @@ import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.types.DataType;
+import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.function.ThrowingConsumer;
@@ -60,12 +63,15 @@ public class KvRecoverHelper {
     // will be initialized when first encounter a log record during recovering from log
     private Integer currentSchemaId;
     private RowType currentRowType;
+    private LogFormat currentLogFormat;
 
     private KeyEncoder keyEncoder;
     private RowEncoder rowEncoder;
     private final SchemaGetter schemaGetter;
 
     private InternalRow.FieldGetter[] currentFieldGetters;
+    private @Nullable InternalRow.FieldGetter ttlTimestampFieldGetter;
+    private @Nullable String kvTtlColumn;
 
     public KvRecoverHelper(
             KvTablet kvTablet,
@@ -159,9 +165,37 @@ public class KvRecoverHelper {
                                     // the log row format may not compatible with kv row format,
                                     // e.g, arrow vs. compacted, thus needs a conversion here.
                                     BinaryRow row = toKvRow(logRecord.getRow());
-                                    value =
-                                            ValueEncoder.encodeValue(
-                                                    currentSchemaId.shortValue(), row);
+                                    // When TTL encoding is enabled, encode KV value with timestamp
+                                    // prefix derived from the configured BIGINT TTL column.
+                                    if (kvTablet.kvTtlEnabled()) {
+                                        if (ttlTimestampFieldGetter == null) {
+                                            throw new IllegalStateException(
+                                                    "TTL encoding is enabled but TTL field getter is not initialized.");
+                                        }
+                                        Object tsObj = ttlTimestampFieldGetter.getFieldOrNull(row);
+                                        if (tsObj == null) {
+                                            throw new IllegalStateException(
+                                                    "TTL encoding is enabled but TTL column '"
+                                                            + kvTtlColumn
+                                                            + "' is null during recovery.");
+                                        }
+                                        long ts = (Long) tsObj;
+                                        if (ts < 0) {
+                                            throw new IllegalStateException(
+                                                    "Invalid TTL timestamp (must be >= 0) during recovery: "
+                                                            + ts);
+                                        }
+                                        value =
+                                                ValueEncoder.encodeValueWithLongPrefix(
+                                                        ts,
+                                                        currentSchemaId.shortValue(),
+                                                        row,
+                                                        kvTablet.getCompactionFilterConfig());
+                                    } else {
+                                        value =
+                                                ValueEncoder.encodeValue(
+                                                        currentSchemaId.shortValue(), row);
+                                    }
                                 }
                                 resumeRecordConsumer.accept(
                                         new KeyValueAndLogOffset(
@@ -183,6 +217,9 @@ public class KvRecoverHelper {
         } else if (logFormat == LogFormat.COMPACTED) {
             return LogRecordReadContext.createCompactedRowReadContext(
                     currentRowType, currentSchemaId);
+        } else if (logFormat == LogFormat.INDEXED) {
+            return LogRecordReadContext.createIndexedReadContext(
+                    currentRowType, currentSchemaId, schemaGetter);
         } else {
             throw new UnsupportedOperationException("Unsupported log format: " + logFormat);
         }
@@ -217,6 +254,40 @@ public class KvRecoverHelper {
         currentRowType = schemaGetter.getSchema(schemaId).getRowType();
         DataType[] dataTypes = currentRowType.getChildren().toArray(new DataType[0]);
         currentSchemaId = schemaId;
+        currentLogFormat = tableInfo.getTableConfig().getLogFormat();
+
+        if (kvTablet.kvTtlEnabled()) {
+            CompactionFilterConfig compactionFilterConfig = tableInfo.getCompactionFilterConfig();
+            if (compactionFilterConfig instanceof TtlCompactionFilterConfig) {
+                TtlCompactionFilterConfig ttlConfig =
+                        (TtlCompactionFilterConfig) compactionFilterConfig;
+                kvTtlColumn =
+                        ttlConfig
+                                .getTtlColumn()
+                                .orElseThrow(
+                                        () ->
+                                                new IllegalStateException(
+                                                        "TTL encoding is enabled but table.kv.compaction-filter.ttl.column is not configured for table "
+                                                                + tableInfo.getTablePath()));
+                int ttlFieldIndex = currentRowType.getFieldIndex(kvTtlColumn);
+                if (ttlFieldIndex < 0) {
+                    throw new IllegalStateException(
+                            "TTL column '"
+                                    + kvTtlColumn
+                                    + "' does not exist in schema during recovery.");
+                }
+                if (currentRowType.getTypeAt(ttlFieldIndex).getTypeRoot() != DataTypeRoot.BIGINT) {
+                    throw new IllegalStateException(
+                            "TTL column '" + kvTtlColumn + "' must be BIGINT (epoch millis).");
+                }
+                ttlTimestampFieldGetter =
+                        InternalRow.createFieldGetter(
+                                currentRowType.getTypeAt(ttlFieldIndex), ttlFieldIndex);
+            }
+        } else {
+            kvTtlColumn = null;
+            ttlTimestampFieldGetter = null;
+        }
 
         keyEncoder =
                 KeyEncoder.ofPrimaryKeyEncoder(

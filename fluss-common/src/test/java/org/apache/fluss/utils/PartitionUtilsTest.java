@@ -42,8 +42,10 @@ import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.utils.PartitionUtils.convertValueOfType;
 import static org.apache.fluss.utils.PartitionUtils.generateAutoPartition;
+import static org.apache.fluss.utils.PartitionUtils.validateAutoPartitionTimeFormat;
 import static org.apache.fluss.utils.PartitionUtils.validatePartitionSpec;
 import static org.apache.fluss.utils.PartitionUtils.validatePartitionValues;
+import static org.apache.fluss.utils.PartitionUtils.validateTimePartitionFormat;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -421,5 +423,238 @@ class PartitionUtilsTest {
         assertThat(toStringResult).isEqualTo("1748662955428");
         String detectInvalid = detectInvalidName(toStringResult);
         assertThat(detectInvalid).isEqualTo(null);
+    }
+
+    // ==================== Tests for validateTimePartitionFormat ====================
+
+    @Test
+    void testValidateTimePartitionFormatHour() {
+        // Valid HOUR format
+        assertThat(validateTimePartitionFormat("2025012108", AutoPartitionTimeUnit.HOUR)).isNull();
+        assertThat(validateTimePartitionFormat("2024123123", AutoPartitionTimeUnit.HOUR)).isNull();
+        assertThat(validateTimePartitionFormat("2024022900", AutoPartitionTimeUnit.HOUR))
+                .isNull(); // leap year
+
+        // Invalid HOUR format - wrong length
+        assertThat(validateTimePartitionFormat("202501210", AutoPartitionTimeUnit.HOUR))
+                .contains("length");
+        assertThat(validateTimePartitionFormat("20250121088", AutoPartitionTimeUnit.HOUR))
+                .contains("length");
+
+        // Invalid HOUR format - non-digits
+        assertThat(validateTimePartitionFormat("2025-01-21", AutoPartitionTimeUnit.HOUR))
+                .contains("digits");
+
+        // Invalid HOUR format - invalid hour
+        assertThat(validateTimePartitionFormat("2025012125", AutoPartitionTimeUnit.HOUR))
+                .contains("Invalid hour");
+
+        // Invalid HOUR format - invalid month
+        assertThat(validateTimePartitionFormat("2025130108", AutoPartitionTimeUnit.HOUR))
+                .contains("Invalid month");
+
+        // Invalid HOUR format - invalid day
+        assertThat(validateTimePartitionFormat("2025023008", AutoPartitionTimeUnit.HOUR))
+                .contains("Invalid day");
+    }
+
+    @Test
+    void testValidateTimePartitionFormatDay() {
+        // Valid DAY format
+        assertThat(validateTimePartitionFormat("20250121", AutoPartitionTimeUnit.DAY)).isNull();
+        assertThat(validateTimePartitionFormat("20241231", AutoPartitionTimeUnit.DAY)).isNull();
+        assertThat(validateTimePartitionFormat("20240229", AutoPartitionTimeUnit.DAY))
+                .isNull(); // leap year
+
+        // Invalid DAY format - wrong length
+        assertThat(validateTimePartitionFormat("2025012", AutoPartitionTimeUnit.DAY))
+                .contains("length");
+        assertThat(validateTimePartitionFormat("202501211", AutoPartitionTimeUnit.DAY))
+                .contains("length");
+
+        // Invalid DAY format - non-digits
+        assertThat(validateTimePartitionFormat("2025-121", AutoPartitionTimeUnit.DAY))
+                .contains("digits");
+
+        // Invalid DAY format - invalid month
+        assertThat(validateTimePartitionFormat("20251301", AutoPartitionTimeUnit.DAY))
+                .contains("Invalid month");
+
+        // Invalid DAY format - invalid day
+        assertThat(validateTimePartitionFormat("20250230", AutoPartitionTimeUnit.DAY))
+                .contains("Invalid day");
+
+        // Invalid DAY format - Feb 29 in non-leap year
+        assertThat(validateTimePartitionFormat("20230229", AutoPartitionTimeUnit.DAY))
+                .contains("Invalid day");
+    }
+
+    @Test
+    void testValidateTimePartitionFormatMonth() {
+        // Valid MONTH format
+        assertThat(validateTimePartitionFormat("202501", AutoPartitionTimeUnit.MONTH)).isNull();
+        assertThat(validateTimePartitionFormat("202412", AutoPartitionTimeUnit.MONTH)).isNull();
+
+        // Invalid MONTH format - wrong length
+        assertThat(validateTimePartitionFormat("20250", AutoPartitionTimeUnit.MONTH))
+                .contains("length");
+        assertThat(validateTimePartitionFormat("2025011", AutoPartitionTimeUnit.MONTH))
+                .contains("length");
+
+        // Invalid MONTH format - non-digits
+        assertThat(validateTimePartitionFormat("2025-1", AutoPartitionTimeUnit.MONTH))
+                .contains("digits");
+
+        // Invalid MONTH format - invalid month
+        assertThat(validateTimePartitionFormat("202513", AutoPartitionTimeUnit.MONTH))
+                .contains("Invalid month");
+        assertThat(validateTimePartitionFormat("202500", AutoPartitionTimeUnit.MONTH))
+                .contains("Invalid month");
+    }
+
+    @Test
+    void testValidateTimePartitionFormatQuarter() {
+        // Valid QUARTER format
+        assertThat(validateTimePartitionFormat("2025Q1", AutoPartitionTimeUnit.QUARTER)).isNull();
+        assertThat(validateTimePartitionFormat("2025Q2", AutoPartitionTimeUnit.QUARTER)).isNull();
+        assertThat(validateTimePartitionFormat("2025Q3", AutoPartitionTimeUnit.QUARTER)).isNull();
+        assertThat(validateTimePartitionFormat("2025Q4", AutoPartitionTimeUnit.QUARTER)).isNull();
+
+        // Invalid QUARTER format - wrong length
+        assertThat(validateTimePartitionFormat("2025Q", AutoPartitionTimeUnit.QUARTER))
+                .contains("length");
+        assertThat(validateTimePartitionFormat("2025Q12", AutoPartitionTimeUnit.QUARTER))
+                .contains("length");
+
+        // Invalid QUARTER format - invalid quarter
+        assertThat(validateTimePartitionFormat("2025Q0", AutoPartitionTimeUnit.QUARTER))
+                .contains("Expected format");
+        assertThat(validateTimePartitionFormat("2025Q5", AutoPartitionTimeUnit.QUARTER))
+                .contains("Expected format");
+
+        // Invalid QUARTER format - wrong format
+        assertThat(validateTimePartitionFormat("202501", AutoPartitionTimeUnit.QUARTER))
+                .contains("Expected format");
+    }
+
+    @Test
+    void testValidateTimePartitionFormatYear() {
+        // Valid YEAR format
+        assertThat(validateTimePartitionFormat("2025", AutoPartitionTimeUnit.YEAR)).isNull();
+        assertThat(validateTimePartitionFormat("1970", AutoPartitionTimeUnit.YEAR)).isNull();
+        assertThat(validateTimePartitionFormat("9999", AutoPartitionTimeUnit.YEAR)).isNull();
+
+        // Invalid YEAR format - wrong length
+        assertThat(validateTimePartitionFormat("202", AutoPartitionTimeUnit.YEAR))
+                .contains("length");
+        assertThat(validateTimePartitionFormat("20251", AutoPartitionTimeUnit.YEAR))
+                .contains("length");
+
+        // Invalid YEAR format - non-digits
+        assertThat(validateTimePartitionFormat("202a", AutoPartitionTimeUnit.YEAR))
+                .contains("digits");
+
+        // Invalid YEAR format - invalid year range
+        assertThat(validateTimePartitionFormat("1969", AutoPartitionTimeUnit.YEAR))
+                .contains("Invalid year");
+    }
+
+    @Test
+    void testValidateAutoPartitionTimeFormatWithSinglePartitionKey() {
+        // Test the validation method itself with single partition key
+        // Note: In production, this validation is only called for tables with indexes
+        AutoPartitionStrategy strategy =
+                AutoPartitionStrategy.from(
+                        new org.apache.fluss.config.Configuration()
+                                .set(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
+                                .set(
+                                        ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT,
+                                        AutoPartitionTimeUnit.DAY),
+                        Collections.singletonList("dt"));
+
+        // Valid partition value
+        PartitionSpec validSpec = new PartitionSpec(Collections.singletonMap("dt", "20250121"));
+        assertThatNoException()
+                .isThrownBy(
+                        () ->
+                                validateAutoPartitionTimeFormat(
+                                        Collections.singletonList("dt"), validSpec, strategy));
+
+        // Invalid partition value
+        PartitionSpec invalidSpec = new PartitionSpec(Collections.singletonMap("dt", "invalid"));
+        assertThatThrownBy(
+                        () ->
+                                validateAutoPartitionTimeFormat(
+                                        Collections.singletonList("dt"), invalidSpec, strategy))
+                .isInstanceOf(InvalidPartitionException.class)
+                .hasMessageContaining("Invalid partition value 'invalid'")
+                .hasMessageContaining("auto-partition key 'dt'");
+    }
+
+    @Test
+    void testValidateAutoPartitionTimeFormatWithMultiplePartitionKeys() {
+        // Test the validation method itself with multiple partition keys
+        // Note: In production, this validation is only called for tables with indexes
+        AutoPartitionStrategy strategy =
+                AutoPartitionStrategy.from(
+                        new org.apache.fluss.config.Configuration()
+                                .set(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
+                                .set(
+                                        ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT,
+                                        AutoPartitionTimeUnit.MONTH)
+                                .set(ConfigOptions.TABLE_AUTO_PARTITION_KEY, "ym"),
+                        Arrays.asList("region", "ym"));
+
+        // Valid partition value - only ym is validated
+        PartitionSpec validSpec =
+                new PartitionSpec(
+                        new java.util.HashMap<String, String>() {
+                            {
+                                put("region", "us-west");
+                                put("ym", "202501");
+                            }
+                        });
+        assertThatNoException()
+                .isThrownBy(
+                        () ->
+                                validateAutoPartitionTimeFormat(
+                                        Arrays.asList("region", "ym"), validSpec, strategy));
+
+        // Invalid partition value for ym
+        PartitionSpec invalidSpec =
+                new PartitionSpec(
+                        new java.util.HashMap<String, String>() {
+                            {
+                                put("region", "us-west");
+                                put("ym", "2025-01");
+                            }
+                        });
+        assertThatThrownBy(
+                        () ->
+                                validateAutoPartitionTimeFormat(
+                                        Arrays.asList("region", "ym"), invalidSpec, strategy))
+                .isInstanceOf(InvalidPartitionException.class)
+                .hasMessageContaining("Invalid partition value '2025-01'")
+                .hasMessageContaining("auto-partition key 'ym'");
+    }
+
+    @Test
+    void testValidateAutoPartitionTimeFormatDisabled() {
+        // Test that validation is skipped when auto-partition is disabled
+        // Note: In production, this method is only called for tables with indexes,
+        // and tables with indexes must have auto-partition enabled
+        AutoPartitionStrategy strategy =
+                AutoPartitionStrategy.from(
+                        new org.apache.fluss.config.Configuration()
+                                .set(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, false),
+                        Collections.singletonList("dt"));
+
+        // Any partition value should be allowed when auto-partition is disabled
+        PartitionSpec anySpec = new PartitionSpec(Collections.singletonMap("dt", "any_value"));
+        assertThatNoException()
+                .isThrownBy(
+                        () ->
+                                validateAutoPartitionTimeFormat(
+                                        Collections.singletonList("dt"), anySpec, strategy));
     }
 }

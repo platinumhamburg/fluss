@@ -267,6 +267,9 @@ public class MetadataManager {
      * Creates the necessary metadata of the given table in zookeeper and return the table id.
      * Returns -1 if the table already exists and ignoreIfExists is true.
      *
+     * <p>Index table validation is handled by {@link
+     * org.apache.fluss.server.utils.TableDescriptorValidation#validateTableDescriptor}.
+     *
      * @param tablePath the table path
      * @param tableToCreate the table descriptor describing the table to create
      * @param tableAssignment the table assignment, will be null when the table is partitioned table

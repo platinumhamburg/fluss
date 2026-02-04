@@ -175,6 +175,18 @@ public class LookupNormalizer implements Serializable {
                 primaryKeyNames, primaryKeyNames, primaryKeys, schema, LookupType.LOOKUP);
     }
 
+    /** Create a {@link LookupNormalizer} for secondary index lookup. */
+    public static LookupNormalizer createSecondaryIndexLookupNormalizer(
+            int[] lookupKeys, RowType schema) {
+        List<String> lookupKeyNames = fieldNames(lookupKeys, schema);
+        return createLookupNormalizer(
+                lookupKeyNames,
+                lookupKeyNames,
+                lookupKeys,
+                schema,
+                LookupType.SECONDARY_INDEX_LOOKUP);
+    }
+
     /**
      * Validate the lookup key indexes and primary keys, and create a {@link LookupNormalizer}.
      *
@@ -184,6 +196,8 @@ public class LookupNormalizer implements Serializable {
      * @param partitionKeys the indexes of the partition keys of the table, maybe empty if the table
      *     is not partitioned
      * @param schema the schema of the table
+     * @param projectedFields the projected fields, nullable
+     * @param secondaryIndexes the secondary indexes definitions, nullable
      */
     public static LookupNormalizer validateAndCreateLookupNormalizer(
             int[][] lookupKeyIndexes,
@@ -191,12 +205,27 @@ public class LookupNormalizer implements Serializable {
             int[] bucketKeys,
             int[] partitionKeys,
             RowType schema,
-            @Nullable int[] projectedFields) {
+            @Nullable int[] projectedFields,
+            @Nullable int[][] secondaryIndexes) {
+        // Step 1: Validate table structure
+        validateTableStructure(primaryKeys, bucketKeys, partitionKeys);
+
+        // Step 2: Resolve lookup keys (handle projection pushdown)
+        LookupKeyInfo lookupKeyInfo = resolveLookupKeys(lookupKeyIndexes, projectedFields, schema);
+
+        // Step 3: Determine lookup type and create normalizer
+        return createNormalizerByLookupType(
+                lookupKeyInfo, primaryKeys, bucketKeys, partitionKeys, schema, secondaryIndexes);
+    }
+
+    /** Validates the table structure (primary keys, bucket keys, partition keys). */
+    private static void validateTableStructure(
+            int[] primaryKeys, int[] bucketKeys, int[] partitionKeys) {
         if (primaryKeys.length == 0) {
             throw new UnsupportedOperationException(
                     "Fluss lookup function only support lookup table with primary key.");
         }
-        // bucket keys must not be empty
+        // bucket keys must not be empty and must be a subset of primary keys
         if (bucketKeys.length == 0 || !ArrayUtils.isSubset(primaryKeys, bucketKeys)) {
             throw new IllegalArgumentException(
                     "Illegal bucket keys: "
@@ -204,7 +233,7 @@ public class LookupNormalizer implements Serializable {
                             + ", must be a part of primary keys: "
                             + Arrays.toString(primaryKeys));
         }
-        // partition keys can be empty
+        // partition keys can be empty, but if not, must be a subset of primary keys
         if (partitionKeys.length != 0 && !ArrayUtils.isSubset(primaryKeys, partitionKeys)) {
             throw new IllegalArgumentException(
                     "Illegal partition keys: "
@@ -212,54 +241,118 @@ public class LookupNormalizer implements Serializable {
                             + ", must be a part of primary keys: "
                             + Arrays.toString(primaryKeys));
         }
+    }
 
+    /**
+     * Resolves lookup keys by handling projection pushdown.
+     *
+     * <p>The lookupKeyIndexes passed by Flink are indexed after projection pushdown. This method
+     * restores the lookup key indexes before pushdown to easier compare with primary keys.
+     */
+    private static LookupKeyInfo resolveLookupKeys(
+            int[][] lookupKeyIndexes, @Nullable int[] projectedFields, RowType schema) {
         int[] lookupKeysBeforeProjection = new int[lookupKeyIndexes.length];
         int[] lookupKeys = new int[lookupKeyIndexes.length];
-        for (int i = 0; i < lookupKeysBeforeProjection.length; i++) {
+
+        for (int i = 0; i < lookupKeyIndexes.length; i++) {
             int[] innerKeyArr = lookupKeyIndexes[i];
             checkArgument(innerKeyArr.length == 1, "Do not support nested lookup keys");
-            // lookupKeyIndexes passed by Flink is key indexed after projection pushdown,
-            // we restore the lookup key indexes before pushdown to easier compare with primary
-            // keys.
-            if (projectedFields != null) {
-                lookupKeysBeforeProjection[i] = projectedFields[innerKeyArr[0]];
-            } else {
-                lookupKeysBeforeProjection[i] = innerKeyArr[0];
-            }
+
+            lookupKeysBeforeProjection[i] =
+                    projectedFields != null ? projectedFields[innerKeyArr[0]] : innerKeyArr[0];
             lookupKeys[i] = innerKeyArr[0];
         }
+
         List<String> lookupKeyNames = fieldNames(lookupKeysBeforeProjection, schema);
+        return new LookupKeyInfo(lookupKeysBeforeProjection, lookupKeys, lookupKeyNames);
+    }
+
+    /** Determines the lookup type and creates the appropriate normalizer. */
+    private static LookupNormalizer createNormalizerByLookupType(
+            LookupKeyInfo lookupKeyInfo,
+            int[] primaryKeys,
+            int[] bucketKeys,
+            int[] partitionKeys,
+            RowType schema,
+            @Nullable int[][] secondaryIndexes) {
         List<String> primaryKeyNames = fieldNames(primaryKeys, schema);
 
-        if (new HashSet<>(lookupKeyNames).containsAll(primaryKeyNames)) {
-            // primary key lookup.
+        // Case 1: Primary key lookup - lookup keys contain all primary keys
+        if (new HashSet<>(lookupKeyInfo.names).containsAll(primaryKeyNames)) {
             return createLookupNormalizer(
-                    lookupKeyNames, primaryKeyNames, lookupKeys, schema, LookupType.LOOKUP);
-        } else {
-            // the encoding primary key is the primary key without partition keys.
-            int[] encodedPrimaryKeys = ArrayUtils.removeSet(primaryKeys, partitionKeys);
-            // the table support prefix lookup iff the bucket key is a prefix of the encoding pk
-            boolean supportPrefixLookup = ArrayUtils.isPrefix(encodedPrimaryKeys, bucketKeys);
-            if (supportPrefixLookup) {
-                // try to create prefix lookup normalizer
-                // TODO: support prefix lookup with arbitrary part of prefix of primary key
-                int[] expectedLookupKeys =
-                        ArrayUtils.intersection(
-                                primaryKeys, ArrayUtils.concat(bucketKeys, partitionKeys));
-                return createLookupNormalizer(
-                        lookupKeyNames,
-                        fieldNames(expectedLookupKeys, schema),
-                        lookupKeys,
-                        schema,
-                        LookupType.PREFIX_LOOKUP);
-            } else {
-                // throw exception for tables that doesn't support prefix lookup
-                throw new TableException(
-                        "The Fluss lookup function supports lookup tables where the lookup keys include all primary keys, the primary keys are "
-                                + primaryKeyNames
-                                + ", but the lookup keys are "
-                                + lookupKeyNames);
-            }
+                    lookupKeyInfo.names,
+                    primaryKeyNames,
+                    lookupKeyInfo.indexes,
+                    schema,
+                    LookupType.LOOKUP);
+        }
+
+        // Case 2: Secondary index lookup - lookup keys match a secondary index
+        if (matchesSecondaryIndex(lookupKeyInfo.beforeProjection, secondaryIndexes)) {
+            return createLookupNormalizer(
+                    lookupKeyInfo.names,
+                    lookupKeyInfo.names,
+                    lookupKeyInfo.indexes,
+                    schema,
+                    LookupType.SECONDARY_INDEX_LOOKUP);
+        }
+
+        // Case 3: Prefix lookup - if supported by table structure
+        return tryCreatePrefixLookupNormalizer(
+                lookupKeyInfo, primaryKeys, bucketKeys, partitionKeys, schema);
+    }
+
+    /**
+     * Tries to create a prefix lookup normalizer.
+     *
+     * <p>Prefix lookup is supported when the bucket key is a prefix of the encoding primary key
+     * (primary key without partition keys).
+     */
+    private static LookupNormalizer tryCreatePrefixLookupNormalizer(
+            LookupKeyInfo lookupKeyInfo,
+            int[] primaryKeys,
+            int[] bucketKeys,
+            int[] partitionKeys,
+            RowType schema) {
+        // The encoding primary key is the primary key without partition keys
+        int[] encodedPrimaryKeys = ArrayUtils.removeSet(primaryKeys, partitionKeys);
+        // The table supports prefix lookup iff the bucket key is a prefix of the encoding pk
+        boolean supportPrefixLookup = ArrayUtils.isPrefix(encodedPrimaryKeys, bucketKeys);
+
+        if (!supportPrefixLookup) {
+            List<String> primaryKeyNames = fieldNames(primaryKeys, schema);
+            throw new TableException(
+                    "The Fluss lookup function supports lookup tables where the lookup keys "
+                            + "include all primary keys, the primary keys are "
+                            + primaryKeyNames
+                            + ", but the lookup keys are "
+                            + lookupKeyInfo.names);
+        }
+
+        // TODO: support prefix lookup with arbitrary part of prefix of primary key
+        int[] expectedLookupKeys =
+                ArrayUtils.intersection(primaryKeys, ArrayUtils.concat(bucketKeys, partitionKeys));
+        return createLookupNormalizer(
+                lookupKeyInfo.names,
+                fieldNames(expectedLookupKeys, schema),
+                lookupKeyInfo.indexes,
+                schema,
+                LookupType.PREFIX_LOOKUP);
+    }
+
+    /** Helper class to hold resolved lookup key information. */
+    private static class LookupKeyInfo {
+        /** Lookup key indexes before projection pushdown (original table column indexes). */
+        final int[] beforeProjection;
+        /** Lookup key indexes after projection pushdown (used for creating normalizer). */
+        final int[] indexes;
+        /** Lookup key column names. */
+        final List<String> names;
+
+        LookupKeyInfo(int[] beforeProjection, int[] indexes, List<String> names) {
+            this.beforeProjection = beforeProjection;
+            this.indexes = indexes;
+            this.names = names;
         }
     }
 
@@ -335,5 +428,39 @@ public class LookupNormalizer implements Serializable {
 
     private static int[] fieldIndexes(List<String> fieldNames, RowType schema) {
         return fieldNames.stream().mapToInt(schema::getFieldIndex).toArray();
+    }
+
+    /**
+     * Check if the lookup key indexes match any secondary index.
+     *
+     * @param lookupKeyIndexes the lookup key indexes
+     * @param secondaryIndexes the secondary index definitions
+     * @return true if matches any secondary index
+     */
+    private static boolean matchesSecondaryIndex(int[] lookupKeyIndexes, int[][] secondaryIndexes) {
+        if (secondaryIndexes == null || secondaryIndexes.length == 0) {
+            return false;
+        }
+
+        // Sort lookup key indexes for comparison
+        int[] sortedLookupKeys = lookupKeyIndexes.clone();
+        Arrays.sort(sortedLookupKeys);
+
+        for (int[] indexDef : secondaryIndexes) {
+            if (indexDef.length != lookupKeyIndexes.length) {
+                continue;
+            }
+
+            // Sort index definition for comparison
+            int[] sortedIndexDef = indexDef.clone();
+            Arrays.sort(sortedIndexDef);
+
+            // Check if lookup columns exactly match index columns
+            if (Arrays.equals(sortedLookupKeys, sortedIndexDef)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

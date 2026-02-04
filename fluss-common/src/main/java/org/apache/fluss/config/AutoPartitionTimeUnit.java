@@ -30,5 +30,31 @@ public enum AutoPartitionTimeUnit {
     QUARTER,
     MONTH,
     DAY,
-    HOUR
+    HOUR;
+
+    /**
+     * Convert retention count to approximate milliseconds for TTL calculation.
+     *
+     * @param numToRetain number of units to retain
+     * @return TTL in milliseconds
+     */
+    public long toApproximateTtlMillis(int numToRetain) {
+        switch (this) {
+            case YEAR:
+                // Approximate using 366 days (leap year)
+                return numToRetain * 366L * 24 * 3600_000L;
+            case QUARTER:
+                // Approximate using 92 days (3 months)
+                return numToRetain * 92L * 24 * 3600_000L;
+            case MONTH:
+                // Approximate using 31 days
+                return numToRetain * 31L * 24 * 3600_000L;
+            case DAY:
+                return numToRetain * 24 * 3600_000L;
+            case HOUR:
+                return numToRetain * 3600_000L;
+            default:
+                throw new IllegalStateException("Unknown time unit: " + this);
+        }
+    }
 }

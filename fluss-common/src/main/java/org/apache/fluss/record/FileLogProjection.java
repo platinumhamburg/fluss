@@ -57,15 +57,18 @@ import static org.apache.fluss.record.DefaultLogRecordBatch.APPEND_ONLY_FLAG_MAS
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.V1_RECORD_BATCH_HEADER_SIZE;
+import static org.apache.fluss.record.LogRecordBatchFormat.V3_BASE_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordsCountOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.stateChangeLogsLengthOffset;
 import static org.apache.fluss.utils.FileUtils.readFully;
 import static org.apache.fluss.utils.FileUtils.readFullyOrFail;
 import static org.apache.fluss.utils.Preconditions.checkState;
@@ -92,7 +95,8 @@ public class FileLogProjection {
      * Buffer to read log records batch header. V1 is larger than V0, so use V1 head buffer can read
      * V0 header even if there is no enough bytes in log file.
      */
-    private final ByteBuffer logHeaderBuffer = ByteBuffer.allocate(V1_RECORD_BATCH_HEADER_SIZE);
+    private final ByteBuffer logHeaderBuffer =
+            ByteBuffer.allocate(V3_BASE_RECORD_BATCH_HEADER_SIZE);
 
     private final ByteBuffer arrowHeaderBuffer = ByteBuffer.allocate(ARROW_HEADER_SIZE);
     private ByteBuffer arrowMetadataBuffer;
@@ -179,14 +183,32 @@ public class FileLogProjection {
             boolean isAppendOnly =
                     (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
 
+            // For V3 format, we need to read extend properties length to calculate correct offset
+            int stateChangeLogsLength = 0;
+            if (magic == LOG_MAGIC_VALUE_V3) {
+                stateChangeLogsLength = logHeaderBuffer.getInt(stateChangeLogsLengthOffset(magic));
+            }
+
             final int changeTypeBytes;
             final long arrowHeaderOffset;
             if (isAppendOnly) {
                 changeTypeBytes = 0;
-                arrowHeaderOffset = position + recordBatchHeaderSize;
+                if (magic == LOG_MAGIC_VALUE_V3) {
+                    arrowHeaderOffset = position + recordBatchHeaderSize + stateChangeLogsLength;
+                } else {
+                    arrowHeaderOffset = position + recordBatchHeaderSize;
+                }
             } else {
                 changeTypeBytes = logHeaderBuffer.getInt(recordsCountOffset(magic));
-                arrowHeaderOffset = position + recordBatchHeaderSize + changeTypeBytes;
+                if (magic == LOG_MAGIC_VALUE_V3) {
+                    arrowHeaderOffset =
+                            position
+                                    + recordBatchHeaderSize
+                                    + stateChangeLogsLength
+                                    + changeTypeBytes;
+                } else {
+                    arrowHeaderOffset = position + recordBatchHeaderSize + changeTypeBytes;
+                }
             }
 
             // read arrow header
@@ -215,6 +237,7 @@ public class FileLogProjection {
 
             int newBatchSizeInBytes =
                     recordBatchHeaderSize
+                            + stateChangeLogsLength
                             + changeTypeBytes
                             + currentProjection.arrowMetadataLength
                             + (int) arrowBodyLength; // safe to cast to int
@@ -243,8 +266,20 @@ public class FileLogProjection {
 
             // 5. build log records
             builder.addBytes(logHeader);
+            // Bug fix: copy state change logs data for V3 format
+            if (magic == LOG_MAGIC_VALUE_V3 && stateChangeLogsLength > 0) {
+                builder.addBytes(channel, position + recordBatchHeaderSize, stateChangeLogsLength);
+            }
             if (!isAppendOnly) {
-                builder.addBytes(channel, position + arrowChangeTypeOffset(magic), changeTypeBytes);
+                if (magic == LOG_MAGIC_VALUE_V3) {
+                    builder.addBytes(
+                            channel,
+                            position + recordBatchHeaderSize + stateChangeLogsLength,
+                            changeTypeBytes);
+                } else {
+                    builder.addBytes(
+                            channel, position + arrowChangeTypeOffset(magic), changeTypeBytes);
+                }
             }
             builder.addBytes(headerMetadata);
             final long bufferOffset = arrowHeaderOffset + ARROW_HEADER_SIZE + arrowMetadataSize;
@@ -394,6 +429,12 @@ public class FileLogProjection {
                                 "Failed to read v1 log header from file channel `%s`. Expected to read %d bytes, "
                                         + "but reached end of file after reading %d bytes. Started read from position %d.",
                                 channel, V1_RECORD_BATCH_HEADER_SIZE, size, position));
+            } else if (magic == LOG_MAGIC_VALUE_V3 && size < V3_BASE_RECORD_BATCH_HEADER_SIZE) {
+                throw new EOFException(
+                        String.format(
+                                "Failed to read v3 log header from file channel `%s`. Expected to read %d bytes, "
+                                        + "but reached end of file after reading %d bytes. Started read from position %d.",
+                                channel, V3_BASE_RECORD_BATCH_HEADER_SIZE, size, position));
             }
         }
     }
