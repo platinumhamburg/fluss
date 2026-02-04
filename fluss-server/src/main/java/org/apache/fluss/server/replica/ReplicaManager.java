@@ -32,6 +32,9 @@ import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.memory.LazyMemorySegmentPool;
+import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -45,6 +48,8 @@ import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.RpcClient;
+import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
+import org.apache.fluss.rpc.entity.FetchIndexStatus;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
 import org.apache.fluss.rpc.entity.ListOffsetsResultForBucket;
@@ -62,6 +67,9 @@ import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
+import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.entity.DataBucketIndexFetchResult;
+import org.apache.fluss.server.entity.FetchIndexReqInfo;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
 import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
@@ -72,6 +80,10 @@ import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
+import org.apache.fluss.server.index.FetchIndexParams;
+import org.apache.fluss.server.index.IndexApplier;
+import org.apache.fluss.server.index.IndexSegment;
+import org.apache.fluss.server.index.IndexWriteTaskScheduler;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
@@ -94,21 +106,30 @@ import org.apache.fluss.server.metrics.UserMetrics;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
+import org.apache.fluss.server.replica.delay.DelayedFetchIndex;
 import org.apache.fluss.server.replica.delay.DelayedFetchLog;
 import org.apache.fluss.server.replica.delay.DelayedFetchLog.FetchBucketStatus;
 import org.apache.fluss.server.replica.delay.DelayedOperationManager;
 import org.apache.fluss.server.replica.delay.DelayedTableBucketKey;
 import org.apache.fluss.server.replica.delay.DelayedWrite;
+import org.apache.fluss.server.replica.fetcher.IndexFetcherManager;
 import org.apache.fluss.server.replica.fetcher.InitialFetchStatus;
 import org.apache.fluss.server.replica.fetcher.ReplicaFetcherManager;
+import org.apache.fluss.server.tablet.PartitionChangeWatcher.PartitionChangeCallback;
+import org.apache.fluss.server.tablet.PartitionChangeWatcher.PartitionInfo;
+import org.apache.fluss.server.tablet.PartitionChangeWatcherManager;
+import org.apache.fluss.server.tablet.PartitionChangeWatcherManager.SubscriptionHandle;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.shaded.guava32.com.google.common.collect.Sets;
+import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.MapUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.concurrent.Scheduler;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -123,11 +144,14 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -138,6 +162,7 @@ import java.util.stream.Stream;
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.server.TabletManagerBase.getTableInfo;
 import static org.apache.fluss.utils.FileUtils.isDirectoryEmpty;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkState;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -176,7 +201,16 @@ public class ReplicaManager {
      */
     private final DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager;
 
+    /**
+     * delayed fetch index operation manager is used to manage the delayed fetch index operation,
+     * which is waited for the available index data size bigger than the
+     * minIndexFetchSize/minIndexRecords or the wait time is up.
+     */
+    private final DelayedOperationManager<DelayedFetchIndex> delayedFetchIndexManager;
+
     private final ReplicaFetcherManager replicaFetcherManager;
+    // New index fetcher manager using target-state driven approach with async retry
+    private final IndexFetcherManager indexFetcherManager;
     // The manager used to manager the replica alter, especially the isr expand and shrink.
     private final AdjustIsrManager adjustIsrManager;
     private final FatalErrorHandler fatalErrorHandler;
@@ -199,6 +233,26 @@ public class ReplicaManager {
 
     private final Clock clock;
 
+    /** Unified index cache memory pool shared by all index components. */
+    private final MemorySegmentPool indexCacheMemoryPool;
+
+    /** Unified task scheduler shared by all index data producers. */
+    private final IndexWriteTaskScheduler taskScheduler;
+
+    /**
+     * Executor service for handling partition events asynchronously. This ensures that partition
+     * event callbacks (e.g., adding/removing index fetcher targets) do not block the metadata cache
+     * update thread, preventing potential deadlocks.
+     */
+    private final ExecutorService partitionEventExecutor;
+
+    /** Manager for watching partition changes via ZooKeeper. */
+    private final PartitionChangeWatcherManager partitionChangeWatcherManager;
+
+    /** Map from index bucket to its partition subscription handle. */
+    private final Map<TableBucket, SubscriptionHandle> partitionSubscriptionHandleMap =
+            MapUtils.newConcurrentHashMap();
+
     public ReplicaManager(
             Configuration conf,
             Scheduler scheduler,
@@ -207,6 +261,7 @@ public class ReplicaManager {
             ZooKeeperClient zkClient,
             int serverId,
             TabletServerMetadataCache metadataCache,
+            MetadataManager metadataManager,
             RpcClient rpcClient,
             CoordinatorGateway coordinatorGateway,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -224,6 +279,7 @@ public class ReplicaManager {
                 zkClient,
                 serverId,
                 metadataCache,
+                metadataManager,
                 rpcClient,
                 coordinatorGateway,
                 completedKvSnapshotCommitter,
@@ -244,6 +300,7 @@ public class ReplicaManager {
             ZooKeeperClient zkClient,
             int serverId,
             TabletServerMetadataCache metadataCache,
+            MetadataManager metadataManager,
             RpcClient rpcClient,
             CoordinatorGateway coordinatorGateway,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -277,6 +334,11 @@ public class ReplicaManager {
                         "delay fetch log",
                         serverId,
                         conf.getInt(ConfigOptions.LOG_REPLICA_FETCH_OPERATION_PURGE_NUMBER));
+        this.delayedFetchIndexManager =
+                new DelayedOperationManager<>(
+                        "delay fetch index",
+                        serverId,
+                        conf.getInt(ConfigOptions.LOG_REPLICA_FETCH_OPERATION_PURGE_NUMBER));
         this.internalListenerName = conf.get(ConfigOptions.INTERNAL_LISTENER_NAME);
 
         this.replicaFetcherManager =
@@ -285,6 +347,15 @@ public class ReplicaManager {
                         rpcClient,
                         serverId,
                         this,
+                        (nodeId) -> metadataCache.getTabletServer(nodeId, internalListenerName));
+        this.indexFetcherManager =
+                new IndexFetcherManager(
+                        conf,
+                        rpcClient,
+                        serverId,
+                        this,
+                        metadataCache,
+                        zkClient,
                         (nodeId) -> metadataCache.getTabletServer(nodeId, internalListenerName));
         this.adjustIsrManager = new AdjustIsrManager(scheduler, coordinatorGateway, serverId);
         this.fatalErrorHandler = fatalErrorHandler;
@@ -299,6 +370,27 @@ public class ReplicaManager {
         this.userMetrics = userMetrics;
         this.clock = clock;
         this.ioExecutor = ioExecutor;
+
+        // Initialize partition event executor for asynchronous event handling
+        // Use single thread to ensure event ordering within the same table
+        this.partitionEventExecutor =
+                Executors.newSingleThreadExecutor(
+                        new ThreadFactoryBuilder()
+                                .setNameFormat("partition-event-handler-%d")
+                                .setDaemon(true)
+                                .build());
+
+        // Initialize partition change watcher manager for reliable ZK-based partition watching
+        this.partitionChangeWatcherManager =
+                new PartitionChangeWatcherManager(zkClient, partitionEventExecutor);
+
+        // Initialize unified index cache memory pool
+        this.indexCacheMemoryPool = LazyMemorySegmentPool.createIndexCacheBufferPool(conf);
+
+        // Initialize unified pending write queue pool with fixed-size threads
+        int threadCount = conf.get(ConfigOptions.SERVER_INDEX_PENDING_WRITE_THREADS);
+        this.taskScheduler = new IndexWriteTaskScheduler(threadCount);
+
         registerMetrics();
     }
 
@@ -311,6 +403,9 @@ public class ReplicaManager {
                 this::maybeShrinkIsr,
                 0L,
                 conf.get(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME).toMillis() / 2);
+
+        // start up index fetcher manager
+        indexFetcherManager.startup();
     }
 
     public RemoteLogManager getRemoteLogManager() {
@@ -326,6 +421,12 @@ public class ReplicaManager {
         serverMetricGroup.gauge(MetricNames.DELAYED_WRITE_COUNT, delayedWriteManager::numDelayed);
         serverMetricGroup.gauge(
                 MetricNames.DELAYED_FETCH_COUNT, delayedFetchLogManager::numDelayed);
+        serverMetricGroup.gauge(
+                MetricNames.DELAYED_INDEX_FETCH_COUNT, delayedFetchIndexManager::numDelayed);
+
+        // index cache memory metrics
+        serverMetricGroup.gauge(
+                MetricNames.INDEX_CACHE_MEMORY_USAGE_PERCENT, this::indexCacheMemoryUsagePercent);
 
         serverMetricGroup.gauge(MetricNames.UNDER_REPLICATED, this::underReplicatedCount);
         serverMetricGroup.gauge(MetricNames.UNDER_MIN_ISR, this::underMinIsrCount);
@@ -389,6 +490,18 @@ public class ReplicaManager {
         return onlineReplicas().map(Replica::logicalStorageKvSize).reduce(0L, Long::sum);
     }
 
+    public MemorySegmentPool getIndexCacheMemoryPool() {
+        return indexCacheMemoryPool;
+    }
+
+    public IndexWriteTaskScheduler getTaskScheduler() {
+        return taskScheduler;
+    }
+
+    public Scheduler getScheduler() {
+        return scheduler;
+    }
+
     private long physicalStorageLocalSize() {
         return onlineReplicas()
                 .mapToLong(
@@ -404,6 +517,19 @@ public class ReplicaManager {
 
     private long physicalStorageRemoteLogSize() {
         return remoteLogManager.getRemoteLogSize();
+    }
+
+    private double indexCacheMemoryUsagePercent() {
+        if (indexCacheMemoryPool == null) {
+            return 0.0;
+        }
+        long totalSize = indexCacheMemoryPool.totalSize();
+        if (totalSize == 0) {
+            return 0.0;
+        }
+        long availableMemory = indexCacheMemoryPool.availableMemory();
+        long usedMemory = totalSize - availableMemory;
+        return (double) usedMemory / totalSize * 100.0;
     }
 
     /**
@@ -547,6 +673,124 @@ public class ReplicaManager {
         // maybe do delay fetch log operation.
         maybeAddDelayedFetchLog(
                 params, bucketFetchInfo, logReadResults, userContext, responseCallback);
+    }
+
+    /**
+     * Fetch index records from a replica.
+     *
+     * @param params fetch index params
+     * @param dataBucketIndexFetchInfo data bucket index fetch info
+     * @param responseCallback callback function
+     */
+    public void fetchIndexRecords(
+            FetchIndexParams params,
+            Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> dataBucketIndexFetchInfo,
+            Consumer<Map<TableBucket, DataBucketIndexFetchResult>> responseCallback) {
+        long startTime = System.currentTimeMillis();
+        Tuple2<Integer, Map<TableBucket, DataBucketIndexFetchResult>> fetchResult =
+                tryFetchIndexBeforeDelayed(params, dataBucketIndexFetchInfo);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Fetched index from {} data buckets in {} ms, {} completions",
+                    dataBucketIndexFetchInfo.size(),
+                    System.currentTimeMillis() - startTime,
+                    fetchResult.f1.size());
+        }
+        maybeAddDelayedFetchIndex(
+                params, dataBucketIndexFetchInfo, fetchResult.f0, fetchResult.f1, responseCallback);
+    }
+
+    private Tuple2<Integer, Map<TableBucket, DataBucketIndexFetchResult>>
+            tryFetchIndexBeforeDelayed(
+                    FetchIndexParams params,
+                    Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>>
+                            dataBucketIndexFetchInfo) {
+        Map<TableBucket, DataBucketIndexFetchResult> completeFetches = new HashMap<>();
+        int alreadyFetchedBytes = 0;
+
+        for (Map.Entry<TableBucket, Map<TableBucket, FetchIndexReqInfo>> entry :
+                dataBucketIndexFetchInfo.entrySet()) {
+            TableBucket dataBucket = entry.getKey();
+            Map<TableBucket, FetchIndexReqInfo> indexRequests = entry.getValue();
+            int remainingBytes = params.maxBytes() - alreadyFetchedBytes;
+
+            // Skip if byte limit exceeded
+            if (remainingBytes <= 0) {
+                completeFetches.put(
+                        dataBucket, createByteLimitExceededResult(indexRequests.keySet()));
+                continue;
+            }
+
+            // Try to fetch index data for this data bucket
+            Tuple2<Integer, DataBucketIndexFetchResult> result =
+                    fetchIndexForDataBucket(dataBucket, indexRequests, params, remainingBytes);
+            alreadyFetchedBytes += result.f0;
+            if (result.f1 != null) {
+                completeFetches.put(dataBucket, result.f1);
+            }
+        }
+        return Tuple2.of(alreadyFetchedBytes, completeFetches);
+    }
+
+    /**
+     * Fetch index data for a single data bucket.
+     *
+     * @return Tuple of (fetched bytes, result or null if data not ready)
+     */
+    private Tuple2<Integer, DataBucketIndexFetchResult> fetchIndexForDataBucket(
+            TableBucket dataBucket,
+            Map<TableBucket, FetchIndexReqInfo> indexRequests,
+            FetchIndexParams params,
+            int maxBytes) {
+        try {
+            Replica replica = getReplicaOrException(dataBucket);
+            checkArgument(
+                    replica.isLeader(), "Replica of data bucket %s is not leader", dataBucket);
+
+            Tuple2<Integer, Optional<Map<TableBucket, IndexSegment>>> fetchResult =
+                    replica.fetchIndex(indexRequests, params.minAdvancedOffset(), maxBytes, false);
+
+            if (!fetchResult.f1.isPresent()) {
+                return Tuple2.of(fetchResult.f0, null);
+            }
+
+            // Process fetched segments
+            Map<TableBucket, FetchIndexLogResultForBucket> results = new HashMap<>();
+            boolean hasNotReadyData = false;
+
+            for (Map.Entry<TableBucket, IndexSegment> segmentEntry :
+                    fetchResult.f1.get().entrySet()) {
+                IndexSegment segment = segmentEntry.getValue();
+                if (segment.getStatus() == IndexSegment.DataStatus.NOT_READY) {
+                    hasNotReadyData = true;
+                    continue;
+                }
+                results.put(
+                        segmentEntry.getKey(),
+                        new FetchIndexLogResultForBucket(
+                                segment.getRecords(),
+                                segment.getStartOffset(),
+                                segment.getEndOffset(),
+                                true));
+            }
+
+            // Return null if any data not ready (will go through delay mechanism)
+            return hasNotReadyData
+                    ? Tuple2.of(fetchResult.f0, null)
+                    : Tuple2.of(fetchResult.f0, new DataBucketIndexFetchResult(results));
+
+        } catch (Exception e) {
+            LOG.debug("Failed to fetch index for data bucket {}", dataBucket, e);
+            return Tuple2.of(
+                    0,
+                    DataBucketIndexFetchResult.errorResult(
+                            indexRequests.keySet(), ApiError.fromThrowable(e)));
+        }
+    }
+
+    private DataBucketIndexFetchResult createByteLimitExceededResult(
+            Set<TableBucket> indexBuckets) {
+        return DataBucketIndexFetchResult.withStatus(indexBuckets, FetchIndexStatus.THROTTLED);
     }
 
     /**
@@ -867,10 +1111,17 @@ public class ReplicaManager {
         if (replicasToBeLeader.isEmpty()) {
             return;
         }
-        replicaFetcherManager.removeFetcherForBuckets(
+        Set<TableBucket> tableBucketsToStopFetch =
                 replicasToBeLeader.stream()
                         .map(NotifyLeaderAndIsrData::getTableBucket)
-                        .collect(Collectors.toSet()));
+                        .collect(Collectors.toSet());
+        replicaFetcherManager.removeFetcherForBuckets(tableBucketsToStopFetch);
+        // Remove index fetcher targets for index buckets that are becoming leaders
+        indexFetcherManager.removeIndexBuckets(tableBucketsToStopFetch);
+
+        // Stop partition listeners for index buckets that are becoming leaders
+        // This prevents stale listeners from interfering when table is recreated
+        cleanupPartitionSubscriptions(tableBucketsToStopFetch);
 
         for (NotifyLeaderAndIsrData data : replicasToBeLeader) {
             TableBucket tb = data.getTableBucket();
@@ -882,6 +1133,13 @@ public class ReplicaManager {
                 }
                 // start the remote log tiering tasks for leaders
                 remoteLogManager.startLogTiering(replica);
+
+                // For index tables, add targets to IndexFetcherManager to pull data from data
+                // tables
+                if (replica.isIndexTable()) {
+                    addIndexFetcherTargetsForIndexTableLeader(replica);
+                }
+
                 result.put(tb, new NotifyLeaderAndIsrResultForBucket(tb));
             } catch (Exception e) {
                 LOG.error("Error make replica {} to leader", tb, e);
@@ -907,6 +1165,194 @@ public class ReplicaManager {
     }
 
     /**
+     * Add index fetcher targets for an index table bucket leader. Creates fetcher targets for all
+     * data buckets and adds them to IndexFetcherManager. The manager handles leader lookup, retry
+     * on failure, and partition changes asynchronously.
+     */
+    private void addIndexFetcherTargetsForIndexTableLeader(Replica indexReplica) {
+        TableBucket indexBucket = indexReplica.getTableBucket();
+        PhysicalTablePath indexPhysicalPath = indexReplica.getPhysicalTablePath();
+
+        try {
+            Optional<TableInfo> dataTableOpt =
+                    metadataCache.getMainTableForIndex(indexPhysicalPath.getTablePath());
+            if (!dataTableOpt.isPresent()) {
+                LOG.warn(
+                        "No data table found for index table: {}, will retry later",
+                        indexPhysicalPath.getTablePath());
+                return;
+            }
+
+            IndexApplier indexApplier = indexReplica.getIndexApplier();
+            if (indexApplier == null) {
+                LOG.error("IndexApplier not available for index table {}", indexBucket);
+                return;
+            }
+
+            TableInfo dataTable = dataTableOpt.get();
+            TablePath indexTablePath = indexPhysicalPath.getTablePath();
+
+            Map<DataIndexTableBucket, IndexFetcherManager.FetcherTargetInfo> targets =
+                    dataTable.isPartitioned()
+                            ? setupPartitionedTableTargets(
+                                    indexBucket, indexTablePath, indexApplier, dataTable)
+                            : createNonPartitionedTableTargets(
+                                    indexBucket, indexTablePath, indexApplier, dataTable);
+
+            if (!targets.isEmpty()) {
+                indexFetcherManager.addOrUpdateTargetsForIndexBucket(indexBucket, targets);
+                LOG.info(
+                        "Added {} index fetcher targets for index table leader {}",
+                        targets.size(),
+                        indexBucket);
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to add index fetcher targets for index table {}", indexBucket, e);
+        }
+    }
+
+    /**
+     * Setup fetcher targets for a partitioned data table. Subscribes to partition changes and
+     * creates targets for existing partitions.
+     */
+    private Map<DataIndexTableBucket, IndexFetcherManager.FetcherTargetInfo>
+            setupPartitionedTableTargets(
+                    TableBucket indexBucket,
+                    TablePath indexTablePath,
+                    IndexApplier indexApplier,
+                    TableInfo dataTable) {
+        TablePath dataTablePath = dataTable.getTablePath();
+        long dataTableId = dataTable.getTableId();
+        int dataBucketCount = dataTable.getNumBuckets();
+
+        // Subscribe to partition changes
+        SubscriptionHandle subscriptionHandle =
+                partitionChangeWatcherManager.subscribe(
+                        dataTablePath,
+                        createPartitionChangeCallback(
+                                indexBucket, indexTablePath, indexApplier, dataTable));
+
+        // Create targets for existing partitions
+        Map<DataIndexTableBucket, IndexFetcherManager.FetcherTargetInfo> targets = new HashMap<>();
+        for (PartitionInfo partition : subscriptionHandle.getCurrentPartitions()) {
+            addTargetsForPartition(
+                    targets,
+                    indexBucket,
+                    indexTablePath,
+                    indexApplier,
+                    dataTableId,
+                    dataBucketCount,
+                    partition.getPartitionId());
+        }
+
+        // Save subscription handle for cleanup
+        SubscriptionHandle previousHandle =
+                partitionSubscriptionHandleMap.put(indexBucket, subscriptionHandle);
+        if (previousHandle != null) {
+            previousHandle.unsubscribe();
+        }
+
+        return targets;
+    }
+
+    /** Create fetcher targets for a non-partitioned data table. */
+    private Map<DataIndexTableBucket, IndexFetcherManager.FetcherTargetInfo>
+            createNonPartitionedTableTargets(
+                    TableBucket indexBucket,
+                    TablePath indexTablePath,
+                    IndexApplier indexApplier,
+                    TableInfo dataTable) {
+        Map<DataIndexTableBucket, IndexFetcherManager.FetcherTargetInfo> targets = new HashMap<>();
+        long dataTableId = dataTable.getTableId();
+        int dataBucketCount = dataTable.getNumBuckets();
+
+        for (int bucketId = 0; bucketId < dataBucketCount; bucketId++) {
+            TableBucket dataBucket = new TableBucket(dataTableId, null, bucketId);
+            DataIndexTableBucket dataIndexBucket =
+                    new DataIndexTableBucket(dataBucket, indexBucket);
+            targets.put(
+                    dataIndexBucket,
+                    new IndexFetcherManager.FetcherTargetInfo(indexTablePath, indexApplier));
+        }
+        return targets;
+    }
+
+    /** Create a callback for handling partition changes on a data table. */
+    private PartitionChangeCallback createPartitionChangeCallback(
+            TableBucket indexBucket,
+            TablePath indexTablePath,
+            IndexApplier indexApplier,
+            TableInfo dataTable) {
+        TablePath dataTablePath = dataTable.getTablePath();
+        long dataTableId = dataTable.getTableId();
+        int dataBucketCount = dataTable.getNumBuckets();
+
+        return new PartitionChangeCallback() {
+            @Override
+            public void onPartitionCreated(PartitionInfo partition) {
+                Map<DataIndexTableBucket, IndexFetcherManager.FetcherTargetInfo> newTargets =
+                        new HashMap<>();
+                addTargetsForPartition(
+                        newTargets,
+                        indexBucket,
+                        indexTablePath,
+                        indexApplier,
+                        dataTableId,
+                        dataBucketCount,
+                        partition.getPartitionId());
+                indexFetcherManager.addOrUpdateTargetsForIndexBucket(indexBucket, newTargets);
+                LOG.info(
+                        "Added {} fetcher targets for partition {} to index table {}",
+                        newTargets.size(),
+                        PhysicalTablePath.of(dataTablePath, partition.getPartitionName()),
+                        indexTablePath);
+            }
+
+            @Override
+            public void onPartitionDeleted(PartitionInfo partition) {
+                Set<TableBucket> deletedBuckets =
+                        createDataBucketsForPartition(
+                                dataTableId, dataBucketCount, partition.getPartitionId());
+                indexFetcherManager.removeDataBucketsFromIndexBucket(indexBucket, deletedBuckets);
+                LOG.info(
+                        "Removed {} fetcher targets for partition {} from index table {}",
+                        deletedBuckets.size(),
+                        PhysicalTablePath.of(dataTablePath, partition.getPartitionName()),
+                        indexTablePath);
+            }
+        };
+    }
+
+    /** Add fetcher targets for all buckets in a partition. */
+    private void addTargetsForPartition(
+            Map<DataIndexTableBucket, IndexFetcherManager.FetcherTargetInfo> targets,
+            TableBucket indexBucket,
+            TablePath indexTablePath,
+            IndexApplier indexApplier,
+            long dataTableId,
+            int dataBucketCount,
+            long partitionId) {
+        for (int bucketId = 0; bucketId < dataBucketCount; bucketId++) {
+            TableBucket dataBucket = new TableBucket(dataTableId, partitionId, bucketId);
+            DataIndexTableBucket dataIndexBucket =
+                    new DataIndexTableBucket(dataBucket, indexBucket);
+            targets.put(
+                    dataIndexBucket,
+                    new IndexFetcherManager.FetcherTargetInfo(indexTablePath, indexApplier));
+        }
+    }
+
+    /** Create a set of data buckets for all buckets in a partition. */
+    private Set<TableBucket> createDataBucketsForPartition(
+            long dataTableId, int dataBucketCount, long partitionId) {
+        Set<TableBucket> buckets = new HashSet<>();
+        for (int bucketId = 0; bucketId < dataBucketCount; bucketId++) {
+            buckets.add(new TableBucket(dataTableId, partitionId, bucketId));
+        }
+        return buckets;
+    }
+
+    /**
      * Make the current server to become follower for a given set of replicas by:
      *
      * <pre>
@@ -928,6 +1374,7 @@ public class ReplicaManager {
             TableBucket tb = data.getTableBucket();
             try {
                 Replica replica = getReplicaOrException(data.getTableBucket());
+
                 if (replica.makeFollower(data)) {
                     replicasBecomeFollower.add(replica);
                 }
@@ -943,10 +1390,16 @@ public class ReplicaManager {
 
         // Stopping the fetchers must be done first in order to initialize the fetch position
         // correctly.
-        replicaFetcherManager.removeFetcherForBuckets(
+        Set<TableBucket> tableBucketsToStopFetch =
                 replicasBecomeFollower.stream()
                         .map(Replica::getTableBucket)
-                        .collect(Collectors.toSet()));
+                        .collect(Collectors.toSet());
+        replicaFetcherManager.removeFetcherForBuckets(tableBucketsToStopFetch);
+        // Remove index fetcher targets for index buckets that are becoming followers
+        indexFetcherManager.removeIndexBuckets(tableBucketsToStopFetch);
+
+        // Stop partition listeners for index buckets that are becoming followers
+        cleanupPartitionSubscriptions(tableBucketsToStopFetch);
 
         replicasBecomeFollower.forEach(
                 replica -> completeDelayedOperations(replica.getTableBucket()));
@@ -972,7 +1425,7 @@ public class ReplicaManager {
             Integer leaderId = replica.getLeaderId();
             TableBucket tb = replica.getTableBucket();
             LogTablet logTablet = replica.getLogTablet();
-            if (leaderId == null) {
+            if (leaderId == null || leaderId < 0) {
                 result.put(
                         tb,
                         new NotifyLeaderAndIsrResultForBucket(
@@ -1008,6 +1461,7 @@ public class ReplicaManager {
             TableMetricGroup tableMetrics = null;
             try {
                 Replica replica = getReplicaOrException(tb);
+
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalProduceLogRequests().inc();
                 // record user metrics before appending to log,
@@ -1476,10 +1930,72 @@ public class ReplicaManager {
                 || error == Errors.UNKNOWN_TABLE_OR_BUCKET_EXCEPTION;
     }
 
+    private void maybeAddDelayedFetchIndex(
+            FetchIndexParams params,
+            Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> dataBucketIndexFetchInfo,
+            int alreadyFetchedBytes,
+            Map<TableBucket, DataBucketIndexFetchResult> completeFetches,
+            Consumer<Map<TableBucket, DataBucketIndexFetchResult>> responseCallback) {
+        if (!delayedIndexFetchRequired(
+                params, dataBucketIndexFetchInfo, alreadyFetchedBytes, completeFetches)) {
+            if (completeFetches.size() < dataBucketIndexFetchInfo.size()) {
+                // Use NO_DATA_AVAILABLE status instead of FetchIndexEarlyFireException
+                Sets.difference(dataBucketIndexFetchInfo.keySet(), completeFetches.keySet())
+                        .forEach(
+                                dataBucket ->
+                                        completeFetches.put(
+                                                dataBucket,
+                                                DataBucketIndexFetchResult.withStatus(
+                                                        dataBucketIndexFetchInfo
+                                                                .get(dataBucket)
+                                                                .keySet(),
+                                                        FetchIndexStatus.NO_DATA_AVAILABLE)));
+            }
+            responseCallback.accept(completeFetches);
+            return;
+        }
+
+        DelayedFetchIndex delayedFetchIndex =
+                new DelayedFetchIndex(
+                        params,
+                        this,
+                        dataBucketIndexFetchInfo,
+                        alreadyFetchedBytes,
+                        completeFetches,
+                        responseCallback,
+                        serverMetricGroup);
+
+        delayedFetchIndexManager.tryCompleteElseWatch(
+                delayedFetchIndex,
+                dataBucketIndexFetchInfo.keySet().stream()
+                        .map(DelayedTableBucketKey::new)
+                        .collect(Collectors.toList()));
+    }
+
+    private boolean delayedIndexFetchRequired(
+            FetchIndexParams params,
+            Map<TableBucket, Map<TableBucket, FetchIndexReqInfo>> dataBucketIndexFetchInfo,
+            int alreadyFetchedBytes,
+            Map<TableBucket, DataBucketIndexFetchResult> completeFetches) {
+
+        // No delay if max wait time is 0
+        if (params.maxWaitMs() <= 0 || dataBucketIndexFetchInfo.isEmpty()) {
+            return false;
+        }
+        // No delay if all fetches are complete
+        if (completeFetches.size() == dataBucketIndexFetchInfo.size()) {
+            return false;
+        }
+        // Check if accumulated data meets minimum requirements
+        // Already have enough data
+        return alreadyFetchedBytes < params.maxBytes();
+    }
+
     private void completeDelayedOperations(TableBucket tableBucket) {
         DelayedTableBucketKey delayedTableBucketKey = new DelayedTableBucketKey(tableBucket);
         delayedWriteManager.checkAndComplete(delayedTableBucketKey);
         delayedFetchLogManager.checkAndComplete(delayedTableBucketKey);
+        delayedFetchIndexManager.checkAndComplete(delayedTableBucketKey);
     }
 
     /**
@@ -1531,6 +2047,7 @@ public class ReplicaManager {
      *     1. requiredAcks = -1.
      *     2. there is data to append.
      *     3. at least one bucket append was successful.
+     *     4. OR any bucket is waiting for index producer initialization.
      * </pre>
      */
     private boolean delayedWriteRequired(
@@ -1539,9 +2056,16 @@ public class ReplicaManager {
             Map<TableBucket, ? extends WriteResultForBucket> writeResults) {
         boolean needDelayedWrite = false;
         int failedBucketSize = 0;
-        for (WriteResultForBucket result : writeResults.values()) {
+        for (Map.Entry<TableBucket, ? extends WriteResultForBucket> entry :
+                writeResults.entrySet()) {
+            WriteResultForBucket result = entry.getValue();
             if (result.failed()) {
                 failedBucketSize++;
+            }
+            // Check if any bucket is waiting for index producer init
+            // (indicated by writeLogEndOffset == -1 and no error)
+            if (!needDelayedWrite && result.succeeded() && result.getWriteLogEndOffset() == -1L) {
+                needDelayedWrite = true;
             }
         }
         if (requiredAcks == -1 && inputBucketSize > 0 && failedBucketSize < inputBucketSize) {
@@ -1560,6 +2084,22 @@ public class ReplicaManager {
         }
     }
 
+    /** Clean up partition subscriptions for a set of table buckets. */
+    private void cleanupPartitionSubscriptions(Set<TableBucket> tableBuckets) {
+        for (TableBucket tb : tableBuckets) {
+            cleanupPartitionSubscription(tb);
+        }
+    }
+
+    /** Clean up partition subscription for a single table bucket. */
+    private void cleanupPartitionSubscription(TableBucket tb) {
+        SubscriptionHandle subscriptionHandle = partitionSubscriptionHandleMap.remove(tb);
+        if (subscriptionHandle != null) {
+            subscriptionHandle.unsubscribe();
+            LOG.debug("Unsubscribed partition watcher for index bucket {}", tb);
+        }
+    }
+
     /** Stop the given replica. */
     private StopReplicaResultForBucket stopReplica(
             TableBucket tb,
@@ -1568,6 +2108,11 @@ public class ReplicaManager {
             Map<Long, Path> deletedPartitionIds) {
         // First stop fetchers for this table bucket.
         replicaFetcherManager.removeFetcherForBuckets(Collections.singleton(tb));
+        // Remove index fetcher targets for index buckets that are being stopped
+        indexFetcherManager.removeIndexBucket(tb);
+
+        // Clean up PartitionChangeWatcher subscription
+        cleanupPartitionSubscription(tb);
 
         HostedReplica replica = getReplica(tb);
         if (replica instanceof OnlineReplica) {
@@ -1655,6 +2200,7 @@ public class ReplicaManager {
                 BucketMetricGroup bucketMetricGroup =
                         serverMetricGroup.addTableBucketMetricGroup(
                                 physicalTablePath, tb, isKvTable);
+
                 Replica replica =
                         new Replica(
                                 physicalTablePath,
@@ -1674,7 +2220,12 @@ public class ReplicaManager {
                                 fatalErrorHandler,
                                 bucketMetricGroup,
                                 tableInfo,
-                                clock);
+                                clock,
+                                remoteLogManager,
+                                indexCacheMemoryPool,
+                                taskScheduler,
+                                scheduler,
+                                conf);
                 allReplicas.put(tb, new OnlineReplica(replica));
                 replicaOpt = Optional.of(replica);
             } else if (hostedReplica instanceof OnlineReplica) {
@@ -1722,6 +2273,11 @@ public class ReplicaManager {
     }
 
     @VisibleForTesting
+    public DelayedOperationManager<DelayedFetchIndex> getDelayedFetchIndexManager() {
+        return delayedFetchIndexManager;
+    }
+
+    @VisibleForTesting
     public AdjustIsrManager getAdjustIsrManager() {
         return adjustIsrManager;
     }
@@ -1762,11 +2318,38 @@ public class ReplicaManager {
     public static final class OfflineReplica implements HostedReplica {}
 
     public void shutdown() throws InterruptedException {
+        // Shutdown partition event executor first to prevent new events
+        partitionEventExecutor.shutdown();
+        try {
+            if (!partitionEventExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                LOG.warn("Partition event executor did not terminate gracefully, forcing shutdown");
+                partitionEventExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            LOG.warn("Interrupted while waiting for partition event executor to terminate");
+            partitionEventExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+
+        // Close partition change watcher manager
+        partitionChangeWatcherManager.close();
+
+        // Close task scheduler
+        taskScheduler.close();
+
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
         replicaFetcherManager.shutdown();
+        indexFetcherManager.shutdown();
         delayedWriteManager.shutdown();
         delayedFetchLogManager.shutdown();
+        delayedFetchIndexManager.shutdown();
+
+        // Close unified index cache memory pool
+        if (indexCacheMemoryPool != null) {
+            indexCacheMemoryPool.close();
+            LOG.info("Closed unified index cache memory pool");
+        }
 
         // Checkpoint highWatermark.
         checkpointHighWatermarks();

@@ -29,6 +29,60 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Tests for {@link org.apache.fluss.metadata.TablePath}. */
 class TablePathTest {
 
+    // -----------------------------------------------------------------------------------------
+    // Index Table Tests
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void testForIndexTable() {
+        TablePath mainTablePath = TablePath.of("test_db", "test_table");
+        String indexName = "test_index";
+
+        TablePath indexTablePath = TablePath.forIndexTable(mainTablePath, indexName);
+
+        assertThat(indexTablePath.getDatabaseName()).isEqualTo("test_db");
+        assertThat(indexTablePath.getTableName()).isEqualTo("__test_table__index__test_index");
+    }
+
+    @Test
+    void testForIndexTableWithComplexNames() {
+        TablePath mainTablePath = TablePath.of("my_database", "user_orders");
+        String indexName = "user_email_idx";
+
+        TablePath indexTablePath = TablePath.forIndexTable(mainTablePath, indexName);
+
+        assertThat(indexTablePath.getDatabaseName()).isEqualTo("my_database");
+        assertThat(indexTablePath.getTableName()).isEqualTo("__user_orders__index__user_email_idx");
+    }
+
+    @Test
+    void testIsIndexTableName() {
+        // Valid index table names
+        assertThat(TablePath.of("db", "__orders__index__user_id_idx").isIndexTableName()).isTrue();
+        assertThat(TablePath.of("db", "__test_table__index__idx").isIndexTableName()).isTrue();
+        assertThat(TablePath.of("db", "__a__index__b").isIndexTableName()).isTrue();
+
+        // Invalid index table names
+        assertThat(TablePath.of("db", "orders").isIndexTableName()).isFalse();
+        assertThat(TablePath.of("db", "__orders").isIndexTableName()).isFalse();
+        assertThat(TablePath.of("db", "orders__index__idx").isIndexTableName()).isFalse();
+        assertThat(TablePath.of("db", "__orders__idx").isIndexTableName()).isFalse();
+    }
+
+    @Test
+    void testForIndexTableAndIsIndexTableNameConsistency() {
+        // Verify that forIndexTable creates paths that isIndexTableName recognizes
+        TablePath mainTablePath = TablePath.of("db", "main_table");
+        TablePath indexTablePath = TablePath.forIndexTable(mainTablePath, "my_index");
+
+        assertThat(indexTablePath.isIndexTableName()).isTrue();
+        assertThat(mainTablePath.isIndexTableName()).isFalse();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Validation Tests
+    // -----------------------------------------------------------------------------------------
+
     @Test
     void testValidate() {
         // assert valid name

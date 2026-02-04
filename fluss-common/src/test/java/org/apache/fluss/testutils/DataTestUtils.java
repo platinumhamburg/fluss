@@ -31,7 +31,9 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.DefaultLogRecordBatch;
+import org.apache.fluss.record.DefaultStateChangeLogsBuilder;
 import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.record.IndexedLogRecord;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordTestUtils;
@@ -42,6 +44,9 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.MemoryLogRecordsArrowBuilder;
 import org.apache.fluss.record.MemoryLogRecordsIndexedBuilder;
+import org.apache.fluss.record.StateChangeLogs;
+import org.apache.fluss.record.StateDefs;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericArray;
@@ -627,7 +632,8 @@ public class DataTestUtils {
                             magic,
                             schemaId,
                             writer,
-                            new ManagedPagedOutputView(new TestingMemorySegmentPool(10 * 1024)));
+                            new ManagedPagedOutputView(new TestingMemorySegmentPool(10 * 1024)),
+                            null);
             for (int i = 0; i < changeTypes.size(); i++) {
                 builder.append(changeTypes.get(i), rows.get(i));
             }
@@ -828,5 +834,56 @@ public class DataTestUtils {
                 assertThat(expectVal[i]).isNull();
             }
         }
+    }
+
+    /**
+     * Generates MemoryLogRecords with state change logs for testing IndexCache/IndexApplier
+     * scenarios.
+     *
+     * <p>This method creates indexed format records with embedded state change logs to track the
+     * data bucket offset corresponding to the index records.
+     *
+     * @param rows the list of indexed rows to include in the records
+     * @param dataBucket the data bucket these index records correspond to
+     * @param dataEndOffset the end offset in the data bucket (exclusive)
+     * @return MemoryLogRecords with embedded state change logs
+     * @throws Exception if building the records fails
+     */
+    public static MemoryLogRecords genIndexedMemoryLogRecordsWithState(
+            List<IndexedRow> rows, TableBucket dataBucket, long dataEndOffset) throws Exception {
+        // Step 1: Serialize the rows to get pre-written bytes view
+        // IMPORTANT: We need to copy each IndexedRow because the input rows may point to
+        // temporary MemorySegments that will be invalid later
+        List<MemorySegmentBytesView> preWrittenBytesView = new java.util.ArrayList<>();
+        if (!rows.isEmpty()) {
+            UnmanagedPagedOutputView tempOutputView = new UnmanagedPagedOutputView(1024);
+            for (IndexedRow row : rows) {
+                // Create a copy of the row to ensure we don't reference temporary memory
+                IndexedRow copiedRow = row.copy();
+                IndexedLogRecord.writeTo(tempOutputView, ChangeType.APPEND_ONLY, copiedRow);
+            }
+            preWrittenBytesView = tempOutputView.getWrittenSegments();
+        }
+
+        // Step 2: Create state change logs to track data bucket offset
+        DefaultStateChangeLogsBuilder stateBuilder = new DefaultStateChangeLogsBuilder();
+        stateBuilder.addLog(
+                ChangeType.UPDATE_AFTER,
+                StateDefs.DATA_BUCKET_OFFSET_OF_INDEX,
+                dataBucket,
+                dataEndOffset);
+        StateChangeLogs stateChangeLogs = stateBuilder.build();
+
+        // Step 3: Build MemoryLogRecords using preWrittenBytesView + stateChangeLogs
+        // Note: We don't use try-with-resources here to avoid closing the builder prematurely,
+        // which would invalidate the IndexedRow objects that point to the MemorySegment
+        MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.builder(
+                        DEFAULT_SCHEMA_ID,
+                        preWrittenBytesView,
+                        rows.size(),
+                        true, // appendOnly
+                        stateChangeLogs);
+        return MemoryLogRecords.pointToBytesView(builder.build());
     }
 }

@@ -382,6 +382,7 @@ public class MemoryLogRecordsArrowBuilderTest {
                 recordBatchMagic,
                 DEFAULT_SCHEMA_ID,
                 writer,
-                new ManagedPagedOutputView(new TestingMemorySegmentPool(pageSizeInBytes)));
+                new ManagedPagedOutputView(new TestingMemorySegmentPool(pageSizeInBytes)),
+                null);
     }
 }

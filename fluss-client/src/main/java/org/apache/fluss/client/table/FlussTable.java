@@ -18,6 +18,7 @@
 package org.apache.fluss.client.table;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.FlussConnection;
 import org.apache.fluss.client.lookup.Lookup;
 import org.apache.fluss.client.lookup.TableLookup;
@@ -57,6 +58,16 @@ public class FlussTable implements Table {
                 new ClientSchemaGetter(tablePath, tableInfo.getSchemaInfo(), conn.getAdmin());
     }
 
+    /**
+     * Check if this table is an index table.
+     *
+     * @return true if this is an index table, false otherwise
+     */
+    @VisibleForTesting
+    boolean isIndexTable() {
+        return tableInfo.isIndexTable();
+    }
+
     @Override
     public TableInfo getTableInfo() {
         return tableInfo;
@@ -70,7 +81,11 @@ public class FlussTable implements Table {
     @Override
     public Lookup newLookup() {
         return new TableLookup(
-                tableInfo, schemaGetter, conn.getMetadataUpdater(), conn.getOrCreateLookupClient());
+                tableInfo,
+                schemaGetter,
+                conn.getMetadataUpdater(),
+                conn.getOrCreateLookupClient(),
+                conn);
     }
 
     @Override
@@ -78,6 +93,10 @@ public class FlussTable implements Table {
         checkState(
                 !hasPrimaryKey,
                 "Table %s is not a Log Table and doesn't support AppendWriter.",
+                tablePath);
+        checkState(
+                !isIndexTable(),
+                "Index table %s doesn't support AppendWriter. Index tables can only be updated by internal roles.",
                 tablePath);
         return new TableAppend(tablePath, tableInfo, conn.getOrCreateWriterClient());
     }
@@ -88,12 +107,18 @@ public class FlussTable implements Table {
                 hasPrimaryKey,
                 "Table %s is not a Primary Key Table and doesn't support UpsertWriter.",
                 tablePath);
+        checkState(
+                !isIndexTable(),
+                "Index table %s doesn't support UpsertWriter. Index tables can only be updated by internal roles.",
+                tablePath);
         return new TableUpsert(tablePath, tableInfo, conn.getOrCreateWriterClient());
     }
 
     @Override
     public void close() throws Exception {
         // do nothing
-        schemaGetter.release();
+        if (schemaGetter != null) {
+            schemaGetter.release();
+        }
     }
 }

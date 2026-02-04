@@ -17,6 +17,7 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -31,16 +32,21 @@ public class ValueRecordReadContext implements ValueRecordBatch.ReadContext {
     private final Map<Integer, RowDecoder> rowDecoderCache;
     private final SchemaGetter schemaGetter;
     private final KvFormat kvFormat;
+    private final int prefixLength;
 
-    private ValueRecordReadContext(SchemaGetter schemaGetter, KvFormat kvFormat) {
+    private ValueRecordReadContext(SchemaGetter schemaGetter, KvFormat kvFormat, int prefixLength) {
         this.rowDecoderCache = new HashMap<>();
         this.schemaGetter = schemaGetter;
         this.kvFormat = kvFormat;
+        this.prefixLength = prefixLength;
     }
 
     public static ValueRecordReadContext createReadContext(
-            SchemaGetter schemaGetter, KvFormat kvFormat) {
-        return new ValueRecordReadContext(schemaGetter, kvFormat);
+            SchemaGetter schemaGetter,
+            KvFormat kvFormat,
+            CompactionFilterConfig compactionFilterConfig) {
+        return new ValueRecordReadContext(
+                schemaGetter, kvFormat, compactionFilterConfig.getPrefixLength());
     }
 
     @Override
@@ -52,5 +58,10 @@ public class ValueRecordReadContext implements ValueRecordBatch.ReadContext {
                     return RowDecoder.create(
                             kvFormat, schema.getRowType().getChildren().toArray(new DataType[0]));
                 });
+    }
+
+    @Override
+    public int prefixLength() {
+        return prefixLength;
     }
 }

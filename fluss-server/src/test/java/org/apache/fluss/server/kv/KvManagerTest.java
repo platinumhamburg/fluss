@@ -352,14 +352,16 @@ final class KvManagerTest {
                         tablePath.getDatabaseName(), tablePath.getTableName(), partitionName);
         LogTablet logTablet =
                 logManager.getOrCreateLog(physicalTablePath, tableBucket, LogFormat.ARROW, 1, true);
+        TableConfig tableConfig = new TableConfig(new Configuration());
         return kvManager.getOrCreateKv(
                 physicalTablePath,
                 tableBucket,
                 logTablet,
                 KvFormat.COMPACTED,
                 schemaGetter,
-                new TableConfig(new Configuration()),
-                DEFAULT_COMPRESSION);
+                tableConfig,
+                DEFAULT_COMPRESSION,
+                tableConfig.getCompactionFilterConfig());
     }
 
     private byte[] valueOf(KvRecord kvRecord) {

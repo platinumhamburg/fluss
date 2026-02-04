@@ -20,11 +20,15 @@ package org.apache.fluss.config;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.CompactionFilterConfig;
+import org.apache.fluss.metadata.CompactionFilterType;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
+import org.apache.fluss.metadata.TableType;
+import org.apache.fluss.metadata.TtlCompactionFilterConfig;
 import org.apache.fluss.utils.AutoPartitionStrategy;
 
 import java.time.Duration;
@@ -72,6 +76,11 @@ public class TableConfig {
      */
     public Optional<Integer> getKvFormatVersion() {
         return config.getOptional(ConfigOptions.TABLE_KV_FORMAT_VERSION);
+    }
+
+    /** Gets the type of the table. */
+    public TableType getTableType() {
+        return config.get(ConfigOptions.TABLE_TYPE);
     }
 
     /** Gets the log TTL of the table. */
@@ -153,5 +162,29 @@ public class TableConfig {
     /** Gets the number of auto-increment IDs cached per segment. */
     public long getAutoIncrementCacheSize() {
         return config.get(ConfigOptions.TABLE_AUTO_INCREMENT_CACHE_SIZE);
+    }
+
+    /**
+     * Gets the compaction filter configuration for KV storage.
+     *
+     * <p>The compaction filter determines how entries are filtered during RocksDB compaction. For
+     * example, TTL-based filtering can remove expired entries.
+     */
+    public CompactionFilterConfig getCompactionFilterConfig() {
+        CompactionFilterType type = config.get(ConfigOptions.TABLE_KV_COMPACTION_FILTER_TYPE);
+
+        switch (type) {
+            case NONE:
+                return CompactionFilterConfig.none();
+            case TTL:
+                String ttlColumn =
+                        config.getOptional(ConfigOptions.TABLE_KV_COMPACTION_FILTER_TTL_COLUMN)
+                                .orElse(null);
+                long retentionMs =
+                        config.get(ConfigOptions.TABLE_KV_COMPACTION_FILTER_TTL_RETENTION_MS);
+                return new TtlCompactionFilterConfig(ttlColumn, retentionMs);
+            default:
+                throw new IllegalArgumentException("Unknown compaction filter type: " + type);
+        }
     }
 }

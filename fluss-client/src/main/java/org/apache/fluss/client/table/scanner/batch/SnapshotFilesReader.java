@@ -19,6 +19,7 @@ package org.apache.fluss.client.table.scanner.batch;
 
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -80,12 +81,13 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
             @Nullable int[] projectedFields,
             int targetSchemaId,
             Schema targetSchema,
-            SchemaGetter schemaGetter)
+            SchemaGetter schemaGetter,
+            CompactionFilterConfig compactionFilterConfig)
             throws IOException {
         this.targetSchemaId = targetSchemaId;
         this.targetSchema = targetSchema;
         this.schemaGetter = schemaGetter;
-        this.valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
+        this.valueDecoder = new ValueDecoder(schemaGetter, kvFormat, compactionFilterConfig);
         this.projectedFields = projectedFields;
         closeableRegistry = new CloseableRegistry();
         try {
@@ -165,18 +167,19 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
         byte[] value = rocksIteratorWrapper.value();
         rocksIteratorWrapper.next();
 
-        BinaryValue originValue = valueDecoder.decodeValue(value);
-        InternalRow originRow = originValue.row;
-        if (targetSchemaId != originValue.schemaId) {
+        BinaryValue binaryValue = valueDecoder.decodeValue(value);
+        short originSchemaId = binaryValue.schemaId;
+        InternalRow originRow = binaryValue.row;
+
+        if (targetSchemaId != originSchemaId) {
             int[] indexMapping =
                     schemaProjectionCache.computeIfAbsent(
-                            originValue.schemaId,
+                            originSchemaId,
                             sourceSchemaId ->
                                     SchemaUtil.getIndexMapping(
                                             schemaGetter.getSchema(sourceSchemaId), targetSchema));
             originRow = ProjectedRow.from(indexMapping).replaceRow(originRow);
         }
-
         if (projectedFields != null) {
             ProjectedRow projectedRow = ProjectedRow.from(projectedFields);
             projectedRow.replaceRow(originRow);

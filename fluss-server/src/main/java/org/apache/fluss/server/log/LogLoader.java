@@ -23,7 +23,11 @@ import org.apache.fluss.exception.InvalidOffsetException;
 import org.apache.fluss.exception.LogSegmentOffsetOverflowException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.server.exception.CorruptIndexException;
+import org.apache.fluss.server.log.state.BucketStateManager;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -39,6 +43,9 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
@@ -55,6 +62,7 @@ final class LogLoader {
     private final long recoveryPointCheckpoint;
     private final LogFormat logFormat;
     private final WriterStateManager writerStateManager;
+    private final BucketStateManager bucketStateManager;
     private final boolean isCleanShutdown;
 
     public LogLoader(
@@ -64,6 +72,7 @@ final class LogLoader {
             long recoveryPointCheckpoint,
             LogFormat logFormat,
             WriterStateManager writerStateManager,
+            BucketStateManager bucketStateManager,
             boolean isCleanShutdown) {
         this.logTabletDir = logTabletDir;
         this.conf = conf;
@@ -71,6 +80,7 @@ final class LogLoader {
         this.recoveryPointCheckpoint = recoveryPointCheckpoint;
         this.logFormat = logFormat;
         this.writerStateManager = writerStateManager;
+        this.bucketStateManager = bucketStateManager;
         this.isCleanShutdown = isCleanShutdown;
     }
 
@@ -100,10 +110,47 @@ final class LogLoader {
             throw new IllegalStateException("Writer state must be empty during log initialization");
         }
 
+        if (!logSegments.isEmpty() && newRecoveryPoint > 0) {
+            List<Long> baseOffsets = logSegments.baseOffsets();
+            NavigableMap<Long, SnapshotFile> snapshotFiles =
+                    SnapshotUtils.loadStateSnapshots(logTabletDir);
+
+            // Find the latest available snapshot that has a corresponding log segment
+            Map.Entry<Long, SnapshotFile> latestAvailableSnapshot = null;
+            for (Map.Entry<Long, SnapshotFile> entry : snapshotFiles.descendingMap().entrySet()) {
+                long snapshotOffset = entry.getKey();
+                // Find a snapshot whose offset is less than or equal to one of the segment base
+                // offsets
+                if (baseOffsets.contains(snapshotOffset)
+                        || snapshotOffset < baseOffsets.get(0)
+                        || (baseOffsets.size() > 0 && snapshotOffset <= newRecoveryPoint)) {
+                    latestAvailableSnapshot = entry;
+                    break;
+                }
+            }
+
+            if (latestAvailableSnapshot != null) {
+                LOG.info(
+                        "Restoring bucket state from snapshot at offset {} for bucket {}",
+                        latestAvailableSnapshot.getKey(),
+                        logSegments.getTableBucket());
+                bucketStateManager.restore(
+                        latestAvailableSnapshot.getValue().file(),
+                        latestAvailableSnapshot.getValue().offset);
+            } else {
+                LOG.info(
+                        "No valid state snapshot found for bucket {}, starting with empty state",
+                        logSegments.getTableBucket());
+            }
+        }
+
         // Reload all snapshots into the WriterStateManager cache, the intermediate
         // WriterStateManager used during log recovery may have deleted some files without the
         // LogLoader.writerStateManager instance witnessing the deletion.
         writerStateManager.removeStraySnapshots(logSegments.baseOffsets());
+
+        // Also reload BucketStateManager snapshots to clean up stray files
+        bucketStateManager.removeStraySnapshots(logSegments.baseOffsets());
 
         // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
         // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
@@ -116,12 +163,139 @@ final class LogLoader {
         LogTablet.rebuildWriterState(
                 writerStateManager, logSegments, 0, nextOffset, isCleanShutdown);
 
+        // Rebuild bucket state by replaying records from the last checkpoint
+        rebuildBucketState(bucketStateManager, logSegments, 0, nextOffset, isCleanShutdown);
+
         LogSegment activeSegment = logSegments.lastSegment().get();
         activeSegment.resizeIndexes((int) conf.get(ConfigOptions.LOG_INDEX_FILE_SIZE).getBytes());
         return new LoadedLogOffsets(
                 newRecoveryPoint,
                 new LogOffsetMetadata(
                         nextOffset, activeSegment.getBaseOffset(), activeSegment.getSizeInBytes()));
+    }
+
+    /**
+     * Just recovers the given segment, without adding it to the provided segments.
+     *
+     * @param segment Segment to recover
+     * @return The number of bytes truncated from the segment
+     * @throws LogSegmentOffsetOverflowException if the segment contains messages that cause index
+     *     offset overflow
+     */
+    private int recoverSegment(LogSegment segment) throws IOException {
+        WriterStateManager writerStateManager =
+                new WriterStateManager(
+                        logSegments.getTableBucket(),
+                        logTabletDir,
+                        this.writerStateManager.writerExpirationMs());
+        // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
+        // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
+        // there may be cases where logStartOffset is not updated. As a result, logStartOffset is
+        // not yet reliable. Once the issue with correctly updating logStartOffset is resolved in
+        // issue https://github.com/apache/fluss/issues/744, we can use logStartOffset here.
+        // Additionally, using 0 versus using logStartOffset does not affect correctness—they both
+        // can restore the complete WriterState. The only difference is that using logStartOffset
+        // can potentially skip over more segments.
+        LogTablet.rebuildWriterState(
+                writerStateManager, logSegments, 0, segment.getBaseOffset(), false);
+        int bytesTruncated = segment.recover();
+        // once we have recovered the segment's data, take a snapshot to ensure that we won't
+        // need to reload the same segment again while recovering another segment.
+        writerStateManager.takeSnapshot();
+        return bytesTruncated;
+    }
+
+    /**
+     * Rebuild bucket state by replaying state change logs from the last checkpoint.
+     *
+     * @param bucketStateManager the bucket state manager to rebuild
+     * @param segments the log segments
+     * @param logStartOffset the log start offset
+     * @param lastOffset the last offset to rebuild up to
+     * @param reloadFromCleanShutdown whether this is a clean shutdown
+     */
+    private void rebuildBucketState(
+            BucketStateManager bucketStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long lastOffset,
+            boolean reloadFromCleanShutdown)
+            throws IOException {
+        if (segments.isEmpty()) {
+            return;
+        }
+
+        LOG.info(
+                "Loading bucket state for bucket {} till offset {}",
+                segments.getTableBucket(),
+                lastOffset);
+
+        // If no snapshot exists and this is a clean shutdown, we don't need to do anything
+        // State will be built up naturally as records are applied
+        if (!bucketStateManager.latestSnapshotOffset().isPresent()) {
+            if (reloadFromCleanShutdown) {
+                LOG.info(
+                        "No bucket state snapshot found for bucket {}, will build state from records",
+                        segments.getTableBucket());
+            }
+            return;
+        }
+
+        // Load from the latest snapshot and replay any records after it
+        LOG.info(
+                "Reloading from bucket state snapshot and rebuilding state for bucket {}",
+                segments.getTableBucket());
+
+        long stateLoadStart = System.currentTimeMillis();
+        bucketStateManager.truncateAndReload(logStartOffset, lastOffset);
+        long segmentRecoveryStart = System.currentTimeMillis();
+
+        // Replay records from the snapshot offset to the last offset
+        long snapshotOffset = bucketStateManager.latestSnapshotOffset().orElse(logStartOffset);
+        if (lastOffset > snapshotOffset) {
+            List<LogSegment> segmentsList = segments.values(snapshotOffset, lastOffset);
+            for (LogSegment segment : segmentsList) {
+                long startOffset = Math.max(segment.getBaseOffset(), snapshotOffset);
+
+                int maxPosition = segment.getSizeInBytes();
+                Optional<LogSegment> segmentOfLastOffset = segments.floorSegment(lastOffset);
+                if (segmentOfLastOffset.isPresent() && segmentOfLastOffset.get() == segment) {
+                    FileLogRecords.LogOffsetPosition logOffsetPosition =
+                            segment.translateOffset(lastOffset);
+                    if (logOffsetPosition != null) {
+                        maxPosition = logOffsetPosition.position;
+                    }
+                }
+
+                FetchDataInfo fetchDataInfo =
+                        segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
+                if (fetchDataInfo != null) {
+                    loadStateFromRecords(bucketStateManager, fetchDataInfo.getRecords());
+                }
+            }
+        }
+
+        LOG.info(
+                "Bucket state recovery took {} ms for snapshot load and {} ms for segment recovery for bucket {}",
+                segmentRecoveryStart - stateLoadStart,
+                System.currentTimeMillis() - segmentRecoveryStart,
+                segments.getTableBucket());
+    }
+
+    /**
+     * Load bucket state from records by applying state change logs.
+     *
+     * @param bucketStateManager the bucket state manager
+     * @param records the log records to load state from
+     */
+    private void loadStateFromRecords(BucketStateManager bucketStateManager, LogRecords records) {
+        for (LogRecordBatch batch : records.batches()) {
+            batch.stateChangeLogs()
+                    .ifPresent(
+                            stateChangeLogs ->
+                                    bucketStateManager.apply(
+                                            batch.lastLogOffset(), stateChangeLogs.iters()));
+        }
     }
 
     /**
@@ -242,38 +416,7 @@ final class LogLoader {
         }
     }
 
-    /**
-     * Just recovers the given segment, without adding it to the provided segments.
-     *
-     * @param segment Segment to recover
-     * @return The number of bytes truncated from the segment
-     * @throws LogSegmentOffsetOverflowException if the segment contains messages that cause index
-     *     offset overflow
-     */
-    private int recoverSegment(LogSegment segment) throws IOException {
-        WriterStateManager writerStateManager =
-                new WriterStateManager(
-                        logSegments.getTableBucket(),
-                        logTabletDir,
-                        this.writerStateManager.writerExpirationMs());
-        // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
-        // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
-        // there may be cases where logStartOffset is not updated. As a result, logStartOffset is
-        // not yet reliable. Once the issue with correctly updating logStartOffset is resolved in
-        // issue https://github.com/apache/fluss/issues/744, we can use logStartOffset here.
-        // Additionally, using 0 versus using logStartOffset does not affect correctness—they both
-        // can restore the complete WriterState. The only difference is that using logStartOffset
-        // can potentially skip over more segments.
-        LogTablet.rebuildWriterState(
-                writerStateManager, logSegments, 0, segment.getBaseOffset(), false);
-        int bytesTruncated = segment.recover();
-        // once we have recovered the segment's data, take a snapshot to ensure that we won't
-        // need to reload the same segment again while recovering another segment.
-        writerStateManager.takeSnapshot();
-        return bytesTruncated;
-    }
-
-    /** Loads segments from disk into the provided segments. */
+    /** /** Loads segments from disk into the provided segments. */
     private void loadSegmentFiles() throws IOException {
         File[] sortedFiles = logTabletDir.listFiles();
         if (sortedFiles != null) {

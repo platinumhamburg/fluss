@@ -18,9 +18,11 @@
 package org.apache.fluss.metadata;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 
 import javax.annotation.Nullable;
 
@@ -155,6 +157,25 @@ public final class TableInfo {
         return !primaryKeys.isEmpty();
     }
 
+    /** Check if the table is an index table or not. Derived from table properties. */
+    public boolean isIndexTable() {
+        return properties.contains(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID);
+    }
+
+    /** Returns the table type derived from table properties. */
+    public TableType getTableType() {
+        return tableConfig.getTableType();
+    }
+
+    /**
+     * Gets the compaction filter configuration for KV storage.
+     *
+     * <p>The compaction filter determines how entries are filtered during RocksDB compaction.
+     */
+    public CompactionFilterConfig getCompactionFilterConfig() {
+        return tableConfig.getCompactionFilterConfig();
+    }
+
     /**
      * Returns the logical primary keys of the table. The logical primary keys are the defined
      * PRIMARY KEY clause when creating table.
@@ -217,7 +238,7 @@ public final class TableInfo {
 
     /** Check if the table is partitioned and auto partition is enabled. */
     public boolean isAutoPartitioned() {
-        return isPartitioned() && tableConfig.getAutoPartitionStrategy().isAutoPartitionEnabled();
+        return isPartitioned() && getAutoPartitionStrategy().isAutoPartitionEnabled();
     }
 
     /**
@@ -250,6 +271,14 @@ public final class TableInfo {
      */
     public TableConfig getTableConfig() {
         return tableConfig;
+    }
+
+    /**
+     * Returns the auto partition strategy with correctly initialized key field. For single-column
+     * partitioned tables, the key will be automatically set to that partition column.
+     */
+    public AutoPartitionStrategy getAutoPartitionStrategy() {
+        return AutoPartitionStrategy.from(properties, partitionKeys);
     }
 
     /**

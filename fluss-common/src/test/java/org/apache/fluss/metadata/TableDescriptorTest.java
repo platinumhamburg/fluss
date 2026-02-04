@@ -19,20 +19,29 @@ package org.apache.fluss.metadata;
 
 import org.apache.fluss.config.ConfigBuilder;
 import org.apache.fluss.config.ConfigOption;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
+import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link org.apache.fluss.metadata.TableDescriptor}. */
 class TableDescriptorTest {
+
+    private static final int DEFAULT_INDEX_BUCKET_NUMBER = 3;
+    private static final long MAIN_TABLE_ID = 1001L;
+    private static final String MAIN_TABLE_NAME = "test_table";
 
     private static final Schema SCHEMA_1 =
             Schema.newBuilder()
@@ -348,5 +357,324 @@ class TableDescriptorTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("some_param")
                 .hasMessageContaining("not supported");
+    }
+
+    @Test
+    void testIndexesWithPrimaryKeyTable() {
+        // Test that indexes work with primary key tables
+        final Schema schemaWithIndex =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .primaryKey("f0", "f2")
+                        .index("idx1", "f1")
+                        .build();
+
+        TableDescriptor descriptor = TableDescriptor.builder().schema(schemaWithIndex).build();
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName()).isEqualTo("idx1");
+        assertThat(descriptor.getSchema().getIndexes().get(0).getColumnNames())
+                .containsExactly("f1");
+    }
+
+    @Test
+    void testIndexesWithoutPrimaryKeyTable() {
+        // Test that indexes are not allowed without primary key
+        final Schema schemaWithIndexNoPK =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .index("idx1", "f1")
+                        .build();
+
+        assertThatThrownBy(() -> TableDescriptor.builder().schema(schemaWithIndexNoPK).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(
+                        "Global secondary indexes are only supported for primary key tables");
+    }
+
+    @Test
+    void testMultipleIndexes() {
+        // Test multiple indexes
+        final Schema schemaWithMultipleIndexes =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .column("f3", DataTypes.INT())
+                        .primaryKey("f0", "f2")
+                        .index("idx1", "f1")
+                        .index("idx2", "f3")
+                        .build();
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(schemaWithMultipleIndexes).build();
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(2);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName()).isEqualTo("idx1");
+        assertThat(descriptor.getSchema().getIndexes().get(1).getIndexName()).isEqualTo("idx2");
+    }
+
+    // ==================== Tests for TableDescriptor.forIndexTable ====================
+
+    @Test
+    void testForIndexTableWithSingleIndexColumn() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .column("c", DataTypes.BIGINT())
+                        .primaryKey("a")
+                        .index("idx_b", "b")
+                        .build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder().schema(mainSchema).distributedBy(3, "a").build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // verify schema
+        Schema indexSchema = indexTableDescriptor.getSchema();
+        assertThat(indexSchema.getColumnNames()).containsExactly("b", "a");
+        assertThat(indexSchema.getPrimaryKeyColumnNames()).containsExactly("b", "a");
+        assertThat(indexSchema.getPrimaryKey().get().getConstraintName()).isEqualTo("pk_idx_b");
+
+        // verify distribution
+        assertThat(indexTableDescriptor.getTableDistribution().get().getBucketKeys())
+                .containsExactly("b");
+        assertThat(indexTableDescriptor.getTableDistribution().get().getBucketCount().get())
+                .isEqualTo(3);
+
+        // verify not partitioned
+        assertThat(indexTableDescriptor.isPartitioned()).isFalse();
+
+        // verify mainTableId is set
+        assertThat(indexTableDescriptor.getMainTableId().isPresent()).isTrue();
+        assertThat(indexTableDescriptor.getMainTableId().getAsLong()).isEqualTo(MAIN_TABLE_ID);
+    }
+
+    @Test
+    void testForIndexTableWithMultipleIndexColumns() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("email", DataTypes.STRING())
+                        .column("age", DataTypes.INT())
+                        .primaryKey("id")
+                        .index("name_email_idx", Arrays.asList("name", "email"))
+                        .build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder().schema(mainSchema).distributedBy(4, "id").build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // verify schema - should include index columns + primary key columns
+        Schema indexSchema = indexTableDescriptor.getSchema();
+        assertThat(indexSchema.getColumnNames()).containsExactly("name", "email", "id");
+        assertThat(indexSchema.getPrimaryKeyColumnNames()).containsExactly("name", "email", "id");
+
+        // verify distribution - bucket key should be index columns
+        assertThat(indexTableDescriptor.getTableDistribution().get().getBucketKeys())
+                .containsExactly("name", "email");
+    }
+
+    @Test
+    void testForIndexTableWithPartitionedMainTable() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("region", DataTypes.STRING())
+                        .column("created_date", DataTypes.STRING())
+                        .primaryKey("id", "region")
+                        .index("name_idx", "name")
+                        .build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder()
+                        .schema(mainSchema)
+                        .distributedBy(3, "id")
+                        .partitionedBy("region")
+                        .build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // verify schema - should include index columns + primary key columns
+        Schema indexSchema = indexTableDescriptor.getSchema();
+        assertThat(indexSchema.getColumnNames()).containsExactly("name", "id", "region");
+
+        // verify index table is NOT partitioned
+        assertThat(indexTableDescriptor.isPartitioned()).isFalse();
+    }
+
+    @Test
+    void testForIndexTableWithCustomBucketCount() {
+        Schema mainSchema =
+                Schema.newBuilder().fromSchema(DATA2_SCHEMA).index("b_idx", "b").build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder()
+                        .schema(mainSchema)
+                        .distributedBy(3, "a")
+                        .property(ConfigOptions.TABLE_SECONDARY_INDEX_BUCKET_NUM.key(), "5")
+                        .build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // verify custom bucket count is used
+        assertThat(indexTableDescriptor.getTableDistribution().get().getBucketCount().get())
+                .isEqualTo(5);
+    }
+
+    @Test
+    void testForIndexTableWithDefaultBucketCount() {
+        Schema mainSchema =
+                Schema.newBuilder().fromSchema(DATA1_SCHEMA_PK).index("b_idx", "b").build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder().schema(mainSchema).distributedBy(2, "a").build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // verify default bucket count is used
+        assertThat(indexTableDescriptor.getTableDistribution().get().getBucketCount().get())
+                .isEqualTo(DEFAULT_INDEX_BUCKET_NUMBER);
+    }
+
+    @Test
+    void testForIndexTableWithIndexColumnPartiallyOverlapsPrimaryKey() {
+        // Test that index columns can partially overlap with primary key columns
+        // and the index table correctly handles deduplication
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("status", DataTypes.STRING())
+                        .primaryKey("id", "status")
+                        .index("id_name_idx", Arrays.asList("id", "name"))
+                        .build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder()
+                        .schema(mainSchema)
+                        .distributedBy(3, Arrays.asList("id", "status"))
+                        .build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // verify schema - should not duplicate columns, id appears only once
+        Schema indexSchema = indexTableDescriptor.getSchema();
+        assertThat(indexSchema.getColumnNames()).containsExactly("id", "name", "status");
+        assertThat(indexSchema.getPrimaryKeyColumnNames()).containsExactly("id", "name", "status");
+    }
+
+    @Test
+    void testForIndexTablePreservesReplicationFactor() {
+        Schema mainSchema =
+                Schema.newBuilder().fromSchema(DATA2_SCHEMA).index("c_idx", "c").build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder()
+                        .schema(mainSchema)
+                        .distributedBy(3, "a")
+                        .property(ConfigOptions.TABLE_REPLICATION_FACTOR.key(), "5")
+                        .build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // verify replication factor is preserved
+        assertThat(indexTableDescriptor.getProperties())
+                .containsEntry(ConfigOptions.TABLE_REPLICATION_FACTOR.key(), "5");
+    }
+
+    @Test
+    void testForIndexTableColumnOrder() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("email", DataTypes.STRING())
+                        .column("region", DataTypes.STRING())
+                        .primaryKey("id", "region")
+                        .index("email_idx", "email")
+                        .build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder()
+                        .schema(mainSchema)
+                        .distributedBy(3, "id")
+                        .partitionedBy("region")
+                        .build();
+
+        Schema.Index index = mainSchema.getIndexes().get(0);
+
+        TableDescriptor indexTableDescriptor =
+                TableDescriptor.forIndexTable(
+                        mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+        // columns should be ordered as: email (index), id (pk), region (partition)
+        Schema indexSchema = indexTableDescriptor.getSchema();
+        List<String> columnNames = indexSchema.getColumnNames();
+
+        assertThat(columnNames).containsExactly("email", "id", "region");
+        assertThat(indexSchema.getPrimaryKeyColumnNames()).containsExactly("email", "id", "region");
+    }
+
+    @Test
+    void testForIndexTableDoesNotContainOffsetColumn() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("email", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index("name_idx", "name")
+                        .index("email_idx", "email")
+                        .build();
+
+        TableDescriptor mainTableDescriptor =
+                TableDescriptor.builder().schema(mainSchema).distributedBy(3, "id").build();
+
+        for (Schema.Index index : mainSchema.getIndexes()) {
+            TableDescriptor indexTableDescriptor =
+                    TableDescriptor.forIndexTable(
+                            mainTableDescriptor, index, MAIN_TABLE_ID, MAIN_TABLE_NAME);
+
+            Schema indexSchema = indexTableDescriptor.getSchema();
+            assertThat(indexSchema.getColumnNames()).doesNotContain("__offset");
+        }
     }
 }

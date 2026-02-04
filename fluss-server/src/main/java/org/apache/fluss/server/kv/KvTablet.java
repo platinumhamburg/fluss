@@ -22,10 +22,12 @@ import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.DeletionDisabledException;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.SchemaNotExistException;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
@@ -35,17 +37,21 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metadata.TtlCompactionFilterConfig;
 import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
 import org.apache.fluss.row.encode.ValueDecoder;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.server.index.IndexDataProducer;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementUpdater;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
@@ -123,6 +129,9 @@ public final class KvTablet {
     private final AutoIncrementManager autoIncrementManager;
 
     private final SchemaGetter schemaGetter;
+    private final CompactionFilterConfig compactionFilterConfig;
+    // IndexDataProducer for hot data caching, set after KvTablet creation for tables with indexes
+    private volatile @Nullable IndexDataProducer indexDataProducer;
 
     // the changelog image mode for this tablet
     private final ChangelogImage changelogImage;
@@ -156,7 +165,8 @@ public final class KvTablet {
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
             @Nullable RocksDBStatistics rocksDBStatistics,
-            AutoIncrementManager autoIncrementManager) {
+            AutoIncrementManager autoIncrementManager,
+            CompactionFilterConfig compactionFilterConfig) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
@@ -178,6 +188,8 @@ public final class KvTablet {
         this.changelogImage = changelogImage;
         this.rocksDBStatistics = rocksDBStatistics;
         this.autoIncrementManager = autoIncrementManager;
+        this.compactionFilterConfig = compactionFilterConfig;
+        this.indexDataProducer = null;
     }
 
     public static KvTablet create(
@@ -195,14 +207,65 @@ public final class KvTablet {
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
             RateLimiter sharedRateLimiter,
-            AutoIncrementManager autoIncrementManager)
+            AutoIncrementManager autoIncrementManager,
+            CompactionFilterConfig compactionFilterConfig)
             throws IOException {
-        RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter);
+        RocksDBKv kv =
+                buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter, compactionFilterConfig);
 
         // Create RocksDB statistics accessor (will be registered to TableMetricGroup by Replica)
         // Pass ResourceGuard to ensure thread-safe access during concurrent close operations
         // Pass ColumnFamilyHandle for column family specific properties like num-files-at-level0
         // Pass Cache for accurate block cache memory tracking
+        RocksDBStatistics rocksDBStatistics =
+                new RocksDBStatistics(
+                        kv.getDb(),
+                        kv.getStatistics(),
+                        kv.getResourceGuard(),
+                        kv.getDefaultColumnFamilyHandle(),
+                        kv.getBlockCache());
+        return new KvTablet(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvTabletDir,
+                serverMetricGroup,
+                kv,
+                serverConf.get(ConfigOptions.KV_WRITE_BATCH_SIZE).getBytes(),
+                logTablet.getLogFormat(),
+                arrowBufferAllocator,
+                memorySegmentPool,
+                kvFormat,
+                rowMerger,
+                arrowCompressionInfo,
+                schemaGetter,
+                changelogImage,
+                rocksDBStatistics,
+                autoIncrementManager,
+                compactionFilterConfig);
+    }
+
+    public static KvTablet create(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File kvTabletDir,
+            Configuration serverConf,
+            TabletServerMetricGroup serverMetricGroup,
+            BufferAllocator arrowBufferAllocator,
+            MemorySegmentPool memorySegmentPool,
+            KvFormat kvFormat,
+            RowMerger rowMerger,
+            ArrowCompressionInfo arrowCompressionInfo,
+            SchemaGetter schemaGetter,
+            ChangelogImage changelogImage,
+            RateLimiter sharedRateLimiter,
+            CompactionFilterConfig compactionFilterConfig)
+            throws IOException {
+        RocksDBKv kv =
+                buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter, compactionFilterConfig);
+
+        // Create RocksDB statistics accessor (will be registered to TableMetricGroup by Replica)
         RocksDBStatistics rocksDBStatistics =
                 new RocksDBStatistics(
                         kv.getDb(),
@@ -228,15 +291,20 @@ public final class KvTablet {
                 schemaGetter,
                 changelogImage,
                 rocksDBStatistics,
-                autoIncrementManager);
+                null, // autoIncrementManager - will be set later
+                compactionFilterConfig);
     }
 
     private static RocksDBKv buildRocksDBKv(
-            Configuration configuration, File kvDir, RateLimiter sharedRateLimiter)
+            Configuration configuration,
+            File kvDir,
+            RateLimiter sharedRateLimiter,
+            CompactionFilterConfig compactionFilterConfig)
             throws IOException {
         // Enable statistics to support RocksDB statistics collection
         RocksDBResourceContainer rocksDBResourceContainer =
-                new RocksDBResourceContainer(configuration, kvDir, true, sharedRateLimiter);
+                new RocksDBResourceContainer(
+                        configuration, kvDir, true, sharedRateLimiter, compactionFilterConfig);
         RocksDBKvBuilder rocksDBKvBuilder =
                 new RocksDBKvBuilder(
                         kvDir,
@@ -253,9 +321,46 @@ public final class KvTablet {
         return physicalPath.getTablePath();
     }
 
+    /**
+     * Set the IndexDataProducer for hot data caching. This is called by Replica after KvTablet
+     * creation for tables with indexes.
+     *
+     * @param indexDataProducer the IndexDataProducer instance, can be null if no indexes exist
+     */
+    public void setIndexDataProducer(@Nullable IndexDataProducer indexDataProducer) {
+        this.indexDataProducer = indexDataProducer;
+    }
+
     @Nullable
     public String getPartitionName() {
         return physicalPath.getPartitionName();
+    }
+
+    /**
+     * Returns whether this KV tablet has KV TTL enabled (timestamp prefix encoding). This is true
+     * only for index tables with TTL enabled (main table is partitioned with retention).
+     */
+    public boolean kvTtlEnabled() {
+        return compactionFilterConfig instanceof TtlCompactionFilterConfig
+                && ((TtlCompactionFilterConfig) compactionFilterConfig).isEnabled();
+    }
+
+    /**
+     * Returns whether this KV tablet belongs to an index table.
+     *
+     * <p>Note: This method uses table name pattern matching because KvTablet may not have access to
+     * table properties during recovery. For property-based checking, use {@link
+     * TableDescriptor#isIndexTable()} or {@link TableInfo#isIndexTable()}.
+     *
+     * @return true if this is an index table, false otherwise
+     */
+    public boolean isIndexTable() {
+        return physicalPath.getTablePath().isIndexTableName();
+    }
+
+    /** Returns the compaction filter configuration for this KV tablet. */
+    public CompactionFilterConfig getCompactionFilterConfig() {
+        return compactionFilterConfig;
     }
 
     public File getKvTabletDir() {
@@ -318,6 +423,13 @@ public final class KvTablet {
     public LogAppendInfo putAsLeader(
             KvRecordBatch kvRecords, @Nullable int[] targetColumns, MergeMode mergeMode)
             throws Exception {
+        if (kvTtlEnabled()) {
+            throw new InvalidTableException(
+                    "KV TTL enabled table does not support direct client writes.");
+        }
+        if (isIndexTable()) {
+            throw new InvalidTableException("Index table does not support direct client writes.");
+        }
         return inWriteLock(
                 kvLock,
                 () -> {
@@ -345,6 +457,7 @@ public final class KvTablet {
                     RowType latestRowType = latestSchema.getRowType();
                     WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType);
                     walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
+
                     // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
                     // only has fewer ending columns than latest schema, so we pad nulls to
                     // the end of the BinaryRow to get the latest schema row.
@@ -372,13 +485,28 @@ public final class KvTablet {
                         // put a batch into file with recordCount 0 and offset plus 1L, it will
                         // update the batchSequence corresponding to the writerId and also increment
                         // the CDC log offset by 1.
-                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
+                        MemoryLogRecords logRecords = walBuilder.build();
+                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(logRecords);
 
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
                         if (logAppendInfo.duplicated()) {
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
+                        } else {
+                            // NEW: Write hot data to IndexDataProducer for real-time index caching
+                            // Only process hot data writing if the batch is not duplicated
+                            IndexDataProducer producer = this.indexDataProducer;
+                            if (producer != null) {
+                                // FIX: Deep copy logRecords for IndexDataProducer to avoid
+                                // use-after-free
+                                // The original logRecords shares memory with walBuilder. We need to
+                                // create an independent copy for IndexDataProducer's asynchronous
+                                // processing
+                                // to prevent corruption when walBuilder is deallocated.
+                                MemoryLogRecords logRecordsCopy = deepCopyLogRecords(logRecords);
+                                producer.cacheIndexDataByHotData(logRecordsCopy, logAppendInfo);
+                            }
                         }
                         return logAppendInfo;
                     } catch (Throwable t) {
@@ -392,7 +520,9 @@ public final class KvTablet {
                         throw t;
                     } finally {
                         // deallocate the memory and arrow writer used by the wal builder
-                        walBuilder.deallocate();
+                        if (walBuilder != null) {
+                            walBuilder.deallocate();
+                        }
                     }
                 });
     }
@@ -421,7 +551,8 @@ public final class KvTablet {
         // TODO: reuse the read context and decoder
         KvRecordBatch.ReadContext readContext =
                 KvRecordReadContext.createReadContext(kvFormat, schemaGetter);
-        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
+        ValueDecoder valueDecoder =
+                new ValueDecoder(schemaGetter, kvFormat, compactionFilterConfig);
 
         for (KvRecord kvRecord : kvRecords.records(readContext)) {
             byte[] keyBytes = BytesUtils.toArray(kvRecord.getKey());
@@ -479,7 +610,7 @@ public final class KvTablet {
             return logOffset;
         }
 
-        BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
+        BinaryValue oldValue = decodeValueBytes(oldValueBytes, valueDecoder);
         BinaryValue newValue = currentMerger.delete(oldValue);
 
         // if newValue is null, it means the row should be deleted
@@ -521,7 +652,7 @@ public final class KvTablet {
                     autoIncrementUpdater);
         }
 
-        BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
+        BinaryValue oldValue = decodeValueBytes(oldValueBytes, valueDecoder);
         BinaryValue newValue = currentMerger.merge(oldValue, currentValue);
 
         if (newValue == oldValue) {
@@ -568,14 +699,37 @@ public final class KvTablet {
             throws Exception {
         if (changelogImage == ChangelogImage.WAL) {
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            kvPreWriteBuffer.put(key, newValue.encodeValue(), logOffset);
+            kvPreWriteBuffer.put(
+                    key, ValueEncoder.encodeValue(newValue.schemaId, newValue.row), logOffset);
             return logOffset + 1;
         } else {
             walBuilder.append(ChangeType.UPDATE_BEFORE, latestSchemaRow.replaceRow(oldValue.row));
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            kvPreWriteBuffer.put(key, newValue.encodeValue(), logOffset + 1);
+            kvPreWriteBuffer.put(
+                    key, ValueEncoder.encodeValue(newValue.schemaId, newValue.row), logOffset + 1);
             return logOffset + 2;
         }
+    }
+
+    /**
+     * Deep copy MemoryLogRecords to create an independent copy with its own memory.
+     *
+     * <p>This is necessary because the original MemoryLogRecords shares memory with WalBuilder's
+     * internal buffer pool. If we pass the original to asynchronous components (like
+     * IndexDataProducer), and then deallocate the WalBuilder, the memory will be freed/reused,
+     * causing data corruption and CRC validation failures.
+     *
+     * @param original the original MemoryLogRecords that shares memory with WalBuilder
+     * @return a deep copy with independent memory
+     */
+    private MemoryLogRecords deepCopyLogRecords(MemoryLogRecords original) {
+        // Allocate a new byte array and copy the data
+        int sizeInBytes = original.sizeInBytes();
+        byte[] copyBytes = new byte[sizeInBytes];
+        original.getMemorySegment().get(original.getPosition(), copyBytes, 0, sizeInBytes);
+
+        // Create a new MemoryLogRecords from the copied bytes
+        return MemoryLogRecords.pointToBytes(copyBytes);
     }
 
     private WalBuilder createWalBuilder(int schemaId, RowType rowType) throws Exception {
@@ -632,20 +786,58 @@ public final class KvTablet {
                             flushedLogOffset = exclusiveUpToLogOffset;
                         } catch (Throwable t) {
                             fatalErrorHandler.onFatalError(
-                                    new KvStorageException("Failed to flush kv pre-write buffer."));
+                                    new KvStorageException(
+                                            "Failed to flush kv pre-write buffer.", t));
                         }
                     }
                 });
     }
 
-    /** put key,value,logOffset into pre-write buffer directly. */
-    void putToPreWriteBuffer(byte[] key, @Nullable byte[] value, long logOffset) {
+    /**
+     * Trigger a manual compaction for this KV tablet. This call is synchronous.
+     *
+     * <p>It is mainly used for tests to verify compaction filters (e.g. TTL-based cleanup).
+     */
+    public void compact() throws IOException {
+        inWriteLock(
+                kvLock,
+                () -> {
+                    rocksDBKv.checkIfRocksDBClosed();
+                    rocksDBKv.compact();
+                });
+    }
+
+    /**
+     * Put key,value,logOffset into pre-write buffer directly.
+     *
+     * <p>This method is intended for use only in recovery operations and index updates. It bypasses
+     * the normal write flow and should not be used for regular client writes.
+     *
+     * @param key the key bytes
+     * @param value the value bytes, null for deletion
+     * @param logOffset the log offset for this record
+     */
+    public void putToPreWriteBuffer(byte[] key, @Nullable byte[] value, long logOffset) {
         KvPreWriteBuffer.Key wrapKey = KvPreWriteBuffer.Key.of(key);
         if (value == null) {
             kvPreWriteBuffer.delete(wrapKey, logOffset);
         } else {
             kvPreWriteBuffer.put(wrapKey, value, logOffset);
         }
+    }
+
+    /**
+     * Put key,value,logOffset into pre-write buffer directly.
+     *
+     * <p>This method is intended for use only in recovery operations and index updates. It bypasses
+     * the normal write flow and should not be used for regular client writes.
+     *
+     * @param key the key bytes
+     * @param value the value bytes, null for deletion
+     * @param logOffset the log offset for this record
+     */
+    public void putToPreWriteBufferSafety(byte[] key, @Nullable byte[] value, long logOffset) {
+        inWriteLock(kvLock, () -> putToPreWriteBuffer(key, value, logOffset));
     }
 
     /**
@@ -666,6 +858,16 @@ public final class KvTablet {
             return rocksDBKv.get(key.get());
         }
         return value.get();
+    }
+
+    /**
+     * Decode value bytes to BinaryValue.
+     *
+     * <p>When TTL timestamp prefix encoding is enabled, {@link ValueDecoder} will skip the prefix
+     * automatically.
+     */
+    private BinaryValue decodeValueBytes(byte[] valueBytes, ValueDecoder valueDecoder) {
+        return valueDecoder.decodeValue(valueBytes);
     }
 
     public List<byte[]> multiGet(List<byte[]> keys) throws IOException {

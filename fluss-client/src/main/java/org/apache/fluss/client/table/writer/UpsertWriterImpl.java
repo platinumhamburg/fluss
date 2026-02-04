@@ -21,6 +21,7 @@ import org.apache.fluss.client.write.WriteFormat;
 import org.apache.fluss.client.write.WriteRecord;
 import org.apache.fluss.client.write.WriterClient;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryRow;
@@ -35,7 +36,9 @@ import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -53,6 +56,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
     private final WriteFormat writeFormat;
     private final RowEncoder rowEncoder;
     private final FieldGetter[] fieldGetters;
+    private final List<IndexColumnInfo> indexColumnInfos;
 
     /** The merge mode for this writer. This controls how the server handles data merging. */
     private final MergeMode mergeMode;
@@ -101,6 +105,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
         this.fieldGetters = InternalRow.createFieldGetters(rowType);
 
         this.tableInfo = tableInfo;
+        this.indexColumnInfos = initIndexColumnInfos(tableInfo);
         this.mergeMode = mergeMode;
     }
 
@@ -176,6 +181,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
     @Override
     public CompletableFuture<UpsertResult> upsert(InternalRow row) {
         checkFieldCount(row);
+        validateIndexColumns(row);
         byte[] key = primaryKeyEncoder.encodeKey(row);
         byte[] bucketKey =
                 bucketKeyEncoder == primaryKeyEncoder ? key : bucketKeyEncoder.encodeKey(row);
@@ -230,5 +236,71 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             rowEncoder.encodeField(i, fieldGetters[i].getFieldOrNull(row));
         }
         return rowEncoder.finishRow();
+    }
+
+    /**
+     * Initialize index column information from table info.
+     *
+     * @param tableInfo the table info containing schema and index definitions
+     * @return list of index column info, or empty list if no indexes defined
+     */
+    private static List<IndexColumnInfo> initIndexColumnInfos(TableInfo tableInfo) {
+        List<Schema.Index> indexes = tableInfo.getSchema().getIndexes();
+        if (indexes.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        RowType rowType = tableInfo.getRowType();
+        List<IndexColumnInfo> result = new ArrayList<>();
+
+        for (Schema.Index index : indexes) {
+            String indexName = index.getIndexName();
+            for (String columnName : index.getColumnNames()) {
+                int columnIndex = rowType.getFieldIndex(columnName);
+                FieldGetter fieldGetter =
+                        InternalRow.createFieldGetter(rowType.getTypeAt(columnIndex), columnIndex);
+                result.add(new IndexColumnInfo(indexName, columnName, columnIndex, fieldGetter));
+            }
+        }
+
+        return Collections.unmodifiableList(result);
+    }
+
+    /**
+     * Validates that all index columns in the row are not NULL.
+     *
+     * <p>Secondary index columns must have non-null values because the index table's primary key is
+     * composed of index columns and the main table's primary key columns. NULL values in index
+     * columns would cause issues during key encoding.
+     *
+     * @param row the row to validate
+     * @throws IllegalArgumentException if any index column has a NULL value
+     */
+    private void validateIndexColumns(InternalRow row) {
+        for (IndexColumnInfo info : indexColumnInfos) {
+            if (info.fieldGetter.getFieldOrNull(row) == null) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Index column '%s' in index '%s' cannot be null. "
+                                        + "Secondary index columns must have non-null values.",
+                                info.columnName, info.indexName));
+            }
+        }
+    }
+
+    /** Internal class to store index column metadata for NULL value validation. */
+    private static class IndexColumnInfo {
+        final String indexName;
+        final String columnName;
+        final int columnIndex;
+        final FieldGetter fieldGetter;
+
+        IndexColumnInfo(
+                String indexName, String columnName, int columnIndex, FieldGetter fieldGetter) {
+            this.indexName = indexName;
+            this.columnName = columnName;
+            this.columnIndex = columnIndex;
+            this.fieldGetter = fieldGetter;
+        }
     }
 }

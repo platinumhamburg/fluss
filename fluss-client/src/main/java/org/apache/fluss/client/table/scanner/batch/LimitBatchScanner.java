@@ -147,7 +147,8 @@ public class LimitBatchScanner implements BatchScanner {
             DefaultValueRecordBatch valueRecords =
                     DefaultValueRecordBatch.pointToByteBuffer(recordsBuffer);
             ValueRecordReadContext readContext =
-                    ValueRecordReadContext.createReadContext(schemaGetter, kvFormat);
+                    ValueRecordReadContext.createReadContext(
+                            schemaGetter, kvFormat, tableInfo.getCompactionFilterConfig());
             for (ValueRecord record : valueRecords.records(readContext)) {
                 InternalRow row = record.getRow();
                 if (targetSchemaId != record.schemaId()) {

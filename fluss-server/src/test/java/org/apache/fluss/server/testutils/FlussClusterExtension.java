@@ -922,6 +922,96 @@ public final class FlussClusterExtension
                 () -> zkClient.getLeaderAndIsr(tb), Duration.ofMinutes(1), "leader is not ready");
     }
 
+    // --------------------------------------------------------------------------------------------
+    // Index Replication Utilities
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Wait until ISR (In-Sync Replicas) expands to at least the specified minimum size. This is
+     * useful for ensuring that follower replicas have caught up with the leader before performing
+     * operations that depend on ISR state.
+     *
+     * @param tableBucket the table bucket to check
+     * @param minIsrSize the minimum ISR size to wait for
+     * @param timeout the maximum time to wait
+     * @return the LeaderAndIsr when ISR reaches the minimum size
+     */
+    public LeaderAndIsr waitForIsrExpansion(
+            TableBucket tableBucket, int minIsrSize, Duration timeout) {
+        return waitValue(
+                () -> {
+                    Optional<LeaderAndIsr> leaderAndIsrOpt =
+                            zooKeeperClient.getLeaderAndIsr(tableBucket);
+                    if (leaderAndIsrOpt.isPresent()
+                            && leaderAndIsrOpt.get().isr().size() >= minIsrSize) {
+                        return leaderAndIsrOpt;
+                    }
+                    return Optional.empty();
+                },
+                timeout,
+                String.format(
+                        "ISR for %s did not expand to at least %d replicas within %s",
+                        tableBucket, minIsrSize, timeout));
+    }
+
+    /**
+     * Wait until ISR expands to at least 2 replicas with default timeout of 2 minutes. This is a
+     * convenience method for the common case of waiting for leader-follower replication to be
+     * established.
+     *
+     * @param tableBucket the table bucket to check
+     * @return the LeaderAndIsr when ISR reaches at least 2 replicas
+     */
+    public LeaderAndIsr waitForIsrExpansion(TableBucket tableBucket) {
+        return waitForIsrExpansion(tableBucket, 2, Duration.ofMinutes(2));
+    }
+
+    /**
+     * Wait until the high watermark of a replica reaches at least the specified offset. This is
+     * useful for ensuring that data has been committed and is visible for reads.
+     *
+     * @param tableBucket the table bucket to check
+     * @param minHighWatermark the minimum high watermark to wait for
+     * @param timeout the maximum time to wait
+     */
+    public void waitForHighWatermark(
+            TableBucket tableBucket, long minHighWatermark, Duration timeout) {
+        retry(
+                timeout,
+                () -> {
+                    Replica leaderReplica = waitAndGetLeaderReplica(tableBucket);
+                    long currentHW = leaderReplica.getLogHighWatermark();
+                    assertThat(currentHW)
+                            .withFailMessage(
+                                    "High watermark for %s should be at least %d, current: %d",
+                                    tableBucket, minHighWatermark, currentHW)
+                            .isGreaterThanOrEqualTo(minHighWatermark);
+                });
+    }
+
+    /**
+     * Wait until the log end offset of a replica reaches at least the specified offset. This is
+     * useful for ensuring that data has been written to the log.
+     *
+     * @param tableBucket the table bucket to check
+     * @param minLogEndOffset the minimum log end offset to wait for
+     * @param timeout the maximum time to wait
+     */
+    public void waitForLogEndOffset(
+            TableBucket tableBucket, long minLogEndOffset, Duration timeout) {
+        retry(
+                timeout,
+                () -> {
+                    Replica leaderReplica = waitAndGetLeaderReplica(tableBucket);
+                    long currentLEO = leaderReplica.getLocalLogEndOffset();
+                    assertThat(currentLEO)
+                            .withFailMessage(
+                                    "Log end offset for %s should be at least %d, current: %d",
+                                    tableBucket, minLogEndOffset, currentLEO)
+                            .isGreaterThanOrEqualTo(minLogEndOffset);
+                });
+    }
+
     private List<AdminReadOnlyGateway> collectAllRpcGateways() {
         String internalListenerName = clusterConf.get(ConfigOptions.INTERNAL_LISTENER_NAME);
         List<AdminReadOnlyGateway> rpcServiceBases = new ArrayList<>();

@@ -248,8 +248,9 @@ public class TabletServerMetadataCacheTest {
     @Test
     void testContainsTableBucket() {
         tableMetadataList =
-                Collections.singletonList(
-                        new TableMetadata(DATA1_TABLE_INFO, initialBucketMetadata));
+                Arrays.asList(
+                        new TableMetadata(DATA1_TABLE_INFO, initialBucketMetadata),
+                        new TableMetadata(partitionTableInfo, Collections.emptyList()));
         partitionMetadataList =
                 Collections.singletonList(
                         new PartitionMetadata(

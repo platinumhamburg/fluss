@@ -27,11 +27,13 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
-import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
+import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
@@ -106,6 +108,7 @@ import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
 import static org.apache.fluss.record.TestData.DATA2_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA2_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA2_TABLE_PATH;
+import static org.apache.fluss.record.TestData.INDEXED_TABLE_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.replica.ReplicaManager.HIGH_WATERMARK_CHECKPOINT_FILE_NAME;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_BUCKET_EPOCH;
@@ -205,7 +208,11 @@ public class ReplicaTestBase {
                                 new LakeCatalogDynamicLoader(new Configuration(), null, true)));
         initMetadataCache(serverMetadataCache);
 
-        rpcClient = RpcClient.create(conf, TestingClientMetricGroup.newInstance(), false);
+        rpcClient =
+                RpcClient.create(
+                        conf,
+                        new ClientMetricGroup(NOPMetricRegistry.INSTANCE, "test-client"),
+                        false);
 
         snapshotReporter = new TestingCompletedKvSnapshotCommitter();
 
@@ -290,6 +297,11 @@ public class ReplicaTestBase {
 
     protected ReplicaManager buildReplicaManager(CoordinatorGateway coordinatorGateway)
             throws Exception {
+        MetadataManager metadataManager =
+                new MetadataManager(
+                        zkClient,
+                        conf,
+                        new LakeCatalogDynamicLoader(new Configuration(), null, true));
         return new ReplicaManager(
                 conf,
                 scheduler,
@@ -298,6 +310,7 @@ public class ReplicaTestBase {
                 zkClient,
                 TABLET_SERVER_ID,
                 serverMetadataCache,
+                metadataManager,
                 rpcClient,
                 coordinatorGateway,
                 snapshotReporter,
@@ -353,6 +366,10 @@ public class ReplicaTestBase {
     // TODO add more test cases for partition table which make leader by this method.
     protected void makeLogTableAsLeader(int bucketId) {
         makeLogTableAsLeader(new TableBucket(DATA1_TABLE_ID, bucketId), false);
+    }
+
+    protected void makeIndexedTableAsLeader(int bucketId) {
+        makeLogTableAsLeader(new TableBucket(INDEXED_TABLE_ID, bucketId), false);
     }
 
     /** If partitionTable is true, the partitionId of input TableBucket tb can not be null. */
@@ -430,7 +447,7 @@ public class ReplicaTestBase {
 
     protected Replica makeLogReplica(PhysicalTablePath physicalTablePath, TableBucket tableBucket)
             throws Exception {
-        return makeReplica(physicalTablePath, tableBucket, false, null);
+        return makeReplica(physicalTablePath, tableBucket, false, null, null);
     }
 
     protected Replica makeKvReplica(
@@ -438,23 +455,36 @@ public class ReplicaTestBase {
             TableBucket tableBucket,
             SnapshotContext snapshotContext)
             throws Exception {
-        return makeReplica(physicalTablePath, tableBucket, true, snapshotContext);
+        return makeReplica(physicalTablePath, tableBucket, true, snapshotContext, DATA1_TABLE_INFO);
     }
 
     protected Replica makeKvReplica(PhysicalTablePath physicalTablePath, TableBucket tableBucket)
             throws Exception {
-        return makeReplica(physicalTablePath, tableBucket, true, null);
+        return makeReplica(physicalTablePath, tableBucket, true, null, DATA1_TABLE_INFO);
+    }
+
+    protected Replica makeKvReplicaWithTableInfo(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            SnapshotContext snapshotContext,
+            TableInfo tableInfo)
+            throws Exception {
+        return makeReplica(physicalTablePath, tableBucket, true, snapshotContext, tableInfo);
     }
 
     private Replica makeReplica(
             PhysicalTablePath physicalTablePath,
             TableBucket tableBucket,
             boolean isPkTable,
-            @Nullable SnapshotContext snapshotContext)
+            @Nullable SnapshotContext snapshotContext,
+            @Nullable TableInfo tableInfo)
             throws Exception {
         if (snapshotContext == null) {
             snapshotContext =
                     new TestSnapshotContext(conf.getString(ConfigOptions.REMOTE_DATA_DIR));
+        }
+        if (tableInfo == null) {
+            tableInfo = DATA1_TABLE_INFO;
         }
         BucketMetricGroup metricGroup =
                 replicaManager
@@ -480,8 +510,13 @@ public class ReplicaTestBase {
                 serverMetadataCache,
                 NOPErrorHandler.INSTANCE,
                 metricGroup,
-                DATA1_TABLE_INFO,
-                manualClock);
+                tableInfo,
+                manualClock,
+                remoteLogManager,
+                null,
+                null,
+                replicaManager.getScheduler(),
+                conf);
     }
 
     private void initRemoteLogEnv() throws Exception {
@@ -554,6 +589,74 @@ public class ReplicaTestBase {
                 .map(f -> f.getPath().getName())
                 .filter(f -> !f.equals("metadata"))
                 .collect(Collectors.toSet());
+    }
+
+    protected void makeFollowerReplica(
+            Replica replica, TablePath tablePath, TableBucket tableBucket, int leaderEpoch) {
+        replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket,
+                        Collections.singletonList(TABLET_SERVER_ID),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID,
+                                leaderEpoch,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                INITIAL_COORDINATOR_EPOCH,
+                                leaderEpoch)));
+    }
+
+    protected void makeLeaderReplica(
+            Replica replica, TablePath tablePath, TableBucket tableBucket, int leaderEpoch)
+            throws Exception {
+        replica.makeLeader(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket,
+                        Collections.singletonList(TABLET_SERVER_ID),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID,
+                                leaderEpoch,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                INITIAL_COORDINATOR_EPOCH,
+                                // we also use the leader epoch as bucket epoch
+                                leaderEpoch)));
+    }
+
+    protected void makeLogReplicaAsLeader(Replica replica) throws Exception {
+        makeLeaderReplica(
+                replica,
+                DATA1_TABLE_PATH,
+                new TableBucket(DATA1_TABLE_ID, 1),
+                INITIAL_LEADER_EPOCH);
+    }
+
+    protected void makeKvReplicaAsLeader(Replica replica) throws Exception {
+        makeLeaderReplica(
+                replica,
+                DATA1_TABLE_PATH_PK,
+                new TableBucket(DATA1_TABLE_ID_PK, 1),
+                INITIAL_LEADER_EPOCH);
+    }
+
+    protected void makeKvReplicaAsLeader(Replica replica, int leaderEpoch) throws Exception {
+        makeLeaderReplica(
+                replica, DATA1_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1), leaderEpoch);
+    }
+
+    protected void makeKvReplicaAsFollower(Replica replica, int leaderEpoch) {
+        replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        new TableBucket(DATA1_TABLE_ID_PK, 1),
+                        Collections.singletonList(TABLET_SERVER_ID),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID,
+                                leaderEpoch,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                INITIAL_COORDINATOR_EPOCH,
+                                // we also use the leader epoch as bucket epoch
+                                leaderEpoch)));
     }
 
     /** An implementation of {@link SnapshotContext} for test purpose. */

@@ -27,6 +27,7 @@ import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.CompactionFilterType;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
@@ -34,6 +35,7 @@ import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
@@ -114,9 +116,12 @@ public class TableDescriptorValidation {
         checkArrowCompression(tableConf);
         checkMergeEngine(tableConf, hasPrimaryKey, schema);
         checkDeleteBehavior(tableConf, hasPrimaryKey);
+        checkCompactionFilter(tableConf, hasPrimaryKey);
         checkTieredLog(tableConf);
         checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema.getRowType());
+        checkIndexes(tableConf, tableDescriptor.getPartitionKeys(), schema);
         checkSystemColumns(schema.getRowType());
+        checkTableTypeAndKvTtl(tableDescriptor, tableConf);
     }
 
     public static void validateAlterTableProperties(
@@ -166,6 +171,44 @@ public class TableDescriptorValidation {
                                     + "The reserved system columns are: %s",
                             String.join(", ", unsupportedColumns),
                             String.join(", ", SYSTEM_COLUMNS)));
+        }
+    }
+
+    private static void checkTableTypeAndKvTtl(
+            TableDescriptor tableDescriptor, Configuration tableConf) {
+        // ----------------------------------------------------------------------------------------
+        // Table type validation
+        // ----------------------------------------------------------------------------------------
+        final boolean declaredTypePresent = tableConf.containsKey(ConfigOptions.TABLE_TYPE.key());
+        final TableType declaredType = tableConf.get(ConfigOptions.TABLE_TYPE);
+
+        // For backward compatibility, index tables created before introducing TABLE_TYPE may not
+        // have the property, but we still treat them as INDEX_TABLE.
+        final boolean isIndexTableByProperties = tableDescriptor.isIndexTable();
+        final TableType effectiveType =
+                (!declaredTypePresent && isIndexTableByProperties)
+                        ? TableType.INDEX_TABLE
+                        : declaredType;
+
+        // Disallow users from spoofing INDEX_TABLE type without index-table markers.
+        if (declaredTypePresent
+                && declaredType == TableType.INDEX_TABLE
+                && !isIndexTableByProperties) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "Table property '%s' cannot be set to INDEX_TABLE for a non-index table.",
+                            ConfigOptions.TABLE_TYPE.key()));
+        }
+
+        // If it is an index table by properties and user explicitly declared a different type,
+        // reject to avoid ambiguous behavior.
+        if (declaredTypePresent
+                && isIndexTableByProperties
+                && declaredType != TableType.INDEX_TABLE) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "Index table must have '%s' set to INDEX_TABLE, but got %s.",
+                            ConfigOptions.TABLE_TYPE.key(), declaredType));
         }
     }
 
@@ -418,6 +461,86 @@ public class TableDescriptorValidation {
         }
     }
 
+    /**
+     * Validates that indexes are only defined on tables where index data can be properly TTL'd.
+     *
+     * <p>Index tables derive their TTL from the main table's auto-partition retention settings. If
+     * the main table is partitioned but auto-partition is not enabled, the index data will never be
+     * TTL'd because:
+     *
+     * <ul>
+     *   <li>The partition timestamp cannot be extracted without auto-partition configuration
+     *   <li>Index records will have Long.MAX_VALUE as TTL timestamp (never expire)
+     *   <li>This leads to unbounded index data growth
+     * </ul>
+     *
+     * <p>Therefore, indexes are only allowed on:
+     *
+     * <ul>
+     *   <li>Non-partitioned tables (index TTL is not partition-dependent)
+     *   <li>Partitioned tables with auto-partition enabled (index TTL derived from partition
+     *       retention)
+     * </ul>
+     *
+     * @param tableConf the table configuration
+     * @param partitionKeys the partition keys of the table
+     * @param schema the table schema containing index definitions
+     * @throws InvalidTableException if indexes are defined on a partitioned table without
+     *     auto-partition enabled
+     */
+    private static void checkIndexes(
+            Configuration tableConf, List<String> partitionKeys, Schema schema) {
+        List<Schema.Index> indexes = schema.getIndexes();
+        if (indexes.isEmpty()) {
+            return;
+        }
+
+        // Get primary key columns for validation
+        List<String> primaryKeyColumns = schema.getPrimaryKeyColumnNames();
+        Set<String> pkSet = new LinkedHashSet<>(primaryKeyColumns);
+        Set<String> partitionSet = new LinkedHashSet<>(partitionKeys);
+
+        // Validate each index
+        for (Schema.Index index : indexes) {
+            Set<String> indexColumnSet = new LinkedHashSet<>(index.getColumnNames());
+
+            // Check if index columns are exactly the same as primary key columns
+            if (indexColumnSet.equals(pkSet)) {
+                throw new InvalidTableException(
+                        String.format(
+                                "Index '%s' columns %s cannot be exactly the same as primary key columns %s. "
+                                        + "Primary key already provides unique lookup capability.",
+                                index.getIndexName(), index.getColumnNames(), primaryKeyColumns));
+            }
+
+            // Check if index columns are exactly the same as partition columns
+            if (!partitionKeys.isEmpty() && indexColumnSet.equals(partitionSet)) {
+                throw new InvalidTableException(
+                        String.format(
+                                "Index '%s' columns %s cannot be exactly the same as partition columns %s. "
+                                        + "Partition columns are typically time-based and not suitable for index lookup.",
+                                index.getIndexName(), index.getColumnNames(), partitionKeys));
+            }
+        }
+
+        boolean isPartitioned = !partitionKeys.isEmpty();
+        if (!isPartitioned) {
+            // Non-partitioned tables can have indexes
+            return;
+        }
+
+        // For partitioned tables with indexes, auto-partition must be enabled
+        AutoPartitionStrategy autoPartition = AutoPartitionStrategy.from(tableConf);
+        if (!autoPartition.isAutoPartitionEnabled()) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Global secondary indexes are not supported on partitioned tables without auto-partition enabled. "
+                                    + "Index data TTL is derived from partition retention, which requires auto-partition. "
+                                    + "Please enable auto-partition by setting '%s' to true, or remove the indexes.",
+                            ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key()));
+        }
+    }
+
     private static void checkDeleteBehavior(Configuration tableConf, boolean hasPrimaryKey) {
         Optional<DeleteBehavior> deleteBehaviorOptional =
                 tableConf.getOptional(ConfigOptions.TABLE_DELETE_BEHAVIOR);
@@ -446,6 +569,42 @@ public class TableDescriptorValidation {
                                     mergeEngine));
                 }
                 // For AGGREGATION, ALLOW is permitted (removes entire record)
+            }
+        }
+    }
+
+    private static void checkCompactionFilter(Configuration tableConf, boolean hasPrimaryKey) {
+        CompactionFilterType compactionFilterType =
+                tableConf.get(ConfigOptions.TABLE_KV_COMPACTION_FILTER_TYPE);
+
+        // Compaction filter is not supported for user-created tables
+        if (compactionFilterType != null && compactionFilterType != CompactionFilterType.NONE) {
+            // Check if this is an internal INDEX_TABLE - compaction filter is allowed for index
+            // tables
+            TableType tableType = tableConf.get(ConfigOptions.TABLE_TYPE);
+            if (tableType == TableType.INDEX_TABLE) {
+                // INDEX_TABLE is allowed to use compaction filter
+                return;
+            }
+
+            if (!hasPrimaryKey) {
+                // Log tables (tables without primary key) cannot use compaction filter
+                throw new InvalidConfigException(
+                        String.format(
+                                "Compaction filter is not supported for log tables (tables without primary key). "
+                                        + "The '%s' configuration must be set to 'NONE', but got '%s'.",
+                                ConfigOptions.TABLE_KV_COMPACTION_FILTER_TYPE.key(),
+                                compactionFilterType));
+            } else {
+                // Primary key tables (DATA_TABLE) are also not allowed to enable CompactionFilter
+                // Only internal tables (INDEX_TABLE) can enable CompactionFilter
+                throw new InvalidConfigException(
+                        String.format(
+                                "Compaction filter is not allowed for user-created tables. "
+                                        + "The '%s' configuration must be set to 'NONE' for DATA_TABLE, "
+                                        + "but got '%s'. Compaction filters are only supported for internal tables (INDEX_TABLE).",
+                                ConfigOptions.TABLE_KV_COMPACTION_FILTER_TYPE.key(),
+                                compactionFilterType));
             }
         }
     }

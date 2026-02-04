@@ -19,12 +19,18 @@ package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metadata.TtlCompactionFilterConfig;
+import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordTestUtils;
@@ -32,8 +38,12 @@ import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
+import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.encode.KeyEncoder;
+import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
-import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
@@ -42,9 +52,10 @@ import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
-import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
+import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -57,9 +68,10 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -73,13 +85,11 @@ import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
-import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA2;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
-import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.apache.fluss.testutils.DataTestUtils.assertLogRecordsEquals;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
@@ -89,6 +99,7 @@ import static org.apache.fluss.testutils.DataTestUtils.genKvRecords;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
+import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -770,57 +781,164 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(logReplica.getLogTablet().isDataLakeEnabled()).isFalse();
     }
 
-    private void makeLogReplicaAsLeader(Replica replica) throws Exception {
-        makeLeaderReplica(
-                replica,
-                DATA1_TABLE_PATH,
-                new TableBucket(DATA1_TABLE_ID, 1),
-                INITIAL_LEADER_EPOCH);
-    }
-
-    private void makeKvReplicaAsLeader(Replica replica) throws Exception {
-        makeLeaderReplica(
-                replica,
-                DATA1_TABLE_PATH_PK,
-                new TableBucket(DATA1_TABLE_ID_PK, 1),
-                INITIAL_LEADER_EPOCH);
-    }
-
-    private void makeKvReplicaAsLeader(Replica replica, int leaderEpoch) throws Exception {
-        makeLeaderReplica(
-                replica, DATA1_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1), leaderEpoch);
-    }
-
-    private void makeKvReplicaAsFollower(Replica replica, int leaderEpoch) {
-        replica.makeFollower(
-                new NotifyLeaderAndIsrData(
-                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
-                        new TableBucket(DATA1_TABLE_ID_PK, 1),
-                        Collections.singletonList(TABLET_SERVER_ID),
-                        new LeaderAndIsr(
-                                TABLET_SERVER_ID,
-                                leaderEpoch,
-                                Collections.singletonList(TABLET_SERVER_ID),
-                                INITIAL_COORDINATOR_EPOCH,
-                                // we also use the leader epoch as bucket epoch
-                                leaderEpoch)));
-    }
-
-    private void makeLeaderReplica(
-            Replica replica, TablePath tablePath, TableBucket tableBucket, int leaderEpoch)
+    /**
+     * Test that KV tablet with TTL (timestamp prefix encoding) enabled correctly recovers data from
+     * Log.
+     *
+     * <p>This test verifies the following scenario:
+     *
+     * <ol>
+     *   <li>Create a PrimaryKey table with KV TTL enabled (timestamp prefix encoding)
+     *   <li>Write data with TTL timestamps to the log
+     *   <li>Make the replica a follower (destroys KvTablet)
+     *   <li>Make the replica a leader again (triggers recovery from log)
+     *   <li>Verify recovered data has correct TTL encoding via ValueDecoder
+     * </ol>
+     */
+    @Test
+    void testRestoreWithKvTtlEnabledFromLog(@TempDir Path snapshotKvTabletDirPath)
             throws Exception {
-        replica.makeLeader(
-                new NotifyLeaderAndIsrData(
-                        PhysicalTablePath.of(tablePath),
-                        tableBucket,
-                        Collections.singletonList(TABLET_SERVER_ID),
-                        new LeaderAndIsr(
-                                TABLET_SERVER_ID,
-                                leaderEpoch,
-                                Collections.singletonList(TABLET_SERVER_ID),
-                                INITIAL_COORDINATOR_EPOCH,
-                                // we also use the leader epoch as bucket epoch
-                                leaderEpoch)));
+        // Create a schema with TTL timestamp column
+        String ttlColumnName = "ttl_timestamp";
+        Schema tableSchema =
+                Schema.newBuilder()
+                        .column("name", DataTypes.STRING())
+                        .column("id", DataTypes.INT())
+                        .column(ttlColumnName, DataTypes.BIGINT())
+                        .primaryKey("name", "id")
+                        .build();
+
+        // Create TABLE_DESCRIPTOR with TTL enabled (timestamp prefix encoding)
+        long ttlRetentionMs = 86400000L; // 1 day
+        Map<String, String> properties = new HashMap<>();
+        properties.put(
+                ConfigOptions.TABLE_KV_COMPACTION_FILTER_TYPE.key(),
+                org.apache.fluss.metadata.CompactionFilterType.TTL.toString());
+        properties.put(ConfigOptions.TABLE_KV_COMPACTION_FILTER_TTL_COLUMN.key(), ttlColumnName);
+        properties.put(
+                ConfigOptions.TABLE_KV_COMPACTION_FILTER_TTL_RETENTION_MS.key(),
+                String.valueOf(ttlRetentionMs));
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(tableSchema)
+                        .distributedBy(3, "name")
+                        .kvFormat(KvFormat.COMPACTED)
+                        .logFormat(LogFormat.ARROW)
+                        .properties(properties)
+                        .build();
+
+        // Register table in ZK
+        TablePath tablePath = TablePath.of("test_db", "test_ttl_table");
+        long tableId = 999001L;
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+
+        zkClient.registerTable(tablePath, TableRegistration.newTable(tableId, tableDescriptor));
+        zkClient.registerFirstSchema(tablePath, tableSchema);
+
+        // Create TableInfo
+        long currentMillis = System.currentTimeMillis();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, tableId, 1, tableDescriptor, currentMillis, currentMillis);
+
+        // Update metadata cache with the schema
+        serverMetadataCache.updateLatestSchema(tableId, new SchemaInfo(tableSchema, (short) 1));
+
+        // Create test context
+        TestSnapshotContext testKvSnapshotContext =
+                new TestSnapshotContext(snapshotKvTabletDirPath.toString());
+
+        // Create replica
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(tablePath);
+        Replica kvReplica =
+                makeKvReplicaWithTableInfo(
+                        physicalTablePath, tableBucket, testKvSnapshotContext, tableInfo);
+
+        // Make leader (this will create KvTablet with TTL enabled)
+        makeLeaderReplica(kvReplica, tablePath, tableBucket, INITIAL_LEADER_EPOCH);
+        assertThat(kvReplica.getKvTablet()).isNotNull();
+        assertThat(kvReplica.getKvTablet().kvTtlEnabled()).isTrue();
+
+        // Phase 1: Write CDC log records with static TTL timestamps
+        long ttlTimestamp1 = 1000000000L;
+        long ttlTimestamp2 = 1000001000L;
+
+        List<ChangeType> changeTypes = Arrays.asList(ChangeType.INSERT, ChangeType.INSERT);
+        List<Object[]> values =
+                Arrays.asList(
+                        new Object[] {"Alice", 1, ttlTimestamp1},
+                        new Object[] {"Bob", 2, ttlTimestamp2});
+
+        MemoryLogRecords cdcLogRecords =
+                createBasicMemoryLogRecords(
+                        tableSchema.getRowType(),
+                        1, // schemaId
+                        0, // offsetBase
+                        0L, // timestamp
+                        CURRENT_LOG_MAGIC_VALUE,
+                        NO_WRITER_ID,
+                        NO_BATCH_SEQUENCE,
+                        changeTypes,
+                        values,
+                        LogFormat.ARROW,
+                        DEFAULT_COMPRESSION);
+
+        LogAppendInfo appendInfo = kvReplica.appendRecordsToLeader(cdcLogRecords, 0);
+        assertThat(appendInfo.lastOffset()).isGreaterThanOrEqualTo(0);
+
+        // Phase 2: Make follower (destroys KvTablet)
+        makeFollowerReplica(kvReplica, tablePath, tableBucket, 1);
+        assertThat(kvReplica.getKvTablet()).isNull();
+
+        // Phase 3: Make leader again (triggers Log recovery)
+        // KvRecoverHelper will encode values with TTL timestamp prefix
+        makeLeaderReplica(kvReplica, tablePath, tableBucket, 2);
+        assertThat(kvReplica.getKvTablet()).isNotNull();
+        assertThat(kvReplica.getKvTablet().kvTtlEnabled()).isTrue();
+
+        // Phase 4: Verify recovered data has correct TTL encoding
+        KvTablet recoveredKvTablet = kvReplica.getKvTablet();
+
+        // Create KeyEncoder matching KvRecoverHelper's encoding
+        KeyEncoder keyEncoder =
+                KeyEncoder.of(
+                        tableSchema.getRowType(),
+                        Arrays.asList("name", "id"), // physicalPrimaryKeys
+                        null);
+
+        byte[] aliceKey = keyEncoder.encodeKey(row(BinaryString.fromString("Alice"), 1));
+        byte[] bobKey = keyEncoder.encodeKey(row(BinaryString.fromString("Bob"), 2));
+
+        List<byte[]> recoveredValues = recoveredKvTablet.multiGet(Arrays.asList(aliceKey, bobKey));
+        assertThat(recoveredValues).hasSize(2);
+        assertThat(recoveredValues.get(0)).isNotNull();
+        assertThat(recoveredValues.get(1)).isNotNull();
+
+        // Verify the values can be decoded correctly with TTL-aware decoder
+        SchemaGetter schemaGetter = new TestingSchemaGetter(1, tableSchema);
+        TtlCompactionFilterConfig ttlConfig = new TtlCompactionFilterConfig("ttl_ms", 1000L);
+        ValueDecoder decoder = new ValueDecoder(schemaGetter, KvFormat.COMPACTED, ttlConfig);
+
+        InternalRow.FieldGetter nameGetter =
+                InternalRow.createFieldGetter(tableSchema.getRowType().getTypeAt(0), 0);
+        InternalRow.FieldGetter idGetter =
+                InternalRow.createFieldGetter(tableSchema.getRowType().getTypeAt(1), 1);
+        InternalRow.FieldGetter ttlGetter =
+                InternalRow.createFieldGetter(tableSchema.getRowType().getTypeAt(2), 2);
+
+        // Decode and verify record 1 (Alice)
+        BinaryValue decoded1 = decoder.decodeValue(recoveredValues.get(0));
+        assertThat(decoded1).isNotNull();
+        assertThat(String.valueOf(nameGetter.getFieldOrNull(decoded1.row))).isEqualTo("Alice");
+        assertThat(idGetter.getFieldOrNull(decoded1.row)).isEqualTo(1);
+        assertThat(ttlGetter.getFieldOrNull(decoded1.row)).isEqualTo(ttlTimestamp1);
+
+        // Decode and verify record 2 (Bob)
+        BinaryValue decoded2 = decoder.decodeValue(recoveredValues.get(1));
+        assertThat(decoded2).isNotNull();
+        assertThat(String.valueOf(nameGetter.getFieldOrNull(decoded2.row))).isEqualTo("Bob");
+        assertThat(idGetter.getFieldOrNull(decoded2.row)).isEqualTo(2);
+        assertThat(ttlGetter.getFieldOrNull(decoded2.row)).isEqualTo(ttlTimestamp2);
     }
 
     private static LogRecords fetchRecords(Replica replica) throws IOException {
