@@ -30,6 +30,7 @@ import javax.annotation.concurrent.NotThreadSafe;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -83,6 +84,12 @@ public class CompletedSnapshot {
      */
     @Nullable private final List<AutoIncIDRange> autoIncIDRanges;
 
+    /**
+     * The index replication offsets of the snapshot, tracking the last applied data offset for each
+     * upstream data bucket. Null for non-index tables.
+     */
+    @Nullable private final Map<TableBucket, Long> indexReplicationOffsets;
+
     /** The location where the snapshot is stored. */
     private final FsPath snapshotLocation;
 
@@ -96,6 +103,26 @@ public class CompletedSnapshot {
             long logOffset,
             @Nullable Long rowCount,
             @Nullable List<AutoIncIDRange> autoIncIDRanges) {
+        this(
+                tableBucket,
+                snapshotID,
+                snapshotLocation,
+                kvSnapshotHandle,
+                logOffset,
+                rowCount,
+                autoIncIDRanges,
+                null);
+    }
+
+    public CompletedSnapshot(
+            TableBucket tableBucket,
+            long snapshotID,
+            FsPath snapshotLocation,
+            KvSnapshotHandle kvSnapshotHandle,
+            long logOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            @Nullable Map<TableBucket, Long> indexReplicationOffsets) {
         this.tableBucket = tableBucket;
         this.snapshotID = snapshotID;
         this.snapshotLocation = snapshotLocation;
@@ -103,6 +130,7 @@ public class CompletedSnapshot {
         this.logOffset = logOffset;
         this.rowCount = rowCount;
         this.autoIncIDRanges = autoIncIDRanges;
+        this.indexReplicationOffsets = indexReplicationOffsets;
     }
 
     @VisibleForTesting
@@ -138,6 +166,11 @@ public class CompletedSnapshot {
     @Nullable
     public List<AutoIncIDRange> getAutoIncIDRanges() {
         return autoIncIDRanges;
+    }
+
+    @Nullable
+    public Map<TableBucket, Long> getIndexReplicationOffsets() {
+        return indexReplicationOffsets;
     }
 
     @Nullable
@@ -227,6 +260,7 @@ public class CompletedSnapshot {
                 && Objects.equals(kvSnapshotHandle, that.kvSnapshotHandle)
                 && Objects.equals(rowCount, that.rowCount)
                 && Objects.equals(autoIncIDRanges, that.autoIncIDRanges)
+                && Objects.equals(indexReplicationOffsets, that.indexReplicationOffsets)
                 && Objects.equals(snapshotLocation, that.snapshotLocation);
     }
 
@@ -239,6 +273,7 @@ public class CompletedSnapshot {
                 logOffset,
                 rowCount,
                 autoIncIDRanges,
+                indexReplicationOffsets,
                 snapshotLocation);
     }
 }

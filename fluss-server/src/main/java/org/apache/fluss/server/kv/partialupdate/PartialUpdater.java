@@ -78,14 +78,33 @@ public class PartialUpdater {
             pkColumnSet.set(pkIndex);
         }
 
+        // Collect index column indices for sparse index support
+        BitSet indexColumnSet = new BitSet();
+        for (Schema.Index index : schema.getIndexes()) {
+            for (String indexCol : index.getColumnNames()) {
+                int colIndex = schema.getRowType().getFieldIndex(indexCol);
+                if (colIndex >= 0) {
+                    indexColumnSet.set(colIndex);
+                }
+            }
+        }
+
+        // Collect auto-increment column indices
+        BitSet autoIncColumnSet = new BitSet();
+        for (int autoIncId : schema.getAutoIncrementColumnIds()) {
+            autoIncColumnSet.set(autoIncId);
+        }
+
         // check the columns not in targetColumns should be nullable
+        // Note: index columns and auto-increment columns are exempt from this check
         for (int i = 0; i < fieldDataTypes.length; i++) {
-            // the columns not in primary key should be nullable
-            if (!pkColumnSet.get(i)) {
+            // the columns not in primary key, not in index columns, and not auto-increment should
+            // be nullable
+            if (!pkColumnSet.get(i) && !indexColumnSet.get(i) && !autoIncColumnSet.get(i)) {
                 if (!fieldDataTypes[i].isNullable()) {
                     throw new InvalidTargetColumnException(
                             String.format(
-                                    "Partial Update requires all columns except primary key to be nullable, but column %s is NOT NULL.",
+                                    "Partial Update requires all columns except primary key and index columns to be nullable, but column %s is NOT NULL.",
                                     schema.getRowType().getFieldNames().get(i)));
                 }
             }

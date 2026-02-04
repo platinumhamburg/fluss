@@ -31,6 +31,7 @@ import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.utils.StringUtils;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.configuration.ConfigOption;
@@ -146,6 +147,10 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                         .toMillis();
 
         LeaseContext leaseContext = LeaseContext.fromConf(tableOptions);
+
+        // Parse secondary indexes from table options
+        int[][] secondaryIndexes = parseSecondaryIndexes(tableOptions, tableOutputType);
+
         return new FlinkTableSource(
                 toFlussTablePath(context.getObjectIdentifier()),
                 toFlussClientConfig(
@@ -163,7 +168,60 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_DATALAKE_ENABLED)),
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_MERGE_ENGINE)),
                 context.getCatalogTable().getOptions(),
-                leaseContext);
+                leaseContext,
+                secondaryIndexes);
+    }
+
+    /**
+     * Parse secondary indexes from table options. Returns array of column indexes for each index.
+     */
+    private static int[][] parseSecondaryIndexes(
+            ReadableConfig tableOptions,
+            org.apache.flink.table.types.logical.RowType tableOutputType) {
+        String configValue =
+                tableOptions
+                        .getOptional(toFlinkOption(ConfigOptions.TABLE_SECONDARY_INDEX_COLUMNS))
+                        .orElse("");
+
+        if (StringUtils.isNullOrWhitespaceOnly(configValue)) {
+            return null;
+        }
+
+        java.util.List<int[]> indexList = new java.util.ArrayList<>();
+        String[] indexConfigs = configValue.split(";");
+
+        for (String indexConfig : indexConfigs) {
+            indexConfig = indexConfig.trim();
+            if (StringUtils.isNullOrWhitespaceOnly(indexConfig)) {
+                continue;
+            }
+
+            String[] columns = indexConfig.split(",");
+            java.util.List<String> columnList =
+                    java.util.Arrays.stream(columns)
+                            .map(String::trim)
+                            .filter(col -> !StringUtils.isNullOrWhitespaceOnly(col))
+                            .collect(java.util.stream.Collectors.toList());
+
+            if (columnList.isEmpty()) {
+                continue;
+            }
+
+            // Convert column names to column indexes
+            int[] columnIndexes = new int[columnList.size()];
+            for (int i = 0; i < columnList.size(); i++) {
+                int fieldIndex = tableOutputType.getFieldIndex(columnList.get(i));
+                if (fieldIndex < 0) {
+                    throw new IllegalArgumentException(
+                            "Column '" + columnList.get(i) + "' not found in table schema");
+                }
+                columnIndexes[i] = fieldIndex;
+            }
+
+            indexList.add(columnIndexes);
+        }
+
+        return indexList.isEmpty() ? null : indexList.toArray(new int[0][]);
     }
 
     @Override

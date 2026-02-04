@@ -19,30 +19,55 @@ package org.apache.fluss.server.replica.fetcher;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.NetworkException;
+import org.apache.fluss.metadata.DataIndexTableBucket;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.entity.FetchIndexLogResultForBucket;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.FetchIndexRequest;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
+import org.apache.fluss.rpc.messages.PbFetchIndexRespForIndexTableBucket;
+import org.apache.fluss.rpc.messages.PbFetchIndexRespForTableBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForTable;
 import org.apache.fluss.rpc.messages.PbListOffsetsRespForBucket;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.log.ListOffsetsParam;
+import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
+import org.apache.fluss.utils.ExceptionUtils;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.ConnectException;
+import java.nio.channels.ClosedChannelException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.getFetchIndexLogResultForBucket;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.getFetchLogResultForBucket;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeListOffsetsRequest;
 
+/** Connection health state for rate limiting. */
+enum EndpointHealthState {
+    // Normal operation, no rate limiting.
+    HEALTHY,
+    // Network/client/metadata issues detected, rate limiting enabled.
+    UNHEALTHY
+}
+
 /** Facilitates fetches from a remote replica leader in one tablet server. */
 final class RemoteLeaderEndpoint implements LeaderEndpoint {
+    private static final Logger LOG = LoggerFactory.getLogger(RemoteLeaderEndpoint.class);
+
     private final int followerServerId;
     private final int remoteServerId;
     private final TabletServerGateway tabletServerGateway;
@@ -53,6 +78,12 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     private final int minFetchBytes;
     private final int maxFetchWaitMs;
+
+    /** Connection health state management. */
+    private AtomicReference<EndpointHealthState> connectionHealth =
+            new AtomicReference<>(EndpointHealthState.HEALTHY);
+    /** Rate limiter for unhealthy connections - 1 request per second. */
+    private final RateLimiter unhealthyRateLimiter = RateLimiter.create(1.0);
 
     RemoteLeaderEndpoint(
             Configuration conf,
@@ -92,37 +123,131 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     @Override
     public CompletableFuture<FetchData> fetchLog(FetchLogContext fetchLogContext) {
-        FetchLogRequest fetchLogRequest = fetchLogContext.getFetchLogRequest();
-        return tabletServerGateway
-                .fetchLog(fetchLogRequest)
-                .thenApply(
-                        fetchLogResponse -> {
-                            Map<TableBucket, FetchLogResultForBucket> fetchLogResultMap =
-                                    new HashMap<>();
-                            List<PbFetchLogRespForTable> tablesRespList =
-                                    fetchLogResponse.getTablesRespsList();
-                            for (PbFetchLogRespForTable tableResp : tablesRespList) {
-                                long tableId = tableResp.getTableId();
-                                List<PbFetchLogRespForBucket> bucketsRespList =
-                                        tableResp.getBucketsRespsList();
-                                for (PbFetchLogRespForBucket bucketResp : bucketsRespList) {
-                                    TableBucket tableBucket =
-                                            new TableBucket(
-                                                    tableId,
-                                                    bucketResp.hasPartitionId()
-                                                            ? bucketResp.getPartitionId()
-                                                            : null,
-                                                    bucketResp.getBucketId());
-                                    TablePath tablePath = fetchLogContext.getTablePath(tableId);
-                                    FetchLogResultForBucket fetchLogResultForBucket =
-                                            getFetchLogResultForBucket(
-                                                    tableBucket, tablePath, bucketResp);
-                                    fetchLogResultMap.put(tableBucket, fetchLogResultForBucket);
-                                }
-                            }
+        // Check rate limiting before making request
+        checkAndTryWaitHealthy();
 
-                            return new FetchData(fetchLogResponse, fetchLogResultMap);
-                        });
+        FetchLogRequest fetchLogRequest = fetchLogContext.getFetchLogRequest();
+        try {
+            return tabletServerGateway
+                    .fetchLog(fetchLogRequest)
+                    .thenApply(
+                            fetchLogResponse -> {
+                                // Mark as healthy on successful response
+                                markEndpointHealthy();
+
+                                Map<TableBucket, FetchLogResultForBucket> fetchLogResultMap =
+                                        new HashMap<>();
+                                List<PbFetchLogRespForTable> tablesRespList =
+                                        fetchLogResponse.getTablesRespsList();
+                                for (PbFetchLogRespForTable tableResp : tablesRespList) {
+                                    long tableId = tableResp.getTableId();
+                                    List<PbFetchLogRespForBucket> bucketsRespList =
+                                            tableResp.getBucketsRespsList();
+                                    for (PbFetchLogRespForBucket bucketResp : bucketsRespList) {
+                                        TableBucket tableBucket =
+                                                new TableBucket(
+                                                        tableId,
+                                                        bucketResp.hasPartitionId()
+                                                                ? bucketResp.getPartitionId()
+                                                                : null,
+                                                        bucketResp.getBucketId());
+                                        TablePath tablePath = fetchLogContext.getTablePath(tableId);
+                                        FetchLogResultForBucket fetchLogResultForBucket =
+                                                getFetchLogResultForBucket(
+                                                        tableBucket, tablePath, bucketResp);
+                                        fetchLogResultMap.put(tableBucket, fetchLogResultForBucket);
+                                    }
+                                }
+
+                                return new FetchData(fetchLogResponse, fetchLogResultMap);
+                            })
+                    .exceptionally(
+                            throwable -> {
+                                // Mark as unhealthy on network exception
+                                if (isNetworkException(throwable)) {
+                                    markEndpointUnhealthy();
+                                }
+                                throw new RuntimeException(throwable);
+                            });
+        } catch (Exception e) {
+            if (ExceptionUtils.findThrowableWithMessage(e, "Netty client is closed.").isPresent()) {
+                markEndpointUnhealthy();
+            }
+            if (ExceptionUtils.findThrowableWithMessage(e, "is not available in metadata cache.")
+                    .isPresent()) {
+                markEndpointUnhealthy();
+            }
+            throw new RuntimeException(e);
+        }
+    }
+
+    public CompletableFuture<FetchIndexData> fetchIndex(FetchIndexContext fetchIndexContext) {
+        // Check rate limiting before making request
+        checkAndTryWaitHealthy();
+
+        FetchIndexRequest fetchIndexRequest = fetchIndexContext.getFetchIndexRequest();
+        try {
+            return tabletServerGateway
+                    .fetchIndex(fetchIndexRequest)
+                    .thenApply(
+                            fetchIndexResponse -> {
+                                // Mark as healthy on successful response
+                                markEndpointHealthy();
+
+                                Map<DataIndexTableBucket, FetchIndexLogResultForBucket>
+                                        fetchIndexResultMap = new HashMap<>();
+                                List<PbFetchIndexRespForIndexTableBucket> indexBucketResponseList =
+                                        fetchIndexResponse.getRespForIndexTableBucketsList();
+                                for (PbFetchIndexRespForIndexTableBucket indexBucketResponse :
+                                        indexBucketResponseList) {
+                                    TableBucket indexTableBucket =
+                                            new TableBucket(
+                                                    indexBucketResponse.getTableId(),
+                                                    indexBucketResponse.hasPartitionId()
+                                                            ? indexBucketResponse.getPartitionId()
+                                                            : null,
+                                                    indexBucketResponse.getBucketId());
+                                    List<PbFetchIndexRespForTableBucket> tableBucketsResponseList =
+                                            indexBucketResponse.getRespForTablesList();
+                                    for (PbFetchIndexRespForTableBucket tableBucketResponse :
+                                            tableBucketsResponseList) {
+                                        TableBucket dataTableBucket =
+                                                new TableBucket(
+                                                        tableBucketResponse.getTableId(),
+                                                        tableBucketResponse.hasPartitionId()
+                                                                ? tableBucketResponse
+                                                                        .getPartitionId()
+                                                                : null,
+                                                        tableBucketResponse.getBucketId());
+                                        FetchIndexLogResultForBucket fetchIndexLogResultForBucket =
+                                                getFetchIndexLogResultForBucket(
+                                                        tableBucketResponse);
+                                        fetchIndexResultMap.put(
+                                                new DataIndexTableBucket(
+                                                        dataTableBucket, indexTableBucket),
+                                                fetchIndexLogResultForBucket);
+                                    }
+                                }
+                                return new FetchIndexData(fetchIndexResponse, fetchIndexResultMap);
+                            })
+                    .exceptionally(
+                            throwable -> {
+                                // Mark as unhealthy on network exception
+                                if (isNetworkException(throwable)) {
+                                    markEndpointUnhealthy();
+                                }
+                                throw new RuntimeException(throwable);
+                            });
+        } catch (Exception e) {
+            if (ExceptionUtils.findThrowableWithMessage(e, "Netty client is closed.").isPresent()) {
+                markEndpointUnhealthy();
+            }
+            if (ExceptionUtils.findThrowableWithMessage(e, "is not available in metadata cache.")
+                    .isPresent()) {
+                markEndpointUnhealthy();
+            }
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
@@ -195,6 +320,9 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
 
     /** Fetch log offset with given offset type. */
     private CompletableFuture<Long> fetchLogOffset(TableBucket tableBucket, int offsetType) {
+        // Check rate limiting before making request
+        checkAndTryWaitHealthy();
+
         return tabletServerGateway
                 .listOffsets(
                         makeListOffsetsRequest(
@@ -205,6 +333,9 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                                 tableBucket.getBucket()))
                 .thenApply(
                         response -> {
+                            // Mark as healthy on successful response
+                            markEndpointHealthy();
+
                             PbListOffsetsRespForBucket respForBucket =
                                     response.getBucketsRespsList().get(0);
                             if (respForBucket.hasErrorCode()) {
@@ -213,6 +344,65 @@ final class RemoteLeaderEndpoint implements LeaderEndpoint {
                             } else {
                                 return respForBucket.getOffset();
                             }
+                        })
+                .exceptionally(
+                        throwable -> {
+                            // Mark as unhealthy on network exception
+                            if (isNetworkException(throwable)) {
+                                markEndpointUnhealthy();
+                            }
+                            throw new RuntimeException(throwable);
                         });
+    }
+
+    /**
+     * Check connection health and apply rate limiting if necessary. This is a private method to
+     * handle rate limiting globally across all requests.
+     */
+    private void checkAndTryWaitHealthy() {
+        if (connectionHealth.get().equals(EndpointHealthState.UNHEALTHY)) {
+            // Block until rate limiter allows the request
+            unhealthyRateLimiter.acquire();
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Rate limited request to remote server {} due to unhealthy connection",
+                        remoteServerId);
+            }
+        }
+    }
+
+    /** Mark connection as healthy and disable rate limiting. */
+    private void markEndpointHealthy() {
+        if (connectionHealth.compareAndSet(
+                EndpointHealthState.UNHEALTHY, EndpointHealthState.HEALTHY)) {
+            LOG.info(
+                    "Connection to remote server {} recovered, disabling rate limiting",
+                    remoteServerId);
+        }
+    }
+
+    /** Mark connection as unhealthy and enable rate limiting. */
+    private void markEndpointUnhealthy() {
+        if (connectionHealth.compareAndSet(
+                EndpointHealthState.HEALTHY, EndpointHealthState.UNHEALTHY)) {
+            LOG.warn(
+                    "Endpoint issues detected with remote server {}, enabling rate limiting (1 req/sec)",
+                    remoteServerId);
+        }
+    }
+
+    /**
+     * Check if the given throwable represents a network exception that should trigger rate
+     * limiting.
+     */
+    private boolean isNetworkException(Throwable throwable) {
+        // Unwrap CompletionException if present
+        if (ExceptionUtils.findThrowable(throwable, NetworkException.class).isPresent()) {
+            return true;
+        }
+        if (ExceptionUtils.findThrowable(throwable, ConnectException.class).isPresent()) {
+            return true;
+        }
+        return ExceptionUtils.findThrowable(throwable, ClosedChannelException.class).isPresent();
     }
 }

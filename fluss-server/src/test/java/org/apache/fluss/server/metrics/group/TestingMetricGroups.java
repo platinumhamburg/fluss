@@ -20,10 +20,15 @@ package org.apache.fluss.server.metrics.group;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.server.metrics.UserMetrics;
-import org.apache.fluss.testutils.common.ScheduledTask;
 import org.apache.fluss.utils.concurrent.Scheduler;
 
+import javax.annotation.Nonnull;
+
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /** Utilities for various metric groups for testing. */
 public class TestingMetricGroups {
@@ -66,7 +71,52 @@ public class TestingMetricGroups {
                 String name, Runnable task, long delayMs, long periodMs) {
             // Directly run the task for testing purpose.
             task.run();
-            return new ScheduledTask<>(() -> null, delayMs, periodMs);
+            return new ImmediateScheduledFuture<>(delayMs);
+        }
+    }
+
+    private static final class ImmediateScheduledFuture<V> implements ScheduledFuture<V> {
+        private final long delayMs;
+
+        private ImmediateScheduledFuture(long delayMs) {
+            this.delayMs = delayMs;
+        }
+
+        @Override
+        public long getDelay(TimeUnit unit) {
+            return unit.convert(delayMs, TimeUnit.MILLISECONDS);
+        }
+
+        @Override
+        public int compareTo(@Nonnull Delayed o) {
+            long diff = getDelay(TimeUnit.MILLISECONDS) - o.getDelay(TimeUnit.MILLISECONDS);
+            return diff == 0 ? 0 : (diff < 0 ? -1 : 1);
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            return false;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return false;
+        }
+
+        @Override
+        public boolean isDone() {
+            return true;
+        }
+
+        @Override
+        public V get() throws InterruptedException, ExecutionException {
+            return null;
+        }
+
+        @Override
+        public V get(long timeout, TimeUnit unit)
+                throws InterruptedException, ExecutionException, TimeoutException {
+            return null;
         }
     }
 }

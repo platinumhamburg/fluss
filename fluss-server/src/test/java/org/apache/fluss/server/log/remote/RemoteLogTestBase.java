@@ -107,7 +107,8 @@ public class RemoteLogTestBase extends ReplicaTestBase {
                         segment.getFileLogRecords().file().toPath(),
                         segment.offsetIndex().file().toPath(),
                         segment.timeIndex().file().toPath(),
-                        writerIdSnapshotFile.toPath());
+                        writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null,
+                        null);
 
         UUID remoteLogSegmentId = UUID.randomUUID();
         RemoteLogSegment remoteLogSegment =

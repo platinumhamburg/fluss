@@ -20,6 +20,7 @@ package org.apache.fluss.server.tablet;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -1044,7 +1045,8 @@ public class TabletServiceITCase {
         TabletServerGateway gateway = FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
         CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(rowType, new int[] {0});
         TestingSchemaGetter schemaGetter = new TestingSchemaGetter(DEFAULT_SCHEMA_ID, schema);
-        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, KvFormat.COMPACTED);
+        ValueDecoder valueDecoder =
+                new ValueDecoder(schemaGetter, KvFormat.COMPACTED, CompactionFilterConfig.none());
 
         byte[] key1 = keyEncoder.encodeKey(row(new Object[] {100}));
         byte[] key2 = keyEncoder.encodeKey(row(new Object[] {200}));

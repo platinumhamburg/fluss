@@ -26,6 +26,7 @@ import org.apache.fluss.annotation.PublicEvolving;
  */
 @PublicEvolving
 public class TableNotExistException extends ApiException {
+
     public TableNotExistException(String message) {
         this(message, null);
     }

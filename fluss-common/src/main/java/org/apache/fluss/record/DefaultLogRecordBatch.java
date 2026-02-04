@@ -211,6 +211,11 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         return segment.getInt(position + recordsCountOffset(magic));
     }
 
+    /** Returns the start offset of records data. */
+    private int getRecordsStartOffset() {
+        return position + recordBatchHeaderSize(magic);
+    }
+
     @Override
     public CloseableIterator<LogRecord> records(ReadContext context) {
         if (getRecordCount() == 0) {
@@ -265,7 +270,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
             RowType rowType, @Nullable ProjectedRow outputProjection, long timestamp) {
         DataType[] fieldTypes = rowType.getChildren().toArray(new DataType[0]);
         return new LogRecordIterator() {
-            int position = DefaultLogRecordBatch.this.position + recordBatchHeaderSize(magic);
+            int position = getRecordsStartOffset();
             int rowId = 0;
 
             @Override
@@ -334,9 +339,9 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         if (isAppendOnly) {
             // append only batch, no change type vector,
             // the start of the arrow data is the beginning of the batch records
-            int recordBatchHeaderSize = recordBatchHeaderSize(magic);
-            int arrowOffset = position + recordBatchHeaderSize;
-            int arrowLength = sizeInBytes() - recordBatchHeaderSize;
+            int recordsStartOffset = getRecordsStartOffset();
+            int arrowOffset = recordsStartOffset;
+            int arrowLength = sizeInBytes() - (recordsStartOffset - position);
             ArrowReader reader =
                     ArrowUtils.createArrowReader(
                             segment, arrowOffset, arrowLength, root, allocator, rowType);
@@ -349,12 +354,11 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
         } else {
             // with change type, decode the change type vector first,
             // the arrow data starts after the change type vector
-            int changeTypeOffset = position + arrowChangeTypeOffset(magic);
+            int changeTypeOffset = getChangeTypeOffset();
             ChangeTypeVector changeTypeVector =
                     new ChangeTypeVector(segment, changeTypeOffset, getRecordCount());
             int arrowOffset = changeTypeOffset + changeTypeVector.sizeInBytes();
-            int arrowLength =
-                    sizeInBytes() - arrowChangeTypeOffset(magic) - changeTypeVector.sizeInBytes();
+            int arrowLength = sizeInBytes() - (arrowOffset - position);
             ArrowReader reader =
                     ArrowUtils.createArrowReader(
                             segment, arrowOffset, arrowLength, root, allocator, rowType);
@@ -365,6 +369,11 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
                 }
             };
         }
+    }
+
+    /** Returns the offset of the change type vector. */
+    private int getChangeTypeOffset() {
+        return position + arrowChangeTypeOffset(magic);
     }
 
     /** The basic implementation for Arrow log record iterator. */

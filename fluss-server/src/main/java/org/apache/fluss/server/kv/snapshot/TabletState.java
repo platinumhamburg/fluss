@@ -19,31 +19,46 @@
 
 package org.apache.fluss.server.kv.snapshot;
 
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 
 import javax.annotation.Nullable;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * TabletState represents the state of a kv tablet at a certain log offset. It contains the flushed
  * log offset, the row count of the tablet at that log offset, and the auto-increment ID ranges of
  * the tablet at that log offset. The row count and auto-increment ID ranges are optional, and may
  * be null if the information is not available or not needed for a particular use case.
+ *
+ * <p>For index tables, it also contains the index replication offsets, which track the last applied
+ * data offset for each upstream data bucket.
  */
 public class TabletState {
 
     private final long flushedLogOffset;
     @Nullable private final Long rowCount;
     @Nullable private final List<AutoIncIDRange> autoIncIDRanges;
+    @Nullable private final Map<TableBucket, Long> indexReplicationOffsets;
 
     public TabletState(
             long flushedLogOffset,
             @Nullable Long rowCount,
             @Nullable List<AutoIncIDRange> autoIncIDRanges) {
+        this(flushedLogOffset, rowCount, autoIncIDRanges, null);
+    }
+
+    public TabletState(
+            long flushedLogOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            @Nullable Map<TableBucket, Long> indexReplicationOffsets) {
         this.flushedLogOffset = flushedLogOffset;
         this.rowCount = rowCount;
         this.autoIncIDRanges = autoIncIDRanges;
+        this.indexReplicationOffsets = indexReplicationOffsets;
     }
 
     public long getFlushedLogOffset() {
@@ -60,6 +75,11 @@ public class TabletState {
         return autoIncIDRanges;
     }
 
+    @Nullable
+    public Map<TableBucket, Long> getIndexReplicationOffsets() {
+        return indexReplicationOffsets;
+    }
+
     @Override
     public String toString() {
         return "TabletState{"
@@ -69,6 +89,8 @@ public class TabletState {
                 + rowCount
                 + ", autoIncIDRanges="
                 + autoIncIDRanges
+                + ", indexReplicationOffsets="
+                + indexReplicationOffsets
                 + '}';
     }
 }

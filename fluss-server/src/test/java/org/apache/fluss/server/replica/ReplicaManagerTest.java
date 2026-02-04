@@ -25,6 +25,7 @@ import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -872,7 +873,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
         // Decode values to verify auto-increment column values
         TestingSchemaGetter schemaGetter =
                 new TestingSchemaGetter(DEFAULT_SCHEMA_ID, DATA3_SCHEMA_PK_AUTO_INC);
-        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, KvFormat.COMPACTED);
+        ValueDecoder valueDecoder =
+                new ValueDecoder(schemaGetter, KvFormat.COMPACTED, CompactionFilterConfig.none());
 
         InternalRow row1 = valueDecoder.decodeValue(inserted.get(0)).row;
         InternalRow row2 = valueDecoder.decodeValue(inserted.get(1)).row;
@@ -977,7 +979,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
         // Verify auto-increment values are sequential and unique
         TestingSchemaGetter schemaGetter =
                 new TestingSchemaGetter(DEFAULT_SCHEMA_ID, DATA3_SCHEMA_PK_AUTO_INC);
-        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, KvFormat.COMPACTED);
+        ValueDecoder valueDecoder =
+                new ValueDecoder(schemaGetter, KvFormat.COMPACTED, CompactionFilterConfig.none());
 
         Set<Long> autoIncrementValues = new HashSet<>();
         for (byte[] value : threadResults[0]) {

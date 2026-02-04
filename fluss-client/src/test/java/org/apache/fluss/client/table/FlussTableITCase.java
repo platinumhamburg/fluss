@@ -22,6 +22,7 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
+import org.apache.fluss.client.lookup.SecondaryIndexLookuper;
 import org.apache.fluss.client.table.scanner.Scan;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
@@ -47,6 +48,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.TestData;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
@@ -84,6 +86,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA3_SCHEMA_PK;
+import static org.apache.fluss.record.TestData.PARTITIONED_INDEXED_TABLE_DESCRIPTOR;
 import static org.apache.fluss.testutils.DataTestUtils.assertRowValueEquals;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.keyRow;
@@ -1827,6 +1830,84 @@ class FlussTableITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testSecondaryIndexLookup() throws Exception {
+        // Step 1: Create a table with global secondary index definitions
+        Schema schema = TestData.INDEXED_SCHEMA;
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        createTable(TestData.INDEXED_TABLE_PATH, tableDescriptor, false);
+
+        // Step 2: Verify both table and index tables are created correctly
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Table mainTable = conn.getTable(TestData.INDEXED_TABLE_PATH);
+
+            // Check main table exists
+            assertThat(mainTable).isNotNull();
+
+            // Check index tables exist
+            Table nameIndexTable = conn.getTable(TestData.IDX_NAME_TABLE_PATH);
+            assertThat(nameIndexTable).isNotNull();
+            Table emailIndexTable = conn.getTable(TestData.IDX_EMAIL_TABLE_PATH);
+            assertThat(emailIndexTable).isNotNull();
+
+            // Check index tables exist by trying to create SecondaryIndexLookupers
+            Lookuper nameIndexLookuper = mainTable.newLookup().lookupBy("name").createLookuper();
+            Lookuper emailIndexLookuper = mainTable.newLookup().lookupBy("email").createLookuper();
+
+            assertThat(nameIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+            assertThat(emailIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+
+            // Step 3: Write data to main table
+            UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
+
+            // Insert test data
+            upsertWriter.upsert(row(1, "Alice", "alice@example.com")).get();
+            upsertWriter.upsert(row(2, "Bob", "bob@example.com")).get();
+            upsertWriter.upsert(row(3, "Charlie", "charlie@example.com")).get();
+            upsertWriter.upsert(row(4, "Diana", "diana@example.com")).get();
+            upsertWriter.upsert(row(5, "Eve", "eve@example.com")).get();
+
+            // Step 4: Create SecondaryIndexLookupers and test lookup functionality
+
+            // Test name index lookup
+            CompletableFuture<LookupResult> nameLookupFuture =
+                    nameIndexLookuper.lookup(row("Alice"));
+            LookupResult nameLookupResult = nameLookupFuture.get();
+            assertThat(nameLookupResult).isNotNull();
+            assertThat(nameLookupResult.getRowList()).hasSize(1);
+            InternalRow nameResultRow = nameLookupResult.getRowList().get(0);
+            assertThat(nameResultRow.getInt(0)).isEqualTo(1); // id
+            assertThat(nameResultRow.getString(1).toString()).isEqualTo("Alice"); // name
+            assertThat(nameResultRow.getString(2).toString())
+                    .isEqualTo("alice@example.com"); // email
+
+            // Test email index lookup
+            CompletableFuture<LookupResult> emailLookupFuture =
+                    emailIndexLookuper.lookup(row("bob@example.com"));
+            LookupResult emailLookupResult = emailLookupFuture.get();
+            assertThat(emailLookupResult).isNotNull();
+            assertThat(emailLookupResult.getRowList()).hasSize(1);
+            InternalRow emailResultRow = emailLookupResult.getRowList().get(0);
+            assertThat(emailResultRow.getInt(0)).isEqualTo(2); // id
+            assertThat(emailResultRow.getString(1).toString()).isEqualTo("Bob"); // name
+            assertThat(emailResultRow.getString(2).toString())
+                    .isEqualTo("bob@example.com"); // email
+
+            // Test lookup with non-existent values
+            CompletableFuture<LookupResult> nonExistentNameLookup =
+                    nameIndexLookuper.lookup(row("NonExistent"));
+            LookupResult nonExistentNameResult = nonExistentNameLookup.get();
+            assertThat(nonExistentNameResult.getRowList()).isEmpty();
+
+            CompletableFuture<LookupResult> nonExistentEmailLookup =
+                    emailIndexLookuper.lookup(row("nonexistent@example.com"));
+            LookupResult nonExistentEmailResult = nonExistentEmailLookup.get();
+            assertThat(nonExistentEmailResult.getRowList()).isEmpty();
+        }
+    }
+
+    @Test
     void testPkUpdateAndDeleteWithCompactedLog() throws Exception {
         Schema schema =
                 Schema.newBuilder()
@@ -1883,6 +1964,129 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             }
             assertThat(seen).isEqualTo(expected.length);
             scanner.close();
+        }
+    }
+
+    @Test
+    void testPartitionedTableSecondaryIndexLookup() throws Exception {
+        // This test verifies that global secondary indexes work correctly with partitioned tables.
+        // Key design points:
+        // 1. Index tables are never partitioned, regardless of main table partitioning
+        // 2. Index tables dynamically track and adjust indexing targets when partitions are
+        // added/dropped
+
+        // Step 1: Create a partitioned table with global secondary index definitions
+        createTable(
+                TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                PARTITIONED_INDEXED_TABLE_DESCRIPTOR,
+                false);
+
+        // Step 2: Verify both main table and index tables are created correctly
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Table mainTable = conn.getTable(TestData.PARTITIONED_INDEXED_TABLE_PATH);
+
+            // Check main table exists
+            assertThat(mainTable).isNotNull();
+
+            // Check index tables exist
+            Table nameIndexTable = conn.getTable(TestData.PARTITIONED_IDX_NAME_TABLE_PATH);
+            assertThat(nameIndexTable).isNotNull();
+            Table emailIndexTable = conn.getTable(TestData.PARTITIONED_IDX_EMAIL_TABLE_PATH);
+            assertThat(emailIndexTable).isNotNull();
+
+            // Step 3: Create partitions and add test data
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2023"),
+                            false)
+                    .get();
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2024"),
+                            false)
+                    .get();
+
+            // Wait for partitions to be ready (2 pre-created + 2 manually created)
+            FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 4);
+
+            // Step 4: Write data to the partitioned main table
+            UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
+
+            // Insert test data across different partitions
+            upsertWriter.upsert(row(1, "Alice", "alice@example.com", "2023")).get();
+            upsertWriter.upsert(row(2, "Bob", "bob@example.com", "2023")).get();
+            upsertWriter.upsert(row(3, "Charlie", "charlie@example.com", "2024")).get();
+            upsertWriter.upsert(row(4, "Diana", "diana@example.com", "2024")).get();
+
+            // Step 5: Create SecondaryIndexLookupers and test lookup functionality
+            Lookuper nameIndexLookuper = mainTable.newLookup().lookupBy("name").createLookuper();
+            Lookuper emailIndexLookuper = mainTable.newLookup().lookupBy("email").createLookuper();
+
+            assertThat(nameIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+            assertThat(emailIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+
+            // Test name index lookup across partitions
+            CompletableFuture<LookupResult> nameLookupFuture =
+                    nameIndexLookuper.lookup(row("Alice"));
+            LookupResult nameLookupResult = nameLookupFuture.get();
+            assertThat(nameLookupResult).isNotNull();
+            assertThat(nameLookupResult.getRowList()).hasSize(1);
+            InternalRow nameResultRow = nameLookupResult.getRowList().get(0);
+            assertThat(nameResultRow.getInt(0)).isEqualTo(1); // id
+            assertThat(nameResultRow.getString(1).toString()).isEqualTo("Alice"); // name
+            assertThat(nameResultRow.getString(2).toString())
+                    .isEqualTo("alice@example.com"); // email
+            assertThat(nameResultRow.getString(3).toString()).isEqualTo("2023"); // year
+
+            // Test email index lookup across partitions
+            CompletableFuture<LookupResult> emailLookupFuture =
+                    emailIndexLookuper.lookup(row("charlie@example.com"));
+            LookupResult emailLookupResult = emailLookupFuture.get();
+            assertThat(emailLookupResult).isNotNull();
+            assertThat(emailLookupResult.getRowList()).hasSize(1);
+            InternalRow emailResultRow = emailLookupResult.getRowList().get(0);
+            assertThat(emailResultRow.getInt(0)).isEqualTo(3); // id
+            assertThat(emailResultRow.getString(1).toString()).isEqualTo("Charlie"); // name
+            assertThat(emailResultRow.getString(2).toString())
+                    .isEqualTo("charlie@example.com"); // email
+            assertThat(emailResultRow.getString(3).toString()).isEqualTo("2024"); // year
+
+            // Step 6: Test partition addition and index adaptation
+            // Note: Index tables are not partitioned, they adapt to main table partition changes
+            // through TabletServerMetadataCache and dynamically track indexing targets
+            admin.createPartition(
+                            TestData.PARTITIONED_INDEXED_TABLE_PATH,
+                            newPartitionSpec("year", "2025"),
+                            false)
+                    .get();
+
+            // Wait for new partition to be ready
+            FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(
+                    TestData.PARTITIONED_INDEXED_TABLE_PATH, 5);
+
+            // Add data to the new partition
+            upsertWriter.upsert(row(5, "Eve", "eve@example.com", "2025")).get();
+
+            // Test lookup can find data in the new partition
+            CompletableFuture<LookupResult> eveLookupFuture = nameIndexLookuper.lookup(row("Eve"));
+            LookupResult eveLookupResult = eveLookupFuture.get();
+            assertThat(eveLookupResult).isNotNull();
+            assertThat(eveLookupResult.getRowList()).hasSize(1);
+            InternalRow eveResultRow = eveLookupResult.getRowList().get(0);
+            assertThat(eveResultRow.getInt(0)).isEqualTo(5); // id
+            assertThat(eveResultRow.getString(1).toString()).isEqualTo("Eve"); // name
+            assertThat(eveResultRow.getString(3).toString()).isEqualTo("2025"); // year
+
+            // Note: Manual partition deletion is not supported for tables with indexes.
+            // Tables with indexes should only have partitions managed by auto-partition mechanism.
+            // This is by design to ensure index consistency.
+
+            // Test lookup with non-existent values
+            CompletableFuture<LookupResult> nonExistentLookup =
+                    nameIndexLookuper.lookup(row("NonExistent"));
+            LookupResult nonExistentResult = nonExistentLookup.get();
+            assertThat(nonExistentResult.getRowList()).isEmpty();
         }
     }
 
@@ -2035,5 +2239,561 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             assertThat(result2.getLogEndOffset()).isEqualTo(3);
             assertThat(result3.getLogEndOffset()).isEqualTo(3);
         }
+    }
+
+    @Test
+    void testSecondaryIndexMassiveDataTest() throws Exception {
+        // Step 1: Create a table with global secondary index definitions using INDEXED_SCHEMA
+        Schema schema = TestData.INDEXED_SCHEMA;
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        createTable(TestData.INDEXED_TABLE_PATH, tableDescriptor, false);
+
+        // Step 2: Generate large amount of random test data (100K rows)
+        int totalRows = 10000;
+        List<Object[]> testData = generateRandomTestData(totalRows);
+
+        // Step 3: Write data to main table
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Table mainTable = conn.getTable(TestData.INDEXED_TABLE_PATH);
+            // Check index tables exist
+            Table nameIndexTable = conn.getTable(TestData.IDX_NAME_TABLE_PATH);
+            assertThat(nameIndexTable).isNotNull();
+            Table emailIndexTable = conn.getTable(TestData.IDX_EMAIL_TABLE_PATH);
+            assertThat(emailIndexTable).isNotNull();
+
+            UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
+
+            // Insert data in batches to avoid memory issues
+            int batchSize = 1000;
+            for (int i = 0; i < testData.size(); i += batchSize) {
+                int endIdx = Math.min(i + batchSize, testData.size());
+                for (int j = i; j < endIdx; j++) {
+                    Object[] rowData = testData.get(j);
+                    upsertWriter.upsert(row(rowData[0], rowData[1], rowData[2]));
+                }
+                upsertWriter.flush();
+            }
+
+            // Step 4: Wait for index replication to complete by checking all data visibility
+            // Wait for all replicas to be ready
+            long tableId = admin.getTableInfo(TestData.INDEXED_TABLE_PATH).get().getTableId();
+            waitAllReplicasReady(tableId, 3);
+
+            // Step 5: Verify all data is visible in main table through secondary index lookup
+            Lookuper nameIndexLookuper = mainTable.newLookup().lookupBy("name").createLookuper();
+            Lookuper emailIndexLookuper = mainTable.newLookup().lookupBy("email").createLookuper();
+
+            // Sample verification - test 100 random entries to ensure they are findable via index
+            // Use retry mechanism since index replication is asynchronous
+            int verificationSampleSize = Math.min(100, totalRows);
+            for (int i = 0; i < verificationSampleSize; i++) {
+                Object[] rowData = testData.get(i * (totalRows / verificationSampleSize));
+
+                // Test name index lookup
+                CompletableFuture<LookupResult> nameLookupFuture =
+                        nameIndexLookuper.lookup(row((String) rowData[1]));
+                LookupResult nameLookupResult = nameLookupFuture.get();
+                assertThat(nameLookupResult).isNotNull();
+                assertThat(nameLookupResult.getRowList()).hasSize(1);
+                InternalRow nameResultRow = nameLookupResult.getRowList().get(0);
+                assertThat(nameResultRow.getInt(0)).isEqualTo((Integer) rowData[0]);
+                assertThat(nameResultRow.getString(1).toString()).isEqualTo((String) rowData[1]);
+                assertThat(nameResultRow.getString(2).toString()).isEqualTo((String) rowData[2]);
+
+                // Test email index lookup
+                CompletableFuture<LookupResult> emailLookupFuture =
+                        emailIndexLookuper.lookup(row((String) rowData[2]));
+                LookupResult emailLookupResult = emailLookupFuture.get();
+                assertThat(emailLookupResult).isNotNull();
+                assertThat(emailLookupResult.getRowList()).hasSize(1);
+                InternalRow emailResultRow = emailLookupResult.getRowList().get(0);
+                assertThat(emailResultRow.getInt(0)).isEqualTo((Integer) rowData[0]);
+                assertThat(emailResultRow.getString(1).toString()).isEqualTo((String) rowData[1]);
+                assertThat(emailResultRow.getString(2).toString()).isEqualTo((String) rowData[2]);
+            }
+        }
+    }
+
+    // ------------------- UpsertWriter NULL Index Column Validation Tests -------------------
+
+    /**
+     * Test sparse index behavior: rows with NULL index columns are written to main table but
+     * skipped in index table.
+     *
+     * <p>Sparse index behavior (similar to DynamoDB GSI): - Rows with NULL index columns are
+     * written to main table normally - These rows are NOT indexed (skipped during index update) -
+     * Lookup by primary key still works - Lookup by index column returns empty for NULL values
+     */
+    @Test
+    void testSparseIndexWithNullIndexColumn() throws Exception {
+        // Create a table with secondary index
+        Schema schema = TestData.INDEXED_SCHEMA;
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        TablePath tablePath = TablePath.of("test_db_1", "test_sparse_index_null_column");
+        createTable(tablePath, tableDescriptor, false);
+
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+
+            // Write rows with NULL index columns - should succeed (sparse index)
+            upsertWriter.upsert(row(1, null, "test1@example.com")).get();
+            upsertWriter.upsert(row(2, "TestName", null)).get();
+            upsertWriter.upsert(row(3, null, null)).get();
+            // Write a normal row for comparison
+            upsertWriter.upsert(row(4, "Alice", "alice@example.com")).get();
+            upsertWriter.flush();
+
+            // Verify data is in main table via primary key lookup
+            Lookuper pkLookuper = table.newLookup().createLookuper();
+
+            InternalRow result1 = lookupRow(pkLookuper, row(1));
+            assertThat(result1).isNotNull();
+            assertThat(result1.getInt(0)).isEqualTo(1);
+            assertThat(result1.isNullAt(1)).isTrue(); // name is NULL
+            assertThat(result1.getString(2).toString()).isEqualTo("test1@example.com");
+
+            InternalRow result2 = lookupRow(pkLookuper, row(2));
+            assertThat(result2).isNotNull();
+            assertThat(result2.getInt(0)).isEqualTo(2);
+            assertThat(result2.getString(1).toString()).isEqualTo("TestName");
+            assertThat(result2.isNullAt(2)).isTrue(); // email is NULL
+
+            InternalRow result3 = lookupRow(pkLookuper, row(3));
+            assertThat(result3).isNotNull();
+            assertThat(result3.getInt(0)).isEqualTo(3);
+            assertThat(result3.isNullAt(1)).isTrue(); // name is NULL
+            assertThat(result3.isNullAt(2)).isTrue(); // email is NULL
+
+            // Verify index lookup works for non-NULL values
+            Lookuper nameIndexLookuper = table.newLookup().lookupBy("name").createLookuper();
+            LookupResult aliceResult = nameIndexLookuper.lookup(row("Alice")).get();
+            assertThat(aliceResult.getRowList()).hasSize(1);
+            assertThat(aliceResult.getRowList().get(0).getInt(0)).isEqualTo(4);
+
+            // Verify index lookup for "TestName" works
+            LookupResult testNameResult = nameIndexLookuper.lookup(row("TestName")).get();
+            assertThat(testNameResult.getRowList()).hasSize(1);
+            assertThat(testNameResult.getRowList().get(0).getInt(0)).isEqualTo(2);
+        }
+    }
+
+    /**
+     * Test sparse index behavior when index column changes from non-NULL to NULL.
+     *
+     * <p>When index column changes from non-NULL to NULL: - Old index entry should be deleted -
+     * Main table should have the updated value - Index lookup with old value should return empty
+     */
+    @Test
+    void testSparseIndexUpdateToNull() throws Exception {
+        // Create a table with secondary index
+        Schema schema = TestData.INDEXED_SCHEMA;
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        TablePath tablePath = TablePath.of("test_db_1", "test_sparse_index_update_to_null");
+        createTable(tablePath, tableDescriptor, false);
+
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+
+            // Step 1: Write a row with non-NULL index column
+            upsertWriter.upsert(row(1, "Alice", "alice@example.com")).get();
+            upsertWriter.flush();
+
+            // Verify index lookup works
+            Lookuper nameIndexLookuper = table.newLookup().lookupBy("name").createLookuper();
+            LookupResult aliceResult = nameIndexLookuper.lookup(row("Alice")).get();
+            assertThat(aliceResult.getRowList()).hasSize(1);
+
+            // Step 2: Update the row to have NULL index column
+            upsertWriter.upsert(row(1, null, "alice_updated@example.com")).get();
+            upsertWriter.flush();
+
+            // Verify main table has updated value
+            Lookuper pkLookuper = table.newLookup().createLookuper();
+            InternalRow result = lookupRow(pkLookuper, row(1));
+            assertThat(result).isNotNull();
+            assertThat(result.isNullAt(1)).isTrue(); // name is now NULL
+            assertThat(result.getString(2).toString()).isEqualTo("alice_updated@example.com");
+
+            // Verify old index entry is deleted (lookup by "Alice" should return empty)
+            LookupResult oldIndexResult = nameIndexLookuper.lookup(row("Alice")).get();
+            assertThat(oldIndexResult.getRowList()).isEmpty();
+        }
+    }
+
+    /**
+     * Test that tables without secondary indexes can write NULL values normally.
+     *
+     * <p>Validates: Requirement 2.4
+     */
+    @Test
+    void testUpsertWithoutIndexNormalWrite() throws Exception {
+        // Create a table WITHOUT secondary index but with nullable columns
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("value", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        TablePath tablePath = TablePath.of("test_db_1", "test_upsert_without_index");
+        createTable(tablePath, tableDescriptor, false);
+
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+
+            // Should be able to write NULL values in non-index columns
+            upsertWriter.upsert(row(1, null, "value1")).get();
+            upsertWriter.upsert(row(2, "name2", null)).get();
+            upsertWriter.upsert(row(3, null, null)).get();
+            upsertWriter.flush();
+
+            // Verify the data was written correctly by looking up
+            Lookuper lookuper = table.newLookup().createLookuper();
+
+            InternalRow result1 = lookupRow(lookuper, row(1));
+            assertThat(result1).isNotNull();
+            assertThat(result1.getInt(0)).isEqualTo(1);
+            assertThat(result1.isNullAt(1)).isTrue();
+            assertThat(result1.getString(2).toString()).isEqualTo("value1");
+
+            InternalRow result2 = lookupRow(lookuper, row(2));
+            assertThat(result2).isNotNull();
+            assertThat(result2.getInt(0)).isEqualTo(2);
+            assertThat(result2.getString(1).toString()).isEqualTo("name2");
+            assertThat(result2.isNullAt(2)).isTrue();
+
+            InternalRow result3 = lookupRow(lookuper, row(3));
+            assertThat(result3).isNotNull();
+            assertThat(result3.getInt(0)).isEqualTo(3);
+            assertThat(result3.isNullAt(1)).isTrue();
+            assertThat(result3.isNullAt(2)).isTrue();
+        }
+    }
+
+    /**
+     * Test that index columns remain nullable to support sparse index behavior.
+     *
+     * <p>Sparse index: index columns can be nullable, rows with NULL index columns are skipped
+     * during index updates (similar to DynamoDB sparse GSI).
+     */
+    @Test
+    void testIndexColumnRemainsNullableForSparseIndex() throws Exception {
+        // Create a schema with nullable index columns
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING()) // nullable by default
+                        .column("email", DataTypes.STRING()) // nullable by default
+                        .primaryKey("id")
+                        .index("idx_name", "name")
+                        .index("idx_email", "email")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        TablePath tablePath = TablePath.of("test_db_1", "test_index_column_remains_nullable");
+        createTable(tablePath, tableDescriptor, false);
+
+        // Get the table info from server and verify index columns remain nullable
+        try (Table table = conn.getTable(tablePath)) {
+            TableInfo tableInfo = table.getTableInfo();
+            Schema serverSchema = tableInfo.getSchema();
+            RowType rowType = serverSchema.getRowType();
+
+            // Verify 'name' column (index column) remains nullable for sparse index
+            assertThat(rowType.getField("name").getType().isNullable())
+                    .as("Index column 'name' should remain nullable for sparse index support")
+                    .isTrue();
+
+            // Verify 'email' column (index column) remains nullable for sparse index
+            assertThat(rowType.getField("email").getType().isNullable())
+                    .as("Index column 'email' should remain nullable for sparse index support")
+                    .isTrue();
+
+            // Verify 'id' column (primary key) is NOT NULL
+            assertThat(rowType.getField("id").getType().isNullable())
+                    .as("Primary key column 'id' should be NOT NULL")
+                    .isFalse();
+        }
+    }
+
+    /**
+     * End-to-end test: Write normal data and verify index lookup works correctly.
+     *
+     * <p>Validates: Requirements 1.1, 2.1, 3.1
+     */
+    @Test
+    void testIndexColumnNormalWriteAndLookup() throws Exception {
+        // Create a table with secondary indexes
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("email", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index("idx_name", "name")
+                        .index("idx_email", "email")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
+
+        TablePath tablePath = TablePath.of("test_db_1", "test_index_normal_write_lookup");
+        createTable(tablePath, tableDescriptor, false);
+
+        try (Table table = conn.getTable(tablePath)) {
+            // Write normal data (non-NULL index columns)
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            upsertWriter.upsert(row(1, "Alice", "alice@example.com")).get();
+            upsertWriter.upsert(row(2, "Bob", "bob@example.com")).get();
+            upsertWriter.upsert(row(3, "Charlie", "charlie@example.com")).get();
+            upsertWriter.flush();
+
+            // Create secondary index lookupers
+            Lookuper nameIndexLookuper = table.newLookup().lookupBy("name").createLookuper();
+            Lookuper emailIndexLookuper = table.newLookup().lookupBy("email").createLookuper();
+
+            // Verify both lookupers are SecondaryIndexLookuper
+            assertThat(nameIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+            assertThat(emailIndexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+
+            // Test name index lookup
+            LookupResult nameLookupResult = nameIndexLookuper.lookup(row("Alice")).get();
+            assertThat(nameLookupResult).isNotNull();
+            assertThat(nameLookupResult.getRowList()).hasSize(1);
+            InternalRow nameResultRow = nameLookupResult.getRowList().get(0);
+            assertThat(nameResultRow.getInt(0)).isEqualTo(1);
+            assertThat(nameResultRow.getString(1).toString()).isEqualTo("Alice");
+            assertThat(nameResultRow.getString(2).toString()).isEqualTo("alice@example.com");
+
+            // Test email index lookup
+            LookupResult emailLookupResult =
+                    emailIndexLookuper.lookup(row("bob@example.com")).get();
+            assertThat(emailLookupResult).isNotNull();
+            assertThat(emailLookupResult.getRowList()).hasSize(1);
+            InternalRow emailResultRow = emailLookupResult.getRowList().get(0);
+            assertThat(emailResultRow.getInt(0)).isEqualTo(2);
+            assertThat(emailResultRow.getString(1).toString()).isEqualTo("Bob");
+            assertThat(emailResultRow.getString(2).toString()).isEqualTo("bob@example.com");
+
+            // Test lookup with non-existent value
+            LookupResult nonExistentResult = nameIndexLookuper.lookup(row("NonExistent")).get();
+            assertThat(nonExistentResult.getRowList()).isEmpty();
+        }
+    }
+
+    /**
+     * Reproduce: secondary index lookup with INT index column and batch write. Mimics the rj_fact
+     * schema from VVR11TableSourceITCase.testRightJoinDeltaJoin.
+     */
+    @Test
+    void testSecondaryIndexLookupWithIntIndexColumn() throws Exception {
+        // Schema: fact_id (PK), product_id (indexed), amount
+        Schema schema =
+                Schema.newBuilder()
+                        .column("fact_id", DataTypes.INT())
+                        .column("product_id", DataTypes.INT())
+                        .column("amount", DataTypes.INT())
+                        .primaryKey("fact_id")
+                        .index("idx_product_id", "product_id")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(3, "fact_id")
+                        .property(ConfigOptions.TABLE_REPLICATION_FACTOR.key(), "1")
+                        .build();
+
+        TablePath tablePath = TablePath.of("test_db_1", "test_int_index_lookup");
+        createTable(tablePath, tableDescriptor, false);
+
+        try (Connection freshConn = ConnectionFactory.createConnection(clientConf)) {
+            Table table = freshConn.getTable(tablePath);
+
+            // Batch write 15 rows (same pattern as failing test)
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            for (int i = 1; i <= 15; i++) {
+                upsertWriter.upsert(row(i, i, i * 100));
+            }
+            upsertWriter.flush();
+
+            // Create secondary index lookuper on product_id
+            Lookuper indexLookuper = table.newLookup().lookupBy("product_id").createLookuper();
+            assertThat(indexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+
+            // Wait for all 15 rows to be visible via secondary index lookup
+            // Index replication is async: main WAL -> IndexDataProducer -> IndexFetcherThread ->
+            // IndexApplier
+            long deadline = System.currentTimeMillis() + 30_000;
+            for (int i = 1; i <= 15; i++) {
+                while (true) {
+                    LookupResult r = indexLookuper.lookup(row(i)).get();
+                    if (!r.getRowList().isEmpty()) {
+                        break;
+                    }
+                    if (System.currentTimeMillis() > deadline) {
+                        assertThat(r.getRowList())
+                                .as(
+                                        "Secondary index lookup for product_id="
+                                                + i
+                                                + " should return 1 row within 30s")
+                                .hasSize(1);
+                    }
+                    Thread.sleep(200);
+                }
+            }
+
+            // Verify data correctness
+            LookupResult result = indexLookuper.lookup(row(1)).get();
+            InternalRow resultRow = result.getRowList().get(0);
+            assertThat(resultRow.getInt(0)).isEqualTo(1); // fact_id
+            assertThat(resultRow.getInt(1)).isEqualTo(1); // product_id
+            assertThat(resultRow.getInt(2)).isEqualTo(100); // amount
+        }
+    }
+
+    @Test
+    void testSecondaryIndexLookupWithoutDistributedBy() throws Exception {
+        // Mimics Flink DDL: no distributedBy, no replication_factor, no merge-engine
+        // This is the pattern used by the failing RIGHT JOIN DeltaJoin test
+        Schema schema =
+                Schema.newBuilder()
+                        .column("fact_id", DataTypes.INT())
+                        .column("product_id", DataTypes.INT())
+                        .column("amount", DataTypes.INT())
+                        .primaryKey("fact_id")
+                        .index("idx_product_id", "product_id")
+                        .build();
+
+        TableDescriptor tableDescriptor = TableDescriptor.builder().schema(schema).build();
+
+        TablePath tablePath = TablePath.of("test_db_1", "test_no_distributed_by_index");
+        createTable(tablePath, tableDescriptor, false);
+
+        // Also check the index table directly
+        TablePath indexTablePath = TablePath.forIndexTable(tablePath, "idx_product_id");
+
+        try (Connection freshConn = ConnectionFactory.createConnection(clientConf)) {
+            Table table = freshConn.getTable(tablePath);
+            Table indexTable = freshConn.getTable(indexTablePath);
+
+            System.out.println(
+                    "Main table info: buckets="
+                            + table.getTableInfo().getNumBuckets()
+                            + ", bucketKeys="
+                            + table.getTableInfo().getBucketKeys());
+            System.out.println(
+                    "Index table info: buckets="
+                            + indexTable.getTableInfo().getNumBuckets()
+                            + ", bucketKeys="
+                            + indexTable.getTableInfo().getBucketKeys());
+
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            for (int i = 1; i <= 15; i++) {
+                upsertWriter.upsert(row(i, i, i * 100));
+            }
+            upsertWriter.flush();
+
+            // First try PK lookup on main table to verify data is there
+            Lookuper pkLookuper = table.newLookup().createLookuper();
+            for (int i = 1; i <= 3; i++) {
+                LookupResult pkResult = pkLookuper.lookup(row(i)).get();
+                System.out.println(
+                        "PK lookup fact_id=" + i + ": resultSize=" + pkResult.getRowList().size());
+            }
+
+            // Try prefix lookup on index table directly
+            Lookuper indexTableLookuper =
+                    indexTable.newLookup().lookupBy("product_id").createLookuper();
+            for (int i = 1; i <= 3; i++) {
+                LookupResult idxResult = indexTableLookuper.lookup(row(i)).get();
+                System.out.println(
+                        "Index table prefix lookup product_id="
+                                + i
+                                + ": resultSize="
+                                + idxResult.getRowList().size());
+            }
+
+            // Now try secondary index lookup on main table
+            Lookuper indexLookuper = table.newLookup().lookupBy("product_id").createLookuper();
+            assertThat(indexLookuper).isInstanceOf(SecondaryIndexLookuper.class);
+
+            for (int i = 1; i <= 15; i++) {
+                LookupResult r = indexLookuper.lookup(row(i)).get();
+                System.out.println(
+                        "Secondary index lookup product_id="
+                                + i
+                                + ": resultSize="
+                                + r.getRowList().size());
+                assertThat(r.getRowList())
+                        .as("Secondary index lookup for product_id=" + i)
+                        .hasSize(1);
+            }
+        }
+    }
+
+    /** Generate random test data conforming to INDEXED_SCHEMA (id, name, email). */
+    private List<Object[]> generateRandomTestData(int rowCount) {
+        List<Object[]> testData = new ArrayList<>(rowCount);
+
+        // Pre-defined name and domain lists for generating realistic test data
+        String[] firstNames = {
+            "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Ivy", "Jack",
+            "Kate", "Liam", "Mia", "Noah", "Olivia", "Paul", "Quinn", "Rose", "Sam", "Tina"
+        };
+        String[] lastNames = {
+            "Smith",
+            "Johnson",
+            "Williams",
+            "Brown",
+            "Jones",
+            "Garcia",
+            "Miller",
+            "Davis",
+            "Rodriguez",
+            "Martinez",
+            "Hernandez",
+            "Lopez",
+            "Gonzalez",
+            "Wilson",
+            "Anderson"
+        };
+        String[] domains = {"example.com", "test.org", "sample.net", "demo.io", "mock.edu"};
+
+        for (int i = 0; i < rowCount; i++) {
+            // Generate unique id
+            int id = i + 1;
+
+            // Generate random name
+            String firstName = firstNames[i % firstNames.length];
+            String lastName = lastNames[(i / firstNames.length) % lastNames.length];
+            String name = firstName + lastName + "_" + (i / (firstNames.length * lastNames.length));
+
+            // Generate unique email based on name and id
+            String domain = domains[i % domains.length];
+            String email =
+                    firstName.toLowerCase()
+                            + "."
+                            + lastName.toLowerCase()
+                            + "."
+                            + id
+                            + "@"
+                            + domain;
+
+            testData.add(new Object[] {id, name, email});
+        }
+
+        return testData;
     }
 }

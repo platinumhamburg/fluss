@@ -155,11 +155,30 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
         delayedWriteMetadata
                 .getBucketStatusMap()
                 .forEach(
-                        (tableBucket, delayedBucketStatus) ->
+                        (tableBucket, delayedBucketStatus) -> {
+                            // Only log diagnostics for buckets that are still waiting for acks
+                            if (delayedBucketStatus.isAcksPending()) {
+                                try {
+                                    Replica replica =
+                                            replicaManager.getReplicaOrException(tableBucket);
+                                    String diagnostics =
+                                            replica.getTimeoutDiagnostics(
+                                                    delayedBucketStatus.getRequiredOffset());
+                                    LOG.warn(diagnostics);
+                                } catch (Exception e) {
+                                    LOG.warn(
+                                            "Failed to get timeout diagnostics for bucket {} with status {}: {}",
+                                            tableBucket,
+                                            delayedBucketStatus,
+                                            e.getMessage());
+                                }
+                            } else {
                                 LOG.debug(
                                         "Expiring delay write operation for bucket {} with status {}",
                                         tableBucket,
-                                        delayedBucketStatus));
+                                        delayedBucketStatus);
+                            }
+                        });
     }
 
     /** Upon completion, return the current response status along with the error code per bucket. */

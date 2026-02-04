@@ -185,10 +185,12 @@ public class LogRecordBatchFormat {
     // ----------------------------------------------------------------------------------------
 
     public static int leaderEpochOffset(byte magic) {
-        if (magic == LOG_MAGIC_VALUE_V1) {
-            return V1_LEADER_EPOCH_OFFSET;
+        switch (magic) {
+            case LOG_MAGIC_VALUE_V1:
+                return V1_LEADER_EPOCH_OFFSET;
+            default:
+                throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
-        throw new IllegalArgumentException("Unsupported magic value " + magic);
     }
 
     public static int crcOffset(byte magic) {

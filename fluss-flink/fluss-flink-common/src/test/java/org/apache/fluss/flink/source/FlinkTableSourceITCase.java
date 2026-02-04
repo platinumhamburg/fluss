@@ -117,6 +117,11 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         admin = conn.getAdmin();
     }
 
+    /** Returns the catalog type identifier used to create the catalog. */
+    protected String catalogType() {
+        return "fluss";
+    }
+
     @BeforeEach
     void before() {
         // initialize env and table env
@@ -127,8 +132,8 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         String bootstrapServers = String.join(",", clientConf.get(ConfigOptions.BOOTSTRAP_SERVERS));
         tEnv.executeSql(
                 String.format(
-                        "create catalog %s with ('type' = 'fluss', '%s' = '%s')",
-                        CATALOG_NAME, BOOTSTRAP_SERVERS.key(), bootstrapServers));
+                        "create catalog %s with ('type' = '%s', '%s' = '%s')",
+                        CATALOG_NAME, catalogType(), BOOTSTRAP_SERVERS.key(), bootstrapServers));
         tEnv.executeSql("use catalog " + CATALOG_NAME);
         tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 4);
         tEnv.executeSql("create database " + DEFAULT_DB);
