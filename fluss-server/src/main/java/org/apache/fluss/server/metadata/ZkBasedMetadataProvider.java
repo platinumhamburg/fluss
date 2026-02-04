@@ -49,6 +49,10 @@ public abstract class ZkBasedMetadataProvider implements MetadataProvider {
         this.metadataManager = metadataManager;
     }
 
+    protected ZooKeeperClient getZkClient() {
+        return zkClient;
+    }
+
     @Override
     public List<TableMetadata> getTablesMetadataFromZK(Collection<TablePath> tablePaths) {
         try {

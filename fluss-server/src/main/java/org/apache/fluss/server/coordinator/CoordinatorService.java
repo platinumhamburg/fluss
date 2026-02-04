@@ -35,6 +35,7 @@ import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.LakeTableAlreadyExistException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
@@ -47,9 +48,11 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
@@ -163,6 +166,7 @@ import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 import org.apache.fluss.utils.json.TableBucketOffsets;
@@ -180,6 +184,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -208,6 +213,7 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toAlterTableSc
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTableBucketOffsets;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTablePath;
 import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
+import static org.apache.fluss.utils.PartitionUtils.validateAutoPartitionTimeFormat;
 import static org.apache.fluss.utils.PartitionUtils.validatePartitionSpec;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
@@ -418,8 +424,28 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         // then create table;
-        metadataManager.createTable(
-                tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+        long tableId =
+                metadataManager.createTable(
+                        tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+
+        // create index tables if the main table has indexes and the table was actually created
+        // (tableId != -1 means the table was newly created, not skipped due to IF NOT EXISTS)
+        if (tableId != -1 && !tableDescriptor.getSchema().getIndexes().isEmpty()) {
+            try {
+                createIndexTables(tablePath, tableDescriptor, tableId);
+            } catch (Exception e) {
+                // rollback main table creation if index table creation fails
+                try {
+                    metadataManager.dropTable(tablePath, true);
+                } catch (Exception rollbackException) {
+                    LOG.error(
+                            "Failed to rollback main table {} after index table creation failure",
+                            tablePath,
+                            rollbackException);
+                }
+                throw new RuntimeException("Failed to create index tables: " + e.getMessage(), e);
+            }
+        }
 
         return CompletableFuture.completedFuture(new CreateTableResponse());
     }
@@ -590,6 +616,44 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         authorizeTable(OperationType.DROP, tablePath);
 
         DropTableResponse response = new DropTableResponse();
+
+        // first check if the main table exists to ensure proper exception handling
+        boolean tableExists = metadataManager.tableExists(tablePath);
+        if (!tableExists) {
+            if (!request.isIgnoreIfNotExists()) {
+                throw new TableNotExistException("Table '" + tablePath + "' does not exist.");
+            }
+            // if ignoreIfNotExists is true and table doesn't exist, return success
+            return CompletableFuture.completedFuture(response);
+        }
+
+        // Check if the table being dropped is an index table
+        TableInfo tableInfo = metadataManager.getTable(tablePath);
+        if (tableInfo.isIndexTable()) {
+            TableDescriptor indexDescriptor = tableInfo.toTableDescriptor();
+            Optional<String> mainTableNameOpt = indexDescriptor.getMainTableName();
+            if (mainTableNameOpt.isPresent()) {
+                TablePath mainTablePath =
+                        new TablePath(tablePath.getDatabaseName(), mainTableNameOpt.get());
+                if (metadataManager.tableExists(mainTablePath)) {
+                    TableInfo mainTableInfo = metadataManager.getTable(mainTablePath);
+                    OptionalLong expectedMainTableId = indexDescriptor.getMainTableId();
+                    if (!expectedMainTableId.isPresent()
+                            || mainTableInfo.getTableId() == expectedMainTableId.getAsLong()) {
+                        throw new InvalidTableException(
+                                String.format(
+                                        "Cannot drop index table %s while main table %s still exists. "
+                                                + "Index tables are automatically managed and can only be dropped when the main table is dropped.",
+                                        tablePath, mainTablePath));
+                    }
+                }
+            }
+            // If main table doesn't exist, allow dropping the index table (cleanup scenario)
+        }
+
+        // drop index tables first (best-effort), then drop the main table
+        dropIndexTables(tablePath, request.isIgnoreIfNotExists());
+
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
         return CompletableFuture.completedFuture(response);
     }
@@ -610,6 +674,19 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         // first, validate the partition spec, and get resolved partition spec.
         PartitionSpec partitionSpec = getPartitionSpec(request.getPartitionSpec());
         validatePartitionSpec(tablePath, table.partitionKeys, partitionSpec, true);
+
+        // validate auto-partition time format only for tables with indexes
+        // (tables with indexes must have auto-partition enabled, and we need to ensure
+        // partition values match the expected time format for proper TTL calculation)
+        TableInfo tableInfo = metadataManager.getTable(tablePath);
+        if (!tableInfo.getSchema().getIndexes().isEmpty()) {
+            AutoPartitionStrategy autoPartitionStrategy =
+                    AutoPartitionStrategy.from(
+                            Configuration.fromMap(table.properties), table.partitionKeys);
+            validateAutoPartitionTimeFormat(
+                    table.partitionKeys, partitionSpec, autoPartitionStrategy);
+        }
+
         ResolvedPartitionSpec partitionToCreate =
                 ResolvedPartitionSpec.fromPartitionSpec(table.partitionKeys, partitionSpec);
 
@@ -622,6 +699,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         PartitionAssignment partitionAssignment =
                 new PartitionAssignment(table.tableId, bucketAssignments);
 
+        // then create main table partition
         metadataManager.createPartition(
                 tablePath,
                 table.tableId,
@@ -637,10 +715,32 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         authorizeTable(OperationType.WRITE, tablePath);
 
         DropPartitionResponse response = new DropPartitionResponse();
+
         TableRegistration table = metadataManager.getTableRegistration(tablePath);
+
+        // Check if trying to drop partition from an index table - this is not allowed
+        if (table.isIndexTable()) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Cannot drop partition from index table %s. "
+                                    + "Index table partitions are automatically managed and can only be dropped "
+                                    + "when the corresponding main table partition is dropped.",
+                            tablePath));
+        }
         if (!table.isPartitioned()) {
             throw new TableNotPartitionedException(
                     "Only partitioned table support drop partition.");
+        }
+
+        // Check if the table has indexes - manual partition drop is not allowed for tables with
+        // indexes. Tables with indexes should only have partitions managed by auto-partition.
+        TableInfo tableInfo = metadataManager.getTable(tablePath);
+        if (!tableInfo.getSchema().getIndexes().isEmpty()) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Cannot manually drop partition from table %s which has indexes. "
+                                    + "Tables with indexes should only have partitions managed by auto-partition mechanism.",
+                            tablePath));
         }
 
         // first, validate the partition spec.
@@ -673,6 +773,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         return metadataResponseAccessContextEvent.getResultFuture();
     }
 
+    @Override
     public CompletableFuture<AdjustIsrResponse> adjustIsr(AdjustIsrRequest request) {
         CompletableFuture<AdjustIsrResponse> response = new CompletableFuture<>();
         eventManagerSupplier
@@ -1152,6 +1253,86 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 throw new InvalidTableException(
                         "Creation of Log Tables is disallowed in the cluster.");
             }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Index Table Management
+    // -------------------------------------------------------------------------
+
+    /**
+     * Creates index tables for the given main table. If any index table creation fails, all
+     * previously created index tables are rolled back.
+     */
+    private void createIndexTables(
+            TablePath mainTablePath, TableDescriptor mainTableDescriptor, long mainTableId) {
+        List<Schema.Index> indexes = mainTableDescriptor.getSchema().getIndexes();
+        Set<TablePath> createdIndexTables = new HashSet<>();
+
+        try {
+            for (Schema.Index index : indexes) {
+                TablePath indexTablePath =
+                        TablePath.forIndexTable(mainTablePath, index.getIndexName());
+                TableDescriptor indexTableDescriptor =
+                        TableDescriptor.forIndexTable(
+                                mainTableDescriptor,
+                                index,
+                                mainTableId,
+                                mainTablePath.getTableName());
+
+                int bucketCount =
+                        indexTableDescriptor.getTableDistribution().get().getBucketCount().get();
+                int replicaFactor = indexTableDescriptor.getReplicationFactor();
+                TabletServerInfo[] servers = metadataCache.getLiveServers();
+                TableAssignment indexTableAssignment =
+                        generateAssignment(bucketCount, replicaFactor, servers);
+
+                long tableId =
+                        metadataManager.createTable(
+                                indexTablePath, indexTableDescriptor, indexTableAssignment, true);
+                if (tableId != -1) {
+                    createdIndexTables.add(indexTablePath);
+                }
+            }
+        } catch (Exception e) {
+            // rollback all created index tables
+            for (TablePath indexTablePath : createdIndexTables) {
+                try {
+                    metadataManager.dropTable(indexTablePath, true);
+                } catch (Exception rollbackException) {
+                    LOG.error(
+                            "Failed to rollback index table {} during cleanup",
+                            indexTablePath,
+                            rollbackException);
+                }
+            }
+            throw e;
+        }
+    }
+
+    /** Drops all index tables for the given main table (best-effort). */
+    private void dropIndexTables(TablePath mainTablePath, boolean ignoreIfNotExists) {
+        TableInfo tableInfo = metadataManager.getTable(mainTablePath);
+        if (tableInfo == null) {
+            return;
+        }
+
+        List<Schema.Index> indexes = tableInfo.toTableDescriptor().getSchema().getIndexes();
+        List<String> failures = new ArrayList<>();
+        for (Schema.Index index : indexes) {
+            TablePath indexTablePath = TablePath.forIndexTable(mainTablePath, index.getIndexName());
+            try {
+                metadataManager.dropTable(indexTablePath, true);
+            } catch (Exception e) {
+                LOG.error("Failed to drop index table {}", indexTablePath, e);
+                failures.add(indexTablePath + ": " + e.getMessage());
+            }
+        }
+        if (!failures.isEmpty() && !ignoreIfNotExists) {
+            LOG.warn(
+                    "Some index tables failed to drop for {}: {}",
+                    mainTablePath,
+                    String.join("; ", failures));
         }
     }
 

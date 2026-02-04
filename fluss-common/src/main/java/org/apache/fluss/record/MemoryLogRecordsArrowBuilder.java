@@ -91,15 +91,20 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
 
         this.pagedOutputView = pagedOutputView;
         this.firstSegment = pagedOutputView.getCurrentSegment();
-        int arrowChangeTypeOffset = arrowChangeTypeOffset(magic);
+        int changeTypeOffset = arrowChangeTypeOffset(magic);
         checkArgument(
-                firstSegment.size() >= arrowChangeTypeOffset,
+                firstSegment.size() >= changeTypeOffset,
                 "The size of first segment of pagedOutputView is too small, need at least "
-                        + arrowChangeTypeOffset
+                        + changeTypeOffset
                         + " bytes.");
-        this.changeTypeWriter = new ChangeTypeVectorWriter(firstSegment, arrowChangeTypeOffset);
+        this.changeTypeWriter = new ChangeTypeVectorWriter(firstSegment, changeTypeOffset);
         this.estimatedSizeInBytes = recordBatchHeaderSize(magic);
         this.recordCount = 0;
+    }
+
+    /** Returns the offset where the change type writer should start. */
+    private int getChangeTypeWriterOffset() {
+        return arrowChangeTypeOffset(magic);
     }
 
     @VisibleForTesting
@@ -142,9 +147,10 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         }
 
         // serialize the arrow batch to dynamically allocated memory segments
-        arrowWriter.serializeToOutputView(
-                pagedOutputView, arrowChangeTypeOffset(magic) + changeTypeWriter.sizeInBytes());
+        int arrowDataOffset = getChangeTypeWriterOffset() + changeTypeWriter.sizeInBytes();
+        arrowWriter.serializeToOutputView(pagedOutputView, arrowDataOffset);
         recordCount = arrowWriter.getRecordsCount();
+
         bytesView =
                 MultiBytesView.builder()
                         .addMemorySegmentByteViewList(pagedOutputView.getWrittenSegments())
@@ -241,7 +247,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         if (reCalculateSizeInBytes) {
             // make size in bytes up-to-date
             estimatedSizeInBytes =
-                    arrowChangeTypeOffset(magic)
+                    getChangeTypeWriterOffset()
                             + changeTypeWriter.sizeInBytes()
                             + arrowWriter.estimatedSizeInBytes();
         }

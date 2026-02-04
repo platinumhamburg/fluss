@@ -18,6 +18,7 @@
 package org.apache.fluss.row.encode;
 
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -33,24 +34,30 @@ import static org.apache.fluss.utils.MapUtils.newConcurrentHashMap;
 
 /**
  * A decoder to decode a schema id and {@link BinaryRow} from a byte array value which is encoded by
- * {@link ValueEncoder#encodeValue(short, BinaryRow)}.
+ * {@link ValueEncoder#encodeValue(short, BinaryRow)} or {@link
+ * ValueEncoder#encodeValueWithLongPrefix(long, short, BinaryRow, CompactionFilterConfig)}.
  */
 public class ValueDecoder {
 
     private final Map<Short, RowDecoder> rowDecoders;
     private final SchemaGetter schemaGetter;
     private final KvFormat kvFormat;
+    private final int prefixLength;
 
-    public ValueDecoder(SchemaGetter schemaGetter, KvFormat kvFormat) {
+    public ValueDecoder(
+            SchemaGetter schemaGetter,
+            KvFormat kvFormat,
+            CompactionFilterConfig compactionFilterConfig) {
         this.rowDecoders = newConcurrentHashMap();
         this.schemaGetter = schemaGetter;
         this.kvFormat = kvFormat;
+        this.prefixLength = compactionFilterConfig.getPrefixLength();
     }
 
     /** Decode the value bytes and return the schema id and the row encoded in the value bytes. */
     public BinaryValue decodeValue(byte[] valueBytes) {
         MemorySegment memorySegment = MemorySegment.wrap(valueBytes);
-        short schemaId = memorySegment.getShort(0);
+        short schemaId = memorySegment.getShort(prefixLength);
 
         RowDecoder rowDecoder =
                 rowDecoders.computeIfAbsent(
@@ -62,9 +69,9 @@ public class ValueDecoder {
                                     schema.getRowType().getChildren().toArray(new DataType[0]));
                         });
 
+        int dataOffset = prefixLength + SCHEMA_ID_LENGTH;
         BinaryRow row =
-                rowDecoder.decode(
-                        memorySegment, SCHEMA_ID_LENGTH, valueBytes.length - SCHEMA_ID_LENGTH);
+                rowDecoder.decode(memorySegment, dataOffset, valueBytes.length - dataOffset);
         return new BinaryValue(schemaId, row);
     }
 }

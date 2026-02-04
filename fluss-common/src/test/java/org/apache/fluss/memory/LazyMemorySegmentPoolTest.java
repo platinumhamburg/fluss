@@ -584,6 +584,74 @@ public class LazyMemorySegmentPoolTest {
                     .isInstanceOf(EOFException.class)
                     .hasMessageContaining("1000 ms");
         }
+
+        @Test
+        void testCreateIndexCacheBufferPoolWithDefaultConfig() {
+            LazyMemorySegmentPool pool = LazyMemorySegmentPool.createIndexCacheBufferPool(conf);
+            assertThat(pool).isNotNull();
+            assertThat(pool.totalSize())
+                    .isEqualTo(conf.get(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE).getBytes());
+            assertThat(pool.pageSize())
+                    .isEqualTo(conf.get(ConfigOptions.SERVER_INDEX_CACHE_PAGE_SIZE).getBytes());
+            assertThat(pool.availableMemory())
+                    .isEqualTo(conf.get(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE).getBytes());
+            assertThat(pool.freePages())
+                    .isEqualTo(
+                            conf.get(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE).getBytes()
+                                    / conf.get(ConfigOptions.SERVER_INDEX_CACHE_PAGE_SIZE)
+                                            .getBytes());
+            assertThat(pool.getAllCachePages().size()).isEqualTo(0);
+        }
+
+        @Test
+        void testCreateIndexCacheBufferPoolWithCustomConfig() throws IOException {
+            conf.set(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE, MemorySize.parse("32mb"));
+            conf.set(ConfigOptions.SERVER_INDEX_CACHE_PAGE_SIZE, MemorySize.parse("256kb"));
+            conf.set(
+                    ConfigOptions.SERVER_INDEX_CACHE_PER_REQUEST_MEMORY_SIZE,
+                    MemorySize.parse("4mb"));
+            conf.set(ConfigOptions.SERVER_INDEX_CACHE_WAIT_TIMEOUT, Duration.ofMillis(2000));
+
+            LazyMemorySegmentPool pool = LazyMemorySegmentPool.createIndexCacheBufferPool(conf);
+            assertThat(pool).isNotNull();
+            assertThat(pool.totalSize())
+                    .isEqualTo(conf.get(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE).getBytes());
+            assertThat(pool.pageSize())
+                    .isEqualTo(conf.get(ConfigOptions.SERVER_INDEX_CACHE_PAGE_SIZE).getBytes());
+            assertThat(pool.availableMemory())
+                    .isEqualTo(conf.get(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE).getBytes());
+            assertThat(pool.freePages())
+                    .isEqualTo(
+                            conf.get(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE).getBytes()
+                                    / conf.get(ConfigOptions.SERVER_INDEX_CACHE_PAGE_SIZE)
+                                            .getBytes());
+            assertThat(pool.getAllCachePages().size()).isEqualTo(0);
+
+            pool.allocatePages(128);
+            assertThatThrownBy(() -> pool.allocatePages(1))
+                    .isInstanceOf(EOFException.class)
+                    .hasMessageContaining("2000 ms");
+        }
+
+        @Test
+        void testIndexCacheBufferPoolWithBasicOperations() throws IOException {
+            conf.set(ConfigOptions.SERVER_INDEX_CACHE_MEMORY_SIZE, MemorySize.parse("8mb"));
+            conf.set(ConfigOptions.SERVER_INDEX_CACHE_PAGE_SIZE, MemorySize.parse("128kb"));
+            conf.set(
+                    ConfigOptions.SERVER_INDEX_CACHE_PER_REQUEST_MEMORY_SIZE,
+                    MemorySize.parse("512kb"));
+
+            LazyMemorySegmentPool pool = LazyMemorySegmentPool.createIndexCacheBufferPool(conf);
+
+            // Test basic allocation and deallocation
+            List<MemorySegment> segments = pool.allocatePages(4);
+            assertThat(segments.size()).isEqualTo(4);
+            assertThat(pool.freePages()).isEqualTo(64 - 4);
+
+            pool.returnAll(segments);
+            assertThat(pool.freePages()).isEqualTo(64);
+            assertThat(pool.availableMemory()).isEqualTo(8 * 1024 * 1024);
+        }
     }
 
     private static LazyMemorySegmentPool buildLazyMemorySegmentSource(

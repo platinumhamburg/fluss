@@ -41,6 +41,7 @@ public class DefaultValueRecord implements ValueRecord {
 
     static final int LENGTH_OFFSET = 0;
     static final int LENGTH_LENGTH = 4;
+    static final int TS_LENGTH = 8;
     static final int SCHEMA_ID_OFFSET = LENGTH_LENGTH;
     static final int SCHEMA_ID_LENGTH = 2;
     static final int VALUE_OFFSET = SCHEMA_ID_OFFSET + SCHEMA_ID_LENGTH;
@@ -79,13 +80,14 @@ public class DefaultValueRecord implements ValueRecord {
     public static DefaultValueRecord readFrom(
             MemorySegment segment, int position, ValueRecordBatch.ReadContext readContext) {
         int sizeInBytesWithoutLength = segment.getInt(position + LENGTH_OFFSET);
-        short schemaId = segment.getShort(position + SCHEMA_ID_OFFSET);
+        int prefixLength = readContext.prefixLength();
+        short schemaId = segment.getShort(position + SCHEMA_ID_OFFSET + prefixLength);
         RowDecoder decoder = readContext.getRowDecoder(schemaId);
         BinaryRow value =
                 decoder.decode(
                         segment,
-                        position + VALUE_OFFSET,
-                        sizeInBytesWithoutLength - SCHEMA_ID_LENGTH);
+                        position + VALUE_OFFSET + prefixLength,
+                        sizeInBytesWithoutLength - SCHEMA_ID_LENGTH - prefixLength);
         return new DefaultValueRecord(schemaId, value);
     }
 }

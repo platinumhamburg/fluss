@@ -28,7 +28,9 @@ import org.apache.fluss.utils.json.JsonSerializer;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /** Json serializer and deserializer for {@link CompletedSnapshot}. */
 public class CompletedSnapshotJsonSerde
@@ -67,6 +69,11 @@ public class CompletedSnapshotJsonSerde
     private static final String AUTO_INC_COLUMN_ID = "column_id";
     private static final String AUTO_INC_ID_START = "start";
     private static final String AUTO_INC_ID_END = "end";
+    private static final String INDEX_REPLICATION_OFFSETS = "index_replication_offsets";
+    private static final String INDEX_OFFSET_TABLE_ID = "table_id";
+    private static final String INDEX_OFFSET_PARTITION_ID = "partition_id";
+    private static final String INDEX_OFFSET_BUCKET_ID = "bucket_id";
+    private static final String INDEX_OFFSET_OFFSET = "offset";
 
     @Override
     public void serialize(CompletedSnapshot completedSnapshot, JsonGenerator generator)
@@ -131,6 +138,25 @@ public class CompletedSnapshotJsonSerde
                 generator.writeNumberField(AUTO_INC_COLUMN_ID, autoIncIDRange.getColumnId());
                 generator.writeNumberField(AUTO_INC_ID_START, autoIncIDRange.getStart());
                 generator.writeNumberField(AUTO_INC_ID_END, autoIncIDRange.getEnd());
+                generator.writeEndObject();
+            }
+            generator.writeEndArray();
+        }
+
+        // serialize index replication offsets if exists
+        if (completedSnapshot.getIndexReplicationOffsets() != null
+                && !completedSnapshot.getIndexReplicationOffsets().isEmpty()) {
+            generator.writeArrayFieldStart(INDEX_REPLICATION_OFFSETS);
+            for (Map.Entry<TableBucket, Long> entry :
+                    completedSnapshot.getIndexReplicationOffsets().entrySet()) {
+                TableBucket tb = entry.getKey();
+                generator.writeStartObject();
+                generator.writeNumberField(INDEX_OFFSET_TABLE_ID, tb.getTableId());
+                if (tb.getPartitionId() != null) {
+                    generator.writeNumberField(INDEX_OFFSET_PARTITION_ID, tb.getPartitionId());
+                }
+                generator.writeNumberField(INDEX_OFFSET_BUCKET_ID, tb.getBucket());
+                generator.writeNumberField(INDEX_OFFSET_OFFSET, entry.getValue());
                 generator.writeEndObject();
             }
             generator.writeEndArray();
@@ -211,6 +237,37 @@ public class CompletedSnapshotJsonSerde
             }
         }
 
+        Map<TableBucket, Long> indexReplicationOffsets = null;
+        if (node.has(INDEX_REPLICATION_OFFSETS)) {
+            JsonNode offsetsNode = node.get(INDEX_REPLICATION_OFFSETS);
+            Map<TableBucket, Long> offsets = new HashMap<>();
+            if (offsetsNode.isArray()) {
+                // New format: structured array
+                for (JsonNode entryNode : offsetsNode) {
+                    long tableId = entryNode.get(INDEX_OFFSET_TABLE_ID).asLong();
+                    Long partId =
+                            entryNode.has(INDEX_OFFSET_PARTITION_ID)
+                                    ? entryNode.get(INDEX_OFFSET_PARTITION_ID).asLong()
+                                    : null;
+                    int bucketId = entryNode.get(INDEX_OFFSET_BUCKET_ID).asInt();
+                    long offset = entryNode.get(INDEX_OFFSET_OFFSET).asLong();
+                    offsets.put(new TableBucket(tableId, partId, bucketId), offset);
+                }
+            } else {
+                // Legacy format: JSON object with string keys "tableId:partitionId:bucketId"
+                // or "tableId:bucketId"
+                offsetsNode
+                        .fields()
+                        .forEachRemaining(
+                                entry -> {
+                                    String key = entry.getKey();
+                                    long offset = entry.getValue().asLong();
+                                    offsets.put(parseLegacyBucketKey(key), offset);
+                                });
+            }
+            indexReplicationOffsets = offsets;
+        }
+
         return new CompletedSnapshot(
                 tableBucket,
                 snapshotId,
@@ -218,7 +275,8 @@ public class CompletedSnapshotJsonSerde
                 kvSnapshotHandle,
                 logOffset,
                 rowCount,
-                autoIncIDRanges);
+                autoIncIDRanges,
+                indexReplicationOffsets);
     }
 
     private List<KvFileHandleAndLocalPath> deserializeKvFileHandles(
@@ -238,6 +296,26 @@ public class CompletedSnapshotJsonSerde
             kvFileHandleAndLocalPaths.add(kvFileHandleAndLocalPath);
         }
         return kvFileHandleAndLocalPaths;
+    }
+
+    /**
+     * Parses a legacy string key format into a {@link TableBucket}. The legacy format is
+     * "tableId:partitionId:bucketId" for partitioned tables or "tableId:bucketId" for
+     * non-partitioned tables.
+     */
+    private static TableBucket parseLegacyBucketKey(String key) {
+        String[] parts = key.split(":");
+        if (parts.length == 3) {
+            return new TableBucket(
+                    Long.parseLong(parts[0]), Long.parseLong(parts[1]), Integer.parseInt(parts[2]));
+        } else if (parts.length == 2) {
+            return new TableBucket(Long.parseLong(parts[0]), Integer.parseInt(parts[1]));
+        } else {
+            throw new IllegalArgumentException(
+                    "Invalid legacy bucket key format: '"
+                            + key
+                            + "', expected 'tableId:bucketId' or 'tableId:partitionId:bucketId'");
+        }
     }
 
     /** Serialize the {@link CompletedSnapshot} to json bytes. */

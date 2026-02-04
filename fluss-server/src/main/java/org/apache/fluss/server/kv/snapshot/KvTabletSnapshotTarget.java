@@ -231,7 +231,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                         snapshotResult.getKvSnapshotHandle(),
                         tabletState.getFlushedLogOffset(),
                         tabletState.getRowCount(),
-                        tabletState.getAutoIncIDRanges());
+                        tabletState.getAutoIncIDRanges(),
+                        tabletState.getIndexReplicationOffsets());
         try {
             // commit the completed snapshot
             completedKvSnapshotCommitter.commitKvSnapshot(

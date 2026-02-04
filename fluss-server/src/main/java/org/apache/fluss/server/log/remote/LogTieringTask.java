@@ -260,7 +260,8 @@ public class LogTieringTask implements Runnable {
                             logFile.toPath(),
                             toPathIfExists(segment.offsetIndex().file()),
                             toPathIfExists(segment.timeIndex().file()),
-                            writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null);
+                            writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null,
+                            null);
 
             UUID remoteLogSegmentId = UUID.randomUUID();
             int sizeInBytes = segment.getFileLogRecords().sizeInBytes();

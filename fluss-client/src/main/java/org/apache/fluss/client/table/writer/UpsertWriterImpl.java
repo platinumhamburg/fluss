@@ -21,6 +21,7 @@ import org.apache.fluss.client.write.WriteFormat;
 import org.apache.fluss.client.write.WriteRecord;
 import org.apache.fluss.client.write.WriterClient;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryRow;
@@ -35,7 +36,9 @@ import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -53,6 +56,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
     private final WriteFormat writeFormat;
     private final RowEncoder rowEncoder;
     private final FieldGetter[] fieldGetters;
+    private final List<IndexColumnInfo> indexColumnInfos;
 
     /** The merge mode for this writer. This controls how the server handles data merging. */
     private final MergeMode mergeMode;
@@ -77,6 +81,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
                 rowType,
                 tableInfo.getPrimaryKeys(),
                 tableInfo.getSchema().getAutoIncrementColumnNames(),
+                tableInfo.getSchema().getIndexes(),
                 partialUpdateColumns);
 
         this.targetColumns = partialUpdateColumns;
@@ -101,6 +106,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
         this.fieldGetters = InternalRow.createFieldGetters(rowType);
 
         this.tableInfo = tableInfo;
+        this.indexColumnInfos = initIndexColumnInfos(tableInfo);
         this.mergeMode = mergeMode;
     }
 
@@ -108,6 +114,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             RowType rowType,
             List<String> primaryKeys,
             List<String> autoIncrementColumnNames,
+            List<Schema.Index> indexes,
             @Nullable int[] targetColumns) {
         // skip check when target columns is null
         if (targetColumns == null) {
@@ -152,15 +159,27 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             autoIncrementColumnSet.set(autoIncrementColumnIndex);
         }
 
+        // Collect index column indices for sparse index support
+        BitSet indexColumnSet = new BitSet();
+        for (Schema.Index index : indexes) {
+            for (String indexCol : index.getColumnNames()) {
+                int colIndex = rowType.getFieldIndex(indexCol);
+                if (colIndex >= 0) {
+                    indexColumnSet.set(colIndex);
+                }
+            }
+        }
+
         // check the columns not in targetColumns should be nullable
+        // Note: index columns are exempt from this check to support sparse index behavior
         for (int i = 0; i < rowType.getFieldCount(); i++) {
-            // column not in primary key and not in auto increment column
-            if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i)) {
+            // column not in primary key, not in auto increment column, and not in index columns
+            if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i) && !indexColumnSet.get(i)) {
                 // the column should be nullable
                 if (!rowType.getTypeAt(i).isNullable()) {
                     throw new IllegalArgumentException(
                             String.format(
-                                    "Partial Update requires all columns except primary key to be nullable, but column %s is NOT NULL.",
+                                    "Partial Update requires all columns except primary key and index columns to be nullable, but column %s is NOT NULL.",
                                     rowType.getFieldNames().get(i)));
                 }
             }
@@ -176,6 +195,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
     @Override
     public CompletableFuture<UpsertResult> upsert(InternalRow row) {
         checkFieldCount(row);
+        validateIndexColumns(row);
         byte[] key = primaryKeyEncoder.encodeKey(row);
         byte[] bucketKey =
                 bucketKeyEncoder == primaryKeyEncoder ? key : bucketKeyEncoder.encodeKey(row);
@@ -230,5 +250,64 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             rowEncoder.encodeField(i, fieldGetters[i].getFieldOrNull(row));
         }
         return rowEncoder.finishRow();
+    }
+
+    /**
+     * Initialize index column information from table info.
+     *
+     * @param tableInfo the table info containing schema and index definitions
+     * @return list of index column info, or empty list if no indexes defined
+     */
+    private static List<IndexColumnInfo> initIndexColumnInfos(TableInfo tableInfo) {
+        List<Schema.Index> indexes = tableInfo.getSchema().getIndexes();
+        if (indexes.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        RowType rowType = tableInfo.getRowType();
+        List<IndexColumnInfo> result = new ArrayList<>();
+
+        for (Schema.Index index : indexes) {
+            String indexName = index.getIndexName();
+            for (String columnName : index.getColumnNames()) {
+                int columnIndex = rowType.getFieldIndex(columnName);
+                FieldGetter fieldGetter =
+                        InternalRow.createFieldGetter(rowType.getTypeAt(columnIndex), columnIndex);
+                result.add(new IndexColumnInfo(indexName, columnName, columnIndex, fieldGetter));
+            }
+        }
+
+        return Collections.unmodifiableList(result);
+    }
+
+    /**
+     * Validates that all index columns in the row are not NULL.
+     *
+     * <p>With sparse index support, NULL values in index columns are allowed. Rows with NULL index
+     * columns will be written to the main table but skipped during index updates (similar to
+     * DynamoDB sparse GSI behavior).
+     *
+     * @param row the row to validate (currently no validation needed for sparse index)
+     */
+    private void validateIndexColumns(InternalRow row) {
+        // Sparse index: NULL values in index columns are allowed.
+        // Rows with NULL index columns will be written to main table but skipped in index table.
+        // No validation needed here.
+    }
+
+    /** Internal class to store index column metadata for NULL value validation. */
+    private static class IndexColumnInfo {
+        final String indexName;
+        final String columnName;
+        final int columnIndex;
+        final FieldGetter fieldGetter;
+
+        IndexColumnInfo(
+                String indexName, String columnName, int columnIndex, FieldGetter fieldGetter) {
+            this.indexName = indexName;
+            this.columnName = columnName;
+            this.columnIndex = columnIndex;
+            this.fieldGetter = fieldGetter;
+        }
     }
 }
