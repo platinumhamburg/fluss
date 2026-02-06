@@ -55,15 +55,20 @@ public class LookupClient {
     private static final Logger LOG = LoggerFactory.getLogger(LookupClient.class);
 
     public static final String LOOKUP_THREAD_PREFIX = "fluss-lookup-sender";
+    public static final String LOOKUP_CALLBACK_THREAD_PREFIX = "fluss-lookup-callback";
 
     private final LookupQueue lookupQueue;
 
     private final ExecutorService lookupSenderThreadPool;
+    private final ExecutorService lookupCallbackExecutor;
     private final LookupSender lookupSender;
+    private final int maxBatchSize;
 
     public LookupClient(Configuration conf, MetadataUpdater metadataUpdater) {
         this.lookupQueue = new LookupQueue(conf);
-        this.lookupSenderThreadPool = createThreadPool();
+        this.maxBatchSize = conf.get(ConfigOptions.CLIENT_LOOKUP_MAX_BATCH_SIZE);
+        this.lookupSenderThreadPool = createThreadPool(LOOKUP_THREAD_PREFIX);
+        this.lookupCallbackExecutor = createThreadPool(LOOKUP_CALLBACK_THREAD_PREFIX);
         this.lookupSender =
                 new LookupSender(
                         metadataUpdater,
@@ -73,10 +78,20 @@ public class LookupClient {
         lookupSenderThreadPool.submit(lookupSender);
     }
 
-    private ExecutorService createThreadPool() {
+    private ExecutorService createThreadPool(String threadPrefix) {
         // according to benchmark, increase the thread pool size improve not so much
         // performance, so we always use 1 thread for simplicity.
-        return Executors.newFixedThreadPool(1, new ExecutorThreadFactory(LOOKUP_THREAD_PREFIX));
+        return Executors.newFixedThreadPool(1, new ExecutorThreadFactory(threadPrefix));
+    }
+
+    /** Returns the executor for offloading lookup callbacks from Netty IO threads. */
+    ExecutorService getLookupCallbackExecutor() {
+        return lookupCallbackExecutor;
+    }
+
+    /** Returns the max batch size for lookup operations. */
+    int getMaxBatchSize() {
+        return maxBatchSize;
     }
 
     public CompletableFuture<byte[]> lookup(
@@ -121,6 +136,11 @@ public class LookupClient {
         if (lookupSender != null) {
             lookupSender.forceClose();
         }
+
+        if (lookupCallbackExecutor != null) {
+            lookupCallbackExecutor.shutdownNow();
+        }
+
         LOG.info("Lookup client closed.");
     }
 }

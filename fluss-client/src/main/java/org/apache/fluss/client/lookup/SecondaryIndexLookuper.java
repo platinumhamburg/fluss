@@ -35,6 +35,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 /**
  * An implementation of {@link Lookuper} that lookups by secondary index. This is a composite
@@ -51,8 +52,8 @@ public class SecondaryIndexLookuper implements Lookuper {
 
     private static final Logger LOG = LoggerFactory.getLogger(SecondaryIndexLookuper.class);
 
-    /** Default batch size for main table lookups to control lookup pressure. */
-    private static final int DEFAULT_MAIN_TABLE_LOOKUP_BATCH_SIZE = 512;
+    /** Batch size for main table lookups to control lookup pressure. */
+    private final int mainTableLookupBatchSize;
 
     /** Thread-local lookuper for querying the index table. */
     private final ThreadLocal<PrefixKeyLookuper> indexTableLookuper;
@@ -69,6 +70,14 @@ public class SecondaryIndexLookuper implements Lookuper {
     private final RowType primaryKeyRowType;
 
     private final RowType lookupRowType;
+
+    /**
+     * Executor for offloading the second-hop (main table) lookup from Netty IO threads. Without
+     * this, the {@code thenCompose} callback after the index table lookup runs on a Netty IO
+     * thread, and calling {@link LookupClient#lookup} may block on the bounded {@link LookupQueue},
+     * creating a deadlock risk.
+     */
+    private final Executor lookupCallbackExecutor;
 
     public SecondaryIndexLookuper(
             TableInfo mainTableInfo,
@@ -113,13 +122,15 @@ public class SecondaryIndexLookuper implements Lookuper {
 
         this.primaryKeyRowType = mainTableInfo.getRowType().project(mainTablePrimaryKeys);
         this.lookupRowType = indexTableInfo.getRowType().project(lookupColumnNames);
+        this.lookupCallbackExecutor = lookupClient.getLookupCallbackExecutor();
+        this.mainTableLookupBatchSize = lookupClient.getMaxBatchSize();
 
         LOG.trace(
                 "Created SecondaryIndexLookuper for main table {} via index table {}, lookup columns: {}, batch size: {}",
                 mainTableInfo.getTablePath(),
                 indexTableInfo.getTablePath(),
                 lookupColumnNames,
-                DEFAULT_MAIN_TABLE_LOOKUP_BATCH_SIZE);
+                mainTableLookupBatchSize);
     }
 
     /**
@@ -144,9 +155,10 @@ public class SecondaryIndexLookuper implements Lookuper {
         return indexTableLookuper
                 .get()
                 .lookup(lookupKey)
-                .thenCompose(
+                .thenComposeAsync(
                         indexResult ->
-                                handleIndexTableLookupResult(lookupKey, indexResult, startTime))
+                                handleIndexTableLookupResult(lookupKey, indexResult, startTime),
+                        lookupCallbackExecutor)
                 .exceptionally(throwable -> handleLookupException(throwable, lookupKey, startTime));
     }
 
@@ -188,11 +200,10 @@ public class SecondaryIndexLookuper implements Lookuper {
         LOG.trace(
                 "Processing {} index rows in batches of {}",
                 indexRows.size(),
-                DEFAULT_MAIN_TABLE_LOOKUP_BATCH_SIZE);
+                mainTableLookupBatchSize);
 
         // Split index rows into batches
-        List<List<InternalRow>> batches =
-                Lists.partition(indexRows, DEFAULT_MAIN_TABLE_LOOKUP_BATCH_SIZE);
+        List<List<InternalRow>> batches = Lists.partition(indexRows, mainTableLookupBatchSize);
         List<InternalRow> allResults = new ArrayList<>();
 
         // Process batches sequentially to control lookup pressure
