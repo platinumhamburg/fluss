@@ -90,6 +90,12 @@ public class FutureUtils {
         }
     }
 
+    public static <T> CompletableFuture<T> failedCompletableFuture(Throwable cause) {
+        CompletableFuture<T> future = new CompletableFuture<>();
+        future.completeExceptionally(cause);
+        return future;
+    }
+
     /** Runnable to complete the given future with a {@link TimeoutException}. */
     private static final class Timeout implements Runnable {
 
@@ -105,12 +111,6 @@ public class FutureUtils {
         public void run() {
             future.completeExceptionally(new TimeoutException(timeoutMsg));
         }
-    }
-
-    public static <T> CompletableFuture<T> failedCompletableFuture(Throwable cause) {
-        CompletableFuture<T> future = new CompletableFuture<>();
-        future.completeExceptionally(cause);
-        return future;
     }
 
     /**
