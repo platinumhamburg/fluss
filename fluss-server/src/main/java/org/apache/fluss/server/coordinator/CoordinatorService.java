@@ -634,17 +634,9 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             // If main table doesn't exist, allow dropping the index table (cleanup scenario)
         }
 
-        // drop index tables first if the main table has indexes
-        try {
-            dropIndexTables(tablePath, request.isIgnoreIfNotExists());
-        } catch (Exception e) {
-            if (!request.isIgnoreIfNotExists()) {
-                throw new RuntimeException("Failed to drop index tables: " + e.getMessage(), e);
-            }
-            // if ignoreIfNotExists is true, we continue even if dropping index tables fails
-        }
+        // drop index tables first (best-effort), then drop the main table
+        dropIndexTables(tablePath, request.isIgnoreIfNotExists());
 
-        // then drop the main table
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
         return CompletableFuture.completedFuture(response);
     }
@@ -1194,7 +1186,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
     }
 
-    /** Drops all index tables for the given main table. */
+    /** Drops all index tables for the given main table (best-effort). */
     private void dropIndexTables(TablePath mainTablePath, boolean ignoreIfNotExists) {
         TableInfo tableInfo = metadataManager.getTable(mainTablePath);
         if (tableInfo == null) {
@@ -1202,16 +1194,21 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         List<Schema.Index> indexes = tableInfo.toTableDescriptor().getSchema().getIndexes();
+        List<String> failures = new ArrayList<>();
         for (Schema.Index index : indexes) {
             TablePath indexTablePath = TablePath.forIndexTable(mainTablePath, index.getIndexName());
             try {
-                metadataManager.dropTable(indexTablePath, ignoreIfNotExists);
+                metadataManager.dropTable(indexTablePath, true);
             } catch (Exception e) {
-                if (!ignoreIfNotExists) {
-                    throw new RuntimeException(
-                            String.format("Failed to drop index table %s", indexTablePath), e);
-                }
+                LOG.error("Failed to drop index table {}", indexTablePath, e);
+                failures.add(indexTablePath + ": " + e.getMessage());
             }
+        }
+        if (!failures.isEmpty() && !ignoreIfNotExists) {
+            LOG.warn(
+                    "Some index tables failed to drop for {}: {}",
+                    mainTablePath,
+                    String.join("; ", failures));
         }
     }
 

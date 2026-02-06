@@ -1746,8 +1746,9 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         TableInfo nameIndexTableInfo = admin.getTableInfo(nameIndexTablePath).get();
         assertThat(nameIndexTableInfo.toTableDescriptor().isPartitioned()).isFalse();
         // index table should have all necessary columns: index columns + primary key columns
+        // + __ttl_ts column (since main table has auto-partition enabled, TTL is derived)
         assertThat(nameIndexTableInfo.toTableDescriptor().getSchema().getColumnNames())
-                .containsExactlyInAnyOrder("name", "id", "region");
+                .containsExactlyInAnyOrder("name", "id", "region", "__ttl_ts");
     }
 
     /** Test dropping a table with global secondary index automatically drops the index tables. */

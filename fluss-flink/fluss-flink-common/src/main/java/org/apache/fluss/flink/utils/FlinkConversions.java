@@ -215,18 +215,6 @@ public class FlinkConversions {
         // parse global secondary indexes from options
         parseGlobalSecondaryIndexes(flinkTableConf, schemBuilder);
 
-        // first build schema with physical columns
-        schemBuilder.fromColumns(
-                resolvedSchema.getColumns().stream()
-                        .filter(Column::isPhysical)
-                        .map(
-                                column ->
-                                        new Schema.Column(
-                                                column.getName(),
-                                                FlinkConversions.toFlussType(column.getDataType()),
-                                                column.getComment().orElse(null)))
-                        .collect(Collectors.toList()));
-
         // convert some flink options to fluss table configs.
         Map<String, String> storageProperties =
                 convertFlinkOptionsToFlussTableProperties(flinkTableConf);

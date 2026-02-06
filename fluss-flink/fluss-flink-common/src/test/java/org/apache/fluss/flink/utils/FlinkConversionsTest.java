@@ -217,9 +217,10 @@ public class FlinkConversionsTest {
         TableDescriptor flussTable =
                 FlinkConversions.toFlussTable(new ResolvedCatalogTable(flinkTable, schema));
         String expectFlussTableString =
-                "TableDescriptor{schema=Schema{columns=[order_id STRING NOT NULL, item ROW<`item_id` STRING, `item_price` STRING, `item_details` ROW<`category` STRING, `specifications` STRING>>, orig_ts TIMESTAMP(6)], "
-                        + "primaryKey=CONSTRAINT PK_order_id PRIMARY KEY (order_id), "
-                        + "autoIncrementColumnNames=[], highestFieldId=7}, comment='test comment', partitionKeys=[], "
+                "TableDescriptor{schema=(order_id STRING NOT NULL,"
+                        + "item ROW<`item_id` STRING, `item_price` STRING, `item_details` ROW<`category` STRING, `specifications` STRING>>,"
+                        + "orig_ts TIMESTAMP(6),"
+                        + "CONSTRAINT PK_order_id PRIMARY KEY (order_id)), comment='test comment', partitionKeys=[], "
                         + "tableDistribution={bucketKeys=[order_id] bucketCount=null}, "
                         + "properties={}, "
                         + "customProperties={"
@@ -632,9 +633,9 @@ public class FlinkConversionsTest {
                 FlinkConversions.toFlussTable(
                         new ResolvedCatalogMaterializedTable(flinkMaterializedTable, schema));
         String expectFlussTableString =
-                "TableDescriptor{schema=Schema{columns=[order_id STRING NOT NULL, orig_ts TIMESTAMP(6)], "
-                        + "primaryKey=CONSTRAINT PK_order_id PRIMARY KEY (order_id), "
-                        + "autoIncrementColumnNames=[], highestFieldId=1}, comment='test comment', partitionKeys=[], "
+                "TableDescriptor{schema=(order_id STRING NOT NULL,"
+                        + "orig_ts TIMESTAMP(6),"
+                        + "CONSTRAINT PK_order_id PRIMARY KEY (order_id)), comment='test comment', partitionKeys=[], "
                         + "tableDistribution={bucketKeys=[order_id] bucketCount=null}, "
                         + "properties={}, "
                         + "customProperties={materialized-table.definition-query=select order_id, orig_ts from t, "

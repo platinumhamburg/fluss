@@ -169,7 +169,7 @@ public final class IndexDataProducer implements Closeable {
         this.coldLoadBatchSize = batchSize.getBytes();
 
         this.taskScheduler = taskScheduler;
-        this.taskQueue = new IndexWriteTaskQueue(logTablet.getTableBucket().toString(), 9192);
+        this.taskQueue = new IndexWriteTaskQueue(logTablet.getTableBucket().toString(), 8192);
         this.taskScheduler.registerQueue(logTablet.getTableBucket(), taskQueue);
 
         LOG.info(
@@ -215,6 +215,7 @@ public final class IndexDataProducer implements Closeable {
 
         while (currentFetchBytes < maxBytes && currentEndOffset <= highWatermark) {
             currentEndOffset += minAdvanceOffset;
+            currentFetchBytes = 0;
             for (Map.Entry<TableBucket, FetchIndexParams> entry : fetchRequests.entrySet()) {
                 TableBucket indexBucket = entry.getKey();
                 currentFetchBytes +=
