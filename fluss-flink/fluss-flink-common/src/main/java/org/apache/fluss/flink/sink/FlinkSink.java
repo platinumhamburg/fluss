@@ -43,6 +43,7 @@ import org.apache.flink.streaming.api.connector.sink2.SupportsPreWriteTopology;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
 import org.apache.flink.table.connector.sink.SinkV2Provider;
 import org.apache.flink.table.types.logical.RowType;
@@ -54,6 +55,7 @@ import java.util.List;
 
 import static org.apache.fluss.flink.sink.FlinkStreamPartitioner.partition;
 import static org.apache.fluss.flink.utils.FlinkConversions.toFlussRowType;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
  * Flink sink for Fluss.
@@ -129,6 +131,9 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
      */
     protected DataStream<InputT> addUndoRecoveryOperatorIfNeeded(DataStream<InputT> stream) {
         if (enableUndoRecovery && builder instanceof UpsertSinkWriterBuilder) {
+            // Validate that checkpointing is enabled for undo recovery
+            validateCheckpointingEnabled(stream.getExecutionEnvironment());
+
             @SuppressWarnings("unchecked")
             UpsertSinkWriterBuilder<InputT> upsertBuilder =
                     (UpsertSinkWriterBuilder<InputT>) builder;
@@ -156,6 +161,24 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
             upsertBuilder.setOffsetReportContext(operatorFactory.getOffsetReportContext());
         }
         return stream;
+    }
+
+    /**
+     * Validates that checkpointing is enabled when undo recovery is required.
+     *
+     * <p>Undo recovery for aggregation tables requires checkpointing to track write offsets and
+     * perform recovery on failure. Without checkpointing, the system cannot guarantee exactly-once
+     * semantics.
+     *
+     * @param env the stream execution environment
+     * @throws IllegalArgumentException if checkpointing is not enabled
+     */
+    private void validateCheckpointingEnabled(StreamExecutionEnvironment env) {
+        checkArgument(
+                env.getCheckpointConfig().isCheckpointingEnabled(),
+                "Aggregation tables require checkpointing to be enabled for undo recovery. "
+                        + "Please enable checkpointing using env.enableCheckpointing(interval) "
+                        + "or set 'execution.checkpointing.interval' in configuration.");
     }
 
     @Internal
