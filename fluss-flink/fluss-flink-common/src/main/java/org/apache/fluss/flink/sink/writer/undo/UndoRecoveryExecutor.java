@@ -216,7 +216,7 @@ public class UndoRecoveryExecutor {
             // Log progress periodically (at the end of each loop iteration)
             long now = System.currentTimeMillis();
             if (now - lastProgressLogTime >= PROGRESS_LOG_INTERVAL_MS) {
-                long elapsedMs = System.currentTimeMillis() - startTimeMs;
+                long elapsedMs = now - startTimeMs;
                 LOG.info(
                         "Undo recovery waiting for changelog records: {} bucket(s) incomplete, "
                                 + "waited {} minutes so far (max: {} minutes)",
