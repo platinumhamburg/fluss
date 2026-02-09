@@ -435,12 +435,6 @@ public class UndoRecoveryManagerITCase {
             // Phase 4: Verify results (parallel lookup)
             List<CompletableFuture<Void>> verifyFutures = new ArrayList<>();
 
-            // Note: For partial update mode with AGGREGATION merge engine, the undo
-            // recovery uses a partialUpdate writer. The delete behavior for zero-offset
-            // bucket keys depends on the changelog history and is not deterministic
-            // from the test's perspective. We skip verification for zero-offset bucket
-            // keys and focus on verifying the core undo logic for non-zero-offset buckets.
-
             for (int bucket = 0; bucket < NUM_BUCKETS; bucket++) {
                 if (bucket == zeroOffsetBucket) {
                     continue;
@@ -585,10 +579,7 @@ public class UndoRecoveryManagerITCase {
                                             assertThat(result.getInt(2)).isEqualTo(keyId * 20);
                                         }));
             }
-            // Note: For partitioned tables with AGGREGATION merge engine, the undo
-            // recovery's ability to delete new keys depends on internal routing and
-            // changelog format. We only verify the core undo logic: existing keys
-            // should be restored to their checkpoint state.
+
             CompletableFuture.allOf(verifyFutures.toArray(new CompletableFuture[0])).get();
         }
     }
