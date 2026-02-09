@@ -228,7 +228,9 @@ public class FlinkTableSink
                                 distributionMode,
                                 new RowDataSerializationSchema(true, sinkIgnoreDelete));
 
-        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath);
+        // Enable undo recovery for aggregation tables
+        boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
+        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath, enableUndoRecovery);
     }
 
     private List<String> columns(int[] columnIndexes) {

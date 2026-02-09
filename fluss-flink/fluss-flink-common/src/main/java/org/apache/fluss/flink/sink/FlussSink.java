@@ -40,19 +40,26 @@ public class FlussSink<InputT> extends FlinkSink<InputT>
     private static final long serialVersionUID = 1L;
 
     /**
-     * Constructs a FlussSink with the given SinkWriterBuilder.
+     * Constructs a FlussSink with the given SinkWriterBuilder and undo recovery flag.
      *
      * @param builder the builder used to create the sink writer
+     * @param tablePath the table path
+     * @param enableUndoRecovery whether to enable undo recovery for aggregation tables
      */
     FlussSink(
             SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
-            TablePath tablePath) {
-        super(builder, tablePath);
+            TablePath tablePath,
+            boolean enableUndoRecovery) {
+        super(builder, tablePath, enableUndoRecovery);
     }
 
     @Override
     public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-        return builder.addPreWriteTopology(input);
+        // First apply the builder's pre-write topology (e.g., bucket shuffle)
+        DataStream<InputT> stream = builder.addPreWriteTopology(input);
+
+        // Add UndoRecoveryOperator for aggregation tables (reuse parent's method)
+        return addUndoRecoveryOperatorIfNeeded(stream);
     }
 
     /**

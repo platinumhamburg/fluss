@@ -1009,7 +1009,11 @@ public class UndoRecoveryManagerITCase {
                 if (latestOffset == null) {
                     latestOffset = 0L;
                 }
-                result.put(tb, new UndoOffsets(checkpointOffsets.get(tb), latestOffset));
+                long checkpointOffset = checkpointOffsets.get(tb);
+                // Skip buckets that don't need recovery (checkpointOffset == latestOffset)
+                if (checkpointOffset < latestOffset) {
+                    result.put(tb, new UndoOffsets(checkpointOffset, latestOffset));
+                }
             }
         }
 
@@ -1040,7 +1044,11 @@ public class UndoRecoveryManagerITCase {
                     if (latestOffset == null) {
                         latestOffset = 0L;
                     }
-                    result.put(tb, new UndoOffsets(checkpointOffsets.get(tb), latestOffset));
+                    long checkpointOffset = checkpointOffsets.get(tb);
+                    // Skip buckets that don't need recovery (checkpointOffset == latestOffset)
+                    if (checkpointOffset < latestOffset) {
+                        result.put(tb, new UndoOffsets(checkpointOffset, latestOffset));
+                    }
                 }
             }
         }

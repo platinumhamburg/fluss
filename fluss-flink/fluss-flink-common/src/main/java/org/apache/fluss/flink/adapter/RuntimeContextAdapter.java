@@ -36,4 +36,8 @@ public class RuntimeContextAdapter {
     public static int getIndexOfThisSubtask(StreamingRuntimeContext runtimeContext) {
         return runtimeContext.getTaskInfo().getIndexOfThisSubtask();
     }
+
+    public static int getNumberOfParallelSubtasks(StreamingRuntimeContext runtimeContext) {
+        return runtimeContext.getTaskInfo().getNumberOfParallelSubtasks();
+    }
 }
