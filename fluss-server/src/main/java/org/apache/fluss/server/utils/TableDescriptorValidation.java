@@ -27,6 +27,7 @@ import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
@@ -302,6 +303,18 @@ public class TableDescriptorValidation {
                                     versionColumn.get(), columnType));
                 }
             } else if (mergeEngine == MergeEngineType.AGGREGATION) {
+                // Check aggregate merge engine with WAL changelog image
+                ChangelogImage changelogImage = tableConf.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
+                if (changelogImage == ChangelogImage.WAL) {
+                    throw new InvalidConfigException(
+                            String.format(
+                                    "Table with '%s' merge engine does not support '%s' changelog image mode. "
+                                            + "Aggregate merge engine tables require FULL changelog image mode "
+                                            + "for correct UNDO recovery. Please set '%s' to 'FULL' or remove the setting.",
+                                    ConfigOptions.TABLE_MERGE_ENGINE.key(),
+                                    ConfigOptions.TABLE_CHANGELOG_IMAGE.key(),
+                                    ConfigOptions.TABLE_CHANGELOG_IMAGE.key()));
+                }
                 // Validate aggregation function parameters for aggregation merge engine
                 validateAggregationFunctionParameters(schema);
             }
