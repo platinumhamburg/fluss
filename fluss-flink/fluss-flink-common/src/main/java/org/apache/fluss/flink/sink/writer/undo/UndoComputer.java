@@ -46,14 +46,6 @@ import java.util.concurrent.CompletableFuture;
  *   <li>{@code DELETE} → Re-insert the deleted row (it existed at checkpoint)
  * </ul>
  *
- * <p>For partial update mode, two writers are used:
- *
- * <ul>
- *   <li>{@code partialWriter} - for UPDATE_BEFORE and DELETE undo (restore/re-insert partial
- *       columns)
- *   <li>{@code deleteWriter} - for INSERT undo (delete entire row, not just partial columns)
- * </ul>
- *
  * <p>For each primary key, only the first change after checkpoint determines the undo action. The
  * original row from {@link ScanRecord} is directly used without copying, as each ScanRecord
  * contains an independent row instance.
@@ -64,48 +56,16 @@ public class UndoComputer {
 
     private final KeyEncoder keyEncoder;
     private final UpsertWriter writer;
-    @Nullable private final UpsertWriter deleteWriter;
-
-    // Track which writer was last used to know when to flush.
-    // This state should be reset before processing each new bucket via resetWriterState().
-    private boolean lastUsedDeleteWriter = false;
 
     /**
-     * Creates an UndoComputer for full row mode.
+     * Creates an UndoComputer.
      *
      * @param keyEncoder the key encoder for primary key deduplication
      * @param writer the writer for all undo operations
      */
     public UndoComputer(KeyEncoder keyEncoder, UpsertWriter writer) {
-        this(keyEncoder, writer, null);
-    }
-
-    /**
-     * Creates an UndoComputer with optional separate delete writer for partial update mode.
-     *
-     * <p>In partial update mode, INSERT undo requires deleting the entire row (not just partial
-     * columns), so a separate full-row delete writer is needed.
-     *
-     * @param keyEncoder the key encoder for primary key deduplication
-     * @param writer the writer for UPDATE_BEFORE and DELETE undo operations
-     * @param deleteWriter optional separate writer for INSERT undo (delete entire row), null for
-     *     full row mode
-     */
-    public UndoComputer(
-            KeyEncoder keyEncoder, UpsertWriter writer, @Nullable UpsertWriter deleteWriter) {
         this.keyEncoder = keyEncoder;
         this.writer = writer;
-        this.deleteWriter = deleteWriter;
-    }
-
-    /**
-     * Resets the writer state before processing a new bucket.
-     *
-     * <p>This ensures that the lastUsedDeleteWriter flag is reset, preventing incorrect flush
-     * behavior when switching between buckets.
-     */
-    public void resetWriterState() {
-        this.lastUsedDeleteWriter = false;
     }
 
     /**
@@ -120,6 +80,11 @@ public class UndoComputer {
     @Nullable
     public CompletableFuture<?> processRecord(
             ScanRecord record, Set<ByteArrayWrapper> processedKeys) {
+        // Skip UPDATE_AFTER before key encoding — UPDATE_BEFORE already handled the undo
+        if (record.getChangeType() == ChangeType.UPDATE_AFTER) {
+            return null;
+        }
+
         byte[] encodedKey = keyEncoder.encodeKey(record.getRow());
         ByteArrayWrapper keyWrapper = new ByteArrayWrapper(encodedKey);
 
@@ -151,11 +116,6 @@ public class UndoComputer {
      *   <li>For UPSERT operations, the original row contains the exact data to restore
      * </ul>
      *
-     * <p>For partial update mode, INSERT undo uses the separate deleteWriter (if provided) to
-     * delete the entire row, not just the partial columns. Before switching between writers, the
-     * previous writer is flushed to avoid mixing records with different target columns in the same
-     * batch.
-     *
      * @param record the changelog record
      * @return CompletableFuture for the async write, or null if no action needed (e.g.,
      *     UPDATE_AFTER)
@@ -168,25 +128,10 @@ public class UndoComputer {
         switch (changeType) {
             case INSERT:
                 // Row was inserted after checkpoint → delete it
-                // Use deleteWriter if available (for partial update mode to delete entire row)
-                if (deleteWriter != null) {
-                    // Flush partial writer before using delete writer to avoid mixing
-                    // records with different target columns in the same batch
-                    if (!lastUsedDeleteWriter) {
-                        writer.flush();
-                        lastUsedDeleteWriter = true;
-                    }
-                    return deleteWriter.delete(row);
-                }
                 return writer.delete(row);
 
             case UPDATE_BEFORE:
                 // Row was updated after checkpoint → restore old value
-                // Flush delete writer before using partial writer
-                if (deleteWriter != null && lastUsedDeleteWriter) {
-                    deleteWriter.flush();
-                    lastUsedDeleteWriter = false;
-                }
                 return writer.upsert(row);
 
             case UPDATE_AFTER:
@@ -195,11 +140,6 @@ public class UndoComputer {
 
             case DELETE:
                 // Row was deleted after checkpoint → re-insert it
-                // Flush delete writer before using partial writer
-                if (deleteWriter != null && lastUsedDeleteWriter) {
-                    deleteWriter.flush();
-                    lastUsedDeleteWriter = false;
-                }
                 return writer.upsert(row);
 
             default:

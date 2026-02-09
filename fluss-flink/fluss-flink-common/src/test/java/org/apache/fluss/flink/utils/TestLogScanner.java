@@ -140,6 +140,9 @@ public class TestLogScanner implements LogScanner {
     public void unsubscribe(long partitionId, int bucket) {}
 
     @Override
+    public void unsubscribe(int bucket) {}
+
+    @Override
     public void wakeup() {}
 
     @Override

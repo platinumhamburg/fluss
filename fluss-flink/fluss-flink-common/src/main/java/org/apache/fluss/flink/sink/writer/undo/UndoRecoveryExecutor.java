@@ -29,6 +29,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -50,18 +51,15 @@ import java.util.concurrent.CompletableFuture;
  *   <li>Subscribe all buckets to the LogScanner
  *   <li>Poll changelog records and execute undo operations immediately
  *   <li>Collect CompletableFutures for completion tracking
- *   <li>Wait for all futures and flush to ensure all writes complete
+ *   <li>Flush and wait for all futures to ensure all writes complete
  * </ol>
  */
 public class UndoRecoveryExecutor {
 
     private static final Logger LOG = LoggerFactory.getLogger(UndoRecoveryExecutor.class);
 
-    /** Default initial poll timeout in milliseconds. */
-    private static final long DEFAULT_INITIAL_POLL_TIMEOUT_MS = 100;
-
-    /** Default maximum poll timeout in milliseconds after exponential backoff. */
-    private static final long DEFAULT_MAX_POLL_TIMEOUT_MS = 30_000; // 30 seconds
+    /** Fixed poll timeout in milliseconds. */
+    private static final long POLL_TIMEOUT_MS = 10_000;
 
     /** Default maximum total wait time in milliseconds before failing (1 hour). */
     private static final long DEFAULT_MAX_TOTAL_WAIT_TIME_MS = 60 * 60 * 1000; // 1 hour
@@ -73,20 +71,12 @@ public class UndoRecoveryExecutor {
     private final UpsertWriter writer;
     private final UndoComputer undoComputer;
 
-    // Configurable timeout parameters
-    private final long initialPollTimeoutMs;
-    private final long maxPollTimeoutMs;
+    // Configurable timeout parameter
     private final long maxTotalWaitTimeMs;
 
     public UndoRecoveryExecutor(
             LogScanner scanner, UpsertWriter writer, UndoComputer undoComputer) {
-        this(
-                scanner,
-                writer,
-                undoComputer,
-                DEFAULT_INITIAL_POLL_TIMEOUT_MS,
-                DEFAULT_MAX_POLL_TIMEOUT_MS,
-                DEFAULT_MAX_TOTAL_WAIT_TIME_MS);
+        this(scanner, writer, undoComputer, DEFAULT_MAX_TOTAL_WAIT_TIME_MS);
     }
 
     /**
@@ -95,22 +85,16 @@ public class UndoRecoveryExecutor {
      * @param scanner the log scanner
      * @param writer the upsert writer
      * @param undoComputer the undo computer
-     * @param initialPollTimeoutMs initial poll timeout in milliseconds
-     * @param maxPollTimeoutMs maximum poll timeout after exponential backoff
      * @param maxTotalWaitTimeMs maximum total wait time before failing
      */
     public UndoRecoveryExecutor(
             LogScanner scanner,
             UpsertWriter writer,
             UndoComputer undoComputer,
-            long initialPollTimeoutMs,
-            long maxPollTimeoutMs,
             long maxTotalWaitTimeMs) {
         this.scanner = scanner;
         this.writer = writer;
         this.undoComputer = undoComputer;
-        this.initialPollTimeoutMs = initialPollTimeoutMs;
-        this.maxPollTimeoutMs = maxPollTimeoutMs;
         this.maxTotalWaitTimeMs = maxTotalWaitTimeMs;
     }
 
@@ -134,11 +118,11 @@ public class UndoRecoveryExecutor {
         subscribeAll(toRecover);
         List<CompletableFuture<?>> allFutures = readChangelogAndExecute(toRecover);
 
-        // Wait for all async writes to complete
+        // Flush first, then wait for all async writes to complete
+        writer.flush();
         if (!allFutures.isEmpty()) {
             CompletableFuture.allOf(allFutures.toArray(new CompletableFuture[0])).get();
         }
-        writer.flush();
 
         // Log summary at INFO level for visibility
         int totalUndoOps = 0;
@@ -146,7 +130,7 @@ public class UndoRecoveryExecutor {
             totalUndoOps += ctx.getProcessedKeys().size();
         }
 
-        LOG.debug(
+        LOG.info(
                 "Undo recovery execution completed: {} bucket(s), {} total undo operation(s)",
                 toRecover.size(),
                 totalUndoOps);
@@ -192,108 +176,77 @@ public class UndoRecoveryExecutor {
             return allFutures;
         }
 
-        long currentPollTimeoutMs = initialPollTimeoutMs;
-        long totalWaitTimeMs = 0;
+        long startTimeMs = System.currentTimeMillis();
         long lastProgressLogTime = System.currentTimeMillis();
+        Set<TableBucket> unsubscribedBuckets = new HashSet<>();
 
         while (!allComplete(contexts)) {
-            ScanRecords records = scanner.poll(Duration.ofMillis(currentPollTimeoutMs));
+            ScanRecords records = scanner.poll(Duration.ofMillis(POLL_TIMEOUT_MS));
 
             if (records.isEmpty()) {
-                totalWaitTimeMs += currentPollTimeoutMs;
-
                 // Check if we've exceeded the maximum total wait time
-                if (totalWaitTimeMs >= maxTotalWaitTimeMs) {
-                    // Undo recovery failure is fatal - incomplete undo leads to data inconsistency
-                    String incompleteBucketsDetail = getIncompleteBucketsDetail(contexts);
+                long elapsedMs = System.currentTimeMillis() - startTimeMs;
+                if (elapsedMs >= maxTotalWaitTimeMs) {
                     throw new RuntimeException(
                             String.format(
-                                    "Undo recovery failed: unable to read all changelog records after "
-                                            + "%.1f minutes of waiting. Incomplete buckets: %s. "
-                                            + "This is a fatal error as incomplete undo recovery "
-                                            + "would lead to data inconsistency.",
-                                    totalWaitTimeMs / 60000.0, incompleteBucketsDetail));
+                                    "Undo recovery timed out: unable to read all changelog records after "
+                                            + "%.1f minutes of waiting. %d bucket(s) still incomplete. "
+                                            + "The job will restart and retry the recovery.",
+                                    elapsedMs / 60000.0, countIncomplete(contexts)));
                 }
 
-                // Log progress periodically during long waits
-                long now = System.currentTimeMillis();
-                if (now - lastProgressLogTime >= PROGRESS_LOG_INTERVAL_MS) {
-                    LOG.info(
-                            "Undo recovery waiting for changelog records: {} bucket(s) incomplete, "
-                                    + "waited {} minutes so far (max: {} minutes)",
-                            countIncomplete(contexts),
-                            String.format("%.1f", totalWaitTimeMs / 60000.0),
-                            String.format("%.1f", maxTotalWaitTimeMs / 60000.0));
-                    lastProgressLogTime = now;
+                LOG.debug("Empty poll (total elapsed: {}ms)", elapsedMs);
+            } else {
+                // Process records for each bucket
+                for (BucketRecoveryContext ctx : contexts) {
+                    if (ctx.isComplete()) {
+                        continue;
+                    }
+                    List<ScanRecord> bucketRecords = records.records(ctx.getBucket());
+                    if (!bucketRecords.isEmpty()) {
+                        processRecords(ctx, bucketRecords, allFutures);
+                    }
+                    // Unsubscribe completed buckets to stop fetching data from them
+                    if (ctx.isComplete() && unsubscribedBuckets.add(ctx.getBucket())) {
+                        unsubscribeBucket(ctx.getBucket());
+                    }
                 }
-
-                // Exponential backoff: double the timeout up to maxPollTimeoutMs
-                currentPollTimeoutMs = Math.min(currentPollTimeoutMs * 2, maxPollTimeoutMs);
-                LOG.debug(
-                        "Empty poll, backing off to {}ms timeout (total wait: {}ms)",
-                        currentPollTimeoutMs,
-                        totalWaitTimeMs);
-                continue;
             }
 
-            // Reset timeout on successful poll (but keep tracking total wait time for logging)
-            currentPollTimeoutMs = initialPollTimeoutMs;
-
-            // Process records for each bucket, resetting writer state before each bucket
-            for (BucketRecoveryContext ctx : contexts) {
-                if (ctx.isComplete()) {
-                    continue;
-                }
-                List<ScanRecord> bucketRecords = records.records(ctx.getBucket());
-                if (!bucketRecords.isEmpty()) {
-                    undoComputer.resetWriterState();
-                    processRecords(ctx, bucketRecords, allFutures);
-                }
+            // Log progress periodically (at the end of each loop iteration)
+            long now = System.currentTimeMillis();
+            if (now - lastProgressLogTime >= PROGRESS_LOG_INTERVAL_MS) {
+                long elapsedMs = System.currentTimeMillis() - startTimeMs;
+                LOG.info(
+                        "Undo recovery waiting for changelog records: {} bucket(s) incomplete, "
+                                + "waited {} minutes so far (max: {} minutes)",
+                        countIncomplete(contexts),
+                        String.format("%.1f", elapsedMs / 60000.0),
+                        String.format("%.1f", maxTotalWaitTimeMs / 60000.0));
+                lastProgressLogTime = now;
             }
         }
 
         // Log summary
-        for (BucketRecoveryContext ctx : contexts) {
-            LOG.debug(
-                    "Bucket {} read {} records, executed {} undo operations",
-                    ctx.getBucket(),
-                    ctx.getTotalRecordsProcessed(),
-                    ctx.getProcessedKeys().size());
+        if (LOG.isDebugEnabled()) {
+            for (BucketRecoveryContext ctx : contexts) {
+                LOG.debug(
+                        "Bucket {} read {} records, executed {} undo operations",
+                        ctx.getBucket(),
+                        ctx.getTotalRecordsProcessed(),
+                        ctx.getProcessedKeys().size());
+            }
         }
 
         return allFutures;
     }
 
-    /**
-     * Gets detailed information about incomplete buckets for error reporting.
-     *
-     * @param contexts all bucket contexts
-     * @return formatted string with detailed status of each incomplete bucket
-     */
-    private String getIncompleteBucketsDetail(List<BucketRecoveryContext> contexts) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("[");
-        boolean first = true;
-        for (BucketRecoveryContext ctx : contexts) {
-            if (!ctx.isComplete()) {
-                if (!first) {
-                    sb.append(", ");
-                }
-                first = false;
-                sb.append(ctx.getBucket())
-                        .append("{checkpointOffset=")
-                        .append(ctx.getCheckpointOffset())
-                        .append(", logEndOffset=")
-                        .append(ctx.getLogEndOffset())
-                        .append(", lastProcessedOffset=")
-                        .append(ctx.getLastProcessedOffset())
-                        .append(", recordsProcessed=")
-                        .append(ctx.getTotalRecordsProcessed())
-                        .append("}");
-            }
+    private void unsubscribeBucket(TableBucket bucket) {
+        if (bucket.getPartitionId() != null) {
+            scanner.unsubscribe(bucket.getPartitionId(), bucket.getBucket());
+        } else {
+            scanner.unsubscribe(bucket.getBucket());
         }
-        sb.append("]");
-        return sb.toString();
     }
 
     private void processRecords(

@@ -40,16 +40,16 @@ public class BucketRecoveryContext {
 
     private final TableBucket bucket;
     private final long checkpointOffset;
-    private long logEndOffset;
+    private final long logEndOffset;
 
     private final Set<ByteArrayWrapper> processedKeys;
     private long lastProcessedOffset;
     private int totalRecordsProcessed;
 
-    public BucketRecoveryContext(TableBucket bucket, long checkpointOffset) {
+    public BucketRecoveryContext(TableBucket bucket, long checkpointOffset, long logEndOffset) {
         this.bucket = bucket;
         this.checkpointOffset = checkpointOffset;
-        this.logEndOffset = -1;
+        this.logEndOffset = logEndOffset;
         this.processedKeys = new HashSet<>();
         this.lastProcessedOffset = checkpointOffset;
         this.totalRecordsProcessed = 0;
@@ -65,10 +65,6 @@ public class BucketRecoveryContext {
 
     public long getLogEndOffset() {
         return logEndOffset;
-    }
-
-    public void setLogEndOffset(long logEndOffset) {
-        this.logEndOffset = logEndOffset;
     }
 
     public Set<ByteArrayWrapper> getProcessedKeys() {
@@ -91,17 +87,9 @@ public class BucketRecoveryContext {
      *
      * <ul>
      *   <li>No recovery is needed (checkpointOffset >= logEndOffset), or
-     *   <li>We have processed all expected records (totalRecordsProcessed >= logEndOffset -
-     *       checkpointOffset)
+     *   <li>The last processed offset has reached or passed logEndOffset - 1 (lastProcessedOffset
+     *       >= logEndOffset - 1)
      * </ul>
-     *
-     * <p>This implementation assumes that changelog offsets are contiguous (no gaps). The number of
-     * records to process equals logEndOffset - checkpointOffset.
-     *
-     * <p><b>Edge case:</b> If checkpointOffset == logEndOffset - 1 (only one record to process) and
-     * that record is skipped (e.g., UPDATE_AFTER), totalRecordsProcessed will be incremented but
-     * processedKeys may be empty. This is correct behavior - the record was processed (read and
-     * evaluated), it just didn't require an undo operation.
      *
      * @return true if changelog scanning is complete
      */
@@ -110,10 +98,7 @@ public class BucketRecoveryContext {
         if (!needsRecovery()) {
             return true;
         }
-        // Number of records to process = logEndOffset - checkpointOffset
-        // (offsets are contiguous, no gaps)
-        long expectedRecords = logEndOffset - checkpointOffset;
-        return totalRecordsProcessed >= expectedRecords;
+        return lastProcessedOffset >= logEndOffset - 1;
     }
 
     /**

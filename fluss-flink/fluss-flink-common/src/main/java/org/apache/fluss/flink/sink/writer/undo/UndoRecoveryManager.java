@@ -23,6 +23,7 @@ import org.apache.fluss.client.table.writer.Upsert;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 
@@ -37,10 +38,10 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Coordinates undo recovery operations during Flink sink writer initialization.
+ * Manages undo recovery operations during Flink sink writer initialization.
  *
- * <p>This coordinator ensures exactly-once semantics by reversing any writes that occurred after
- * the last successful checkpoint but before a failure. The recovery process involves:
+ * <p>This manager ensures exactly-once semantics by reversing any writes that occurred after the
+ * last successful checkpoint but before a failure. The recovery process involves:
  *
  * <ol>
  *   <li>Reading changelog records from checkpoint offset to current latest offset
@@ -68,20 +69,20 @@ import java.util.Map;
  *
  * @see MergeMode#OVERWRITE
  */
-public class UndoRecoveryCoordinator {
+public class UndoRecoveryManager {
 
-    private static final Logger LOG = LoggerFactory.getLogger(UndoRecoveryCoordinator.class);
+    private static final Logger LOG = LoggerFactory.getLogger(UndoRecoveryManager.class);
 
     private final Table table;
     @Nullable private final int[] targetColumnIndexes;
 
     /**
-     * Creates a new UndoRecoveryCoordinator.
+     * Creates a new UndoRecoveryManager.
      *
      * @param table the Fluss table to perform recovery on
      * @param targetColumnIndexes optional target columns for partial update (null for full row)
      */
-    public UndoRecoveryCoordinator(Table table, @Nullable int[] targetColumnIndexes) {
+    public UndoRecoveryManager(Table table, @Nullable int[] targetColumnIndexes) {
         this.table = table;
         this.targetColumnIndexes = targetColumnIndexes;
 
@@ -90,7 +91,7 @@ public class UndoRecoveryCoordinator {
 
     private void logPartialUpdateConfig(@Nullable int[] targetColumnIndexes) {
         if (targetColumnIndexes != null) {
-            LOG.debug(
+            LOG.info(
                     "Undo recovery configured with partial update columns: {}",
                     Arrays.toString(targetColumnIndexes));
         }
@@ -134,32 +135,20 @@ public class UndoRecoveryCoordinator {
             }
             UpsertWriter writer = recoveryUpsert.createWriter();
 
-            // For partial update mode, create a separate delete writer for INSERT undo
-            // INSERT undo needs to delete the entire row, not just partial columns
-            UpsertWriter deleteWriter = null;
-            if (targetColumnIndexes != null) {
-                deleteWriter = table.newUpsert().mergeMode(MergeMode.OVERWRITE).createWriter();
-            }
-
             // Create UndoComputer with writer for streaming execution
             Schema schema = table.getTableInfo().getSchema();
+            // Use CompactedKeyEncoder directly instead of the deprecated KeyEncoder.of(),
+            // which requires a lake format parameter that is not applicable here.
             KeyEncoder keyEncoder =
-                    KeyEncoder.of(
-                            schema.getRowType(),
-                            schema.getPrimaryKey().get().getColumnNames(),
-                            null);
-            UndoComputer undoComputer = new UndoComputer(keyEncoder, writer, deleteWriter);
+                    CompactedKeyEncoder.createKeyEncoder(
+                            schema.getRowType(), schema.getPrimaryKey().get().getColumnNames());
+            UndoComputer undoComputer = new UndoComputer(keyEncoder, writer);
 
             UndoRecoveryExecutor executor = new UndoRecoveryExecutor(scanner, writer, undoComputer);
+            // This is a blocking operation that reads changelog and executes undo operations.
+            // It may take a significant amount of time depending on the volume of records to
+            // process.
             executor.execute(contexts);
-
-            // Flush both writers to ensure all writes complete
-            // Note: UpsertWriter does not have a close() method, flush() is sufficient
-            // to ensure all pending writes are sent to the server
-            writer.flush();
-            if (deleteWriter != null) {
-                deleteWriter.flush();
-            }
         }
 
         // Calculate total undo operations for summary
@@ -249,8 +238,8 @@ public class UndoRecoveryCoordinator {
             UndoOffsets offsets = entry.getValue();
 
             BucketRecoveryContext ctx =
-                    new BucketRecoveryContext(bucket, offsets.getCheckpointOffset());
-            ctx.setLogEndOffset(offsets.getLogEndOffset());
+                    new BucketRecoveryContext(
+                            bucket, offsets.getCheckpointOffset(), offsets.getLogEndOffset());
             contexts.add(ctx);
         }
 

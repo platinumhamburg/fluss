@@ -56,9 +56,7 @@ class UndoRecoveryExecutorTest {
     private UndoComputer undoComputer;
     private UndoRecoveryExecutor executor;
 
-    // Short timeout values for testing (total ~300ms instead of 1 hour)
-    private static final long TEST_INITIAL_POLL_TIMEOUT_MS = 10;
-    private static final long TEST_MAX_POLL_TIMEOUT_MS = 50;
+    // Short timeout value for testing (total ~300ms instead of 1 hour)
     private static final long TEST_MAX_TOTAL_WAIT_TIME_MS = 300;
 
     @BeforeEach
@@ -67,15 +65,10 @@ class UndoRecoveryExecutorTest {
         mockWriter = new TestUpsertWriter();
         mockScanner = new TestLogScanner();
         undoComputer = new UndoComputer(keyEncoder, mockWriter);
-        // Use short timeouts for testing
+        // Use short timeout for testing
         executor =
                 new UndoRecoveryExecutor(
-                        mockScanner,
-                        mockWriter,
-                        undoComputer,
-                        TEST_INITIAL_POLL_TIMEOUT_MS,
-                        TEST_MAX_POLL_TIMEOUT_MS,
-                        TEST_MAX_TOTAL_WAIT_TIME_MS);
+                        mockScanner, mockWriter, undoComputer, TEST_MAX_TOTAL_WAIT_TIME_MS);
     }
 
     /**
@@ -88,11 +81,9 @@ class UndoRecoveryExecutorTest {
         TableBucket bucket0 = new TableBucket(TABLE_ID, 0);
         TableBucket bucket1 = new TableBucket(TABLE_ID, 1);
 
-        BucketRecoveryContext ctx0 = new BucketRecoveryContext(bucket0, 0L);
-        ctx0.setLogEndOffset(4L);
+        BucketRecoveryContext ctx0 = new BucketRecoveryContext(bucket0, 0L, 4L);
 
-        BucketRecoveryContext ctx1 = new BucketRecoveryContext(bucket1, 0L);
-        ctx1.setLogEndOffset(3L);
+        BucketRecoveryContext ctx1 = new BucketRecoveryContext(bucket1, 0L, 3L);
 
         // Bucket0: INSERT(key=1), UPDATE_BEFORE(key=1, dup), INSERT(key=2), DELETE(key=3)
         mockScanner.setRecordsForBucket(
@@ -143,8 +134,7 @@ class UndoRecoveryExecutorTest {
         TableBucket bucket = new TableBucket(TABLE_ID, 0);
 
         // Checkpoint offset (5) >= log end offset (5) → no recovery needed
-        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 5L);
-        ctx.setLogEndOffset(5L);
+        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 5L, 5L);
 
         executor.execute(Collections.singletonList(ctx));
 
@@ -162,8 +152,7 @@ class UndoRecoveryExecutorTest {
     void testExceptionPropagationFromWriter() {
         TableBucket bucket = new TableBucket(TABLE_ID, 0);
 
-        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L);
-        ctx.setLogEndOffset(2L);
+        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L, 2L);
 
         mockScanner.setRecordsForBucket(
                 bucket,
@@ -179,18 +168,17 @@ class UndoRecoveryExecutorTest {
     }
 
     /**
-     * Test that fatal exception is thrown after max total wait time.
+     * Test that exception is thrown after max total wait time.
      *
-     * <p>Validates: Undo recovery failure is fatal - incomplete undo leads to data inconsistency.
-     * Note: This test uses a mock scanner that always returns empty, so it will hit the timeout
-     * quickly in test environment. In production, the timeout is 1 hour.
+     * <p>Validates: Undo recovery timeout triggers a retryable exception. Note: This test uses a
+     * mock scanner that always returns empty, so it will hit the timeout quickly in test
+     * environment. In production, the timeout is 1 hour.
      */
     @Test
     void testFatalExceptionOnMaxEmptyPolls() {
         TableBucket bucket = new TableBucket(TABLE_ID, 0);
 
-        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L);
-        ctx.setLogEndOffset(2L);
+        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L, 2L);
 
         // Configure scanner to always return empty (simulating network issues or server problems)
         mockScanner.setAlwaysReturnEmpty(true);
@@ -199,10 +187,10 @@ class UndoRecoveryExecutorTest {
         // scanner with no actual delay, it will fail quickly
         assertThatThrownBy(() -> executor.execute(Collections.singletonList(ctx)))
                 .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Undo recovery failed")
+                .hasMessageContaining("Undo recovery timed out")
                 .hasMessageContaining("minutes of waiting")
-                .hasMessageContaining("fatal error")
-                .hasMessageContaining("data inconsistency");
+                .hasMessageContaining("still incomplete")
+                .hasMessageContaining("restart and retry");
     }
 
     /**
@@ -215,8 +203,7 @@ class UndoRecoveryExecutorTest {
     void testMultiPollBatchProcessing() throws Exception {
         TableBucket bucket = new TableBucket(TABLE_ID, 0);
 
-        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L);
-        ctx.setLogEndOffset(6L);
+        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L, 6L);
 
         // Configure 6 records but return only 2 per poll
         mockScanner.setRecordsForBucket(
