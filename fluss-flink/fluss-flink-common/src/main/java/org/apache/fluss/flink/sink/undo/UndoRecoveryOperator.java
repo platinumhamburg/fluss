@@ -617,6 +617,11 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      */
     @Override
     public void close() throws Exception {
+        // Remove this operator from the static DELEGATE_REGISTRY to prevent memory leaks.
+        // Each job submission registers entries in the registry via OffsetReportContextHolder,
+        // and without this cleanup, entries accumulate indefinitely in long-running clusters.
+        UndoRecoveryOperatorFactory.removeDelegate(this);
+
         // Close Table instance first (if created)
         if (table != null) {
             try {

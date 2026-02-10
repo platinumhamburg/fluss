@@ -276,6 +276,19 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
         return producerOffsetsPollIntervalMs;
     }
 
+    /**
+     * Removes a delegate from the static DELEGATE_REGISTRY by reference.
+     *
+     * <p>This should be called by {@link UndoRecoveryOperator#close()} to prevent memory leaks.
+     * Without this cleanup, the static registry accumulates entries indefinitely as jobs are
+     * submitted to long-running Flink clusters.
+     *
+     * @param delegate the delegate to remove from the registry
+     */
+    public static void removeDelegate(OffsetReportContext delegate) {
+        OffsetReportContextHolder.removeDelegate(delegate);
+    }
+
     // ==================== Inner Classes ====================
 
     /**
@@ -343,10 +356,18 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
             }
         }
 
-        /** Cleanup method to remove the delegate from the registry. */
-        void cleanup() {
-            DELEGATE_REGISTRY.remove(holderId);
-            LOG.debug("Removed delegate for holder ID: {}", holderId);
+        /**
+         * Removes a delegate from the registry by its reference.
+         *
+         * <p>This is called by {@link UndoRecoveryOperator#close()} to prevent memory leaks in the
+         * static DELEGATE_REGISTRY. Since the operator does not know the holder ID, it removes
+         * itself by value.
+         *
+         * @param delegate the delegate to remove from the registry
+         */
+        static void removeDelegate(OffsetReportContext delegate) {
+            DELEGATE_REGISTRY.values().remove(delegate);
+            LOG.debug("Removed delegate from registry by reference: {}", delegate);
         }
     }
 }
