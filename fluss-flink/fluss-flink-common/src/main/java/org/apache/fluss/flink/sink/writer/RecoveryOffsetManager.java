@@ -208,6 +208,12 @@ public class RecoveryOffsetManager {
         Map<TableBucket, Long> recoveryOffsets =
                 hasCheckpoint ? mergeCheckpointState(recoveredState) : getProducerOffsets();
 
+        LOG.info(
+                "Recovery offsets for subtask {} (source={}): {}",
+                subtaskIndex,
+                hasCheckpoint ? "checkpoint" : "producer",
+                recoveryOffsets);
+
         // Step 2: Get all buckets (to ensure no bucket is missed during listOffset)
         Set<TableBucket> allBuckets = getAllBuckets();
 
@@ -216,6 +222,12 @@ public class RecoveryOffsetManager {
         Set<TableBucket> filteredBuckets = filterBucketsBySharding(allBuckets, partitionNames);
         Map<TableBucket, Long> filteredRecoveryOffsets =
                 filterRecoveryOffsetsBySharding(recoveryOffsets, partitionNames);
+
+        LOG.info(
+                "Subtask {}: filteredBuckets={}, filteredRecoveryOffsets={}",
+                subtaskIndex,
+                filteredBuckets,
+                filteredRecoveryOffsets);
 
         if (filteredBuckets.isEmpty()) {
             LOG.info("No buckets assigned to subtask {} after filtering", subtaskIndex);
@@ -226,6 +238,8 @@ public class RecoveryOffsetManager {
         Map<TableBucket, Long> currentOffsets =
                 fetchCurrentOffsets(filteredBuckets, partitionNames);
 
+        LOG.info("Subtask {}: currentOffsets={}", subtaskIndex, currentOffsets);
+
         // Step 5: Filter changed buckets and build UndoOffsets in one pass
         // For buckets not in filteredRecoveryOffsets, use 0 as recovery offset
         Map<TableBucket, Long> changedOffsets = new HashMap<>();
@@ -234,6 +248,15 @@ public class RecoveryOffsetManager {
         for (TableBucket bucket : filteredBuckets) {
             long recovery = filteredRecoveryOffsets.getOrDefault(bucket, 0L);
             long current = currentOffsets.getOrDefault(bucket, 0L);
+            boolean inRecoveryOffsets = filteredRecoveryOffsets.containsKey(bucket);
+
+            LOG.info(
+                    "Subtask {}: bucket={}, recovery={} (inCheckpoint={}), current={}",
+                    subtaskIndex,
+                    bucket,
+                    recovery,
+                    inRecoveryOffsets,
+                    current);
 
             if (recovery > current) {
                 throw new IllegalStateException(
@@ -306,6 +329,7 @@ public class RecoveryOffsetManager {
     private void registerCurrentOffsets() throws Exception {
         LOG.info("Task0 registering offsets for {}", producerId);
         Map<TableBucket, Long> offsets = fetchAllBucketOffsets();
+        LOG.info("Task0 registering offsets: {}", offsets);
         RegisterResult result = admin.registerProducerOffsets(producerId, offsets).get();
         LOG.info("Registration result: {} ({} offsets)", result, offsets.size());
     }

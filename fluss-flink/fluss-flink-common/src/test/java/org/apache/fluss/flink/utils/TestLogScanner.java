@@ -38,11 +38,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>Simulating empty polls for testing exponential backoff behavior
  *   <li>Batch size control for realistic multi-poll scenarios
  *   <li>Always-empty mode for testing fatal exception on max empty polls
+ *   <li>Position tracking via subscribe/position/unsubscribe
  * </ul>
  */
 public class TestLogScanner implements LogScanner {
     private final Map<TableBucket, List<ScanRecord>> recordsByBucket = new HashMap<>();
     private final Map<TableBucket, AtomicInteger> pollIndexByBucket = new HashMap<>();
+
+    // Position tracking: keyed by bucket int for non-partitioned,
+    // by "partitionId:bucket" string for partitioned
+    private final Map<String, Long> positions = new HashMap<>();
 
     /** Number of empty polls to return before returning actual records. */
     private int emptyPollsBeforeData = 0;
@@ -82,9 +87,6 @@ public class TestLogScanner implements LogScanner {
     /**
      * Sets the maximum number of records to return per bucket per poll.
      *
-     * <p>This simulates realistic behavior where LogScanner returns records in batches. Use this to
-     * test multi-poll scenarios and ensure the executor handles partial results correctly.
-     *
      * @param batchSize max records per bucket per poll (0 = unlimited, returns all remaining)
      */
     public void setBatchSize(int batchSize) {
@@ -93,12 +95,10 @@ public class TestLogScanner implements LogScanner {
 
     @Override
     public ScanRecords poll(Duration timeout) {
-        // If configured to always return empty, do so
         if (alwaysReturnEmpty) {
             return ScanRecords.EMPTY;
         }
 
-        // Return empty polls if configured
         if (currentEmptyPollCount < emptyPollsBeforeData) {
             currentEmptyPollCount++;
             return ScanRecords.EMPTY;
@@ -115,15 +115,38 @@ public class TestLogScanner implements LogScanner {
                 int startIndex = index.get();
                 int endIndex;
                 if (batchSize > 0) {
-                    // Return at most batchSize records
                     endIndex = Math.min(startIndex + batchSize, allRecords.size());
                 } else {
-                    // Return all remaining records
                     endIndex = allRecords.size();
                 }
                 List<ScanRecord> batch = allRecords.subList(startIndex, endIndex);
                 result.put(bucket, new ArrayList<>(batch));
                 index.set(endIndex);
+                // Advance scanner position to next offset after last returned record
+                ScanRecord lastRecord = batch.get(batch.size() - 1);
+                String key = positionKey(bucket);
+                if (positions.containsKey(key)) {
+                    positions.put(key, lastRecord.logOffset() + 1);
+                }
+            }
+        }
+
+        // For subscribed buckets with no records configured, advance position to simulate
+        // the scanner consuming empty LogRecordBatches that produce zero ScanRecords.
+        // Skip this when alwaysReturnEmpty is set (simulating network issues, not empty batches).
+        if (!alwaysReturnEmpty) {
+            for (Map.Entry<String, Long> entry : new HashMap<>(positions).entrySet()) {
+                String key = entry.getKey();
+                boolean hasRecords = false;
+                for (TableBucket tb : recordsByBucket.keySet()) {
+                    if (positionKey(tb).equals(key)) {
+                        hasRecords = true;
+                        break;
+                    }
+                }
+                if (!hasRecords) {
+                    positions.put(key, entry.getValue() + 1);
+                }
             }
         }
 
@@ -131,16 +154,29 @@ public class TestLogScanner implements LogScanner {
     }
 
     @Override
-    public void subscribe(int bucket, long offset) {}
+    public void subscribe(int bucket, long offset) {
+        positions.put(bucketKey(bucket), offset);
+    }
 
     @Override
-    public void subscribe(long partitionId, int bucket, long offset) {}
+    public void subscribe(long partitionId, int bucket, long offset) {
+        positions.put(partitionBucketKey(partitionId, bucket), offset);
+    }
 
     @Override
-    public void unsubscribe(long partitionId, int bucket) {}
+    public Long position(TableBucket tableBucket) {
+        return positions.get(positionKey(tableBucket));
+    }
 
     @Override
-    public void unsubscribe(int bucket) {}
+    public void unsubscribe(long partitionId, int bucket) {
+        positions.remove(partitionBucketKey(partitionId, bucket));
+    }
+
+    @Override
+    public void unsubscribe(int bucket) {
+        positions.remove(bucketKey(bucket));
+    }
 
     @Override
     public void wakeup() {}
@@ -151,9 +187,26 @@ public class TestLogScanner implements LogScanner {
     public void reset() {
         recordsByBucket.clear();
         pollIndexByBucket.clear();
+        positions.clear();
         emptyPollsBeforeData = 0;
         currentEmptyPollCount = 0;
         alwaysReturnEmpty = false;
         batchSize = 0;
+    }
+
+    private static String bucketKey(int bucket) {
+        return "b:" + bucket;
+    }
+
+    private static String partitionBucketKey(long partitionId, int bucket) {
+        return "p:" + partitionId + ":b:" + bucket;
+    }
+
+    private static String positionKey(TableBucket tb) {
+        if (tb.getPartitionId() != null) {
+            return partitionBucketKey(tb.getPartitionId(), tb.getBucket());
+        } else {
+            return bucketKey(tb.getBucket());
+        }
     }
 }

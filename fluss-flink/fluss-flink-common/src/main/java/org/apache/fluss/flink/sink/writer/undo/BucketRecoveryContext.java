@@ -43,7 +43,6 @@ public class BucketRecoveryContext {
     private final long logEndOffset;
 
     private final Set<ByteArrayWrapper> processedKeys;
-    private long lastProcessedOffset;
     private int totalRecordsProcessed;
 
     public BucketRecoveryContext(TableBucket bucket, long checkpointOffset, long logEndOffset) {
@@ -51,7 +50,6 @@ public class BucketRecoveryContext {
         this.checkpointOffset = checkpointOffset;
         this.logEndOffset = logEndOffset;
         this.processedKeys = new HashSet<>();
-        this.lastProcessedOffset = checkpointOffset;
         this.totalRecordsProcessed = 0;
     }
 
@@ -80,43 +78,13 @@ public class BucketRecoveryContext {
         return checkpointOffset < logEndOffset;
     }
 
-    /**
-     * Checks if changelog scanning is complete for this bucket.
-     *
-     * <p>Complete means either:
-     *
-     * <ul>
-     *   <li>No recovery is needed (checkpointOffset >= logEndOffset), or
-     *   <li>The last processed offset has reached or passed logEndOffset - 1 (lastProcessedOffset
-     *       >= logEndOffset - 1)
-     * </ul>
-     *
-     * @return true if changelog scanning is complete
-     */
-    public boolean isComplete() {
-        // If no recovery is needed, we're already complete
-        if (!needsRecovery()) {
-            return true;
-        }
-        return lastProcessedOffset >= logEndOffset - 1;
-    }
-
-    /**
-     * Records that a changelog record has been processed.
-     *
-     * @param offset the offset of the processed record
-     */
-    public void recordProcessed(long offset) {
-        lastProcessedOffset = offset;
+    /** Records that a changelog record has been processed. */
+    public void recordProcessed() {
         totalRecordsProcessed++;
     }
 
     public int getTotalRecordsProcessed() {
         return totalRecordsProcessed;
-    }
-
-    public long getLastProcessedOffset() {
-        return lastProcessedOffset;
     }
 
     @Override
@@ -130,8 +98,6 @@ public class BucketRecoveryContext {
                 + logEndOffset
                 + ", processedKeys="
                 + processedKeys.size()
-                + ", complete="
-                + isComplete()
                 + '}';
     }
 }

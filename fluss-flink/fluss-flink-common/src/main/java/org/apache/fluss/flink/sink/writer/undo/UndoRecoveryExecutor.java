@@ -199,7 +199,7 @@ public class UndoRecoveryExecutor {
             } else {
                 // Process records for each bucket
                 for (BucketRecoveryContext ctx : contexts) {
-                    if (ctx.isComplete()) {
+                    if (unsubscribedBuckets.contains(ctx.getBucket())) {
                         continue;
                     }
                     List<ScanRecord> bucketRecords = records.records(ctx.getBucket());
@@ -207,7 +207,7 @@ public class UndoRecoveryExecutor {
                         processRecords(ctx, bucketRecords, allFutures);
                     }
                     // Unsubscribe completed buckets to stop fetching data from them
-                    if (ctx.isComplete() && unsubscribedBuckets.add(ctx.getBucket())) {
+                    if (isBucketComplete(ctx) && unsubscribedBuckets.add(ctx.getBucket())) {
                         unsubscribeBucket(ctx.getBucket());
                     }
                 }
@@ -255,20 +255,21 @@ public class UndoRecoveryExecutor {
             List<CompletableFuture<?>> futures) {
         Set<ByteArrayWrapper> processedKeys = ctx.getProcessedKeys();
         for (ScanRecord record : records) {
+            // Skip records beyond the recovery range
+            if (record.logOffset() >= ctx.getLogEndOffset()) {
+                break;
+            }
             CompletableFuture<?> future = undoComputer.processRecord(record, processedKeys);
             if (future != null) {
                 futures.add(future);
             }
-            ctx.recordProcessed(record.logOffset());
-            if (ctx.isComplete()) {
-                break;
-            }
+            ctx.recordProcessed();
         }
     }
 
     private boolean allComplete(List<BucketRecoveryContext> contexts) {
         for (BucketRecoveryContext ctx : contexts) {
-            if (!ctx.isComplete()) {
+            if (!isBucketComplete(ctx)) {
                 return false;
             }
         }
@@ -278,10 +279,35 @@ public class UndoRecoveryExecutor {
     private int countIncomplete(List<BucketRecoveryContext> contexts) {
         int count = 0;
         for (BucketRecoveryContext ctx : contexts) {
-            if (!ctx.isComplete()) {
+            if (!isBucketComplete(ctx)) {
                 count++;
             }
         }
         return count;
+    }
+
+    /**
+     * Checks if changelog scanning is complete for the given bucket context.
+     *
+     * <p>Complete means either:
+     *
+     * <ul>
+     *   <li>No recovery is needed (checkpointOffset >= logEndOffset).
+     *   <li>The scanner's current position has reached or passed logEndOffset. The scanner position
+     *       reflects the internal fetch offset, correctly accounting for empty LogRecordBatches
+     *       that consume WAL offsets but produce zero ScanRecords.
+     *   <li>The bucket has been unsubscribed (scanner position is null).
+     * </ul>
+     */
+    private boolean isBucketComplete(BucketRecoveryContext ctx) {
+        if (!ctx.needsRecovery()) {
+            return true;
+        }
+        Long scannerPosition = scanner.position(ctx.getBucket());
+        // Bucket already unsubscribed — treat as complete
+        if (scannerPosition == null) {
+            return true;
+        }
+        return scannerPosition >= ctx.getLogEndOffset();
     }
 }

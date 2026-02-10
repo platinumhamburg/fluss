@@ -302,6 +302,14 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
                     "Restored {} WriterState objects from Union List State for subtask {}",
                     recoveredState.size(),
                     subtaskIndex);
+            // Log detailed state content for debugging recovery issues
+            for (WriterState state : recoveredState) {
+                LOG.info(
+                        "Subtask {} restored WriterState: checkpointId={}, bucketOffsets={}",
+                        subtaskIndex,
+                        state.getCheckpointId(),
+                        state.getBucketOffsets());
+            }
         }
 
         // Step 3: Use RecoveryOffsetManager to determine recovery strategy
@@ -330,14 +338,18 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
         if (decision.needsUndoRecovery()) {
             Map<TableBucket, UndoOffsets> undoOffsets = decision.getUndoOffsets();
             LOG.info(
-                    "Executing undo recovery with {} bucket offsets for subtask {}",
-                    undoOffsets.size(),
-                    subtaskIndex);
+                    "Executing undo recovery for subtask {}: undoOffsets={}",
+                    subtaskIndex,
+                    undoOffsets);
 
             performUndoRecovery(undoOffsets);
 
             // Initialize bucket offsets with recovery offsets (checkpoint offsets)
             Map<TableBucket, Long> recoveryOffsets = decision.getRecoveryOffsets();
+            LOG.info(
+                    "Subtask {} initializing bucketOffsets from recovery: {}",
+                    subtaskIndex,
+                    recoveryOffsets);
             initializeBucketOffsets(recoveryOffsets);
         } else {
             LOG.info("No undo recovery needed for subtask {}", subtaskIndex);
@@ -434,9 +446,15 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
                             new WriterState(
                                     context.getCheckpointId(), new HashMap<>(bucketOffsets));
                     undoStateList.add(state);
-                    LOG.debug(
-                            "Snapshot state with {} bucket offsets at checkpoint {}",
-                            bucketOffsets.size(),
+                    LOG.info(
+                            "Subtask {} snapshot state at checkpoint {}: bucketOffsets={}",
+                            subtaskIndex,
+                            context.getCheckpointId(),
+                            bucketOffsets);
+                } else {
+                    LOG.info(
+                            "Subtask {} snapshot state at checkpoint {}: bucketOffsets is EMPTY",
+                            subtaskIndex,
                             context.getCheckpointId());
                 }
             } finally {
@@ -467,11 +485,12 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     public void notifyCheckpointComplete(long checkpointId) throws Exception {
         super.notifyCheckpointComplete(checkpointId);
 
-        LOG.debug(
-                "Checkpoint {} completed for subtask {} (restoredFromCheckpoint={})",
+        LOG.info(
+                "Checkpoint {} completed for subtask {} (restoredFromCheckpoint={}, bucketOffsets={})",
                 checkpointId,
                 subtaskIndex,
-                restoredFromCheckpoint);
+                restoredFromCheckpoint,
+                bucketOffsets);
 
         // Only delete producer offsets if we were restored from a checkpoint.
         // If starting fresh, keep producer offsets for potential recovery on failure.

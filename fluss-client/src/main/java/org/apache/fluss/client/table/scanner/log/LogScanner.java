@@ -18,6 +18,7 @@
 package org.apache.fluss.client.table.scanner.log;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.metadata.TableBucket;
 
 import java.time.Duration;
 
@@ -83,6 +84,15 @@ public interface LogScanner extends AutoCloseable {
     default void subscribeFromBeginning(int bucket) {
         subscribe(bucket, EARLIEST_OFFSET);
     }
+
+    /**
+     * Get the current scan offset of the given table bucket. Returns the offset that will be used
+     * for the next fetch from this bucket.
+     *
+     * @param tableBucket the table bucket to get the position for.
+     * @return the current offset, or {@code null} if the bucket is not subscribed.
+     */
+    Long position(TableBucket tableBucket);
 
     /**
      * Subscribe to the given partitioned table bucket in given offset dynamically. If the table
