@@ -85,6 +85,7 @@ public class FlinkTableSink
     private final List<String> bucketKeys;
     private final DistributionMode distributionMode;
     private final @Nullable DataLakeFormat lakeFormat;
+    @Nullable private final String producerId;
 
     private boolean appliedUpdates = false;
     @Nullable private GenericRow deleteRow;
@@ -102,7 +103,8 @@ public class FlinkTableSink
             DeleteBehavior tableDeleteBehavior,
             int numBucket,
             List<String> bucketKeys,
-            DistributionMode distributionMode) {
+            DistributionMode distributionMode,
+            @Nullable String producerId) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableRowType = tableRowType;
@@ -116,6 +118,7 @@ public class FlinkTableSink
         this.bucketKeys = bucketKeys;
         this.distributionMode = distributionMode;
         this.lakeFormat = lakeFormat;
+        this.producerId = producerId;
     }
 
     @Override
@@ -230,7 +233,8 @@ public class FlinkTableSink
 
         // Enable undo recovery for aggregation tables
         boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
-        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath, enableUndoRecovery);
+
+        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath, enableUndoRecovery, producerId);
     }
 
     private List<String> columns(int[] columnIndexes) {
@@ -257,7 +261,8 @@ public class FlinkTableSink
                         tableDeleteBehavior,
                         numBucket,
                         bucketKeys,
-                        distributionMode);
+                        distributionMode,
+                        producerId);
         sink.appliedUpdates = appliedUpdates;
         sink.deleteRow = deleteRow;
         return sink;

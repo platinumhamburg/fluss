@@ -206,7 +206,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(toFlinkOption(TABLE_DELETE_BEHAVIOR)),
                 tableOptions.get(FlinkConnectorOptions.BUCKET_NUMBER),
                 getBucketKeys(tableOptions),
-                distributionMode);
+                distributionMode,
+                tableOptions.getOptional(FlinkConnectorOptions.SINK_PRODUCER_ID).orElse(null));
     }
 
     @Override
@@ -237,6 +238,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                                 FlinkConnectorOptions.SINK_IGNORE_DELETE,
                                 FlinkConnectorOptions.SINK_BUCKET_SHUFFLE,
                                 FlinkConnectorOptions.SINK_DISTRIBUTION_MODE,
+                                FlinkConnectorOptions.SINK_PRODUCER_ID,
                                 LookupOptions.MAX_RETRIES,
                                 LookupOptions.CACHE_TYPE,
                                 LookupOptions.PARTIAL_CACHE_EXPIRE_AFTER_ACCESS,

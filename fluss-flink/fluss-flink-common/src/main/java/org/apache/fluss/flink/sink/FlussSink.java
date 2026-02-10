@@ -24,6 +24,8 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.flink.streaming.api.connector.sink2.SupportsPreWriteTopology;
 import org.apache.flink.streaming.api.datastream.DataStream;
 
+import javax.annotation.Nullable;
+
 /**
  * FlussSink is a specialized Flink sink for writing data to Fluss.
  *
@@ -49,8 +51,9 @@ public class FlussSink<InputT> extends FlinkSink<InputT>
     FlussSink(
             SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
             TablePath tablePath,
-            boolean enableUndoRecovery) {
-        super(builder, tablePath, enableUndoRecovery);
+            boolean enableUndoRecovery,
+            @Nullable String producerId) {
+        super(builder, tablePath, enableUndoRecovery, producerId);
     }
 
     @Override

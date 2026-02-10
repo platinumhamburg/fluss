@@ -81,13 +81,31 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
      */
     private final boolean enableUndoRecovery;
 
+    /**
+     * Optional producer ID for undo recovery. If null, defaults to the Flink job ID.
+     *
+     * <p>This is passed directly to {@link UndoRecoveryOperatorFactory} which forwards it to {@link
+     * org.apache.fluss.flink.sink.undo.UndoRecoveryOperator} for producer offset registration and
+     * retrieval during pre-checkpoint failure recovery.
+     */
+    @Nullable private final String producerId;
+
     FlinkSink(
             SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
             TablePath tablePath,
             boolean enableUndoRecovery) {
+        this(builder, tablePath, enableUndoRecovery, null);
+    }
+
+    FlinkSink(
+            SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
+            TablePath tablePath,
+            boolean enableUndoRecovery,
+            @Nullable String producerId) {
         this.builder = builder;
         this.tablePath = tablePath;
         this.enableUndoRecovery = enableUndoRecovery;
+        this.producerId = producerId;
     }
 
     @Override
@@ -139,6 +157,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                     (UpsertSinkWriterBuilder<InputT>) builder;
 
             // Create UndoRecoveryOperatorFactory with required parameters
+            // producerId is passed directly from FlinkSink, not from the builder
             UndoRecoveryOperatorFactory<InputT> operatorFactory =
                     new UndoRecoveryOperatorFactory<>(
                             tablePath,
@@ -147,7 +166,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                             upsertBuilder.getTargetColumnIndexes(),
                             upsertBuilder.getNumBucket(),
                             upsertBuilder.isPartitioned(),
-                            upsertBuilder.getProducerId());
+                            producerId);
 
             // Add UndoRecoveryOperator to the stream
             stream =
@@ -330,14 +349,6 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
 
         /**
-         * Optional producer ID for undo recovery. If null, defaults to the Flink job ID.
-         *
-         * <p>This is used by UndoRecoveryOperator to register and retrieve producer offsets for
-         * pre-checkpoint failure recovery.
-         */
-        @Nullable private final String producerId;
-
-        /**
          * Optional context for reporting offsets to the upstream UndoRecoveryOperator.
          *
          * <p>This is set by FlinkSink.apply() or FlussSink.addPreWriteTopology() when
@@ -360,32 +371,6 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                 @Nullable DataLakeFormat lakeFormat,
                 DistributionMode distributionMode,
                 FlussSerializationSchema<InputT> flussSerializationSchema) {
-            this(
-                    tablePath,
-                    flussConfig,
-                    tableRowType,
-                    targetColumnIndexes,
-                    numBucket,
-                    bucketKeys,
-                    partitionKeys,
-                    lakeFormat,
-                    distributionMode,
-                    flussSerializationSchema,
-                    null);
-        }
-
-        UpsertSinkWriterBuilder(
-                TablePath tablePath,
-                Configuration flussConfig,
-                RowType tableRowType,
-                @Nullable int[] targetColumnIndexes,
-                int numBucket,
-                List<String> bucketKeys,
-                List<String> partitionKeys,
-                @Nullable DataLakeFormat lakeFormat,
-                DistributionMode distributionMode,
-                FlussSerializationSchema<InputT> flussSerializationSchema,
-                @Nullable String producerId) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
             this.tableRowType = tableRowType;
@@ -396,7 +381,6 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
             this.lakeFormat = lakeFormat;
             this.distributionMode = distributionMode;
             this.flussSerializationSchema = flussSerializationSchema;
-            this.producerId = producerId;
         }
 
         @Override
@@ -457,11 +441,6 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
 
         boolean isPartitioned() {
             return !partitionKeys.isEmpty();
-        }
-
-        @Nullable
-        String getProducerId() {
-            return producerId;
         }
 
         void setOffsetReportContext(@Nullable OffsetReportContext offsetReportContext) {
