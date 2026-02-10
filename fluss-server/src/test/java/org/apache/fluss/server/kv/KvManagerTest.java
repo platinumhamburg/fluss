@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.metadata.KvFormat;
@@ -162,6 +163,28 @@ final class KvManagerTest {
 
     static List<String> partitionProvider() {
         return Arrays.asList(null, "2024");
+    }
+
+    @Test
+    void testPositiveSharedBlockCacheSizeEnablesSharedCache() throws Exception {
+        kvManager.shutdown();
+        kvManager = null;
+        conf.set(ConfigOptions.KV_SHARED_BLOCK_CACHE_SIZE, MemorySize.parse("64mb"));
+        kvManager =
+                KvManager.create(
+                        conf,
+                        zkClient,
+                        logManager,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
+        kvManager.startup();
+
+        initTableBuckets(null);
+        KvTablet firstKv = getOrCreateKv(tablePath1, null, tableBucket1);
+        KvTablet secondKv = getOrCreateKv(tablePath2, null, tableBucket2);
+
+        assertThat(firstKv.getRocksDBKv().getBlockCache())
+                .isSameAs(secondKv.getRocksDBKv().getBlockCache());
     }
 
     @ParameterizedTest

@@ -2176,6 +2176,18 @@ public class ConfigOptions {
                                     + "The RateLimiter is always enabled. The default value is Long.MAX_VALUE (effectively unlimited). "
                                     + "Set to a lower value (e.g., 100MB) to limit the rate.");
 
+    public static final ConfigOption<MemorySize> KV_SHARED_BLOCK_CACHE_SIZE =
+            key("kv.rocksdb.shared-block-cache.size")
+                    .memoryType()
+                    .defaultValue(MemorySize.ZERO)
+                    .withDescription(
+                            "The soft capacity of the shared block cache for all RocksDB instances "
+                                    + "in the TabletServer. All KV tablets share a single block cache "
+                                    + "to improve memory utilization. Hot tablets can use more cache "
+                                    + "while cold tablets use less. Set to 0 to disable the shared "
+                                    + "block cache, in which case each tablet creates its own cache. "
+                                    + "This is not a hard limit on process memory. The default is 0.");
+
     // --------------------------------------------------------------------------
     // Provided configurable ColumnFamilyOptions within Fluss
     // --------------------------------------------------------------------------
@@ -2299,7 +2311,9 @@ public class ConfigOptions {
                     .defaultValue(MemorySize.parse("8mb"))
                     .withDescription(
                             "The amount of the cache for data blocks in RocksDB. "
-                                    + "The default block-cache size is `8MB`.");
+                                    + "The default block-cache size is `8MB`. "
+                                    + "This setting is ignored when "
+                                    + "kv.rocksdb.shared-block-cache.size is greater than 0.");
 
     public static final ConfigOption<Boolean> KV_USE_BLOOM_FILTER =
             key("kv.rocksdb.use-bloom-filter")
