@@ -25,7 +25,7 @@ import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.row.OperationType;
 import org.apache.fluss.flink.sink.serializer.FlussSerializationSchema;
-import org.apache.fluss.flink.sink.undo.OffsetReportContext;
+import org.apache.fluss.flink.sink.undo.ProducerOffsetReporter;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 
@@ -51,10 +51,11 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
      *
      * <p>When null, offset reporting is skipped (for non-aggregation tables).
      */
-    @Nullable private final OffsetReportContext offsetReportContext;
+    @Nullable private final ProducerOffsetReporter offsetReporter;
 
     /**
-     * Creates a new UpsertSinkWriter with OffsetReportContext for UndoRecoveryOperator integration.
+     * Creates a new UpsertSinkWriter with ProducerOffsetReporter for UndoRecoveryOperator
+     * integration.
      *
      * @param tablePath the path of the table to write to
      * @param flussConfig the Fluss configuration
@@ -62,7 +63,7 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
      * @param targetColumnIndexes optional column indexes for partial updates
      * @param mailboxExecutor the mailbox executor for async operations
      * @param flussSerializationSchema the serialization schema for input records
-     * @param offsetReportContext optional context for reporting offsets to upstream operator
+     * @param offsetReporter optional reporter for reporting offsets to upstream operator
      */
     public UpsertSinkWriter(
             TablePath tablePath,
@@ -71,7 +72,7 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             @Nullable int[] targetColumnIndexes,
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> flussSerializationSchema,
-            @Nullable OffsetReportContext offsetReportContext) {
+            @Nullable ProducerOffsetReporter offsetReporter) {
         super(
                 tablePath,
                 flussConfig,
@@ -79,7 +80,7 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
                 targetColumnIndexes,
                 mailboxExecutor,
                 flussSerializationSchema);
-        this.offsetReportContext = offsetReportContext;
+        this.offsetReporter = offsetReporter;
     }
 
     @Override
@@ -94,20 +95,15 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
     }
 
     @Override
-    public void write(InputT inputValue, Context context) throws IOException, InterruptedException {
-        super.write(inputValue, context);
-    }
-
-    @Override
     CompletableFuture<?> writeRow(OperationType opType, InternalRow internalRow) {
         if (opType == OperationType.UPSERT) {
             CompletableFuture<UpsertResult> future = upsertWriter.upsert(internalRow);
-            // Report offset to upstream UndoRecoveryOperator if context provided
-            if (offsetReportContext != null) {
+            // Report offset to upstream UndoRecoveryOperator if reporter provided
+            if (offsetReporter != null) {
                 return future.thenAccept(
                         result -> {
                             if (result.getBucket() != null && result.getLogEndOffset() >= 0) {
-                                offsetReportContext.reportOffset(
+                                offsetReporter.reportOffset(
                                         result.getBucket(), result.getLogEndOffset());
                             }
                         });
@@ -115,12 +111,12 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             return future;
         } else if (opType == OperationType.DELETE) {
             CompletableFuture<DeleteResult> future = upsertWriter.delete(internalRow);
-            // Report offset to upstream UndoRecoveryOperator if context provided
-            if (offsetReportContext != null) {
+            // Report offset to upstream UndoRecoveryOperator if reporter provided
+            if (offsetReporter != null) {
                 return future.thenAccept(
                         result -> {
                             if (result.getBucket() != null && result.getLogEndOffset() >= 0) {
-                                offsetReportContext.reportOffset(
+                                offsetReporter.reportOffset(
                                         result.getBucket(), result.getLogEndOffset());
                             }
                         });
@@ -140,10 +136,5 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
     @Override
     TableWriter getTableWriter() {
         return upsertWriter;
-    }
-
-    @Override
-    public void close() throws Exception {
-        super.close();
     }
 }

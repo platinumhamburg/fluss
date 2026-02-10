@@ -26,7 +26,7 @@ import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecord;
 import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecordChannelComputer;
 import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecordTypeInformation;
-import org.apache.fluss.flink.sink.undo.OffsetReportContext;
+import org.apache.fluss.flink.sink.undo.ProducerOffsetReporter;
 import org.apache.fluss.flink.sink.undo.UndoRecoveryOperatorFactory;
 import org.apache.fluss.flink.sink.writer.AppendSinkWriter;
 import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
@@ -43,7 +43,6 @@ import org.apache.flink.streaming.api.connector.sink2.SupportsPreWriteTopology;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
 import org.apache.flink.table.connector.sink.SinkV2Provider;
 import org.apache.flink.table.types.logical.RowType;
@@ -55,13 +54,13 @@ import java.util.List;
 
 import static org.apache.fluss.flink.sink.FlinkStreamPartitioner.partition;
 import static org.apache.fluss.flink.utils.FlinkConversions.toFlussRowType;
-import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
  * Flink sink for Fluss.
  *
- * <p>State management for undo recovery is handled by {@code UndoRecoveryOperator} using Union List
- * State, so this sink does not implement StatefulSink or SupportsWriterState.
+ * <p>State management for undo recovery is handled by {@code UndoRecoveryOperator} which is added
+ * as part of the pre-write topology by {@link UpsertSinkWriterBuilder}, so this sink does not
+ * implement StatefulSink or SupportsWriterState.
  */
 class FlinkSink<InputT> extends SinkAdapter<InputT> {
 
@@ -70,42 +69,11 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
     protected final SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder;
     private final TablePath tablePath;
 
-    /**
-     * Whether undo recovery is enabled for this sink.
-     *
-     * <p>When true, an UndoRecoveryOperator will be added before the sink to manage state using
-     * Union List State for correct redistribution during scale up/down scenarios.
-     *
-     * <p>This is typically enabled for aggregation tables that require undo recovery for
-     * exactly-once semantics.
-     */
-    private final boolean enableUndoRecovery;
-
-    /**
-     * Optional producer ID for undo recovery. If null, defaults to the Flink job ID.
-     *
-     * <p>This is passed directly to {@link UndoRecoveryOperatorFactory} which forwards it to {@link
-     * org.apache.fluss.flink.sink.undo.UndoRecoveryOperator} for producer offset registration and
-     * retrieval during pre-checkpoint failure recovery.
-     */
-    @Nullable private final String producerId;
-
     FlinkSink(
             SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
-            TablePath tablePath,
-            boolean enableUndoRecovery) {
-        this(builder, tablePath, enableUndoRecovery, null);
-    }
-
-    FlinkSink(
-            SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
-            TablePath tablePath,
-            boolean enableUndoRecovery,
-            @Nullable String producerId) {
+            TablePath tablePath) {
         this.builder = builder;
         this.tablePath = tablePath;
-        this.enableUndoRecovery = enableUndoRecovery;
-        this.producerId = producerId;
     }
 
     @Override
@@ -129,75 +97,9 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
      */
     public DataStreamSink<InputT> apply(DataStream<InputT> input) {
         DataStream<InputT> stream = builder.addPreWriteTopology(input);
-
-        // Add UndoRecoveryOperator for aggregation tables
-        stream = addUndoRecoveryOperatorIfNeeded(stream);
-
         return stream.sinkTo(this)
                 .name("Sink(" + tablePath + ")")
                 .setParallelism(stream.getParallelism());
-    }
-
-    /**
-     * Adds UndoRecoveryOperator to the stream if undo recovery is enabled for aggregation tables.
-     *
-     * <p>This method is shared between {@link FlinkSink#apply} and {@link
-     * FlussSink#addPreWriteTopology} to avoid code duplication.
-     *
-     * @param stream the input stream after pre-write topology
-     * @return the stream with UndoRecoveryOperator added if needed, otherwise the original stream
-     */
-    protected DataStream<InputT> addUndoRecoveryOperatorIfNeeded(DataStream<InputT> stream) {
-        if (enableUndoRecovery && builder instanceof UpsertSinkWriterBuilder) {
-            // Validate that checkpointing is enabled for undo recovery
-            validateCheckpointingEnabled(stream.getExecutionEnvironment());
-
-            @SuppressWarnings("unchecked")
-            UpsertSinkWriterBuilder<InputT> upsertBuilder =
-                    (UpsertSinkWriterBuilder<InputT>) builder;
-
-            // Create UndoRecoveryOperatorFactory with required parameters
-            // producerId is passed directly from FlinkSink, not from the builder
-            UndoRecoveryOperatorFactory<InputT> operatorFactory =
-                    new UndoRecoveryOperatorFactory<>(
-                            tablePath,
-                            upsertBuilder.getFlussConfig(),
-                            toFlussRowType(upsertBuilder.getTableRowType()),
-                            upsertBuilder.getTargetColumnIndexes(),
-                            upsertBuilder.getNumBucket(),
-                            upsertBuilder.isPartitioned(),
-                            producerId);
-
-            // Add UndoRecoveryOperator to the stream
-            stream =
-                    stream.transform(
-                                    "UndoRecovery(" + tablePath + ")",
-                                    stream.getType(),
-                                    operatorFactory)
-                            .setParallelism(stream.getParallelism());
-
-            // Pass the OffsetReportContext to the builder for the writer to use
-            upsertBuilder.setOffsetReportContext(operatorFactory.getOffsetReportContext());
-        }
-        return stream;
-    }
-
-    /**
-     * Validates that checkpointing is enabled when undo recovery is required.
-     *
-     * <p>Undo recovery for aggregation tables requires checkpointing to track write offsets and
-     * perform recovery on failure. Without checkpointing, the system cannot guarantee exactly-once
-     * semantics.
-     *
-     * @param env the stream execution environment
-     * @throws IllegalArgumentException if checkpointing is not enabled
-     */
-    private void validateCheckpointingEnabled(StreamExecutionEnvironment env) {
-        checkArgument(
-                env.getCheckpointConfig().isCheckpointingEnabled(),
-                "Aggregation tables require checkpointing to be enabled for undo recovery. "
-                        + "Please enable checkpointing using env.enableCheckpointing(interval) "
-                        + "or set 'execution.checkpointing.interval' in configuration.");
     }
 
     @Internal
@@ -347,18 +249,20 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
         private final @Nullable DataLakeFormat lakeFormat;
         private final DistributionMode distributionMode;
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
+        private final boolean enableUndoRecovery;
+        @Nullable private final String producerId;
 
         /**
          * Optional context for reporting offsets to the upstream UndoRecoveryOperator.
          *
-         * <p>This is set by FlinkSink.apply() or FlussSink.addPreWriteTopology() when
-         * UndoRecoveryOperator is added to the pipeline. The context is then passed to the
-         * UpsertSinkWriter during creation.
+         * <p>This is set internally by {@link #addPreWriteTopology} when UndoRecoveryOperator is
+         * added to the pipeline. The context is then passed to the UpsertSinkWriter during
+         * creation.
          *
-         * <p>Note: This field is NOT transient because the OffsetReportContextHolder is
+         * <p>Note: This field is NOT transient because the ProducerOffsetReporterHolder is
          * serializable and needs to survive job serialization to be passed to the TaskManager.
          */
-        @Nullable private OffsetReportContext offsetReportContext;
+        @Nullable private ProducerOffsetReporter offsetReporter;
 
         UpsertSinkWriterBuilder(
                 TablePath tablePath,
@@ -370,7 +274,9 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                 List<String> partitionKeys,
                 @Nullable DataLakeFormat lakeFormat,
                 DistributionMode distributionMode,
-                FlussSerializationSchema<InputT> flussSerializationSchema) {
+                FlussSerializationSchema<InputT> flussSerializationSchema,
+                boolean enableUndoRecovery,
+                @Nullable String producerId) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
             this.tableRowType = tableRowType;
@@ -381,6 +287,8 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
             this.lakeFormat = lakeFormat;
             this.distributionMode = distributionMode;
             this.flussSerializationSchema = flussSerializationSchema;
+            this.enableUndoRecovery = enableUndoRecovery;
+            this.producerId = producerId;
         }
 
         @Override
@@ -392,59 +300,60 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                     targetColumnIndexes,
                     mailboxExecutor,
                     flussSerializationSchema,
-                    offsetReportContext);
+                    offsetReporter);
         }
 
         @Override
         public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
+            DataStream<InputT> stream;
             switch (distributionMode) {
                 case NONE:
-                    return input;
+                    stream = input;
+                    break;
                 case AUTO:
                 case BUCKET:
-                    return partition(
-                            input,
-                            new FlinkRowDataChannelComputer<>(
-                                    toFlussRowType(tableRowType),
-                                    bucketKeys,
-                                    partitionKeys,
-                                    lakeFormat,
-                                    numBucket,
-                                    flussSerializationSchema),
-                            input.getParallelism());
+                    stream =
+                            partition(
+                                    input,
+                                    new FlinkRowDataChannelComputer<>(
+                                            toFlussRowType(tableRowType),
+                                            bucketKeys,
+                                            partitionKeys,
+                                            lakeFormat,
+                                            numBucket,
+                                            flussSerializationSchema),
+                                    input.getParallelism());
+                    break;
                 default:
                     throw new UnsupportedOperationException(
                             String.format(
                                     "Unsupported distribution mode: %s for primary key table",
                                     distributionMode));
             }
-        }
 
-        // ==================== Getters for UndoRecoveryOperator integration ====================
+            // Add UndoRecoveryOperator for aggregation tables
+            if (enableUndoRecovery) {
+                UndoRecoveryOperatorFactory<InputT> operatorFactory =
+                        new UndoRecoveryOperatorFactory<>(
+                                tablePath,
+                                flussConfig,
+                                toFlussRowType(tableRowType),
+                                targetColumnIndexes,
+                                numBucket,
+                                !partitionKeys.isEmpty(),
+                                producerId);
 
-        Configuration getFlussConfig() {
-            return flussConfig;
-        }
+                stream =
+                        stream.transform(
+                                        "UndoRecovery(" + tablePath + ")",
+                                        stream.getType(),
+                                        operatorFactory)
+                                .setParallelism(stream.getParallelism());
 
-        RowType getTableRowType() {
-            return tableRowType;
-        }
+                offsetReporter = operatorFactory.getProducerOffsetReporter();
+            }
 
-        @Nullable
-        int[] getTargetColumnIndexes() {
-            return targetColumnIndexes;
-        }
-
-        int getNumBucket() {
-            return numBucket;
-        }
-
-        boolean isPartitioned() {
-            return !partitionKeys.isEmpty();
-        }
-
-        void setOffsetReportContext(@Nullable OffsetReportContext offsetReportContext) {
-            this.offsetReportContext = offsetReportContext;
+            return stream;
         }
     }
 }

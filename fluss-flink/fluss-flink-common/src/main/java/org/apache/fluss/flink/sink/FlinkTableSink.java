@@ -207,6 +207,9 @@ public class FlinkTableSink
     }
 
     private FlinkSink<RowData> getFlinkSink(int[] targetColumnIndexes) {
+        // Enable undo recovery for aggregation tables
+        boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
+
         FlinkSink.SinkWriterBuilder<? extends FlinkSinkWriter, RowData> flinkSinkWriterBuilder =
                 (primaryKeyIndexes.length > 0)
                         ? new FlinkSink.UpsertSinkWriterBuilder<>(
@@ -219,7 +222,9 @@ public class FlinkTableSink
                                 partitionKeys,
                                 lakeFormat,
                                 distributionMode,
-                                new RowDataSerializationSchema(false, sinkIgnoreDelete))
+                                new RowDataSerializationSchema(false, sinkIgnoreDelete),
+                                enableUndoRecovery,
+                                producerId)
                         : new FlinkSink.AppendSinkWriterBuilder<>(
                                 tablePath,
                                 flussConfig,
@@ -231,10 +236,7 @@ public class FlinkTableSink
                                 distributionMode,
                                 new RowDataSerializationSchema(true, sinkIgnoreDelete));
 
-        // Enable undo recovery for aggregation tables
-        boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
-
-        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath, enableUndoRecovery, producerId);
+        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath);
     }
 
     private List<String> columns(int[] columnIndexes) {

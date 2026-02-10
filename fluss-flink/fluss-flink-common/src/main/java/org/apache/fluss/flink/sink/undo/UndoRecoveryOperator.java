@@ -25,9 +25,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.flink.sink.state.WriterState;
 import org.apache.fluss.flink.sink.state.WriterStateSerializer;
-import org.apache.fluss.flink.sink.writer.RecoveryOffsetManager;
-import org.apache.fluss.flink.sink.writer.undo.UndoRecoveryManager;
-import org.apache.fluss.flink.sink.writer.undo.UndoRecoveryManager.UndoOffsets;
+import org.apache.fluss.flink.sink.undo.UndoRecoveryManager.UndoOffsets;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.types.RowType;
@@ -52,8 +50,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A Flink stream operator that manages undo recovery state using Union List State.
@@ -70,7 +67,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *   <li>Uses {@link RecoveryOffsetManager} to determine recovery strategy (checkpoint or producer
  *       offsets)
  *   <li>Executes undo recovery during {@code initializeState()} using {@link UndoRecoveryManager}
- *   <li>Receives offset reports from downstream Writer via {@link OffsetReportContext}
+ *   <li>Receives offset reports from downstream Writer via {@link ProducerOffsetReporter}
  *   <li>Snapshots state during checkpoints
  *   <li>Cleans up producer offsets after first checkpoint (Task0 only)
  *   <li>Passes through input elements unchanged
@@ -82,12 +79,12 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * failure scenarios.
  *
  * @param <IN> The type of input elements
- * @see OffsetReportContext
+ * @see ProducerOffsetReporter
  * @see RecoveryOffsetManager
  */
 @Internal
 public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
-        implements OneInputStreamOperator<IN, IN>, BoundedOneInput, OffsetReportContext {
+        implements OneInputStreamOperator<IN, IN>, BoundedOneInput, ProducerOffsetReporter {
 
     private static final long serialVersionUID = 1L;
 
@@ -135,6 +132,17 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     /** The polling interval in milliseconds for producer offsets synchronization. */
     private final long producerOffsetsPollIntervalMs;
 
+    /** The maximum total time in milliseconds to poll for producer offsets before giving up. */
+    private final long maxPollTimeoutMs;
+
+    /**
+     * The registry ID used to register/remove this operator in the static delegate registry.
+     *
+     * <p>This ID is passed from {@link UndoRecoveryOperatorFactory} and used by {@link #close()} to
+     * remove this operator from the registry by ID (O(1)) instead of by reference (O(n)).
+     */
+    private final String offsetReporterRegistryId;
+
     // ==================== State Fields ====================
 
     /** Union List State for storing bucket offsets across checkpoints. */
@@ -146,37 +154,11 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      * <p>This map is updated by the downstream SinkWriter via {@link #reportOffset(TableBucket,
      * long)} and is used to create WriterState during checkpoint snapshotting.
      *
-     * <p>Uses ConcurrentHashMap for thread-safe updates from async write callbacks.
-     *
-     * <p>Access to this map is protected by {@link #bucketOffsetsLock} to ensure consistent
-     * snapshots during checkpointing.
+     * <p>Uses ConcurrentHashMap for thread-safe updates from async write callbacks. The
+     * ConcurrentHashMap's native thread-safety is sufficient since {@code merge()} is atomic and
+     * {@code snapshotState()} runs on the mailbox thread (single-threaded context).
      */
-    private transient Map<TableBucket, Long> bucketOffsets;
-
-    /**
-     * Read-write lock for protecting access to {@link #bucketOffsets}.
-     *
-     * <p>This lock ensures thread-safe access between:
-     *
-     * <ul>
-     *   <li>Write operations: {@link #reportOffset(TableBucket, long)} called from async write
-     *       callbacks on multiple threads
-     *   <li>Read operations: {@link #snapshotState(StateSnapshotContext)} called from the
-     *       checkpoint thread to create a consistent snapshot
-     * </ul>
-     *
-     * <p>Using a read-write lock allows multiple concurrent offset reports (write lock) while
-     * ensuring exclusive access during snapshot creation (read lock for iteration).
-     *
-     * <p>Note: We use write lock for reportOffset and read lock for snapshotState because:
-     *
-     * <ul>
-     *   <li>reportOffset modifies the map (needs write lock)
-     *   <li>snapshotState only reads/iterates the map (needs read lock to prevent concurrent
-     *       modifications during iteration)
-     * </ul>
-     */
-    private transient ReadWriteLock bucketOffsetsLock;
+    private transient ConcurrentHashMap<TableBucket, Long> bucketOffsets;
 
     /** Flag indicating whether the producer offsets have been deleted after first checkpoint. */
     private transient boolean producerOffsetsDeleted;
@@ -223,6 +205,9 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      * @param isPartitioned whether the table is partitioned
      * @param producerId the producer ID for producer offset management (null to use Flink job ID)
      * @param producerOffsetsPollIntervalMs the polling interval for producer offsets
+     * @param maxPollTimeoutMs the maximum total time to poll for producer offsets
+     * @param offsetReporterRegistryId the registry ID for registering/removing in the delegate
+     *     registry
      */
     public UndoRecoveryOperator(
             StreamOperatorParameters<IN> parameters,
@@ -233,7 +218,9 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
             int numBuckets,
             boolean isPartitioned,
             @Nullable String producerId,
-            long producerOffsetsPollIntervalMs) {
+            long producerOffsetsPollIntervalMs,
+            long maxPollTimeoutMs,
+            String offsetReporterRegistryId) {
         super();
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
@@ -244,6 +231,8 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
         this.configuredProducerId =
                 producerId; // May be null, will be resolved in initializeState()
         this.producerOffsetsPollIntervalMs = producerOffsetsPollIntervalMs;
+        this.maxPollTimeoutMs = maxPollTimeoutMs;
+        this.offsetReporterRegistryId = offsetReporterRegistryId;
 
         // Call setup internally - this is allowed because we're inside the operator class
         this.setup(
@@ -304,10 +293,9 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
                     subtaskIndex);
             // Log detailed state content for debugging recovery issues
             for (WriterState state : recoveredState) {
-                LOG.info(
-                        "Subtask {} restored WriterState: checkpointId={}, bucketOffsets={}",
+                LOG.debug(
+                        "Subtask {} restored WriterState: bucketOffsets={}",
                         subtaskIndex,
-                        state.getCheckpointId(),
                         state.getBucketOffsets());
             }
         }
@@ -326,6 +314,7 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
                         subtaskIndex,
                         parallelism,
                         producerOffsetsPollIntervalMs,
+                        maxPollTimeoutMs,
                         tablePath,
                         table.getTableInfo());
 
@@ -338,18 +327,20 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
         if (decision.needsUndoRecovery()) {
             Map<TableBucket, UndoOffsets> undoOffsets = decision.getUndoOffsets();
             LOG.info(
-                    "Executing undo recovery for subtask {}: undoOffsets={}",
+                    "Executing undo recovery for subtask {}: {} buckets",
                     subtaskIndex,
-                    undoOffsets);
+                    undoOffsets.size());
+            LOG.debug("Subtask {} undoOffsets details: {}", subtaskIndex, undoOffsets);
 
             performUndoRecovery(undoOffsets);
 
             // Initialize bucket offsets with recovery offsets (checkpoint offsets)
             Map<TableBucket, Long> recoveryOffsets = decision.getRecoveryOffsets();
             LOG.info(
-                    "Subtask {} initializing bucketOffsets from recovery: {}",
+                    "Subtask {} initializing bucketOffsets from recovery: {} buckets",
                     subtaskIndex,
-                    recoveryOffsets);
+                    recoveryOffsets.size());
+            LOG.debug("Subtask {} recovery offsets details: {}", subtaskIndex, recoveryOffsets);
             initializeBucketOffsets(recoveryOffsets);
         } else {
             LOG.info("No undo recovery needed for subtask {}", subtaskIndex);
@@ -422,9 +413,6 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      * the producer offsets. This prevents data loss in case of failure between snapshotState and
      * checkpoint completion.
      *
-     * <p>Thread-safety: This method acquires a read lock on {@link #bucketOffsetsLock} to ensure a
-     * consistent snapshot of bucket offsets while allowing concurrent offset reports to complete.
-     *
      * @param context the state snapshot context containing checkpoint information
      * @throws Exception if snapshotting fails
      */
@@ -436,29 +424,25 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
         undoStateList.clear();
 
         // Add new state if bucket offsets is not empty
-        // Use read lock to get a consistent snapshot of bucket offsets
-        if (bucketOffsets != null && bucketOffsetsLock != null) {
-            bucketOffsetsLock.readLock().lock();
-            try {
-                if (!bucketOffsets.isEmpty()) {
-                    // Create a defensive copy while holding the lock
-                    WriterState state =
-                            new WriterState(
-                                    context.getCheckpointId(), new HashMap<>(bucketOffsets));
-                    undoStateList.add(state);
-                    LOG.info(
-                            "Subtask {} snapshot state at checkpoint {}: bucketOffsets={}",
-                            subtaskIndex,
-                            context.getCheckpointId(),
-                            bucketOffsets);
-                } else {
-                    LOG.info(
-                            "Subtask {} snapshot state at checkpoint {}: bucketOffsets is EMPTY",
-                            subtaskIndex,
-                            context.getCheckpointId());
-                }
-            } finally {
-                bucketOffsetsLock.readLock().unlock();
+        if (bucketOffsets != null) {
+            if (!bucketOffsets.isEmpty()) {
+                WriterState state = new WriterState(new HashMap<>(bucketOffsets));
+                undoStateList.add(state);
+                LOG.info(
+                        "Subtask {} snapshot state at checkpoint {}: {} buckets",
+                        subtaskIndex,
+                        context.getCheckpointId(),
+                        bucketOffsets.size());
+                LOG.debug(
+                        "Subtask {} checkpoint {} bucketOffsets details: {}",
+                        subtaskIndex,
+                        context.getCheckpointId(),
+                        bucketOffsets);
+            } else {
+                LOG.debug(
+                        "Subtask {} snapshot state at checkpoint {}: bucketOffsets is EMPTY",
+                        subtaskIndex,
+                        context.getCheckpointId());
             }
         }
     }
@@ -551,23 +535,28 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     /**
      * Called when the input is exhausted (for bounded streams).
      *
-     * <p>This is a no-op for the UndoRecoveryOperator as there is no buffered state to flush or
-     * finalize when the input ends.
+     * <p>Cleans up producer offsets in ZooKeeper to prevent stale entries from lingering. This is
+     * important for bounded jobs where {@link #notifyCheckpointComplete} may never be called (e.g.,
+     * checkpointing not enabled, or job finishes before the first checkpoint).
+     *
+     * <p>The cleanup is idempotent — {@link #deleteProducerOffsetsIfNeeded()} uses the {@code
+     * producerOffsetsDeleted} flag and Task0-only guard, so it's safe to call from both here and
+     * {@link #notifyCheckpointComplete}.
      *
      * @throws Exception if end input processing fails
      */
     @Override
     public void endInput() throws Exception {
-        // No-op - nothing to finalize when input ends
+        deleteProducerOffsetsIfNeeded();
     }
 
-    // ==================== OffsetReportContext Methods ====================
+    // ==================== ProducerOffsetReporter Methods ====================
 
     /**
      * Reports a written offset for a bucket.
      *
-     * <p>This method is called from async write callbacks on multiple threads, so thread-safety is
-     * critical. It uses a write lock to ensure exclusive access during the update operation.
+     * <p>This method is called from async write callbacks on multiple threads. Thread-safety is
+     * provided by the ConcurrentHashMap's atomic {@code merge()} operation.
      *
      * <p>The method updates the offset only if the new offset is greater than the existing one,
      * ensuring monotonically increasing offsets for each bucket.
@@ -577,19 +566,14 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      */
     @Override
     public void reportOffset(TableBucket bucket, long offset) {
-        if (bucketOffsets != null && bucketOffsetsLock != null) {
-            bucketOffsetsLock.writeLock().lock();
-            try {
-                bucketOffsets.merge(bucket, offset, Math::max);
-                if (LOG.isTraceEnabled()) {
-                    LOG.trace(
-                            "Reported offset {} for bucket {} (current max: {})",
-                            offset,
-                            bucket,
-                            bucketOffsets.get(bucket));
-                }
-            } finally {
-                bucketOffsetsLock.writeLock().unlock();
+        if (bucketOffsets != null) {
+            bucketOffsets.merge(bucket, offset, Math::max);
+            if (LOG.isTraceEnabled()) {
+                LOG.trace(
+                        "Reported offset {} for bucket {} (current max: {})",
+                        offset,
+                        bucket,
+                        bucketOffsets.get(bucket));
             }
         } else {
             LOG.warn(
@@ -618,9 +602,9 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     @Override
     public void close() throws Exception {
         // Remove this operator from the static DELEGATE_REGISTRY to prevent memory leaks.
-        // Each job submission registers entries in the registry via OffsetReportContextHolder,
+        // Each job submission registers entries in the registry via ProducerOffsetReporterHolder,
         // and without this cleanup, entries accumulate indefinitely in long-running clusters.
-        UndoRecoveryOperatorFactory.removeDelegate(this);
+        UndoRecoveryOperatorFactory.removeDelegate(offsetReporterRegistryId);
 
         // Close Table instance first (if created)
         if (table != null) {
@@ -690,6 +674,10 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
         return producerOffsetsPollIntervalMs;
     }
 
+    public long getMaxPollTimeoutMs() {
+        return maxPollTimeoutMs;
+    }
+
     @Nullable
     public Map<TableBucket, Long> getBucketOffsets() {
         return bucketOffsets;
@@ -701,7 +689,6 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      * @param initialOffsets the initial bucket offsets
      */
     protected void initializeBucketOffsets(Map<TableBucket, Long> initialOffsets) {
-        this.bucketOffsetsLock = new ReentrantReadWriteLock();
         this.bucketOffsets = MapUtils.newConcurrentHashMap();
         this.bucketOffsets.putAll(initialOffsets);
     }

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.sink.writer.undo;
+package org.apache.fluss.flink.sink.undo;
 
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.utils.ByteArrayWrapper;
@@ -43,6 +43,7 @@ public class BucketRecoveryContext {
     private final long logEndOffset;
 
     private final Set<ByteArrayWrapper> processedKeys;
+    private long lastProcessedOffset;
     private int totalRecordsProcessed;
 
     public BucketRecoveryContext(TableBucket bucket, long checkpointOffset, long logEndOffset) {
@@ -50,6 +51,7 @@ public class BucketRecoveryContext {
         this.checkpointOffset = checkpointOffset;
         this.logEndOffset = logEndOffset;
         this.processedKeys = new HashSet<>();
+        this.lastProcessedOffset = checkpointOffset - 1;
         this.totalRecordsProcessed = 0;
     }
 
@@ -78,13 +80,50 @@ public class BucketRecoveryContext {
         return checkpointOffset < logEndOffset;
     }
 
-    /** Records that a changelog record has been processed. */
-    public void recordProcessed() {
+    /**
+     * Checks if changelog scanning is complete for this bucket.
+     *
+     * <p>Complete means either:
+     *
+     * <ul>
+     *   <li>No recovery is needed (checkpointOffset >= logEndOffset), or
+     *   <li>The last processed offset has reached or passed logEndOffset - 1 (lastProcessedOffset
+     *       >= logEndOffset - 1)
+     * </ul>
+     *
+     * <p>TODO: This offset-based completion detection cannot handle the case where all
+     * LogRecordBatches between checkpointOffset and logEndOffset are empty (contain no user
+     * records). In that scenario, lastProcessedOffset will never advance and isComplete() will
+     * never return true, causing the recovery to rely on the timeout mechanism in
+     * UndoRecoveryExecutor. A future improvement is to implement bounded subscription mode in
+     * LogScanner, which will allow the scanner to signal completion directly, and this logic should
+     * be refactored accordingly.
+     *
+     * @return true if changelog scanning is complete
+     */
+    public boolean isComplete() {
+        if (!needsRecovery()) {
+            return true;
+        }
+        return lastProcessedOffset >= logEndOffset - 1;
+    }
+
+    /**
+     * Records that a changelog record has been processed.
+     *
+     * @param offset the offset of the processed record
+     */
+    public void recordProcessed(long offset) {
+        lastProcessedOffset = offset;
         totalRecordsProcessed++;
     }
 
     public int getTotalRecordsProcessed() {
         return totalRecordsProcessed;
+    }
+
+    public long getLastProcessedOffset() {
+        return lastProcessedOffset;
     }
 
     @Override
@@ -98,6 +137,8 @@ public class BucketRecoveryContext {
                 + logEndOffset
                 + ", processedKeys="
                 + processedKeys.size()
+                + ", complete="
+                + isComplete()
                 + '}';
     }
 }

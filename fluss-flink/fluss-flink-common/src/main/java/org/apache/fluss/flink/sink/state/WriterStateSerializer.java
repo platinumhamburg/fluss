@@ -22,10 +22,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.flink.api.common.typeutils.SimpleTypeSerializerSnapshot;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.TypeSerializerSnapshot;
-import org.apache.flink.core.io.SimpleVersionedSerializer;
-import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataInputView;
-import org.apache.flink.core.memory.DataOutputSerializer;
 import org.apache.flink.core.memory.DataOutputView;
 
 import java.io.IOException;
@@ -33,17 +30,14 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * A serializer for {@link WriterState} that implements both {@link SimpleVersionedSerializer} and
- * {@link TypeSerializer}.
+ * A {@link TypeSerializer} for {@link WriterState}.
  *
- * <p>This serializer implements {@link SimpleVersionedSerializer} for use with Flink's {@code
- * SupportsWriterState} interface (Flink 1.19+), and also extends {@link TypeSerializer} for
- * backward compatibility with Flink 1.18's {@code ListStateDescriptor}.
+ * <p>This serializer extends {@link TypeSerializer} for use with Flink's {@code
+ * ListStateDescriptor} in Union List State.
  *
  * <p>Serialization format:
  *
  * <ul>
- *   <li>long: checkpoint ID
  *   <li>int: number of bucket offsets
  *   <li>For each bucket offset:
  *       <ul>
@@ -58,39 +52,9 @@ import java.util.Map;
  * <p>This serializer uses a stable binary format that supports both partitioned and non-partitioned
  * tables via {@link TableBucket}.
  */
-public class WriterStateSerializer extends TypeSerializer<WriterState>
-        implements SimpleVersionedSerializer<WriterState> {
+public class WriterStateSerializer extends TypeSerializer<WriterState> {
 
     private static final long serialVersionUID = 1L;
-
-    /** The current version of the serialization format. */
-    private static final int CURRENT_VERSION = 1;
-
-    // -------------------------------------------------------------------------
-    //  SimpleVersionedSerializer methods
-    // -------------------------------------------------------------------------
-
-    @Override
-    public int getVersion() {
-        return CURRENT_VERSION;
-    }
-
-    @Override
-    public byte[] serialize(WriterState state) throws IOException {
-        DataOutputSerializer out = new DataOutputSerializer(256);
-        serialize(state, out);
-        return out.getCopyOfBuffer();
-    }
-
-    @Override
-    public WriterState deserialize(int version, byte[] serialized) throws IOException {
-        if (version != CURRENT_VERSION) {
-            throw new IOException(
-                    "Unrecognized version: " + version + ". Expected version: " + CURRENT_VERSION);
-        }
-        DataInputDeserializer in = new DataInputDeserializer(serialized);
-        return deserialize(in);
-    }
 
     // -------------------------------------------------------------------------
     //  TypeSerializer methods
@@ -110,7 +74,7 @@ public class WriterStateSerializer extends TypeSerializer<WriterState>
 
     @Override
     public WriterState createInstance() {
-        return WriterState.empty(0);
+        return WriterState.empty();
     }
 
     @Override
@@ -133,7 +97,6 @@ public class WriterStateSerializer extends TypeSerializer<WriterState>
 
     @Override
     public void serialize(WriterState record, DataOutputView target) throws IOException {
-        target.writeLong(record.getCheckpointId());
         Map<TableBucket, Long> bucketOffsets = record.getBucketOffsets();
         target.writeInt(bucketOffsets.size());
         for (Map.Entry<TableBucket, Long> entry : bucketOffsets.entrySet()) {
@@ -150,7 +113,6 @@ public class WriterStateSerializer extends TypeSerializer<WriterState>
 
     @Override
     public WriterState deserialize(DataInputView source) throws IOException {
-        long checkpointId = source.readLong();
         int size = source.readInt();
         Map<TableBucket, Long> bucketOffsets = new HashMap<>(size);
         for (int i = 0; i < size; i++) {
@@ -161,7 +123,7 @@ public class WriterStateSerializer extends TypeSerializer<WriterState>
             long offset = source.readLong();
             bucketOffsets.put(new TableBucket(tableId, partitionId, bucketId), offset);
         }
-        return new WriterState(checkpointId, bucketOffsets);
+        return new WriterState(bucketOffsets);
     }
 
     @Override
@@ -172,8 +134,6 @@ public class WriterStateSerializer extends TypeSerializer<WriterState>
 
     @Override
     public void copy(DataInputView source, DataOutputView target) throws IOException {
-        // Copy checkpoint ID
-        target.writeLong(source.readLong());
         // Copy bucket offsets size
         int size = source.readInt();
         target.writeInt(size);

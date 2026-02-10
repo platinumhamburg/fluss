@@ -19,7 +19,6 @@ package org.apache.fluss.flink.sink.undo;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.flink.sink.writer.RecoveryOffsetManager;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.types.RowType;
@@ -51,15 +50,15 @@ import static org.apache.fluss.utils.MapUtils.newConcurrentHashMap;
  * chaining. This allows the UndoRecoveryOperator to be chained with downstream operators (like the
  * SinkWriter) for better performance by reducing serialization overhead and network communication.
  *
- * <p><b>OffsetReportContext:</b> The factory creates a shared {@link OffsetReportContextHolder}
- * that acts as a bridge between the factory and the operator. The holder is passed to the
- * downstream SinkWriter via {@link #getOffsetReportContext()}, and when the operator is created at
- * runtime, it registers itself with the holder. This enables the SinkWriter to report written
- * offsets back to the operator for state tracking.
+ * <p><b>ProducerOffsetReporter:</b> The factory creates a shared {@link
+ * ProducerOffsetReporterHolder} that acts as a bridge between the factory and the operator. The
+ * holder is passed to the downstream SinkWriter via {@link #getProducerOffsetReporter()}, and when
+ * the operator is created at runtime, it registers itself with the holder. This enables the
+ * SinkWriter to report written offsets back to the operator for state tracking.
  *
  * @param <IN> The type of input elements
  * @see UndoRecoveryOperator
- * @see OffsetReportContext
+ * @see ProducerOffsetReporter
  */
 @Internal
 public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFactory<IN>
@@ -98,16 +97,19 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
     /** The polling interval in milliseconds for producer offsets synchronization. */
     private final long producerOffsetsPollIntervalMs;
 
+    /** The maximum total time in milliseconds to poll for producer offsets before giving up. */
+    private final long maxPollTimeoutMs;
+
     // ==================== Runtime Fields ====================
 
     /**
-     * The shared OffsetReportContext holder.
+     * The shared ProducerOffsetReporter holder.
      *
      * <p>This holder is created in the constructor and passed to both the downstream SinkWriter
-     * (via {@link #getOffsetReportContext()}) and the operator (when created at runtime). The
+     * (via {@link #getProducerOffsetReporter()}) and the operator (when created at runtime). The
      * holder delegates offset reports to the actual operator once it's registered.
      */
-    private final OffsetReportContextHolder offsetReportContextHolder;
+    private final ProducerOffsetReporterHolder offsetReporterHolder;
 
     // ==================== Constructors ====================
 
@@ -138,7 +140,8 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
                 numBuckets,
                 isPartitioned,
                 producerId,
-                RecoveryOffsetManager.DEFAULT_PRODUCER_OFFSETS_POLL_INTERVAL_MS);
+                RecoveryOffsetManager.DEFAULT_PRODUCER_OFFSETS_POLL_INTERVAL_MS,
+                RecoveryOffsetManager.DEFAULT_MAX_POLL_TIMEOUT_MS);
     }
 
     /**
@@ -155,6 +158,7 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
      * @param isPartitioned whether the table is partitioned
      * @param producerId the producer ID for producer offset management (null to use Flink job ID)
      * @param producerOffsetsPollIntervalMs the polling interval for producer offsets
+     * @param maxPollTimeoutMs the maximum total time to poll for producer offsets
      */
     public UndoRecoveryOperatorFactory(
             TablePath tablePath,
@@ -164,7 +168,8 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
             int numBuckets,
             boolean isPartitioned,
             @Nullable String producerId,
-            long producerOffsetsPollIntervalMs) {
+            long producerOffsetsPollIntervalMs,
+            long maxPollTimeoutMs) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableRowType = tableRowType;
@@ -173,9 +178,10 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
         this.isPartitioned = isPartitioned;
         this.producerId = producerId;
         this.producerOffsetsPollIntervalMs = producerOffsetsPollIntervalMs;
+        this.maxPollTimeoutMs = maxPollTimeoutMs;
 
         // Create the shared holder that will be passed to both the writer and the operator
-        this.offsetReportContextHolder = new OffsetReportContextHolder();
+        this.offsetReporterHolder = new ProducerOffsetReporterHolder();
 
         // Set chaining strategy to ALWAYS to enable operator chaining
         // This allows the UndoRecoveryOperator to be chained with downstream operators
@@ -188,8 +194,8 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
      * Creates a new {@link UndoRecoveryOperator} instance.
      *
      * <p>This method is called by Flink's runtime to create the operator instance. The created
-     * operator is registered with the {@link OffsetReportContextHolder} so that offset reports from
-     * the downstream SinkWriter are forwarded to the operator.
+     * operator is registered with the {@link ProducerOffsetReporterHolder} so that offset reports
+     * from the downstream SinkWriter are forwarded to the operator.
      *
      * @param parameters the stream operator parameters from Flink runtime
      * @param <T> the type of the stream operator
@@ -208,10 +214,13 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
                         numBuckets,
                         isPartitioned,
                         producerId,
-                        producerOffsetsPollIntervalMs);
+                        producerOffsetsPollIntervalMs,
+                        maxPollTimeoutMs,
+                        offsetReporterHolder.getHolderId());
 
-        // Register the operator with the holder so offset reports are forwarded
-        offsetReportContextHolder.setDelegate(operator);
+        // Register the operator with the static registry so offset reports are forwarded
+        registerDelegate(offsetReporterHolder.getHolderId(), operator);
+        offsetReporterHolder.cachedDelegate = operator;
 
         @SuppressWarnings("unchecked")
         final T castedOperator = (T) operator;
@@ -234,12 +243,12 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
     // ==================== Getters ====================
 
     /**
-     * Returns the OffsetReportContext that can be passed to the downstream SinkWriter.
+     * Returns the ProducerOffsetReporter that can be passed to the downstream SinkWriter.
      *
-     * @return the OffsetReportContext holder
+     * @return the ProducerOffsetReporter holder
      */
-    public OffsetReportContext getOffsetReportContext() {
-        return offsetReportContextHolder;
+    public ProducerOffsetReporter getProducerOffsetReporter() {
+        return offsetReporterHolder;
     }
 
     public TablePath getTablePath() {
@@ -276,17 +285,34 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
         return producerOffsetsPollIntervalMs;
     }
 
+    public long getMaxPollTimeoutMs() {
+        return maxPollTimeoutMs;
+    }
+
     /**
-     * Removes a delegate from the static DELEGATE_REGISTRY by reference.
+     * Registers a delegate in the static DELEGATE_REGISTRY by holder ID.
+     *
+     * <p>This is called by {@link UndoRecoveryOperator} during initialization to register itself so
+     * that offset reports from the downstream SinkWriter are forwarded to the operator.
+     *
+     * @param holderId the holder ID to register under
+     * @param delegate the delegate to register
+     */
+    public static void registerDelegate(String holderId, ProducerOffsetReporter delegate) {
+        ProducerOffsetReporterHolder.registerDelegate(holderId, delegate);
+    }
+
+    /**
+     * Removes a delegate from the static DELEGATE_REGISTRY by holder ID.
      *
      * <p>This should be called by {@link UndoRecoveryOperator#close()} to prevent memory leaks.
      * Without this cleanup, the static registry accumulates entries indefinitely as jobs are
      * submitted to long-running Flink clusters.
      *
-     * @param delegate the delegate to remove from the registry
+     * @param holderId the holder ID to remove
      */
-    public static void removeDelegate(OffsetReportContext delegate) {
-        OffsetReportContextHolder.removeDelegate(delegate);
+    public static void removeDelegate(String holderId) {
+        ProducerOffsetReporterHolder.removeDelegate(holderId);
     }
 
     // ==================== Inner Classes ====================
@@ -296,8 +322,8 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
      *
      * <p>This holder is created during job construction and passed to the downstream SinkWriter.
      * When the operator is created at runtime, it registers itself with the holder via {@link
-     * #setDelegate(OffsetReportContext)}. Offset reports from the SinkWriter are then forwarded to
-     * the actual operator.
+     * #setDelegate(ProducerOffsetReporter)}. Offset reports from the SinkWriter are then forwarded
+     * to the actual operator.
      *
      * <p><b>Serialization Note:</b> This holder uses a static registry to maintain the connection
      * between the operator and writer across serialization boundaries. The holder is identified by
@@ -305,11 +331,13 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
      * registers itself in the static registry. When the writer calls reportOffset(), the holder
      * looks up the delegate from the registry.
      */
-    private static class OffsetReportContextHolder implements OffsetReportContext, Serializable {
+    private static class ProducerOffsetReporterHolder
+            implements ProducerOffsetReporter, Serializable {
 
         private static final long serialVersionUID = 1L;
 
-        private static final Logger LOG = LoggerFactory.getLogger(OffsetReportContextHolder.class);
+        private static final Logger LOG =
+                LoggerFactory.getLogger(ProducerOffsetReporterHolder.class);
 
         /**
          * Static registry mapping holder IDs to their delegates.
@@ -318,33 +346,43 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
          * across serialization boundaries. The holder stores its ID, and when reportOffset() is
          * called, it looks up the delegate from this registry.
          */
-        private static final Map<String, OffsetReportContext> DELEGATE_REGISTRY =
+        private static final Map<String, ProducerOffsetReporter> DELEGATE_REGISTRY =
                 newConcurrentHashMap();
 
         /** Unique ID for this holder, used to look up the delegate in the registry. */
         private final String holderId;
 
-        /** Local delegate reference (set when operator is created in the same JVM). */
-        @Nullable private transient OffsetReportContext localDelegate;
+        /**
+         * Cached delegate reference for hot-path optimization.
+         *
+         * <p>This volatile field caches the delegate after the first successful lookup from the
+         * registry, avoiding repeated ConcurrentHashMap lookups on every {@link #reportOffset}
+         * call. The field is volatile to ensure visibility across threads (async write callbacks).
+         *
+         * <p>Before serialization (same JVM): set directly by {@link #registerDelegate}. After
+         * deserialization (different JVM): populated on first {@link #reportOffset} call from the
+         * registry lookup.
+         */
+        @Nullable private transient volatile ProducerOffsetReporter cachedDelegate;
 
-        OffsetReportContextHolder() {
+        ProducerOffsetReporterHolder() {
             this.holderId = UUID.randomUUID().toString();
-            LOG.debug("Created OffsetReportContextHolder with ID: {}", holderId);
+            LOG.debug("Created ProducerOffsetReporterHolder with ID: {}", holderId);
         }
 
-        void setDelegate(OffsetReportContext delegate) {
-            this.localDelegate = delegate;
-            DELEGATE_REGISTRY.put(holderId, delegate);
-            LOG.debug("Registered delegate for holder ID: {}", holderId);
+        String getHolderId() {
+            return holderId;
         }
 
         @Override
         public void reportOffset(TableBucket bucket, long offset) {
-            // First try local delegate (same JVM, no serialization)
-            OffsetReportContext delegate = localDelegate;
+            ProducerOffsetReporter delegate = cachedDelegate;
             if (delegate == null) {
-                // Fall back to registry lookup (after serialization)
+                // After deserialization, cache from registry on first call
                 delegate = DELEGATE_REGISTRY.get(holderId);
+                if (delegate != null) {
+                    cachedDelegate = delegate;
+                }
             }
             if (delegate != null) {
                 delegate.reportOffset(bucket, offset);
@@ -357,17 +395,24 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
         }
 
         /**
-         * Removes a delegate from the registry by its reference.
+         * Registers a delegate in the static registry by holder ID.
          *
-         * <p>This is called by {@link UndoRecoveryOperator#close()} to prevent memory leaks in the
-         * static DELEGATE_REGISTRY. Since the operator does not know the holder ID, it removes
-         * itself by value.
-         *
-         * @param delegate the delegate to remove from the registry
+         * @param holderId the holder ID to register under
+         * @param delegate the delegate to register
          */
-        static void removeDelegate(OffsetReportContext delegate) {
-            DELEGATE_REGISTRY.values().remove(delegate);
-            LOG.debug("Removed delegate from registry by reference: {}", delegate);
+        static void registerDelegate(String holderId, ProducerOffsetReporter delegate) {
+            DELEGATE_REGISTRY.put(holderId, delegate);
+            LOG.debug("Registered delegate for holder ID: {}", holderId);
+        }
+
+        /**
+         * Removes a delegate from the static registry by holder ID.
+         *
+         * @param holderId the holder ID to remove
+         */
+        static void removeDelegate(String holderId) {
+            DELEGATE_REGISTRY.remove(holderId);
+            LOG.debug("Removed delegate for holder ID: {}", holderId);
         }
     }
 }

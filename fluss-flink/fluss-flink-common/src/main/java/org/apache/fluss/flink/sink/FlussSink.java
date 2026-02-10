@@ -24,8 +24,6 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.flink.streaming.api.connector.sink2.SupportsPreWriteTopology;
 import org.apache.flink.streaming.api.datastream.DataStream;
 
-import javax.annotation.Nullable;
-
 /**
  * FlussSink is a specialized Flink sink for writing data to Fluss.
  *
@@ -42,27 +40,20 @@ public class FlussSink<InputT> extends FlinkSink<InputT>
     private static final long serialVersionUID = 1L;
 
     /**
-     * Constructs a FlussSink with the given SinkWriterBuilder and undo recovery flag.
+     * Constructs a FlussSink with the given SinkWriterBuilder.
      *
      * @param builder the builder used to create the sink writer
      * @param tablePath the table path
-     * @param enableUndoRecovery whether to enable undo recovery for aggregation tables
      */
     FlussSink(
             SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
-            TablePath tablePath,
-            boolean enableUndoRecovery,
-            @Nullable String producerId) {
-        super(builder, tablePath, enableUndoRecovery, producerId);
+            TablePath tablePath) {
+        super(builder, tablePath);
     }
 
     @Override
     public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-        // First apply the builder's pre-write topology (e.g., bucket shuffle)
-        DataStream<InputT> stream = builder.addPreWriteTopology(input);
-
-        // Add UndoRecoveryOperator for aggregation tables (reuse parent's method)
-        return addUndoRecoveryOperatorIfNeeded(stream);
+        return builder.addPreWriteTopology(input);
     }
 
     /**

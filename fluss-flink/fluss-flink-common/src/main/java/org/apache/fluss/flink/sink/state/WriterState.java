@@ -39,9 +39,6 @@ public class WriterState implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    /** The checkpoint ID when this state was snapshot. */
-    private final long checkpointId;
-
     /**
      * Map from TableBucket to the last successfully written changelog offset.
      *
@@ -53,11 +50,7 @@ public class WriterState implements Serializable {
      */
     private final Map<TableBucket, Long> bucketOffsets;
 
-    public WriterState(long checkpointId, Map<TableBucket, Long> bucketOffsets) {
-        if (checkpointId < 0) {
-            throw new IllegalArgumentException(
-                    "checkpointId must be non-negative: " + checkpointId);
-        }
+    public WriterState(Map<TableBucket, Long> bucketOffsets) {
         if (bucketOffsets == null) {
             throw new IllegalArgumentException("bucketOffsets must not be null");
         }
@@ -73,12 +66,7 @@ public class WriterState implements Serializable {
                         "Invalid offset for bucket " + entry.getKey() + ": " + entry.getValue());
             }
         }
-        this.checkpointId = checkpointId;
         this.bucketOffsets = Collections.unmodifiableMap(new HashMap<>(bucketOffsets));
-    }
-
-    public long getCheckpointId() {
-        return checkpointId;
     }
 
     public Map<TableBucket, Long> getBucketOffsets() {
@@ -90,13 +78,12 @@ public class WriterState implements Serializable {
     }
 
     /**
-     * Create an empty writer state for the given checkpoint ID.
+     * Create an empty writer state.
      *
-     * @param checkpointId the checkpoint ID
      * @return an empty writer state
      */
-    public static WriterState empty(long checkpointId) {
-        return new WriterState(checkpointId, Collections.emptyMap());
+    public static WriterState empty() {
+        return new WriterState(Collections.emptyMap());
     }
 
     @Override
@@ -108,22 +95,16 @@ public class WriterState implements Serializable {
             return false;
         }
         WriterState that = (WriterState) o;
-        return checkpointId == that.checkpointId
-                && Objects.equals(bucketOffsets, that.bucketOffsets);
+        return Objects.equals(bucketOffsets, that.bucketOffsets);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(checkpointId, bucketOffsets);
+        return Objects.hash(bucketOffsets);
     }
 
     @Override
     public String toString() {
-        return "WriterState{"
-                + "checkpointId="
-                + checkpointId
-                + ", bucketOffsets="
-                + bucketOffsets
-                + '}';
+        return "WriterState{" + "bucketOffsets=" + bucketOffsets + '}';
     }
 }

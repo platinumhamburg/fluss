@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.sink.writer;
+package org.apache.fluss.flink.sink.undo;
 
 import org.apache.fluss.client.admin.ListOffsetsResult;
 import org.apache.fluss.client.admin.OffsetSpec;
@@ -104,7 +104,8 @@ public class RecoveryOffsetManagerTest {
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
         TableInfo tableInfo = createTableInfo(2, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Execute: empty checkpoint (checkpoint exists but no data written)
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -127,11 +128,12 @@ public class RecoveryOffsetManagerTest {
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
         TableInfo tableInfo = createTableInfo(2, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Checkpoint offsets match current
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>(currentOffsets);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -156,13 +158,14 @@ public class RecoveryOffsetManagerTest {
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
         TableInfo tableInfo = createTableInfo(2, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Checkpoint offsets are behind current
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
         checkpointOffsets.put(new TableBucket(TABLE_ID, 1), 200L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -178,35 +181,54 @@ public class RecoveryOffsetManagerTest {
     }
 
     @Test
-    void testCheckpointRecoveryMergesMultipleStates() throws Exception {
-        // Setup
+    void testCheckpointRecoveryWithRescaling() throws Exception {
+        // Simulates rescaling from parallelism=4 to parallelism=4 with state redistribution.
+        // Previously each subtask had one unique bucket. After rescaling, Flink may redistribute
+        // all 4 states to subtask 0. The manager should filter by bucket assignment and only
+        // return the bucket assigned to this subtask.
+
+        // Setup: 4 buckets, all with data ahead of checkpoint
         Map<TableBucket, Long> currentOffsets = new HashMap<>();
         currentOffsets.put(new TableBucket(TABLE_ID, 0), 200L);
+        currentOffsets.put(new TableBucket(TABLE_ID, 1), 300L);
+        currentOffsets.put(new TableBucket(TABLE_ID, 2), 400L);
+        currentOffsets.put(new TableBucket(TABLE_ID, 3), 500L);
 
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
-        TableInfo tableInfo = createTableInfo(1, false);
+        TableInfo tableInfo = createTableInfo(4, false);
+        // subtaskIndex=0, parallelism=4: only bucket 0 assigned (0 % 4 = 0)
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 4, 10L, 5000L, TABLE_PATH, tableInfo);
 
-        // Two states with different offsets for same bucket (simulates rescaling)
+        // 4 distinct states from previous subtasks, each with a unique bucket
+        Map<TableBucket, Long> offsets0 = new HashMap<>();
+        offsets0.put(new TableBucket(TABLE_ID, 0), 100L);
+        WriterState state0 = new WriterState(offsets0);
+
         Map<TableBucket, Long> offsets1 = new HashMap<>();
-        offsets1.put(new TableBucket(TABLE_ID, 0), 100L);
-        WriterState state1 = new WriterState(1L, offsets1);
+        offsets1.put(new TableBucket(TABLE_ID, 1), 150L);
+        WriterState state1 = new WriterState(offsets1);
 
         Map<TableBucket, Long> offsets2 = new HashMap<>();
-        offsets2.put(new TableBucket(TABLE_ID, 0), 150L);
-        WriterState state2 = new WriterState(1L, offsets2);
+        offsets2.put(new TableBucket(TABLE_ID, 2), 200L);
+        WriterState state2 = new WriterState(offsets2);
 
-        // Execute
+        Map<TableBucket, Long> offsets3 = new HashMap<>();
+        offsets3.put(new TableBucket(TABLE_ID, 3), 250L);
+        WriterState state3 = new WriterState(offsets3);
+
+        // Execute: subtask 0 receives all 4 states after rescaling
         RecoveryOffsetManager.RecoveryDecision decision =
-                manager.determineRecoveryStrategy(Arrays.asList(state1, state2));
+                manager.determineRecoveryStrategy(Arrays.asList(state0, state1, state2, state3));
 
-        // Verify: should take max(100, 150) = 150
+        // Verify: only bucket 0 is assigned to subtask 0 (0 % 4 = 0)
         assertThat(decision.getStrategy())
                 .isEqualTo(RecoveryOffsetManager.RecoveryStrategy.CHECKPOINT_RECOVERY);
         assertThat(decision.needsUndoRecovery()).isTrue();
         assertThat(decision.getRecoveryOffsets()).hasSize(1);
-        assertThat(decision.getRecoveryOffsets().get(new TableBucket(TABLE_ID, 0))).isEqualTo(150L);
+        assertThat(decision.getRecoveryOffsets()).containsKey(new TableBucket(TABLE_ID, 0));
+        assertThat(decision.getRecoveryOffsets().get(new TableBucket(TABLE_ID, 0))).isEqualTo(100L);
     }
 
     @Test
@@ -219,12 +241,13 @@ public class RecoveryOffsetManagerTest {
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
         TableInfo tableInfo = createTableInfo(2, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Checkpoint only has bucket 0
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -254,7 +277,8 @@ public class RecoveryOffsetManagerTest {
 
         TableInfo tableInfo = createTableInfo(1, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Execute: null means no checkpoint
         RecoveryOffsetManager.RecoveryDecision decision = manager.determineRecoveryStrategy(null);
@@ -288,7 +312,8 @@ public class RecoveryOffsetManagerTest {
         TableInfo tableInfo = createTableInfo(2, false);
         // subtaskIndex=1, parallelism=2: bucket 1 assigned
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 1, 2, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 1, 2, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision = manager.determineRecoveryStrategy(null);
@@ -314,7 +339,8 @@ public class RecoveryOffsetManagerTest {
 
         TableInfo tableInfo = createTableInfo(1, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision = manager.determineRecoveryStrategy(null);
@@ -339,13 +365,14 @@ public class RecoveryOffsetManagerTest {
         TableInfo tableInfo = createTableInfo(3, false);
         // subtask 0 with parallelism 3: only bucket 0 assigned (0 % 3 = 0)
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 3, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 3, 10L, 5000L, TABLE_PATH, tableInfo);
 
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
         checkpointOffsets.put(new TableBucket(TABLE_ID, 1), 200L);
         checkpointOffsets.put(new TableBucket(TABLE_ID, 2), 300L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -371,12 +398,13 @@ public class RecoveryOffsetManagerTest {
         TableInfo tableInfo = createTableInfo(2, false);
         // subtask 2 with parallelism 4: no buckets assigned
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 2, 4, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 2, 4, 10L, 5000L, TABLE_PATH, tableInfo);
 
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 0), 50L);
         checkpointOffsets.put(new TableBucket(TABLE_ID, 1), 100L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -406,12 +434,13 @@ public class RecoveryOffsetManagerTest {
 
         TableInfo tableInfo = createTableInfo(1, true);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 1L, 0), 100L);
         checkpointOffsets.put(new TableBucket(TABLE_ID, 2L, 0), 200L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -443,12 +472,13 @@ public class RecoveryOffsetManagerTest {
 
         TableInfo tableInfo = createTableInfo(1, true);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Checkpoint only has partition 1
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 1L, 0), 100L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute
         RecoveryOffsetManager.RecoveryDecision decision =
@@ -484,7 +514,8 @@ public class RecoveryOffsetManagerTest {
 
         TableInfo tableInfo = createTableInfo(1, true);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Execute: null means no checkpoint (producer offset recovery)
         RecoveryOffsetManager.RecoveryDecision decision = manager.determineRecoveryStrategy(null);
@@ -506,6 +537,38 @@ public class RecoveryOffsetManagerTest {
     // ==================== Error Handling Tests ====================
 
     @Test
+    void testTableRecreatedThrowsException() throws Exception {
+        // Simulates: savepoint → drop table → re-create table → restore from savepoint.
+        // The checkpoint state contains buckets with the old table ID (TABLE_ID=1),
+        // but the re-created table has a new table ID (NEW_TABLE_ID=999).
+        long oldTableId = TABLE_ID;
+        long newTableId = 999L;
+
+        // Setup: re-created table with new tableId, current offsets are 0 (fresh table)
+        Map<TableBucket, Long> currentOffsets = new HashMap<>();
+        currentOffsets.put(new TableBucket(newTableId, 0), 0L);
+
+        RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
+        // Use the package-private constructor to set the new tableId directly
+        RecoveryOffsetManager manager =
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, newTableId, 1, false);
+
+        // Checkpoint state from before table was dropped (old tableId)
+        Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
+        checkpointOffsets.put(new TableBucket(oldTableId, 0), 100L);
+        WriterState state = new WriterState(checkpointOffsets);
+
+        // Execute & Verify: should detect table re-creation and throw
+        assertThatThrownBy(
+                        () -> manager.determineRecoveryStrategy(Collections.singletonList(state)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("re-created")
+                .hasMessageContaining(String.valueOf(oldTableId))
+                .hasMessageContaining(String.valueOf(newTableId));
+    }
+
+    @Test
     void testDataInconsistencyThrowsException() throws Exception {
         // Setup: checkpoint offset > current offset (data loss)
         Map<TableBucket, Long> currentOffsets = new HashMap<>();
@@ -514,11 +577,12 @@ public class RecoveryOffsetManagerTest {
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
         TableInfo tableInfo = createTableInfo(1, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 0), 100L); // checkpoint > current
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute & Verify
         assertThatThrownBy(
@@ -535,11 +599,12 @@ public class RecoveryOffsetManagerTest {
 
         TableInfo tableInfo = createTableInfo(1, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute & Verify
         assertThatThrownBy(
@@ -560,11 +625,12 @@ public class RecoveryOffsetManagerTest {
 
         TableInfo tableInfo = createTableInfo(1, true);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         Map<TableBucket, Long> checkpointOffsets = new HashMap<>();
         checkpointOffsets.put(new TableBucket(TABLE_ID, 1L, 0), 50L);
-        WriterState state = new WriterState(1L, checkpointOffsets);
+        WriterState state = new WriterState(checkpointOffsets);
 
         // Execute & Verify
         assertThatThrownBy(
@@ -582,7 +648,8 @@ public class RecoveryOffsetManagerTest {
         RecoveryTestAdmin admin = new RecoveryTestAdmin(new HashMap<>());
         TableInfo tableInfo = createTableInfo(1, false);
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 0, 1, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 0, 1, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Execute
         manager.cleanupOffsets();
@@ -599,7 +666,8 @@ public class RecoveryOffsetManagerTest {
         TableInfo tableInfo = createTableInfo(1, false);
         // subtaskIndex=1 (non-Task0)
         RecoveryOffsetManager manager =
-                new RecoveryOffsetManager(admin, PRODUCER_ID, 1, 2, 10L, TABLE_PATH, tableInfo);
+                new RecoveryOffsetManager(
+                        admin, PRODUCER_ID, 1, 2, 10L, 5000L, TABLE_PATH, tableInfo);
 
         // Execute
         manager.cleanupOffsets();

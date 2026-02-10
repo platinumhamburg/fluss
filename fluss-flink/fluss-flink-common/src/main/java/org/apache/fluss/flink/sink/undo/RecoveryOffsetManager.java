@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.sink.writer;
+package org.apache.fluss.flink.sink.undo;
 
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.admin.ListOffsetsResult;
@@ -24,7 +24,7 @@ import org.apache.fluss.client.admin.ProducerOffsetsResult;
 import org.apache.fluss.client.admin.RegisterResult;
 import org.apache.fluss.flink.sink.ChannelComputer;
 import org.apache.fluss.flink.sink.state.WriterState;
-import org.apache.fluss.flink.sink.writer.undo.UndoRecoveryManager.UndoOffsets;
+import org.apache.fluss.flink.sink.undo.UndoRecoveryManager.UndoOffsets;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -67,11 +67,15 @@ public class RecoveryOffsetManager {
 
     public static final long DEFAULT_PRODUCER_OFFSETS_POLL_INTERVAL_MS = 100;
 
+    /** Default maximum total time to poll for producer offsets before giving up (5 minutes). */
+    public static final long DEFAULT_MAX_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+
     private final Admin admin;
     private final String producerId;
     private final int subtaskIndex;
     private final int parallelism;
     private final long pollIntervalMs;
+    private final long maxPollTimeoutMs;
     private final TablePath tablePath;
     private final long tableId;
 
@@ -151,6 +155,7 @@ public class RecoveryOffsetManager {
             int subtaskIndex,
             int parallelism,
             long pollIntervalMs,
+            long maxPollTimeoutMs,
             TablePath tablePath,
             TableInfo tableInfo) {
         this(
@@ -159,10 +164,11 @@ public class RecoveryOffsetManager {
                 subtaskIndex,
                 parallelism,
                 pollIntervalMs,
+                maxPollTimeoutMs,
                 tablePath,
-                tableInfo != null ? tableInfo.getTableId() : -1,
-                tableInfo != null ? tableInfo.getNumBuckets() : 0,
-                tableInfo != null && tableInfo.isPartitioned());
+                tableInfo.getTableId(),
+                tableInfo.getNumBuckets(),
+                tableInfo.isPartitioned());
     }
 
     /** Package-private constructor for testing without TableInfo dependency. */
@@ -172,6 +178,7 @@ public class RecoveryOffsetManager {
             int subtaskIndex,
             int parallelism,
             long pollIntervalMs,
+            long maxPollTimeoutMs,
             TablePath tablePath,
             long tableId,
             int numBuckets,
@@ -181,6 +188,7 @@ public class RecoveryOffsetManager {
         this.subtaskIndex = subtaskIndex;
         this.parallelism = parallelism;
         this.pollIntervalMs = pollIntervalMs;
+        this.maxPollTimeoutMs = maxPollTimeoutMs;
         this.tablePath = tablePath;
         this.tableId = tableId;
         this.isPartitioned = isPartitioned;
@@ -207,6 +215,11 @@ public class RecoveryOffsetManager {
         boolean hasCheckpoint = recoveredState != null && !recoveredState.isEmpty();
         Map<TableBucket, Long> recoveryOffsets =
                 hasCheckpoint ? mergeCheckpointState(recoveredState) : getProducerOffsets();
+
+        // Validate that checkpoint state refers to the same table (detect table re-creation)
+        if (hasCheckpoint) {
+            validateTableId(recoveryOffsets);
+        }
 
         LOG.info(
                 "Recovery offsets for subtask {} (source={}): {}",
@@ -317,6 +330,28 @@ public class RecoveryOffsetManager {
         return merged;
     }
 
+    /**
+     * Validates that all buckets in the recovery offsets belong to the current table.
+     *
+     * <p>If the table was dropped and re-created, the checkpoint state will contain buckets with
+     * the old table ID, which won't match the current table ID. In this case, restoring from the
+     * checkpoint is not safe and should fail explicitly.
+     *
+     * @param recoveryOffsets the merged recovery offsets from checkpoint state
+     * @throws IllegalStateException if any bucket has a mismatched table ID
+     */
+    private void validateTableId(Map<TableBucket, Long> recoveryOffsets) {
+        for (TableBucket bucket : recoveryOffsets.keySet()) {
+            if (bucket.getTableId() != tableId) {
+                throw new IllegalStateException(
+                        String.format(
+                                "Table '%s' has been re-created (state tableId=%d, current tableId=%d). "
+                                        + "Cannot restore from checkpoint/savepoint after table re-creation.",
+                                tablePath, bucket.getTableId(), tableId));
+            }
+        }
+    }
+
     private Map<TableBucket, Long> getProducerOffsets() throws Exception {
         if (subtaskIndex == 0) {
             registerCurrentOffsets();
@@ -336,19 +371,38 @@ public class RecoveryOffsetManager {
 
     private ProducerOffsetsResult pollForOffsets() throws Exception {
         int attempt = 0;
+        long startTime = System.currentTimeMillis();
+        Exception lastException = null;
         while (true) {
+            long elapsed = System.currentTimeMillis() - startTime;
+            if (elapsed >= maxPollTimeoutMs) {
+                throw new RuntimeException(
+                        String.format(
+                                "Timed out polling for producer offsets after %d ms (%d attempts). "
+                                        + "producerId=%s, subtask=%d/%d. Last error: %s",
+                                elapsed,
+                                attempt,
+                                producerId,
+                                subtaskIndex,
+                                parallelism,
+                                lastException != null
+                                        ? lastException.getMessage()
+                                        : "no valid result"),
+                        lastException);
+            }
             try {
                 ProducerOffsetsResult result = admin.getProducerOffsets(producerId).get();
                 if (result != null && result.getExpirationTime() > System.currentTimeMillis()) {
                     return result;
                 }
             } catch (Exception e) {
-                attempt++;
+                lastException = e;
                 LOG.warn(
                         "Failed to get producer offsets (attempt {}), retrying: {}",
-                        attempt,
+                        attempt + 1,
                         e.getMessage());
             }
+            attempt++;
             Thread.sleep(pollIntervalMs);
         }
     }

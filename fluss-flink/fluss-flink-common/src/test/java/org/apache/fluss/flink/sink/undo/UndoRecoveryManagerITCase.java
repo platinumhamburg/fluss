@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.sink.writer.undo;
+package org.apache.fluss.flink.sink.undo;
 
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
@@ -30,7 +30,7 @@ import org.apache.fluss.client.table.writer.UpsertResult;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.flink.sink.writer.undo.UndoRecoveryManager.UndoOffsets;
+import org.apache.fluss.flink.sink.undo.UndoRecoveryManager.UndoOffsets;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionInfo;
@@ -924,11 +924,6 @@ public class UndoRecoveryManagerITCase {
         @Override
         public void unsubscribe(int bucket) {
             delegate.unsubscribe(bucket);
-        }
-
-        @Override
-        public Long position(TableBucket tableBucket) {
-            return delegate.position(tableBucket);
         }
 
         @Override

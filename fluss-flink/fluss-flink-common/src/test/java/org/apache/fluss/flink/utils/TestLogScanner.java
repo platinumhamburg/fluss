@@ -164,11 +164,6 @@ public class TestLogScanner implements LogScanner {
     }
 
     @Override
-    public Long position(TableBucket tableBucket) {
-        return positions.get(positionKey(tableBucket));
-    }
-
-    @Override
     public void unsubscribe(long partitionId, int bucket) {
         positions.remove(partitionBucketKey(partitionId, bucket));
     }

@@ -51,7 +51,7 @@ class WriterStateSerializerTest {
         bucketOffsets.put(new TableBucket(1L, null, 0), 100L);
         bucketOffsets.put(new TableBucket(1L, null, 1), 200L);
         bucketOffsets.put(new TableBucket(2L, 10L, 0), 300L);
-        WriterState original = new WriterState(42L, bucketOffsets);
+        WriterState original = new WriterState(bucketOffsets);
 
         DataOutputSerializer output = new DataOutputSerializer(256);
         serializer.serialize(original, output);
@@ -60,11 +60,10 @@ class WriterStateSerializerTest {
         WriterState deserialized = serializer.deserialize(input);
 
         assertThat(deserialized).isEqualTo(original);
-        assertThat(deserialized.getCheckpointId()).isEqualTo(42L);
         assertThat(deserialized.getBucketOffsets()).hasSize(3);
 
         // Test empty state
-        WriterState emptyState = WriterState.empty(0L);
+        WriterState emptyState = WriterState.empty();
         output = new DataOutputSerializer(64);
         serializer.serialize(emptyState, output);
         input = new DataInputDeserializer(output.getCopyOfBuffer());
@@ -74,7 +73,7 @@ class WriterStateSerializerTest {
         output = new DataOutputSerializer(256);
         serializer.serialize(original, output);
         input = new DataInputDeserializer(output.getCopyOfBuffer());
-        WriterState reuse = WriterState.empty(0L);
+        WriterState reuse = WriterState.empty();
         deserialized = serializer.deserialize(reuse, input);
         assertThat(deserialized).isEqualTo(original);
         assertThat(deserialized).isNotSameAs(reuse);
@@ -86,7 +85,7 @@ class WriterStateSerializerTest {
         Map<TableBucket, Long> bucketOffsets = new HashMap<>();
         bucketOffsets.put(new TableBucket(1L, null, 0), 100L);
         bucketOffsets.put(new TableBucket(2L, 10L, 1), 200L);
-        WriterState original = new WriterState(42L, bucketOffsets);
+        WriterState original = new WriterState(bucketOffsets);
 
         DataOutputSerializer sourceOutput = new DataOutputSerializer(256);
         serializer.serialize(original, sourceOutput);
@@ -143,43 +142,13 @@ class WriterStateSerializerTest {
 
         // CreateInstance returns empty state
         WriterState instance = serializer.createInstance();
-        assertThat(instance.getCheckpointId()).isEqualTo(0L);
         assertThat(instance.getBucketOffsets()).isEmpty();
 
         // Copy returns same instance for immutable types
         Map<TableBucket, Long> bucketOffsets = new HashMap<>();
         bucketOffsets.put(new TableBucket(1L, null, 0), 100L);
-        WriterState original = new WriterState(42L, bucketOffsets);
+        WriterState original = new WriterState(bucketOffsets);
         assertThat(serializer.copy(original)).isSameAs(original);
-        assertThat(serializer.copy(original, WriterState.empty(0L))).isSameAs(original);
-    }
-
-    /** Tests that TypeSerializer and SimpleVersionedSerializer produce compatible bytes. */
-    @Test
-    void testSimpleVersionedSerializerCompatibility() throws IOException {
-        Map<TableBucket, Long> bucketOffsets = new HashMap<>();
-        bucketOffsets.put(new TableBucket(1L, null, 0), 100L);
-        bucketOffsets.put(new TableBucket(2L, 10L, 1), 200L);
-        WriterState original = new WriterState(42L, bucketOffsets);
-
-        // Serialize using TypeSerializer
-        DataOutputSerializer output = new DataOutputSerializer(256);
-        serializer.serialize(original, output);
-        byte[] typeSerializerBytes = output.getCopyOfBuffer();
-
-        // Serialize using SimpleVersionedSerializer
-        byte[] simpleVersionedBytes = serializer.serialize(original);
-
-        // Both should produce the same bytes
-        assertThat(typeSerializerBytes).isEqualTo(simpleVersionedBytes);
-
-        // Both should deserialize to equal results
-        DataInputDeserializer input = new DataInputDeserializer(typeSerializerBytes);
-        WriterState fromTypeSerializer = serializer.deserialize(input);
-        WriterState fromSimpleVersioned =
-                serializer.deserialize(serializer.getVersion(), simpleVersionedBytes);
-
-        assertThat(fromTypeSerializer).isEqualTo(fromSimpleVersioned);
-        assertThat(fromTypeSerializer).isEqualTo(original);
+        assertThat(serializer.copy(original, WriterState.empty())).isSameAs(original);
     }
 }

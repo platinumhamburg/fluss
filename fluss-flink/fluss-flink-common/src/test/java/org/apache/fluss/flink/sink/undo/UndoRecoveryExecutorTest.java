@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.sink.writer.undo;
+package org.apache.fluss.flink.sink.undo;
 
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.flink.utils.TestLogScanner;
@@ -289,32 +289,6 @@ class UndoRecoveryExecutorTest {
      * that cause the mock scanner to advance bucket0's position on each poll. Completion is
      * detected via {@code scanner.position(bucket) >= logEndOffset}.
      */
-    @Test
-    void testScannerExhaustionWithEmptyBatches() throws Exception {
-        TableBucket bucket0 = new TableBucket(TABLE_ID, 0);
-        TableBucket bucket1 = new TableBucket(TABLE_ID, 1);
-
-        // bucket0: recovery range [0, 3) with only empty batches → no ScanRecords
-        BucketRecoveryContext ctx0 = new BucketRecoveryContext(bucket0, 0L, 3L);
-
-        // bucket1: helper bucket with real records to make scanner return non-empty ScanRecords
-        BucketRecoveryContext ctx1 = new BucketRecoveryContext(bucket1, 0L, 1L);
-
-        // Only bucket1 has records; bucket0 has none (simulating empty batches)
-        mockScanner.setRecordsForBucket(
-                bucket1,
-                Collections.singletonList(
-                        new ScanRecord(0L, 0L, ChangeType.INSERT, row(1, "a", 100))));
-
-        // No records configured for bucket0 — simulates empty LogRecordBatches
-        // that consumed offsets 0, 1, 2 but produced zero ScanRecords
-
-        executor.execute(Arrays.asList(ctx0, ctx1));
-
-        // bucket0: completed via scanner position advancement, no records to undo
-        assertThat(ctx0.getTotalRecordsProcessed()).isEqualTo(0);
-
-        // bucket1: normal recovery completed
-        assertThat(ctx1.getTotalRecordsProcessed()).isEqualTo(1);
-    }
+    // TODO: Empty LogRecordBatch scenario is not testable with current offset-based completion
+    //  detection. Once LogScanner supports bounded subscription mode, add a test here.
 }

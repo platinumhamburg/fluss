@@ -38,7 +38,7 @@ import org.apache.fluss.metadata.TableBucket;
  * implementing operator should track the maximum offset for each bucket to ensure correct state
  * during checkpointing.
  */
-public interface OffsetReportContext {
+public interface ProducerOffsetReporter {
 
     /**
      * Reports a written offset for a bucket.
