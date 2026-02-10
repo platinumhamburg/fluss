@@ -211,6 +211,7 @@ class KvTabletTest {
                 schemaGetter,
                 tableConf.getChangelogImage(),
                 KvManager.getDefaultRateLimiter(),
+                null,
                 autoIncrementManager);
     }
 
