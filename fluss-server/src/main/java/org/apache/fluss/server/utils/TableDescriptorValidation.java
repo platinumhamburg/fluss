@@ -308,11 +308,9 @@ public class TableDescriptorValidation {
                 if (changelogImage == ChangelogImage.WAL) {
                     throw new InvalidConfigException(
                             String.format(
-                                    "Table with '%s' merge engine does not support '%s' changelog image mode. "
-                                            + "Aggregate merge engine tables require FULL changelog image mode "
+                                    "Table with 'AGGREGATION' merge engine does not support 'WAL' changelog image mode. "
+                                            + "Aggregation merge engine tables require FULL changelog image mode "
                                             + "for correct UNDO recovery. Please set '%s' to 'FULL' or remove the setting.",
-                                    ConfigOptions.TABLE_MERGE_ENGINE.key(),
-                                    ConfigOptions.TABLE_CHANGELOG_IMAGE.key(),
                                     ConfigOptions.TABLE_CHANGELOG_IMAGE.key()));
                 }
                 // Validate aggregation function parameters for aggregation merge engine

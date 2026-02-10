@@ -1740,8 +1740,10 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertThatThrownBy(() -> admin.createTable(tablePath1, tableDescriptor1, false).get())
                 .cause()
                 .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining(ConfigOptions.TABLE_MERGE_ENGINE.key())
-                .hasMessageContaining(ConfigOptions.TABLE_CHANGELOG_IMAGE.key());
+                .hasMessageContaining(
+                        "Table with 'AGGREGATION' merge engine does not support 'WAL' changelog image mode. "
+                                + "Aggregation merge engine tables require FULL changelog image mode for correct UNDO recovery. "
+                                + "Please set 'table.changelog.image' to 'FULL' or remove the setting.");
 
         // Test 2: Aggregate + FULL should be allowed
         TablePath tablePath2 = TablePath.of("fluss", "test_aggregate_full_changelog_allowed");
