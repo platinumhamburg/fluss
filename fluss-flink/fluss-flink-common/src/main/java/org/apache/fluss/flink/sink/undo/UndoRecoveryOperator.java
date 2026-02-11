@@ -258,7 +258,7 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
         // Resolve producerId: use configured value or default to Flink job ID
         resolvedProducerId = configuredProducerId;
         if (resolvedProducerId == null) {
-            resolvedProducerId = getRuntimeContext().getJobId().toString();
+            resolvedProducerId = RuntimeContextAdapter.getJobId(getRuntimeContext()).toString();
             LOG.info("Using Flink job ID as producerId: {}", resolvedProducerId);
         }
 
