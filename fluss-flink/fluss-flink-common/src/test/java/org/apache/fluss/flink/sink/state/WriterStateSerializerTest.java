@@ -151,4 +151,24 @@ class WriterStateSerializerTest {
         assertThat(serializer.copy(original)).isSameAs(original);
         assertThat(serializer.copy(original, WriterState.empty())).isSameAs(original);
     }
+
+    /** Tests that TypeSerializer and SimpleVersionedSerializer produce compatible bytes. */
+    @Test
+    void testSimpleVersionedSerializerCompatibility() throws IOException {
+        Map<TableBucket, Long> bucketOffsets = new HashMap<>();
+        bucketOffsets.put(new TableBucket(1L, null, 0), 100L);
+        bucketOffsets.put(new TableBucket(2L, 10L, 1), 200L);
+        WriterState original = new WriterState(bucketOffsets);
+
+        // Serialize using TypeSerializer
+        DataOutputSerializer output = new DataOutputSerializer(256);
+        serializer.serialize(original, output);
+        byte[] typeSerializerBytes = output.getCopyOfBuffer();
+
+        // Both should deserialize to equal results
+        DataInputDeserializer input = new DataInputDeserializer(typeSerializerBytes);
+        WriterState fromTypeSerializer = serializer.deserialize(input);
+
+        assertThat(fromTypeSerializer).isEqualTo(original);
+    }
 }

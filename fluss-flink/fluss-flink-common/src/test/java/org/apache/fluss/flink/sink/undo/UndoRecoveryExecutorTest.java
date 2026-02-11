@@ -244,6 +244,7 @@ class UndoRecoveryExecutorTest {
         assertThat(ctx.getTotalRecordsProcessed()).isEqualTo(6);
         assertThat(mockWriter.getDeleteCount()).isEqualTo(3); // keys 1, 2, 5
         assertThat(mockWriter.getUpsertCount()).isEqualTo(2); // keys 3, 4
+        assertThat(ctx.isComplete()).isTrue();
     }
 
     /**

@@ -43,7 +43,10 @@ import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.test.util.MiniClusterWithClientResource;
@@ -194,7 +197,7 @@ abstract class UndoRecoveryITCase {
         String tableName = "undo_checkpoint_failover_" + System.currentTimeMillis();
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
 
-        initTableEnvironment(null, false, null).executeSql(createAggTableDDL(tableName));
+        initTableEnvironment(null, false).executeSql(createAggTableDDL(tableName));
 
         // Configure: 10 records before failure, 3 records after recovery
         int recordsBeforeFailure = 10;
@@ -204,6 +207,59 @@ abstract class UndoRecoveryITCase {
         JobClient job =
                 startFailoverJob(
                         tablePath, null, recordsBeforeFailure, recordsAfterFailure, 1, false);
+
+        // Wait for checkpoint to complete before failure triggers
+        waitForCheckpoint(job.getJobID());
+
+        // Wait for final sum after recovery
+        // Expected: (10 + 3) * VALUE_PER_RECORD = 130
+        long expectedFinalSum = (recordsBeforeFailure + recordsAfterFailure) * VALUE_PER_RECORD;
+        retry(
+                DEFAULT_TIMEOUT,
+                () -> {
+                    Long sum = lookupSum(tablePath, 1L);
+                    assertThat(sum)
+                            .as("Final sum after checkpoint failover recovery")
+                            .isEqualTo(expectedFinalSum);
+                });
+
+        // Cancel the job after verification
+        job.cancel().get();
+        waitForJobTermination(job, DEFAULT_TIMEOUT);
+
+        // Final verification
+        Long finalSum = lookupSum(tablePath, 1L);
+        LOG.info("Final sum: {}, expected: {}", finalSum, expectedFinalSum);
+        assertThat(finalSum)
+                .as(
+                        "Final sum should equal (recordsBeforeFailure + recordsAfterFailure) * VALUE_PER_RECORD")
+                .isEqualTo(expectedFinalSum);
+    }
+
+    /** Tests checkpoint-based failover recovery through the SQL/Table API sink path. */
+    @Test
+    void testCheckpointFailoverRecoverySQLJob() throws Exception {
+        String tableName = "undo_checkpoint_failover_sql_" + System.currentTimeMillis();
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+
+        // Configure: 10 records before failure, 3 records after recovery
+        int recordsBeforeFailure = 10;
+        int recordsAfterFailure = 3;
+
+        // Start job with FailingCountingSource (default producerId = Flink Job ID)
+        TableResult tableResult =
+                startFailoverSqlJob(
+                        tablePath,
+                        createAggTableDDL(tableName),
+                        recordsBeforeFailure,
+                        recordsAfterFailure,
+                        1,
+                        false);
+
+        JobClient job =
+                tableResult
+                        .getJobClient()
+                        .orElseThrow(() -> new RuntimeException("JobClient not available"));
 
         // Wait for checkpoint to complete before failure triggers
         waitForCheckpoint(job.getJobID());
@@ -256,7 +312,7 @@ abstract class UndoRecoveryITCase {
         String tableName = "undo_multi_keys_" + System.currentTimeMillis();
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
 
-        initTableEnvironment(null, false, null).executeSql(createAggTableDDL(tableName));
+        initTableEnvironment(null, false).executeSql(createAggTableDDL(tableName));
 
         // Configure: 10 records per key before failure, 3 records per key after recovery
         int recordsBeforeFailurePerKey = 10;
@@ -342,7 +398,7 @@ abstract class UndoRecoveryITCase {
         String tableName = "undo_producer_offset_" + System.currentTimeMillis();
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
 
-        initTableEnvironment(null, false, null).executeSql(createAggTableDDL(tableName));
+        initTableEnvironment(null, false).executeSql(createAggTableDDL(tableName));
 
         // Configure to fail quickly before checkpoint completes
         int recordsBeforeFailure = 2;
@@ -427,7 +483,7 @@ abstract class UndoRecoveryITCase {
         String producerId = "test-producer-sql-" + System.currentTimeMillis();
 
         // Create table with sink.producer-id option (needed for SQL INSERT in Phase 2)
-        initTableEnvironment(null, false, null)
+        initTableEnvironment(null, false)
                 .executeSql(
                         String.format(
                                 "CREATE TABLE `%s`.`%s` ("
@@ -464,7 +520,7 @@ abstract class UndoRecoveryITCase {
         assertThat(sumAfterCancel).as("Dirty data should still be visible").isEqualTo(dirtySum);
 
         // Phase 2: SQL INSERT with the same producerId — triggers undo recovery via SQL path
-        StreamTableEnvironment tEnv = initTableEnvironment(null, true, null);
+        StreamTableEnvironment tEnv = initTableEnvironment(null, true);
 
         // SQL INSERT writes new data — undo recovery should undo the dirty Phase 1 data
         tEnv.executeSql(
@@ -506,7 +562,7 @@ abstract class UndoRecoveryITCase {
         String producerId = "test-producer-bounded-" + System.currentTimeMillis();
 
         // Create table via SQL DDL
-        StreamTableEnvironment tEnv = initTableEnvironment(null, false, null);
+        StreamTableEnvironment tEnv = initTableEnvironment(null, false);
         tEnv.executeSql(createAggTableDDL(tableName));
 
         // Use SQL INSERT which is inherently bounded — no checkpointing needed.
@@ -576,7 +632,7 @@ abstract class UndoRecoveryITCase {
                 phase12Parallelism,
                 phase3Parallelism);
 
-        initTableEnvironment(null, false, null).executeSql(createAggTableDDL(tableName, buckets));
+        initTableEnvironment(null, false).executeSql(createAggTableDDL(tableName, buckets));
 
         // Phase 1: Write records for multiple keys and take savepoint
         JobClient phase1Job =
@@ -848,6 +904,87 @@ abstract class UndoRecoveryITCase {
     }
 
     /**
+     * Starts a job with FailingCountingSource for checkpoint-based failover testing.
+     *
+     * <p>This method configures a job that will:
+     *
+     * <ol>
+     *   <li>Emit {@code recordsBeforeFailure} records
+     *   <li>Trigger a failure (RuntimeException)
+     *   <li>Auto-recover from checkpoint and emit {@code recordsAfterFailure} records
+     * </ol>
+     *
+     * @param tablePath target table
+     * @param recordsBeforeFailure records to emit before triggering failure
+     * @param recordsAfterFailure records to emit after recovery
+     * @param parallelism job parallelism
+     * @param multiKey if true, emit to keys 1,2,3 in round-robin
+     * @return JobClient for monitoring the job
+     */
+    private TableResult startFailoverSqlJob(
+            TablePath tablePath,
+            String ddl,
+            int recordsBeforeFailure,
+            int recordsAfterFailure,
+            int parallelism,
+            boolean multiKey)
+            throws Exception {
+
+        Configuration conf = new Configuration();
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(conf);
+        env.setParallelism(parallelism);
+        env.enableCheckpointing(1000);
+
+        StreamTableEnvironment tEnv =
+                StreamTableEnvironment.create(env, EnvironmentSettings.inStreamingMode());
+
+        tEnv.executeSql(
+                String.format(
+                        "CREATE CATALOG %s WITH ('type' = 'fluss', '%s' = '%s')",
+                        CATALOG_NAME, BOOTSTRAP_SERVERS.key(), bootstrapServers));
+        tEnv.executeSql("USE CATALOG " + CATALOG_NAME);
+
+        FailingCountingSource source =
+                multiKey
+                        ? FailingCountingSource.multiKey(
+                                failureMarkerDir,
+                                VALUE_PER_RECORD,
+                                recordsBeforeFailure,
+                                recordsAfterFailure)
+                        : FailingCountingSource.singleKey(
+                                failureMarkerDir,
+                                1L,
+                                VALUE_PER_RECORD,
+                                recordsBeforeFailure,
+                                recordsAfterFailure);
+
+        DataStreamSource<RowData> stream =
+                env.fromSource(
+                        source,
+                        WatermarkStrategy.noWatermarks(),
+                        "failing-counting-source",
+                        source.getProducedType());
+
+        tEnv.createTemporaryView(
+                "source_table",
+                stream,
+                Schema.newBuilder()
+                        .column("key", DataTypes.BIGINT())
+                        .column("value", DataTypes.BIGINT())
+                        .build());
+
+        tEnv.executeSql(ddl).await();
+
+        return tEnv.executeSql(
+                "INSERT INTO `"
+                        + tablePath.getDatabaseName()
+                        + "`.`"
+                        + tablePath.getTableName()
+                        + "` SELECT * FROM source_table");
+    }
+
+    /**
      * Verifies that producer offsets have been cleaned up from ZK.
      *
      * <p>After a successful checkpoint, the UndoRecoveryOperator deletes producer offsets from ZK.
@@ -888,7 +1025,7 @@ abstract class UndoRecoveryITCase {
     }
 
     protected StreamTableEnvironment initTableEnvironment(
-            @Nullable String savepointPath, boolean enableCheckpointing, @Nullable JobID unused) {
+            @Nullable String savepointPath, boolean enableCheckpointing) {
         Configuration conf = new Configuration();
         if (savepointPath != null) {
             conf.setString("execution.savepoint.path", savepointPath);

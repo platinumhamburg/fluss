@@ -220,7 +220,6 @@ public class UndoRecoveryOperatorFactory<IN> extends AbstractStreamOperatorFacto
 
         // Register the operator with the static registry so offset reports are forwarded
         registerDelegate(offsetReporterHolder.getHolderId(), operator);
-        offsetReporterHolder.cachedDelegate = operator;
 
         @SuppressWarnings("unchecked")
         final T castedOperator = (T) operator;

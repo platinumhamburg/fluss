@@ -203,6 +203,11 @@ public class TestAdminAdapter implements Admin {
     }
 
     @Override
+    public CompletableFuture<LakeSnapshot> getLakeSnapshot(TablePath tablePath, long snapshotId) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
     public ListOffsetsResult listOffsets(
             TablePath tablePath, Collection<Integer> buckets, OffsetSpec offsetSpec) {
         throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");

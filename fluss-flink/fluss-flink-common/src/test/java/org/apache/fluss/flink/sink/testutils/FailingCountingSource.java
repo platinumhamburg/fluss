@@ -29,14 +29,18 @@ import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.core.io.InputStatus;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
+import org.apache.flink.table.types.logical.RowType;
 
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Queue;
@@ -202,7 +206,13 @@ public class FailingCountingSource
 
     @Override
     public TypeInformation<RowData> getProducedType() {
-        return TypeInformation.of(RowData.class);
+        RowType rowType =
+                new RowType(
+                        Arrays.asList(
+                                new RowType.RowField("key", DataTypes.BIGINT().getLogicalType()),
+                                new RowType.RowField(
+                                        "value", DataTypes.BIGINT().getLogicalType())));
+        return InternalTypeInfo.of(rowType);
     }
 
     // ==================== FailingCountingSplit ====================

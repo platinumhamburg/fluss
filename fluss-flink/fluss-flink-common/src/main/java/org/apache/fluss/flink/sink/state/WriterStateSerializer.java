@@ -56,6 +56,8 @@ public class WriterStateSerializer extends TypeSerializer<WriterState> {
 
     private static final long serialVersionUID = 1L;
 
+    /** The current version of the serialization format. */
+    private static final int CURRENT_VERSION = 1;
     // -------------------------------------------------------------------------
     //  TypeSerializer methods
     // -------------------------------------------------------------------------
@@ -97,6 +99,7 @@ public class WriterStateSerializer extends TypeSerializer<WriterState> {
 
     @Override
     public void serialize(WriterState record, DataOutputView target) throws IOException {
+        target.writeInt(CURRENT_VERSION);
         Map<TableBucket, Long> bucketOffsets = record.getBucketOffsets();
         target.writeInt(bucketOffsets.size());
         for (Map.Entry<TableBucket, Long> entry : bucketOffsets.entrySet()) {
@@ -113,6 +116,11 @@ public class WriterStateSerializer extends TypeSerializer<WriterState> {
 
     @Override
     public WriterState deserialize(DataInputView source) throws IOException {
+        int version = source.readInt();
+        if (version != CURRENT_VERSION) {
+            throw new IOException(
+                    "Unsupported version: " + version + ". Expected version: " + CURRENT_VERSION);
+        }
         int size = source.readInt();
         Map<TableBucket, Long> bucketOffsets = new HashMap<>(size);
         for (int i = 0; i < size; i++) {
@@ -134,6 +142,12 @@ public class WriterStateSerializer extends TypeSerializer<WriterState> {
 
     @Override
     public void copy(DataInputView source, DataOutputView target) throws IOException {
+        int version = source.readInt();
+        if (version != CURRENT_VERSION) {
+            throw new IOException(
+                    "Unsupported version: " + version + ". Expected version: " + CURRENT_VERSION);
+        }
+        target.writeInt(version);
         // Copy bucket offsets size
         int size = source.readInt();
         target.writeInt(size);
