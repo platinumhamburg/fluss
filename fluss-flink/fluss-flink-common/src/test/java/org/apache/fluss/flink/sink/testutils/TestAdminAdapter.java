@@ -294,4 +294,9 @@ public class TestAdminAdapter implements Admin {
     public void close() {
         // No-op for test adapter
     }
+
+    @Override
+    public CompletableFuture<LakeSnapshot> getReadableLakeSnapshot(TablePath tablePath) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
 }
