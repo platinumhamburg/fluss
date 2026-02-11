@@ -20,6 +20,7 @@ package org.apache.fluss.flink.sink;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.admin.ProducerOffsetsResult;
 import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.ConfigOptions;
@@ -74,7 +75,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <h3>Checkpoint Failover Tests (use FailingCountingSource)</h3>
  *
  * <p>These tests simulate real job failures by injecting exceptions and relying on Flink's
- * automatic checkpoint-based recovery:
+ * automatic checkpoint-based recovery. All failover tests use the default producerId (Flink Job ID)
+ * to match production usage:
  *
  * <ul>
  *   <li><b>Checkpoint Failover Recovery</b>: {@link #testCheckpointFailoverRecovery()} - Tests
@@ -191,9 +193,6 @@ abstract class UndoRecoveryITCase {
     void testCheckpointFailoverRecovery() throws Exception {
         String tableName = "undo_checkpoint_failover_" + System.currentTimeMillis();
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
-        String producerId = "test-producer-failover-" + System.currentTimeMillis();
-
-        LOG.info("Test using producerId: {}", producerId);
 
         initTableEnvironment(null, false, null).executeSql(createAggTableDDL(tableName));
 
@@ -201,15 +200,10 @@ abstract class UndoRecoveryITCase {
         int recordsBeforeFailure = 10;
         int recordsAfterFailure = 3;
 
-        // Start job with FailingCountingSource - it will:
-        // 1. Emit 10 records
-        // 2. Wait for checkpoint (source idles after emitting recordsBeforeFailure)
-        // 3. Trigger failure
-        // 4. Auto-recover from checkpoint
-        // 5. Emit 3 more records
+        // Start job with FailingCountingSource (default producerId = Flink Job ID)
         JobClient job =
                 startFailoverJob(
-                        tablePath, producerId, recordsBeforeFailure, recordsAfterFailure, 1, false);
+                        tablePath, null, recordsBeforeFailure, recordsAfterFailure, 1, false);
 
         // Wait for checkpoint to complete before failure triggers
         waitForCheckpoint(job.getJobID());
@@ -261,9 +255,6 @@ abstract class UndoRecoveryITCase {
     void testUndoRecoveryMultipleKeys() throws Exception {
         String tableName = "undo_multi_keys_" + System.currentTimeMillis();
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
-        String producerId = "test-producer-multikey-" + System.currentTimeMillis();
-
-        LOG.info("Test using producerId: {}", producerId);
 
         initTableEnvironment(null, false, null).executeSql(createAggTableDDL(tableName));
 
@@ -271,11 +262,12 @@ abstract class UndoRecoveryITCase {
         int recordsBeforeFailurePerKey = 10;
         int recordsAfterFailurePerKey = 3;
 
-        // Start job with FailingCountingSource in multi-key mode
+        // Start job with FailingCountingSource in multi-key mode (default producerId = Flink Job
+        // ID)
         JobClient job =
                 startFailoverJob(
                         tablePath,
-                        producerId,
+                        null,
                         recordsBeforeFailurePerKey,
                         recordsAfterFailurePerKey,
                         1,
@@ -349,26 +341,17 @@ abstract class UndoRecoveryITCase {
     void testProducerOffsetRecoveryWithFailover() throws Exception {
         String tableName = "undo_producer_offset_" + System.currentTimeMillis();
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
-        String producerId = "test-producer-po-" + System.currentTimeMillis();
-
-        LOG.info("Test using producerId: {}", producerId);
 
         initTableEnvironment(null, false, null).executeSql(createAggTableDDL(tableName));
 
         // Configure to fail quickly before checkpoint completes
-        // 2 records before failure (not enough time for checkpoint)
-        // 5 records after recovery
         int recordsBeforeFailure = 2;
         int recordsAfterFailure = 5;
 
-        // Start job with FailingCountingSource - it will:
-        // 1. Emit 2 records quickly
-        // 2. Trigger failure BEFORE checkpoint completes
-        // 3. Auto-recover (no checkpoint, job restarts from scratch)
-        // 4. Emit 5 new records
+        // Start job with FailingCountingSource (default producerId = Flink Job ID)
         JobClient job =
                 startFailoverJob(
-                        tablePath, producerId, recordsBeforeFailure, recordsAfterFailure, 1, false);
+                        tablePath, null, recordsBeforeFailure, recordsAfterFailure, 1, false);
 
         // Wait for final sum after recovery
         // Expected: 7 * VALUE_PER_RECORD = 70
@@ -416,6 +399,149 @@ abstract class UndoRecoveryITCase {
                 2, // phase1 & phase2 parallelism
                 1, // phase3 parallelism (scale down)
                 new int[] {10, 5, 3});
+    }
+
+    /**
+     * Tests that undo recovery works through the SQL/Table API sink path.
+     *
+     * <p>The SQL path creates the sink via {@code FlinkTableSink.getSinkRuntimeProvider()} → {@code
+     * getFlinkSink()}, which is a different code path from the DataStream API's {@code
+     * FlussSinkBuilder}. This test verifies that the SQL path correctly configures and executes
+     * undo recovery.
+     *
+     * <p>Pattern:
+     *
+     * <ol>
+     *   <li>Phase 1 (DataStream API): Write dirty data using CountingSource with a specific
+     *       producerId, then cancel without checkpoint — leaving uncommitted writes
+     *   <li>Phase 2 (SQL INSERT): Execute SQL INSERT with the same producerId via {@code
+     *       sink.producer-id} table option — the SQL sink's UndoRecoveryOperator should undo the
+     *       dirty data from Phase 1
+     *   <li>Verify: Final result contains only the SQL INSERT data (dirty data undone)
+     * </ol>
+     */
+    @Test
+    void testSqlInsertWithUndoRecovery() throws Exception {
+        String tableName = "undo_sql_test_" + System.currentTimeMillis();
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+        String producerId = "test-producer-sql-" + System.currentTimeMillis();
+
+        // Create table with sink.producer-id option (needed for SQL INSERT in Phase 2)
+        initTableEnvironment(null, false, null)
+                .executeSql(
+                        String.format(
+                                "CREATE TABLE `%s`.`%s` ("
+                                        + "  id BIGINT NOT NULL PRIMARY KEY NOT ENFORCED,"
+                                        + "  sum_val BIGINT"
+                                        + ") WITH ("
+                                        + "  'bucket.num' = '1',"
+                                        + "  'table.merge-engine' = 'aggregation',"
+                                        + "  'fields.sum_val.agg' = 'sum',"
+                                        + "  'sink.producer-id' = '%s'"
+                                        + ")",
+                                DEFAULT_DB, tableName, producerId));
+
+        // Phase 1: Write dirty data via DataStream API with the same producerId, cancel without
+        // checkpoint
+        JobClient dirtyJob = startBoundedJob(tablePath, producerId, null, 5, 1, false);
+
+        // Wait for dirty data to be written
+        long dirtySum = 5 * VALUE_PER_RECORD; // 50
+        retry(
+                DEFAULT_TIMEOUT,
+                () -> {
+                    Long sum = lookupSum(tablePath, 1L);
+                    assertThat(sum).as("Dirty data sum").isEqualTo(dirtySum);
+                });
+
+        // Cancel without checkpoint — leaves uncommitted writes
+        dirtyJob.cancel().get();
+        waitForJobTermination(dirtyJob, DEFAULT_TIMEOUT);
+
+        // Verify dirty data is still visible
+        Long sumAfterCancel = lookupSum(tablePath, 1L);
+        LOG.info("Sum after dirty job cancel: {} (dirty, uncommitted)", sumAfterCancel);
+        assertThat(sumAfterCancel).as("Dirty data should still be visible").isEqualTo(dirtySum);
+
+        // Phase 2: SQL INSERT with the same producerId — triggers undo recovery via SQL path
+        StreamTableEnvironment tEnv = initTableEnvironment(null, true, null);
+
+        // SQL INSERT writes new data — undo recovery should undo the dirty Phase 1 data
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO `%s`.`%s` VALUES (1, 100), (1, 200)",
+                                DEFAULT_DB, tableName))
+                .await();
+
+        // Verify: final sum = only SQL INSERT data (dirty data undone)
+        // If undo recovery didn't work, sum would be 50 + 300 = 350
+        // With undo recovery: 300 (dirty 50 undone, then 100 + 200 written)
+        long expectedSum = 300L;
+        retry(
+                DEFAULT_TIMEOUT,
+                () -> {
+                    Long sum = lookupSum(tablePath, 1L);
+                    assertThat(sum)
+                            .as(
+                                    "Final sum should be SQL INSERT data only (dirty data undone by SQL sink's undo recovery)")
+                            .isEqualTo(expectedSum);
+                });
+
+        // Verify producer offsets cleaned up
+        verifyProducerOffsetsCleanedUp(producerId);
+    }
+
+    /**
+     * Tests that producer offsets are cleaned up via endInput() for bounded jobs without
+     * checkpointing.
+     *
+     * <p>This verifies the cleanup path added in Comment #12: when a bounded job finishes (source
+     * reaches end of input) without any checkpoint completing, {@code endInput()} calls {@code
+     * deleteProducerOffsetsIfNeeded()} to ensure producer offsets don't remain in ZK.
+     */
+    @Test
+    void testBoundedJobCleansUpProducerOffsetsWithoutCheckpoint() throws Exception {
+        String tableName = "undo_bounded_cleanup_" + System.currentTimeMillis();
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+        String producerId = "test-producer-bounded-" + System.currentTimeMillis();
+
+        // Create table via SQL DDL
+        StreamTableEnvironment tEnv = initTableEnvironment(null, false, null);
+        tEnv.executeSql(createAggTableDDL(tableName));
+
+        // Use SQL INSERT which is inherently bounded — no checkpointing needed.
+        // endInput() is called when the bounded source finishes.
+        tEnv.executeSql(
+                String.format(
+                        "CREATE TABLE `%s`.`%s_with_pid` ("
+                                + "  id BIGINT NOT NULL PRIMARY KEY NOT ENFORCED,"
+                                + "  sum_val BIGINT"
+                                + ") WITH ("
+                                + "  'bucket.num' = '1',"
+                                + "  'table.merge-engine' = 'aggregation',"
+                                + "  'fields.sum_val.agg' = 'sum',"
+                                + "  'sink.producer-id' = '%s'"
+                                + ")",
+                        DEFAULT_DB, tableName, producerId));
+
+        // Execute bounded SQL INSERT (no checkpointing enabled in initTableEnvironment)
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO `%s`.`%s_with_pid` VALUES (1, 10), (1, 20), (1, 30)",
+                                DEFAULT_DB, tableName))
+                .await();
+
+        // Verify data written
+        TablePath actualPath = TablePath.of(DEFAULT_DB, tableName + "_with_pid");
+        retry(
+                DEFAULT_TIMEOUT,
+                () -> {
+                    Long sum = lookupSum(actualPath, 1L);
+                    assertThat(sum).as("Sum after bounded write").isEqualTo(60L);
+                });
+
+        // Verify producer offsets cleaned up via endInput() path
+        verifyProducerOffsetsCleanedUp(producerId);
     }
 
     // ==================== Reusable Test Patterns ====================
@@ -547,6 +673,10 @@ abstract class UndoRecoveryITCase {
                     }
                 });
 
+        // Verify producer offsets have been cleaned up from ZK after checkpoint (Comment #8)
+        waitForCheckpoint(phase3Job.getJobID());
+        verifyProducerOffsetsCleanedUp(producerId);
+
         phase3Job.cancel().get();
         waitForJobTermination(phase3Job, DEFAULT_TIMEOUT);
 
@@ -598,7 +728,7 @@ abstract class UndoRecoveryITCase {
      * Unified method to start a bounded streaming job.
      *
      * @param tablePath target table
-     * @param producerId producer ID for undo recovery
+     * @param producerId producer ID for undo recovery, or null to use default (Flink Job ID)
      * @param savepointPath savepoint to restore from, or null
      * @param maxRecords max records to emit (per key if multiKey)
      * @param parallelism job parallelism
@@ -606,7 +736,7 @@ abstract class UndoRecoveryITCase {
      */
     private JobClient startBoundedJob(
             TablePath tablePath,
-            String producerId,
+            @Nullable String producerId,
             @Nullable String savepointPath,
             int maxRecords,
             int parallelism,
@@ -630,16 +760,17 @@ abstract class UndoRecoveryITCase {
         DataStreamSource<RowData> stream =
                 env.fromSource(source, WatermarkStrategy.noWatermarks(), "counting-source");
 
-        FlussSink<RowData> sink =
+        FlussSinkBuilder<RowData> sinkBuilder =
                 FlussSink.<RowData>builder()
                         .setBootstrapServers(bootstrapServers)
                         .setDatabase(tablePath.getDatabaseName())
                         .setTable(tablePath.getTableName())
-                        .setSerializationSchema(new RowDataSerializationSchema(false, true))
-                        .setProducerId(producerId)
-                        .build();
+                        .setSerializationSchema(new RowDataSerializationSchema(false, true));
+        if (producerId != null) {
+            sinkBuilder.setProducerId(producerId);
+        }
 
-        stream.sinkTo(sink).name("Fluss Sink");
+        stream.sinkTo(sinkBuilder.build()).name("Fluss Sink");
 
         String jobName = multiKey ? "Multi-Key Undo Test" : "Undo Test (p=" + parallelism + ")";
         return env.executeAsync(jobName);
@@ -657,7 +788,7 @@ abstract class UndoRecoveryITCase {
      * </ol>
      *
      * @param tablePath target table
-     * @param producerId producer ID for undo recovery
+     * @param producerId producer ID for undo recovery, or null to use default (Flink Job ID)
      * @param recordsBeforeFailure records to emit before triggering failure
      * @param recordsAfterFailure records to emit after recovery
      * @param parallelism job parallelism
@@ -666,7 +797,7 @@ abstract class UndoRecoveryITCase {
      */
     private JobClient startFailoverJob(
             TablePath tablePath,
-            String producerId,
+            @Nullable String producerId,
             int recordsBeforeFailure,
             int recordsAfterFailure,
             int parallelism,
@@ -697,20 +828,46 @@ abstract class UndoRecoveryITCase {
         DataStreamSource<RowData> stream =
                 env.fromSource(source, WatermarkStrategy.noWatermarks(), "failing-counting-source");
 
-        FlussSink<RowData> sink =
+        FlussSink<RowData> sink;
+        FlussSinkBuilder<RowData> sinkBuilder =
                 FlussSink.<RowData>builder()
                         .setBootstrapServers(bootstrapServers)
                         .setDatabase(tablePath.getDatabaseName())
                         .setTable(tablePath.getTableName())
-                        .setSerializationSchema(new RowDataSerializationSchema(false, true))
-                        .setProducerId(producerId)
-                        .build();
+                        .setSerializationSchema(new RowDataSerializationSchema(false, true));
+        if (producerId != null) {
+            sinkBuilder.setProducerId(producerId);
+        }
+        sink = sinkBuilder.build();
 
         stream.sinkTo(sink).name("Fluss Sink");
 
         String jobName =
                 multiKey ? "Multi-Key Failover Test" : "Failover Test (p=" + parallelism + ")";
         return env.executeAsync(jobName);
+    }
+
+    /**
+     * Verifies that producer offsets have been cleaned up from ZK.
+     *
+     * <p>After a successful checkpoint, the UndoRecoveryOperator deletes producer offsets from ZK.
+     * This method retries the check to account for async cleanup timing.
+     *
+     * @param producerId the producer ID to check
+     */
+    private void verifyProducerOffsetsCleanedUp(String producerId) {
+        retry(
+                DEFAULT_TIMEOUT,
+                () -> {
+                    ProducerOffsetsResult result = admin.getProducerOffsets(producerId).get();
+                    assertThat(result)
+                            .as(
+                                    "Producer offsets for '"
+                                            + producerId
+                                            + "' should be cleaned up from ZK")
+                            .isNull();
+                });
+        LOG.info("Verified producer offsets cleaned up for {}", producerId);
     }
 
     @Nullable
