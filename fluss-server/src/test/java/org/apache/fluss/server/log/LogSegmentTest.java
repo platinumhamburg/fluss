@@ -606,6 +606,135 @@ final class LogSegmentTest extends LogTestBase {
         }
     }
 
+    @Test
+    void testFilterReturnsNullWhenAllBatchesFiltered() throws Exception {
+        // Test that read returns null when all batches are filtered out
+        LogSegment segment = createSegment(40);
+
+        // Add data that will be filtered out: a=1, a=2, a=3 (all < 5)
+        MemoryLogRecords records1 =
+                LogRecordBatchStatisticsTestUtils.createLogRecordsWithStatistics(
+                        Arrays.asList(new Object[] {1, "a"}, new Object[] {2, "b"}),
+                        DATA1_ROW_TYPE,
+                        40L,
+                        DEFAULT_SCHEMA_ID);
+        segment.append(41, -1L, -1L, records1);
+
+        MemoryLogRecords records2 =
+                LogRecordBatchStatisticsTestUtils.createLogRecordsWithStatistics(
+                        Arrays.asList(new Object[] {3, "c"}, new Object[] {4, "d"}),
+                        DATA1_ROW_TYPE,
+                        42L,
+                        DEFAULT_SCHEMA_ID);
+        segment.append(43, -1L, -1L, records2);
+
+        // Create filter: a >= 5 (will filter out all batches)
+        PredicateBuilder builder = new PredicateBuilder(DATA1_ROW_TYPE);
+        Predicate filterPredicate = builder.greaterOrEqual(0, 5);
+
+        try (LogRecordReadContext readContext =
+                LogRecordReadContext.createArrowReadContext(
+                        DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
+            FetchDataInfo fetchDataInfo =
+                    segment.read(
+                            40,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new Filter(filterPredicate, DEFAULT_SCHEMA_ID),
+                            readContext);
+
+            // When all batches are filtered out, should return null
+            assertThat(fetchDataInfo).isNull();
+        }
+    }
+
+    @Test
+    void testFilterReturnsDataWhenSomeBatchesMatch() throws Exception {
+        // Test that read returns data when some batches match the filter
+        LogSegment segment = createSegment(40);
+
+        // Add data: first batch filtered out (a=1,2), second batch matches (a=6,7)
+        MemoryLogRecords records1 =
+                LogRecordBatchStatisticsTestUtils.createLogRecordsWithStatistics(
+                        Arrays.asList(new Object[] {1, "a"}, new Object[] {2, "b"}),
+                        DATA1_ROW_TYPE,
+                        40L,
+                        DEFAULT_SCHEMA_ID);
+        segment.append(41, -1L, -1L, records1);
+
+        MemoryLogRecords records2 =
+                LogRecordBatchStatisticsTestUtils.createLogRecordsWithStatistics(
+                        Arrays.asList(new Object[] {6, "c"}, new Object[] {7, "d"}),
+                        DATA1_ROW_TYPE,
+                        42L,
+                        DEFAULT_SCHEMA_ID);
+        segment.append(43, -1L, -1L, records2);
+
+        // Create filter: a >= 5
+        PredicateBuilder builder = new PredicateBuilder(DATA1_ROW_TYPE);
+        Predicate filterPredicate = builder.greaterOrEqual(0, 5);
+
+        try (LogRecordReadContext readContext =
+                LogRecordReadContext.createArrowReadContext(
+                        DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
+            FetchDataInfo fetchDataInfo =
+                    segment.read(
+                            40,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new Filter(filterPredicate, DEFAULT_SCHEMA_ID),
+                            readContext);
+
+            // Should return the matching batch
+            assertThat(fetchDataInfo).isNotNull();
+            assertThat(fetchDataInfo.getRecords().sizeInBytes()).isGreaterThan(0);
+        }
+    }
+
+    @Test
+    void testFilterWithMultipleConsecutiveFilteredBatches() throws Exception {
+        // Test filtering with multiple consecutive batches that are all filtered out
+        LogSegment segment = createSegment(40);
+
+        // Add multiple batches that will all be filtered out
+        for (int i = 0; i < 5; i++) {
+            MemoryLogRecords records =
+                    LogRecordBatchStatisticsTestUtils.createLogRecordsWithStatistics(
+                            Arrays.asList(
+                                    new Object[] {i, "data" + i},
+                                    new Object[] {i + 1, "data" + (i + 1)}),
+                            DATA1_ROW_TYPE,
+                            40L + i * 2,
+                            DEFAULT_SCHEMA_ID);
+            segment.append(41L + i * 2, -1L, -1L, records);
+        }
+
+        // Create filter: a >= 100 (will filter out all batches)
+        PredicateBuilder builder = new PredicateBuilder(DATA1_ROW_TYPE);
+        Predicate filterPredicate = builder.greaterOrEqual(0, 100);
+
+        try (LogRecordReadContext readContext =
+                LogRecordReadContext.createArrowReadContext(
+                        DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
+            FetchDataInfo fetchDataInfo =
+                    segment.read(
+                            40,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new Filter(filterPredicate, DEFAULT_SCHEMA_ID),
+                            readContext);
+
+            // All batches filtered out, should return null
+            assertThat(fetchDataInfo).isNull();
+        }
+    }
+
     private LogSegment createSegment(long baseOffset) throws IOException {
         return createSegment(baseOffset, 10);
     }
