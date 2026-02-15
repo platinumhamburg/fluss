@@ -22,6 +22,7 @@ import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.TypedLogScanner;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.predicate.Predicate;
 
 import javax.annotation.Nullable;
 
@@ -58,6 +59,16 @@ public interface Scan {
      * @param rowNumber the limited row number to read
      */
     Scan limit(int rowNumber);
+
+    /**
+     * Returns a new scan from this that will apply the given predicate filter.
+     *
+     * <p>Note: the filter currently only supports record batch level filtering, not row level
+     * filtering. The computing engine still needs to perform secondary filtering on the results.
+     *
+     * @param predicate the predicate to apply for record batch level filtering
+     */
+    Scan filter(@Nullable Predicate predicate);
 
     /**
      * Creates a {@link LogScanner} to continuously read log data for this scan.
