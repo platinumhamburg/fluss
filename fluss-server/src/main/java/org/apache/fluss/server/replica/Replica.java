@@ -43,6 +43,8 @@ import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.protocol.Errors;
@@ -1335,6 +1337,8 @@ public final class Replica {
                                         Integer.MAX_VALUE,
                                         FetchIsolation.HIGH_WATERMARK,
                                         true,
+                                        null,
+                                        null,
                                         null);
                         return dataInfo.getRecords();
                     } catch (IOException e) {
@@ -1494,13 +1498,33 @@ public final class Replica {
 
         // todo validate fetched epoch.
 
+        // Create ReadContext for batch filtering if needed
+        LogRecordBatch.ReadContext readContext = null;
+        if (fetchParams.getTableFilter(tableBucket.getTableId()) != null) {
+            if (logFormat == LogFormat.ARROW) {
+                readContext =
+                        LogRecordReadContext.createArrowReadContext(
+                                tableInfo.getSchema().getRowType(),
+                                tableInfo.getSchemaId(),
+                                schemaGetter);
+            } else if (logFormat == LogFormat.INDEXED) {
+                readContext =
+                        LogRecordReadContext.createIndexedReadContext(
+                                tableInfo.getSchema().getRowType(),
+                                tableInfo.getSchemaId(),
+                                schemaGetter);
+            }
+        }
+
         FetchDataInfo fetchDataInfo =
                 logTablet.read(
                         readOffset,
                         fetchParams.maxFetchBytes(),
                         fetchParams.isolation(),
                         fetchParams.minOneMessage(),
-                        fetchParams.projection());
+                        fetchParams.projection(),
+                        fetchParams.getTableFilter(tableBucket.getTableId()),
+                        readContext);
         return new LogReadInfo(fetchDataInfo, initialHighWatermark, initialLogEndOffset);
     }
 
