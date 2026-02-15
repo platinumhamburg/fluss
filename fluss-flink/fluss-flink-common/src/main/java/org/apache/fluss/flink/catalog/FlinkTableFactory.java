@@ -62,6 +62,7 @@ import java.util.Set;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DELETE_BEHAVIOR;
 import static org.apache.fluss.config.FlussConfigUtils.CLIENT_PREFIX;
+import static org.apache.fluss.config.FlussConfigUtils.TABLE_PREFIX;
 import static org.apache.fluss.flink.catalog.FlinkCatalog.LAKE_TABLE_SPLITTER;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getBucketKeyIndexes;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getBucketKeys;
@@ -150,6 +151,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 toFlussTablePath(context.getObjectIdentifier()),
                 toFlussClientConfig(
                         context.getCatalogTable().getOptions(), context.getConfiguration()),
+                toFlussTableConfig(tableOptions),
                 tableOutputType,
                 primaryKeyIndexes,
                 bucketKeyIndexes,
@@ -271,6 +273,24 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         // RetriableException return by server not all exceptions. Trace by:
         // https://github.com/apache/fluss/issues/2099
         return flussConfig;
+    }
+
+    private static Configuration toFlussTableConfig(ReadableConfig tableOptions) {
+        Configuration tableConfig = new Configuration();
+
+        // forward all table-level configs by iterating through known table options
+        // this approach is safer than using toMap() which may not exist in all Flink versions
+        for (ConfigOption<?> option : FlinkConnectorOptions.TABLE_OPTIONS) {
+            if (option.key().startsWith(TABLE_PREFIX)) {
+                Object value = tableOptions.getOptional(option).orElse(null);
+                if (value != null) {
+                    // convert value to string for configuration storage
+                    tableConfig.setString(option.key(), value.toString());
+                }
+            }
+        }
+
+        return tableConfig;
     }
 
     private static TablePath toFlussTablePath(ObjectIdentifier tablePath) {
