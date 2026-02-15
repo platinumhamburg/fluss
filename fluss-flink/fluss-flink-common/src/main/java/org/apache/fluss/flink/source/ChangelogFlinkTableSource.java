@@ -162,6 +162,7 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
                         isPartitioned(),
                         flussRowType,
                         projectedFields,
+                        null,
                         offsetsInitializer,
                         scanPartitionDiscoveryIntervalMs,
                         new ChangelogDeserializationSchema(),
