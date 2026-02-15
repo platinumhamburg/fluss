@@ -1,0 +1,12 @@
+{
+  "mode": "auto",
+  "base_override": "",
+  "max_commits": 8,
+  "user_prompt": "评审专家认为63db1b5a56453ae7bd2cf7744d98301031207e01这个提交太大了，我们将这个提交拆分成两个提交，一个是与null count优化无关的一些其他的fix和优化（作为前置提交），一个是专注于null count优化的单独提交",
+  "target_commit": "63db1b5a56453ae7bd2cf7744d98301031207e01",
+  "original_branch": "filter-server-client-integration",
+  "original_head": "63db1b5a56453ae7bd2cf7744d98301031207e01",
+  "base_sha": "3f645087100d8cb0cd9b8dbb28e304137c5ee6ba",
+  "phase": "init_complete",
+  "created_at": 1775184838000
+}

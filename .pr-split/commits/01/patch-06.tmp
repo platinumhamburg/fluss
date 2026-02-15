@@ -1,0 +1,14 @@
+diff --git a/fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java b/fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java
+index 0bb2c005..98aa64c2 100644
+--- a/fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java
++++ b/fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java
+@@ -48,7 +48,8 @@ public final class FetchParamsBuilder {
+         return this;
+     }
+ 
+-    public FetchParamsBuilder withTableFilterInfoMap(Map<Long, FilterInfo> tableFilterInfoMap) {
++    public FetchParamsBuilder withTableFilterInfoMap(
++            @Nullable Map<Long, FilterInfo> tableFilterInfoMap) {
+         this.tableFilterInfoMap = tableFilterInfoMap;
+         return this;
+     }

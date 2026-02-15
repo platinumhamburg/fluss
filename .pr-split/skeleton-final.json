@@ -1,0 +1,172 @@
+{
+  "version": 1,
+  "total_commits": 2,
+  "synthetic_count": 0,
+  "revision_notes": [],
+  "commits": [
+    {
+      "id": 1,
+      "subject": "[filter] Address code review feedback for filter pushdown",
+      "theme_type": "refactor",
+      "message_draft": "[filter] Address code review feedback for filter pushdown\n\nApply miscellaneous fixes and improvements from code review:\n- Narrow Long to long primitive in DefaultCompletedFetch\n- Clean up imports and fix typo in LogFetcher\n- Remove redundant FILTER_TEST_ROW_TYPE field and improve assertions in LogFetcherFilterITCase\n- Remove unused getTargetSchemaId() from LogRecordReadContext\n- Remove @VisibleForTesting and add @Nullable in FetchParams/FetchParamsBuilder\n- Improve log messages in Replica\n- Add mid-segment offset filter test in LocalLogTest\n- Refactor filter tests and add boundary predicate test in LogSegmentTest",
+      "type": "extractive",
+      "status": "pending",
+      "files": [
+        "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/DefaultCompletedFetch.java",
+        "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/LogFetcher.java",
+        "fluss-client/src/test/java/org/apache/fluss/client/table/scanner/log/LogFetcherFilterITCase.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java",
+        "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParams.java",
+        "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java",
+        "fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java",
+        "fluss-server/src/test/java/org/apache/fluss/server/log/LocalLogTest.java",
+        "fluss-server/src/test/java/org/apache/fluss/server/log/LogSegmentTest.java"
+      ],
+      "hunk_groups": [
+        {
+          "file": "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/DefaultCompletedFetch.java",
+          "mode": "extractive",
+          "hunk_ids": ["H001"]
+        },
+        {
+          "file": "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/LogFetcher.java",
+          "mode": "extractive",
+          "hunk_ids": ["H002", "H003", "H004"]
+        },
+        {
+          "file": "fluss-client/src/test/java/org/apache/fluss/client/table/scanner/log/LogFetcherFilterITCase.java",
+          "mode": "extractive",
+          "hunk_ids": ["H005", "H006", "H007", "H008", "H009", "H010", "H011", "H012", "H013"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java",
+          "mode": "extractive",
+          "hunk_ids": ["H039"]
+        },
+        {
+          "file": "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParams.java",
+          "mode": "extractive",
+          "hunk_ids": ["H066", "H067"]
+        },
+        {
+          "file": "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java",
+          "mode": "extractive",
+          "hunk_ids": ["H068"]
+        },
+        {
+          "file": "fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java",
+          "mode": "extractive",
+          "hunk_ids": ["H069", "H070"]
+        },
+        {
+          "file": "fluss-server/src/test/java/org/apache/fluss/server/log/LocalLogTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H071"]
+        },
+        {
+          "file": "fluss-server/src/test/java/org/apache/fluss/server/log/LogSegmentTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H072", "H073", "H074", "H075"]
+        }
+      ],
+      "estimated_lines": 350
+    },
+    {
+      "id": 2,
+      "subject": "[common] Get null count from Arrow metadata instead of statistics",
+      "theme_type": "implementation",
+      "message_draft": "[common] Get null count from Arrow metadata instead of statistics\n\nIntroduce V2 statistics format that omits null counts from the binary\nstatistics layout. Instead, null counts are extracted on-demand from\nArrow RecordBatch FlatBuffer metadata via the new ArrowNullCountReader.\n\nThis reduces the serialized statistics size and avoids redundant null\ncount tracking during record writing, since Arrow already maintains\naccurate null counts in its field node metadata.\n\nKey changes:\n- Add ArrowNullCountReader to extract null counts from Arrow FlatBuffer\n- Introduce STATISTICS_VERSION_V2 that excludes null counts from layout\n- Update writer/parser/collector to handle V2 format\n- Make DefaultLogRecordBatchStatistics support lazy null count injection\n- Maintain backward compatibility: V1 statistics are still parsed correctly\n- Add comprehensive tests including V1 backward compatibility verification",
+      "type": "extractive",
+      "status": "pending",
+      "files": [
+        "fluss-common/src/main/java/org/apache/fluss/record/ArrowNullCountReader.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatch.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatchStatistics.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/FileLogInputStream.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchFormat.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsCollector.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsParser.java",
+        "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsWriter.java",
+        "fluss-common/src/test/java/org/apache/fluss/record/ArrowNullCountReaderTest.java",
+        "fluss-common/src/test/java/org/apache/fluss/record/FileLogInputStreamTest.java",
+        "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsCollectorTest.java",
+        "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsParserTest.java",
+        "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsTest.java",
+        "fluss-common/src/test/java/org/apache/fluss/record/MemoryLogRecordsArrowBuilderTest.java"
+      ],
+      "hunk_groups": [
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/ArrowNullCountReader.java",
+          "mode": "extractive",
+          "hunk_ids": ["H014"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatch.java",
+          "mode": "extractive",
+          "hunk_ids": ["H015"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatchStatistics.java",
+          "mode": "extractive",
+          "hunk_ids": ["H016", "H017", "H018", "H019", "H020"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/FileLogInputStream.java",
+          "mode": "extractive",
+          "hunk_ids": ["H021"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchFormat.java",
+          "mode": "extractive",
+          "hunk_ids": ["H022"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsCollector.java",
+          "mode": "extractive",
+          "hunk_ids": ["H023", "H024", "H025", "H026", "H027"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsParser.java",
+          "mode": "extractive",
+          "hunk_ids": ["H028", "H029", "H030", "H031", "H032", "H033"]
+        },
+        {
+          "file": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsWriter.java",
+          "mode": "extractive",
+          "hunk_ids": ["H034", "H035", "H036", "H037", "H038"]
+        },
+        {
+          "file": "fluss-common/src/test/java/org/apache/fluss/record/ArrowNullCountReaderTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H040"]
+        },
+        {
+          "file": "fluss-common/src/test/java/org/apache/fluss/record/FileLogInputStreamTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H041"]
+        },
+        {
+          "file": "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsCollectorTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H042", "H043", "H044", "H045", "H046"]
+        },
+        {
+          "file": "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsParserTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H047", "H048", "H049", "H050", "H051", "H052", "H053", "H054", "H055"]
+        },
+        {
+          "file": "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H056", "H057", "H058", "H059", "H060"]
+        },
+        {
+          "file": "fluss-common/src/test/java/org/apache/fluss/record/MemoryLogRecordsArrowBuilderTest.java",
+          "mode": "extractive",
+          "hunk_ids": ["H061", "H062", "H063", "H064", "H065"]
+        }
+      ],
+      "estimated_lines": 1572
+    }
+  ]
+}

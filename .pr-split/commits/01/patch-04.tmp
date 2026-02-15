@@ -1,0 +1,16 @@
+diff --git a/fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java b/fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java
+index ee2b1dc5..ed9fc1e6 100644
+--- a/fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java
++++ b/fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java
+@@ -270,11 +270,6 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
+         return projectionPushDowned;
+     }
+ 
+-    /** Get the target schema ID. */
+-    public int getTargetSchemaId() {
+-        return targetSchemaId;
+-    }
+-
+     /** Get the schema getter. */
+     @Nullable
+     public SchemaGetter getSchemaGetter() {

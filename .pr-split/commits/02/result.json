@@ -1,0 +1,12 @@
+{
+  "commit_id": 2,
+  "status": "pass",
+  "compile": "pass",
+  "test": "pass",
+  "test_summary": "1642 run, 0 failures, 0 errors, 1 skipped",
+  "commit_message_check": "pass",
+  "distance": 0,
+  "prev_distance": 1479,
+  "errors": 0,
+  "next_action": "done"
+}

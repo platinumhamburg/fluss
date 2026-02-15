@@ -1,0 +1,58 @@
+{
+  "commit_id": 1,
+  "subject": "[filter] Address code review feedback for filter pushdown",
+  "theme_type": "refactor",
+  "message": "[filter] Address code review feedback for filter pushdown\n\nApply miscellaneous fixes and improvements from code review:\n- Narrow Long to long primitive in DefaultCompletedFetch\n- Clean up imports and fix typo in LogFetcher\n- Remove redundant FILTER_TEST_ROW_TYPE field and improve assertions in LogFetcherFilterITCase\n- Remove unused getTargetSchemaId() from LogRecordReadContext\n- Remove @VisibleForTesting and add @Nullable in FetchParams/FetchParamsBuilder\n- Improve log messages in Replica\n- Add mid-segment offset filter test in LocalLogTest\n- Refactor filter tests and add boundary predicate test in LogSegmentTest",
+  "type": "extractive",
+  "skip_gan": false,
+  "files": [
+    {
+      "path": "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/DefaultCompletedFetch.java",
+      "mode": "extractive",
+      "hunk_ids": ["H001"]
+    },
+    {
+      "path": "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/LogFetcher.java",
+      "mode": "extractive",
+      "hunk_ids": ["H002", "H003", "H004"]
+    },
+    {
+      "path": "fluss-client/src/test/java/org/apache/fluss/client/table/scanner/log/LogFetcherFilterITCase.java",
+      "mode": "extractive",
+      "hunk_ids": ["H005", "H006", "H007", "H008", "H009", "H010", "H011", "H012", "H013"]
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java",
+      "mode": "extractive",
+      "hunk_ids": ["H039"]
+    },
+    {
+      "path": "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParams.java",
+      "mode": "extractive",
+      "hunk_ids": ["H066", "H067"]
+    },
+    {
+      "path": "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java",
+      "mode": "extractive",
+      "hunk_ids": ["H068"]
+    },
+    {
+      "path": "fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java",
+      "mode": "extractive",
+      "hunk_ids": ["H069", "H070"]
+    },
+    {
+      "path": "fluss-server/src/test/java/org/apache/fluss/server/log/LocalLogTest.java",
+      "mode": "extractive",
+      "hunk_ids": ["H071"]
+    },
+    {
+      "path": "fluss-server/src/test/java/org/apache/fluss/server/log/LogSegmentTest.java",
+      "mode": "extractive",
+      "hunk_ids": ["H072", "H073", "H074", "H075"]
+    }
+  ],
+  "total_hunks": 24,
+  "estimated_lines": 350,
+  "glue_code": false
+}

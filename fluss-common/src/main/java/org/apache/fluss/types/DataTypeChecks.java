@@ -87,6 +87,11 @@ public final class DataTypeChecks {
                 DataTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE);
     }
 
+    /** Returns true if the given data type is a binary type (BINARY or BYTES). */
+    public static boolean isBinaryType(DataType dataType) {
+        return dataType.isAnyOf(DataTypeRoot.BINARY, DataTypeRoot.BYTES);
+    }
+
     private DataTypeChecks() {
         // no instantiation
     }

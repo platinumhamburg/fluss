@@ -1,0 +1,669 @@
+{
+  "version": 1,
+  "total_hunks": 64,
+  "files": [
+    {
+      "path": "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/DefaultCompletedFetch.java",
+      "hunks": [
+        {
+          "id": "H001",
+          "lines": "36-36",
+          "type": "~signature",
+          "summary": "Change fetchOffset parameter from Long (boxed) to long (primitive)",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-client/src/main/java/org/apache/fluss/client/table/scanner/log/LogFetcher.java",
+      "hunks": [
+        {
+          "id": "H002",
+          "lines": "51-52",
+          "type": "+import",
+          "summary": "Add direct import for PbPredicate instead of using fully qualified name",
+          "null_count_related": false
+        },
+        {
+          "id": "H003",
+          "lines": "97-97",
+          "type": "~body",
+          "summary": "Use short PbPredicate class name instead of fully qualified name",
+          "null_count_related": false
+        },
+        {
+          "id": "H004",
+          "lines": "402-402",
+          "type": "~body",
+          "summary": "Fix typo: 'In oder to' -> 'In order to'",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": [["H002", "H003"]]
+    },
+    {
+      "path": "fluss-client/src/test/java/org/apache/fluss/client/table/scanner/log/LogFetcherFilterITCase.java",
+      "hunks": [
+        {
+          "id": "H005",
+          "lines": "29-29",
+          "type": "-import",
+          "summary": "Remove unused RowType import",
+          "null_count_related": false
+        },
+        {
+          "id": "H006",
+          "lines": "59-61",
+          "type": "-field",
+          "summary": "Remove redundant FILTER_TEST_ROW_TYPE field, use DATA1_ROW_TYPE directly",
+          "null_count_related": false
+        },
+        {
+          "id": "H007",
+          "lines": "97-97",
+          "type": "~body",
+          "summary": "Replace FILTER_TEST_ROW_TYPE with DATA1_ROW_TYPE in PredicateBuilder",
+          "null_count_related": false
+        },
+        {
+          "id": "H008",
+          "lines": "129-133",
+          "type": "~body",
+          "summary": "Replace FILTER_TEST_ROW_TYPE with DATA1_ROW_TYPE in matching/non-matching data creation",
+          "null_count_related": false
+        },
+        {
+          "id": "H009",
+          "lines": "154-154",
+          "type": "~body",
+          "summary": "Improve assertion: use assertThat(records).containsKey(tb0) instead of assertThat(records.containsKey(tb0)).isTrue()",
+          "null_count_related": false
+        },
+        {
+          "id": "H010",
+          "lines": "190-190",
+          "type": "~body",
+          "summary": "Replace FILTER_TEST_ROW_TYPE with DATA1_ROW_TYPE in mixed data test",
+          "null_count_related": false
+        },
+        {
+          "id": "H011",
+          "lines": "206-206",
+          "type": "~body",
+          "summary": "Improve assertion: use assertThat(records).containsKey(tb0)",
+          "null_count_related": false
+        },
+        {
+          "id": "H012",
+          "lines": "236-236",
+          "type": "~body",
+          "summary": "Replace FILTER_TEST_ROW_TYPE with DATA1_ROW_TYPE in all-non-matching test",
+          "null_count_related": false
+        },
+        {
+          "id": "H013",
+          "lines": "272-293",
+          "type": "~body",
+          "summary": "Replace FILTER_TEST_ROW_TYPE with DATA1_ROW_TYPE and simplify retry loop comments and nested retry",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": [["H006", "H007"], ["H006", "H008"], ["H006", "H010"], ["H006", "H012"], ["H006", "H013"], ["H005", "H006"]]
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/ArrowNullCountReader.java",
+      "hunks": [
+        {
+          "id": "H014",
+          "lines": "1-167",
+          "type": "+file",
+          "summary": "New utility class to extract null counts from Arrow RecordBatch FlatBuffer metadata, with caching for field node mappings",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatch.java",
+      "hunks": [
+        {
+          "id": "H015",
+          "lines": "522-607",
+          "type": "~body",
+          "summary": "Change getStatistics to use DefaultLogRecordBatchStatistics, add V2 null count extraction from Arrow metadata via readAndSetNullCountsFromArrowMetadata",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatchStatistics.java",
+      "hunks": [
+        {
+          "id": "H016",
+          "lines": "39-57",
+          "type": "~body",
+          "summary": "Update javadoc to document V1 and V2 statistics layout formats",
+          "null_count_related": true
+        },
+        {
+          "id": "H017",
+          "lines": "58-82",
+          "type": "~body",
+          "summary": "Add V2 layout documentation in javadoc showing null counts omitted",
+          "null_count_related": true
+        },
+        {
+          "id": "H018",
+          "lines": "91-91",
+          "type": "~field",
+          "summary": "Make statsNullCounts non-final to allow setting from Arrow metadata",
+          "null_count_related": true
+        },
+        {
+          "id": "H019",
+          "lines": "168-170",
+          "type": "~body",
+          "summary": "Add null check for statsNullCounts in getNullCounts() to return null for V2 before Arrow extraction",
+          "null_count_related": true
+        },
+        {
+          "id": "H020",
+          "lines": "185-204",
+          "type": "+method",
+          "summary": "Add setNullCounts() and getStatsIndexMapping() methods for V2 Arrow null count injection",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": [["H018", "H019"], ["H018", "H020"]]
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/FileLogInputStream.java",
+      "hunks": [
+        {
+          "id": "H021",
+          "lines": "321-603",
+          "type": "~body",
+          "summary": "Change getStatistics to use DefaultLogRecordBatchStatistics, add V2 null count extraction from Arrow metadata via readAndSetNullCountsFromArrowMetadata for file-based reads",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchFormat.java",
+      "hunks": [
+        {
+          "id": "H022",
+          "lines": "59-63",
+          "type": "~field",
+          "summary": "Rename STATISTICS_VERSION to STATISTICS_VERSION_V1, add STATISTICS_VERSION_V2 and CURRENT_STATISTICS_VERSION constants",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsCollector.java",
+      "hunks": [
+        {
+          "id": "H023",
+          "lines": "47-47",
+          "type": "-field",
+          "summary": "Remove nullCounts field from collector (V2 gets null counts from Arrow metadata)",
+          "null_count_related": true
+        },
+        {
+          "id": "H024",
+          "lines": "57-59",
+          "type": "~body",
+          "summary": "Remove nullCounts initialization and Arrays.fill in constructor",
+          "null_count_related": true
+        },
+        {
+          "id": "H025",
+          "lines": "69-71",
+          "type": "~body",
+          "summary": "Remove null count tracking in processRow — only track min/max",
+          "null_count_related": true
+        },
+        {
+          "id": "H026",
+          "lines": "84-84",
+          "type": "~body",
+          "summary": "Remove nullCounts parameter from writeStatistics call",
+          "null_count_related": true
+        },
+        {
+          "id": "H027",
+          "lines": "110-110",
+          "type": "~body",
+          "summary": "Remove Arrays.fill(nullCounts, 0L) from reset()",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": [["H023", "H024"], ["H023", "H025"], ["H023", "H026"], ["H023", "H027"]]
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsParser.java",
+      "hunks": [
+        {
+          "id": "H028",
+          "lines": "27-28",
+          "type": "~body",
+          "summary": "Update imports: STATISTICS_VERSION -> STATISTICS_VERSION_V1, add STATISTICS_VERSION_V2",
+          "null_count_related": true
+        },
+        {
+          "id": "H029",
+          "lines": "57-59",
+          "type": "~body",
+          "summary": "Update comment to document V1 and V2 format layouts",
+          "null_count_related": true
+        },
+        {
+          "id": "H030",
+          "lines": "97-97",
+          "type": "~body",
+          "summary": "Accept both V1 and V2 version bytes in parseStatistics (MemorySegment overload)",
+          "null_count_related": true
+        },
+        {
+          "id": "H031",
+          "lines": "114-148",
+          "type": "~body",
+          "summary": "Branch null count reading: V1 reads inline, V2 sets null; compute minSizeFieldOffset differently per version",
+          "null_count_related": true
+        },
+        {
+          "id": "H032",
+          "lines": "244-244",
+          "type": "~body",
+          "summary": "Accept both V1 and V2 version bytes in isValidStatistics",
+          "null_count_related": true
+        },
+        {
+          "id": "H033",
+          "lines": "315-335",
+          "type": "~body",
+          "summary": "Update getStatisticsSize to handle V1/V2 layout differences for size calculation",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": [["H028", "H030"], ["H028", "H031"], ["H028", "H032"], ["H028", "H033"]]
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchStatisticsWriter.java",
+      "hunks": [
+        {
+          "id": "H034",
+          "lines": "30-30",
+          "type": "~body",
+          "summary": "Update import: STATISTICS_VERSION -> CURRENT_STATISTICS_VERSION",
+          "null_count_related": true
+        },
+        {
+          "id": "H035",
+          "lines": "30-55",
+          "type": "~body",
+          "summary": "Update javadoc: remove null counts from format description, update to V2",
+          "null_count_related": true
+        },
+        {
+          "id": "H036",
+          "lines": "56-58",
+          "type": "~body",
+          "summary": "Update usage example in javadoc: remove nullCounts parameter",
+          "null_count_related": true
+        },
+        {
+          "id": "H037",
+          "lines": "103-130",
+          "type": "~signature",
+          "summary": "Remove nullCounts parameter from writeStatistics method, write CURRENT_STATISTICS_VERSION, remove null counts writing loop",
+          "null_count_related": true
+        },
+        {
+          "id": "H038",
+          "lines": "256-258",
+          "type": "~body",
+          "summary": "Remove null counts size estimation from estimateStatisticsSize",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": [["H034", "H037"], ["H035", "H036"]]
+    },
+    {
+      "path": "fluss-common/src/main/java/org/apache/fluss/record/LogRecordReadContext.java",
+      "hunks": [
+        {
+          "id": "H039",
+          "lines": "270-274",
+          "type": "-method",
+          "summary": "Remove unused getTargetSchemaId() method",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/test/java/org/apache/fluss/record/ArrowNullCountReaderTest.java",
+      "hunks": [
+        {
+          "id": "H040",
+          "lines": "1-162",
+          "type": "+file",
+          "summary": "New test class for ArrowNullCountReader: tests field node mapping for simple, partial, and nested types, plus null count extraction",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/test/java/org/apache/fluss/record/FileLogInputStreamTest.java",
+      "hunks": [
+        {
+          "id": "H041",
+          "lines": "228-260",
+          "type": "-method",
+          "summary": "Remove testStatisticsCreation test (superseded by V2 null count tests elsewhere)",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsCollectorTest.java",
+      "hunks": [
+        {
+          "id": "H042",
+          "lines": "93-95",
+          "type": "~body",
+          "summary": "Update test: expect null counts to be null in V2 format (basic test)",
+          "null_count_related": true
+        },
+        {
+          "id": "H043",
+          "lines": "157-160",
+          "type": "~body",
+          "summary": "Update test: expect null counts to be null in V2 format (nullable test)",
+          "null_count_related": true
+        },
+        {
+          "id": "H044",
+          "lines": "303-306",
+          "type": "~body",
+          "summary": "Update test: expect null counts to be null in V2 format (empty rows test)",
+          "null_count_related": true
+        },
+        {
+          "id": "H045",
+          "lines": "349-351",
+          "type": "~body",
+          "summary": "Update test: expect null counts to be null in V2 format (all-null column test)",
+          "null_count_related": true
+        },
+        {
+          "id": "H046",
+          "lines": "361-362",
+          "type": "~body",
+          "summary": "Remove null count assertions for non-null columns in all-null column test",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsParserTest.java",
+      "hunks": [
+        {
+          "id": "H047",
+          "lines": "21-21",
+          "type": "+import",
+          "summary": "Add AlignedRow import for V1 backward compatibility test",
+          "null_count_related": true
+        },
+        {
+          "id": "H048",
+          "lines": "55-78",
+          "type": "~body",
+          "summary": "Update testWriteAndParseStatistics_byteArray: remove nullCounts param, expect null counts to be null in V2",
+          "null_count_related": true
+        },
+        {
+          "id": "H049",
+          "lines": "80-98",
+          "type": "~body",
+          "summary": "Update testWriteAndParseStatistics_directByteBuffer: remove nullCounts param, expect null in V2",
+          "null_count_related": true
+        },
+        {
+          "id": "H050",
+          "lines": "105-122",
+          "type": "~body",
+          "summary": "Update testWriteAndParseStatistics_memorySegment: remove nullCounts param, expect null in V2",
+          "null_count_related": true
+        },
+        {
+          "id": "H051",
+          "lines": "129-140",
+          "type": "~body",
+          "summary": "Update testIsValidStatistics: remove nullCounts param",
+          "null_count_related": true
+        },
+        {
+          "id": "H052",
+          "lines": "161-172",
+          "type": "~body",
+          "summary": "Update testGetStatisticsSize: remove nullCounts param",
+          "null_count_related": true
+        },
+        {
+          "id": "H053",
+          "lines": "197-213",
+          "type": "~body",
+          "summary": "Update testWriteAndParseStatistics_singleColumn: remove nullCounts param, expect null in V2",
+          "null_count_related": true
+        },
+        {
+          "id": "H054",
+          "lines": "210-276",
+          "type": "+method",
+          "summary": "Add testParseV1StatisticsAfterVersionBump and writeAlignedRowToOutput helper for V1 backward compatibility verification",
+          "null_count_related": true
+        },
+        {
+          "id": "H055",
+          "lines": "298-302",
+          "type": "~signature",
+          "summary": "Remove nullCounts parameter from writeStatisticsForTest helper method",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": [["H047", "H054"]]
+    },
+    {
+      "path": "fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchStatisticsTest.java",
+      "hunks": [
+        {
+          "id": "H056",
+          "lines": "86-90",
+          "type": "~body",
+          "summary": "Update test: V2 null counts extracted from Arrow metadata, expect containsExactly(0L,0L,0L,0L)",
+          "null_count_related": true
+        },
+        {
+          "id": "H057",
+          "lines": "108-112",
+          "type": "~body",
+          "summary": "Update test: V2 null counts from Arrow metadata, expect containsExactly(1L,1L,1L)",
+          "null_count_related": true
+        },
+        {
+          "id": "H058",
+          "lines": "248-253",
+          "type": "~body",
+          "summary": "Update test: compare file and default null counts from Arrow metadata",
+          "null_count_related": true
+        },
+        {
+          "id": "H059",
+          "lines": "358-377",
+          "type": "~body",
+          "summary": "Update testDefaultLogRecordBatchStatisticsWithSerializedData: remove nullCounts param, expect null in V2",
+          "null_count_related": true
+        },
+        {
+          "id": "H060",
+          "lines": "387-401",
+          "type": "~body",
+          "summary": "Update testPartialStatisticsWrapperThrowsForUnavailableColumns: remove nullCounts param",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-common/src/test/java/org/apache/fluss/record/MemoryLogRecordsArrowBuilderTest.java",
+      "hunks": [
+        {
+          "id": "H061",
+          "lines": "428-474",
+          "type": "~body",
+          "summary": "Update testStatisticsWithV2Format: V2 null counts from Arrow metadata, add containsExactly assertion, remove per-field null count checks",
+          "null_count_related": true
+        },
+        {
+          "id": "H062",
+          "lines": "474-580",
+          "type": "+method",
+          "summary": "Add testV2NullCountRoundTripFromArrowMetadata: end-to-end test verifying null counts extracted from Arrow metadata match expected values",
+          "null_count_related": true
+        },
+        {
+          "id": "H063",
+          "lines": "596-601",
+          "type": "~body",
+          "summary": "Update testStatisticsWithNullValues: V2 null counts from Arrow metadata, use containsExactly",
+          "null_count_related": true
+        },
+        {
+          "id": "H064",
+          "lines": "681-685",
+          "type": "~body",
+          "summary": "Update testStatisticsWithChangeTypes: V2 null counts from Arrow metadata, use containsExactly",
+          "null_count_related": true
+        },
+        {
+          "id": "H065",
+          "lines": "713-754",
+          "type": "+method",
+          "summary": "Add testV2NullCountAllNullColumn: test that all-null column correctly reports null count from Arrow metadata",
+          "null_count_related": true
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParams.java",
+      "hunks": [
+        {
+          "id": "H066",
+          "lines": "17-17",
+          "type": "-import",
+          "summary": "Remove unused @VisibleForTesting import",
+          "null_count_related": false
+        },
+        {
+          "id": "H067",
+          "lines": "78-79",
+          "type": "~signature",
+          "summary": "Remove @VisibleForTesting annotation and change constructor to package-private",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": [["H066", "H067"]]
+    },
+    {
+      "path": "fluss-server/src/main/java/org/apache/fluss/server/log/FetchParamsBuilder.java",
+      "hunks": [
+        {
+          "id": "H068",
+          "lines": "48-49",
+          "type": "~signature",
+          "summary": "Add @Nullable annotation to tableFilterInfoMap parameter in withTableFilterInfoMap",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java",
+      "hunks": [
+        {
+          "id": "H069",
+          "lines": "1521-1525",
+          "type": "~body",
+          "summary": "Improve log message: add table path to filter schema not found warning",
+          "null_count_related": false
+        },
+        {
+          "id": "H070",
+          "lines": "1547-1551",
+          "type": "~body",
+          "summary": "Simplify log message: remove exception class name from filter init failure warning",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-server/src/test/java/org/apache/fluss/server/log/LocalLogTest.java",
+      "hunks": [
+        {
+          "id": "H071",
+          "lines": "730-799",
+          "type": "+method",
+          "summary": "Add testReadWithFilterFromMidSegmentOffset: test filter reading starting from mid-segment offset",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": []
+    },
+    {
+      "path": "fluss-server/src/test/java/org/apache/fluss/server/log/LogSegmentTest.java",
+      "hunks": [
+        {
+          "id": "H072",
+          "lines": "500-519",
+          "type": "~body",
+          "summary": "Refactor filter test: collect all values and use anyMatch instead of early break",
+          "null_count_related": false
+        },
+        {
+          "id": "H073",
+          "lines": "649-649",
+          "type": "~body",
+          "summary": "Make filteredEndOffset assertion exact: isGreaterThanOrEqualTo(50L) -> isEqualTo(59L)",
+          "null_count_related": false
+        },
+        {
+          "id": "H074",
+          "lines": "824-824",
+          "type": "~body",
+          "summary": "Make filteredEndOffset assertion exact: isGreaterThanOrEqualTo(50L) -> isEqualTo(51L)",
+          "null_count_related": false
+        },
+        {
+          "id": "H075",
+          "lines": "937-1006",
+          "type": "+method",
+          "summary": "Add testReadWithFilterBoundaryPredicateAtBatchMax: test boundary condition where predicate threshold equals batch max value",
+          "null_count_related": false
+        }
+      ],
+      "intra_deps": []
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "commit_id": 1,
+  "status": "pass",
+  "compile": "pass",
+  "test": "pass",
+  "commit_message_check": "pass",
+  "tests_run": 70,
+  "tests_passed": 70,
+  "tests_failed": 0,
+  "errors": 0,
+  "distance": 1479,
+  "remaining_hunks": 51,
+  "notes": "Compile passed for fluss-client, fluss-server, fluss-common. Server tests (LocalLogTest: 23, LogSegmentTest: 37) all passed. Client test (DefaultCompletedFetchTest: 10) passed after clean rebuild. ReplicaFetcherITCase has a pre-existing compile error (FetchParams constructor visibility) that also exists in the original target commit 63db1b5a — not introduced by this split.",
+  "next_action": "continue"
+}
