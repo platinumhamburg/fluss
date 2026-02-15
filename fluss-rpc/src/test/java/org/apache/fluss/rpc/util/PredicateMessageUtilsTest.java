@@ -55,11 +55,13 @@ import org.junit.jupiter.api.Test;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** PredicateMessageUtilsTest. */
 public class PredicateMessageUtilsTest {
@@ -514,5 +516,96 @@ public class PredicateMessageUtilsTest {
             assertThat(lp.type().getClass()).isEqualTo(predicate.type().getClass());
             assertThat(lp.literals().get(0)).isNull();
         }
+    }
+
+    @Test
+    public void testInvalidPredicateTypeHandling() {
+        // Create a PbPredicate with invalid type value
+        PbPredicate invalidPb = new PbPredicate();
+        invalidPb.setType(999); // Invalid type value
+
+        // Should throw exception for invalid predicate type
+        assertThatThrownBy(() -> PredicateMessageUtils.toPredicate(invalidPb))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void testLeafPredicateWithoutLeafData() {
+        // Create a PbPredicate marked as LEAF but without leaf data
+        PbPredicate incompletePb = new PbPredicate();
+        incompletePb.setType(0); // LEAF type
+
+        // Should throw IllegalStateException when trying to access unset leaf field
+        assertThatThrownBy(() -> PredicateMessageUtils.toPredicate(incompletePb))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Field 'leaf' is not set");
+    }
+
+    @Test
+    public void testCompoundPredicateWithEmptyChildren() {
+        // Test compound predicate with no children
+        DataType type = new IntType(false);
+        CompoundPredicate emptyCompound =
+                new CompoundPredicate(And.INSTANCE, Collections.emptyList());
+
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(emptyCompound);
+        assertThat(pb.totalSize()).isGreaterThan(0);
+
+        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        assertThat(result).isInstanceOf(CompoundPredicate.class);
+        CompoundPredicate cp = (CompoundPredicate) result;
+        assertThat(cp.children()).isEmpty();
+    }
+
+    @Test
+    public void testDeeplyNestedCompoundPredicate() {
+        // Test deeply nested compound predicates (stress test)
+        DataType type = new IntType(false);
+        LeafPredicate leaf =
+                new LeafPredicate(Equal.INSTANCE, type, 0, "id", Collections.singletonList(1));
+
+        // Create a deeply nested structure: ((((leaf AND leaf) AND leaf) AND leaf) AND leaf)
+        Predicate nested = leaf;
+        for (int i = 0; i < 10; i++) {
+            nested = new CompoundPredicate(And.INSTANCE, Arrays.asList(nested, leaf));
+        }
+
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(nested);
+        assertThat(pb.totalSize()).isGreaterThan(0);
+
+        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        assertThat(result).isInstanceOf(CompoundPredicate.class);
+
+        // Verify the structure is preserved
+        int depth = 0;
+        Predicate current = result;
+        while (current instanceof CompoundPredicate) {
+            CompoundPredicate cp = (CompoundPredicate) current;
+            if (cp.children().isEmpty()) {
+                break;
+            }
+            depth++;
+            current = cp.children().get(0);
+        }
+        assertThat(depth).isEqualTo(10);
+    }
+
+    @Test
+    public void testLargeInPredicateWithManyValues() {
+        // Test IN predicate with many values
+        DataType type = new IntType(false);
+        List<Object> manyValues = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            manyValues.add(i);
+        }
+
+        LeafPredicate predicate = new LeafPredicate(In.INSTANCE, type, 0, "id", manyValues);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+        assertThat(pb.totalSize()).isGreaterThan(0);
+
+        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        assertThat(result).isInstanceOf(LeafPredicate.class);
+        LeafPredicate lp = (LeafPredicate) result;
+        assertThat(lp.literals()).hasSize(1000);
     }
 }
