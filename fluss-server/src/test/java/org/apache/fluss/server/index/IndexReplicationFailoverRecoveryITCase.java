@@ -49,6 +49,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
@@ -1426,7 +1427,10 @@ class IndexReplicationFailoverRecoveryITCase {
 
         int leaderA = leaderAndIsr.leader();
         int leaderB =
-                leaderAndIsr.isr().stream().filter(id -> id != leaderA).findFirst().orElseThrow();
+                leaderAndIsr.isr().stream()
+                        .filter(id -> id != leaderA)
+                        .findFirst()
+                        .orElseThrow(() -> new NoSuchElementException());
 
         LOG.info("Cascading failover: A={}, B={}", leaderA, leaderB);
 
@@ -1638,7 +1642,10 @@ class IndexReplicationFailoverRecoveryITCase {
                 FLUSS_CLUSTER_EXTENSION.waitForIsrExpansion(
                         idxNameBucket, 2, Duration.ofMinutes(2));
         int idxFollower =
-                leaderAndIsr.isr().stream().filter(id -> id != idxLeader).findFirst().orElseThrow();
+                leaderAndIsr.isr().stream()
+                        .filter(id -> id != idxLeader)
+                        .findFirst()
+                        .orElseThrow(() -> new NoSuchElementException());
 
         // Write data and wait for HW
         int dataLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(dataTableBucket);
@@ -1971,7 +1978,10 @@ class IndexReplicationFailoverRecoveryITCase {
                 FLUSS_CLUSTER_EXTENSION.waitForIsrExpansion(
                         idxNameBucket, 2, Duration.ofMinutes(2));
         int idxFollower =
-                leaderAndIsr.isr().stream().filter(id -> id != idxLeader).findFirst().orElseThrow();
+                leaderAndIsr.isr().stream()
+                        .filter(id -> id != idxLeader)
+                        .findFirst()
+                        .orElseThrow(() -> new NoSuchElementException());
 
         // Step 2: Write a large batch of data (20 records)
         int dataLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(dataTableBucket);
