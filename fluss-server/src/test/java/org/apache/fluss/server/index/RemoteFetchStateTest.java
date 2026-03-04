@@ -28,7 +28,8 @@ class RemoteFetchStateTest {
     void testInitialState() {
         RemoteFetchState state = new RemoteFetchState();
 
-        assertThat(state.getCommitOffset()).isEqualTo(0L);
+        // commitOffset initialized to -1 means "no report received yet"
+        assertThat(state.getCommitOffset()).isEqualTo(-1L);
         assertThat(state.getLeaderServerId()).isEqualTo(-1);
     }
 

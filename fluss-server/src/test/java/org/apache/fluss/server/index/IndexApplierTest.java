@@ -615,6 +615,45 @@ class IndexApplierTest {
     }
 
     // ================================================================================================
+    // Schema Evolution Tests
+    // ================================================================================================
+
+    @Test
+    void testApplyIndexRecordsAfterDataTableSchemaEvolution() throws Exception {
+        // Index table schema is invariant under data table ADD COLUMN.
+        // Verify IndexApplier works correctly after re-creation (as happens on leader switch).
+
+        // Apply first batch
+        MemoryLogRecords records1 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(0, 2), dataBucket1, 2L);
+        long applied1 = indexApplier.applyIndexRecords(records1, 0L, 2L, dataBucket1);
+        assertThat(applied1).isEqualTo(2L);
+
+        // Re-create IndexApplier (simulates leader switch after data table ADD COLUMN)
+        indexApplier.close();
+
+        indexApplier =
+                new IndexApplier(
+                        kvTablet,
+                        logTablet,
+                        () -> {},
+                        new TestingSchemaGetter(DEFAULT_SCHEMA_ID, indexSchema),
+                        TestingMetricGroups.TABLE_METRICS,
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
+
+        // Apply more index records with same index schema
+        MemoryLogRecords records2 =
+                createIndexMemoryLogRecordsWithState(DATA1.subList(2, 4), dataBucket1, 4L);
+        long applied2 = indexApplier.applyIndexRecords(records2, 2L, 4L, dataBucket1);
+        assertThat(applied2).isEqualTo(4L);
+
+        // Verify commit offset progressed
+        long leo = logTablet.localLogEndOffset();
+        updateHighWatermark(leo);
+        assertThat(indexApplier.getIndexCommitOffset(dataBucket1)).isEqualTo(4L);
+    }
+
+    // ================================================================================================
     // Data Class Tests
     // ================================================================================================
 

@@ -20,6 +20,7 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
+import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.record.ChangeType;
@@ -100,7 +101,6 @@ public final class IndexApplier implements Closeable {
 
     // ==================== Encoding ====================
 
-    private final RowType indexRowType;
     private final KeyEncoder indexKeyEncoder;
     private final @Nullable TtlHandler ttlHandler;
 
@@ -128,10 +128,10 @@ public final class IndexApplier implements Closeable {
         this.serverMetricGroup = checkNotNull(serverMetricGroup, "serverMetricGroup");
 
         Schema indexTableSchema = schemaGetter.getLatestSchemaInfo().getSchema();
-        this.indexRowType = indexTableSchema.getRowType();
+        RowType initRowType = indexTableSchema.getRowType();
         this.indexKeyEncoder =
-                KeyEncoder.of(indexRowType, indexTableSchema.getPrimaryKeyColumnNames(), null);
-        this.ttlHandler = kvTablet.kvTtlEnabled() ? new TtlHandler(indexRowType) : null;
+                KeyEncoder.of(initRowType, indexTableSchema.getPrimaryKeyColumnNames(), null);
+        this.ttlHandler = kvTablet.kvTtlEnabled() ? new TtlHandler(initRowType) : null;
 
         LOG.info("IndexApplier initialized for index bucket {}", kvTablet.getTableBucket());
     }
@@ -268,8 +268,12 @@ public final class IndexApplier implements Closeable {
         long currentOffset = appendInfo.firstOffset();
         int recordCount = 0;
 
+        SchemaInfo latestSchemaInfo = schemaGetter.getLatestSchemaInfo();
         LogRecordReadContext readContext =
-                LogRecordReadContext.createIndexedReadContext(indexRowType, 1, schemaGetter);
+                LogRecordReadContext.createIndexedReadContext(
+                        latestSchemaInfo.getSchema().getRowType(),
+                        latestSchemaInfo.getSchemaId(),
+                        schemaGetter);
 
         for (LogRecordBatch batch : records.batches()) {
             try (CloseableIterator<LogRecord> iterator = batch.records(readContext)) {

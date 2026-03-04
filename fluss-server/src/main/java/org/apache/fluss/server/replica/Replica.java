@@ -1045,10 +1045,15 @@ public final class Replica {
             return;
         }
 
-        // For tables with indexes, use minimum of HW and indexCommitHorizon for visibility control
+        // For tables with indexes, use min(HW, indexCommitHorizon) for visibility control.
+        // When indexCommitHorizon is -1 (no report yet), use HW directly.
         IndexDataProducer producer = this.indexDataProducer;
-        long flushUpTo =
-                (producer != null) ? Math.min(highWatermark, indexCommitHorizon) : highWatermark;
+        long flushUpTo;
+        if (producer != null && indexCommitHorizon >= 0) {
+            flushUpTo = Math.min(highWatermark, indexCommitHorizon);
+        } else {
+            flushUpTo = highWatermark;
+        }
 
         if (producer != null && flushUpTo < highWatermark) {
             LOG.trace(
@@ -1804,7 +1809,7 @@ public final class Replica {
     }
 
     private boolean mayCheckIndexReplicaReachOffset(long requiredOffset) {
-        // For data tables with indexes, check IndexDataProducer's commit horizon
+        // For data tables with indexes, check IndexDataProducer's commit horizon.
         if (isTableWithIndexes) {
             IndexDataProducer producer = this.indexDataProducer;
             if (producer != null) {

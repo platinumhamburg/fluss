@@ -129,17 +129,17 @@ class IndexBucketCacheManagerTest {
 
     @Test
     void testInitialCommitOffsets() {
-        // All commit offsets should be 0 initially (not -1)
+        // All commit offsets should be -1 initially (meaning "no report received yet")
         for (int bucket = 0; bucket < BUCKET_COUNT; bucket++) {
-            assertThat(cacheManager.getCommitOffset(INDEX_TABLE_1, bucket)).isEqualTo(0L);
-            assertThat(cacheManager.getCommitOffset(INDEX_TABLE_2, bucket)).isEqualTo(0L);
+            assertThat(cacheManager.getCommitOffset(INDEX_TABLE_1, bucket)).isEqualTo(-1L);
+            assertThat(cacheManager.getCommitOffset(INDEX_TABLE_2, bucket)).isEqualTo(-1L);
         }
     }
 
     @Test
     void testInitialCommitHorizon() {
-        // Initial commit horizon should be 0 (minimum of all commit offsets)
-        assertThat(cacheManager.getCommitHorizon()).isEqualTo(0L);
+        // Initial commit horizon should be -1 (no index bucket has reported yet)
+        assertThat(cacheManager.getCommitHorizon()).isEqualTo(-1L);
     }
 
     // ================================================================================================
@@ -285,8 +285,8 @@ class IndexBucketCacheManagerTest {
         cacheManager.updateCommitOffset(INDEX_TABLE_1, 1, 50L, 50L, 1);
         cacheManager.updateCommitOffset(INDEX_TABLE_1, 2, 200L, 200L, 1);
 
-        // Horizon should be minimum across all buckets (including INDEX_TABLE_2 which is still 0)
-        assertThat(cacheManager.getCommitHorizon()).isEqualTo(0L);
+        // Horizon should be minimum across all buckets (including INDEX_TABLE_2 which is still -1)
+        assertThat(cacheManager.getCommitHorizon()).isEqualTo(-1L);
 
         // Update all INDEX_TABLE_2 buckets
         for (int i = 0; i < BUCKET_COUNT; i++) {

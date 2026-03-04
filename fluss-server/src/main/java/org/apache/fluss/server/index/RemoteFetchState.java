@@ -36,13 +36,8 @@ public class RemoteFetchState {
     private final AtomicLong lastFetchOffset;
 
     public RemoteFetchState() {
-        // Initialize commitOffset to 0 instead of -1.
-        // This allows data table writes to proceed immediately when index tables are created.
-        // The semantics: commitOffset=0 means "index table is ready but hasn't applied any data
-        // yet" which is the correct initial state. When IndexFetcherThread starts fetching, it will
-        // send indexCommitOffset from IndexApplier.getIndexCommitOffset() which also returns 0
-        // initially, so this is consistent with the actual index table state.
-        this.commitOffset = new AtomicLong(0L);
+        // -1 means no index bucket has reported yet. Updated on first IndexFetcherThread fetch.
+        this.commitOffset = new AtomicLong(-1L);
         this.lastUpdateTimeMs = new AtomicLong(-1L);
         this.leaderServerId = new AtomicInteger(-1);
         this.lastFetchOffset = new AtomicLong(-1L);

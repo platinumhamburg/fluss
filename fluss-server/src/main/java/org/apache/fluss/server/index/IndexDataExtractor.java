@@ -77,7 +77,6 @@ public final class IndexDataExtractor implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(IndexDataExtractor.class);
 
     private final LogTablet logTablet;
-    private final Schema tableSchema;
     private final SchemaGetter schemaGetter;
 
     private volatile boolean closed = false;
@@ -94,8 +93,8 @@ public final class IndexDataExtractor implements Closeable {
         this.logTablet = logTablet;
         this.schemaGetter = checkNotNull(schemaGetter, "schemaGetter cannot be null");
 
-        // Get latest schema for table schema initialization
-        this.tableSchema = schemaGetter.getLatestSchemaInfo().getSchema();
+        // Get latest schema for SingleIndexExtractor initialization only
+        Schema initSchema = schemaGetter.getLatestSchemaInfo().getSchema();
 
         // Get auto-partition strategy from main table if available and enabled
         AutoPartitionStrategy autoPartitionStrategy =
@@ -113,7 +112,7 @@ public final class IndexDataExtractor implements Closeable {
                                 indexTableInfo ->
                                         new SingleIndexExtractor(
                                                 indexTableInfo.getTableId(),
-                                                tableSchema,
+                                                initSchema,
                                                 indexTableInfo.getSchema(),
                                                 indexTableInfo.getNumBuckets(),
                                                 indexTableInfo.getBucketKeys(),
@@ -242,7 +241,9 @@ public final class IndexDataExtractor implements Closeable {
 
             try (LogRecordReadContext readContext =
                             LogRecordReadContext.createArrowReadContext(
-                                    tableSchema.getRowType(), schemaId, schemaGetter);
+                                    schemaGetter.getSchema(schemaId).getRowType(),
+                                    schemaId,
+                                    schemaGetter);
                     CloseableIterator<LogRecord> recordIterator = batch.records(readContext)) {
                 while (recordIterator.hasNext()) {
                     LogRecord walRecord = recordIterator.next();

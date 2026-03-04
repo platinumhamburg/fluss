@@ -23,6 +23,7 @@ import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -331,6 +332,10 @@ public final class IndexDataProducer implements Closeable {
     }
 
     private void mayTriggerColdDataLoading(long currentCommitHorizon) {
+        if (currentCommitHorizon < 0) {
+            return;
+        }
+
         if (logEndOffsetOnLeaderStart <= 0) {
             return;
         }
@@ -373,7 +378,12 @@ public final class IndexDataProducer implements Closeable {
         long batchEndOffset =
                 Math.min(currentCommitHorizon + estimatedRecordsInBatch, coldLoadTargetEndOffset);
 
-        if (currentCommitHorizon >= batchEndOffset) {
+        // Defensive check: ensure cold load start offset is within WAL bounds.
+        // WAL segments before logStartOffset may have been cleaned, so we must not
+        // attempt to read from an offset that no longer exists.
+        long logStartOffset = logTablet.logStartOffset();
+        long adjustedStartOffset = Math.max(currentCommitHorizon, logStartOffset);
+        if (adjustedStartOffset >= batchEndOffset) {
             return;
         }
 
@@ -390,7 +400,7 @@ public final class IndexDataProducer implements Closeable {
                 "DataBucket {}: Triggering batch cold data loading from WAL, batch range [{}, {}), "
                         + "target end offset: {}, batch size limit: {} bytes",
                 logTablet.getTableBucket(),
-                currentCommitHorizon,
+                adjustedStartOffset,
                 batchEndOffset,
                 coldLoadTargetEndOffset,
                 coldLoadBatchSize);
@@ -415,19 +425,26 @@ public final class IndexDataProducer implements Closeable {
                                 startOffset,
                                 endOffset,
                                 cause);
+                        if (cause instanceof LogOffsetOutOfRangeException) {
+                            // WAL segments were cleaned before we could read them.
+                            // Reset cold load state so next commitHorizon advance can
+                            // recalculate with current WAL bounds.
+                            coldLoadTargetEndOffset = -1;
+                            coldLoadCurrentEndOffset = -1;
+                        }
                         coldLoadInProgress.set(false);
                     }
                 };
 
         ColdDataLoadTask coldDataLoadTask =
-                new ColdDataLoadTask(dataExtractor, currentCommitHorizon, batchEndOffset, callback);
+                new ColdDataLoadTask(dataExtractor, adjustedStartOffset, batchEndOffset, callback);
         boolean submitted = taskQueue.submit(coldDataLoadTask);
 
         if (!submitted) {
             LOG.error(
                     "DataBucket {}: Failed to submit cold data loading task for batch range [{}, {}), queue may be closed",
                     logTablet.getTableBucket(),
-                    currentCommitHorizon,
+                    adjustedStartOffset,
                     batchEndOffset);
             coldLoadInProgress.set(false);
         }

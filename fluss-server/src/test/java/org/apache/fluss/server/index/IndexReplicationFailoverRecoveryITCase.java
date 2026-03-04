@@ -407,12 +407,14 @@ class IndexReplicationFailoverRecoveryITCase {
                             .isGreaterThan(logEndOffsetBeforeSwitch);
                 });
 
-        // Wait for high watermark to advance
+        // Wait for high watermark to advance. Use isGreaterThanOrEqualTo because after
+        // leader switch, the new leader's HW may equal logEndOffsetBeforeSwitch when the
+        // follower (old leader) hasn't yet fetched the new data written by IndexApplier.
         retry(
                 Duration.ofMinutes(1),
                 () ->
                         assertThat(newLeaderReplica.getLogHighWatermark())
-                                .isGreaterThan(logEndOffsetBeforeSwitch));
+                                .isGreaterThanOrEqualTo(logEndOffsetBeforeSwitch));
 
         // Step 12: Verify state is updated correctly after new writes
         retry(
@@ -1351,6 +1353,26 @@ class IndexReplicationFailoverRecoveryITCase {
         int newDataLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(dataTableBucket);
         int newIdxLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(idxNameBucket);
         LOG.info("New leaders after failover: data={}, index={}", newDataLeader, newIdxLeader);
+
+        // After failover, before any index bucket reports, commitHorizon should be -1.
+        TabletServer newDataLeaderServer0 =
+                FLUSS_CLUSTER_EXTENSION.getTabletServerById(newDataLeader);
+        retry(
+                Duration.ofMinutes(1),
+                () -> {
+                    Replica r =
+                            newDataLeaderServer0
+                                    .getReplicaManager()
+                                    .getReplicaOrException(dataTableBucket);
+                    assertThat(r.getIndexDataProducer()).isNotNull();
+                });
+
+        Replica newDataReplicaForCheck =
+                newDataLeaderServer0.getReplicaManager().getReplicaOrException(dataTableBucket);
+        IndexDataProducer producer = newDataReplicaForCheck.getIndexDataProducer();
+        assertThat(producer).isNotNull();
+        assertThat(newDataReplicaForCheck.getLocalLogEndOffset()).isGreaterThan(0);
+        assertThat(producer.getIndexCommitHorizon()).isEqualTo(-1L);
 
         // Step 6: Write more data to new data leader
         TabletServerGateway newDataGateway =
