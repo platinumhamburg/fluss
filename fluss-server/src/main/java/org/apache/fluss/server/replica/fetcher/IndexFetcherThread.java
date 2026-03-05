@@ -277,26 +277,43 @@ final class IndexFetcherThread extends ShutdownableThread {
                 Throwable e = ExceptionUtils.stripException(t, ExecutionException.class);
                 if (e instanceof TimeoutException) {
                     LOG.warn("fetch index timeout from leader {}", leader.leaderServerId());
-                } else {
-                    LOG.warn(
-                            "Error in response for fetch index request from leader {}",
-                            leader.leaderServerId(),
-                            t);
-                }
-
-                Set<DataIndexTableBucket> bucketsToRetry = new HashSet<>();
-                for (DataIndexTableBucket bucket : fetchIndexContext.getRequestDataIndexBuckets()) {
-                    // Only retry if the bucket still exists in our status map (not deleted)
-                    if (fairIndexBucketStatusMap.statusValue(bucket) != null) {
-                        bucketsToRetry.add(bucket);
-                    } else {
-                        if (LOG.isDebugEnabled()) {
-                            LOG.debug("Skipping retry for deleted index bucket: {}", bucket);
+                    // Timeout: delay retry within the fetcher thread
+                    Set<DataIndexTableBucket> bucketsToRetry = new HashSet<>();
+                    for (DataIndexTableBucket bucket :
+                            fetchIndexContext.getRequestDataIndexBuckets()) {
+                        if (fairIndexBucketStatusMap.statusValue(bucket) != null) {
+                            bucketsToRetry.add(bucket);
                         }
                     }
-                }
-                if (!bucketsToRetry.isEmpty()) {
-                    indexBucketsWithError.addAll(bucketsToRetry);
+                    if (!bucketsToRetry.isEmpty()) {
+                        indexBucketsWithError.addAll(bucketsToRetry);
+                    }
+                } else {
+                    // Non-timeout exception (e.g. "Server X not in cache"):
+                    // Report to reconciliation via invalidBuckets so the manager
+                    // can detect persistent failures and reassign to a new server.
+                    LOG.warn(
+                            "Error in response for fetch index request from leader {}, "
+                                    + "reporting to reconciliation",
+                            leader.leaderServerId(),
+                            t);
+                    indexBucketStatusMapLock.lock();
+                    try {
+                        for (DataIndexTableBucket bucket :
+                                fetchIndexContext.getRequestDataIndexBuckets()) {
+                            if (fairIndexBucketStatusMap.statusValue(bucket) != null) {
+                                invalidBuckets.put(
+                                        bucket,
+                                        "Network error from leader "
+                                                + leader.leaderServerId()
+                                                + ": "
+                                                + e.getMessage());
+                                fairIndexBucketStatusMap.remove(bucket);
+                            }
+                        }
+                    } finally {
+                        indexBucketStatusMapLock.unlock();
+                    }
                 }
             }
         }

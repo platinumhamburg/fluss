@@ -368,11 +368,14 @@ public class IndexFetcherManager {
         // Step 1: Process failures reported by fetcher threads
         int failureCount = processFailedBuckets(now);
 
-        // Step 2: Classify targets and determine actions
+        // Step 2: Health check - detect fetcher threads bound to dead servers
+        checkFetcherThreadHealth(now);
+
+        // Step 3: Classify targets and determine actions
         Map<ServerIdAndFetcherId, List<IndexFetcherTarget>> toCreate = new HashMap<>();
         classifyTargets(now, toCreate);
 
-        // Step 3: Execute creations (may collect threads to shutdown)
+        // Step 4: Execute creations (may collect threads to shutdown)
         List<IndexFetcherThread> threadsToShutdown = executeCreations(toCreate, now);
 
         if (failureCount > 0 || !toCreate.isEmpty()) {
@@ -384,6 +387,49 @@ public class IndexFetcherManager {
         }
 
         return threadsToShutdown;
+    }
+
+    /**
+     * Checks health of all fetcher threads by verifying their bound servers are still alive. If a
+     * fetcher thread's server is no longer in the server node cache, all RUNNING targets on that
+     * thread are marked as FAILED and removed from the fetcher.
+     */
+    @GuardedBy("lock")
+    private void checkFetcherThreadHealth(long now) {
+        for (Map.Entry<ServerIdAndFetcherId, IndexFetcherThread> entry :
+                fetcherThreads.entrySet()) {
+            int boundServerId = entry.getKey().getServerId();
+            if (!serverNodeCache.apply(boundServerId).isPresent()) {
+                LOG.warn(
+                        "Fetcher thread {} is bound to dead server {}, "
+                                + "marking all its RUNNING targets as FAILED",
+                        entry.getKey(),
+                        boundServerId);
+
+                // Find all RUNNING targets that are assigned to this fetcher thread
+                // and mark them as FAILED
+                for (Map.Entry<DataIndexTableBucket, ServerIdAndFetcherId> bucketEntry :
+                        new ArrayList<>(bucketToFetcher.entrySet())) {
+                    if (bucketEntry.getValue().equals(entry.getKey())) {
+                        DataIndexTableBucket bucket = bucketEntry.getKey();
+                        IndexFetcherTarget target = findTarget(bucket);
+                        if (target != null
+                                && target.getState() == IndexFetcherTarget.State.RUNNING) {
+                            target.markFailed(
+                                    String.format(
+                                            "Fetcher thread bound to dead server %d",
+                                            boundServerId),
+                                    now);
+                            removeFromFetcher(bucket);
+                            LOG.info(
+                                    "Marked target {} as FAILED due to dead server {}",
+                                    bucket,
+                                    boundServerId);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /** Processes failures reported by fetcher threads. */
@@ -472,11 +518,24 @@ public class IndexFetcherManager {
         toCreate.computeIfAbsent(fetcherId, k -> new ArrayList<>()).add(target);
     }
 
-    /** Handles a target in RUNNING state - checks for leader changes. */
+    /** Handles a target in RUNNING state - checks for server liveness and leader changes. */
     @GuardedBy("lock")
     private void handleRunning(IndexFetcherTarget target, long now) {
         int lastLeader = target.getLastKnownLeaderServerId();
         if (lastLeader == INVALID_LEADER_ID) {
+            return;
+        }
+
+        // Check if the server bound to this target is still alive in the server node cache.
+        // This detects node crashes before the metadata cache is updated.
+        if (!serverNodeCache.apply(lastLeader).isPresent()) {
+            LOG.warn(
+                    "Server {} is no longer in server node cache for {}, marking failed",
+                    lastLeader,
+                    target.getDataIndexTableBucket());
+            target.markFailed(
+                    String.format("Server %d no longer in server node cache", lastLeader), now);
+            removeFromFetcher(target.getDataIndexTableBucket());
             return;
         }
 
