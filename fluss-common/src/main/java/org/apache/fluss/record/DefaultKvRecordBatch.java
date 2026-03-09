@@ -56,9 +56,13 @@ import java.util.NoSuchElementException;
  *
  * <pre>
  * -----------------------------------------------------------------------------------------------
- * | Unused (0-8)
+ * | Bit 0: HAS_RECORD_FLAGS | Unused (1-7)
  * -----------------------------------------------------------------------------------------------
  * </pre>
+ *
+ * <p>When HAS_RECORD_FLAGS (bit 0) is set, each record in the batch contains a Flags byte
+ * (immediately after the record length field) that carries per-record metadata such as the retract
+ * flag. When this bit is not set, records use the legacy format without per-record flags.
  *
  * @since 0.1
  */
@@ -86,6 +90,9 @@ public class DefaultKvRecordBatch implements KvRecordBatch {
     public static final int RECORD_BATCH_HEADER_SIZE = RECORDS_OFFSET;
 
     public static final int KV_OVERHEAD = LENGTH_OFFSET + LENGTH_LENGTH;
+
+    /** Bit mask for the HAS_RECORD_FLAGS attribute in the batch header. */
+    static final byte HAS_RECORD_FLAGS_MASK = 0x01;
 
     private MemorySegment segment;
     private int position;
@@ -156,6 +163,19 @@ public class DefaultKvRecordBatch implements KvRecordBatch {
         return segment.getInt(position + RECORDS_COUNT_OFFSET);
     }
 
+    /** Returns the attributes byte from the batch header. */
+    public byte attributes() {
+        return segment.get(position + ATTRIBUTES_OFFSET);
+    }
+
+    /**
+     * Returns whether the records in this batch contain per-record flags bytes. This is indicated
+     * by bit 0 of the batch attributes.
+     */
+    public boolean hasRecordFlags() {
+        return (attributes() & HAS_RECORD_FLAGS_MASK) != 0;
+    }
+
     public MemorySegment getMemorySegment() {
         return segment;
     }
@@ -174,6 +194,8 @@ public class DefaultKvRecordBatch implements KvRecordBatch {
             return Collections.emptyIterator();
         }
 
+        final boolean hasRecordFlags = hasRecordFlags();
+
         return new KvRecordIterator() {
             final short schemaId = schemaId();
             int position = DefaultKvRecordBatch.this.position + RECORD_BATCH_HEADER_SIZE;
@@ -182,7 +204,8 @@ public class DefaultKvRecordBatch implements KvRecordBatch {
             @Override
             protected KvRecord readNext() {
                 KvRecord kvRecord =
-                        DefaultKvRecord.readFrom(segment, position, schemaId, readContext);
+                        DefaultKvRecord.readFrom(
+                                segment, position, schemaId, readContext, hasRecordFlags);
                 iteratorNumber++;
                 position += kvRecord.getSizeInBytes();
                 return kvRecord;

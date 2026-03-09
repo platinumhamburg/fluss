@@ -38,6 +38,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.KvMutationType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
@@ -474,33 +475,68 @@ public final class KvTablet {
         ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
 
         for (KvRecord kvRecord : kvRecords.records(readContext)) {
-            byte[] keyBytes = BytesUtils.toArray(kvRecord.getKey());
-            KvPreWriteBuffer.Key key = KvPreWriteBuffer.Key.of(keyBytes);
-            BinaryRow row = kvRecord.getRow();
-            BinaryValue currentValue = row == null ? null : new BinaryValue(schemaIdOfNewData, row);
+            NormalizedKvMutation mutation = normalizeKvMutation(kvRecord, schemaIdOfNewData);
+            if (mutation == null) {
+                continue;
+            }
 
-            if (currentValue == null) {
-                logOffset =
-                        processDeletion(
-                                key,
-                                currentMerger,
-                                valueDecoder,
-                                walBuilder,
-                                latestSchemaRow,
-                                logOffset);
-            } else {
-                logOffset =
-                        processUpsert(
-                                key,
-                                currentValue,
-                                currentMerger,
-                                autoIncrementUpdater,
-                                valueDecoder,
-                                walBuilder,
-                                latestSchemaRow,
-                                logOffset);
+            switch (mutation.mutationType) {
+                case RETRACT:
+                    logOffset =
+                            processRetract(
+                                    mutation.key,
+                                    mutation.value,
+                                    currentMerger,
+                                    valueDecoder,
+                                    walBuilder,
+                                    latestSchemaRow,
+                                    logOffset);
+                    break;
+                case DELETE:
+                    logOffset =
+                            processDeletion(
+                                    mutation.key,
+                                    currentMerger,
+                                    valueDecoder,
+                                    walBuilder,
+                                    latestSchemaRow,
+                                    logOffset);
+                    break;
+                case UPSERT:
+                    logOffset =
+                            processUpsert(
+                                    mutation.key,
+                                    mutation.value,
+                                    currentMerger,
+                                    autoIncrementUpdater,
+                                    valueDecoder,
+                                    walBuilder,
+                                    latestSchemaRow,
+                                    logOffset);
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            "Unsupported KvMutationType: " + mutation.mutationType);
             }
         }
+    }
+
+    @Nullable
+    private NormalizedKvMutation normalizeKvMutation(KvRecord kvRecord, short schemaIdOfNewData) {
+        KvPreWriteBuffer.Key key = KvPreWriteBuffer.Key.of(BytesUtils.toArray(kvRecord.getKey()));
+        BinaryRow row = kvRecord.getRow();
+        BinaryValue value = row == null ? null : new BinaryValue(schemaIdOfNewData, row);
+        KvMutationType mutationType = kvRecord.getMutationType();
+
+        if (mutationType.requiresRowData() && value == null) {
+            LOG.warn(
+                    "KV mutation {} with null row is not supported, ignoring. "
+                            + "This mutation type must carry row data.",
+                    mutationType);
+            return null;
+        }
+
+        return new NormalizedKvMutation(key, mutationType, value);
     }
 
     private long processDeletion(
@@ -538,6 +574,48 @@ public final class KvTablet {
         } else {
             return applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
         }
+    }
+
+    private long processRetract(
+            KvPreWriteBuffer.Key key,
+            BinaryValue retractValue,
+            RowMerger currentMerger,
+            ValueDecoder valueDecoder,
+            WalBuilder walBuilder,
+            PaddingRow latestSchemaRow,
+            long logOffset)
+            throws Exception {
+        byte[] oldValueBytes = getFromBufferOrKv(key);
+        if (oldValueBytes == null) {
+            // Nothing to retract from — silently ignore
+            LOG.debug(
+                    "The specific key can't be found in kv tablet for retract, "
+                            + "ignore it directly as it doesn't exist in the kv tablet yet.");
+            return logOffset;
+        }
+
+        BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
+        BinaryValue newValue = currentMerger.retract(oldValue, retractValue);
+
+        if (newValue == null) {
+            // Retract resulted in removal of the row — respect DeleteBehavior
+            DeleteBehavior deleteBehavior = currentMerger.deleteBehavior();
+            if (deleteBehavior == DeleteBehavior.IGNORE) {
+                return logOffset;
+            } else if (deleteBehavior == DeleteBehavior.DISABLE) {
+                throw new DeletionDisabledException(
+                        "Delete operations are disabled for this table. "
+                                + "The table.delete.behavior is set to 'disable'.");
+            }
+            return applyDelete(key, oldValue, walBuilder, latestSchemaRow, logOffset);
+        }
+
+        if (newValue.equals(oldValue)) {
+            // No actual state change after retract, skip CDC and buffer updates.
+            return logOffset;
+        }
+
+        return applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
     }
 
     private long processUpsert(
@@ -625,6 +703,21 @@ public final class KvTablet {
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
             kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset + 1);
             return logOffset + 2;
+        }
+    }
+
+    private static final class NormalizedKvMutation {
+        private final KvPreWriteBuffer.Key key;
+        private final KvMutationType mutationType;
+        private final @Nullable BinaryValue value;
+
+        private NormalizedKvMutation(
+                KvPreWriteBuffer.Key key,
+                KvMutationType mutationType,
+                @Nullable BinaryValue value) {
+            this.key = key;
+            this.mutationType = mutationType;
+            this.value = value;
         }
     }
 

@@ -25,6 +25,10 @@ import org.apache.fluss.annotation.PublicEvolving;
  * <p>This enum controls how the server handles data merging when writing to tables with merge
  * engines. It applies uniformly to all merge engine types (aggregation, first-row, versioned).
  *
+ * <p>Note: Retract operations are NOT a separate merge mode. They use {@link #DEFAULT} merge mode
+ * and are identified by a per-record {@code isRetract} flag encoded in each {@link
+ * org.apache.fluss.record.KvRecord} (flags byte bit 0).
+ *
  * @since 0.9
  */
 @PublicEvolving
@@ -43,6 +47,9 @@ public enum MergeMode {
      *   <li>For versioned merge engine: keeps the row with the highest version for each primary
      *       key.
      * </ul>
+     *
+     * <p>Retract operations also use DEFAULT merge mode, with a per-record isRetract flag to
+     * indicate that inverse aggregation should be applied.
      */
     DEFAULT(0),
 
@@ -92,7 +99,8 @@ public enum MergeMode {
      * Converts an integer value to a MergeMode enum.
      *
      * @param value the integer value
-     * @return the corresponding MergeMode, or DEFAULT if the value is invalid
+     * @return the corresponding MergeMode
+     * @throws IllegalArgumentException if the value does not match any known MergeMode
      */
     public static MergeMode fromValue(int value) {
         switch (value) {
@@ -101,7 +109,7 @@ public enum MergeMode {
             case 1:
                 return OVERWRITE;
             default:
-                return DEFAULT;
+                throw new IllegalArgumentException("Unknown MergeMode value: " + value);
         }
     }
 
@@ -111,7 +119,8 @@ public enum MergeMode {
      * <p>This is an alias for {@link #fromValue(int)} for clarity when working with proto messages.
      *
      * @param protoValue the proto value
-     * @return the corresponding MergeMode, or DEFAULT if the value is invalid
+     * @return the corresponding MergeMode
+     * @throws IllegalArgumentException if the value does not match any known MergeMode
      */
     public static MergeMode fromProtoValue(int protoValue) {
         return fromValue(protoValue);

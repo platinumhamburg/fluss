@@ -45,4 +45,16 @@ public interface UpsertWriter extends TableWriter {
      * @return A {@link CompletableFuture} that always delete result when complete normally.
      */
     CompletableFuture<DeleteResult> delete(InternalRow record);
+
+    /**
+     * Retract a previously aggregated record from the Fluss table. The input must contain the full
+     * row data so the server can compute the inverse aggregation.
+     *
+     * <p>This is only supported on tables with aggregation merge engines whose functions are
+     * retract-safe (e.g., SUM).
+     *
+     * @param record the record to retract.
+     * @return A {@link CompletableFuture} that returns upsert result with bucket and offset info.
+     */
+    CompletableFuture<UpsertResult> retract(InternalRow record);
 }

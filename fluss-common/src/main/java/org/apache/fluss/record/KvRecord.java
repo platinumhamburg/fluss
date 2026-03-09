@@ -48,6 +48,25 @@ public interface KvRecord {
     BinaryRow getRow();
 
     /**
+     * Returns the normalized mutation type of this KV record.
+     *
+     * <p>The current wire format still represents delete as {@code row == null} and retract as a
+     * per-record flag. This accessor centralizes that legacy decoding so callers no longer have to
+     * duplicate the same branching logic.
+     */
+    default KvMutationType getMutationType() {
+        return KvMutationType.fromRowAndRetract(getRow(), isRetract());
+    }
+
+    /**
+     * Returns whether this record is a retract record. A retract record reverses a previously
+     * aggregated value in merge-engine tables.
+     *
+     * @return true if this record is a retract record, false otherwise.
+     */
+    boolean isRetract();
+
+    /**
      * Get the size in bytes of this record.
      *
      * @return the size of the record in bytes

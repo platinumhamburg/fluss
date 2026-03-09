@@ -24,6 +24,7 @@ import org.apache.fluss.memory.PreAllocatedPagedOutputView;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.KvRecordBatchEncoding;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
 
@@ -139,6 +140,7 @@ class ClientRpcMessageUtilsTest {
                 outputView,
                 null,
                 mergeMode,
+                KvRecordBatchEncoding.WITH_RECORD_FLAGS,
                 System.currentTimeMillis());
     }
 }

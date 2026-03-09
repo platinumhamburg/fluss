@@ -32,6 +32,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.record.KvRecordBatchEncoding;
 import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
@@ -618,6 +619,7 @@ public final class RecordAccumulator {
                         outputView,
                         writeRecord.getTargetColumns(),
                         writeRecord.getMergeMode(),
+                        KvRecordBatchEncoding.WITH_RECORD_FLAGS,
                         clock.milliseconds());
 
             case ARROW_LOG:

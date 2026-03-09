@@ -15,25 +15,20 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.row;
+package org.apache.fluss.record;
 
-/** Enumeration of row operation types used in Fluss-Flink data processing. */
-public enum OperationType {
-    /** Represents an append-only (insert) operation. */
-    APPEND,
+import org.apache.fluss.annotation.PublicEvolving;
 
-    /** Represents an upsert operation (update or insert). */
-    UPSERT,
+/** Encoding mode of a KV record batch. */
+@PublicEvolving
+public enum KvRecordBatchEncoding {
+    /** Legacy encoding without per-record flags. */
+    LEGACY,
 
-    /** Represents a delete operation. */
-    DELETE,
+    /** Current encoding with per-record flags. */
+    WITH_RECORD_FLAGS;
 
-    /**
-     * Represents a retract operation for aggregation tables. Unlike DELETE which removes a row,
-     * RETRACT reverses a previous aggregation contribution.
-     */
-    RETRACT,
-
-    /** Represents an operation that should be ignored. */
-    IGNORE
+    public boolean usesRecordFlags() {
+        return this == WITH_RECORD_FLAGS;
+    }
 }

@@ -139,6 +139,7 @@ public class FlinkConversions {
                         column.getName(), column.getAggFunction().get(), newOptions);
             }
         }
+
         List<String> physicalColumns = schema.getColumnNames();
         int columnCount =
                 physicalColumns.size()

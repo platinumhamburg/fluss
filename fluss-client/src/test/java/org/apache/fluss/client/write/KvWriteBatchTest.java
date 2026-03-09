@@ -28,7 +28,9 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.DefaultKvRecord;
 import org.apache.fluss.record.DefaultKvRecordBatch;
+import org.apache.fluss.record.KvMutationType;
 import org.apache.fluss.record.KvRecord;
+import org.apache.fluss.record.KvRecordBatchEncoding;
 import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.BinaryRow;
@@ -229,6 +231,7 @@ class KvWriteBatchTest {
                 outputView,
                 null,
                 MergeMode.DEFAULT,
+                KvRecordBatchEncoding.WITH_RECORD_FLAGS,
                 System.currentTimeMillis());
     }
 
@@ -255,6 +258,7 @@ class KvWriteBatchTest {
         KvRecord kvRecord = iterator.next();
         assertThat(toArray(kvRecord.getKey())).isEqualTo(key);
         assertThat(kvRecord.getRow()).isEqualTo(row);
+        assertThat(kvRecord.getMutationType()).isEqualTo(KvMutationType.UPSERT);
     }
 
     // ==================== MergeMode Tests ====================
@@ -324,6 +328,7 @@ class KvWriteBatchTest {
                 outputView,
                 null,
                 mergeMode,
+                KvRecordBatchEncoding.WITH_RECORD_FLAGS,
                 System.currentTimeMillis());
     }
 
@@ -337,5 +342,175 @@ class KvWriteBatchTest {
                 WriteFormat.COMPACTED_KV,
                 null,
                 mergeMode);
+    }
+
+    // ==================== Retract Tests ====================
+
+    @Test
+    void testMixedRetractAndNormalRecordsInSameBatch() throws Exception {
+        // With per-record isRetract flags, retract and normal records can be mixed in one batch.
+        KvWriteBatch batch =
+                createKvWriteBatchWithMergeMode(
+                        new TableBucket(DATA1_TABLE_ID_PK, 0), MergeMode.DEFAULT);
+
+        // Append a retract record
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null);
+        assertThat(retractRecord.getKvMutationType()).isEqualTo(KvMutationType.RETRACT);
+        assertThat(batch.tryAppend(retractRecord, newWriteCallback())).isTrue();
+
+        // Append a normal record — should also succeed (no longer restricted)
+        WriteRecord normalRecord = createWriteRecordWithMergeMode(MergeMode.DEFAULT);
+        assertThat(normalRecord.getKvMutationType()).isEqualTo(KvMutationType.UPSERT);
+        assertThat(batch.tryAppend(normalRecord, newWriteCallback())).isTrue();
+
+        // Build and verify both records with correct per-record isRetract flag
+        DefaultKvRecordBatch kvRecords = DefaultKvRecordBatch.pointToBytesView(batch.build());
+        assertThat(kvRecords.getRecordCount()).isEqualTo(2);
+
+        Iterator<KvRecord> iterator =
+                kvRecords
+                        .records(
+                                KvRecordReadContext.createReadContext(
+                                        KvFormat.COMPACTED,
+                                        new TestingSchemaGetter(1, DATA1_SCHEMA)))
+                        .iterator();
+        KvRecord first = iterator.next();
+        assertThat(first.isRetract()).isTrue();
+        assertThat(first.getMutationType()).isEqualTo(KvMutationType.RETRACT);
+        KvRecord second = iterator.next();
+        assertThat(second.isRetract()).isFalse();
+        assertThat(second.getMutationType()).isEqualTo(KvMutationType.UPSERT);
+    }
+
+    @Test
+    void testRetractWriteRecordHasNonNullRow() {
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null);
+        assertThat(retractRecord.getRow()).isNotNull();
+        assertThat(retractRecord.getKey()).isNotNull();
+        assertThat(retractRecord.getMergeMode()).isEqualTo(MergeMode.DEFAULT);
+        assertThat(retractRecord.isRetract()).isTrue();
+        assertThat(retractRecord.getKvMutationType()).isEqualTo(KvMutationType.RETRACT);
+    }
+
+    @Test
+    void testKvWriteBatchUsesRecordFlagsEncoding() throws Exception {
+        assertThat(createKvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0)).getBatchEncoding())
+                .isEqualTo(KvRecordBatchEncoding.WITH_RECORD_FLAGS);
+    }
+
+    @Test
+    void testDeleteWriteRecordUsesDeleteMutationType() throws Exception {
+        KvWriteBatch batch = createKvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
+        WriteRecord deleteRecord =
+                WriteRecord.forDelete(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null);
+
+        assertThat(deleteRecord.getRow()).isNull();
+        assertThat(deleteRecord.isRetract()).isFalse();
+        assertThat(deleteRecord.getKvMutationType()).isEqualTo(KvMutationType.DELETE);
+        assertThat(batch.tryAppend(deleteRecord, newWriteCallback())).isTrue();
+
+        DefaultKvRecordBatch kvRecords = DefaultKvRecordBatch.pointToBytesView(batch.build());
+        KvRecord kvRecord =
+                kvRecords
+                        .records(
+                                KvRecordReadContext.createReadContext(
+                                        KvFormat.COMPACTED,
+                                        new TestingSchemaGetter(1, DATA1_SCHEMA)))
+                        .iterator()
+                        .next();
+        assertThat(kvRecord.getRow()).isNull();
+        assertThat(kvRecord.getMutationType()).isEqualTo(KvMutationType.DELETE);
+    }
+
+    @Test
+    void testRetractWriteRecordRejectsNullRow() {
+        assertThatThrownBy(
+                        () ->
+                                WriteRecord.forRetract(
+                                        DATA1_TABLE_INFO_PK,
+                                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                                        null,
+                                        key,
+                                        key,
+                                        WriteFormat.COMPACTED_KV,
+                                        null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("retract row must not be null");
+    }
+
+    @Test
+    void testRetractWriteRecordRejectsNonKvFormat() {
+        assertThatThrownBy(
+                        () ->
+                                WriteRecord.forRetract(
+                                        DATA1_TABLE_INFO_PK,
+                                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                                        row,
+                                        key,
+                                        key,
+                                        WriteFormat.INDEXED_LOG,
+                                        null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("writeFormat must be a KV format");
+    }
+
+    @Test
+    void testRetractBatchBuildAndRead() throws Exception {
+        KvWriteBatch retractBatch =
+                createKvWriteBatchWithMergeMode(
+                        new TableBucket(DATA1_TABLE_ID_PK, 0), MergeMode.DEFAULT);
+
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null);
+        assertThat(retractBatch.tryAppend(retractRecord, newWriteCallback())).isTrue();
+
+        // Build and verify the batch can be read back with per-record isRetract=true
+        DefaultKvRecordBatch kvRecords =
+                DefaultKvRecordBatch.pointToBytesView(retractBatch.build());
+        assertThat(kvRecords.getRecordCount()).isEqualTo(1);
+
+        Iterator<KvRecord> iterator =
+                kvRecords
+                        .records(
+                                KvRecordReadContext.createReadContext(
+                                        KvFormat.COMPACTED,
+                                        new TestingSchemaGetter(1, DATA1_SCHEMA)))
+                        .iterator();
+        assertThat(iterator.hasNext()).isTrue();
+        KvRecord kvRecord = iterator.next();
+        // Retract records carry row data (non-null) and isRetract flag is true
+        assertThat(kvRecord.getRow()).isNotNull();
+        assertThat(toArray(kvRecord.getKey())).isEqualTo(key);
+        assertThat(kvRecord.isRetract()).isTrue();
+        assertThat(kvRecord.getMutationType()).isEqualTo(KvMutationType.RETRACT);
     }
 }

@@ -88,6 +88,13 @@ public class RowDataSerializationSchema implements FlussSerializationSchema<RowD
     private final boolean ignoreDelete;
 
     /**
+     * Whether the table uses the AGGREGATION merge engine. When true, UPDATE_BEFORE rows are mapped
+     * to {@link OperationType#RETRACT} instead of {@link OperationType#DELETE}. This aligns with
+     * Paimon's approach where AGGREGATE engine accepts full changelog.
+     */
+    private final boolean isAggregationTable;
+
+    /**
      * The converter used to transform Flink {@link RowData} to Fluss {@link InternalRow}.
      * Initialized in {@link #open(InitializationContext)}.
      */
@@ -119,8 +126,21 @@ public class RowDataSerializationSchema implements FlussSerializationSchema<RowD
      * @param ignoreDelete whether to ignore DELETE and UPDATE_BEFORE operations
      */
     public RowDataSerializationSchema(boolean isAppendOnly, boolean ignoreDelete) {
+        this(isAppendOnly, ignoreDelete, false);
+    }
+
+    /**
+     * Constructs a new {@code RowSerializationSchema}.
+     *
+     * @param isAppendOnly whether the schema is append-only (only INSERTs allowed)
+     * @param ignoreDelete whether to ignore DELETE and UPDATE_BEFORE operations
+     * @param isAggregationTable whether UPDATE_BEFORE should map to RETRACT instead of DELETE
+     */
+    public RowDataSerializationSchema(
+            boolean isAppendOnly, boolean ignoreDelete, boolean isAggregationTable) {
         this.isAppendOnly = isAppendOnly;
         this.ignoreDelete = ignoreDelete;
+        this.isAggregationTable = isAggregationTable;
     }
 
     /**
@@ -204,8 +224,9 @@ public class RowDataSerializationSchema implements FlussSerializationSchema<RowD
                 case INSERT:
                 case UPDATE_AFTER:
                     return OperationType.UPSERT;
-                case DELETE:
                 case UPDATE_BEFORE:
+                    return isAggregationTable ? OperationType.RETRACT : OperationType.DELETE;
+                case DELETE:
                     return OperationType.DELETE;
                 default:
                     throw new UnsupportedOperationException("Unsupported row kind: " + rowKind);

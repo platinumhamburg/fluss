@@ -26,6 +26,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.row.OperationType;
 import org.apache.fluss.flink.sink.serializer.FlussSerializationSchema;
 import org.apache.fluss.flink.sink.undo.ProducerOffsetReporter;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 
@@ -98,32 +99,43 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
     CompletableFuture<?> writeRow(OperationType opType, InternalRow internalRow) {
         if (opType == OperationType.UPSERT) {
             CompletableFuture<UpsertResult> future = upsertWriter.upsert(internalRow);
-            // Report offset to upstream UndoRecoveryOperator if reporter provided
             if (offsetReporter != null) {
                 return future.thenAccept(
-                        result -> {
-                            if (result.getBucket() != null && result.getLogEndOffset() >= 0) {
-                                offsetReporter.reportOffset(
-                                        result.getBucket(), result.getLogEndOffset());
-                            }
-                        });
+                        result ->
+                                reportOffsetIfAvailable(
+                                        result.getBucket(), result.getLogEndOffset()));
             }
             return future;
         } else if (opType == OperationType.DELETE) {
             CompletableFuture<DeleteResult> future = upsertWriter.delete(internalRow);
-            // Report offset to upstream UndoRecoveryOperator if reporter provided
             if (offsetReporter != null) {
                 return future.thenAccept(
-                        result -> {
-                            if (result.getBucket() != null && result.getLogEndOffset() >= 0) {
-                                offsetReporter.reportOffset(
-                                        result.getBucket(), result.getLogEndOffset());
-                            }
-                        });
+                        result ->
+                                reportOffsetIfAvailable(
+                                        result.getBucket(), result.getLogEndOffset()));
+            }
+            return future;
+        } else if (opType == OperationType.RETRACT) {
+            CompletableFuture<UpsertResult> future = upsertWriter.retract(internalRow);
+            if (offsetReporter != null) {
+                return future.thenAccept(
+                        result ->
+                                reportOffsetIfAvailable(
+                                        result.getBucket(), result.getLogEndOffset()));
             }
             return future;
         } else {
             throw new UnsupportedOperationException("Unsupported operation type: " + opType);
+        }
+    }
+
+    /**
+     * Reports the offset to the upstream UndoRecoveryOperator if the bucket and offset are
+     * available.
+     */
+    private void reportOffsetIfAvailable(@Nullable TableBucket bucket, long logEndOffset) {
+        if (bucket != null && logEndOffset >= 0) {
+            offsetReporter.reportOffset(bucket, logEndOffset);
         }
     }
 

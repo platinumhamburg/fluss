@@ -61,12 +61,13 @@ class DefaultKvRecordTest extends KvTestBase {
                         MemorySegment.wrap(outputView.getCopyOfBuffer()),
                         0,
                         schemaId,
-                        kvRecordReadContext);
+                        kvRecordReadContext,
+                        true);
 
-        // four byte for length + bytes for key length  + bytes for key +
+        // four byte for length + flags byte + bytes for key length  + bytes for key +
         // bytes for row
-        // 4 + 1 + 2 + 6 = 13
-        assertThat(kvRecord.getSizeInBytes()).isEqualTo(13);
+        // 4 + 1 + 1 + 2 + 6 = 14
+        assertThat(kvRecord.getSizeInBytes()).isEqualTo(14);
         // check key
         assertThat(keyToBytes(kvRecord)).isEqualTo(key);
         // check value
@@ -82,10 +83,11 @@ class DefaultKvRecordTest extends KvTestBase {
                         MemorySegment.wrap(outputView.getCopyOfBuffer()),
                         0,
                         schemaId,
-                        kvRecordReadContext);
-        // four byte for length + bytes for key length  + bytes for key
-        // 4 + 1 + 2  = 7
-        assertThat(kvRecord.getSizeInBytes()).isEqualTo(7);
+                        kvRecordReadContext,
+                        true);
+        // four byte for length + flags byte + bytes for key length  + bytes for key
+        // 4 + 1 + 1 + 2  = 8
+        assertThat(kvRecord.getSizeInBytes()).isEqualTo(8);
         // check key
         assertThat(keyToBytes(kvRecord)).isEqualTo(key);
         // check value
@@ -110,11 +112,42 @@ class DefaultKvRecordTest extends KvTestBase {
                         0,
                         schemaId,
                         KvRecordReadContext.createReadContext(
-                                KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA)));
+                                KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA)),
+                        true);
 
         // check key
         assertThat(keyToBytes(kvRecord)).isEqualTo(key);
         // check value
+        assertThat(kvRecord.getRow()).isEqualTo(row);
+    }
+
+    @Test
+    void testWriteAndReadWithRetractFlag() throws Exception {
+        KvRecordReadContext kvRecordReadContext =
+                KvRecordReadContext.createReadContext(
+                        KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA));
+
+        CompactedRow row;
+        try (CompactedRowEncoder writer = new CompactedRowEncoder(baseRowFieldTypes)) {
+            writer.startNewRow();
+            writer.encodeField(0, 42);
+            writer.encodeField(1, BinaryString.fromString("retract"));
+            row = writer.finishRow();
+        }
+
+        byte[] key = new byte[] {5, 6};
+        DefaultKvRecord.writeTo(outputView, key, row, true, true);
+
+        KvRecord kvRecord =
+                DefaultKvRecord.readFrom(
+                        MemorySegment.wrap(outputView.getCopyOfBuffer()),
+                        0,
+                        schemaId,
+                        kvRecordReadContext,
+                        true);
+
+        assertThat(kvRecord.isRetract()).isTrue();
+        assertThat(keyToBytes(kvRecord)).isEqualTo(key);
         assertThat(kvRecord.getRow()).isEqualTo(row);
     }
 }

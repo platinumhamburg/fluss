@@ -42,6 +42,8 @@ import java.nio.ByteBuffer;
  *
  * <ul>
  *   <li>Length => int32
+ *   <li>Flags => int8 (present only when batch attribute HAS_RECORD_FLAGS is set; bit 0 =
+ *       isRetract: 1 means retract record, 0 means normal record)
  *   <li>KeyLength => unsigned varint
  *   <li>Key => bytes
  *   <li>Row => {@link BinaryRow}
@@ -55,6 +57,10 @@ import java.nio.ByteBuffer;
 public class DefaultKvRecord implements KvRecord {
 
     static final int LENGTH_LENGTH = 4;
+    static final int FLAGS_LENGTH = 1;
+    /** Bit 0 of the flags byte: indicates this is a retract record. */
+    static final byte RETRACT_FLAG = 0x01;
+
     private final RowDecoder rowDecoder;
 
     private MemorySegment segment;
@@ -63,17 +69,19 @@ public class DefaultKvRecord implements KvRecord {
 
     private ByteBuffer key;
     private BinaryRow value;
+    private boolean retract;
 
     private DefaultKvRecord(RowDecoder rowDecoder) {
         this.rowDecoder = rowDecoder;
     }
 
-    private void pointTo(MemorySegment segment, int offset, int sizeInBytes) {
+    private void pointTo(
+            MemorySegment segment, int offset, int sizeInBytes, boolean hasRecordFlags) {
         this.segment = segment;
         this.offset = offset;
         this.sizeInBytes = sizeInBytes;
         try {
-            readKeyAndRow();
+            readKeyAndRow(hasRecordFlags);
         } catch (IOException e) {
             throw new InvalidRecordException("Found invalid kv record structure.", e);
         }
@@ -97,14 +105,32 @@ public class DefaultKvRecord implements KvRecord {
         return MurmurHashUtils.hashBytes(segment, offset, sizeInBytes);
     }
 
+    /**
+     * Convenience overload that writes with record flags enabled (matching {@link
+     * KvRecordBatchEncoding#WITH_RECORD_FLAGS}).
+     */
     public static int writeTo(OutputView outputView, byte[] key, @Nullable BinaryRow row)
             throws IOException {
-        // bytes for key length + bytes for key + bytes for row
-        int sizeInBytes = sizeWithoutLength(key, row);
+        return writeTo(outputView, key, row, false, true);
+    }
+
+    public static int writeTo(
+            OutputView outputView,
+            byte[] key,
+            @Nullable BinaryRow row,
+            boolean isRetract,
+            boolean hasRecordFlags)
+            throws IOException {
+        int sizeInBytes = sizeWithoutLength(key, row, hasRecordFlags);
 
         // TODO using varint instead int to reduce storage size.
         // write record total bytes size.
         outputView.writeInt(sizeInBytes);
+
+        if (hasRecordFlags) {
+            // write flags byte: bit 0 = isRetract
+            outputView.writeByte(isRetract ? RETRACT_FLAG : 0);
+        }
 
         // write key length, unsigned var int;
         VarLengthUtils.writeUnsignedVarInt(key.length, outputView);
@@ -122,27 +148,47 @@ public class DefaultKvRecord implements KvRecord {
             MemorySegment segment,
             int position,
             short schemaId,
-            KvRecordBatch.ReadContext readContext) {
+            KvRecordBatch.ReadContext readContext,
+            boolean hasRecordFlags) {
         int sizeInBytes = segment.getInt(position);
         DefaultKvRecord kvRecord = new DefaultKvRecord(readContext.getRowDecoder(schemaId));
-        kvRecord.pointTo(segment, position, sizeInBytes + LENGTH_LENGTH);
+        kvRecord.pointTo(segment, position, sizeInBytes + LENGTH_LENGTH, hasRecordFlags);
         return kvRecord;
     }
 
     /** Calculate the size of the kv record write to batch, including {@link #LENGTH_LENGTH}. */
-    public static int sizeOf(byte[] key, @Nullable BinaryRow row) {
-        return sizeWithoutLength(key, row) + LENGTH_LENGTH;
+    public static int sizeOf(byte[] key, @Nullable BinaryRow row, boolean hasRecordFlags) {
+        return sizeWithoutLength(key, row, hasRecordFlags) + LENGTH_LENGTH;
     }
 
-    private static int sizeWithoutLength(byte[] key, @Nullable BinaryRow row) {
-        return VarLengthUtils.sizeOfUnsignedVarInt(key.length)
+    /**
+     * Convenience overload that computes size with record flags included (matching {@link
+     * KvRecordBatchEncoding#WITH_RECORD_FLAGS}).
+     */
+    public static int sizeOf(byte[] key, @Nullable BinaryRow row) {
+        return sizeOf(key, row, true);
+    }
+
+    private static int sizeWithoutLength(
+            byte[] key, @Nullable BinaryRow row, boolean hasRecordFlags) {
+        return (hasRecordFlags ? FLAGS_LENGTH : 0)
+                + VarLengthUtils.sizeOfUnsignedVarInt(key.length)
                 + key.length
                 + (row == null ? 0 : row.getSizeInBytes());
     }
 
-    private void readKeyAndRow() throws IOException {
-        // start to read from the offset of key
-        int currentOffset = offset + LENGTH_LENGTH;
+    private void readKeyAndRow(boolean hasRecordFlags) throws IOException {
+        int currentOffset;
+        if (hasRecordFlags) {
+            // new format: read flags byte (immediately after the length field)
+            byte flags = segment.get(offset + LENGTH_LENGTH);
+            retract = (flags & RETRACT_FLAG) != 0;
+            currentOffset = offset + LENGTH_LENGTH + FLAGS_LENGTH;
+        } else {
+            // legacy format: no flags byte, retract is always false
+            retract = false;
+            currentOffset = offset + LENGTH_LENGTH;
+        }
         // now, read key;
         // read the length of key size
         int keyLength = VarLengthUtils.readUnsignedVarInt(segment, currentOffset);
@@ -171,6 +217,11 @@ public class DefaultKvRecord implements KvRecord {
     @Override
     public @Nullable BinaryRow getRow() {
         return value;
+    }
+
+    @Override
+    public boolean isRetract() {
+        return retract;
     }
 
     @Override

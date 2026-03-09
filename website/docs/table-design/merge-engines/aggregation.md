@@ -818,11 +818,6 @@ SELECT * FROM test_string_agg WHERE id = 1;
 ```java
 Schema schema = Schema.newBuilder()
     .column("id", DataTypes.BIGINT())
-    .column("tags", DataTypes.STRING(), AggFunctions.STRING_AGG(";"))  // Specify delimiter inline
-    .primaryKey("id")
-    .build();
-Schema schema = Schema.newBuilder()
-    .column("id", DataTypes.BIGINT())
     .column("tags1", DataTypes.STRING(), AggFunctions.STRING_AGG())
     .column("tags2", DataTypes.STRING(), AggFunctions.STRING_AGG(";"))  // Specify delimiter inline
     .primaryKey("id")
@@ -1137,12 +1132,11 @@ partialWriter.delete(primaryKeyRow);
 ```
 
 :::note
-**Current Limitation**: The aggregation merge engine does not support retraction semantics (e.g., subtracting from a sum, reverting a max). 
+**Retract Support**: The aggregation merge engine supports retract semantics for aggregate functions with well-defined inverse operations. When using Flink SQL with a retract-compatible aggregation table, `UPDATE_BEFORE` rows are automatically treated as retract operations rather than deletes.
 
-- **Full update mode**: Delete operations can only remove the entire record
-- **Partial update mode**: Delete operations can only null out target columns, not retract aggregated values
-
-Future versions may support fine-grained retraction by enhancing the protocol to carry row data with delete operations.
+- **Supported functions**: `sum` (subtraction), `product` (division), `last_value` (clear to null), `last_value_ignore_nulls` (conditional clear). Retract is only supported when **all** non-PK aggregation fields use retract-safe functions.
+- **Undo vs Retract**: Undo recovery (used during Flink failover) restores exact checkpoint state via OVERWRITE mode. Retract applies inverse aggregation during normal streaming. These are independent mechanisms.
+- **Non-retract-safe functions** (e.g., `max`, `min`, `first_value`, `listagg`, `bool_and`, `bool_or`): These functions throw `UnsupportedOperationException` on retract. They cannot be used in retract-enabled tables.
 :::
 
 ## Limitations

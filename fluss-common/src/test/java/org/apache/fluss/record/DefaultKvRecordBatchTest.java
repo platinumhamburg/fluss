@@ -27,6 +27,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.apache.fluss.record.DefaultKvRecordBatch.HAS_RECORD_FLAGS_MASK;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -71,8 +72,119 @@ class DefaultKvRecordBatchTest extends KvTestBase {
                                 KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA)))) {
             assertThat(keyToBytes(record)).isEqualTo(keys.get(i));
             assertThat(record.getRow()).isEqualTo(rows.get(i));
+            assertThat(record.getMutationType())
+                    .isEqualTo(rows.get(i) == null ? KvMutationType.DELETE : KvMutationType.UPSERT);
             i++;
         }
+
+        builder.close();
+    }
+
+    @Test
+    void testNewFormatBatchHasRecordFlagsAttribute() throws Exception {
+        // New format (useRecordFlags=true) should set bit 0 of attributes
+        KvRecordBatchBuilder builder =
+                KvRecordBatchBuilder.builder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        KvFormat.COMPACTED,
+                        KvRecordBatchEncoding.WITH_RECORD_FLAGS);
+        byte[] key = new byte[] {1, 2};
+        CompactedRow row = TestInternalRowGenerator.genCompactedRowForAllType();
+        builder.append(key, row);
+        // Append a retract record
+        byte[] key2 = new byte[] {3, 4};
+        builder.append(key2, row, true);
+
+        DefaultKvRecordBatch batch = DefaultKvRecordBatch.pointToBytesView(builder.build());
+        batch.ensureValid();
+
+        assertThat(batch.hasRecordFlags()).isTrue();
+        assertThat(batch.attributes() & HAS_RECORD_FLAGS_MASK).isEqualTo((byte) 1);
+        assertThat(batch.getRecordCount()).isEqualTo(2);
+
+        // Verify per-record retract flags
+        KvRecordBatch.ReadContext ctx =
+                KvRecordReadContext.createReadContext(
+                        KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA));
+        List<KvRecord> records = new ArrayList<>();
+        for (KvRecord r : batch.records(ctx)) {
+            records.add(r);
+        }
+        assertThat(records.get(0).isRetract()).isFalse();
+        assertThat(records.get(0).getMutationType()).isEqualTo(KvMutationType.UPSERT);
+        assertThat(records.get(1).isRetract()).isTrue();
+        assertThat(records.get(1).getMutationType()).isEqualTo(KvMutationType.RETRACT);
+
+        builder.close();
+    }
+
+    @Test
+    void testLegacyFormatBatchNoRecordFlags() throws Exception {
+        // Legacy format should NOT set bit 0 of attributes
+        KvRecordBatchBuilder builder =
+                KvRecordBatchBuilder.builder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        KvFormat.COMPACTED,
+                        KvRecordBatchEncoding.LEGACY);
+        byte[] key = new byte[] {1, 2};
+        CompactedRow row = TestInternalRowGenerator.genCompactedRowForAllType();
+        builder.append(key, row);
+        // Even if isRetract=true is passed, legacy format ignores it
+        byte[] key2 = new byte[] {3, 4};
+        builder.append(key2, row, true);
+
+        DefaultKvRecordBatch batch = DefaultKvRecordBatch.pointToBytesView(builder.build());
+        batch.ensureValid();
+
+        assertThat(batch.hasRecordFlags()).isFalse();
+        assertThat(batch.attributes() & HAS_RECORD_FLAGS_MASK).isEqualTo((byte) 0);
+        assertThat(batch.getRecordCount()).isEqualTo(2);
+
+        // All records should have isRetract=false in legacy format
+        KvRecordBatch.ReadContext ctx =
+                KvRecordReadContext.createReadContext(
+                        KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA));
+        List<KvRecord> records = new ArrayList<>();
+        for (KvRecord r : batch.records(ctx)) {
+            records.add(r);
+        }
+        assertThat(records.get(0).isRetract()).isFalse();
+        assertThat(records.get(0).getMutationType()).isEqualTo(KvMutationType.UPSERT);
+        assertThat(records.get(1).isRetract()).isFalse();
+        assertThat(records.get(1).getMutationType()).isEqualTo(KvMutationType.UPSERT);
+
+        builder.close();
+    }
+
+    @Test
+    void testLegacyNullRowIsNormalizedAsDelete() throws Exception {
+        KvRecordBatchBuilder builder =
+                KvRecordBatchBuilder.builder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        KvFormat.COMPACTED,
+                        KvRecordBatchEncoding.LEGACY);
+        byte[] key = new byte[] {1, 2};
+        builder.append(key, null);
+
+        DefaultKvRecordBatch batch = DefaultKvRecordBatch.pointToBytesView(builder.build());
+        batch.ensureValid();
+
+        KvRecord record =
+                batch.records(
+                                KvRecordReadContext.createReadContext(
+                                        KvFormat.COMPACTED,
+                                        new TestingSchemaGetter(1, DATA1_SCHEMA)))
+                        .iterator()
+                        .next();
+        assertThat(record.getRow()).isNull();
+        assertThat(record.isRetract()).isFalse();
+        assertThat(record.getMutationType()).isEqualTo(KvMutationType.DELETE);
 
         builder.close();
     }

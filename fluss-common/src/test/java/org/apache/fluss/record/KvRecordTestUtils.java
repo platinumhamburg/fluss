@@ -73,7 +73,10 @@ public class KvRecordTestUtils {
                             new UnmanagedPagedOutputView(100),
                             KvFormat.COMPACTED);
             for (KvRecord kvRecord : records) {
-                builder.append(BytesUtils.toArray(kvRecord.getKey()), kvRecord.getRow());
+                builder.append(
+                        BytesUtils.toArray(kvRecord.getKey()),
+                        kvRecord.getRow(),
+                        kvRecord.getMutationType());
             }
 
             builder.setWriterState(writeClientId, batchSequenceId);
@@ -115,6 +118,23 @@ public class KvRecordTestUtils {
         public KvRecord ofRecord(String key, @Nullable Object[] value) {
             return ofRecord(key.getBytes(), value);
         }
+
+        /**
+         * Create a retract KvRecord with given key and value. A retract record reverses a
+         * previously aggregated value.
+         */
+        public KvRecord ofRetractRecord(byte[] key, @Nullable Object[] value) {
+            BinaryRow row = value == null ? null : compactedRow(rowType, value);
+            return new SimpleTestKvRecord(key, row, true);
+        }
+
+        /**
+         * Create a retract KvRecord with given key and value. A retract record reverses a
+         * previously aggregated value.
+         */
+        public KvRecord ofRetractRecord(String key, @Nullable Object[] value) {
+            return ofRetractRecord(key.getBytes(), value);
+        }
     }
 
     /**
@@ -148,10 +168,16 @@ public class KvRecordTestUtils {
     private static class SimpleTestKvRecord implements KvRecord {
         private final byte[] key;
         private final BinaryRow row;
+        private final boolean retract;
 
         SimpleTestKvRecord(byte[] key, @Nullable BinaryRow row) {
+            this(key, row, false);
+        }
+
+        SimpleTestKvRecord(byte[] key, @Nullable BinaryRow row, boolean retract) {
             this.key = key;
             this.row = row;
+            this.retract = retract;
         }
 
         @Override
@@ -167,6 +193,11 @@ public class KvRecordTestUtils {
         @Override
         public int getSizeInBytes() {
             throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean isRetract() {
+            return retract;
         }
     }
 }

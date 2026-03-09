@@ -244,6 +244,11 @@ public class KeyRecordBatch implements KvRecordBatch {
         }
 
         @Override
+        public boolean isRetract() {
+            return false;
+        }
+
+        @Override
         public int getSizeInBytes() {
             return key.length + (row != null ? row.getSizeInBytes() : 0);
         }

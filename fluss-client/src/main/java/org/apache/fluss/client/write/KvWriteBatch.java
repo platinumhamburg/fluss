@@ -24,6 +24,7 @@ import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.record.KvRecordBatchBuilder;
+import org.apache.fluss.record.KvRecordBatchEncoding;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
@@ -53,6 +54,7 @@ public class KvWriteBatch extends WriteBatch {
     private final @Nullable int[] targetColumns;
     private final int schemaId;
     private final MergeMode mergeMode;
+    private final KvRecordBatchEncoding batchEncoding;
 
     public KvWriteBatch(
             int bucketId,
@@ -63,14 +65,17 @@ public class KvWriteBatch extends WriteBatch {
             AbstractPagedOutputView outputView,
             @Nullable int[] targetColumns,
             MergeMode mergeMode,
+            KvRecordBatchEncoding batchEncoding,
             long createdMs) {
         super(bucketId, physicalTablePath, createdMs);
         this.outputView = outputView;
         this.recordsBuilder =
-                KvRecordBatchBuilder.builder(schemaId, writeLimit, outputView, kvFormat);
+                KvRecordBatchBuilder.builder(
+                        schemaId, writeLimit, outputView, kvFormat, batchEncoding);
         this.targetColumns = targetColumns;
         this.schemaId = schemaId;
         this.mergeMode = mergeMode;
+        this.batchEncoding = batchEncoding;
     }
 
     @Override
@@ -115,7 +120,7 @@ public class KvWriteBatch extends WriteBatch {
         if (!recordsBuilder.hasRoomFor(key, row) || isClosed()) {
             return false;
         } else {
-            recordsBuilder.append(key, row);
+            recordsBuilder.append(key, row, writeRecord.requireKvMutationType());
             callbacks.add(callback);
             recordCount++;
             return true;
@@ -129,6 +134,10 @@ public class KvWriteBatch extends WriteBatch {
 
     public MergeMode getMergeMode() {
         return mergeMode;
+    }
+
+    public KvRecordBatchEncoding getBatchEncoding() {
+        return batchEncoding;
     }
 
     @Override

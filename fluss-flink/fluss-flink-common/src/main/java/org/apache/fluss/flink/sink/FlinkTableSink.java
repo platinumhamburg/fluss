@@ -87,6 +87,13 @@ public class FlinkTableSink
     private final @Nullable DataLakeFormat lakeFormat;
     @Nullable private final String producerId;
 
+    /**
+     * Whether the table uses the AGGREGATION merge engine. When true, UPDATE_BEFORE rows are
+     * accepted and mapped to RETRACT operations. This replaces the previous isRetractCompatible
+     * check to align with Paimon's approach of accepting full changelog for AGGREGATE engine.
+     */
+    private final boolean isAggregationTable;
+
     private boolean appliedUpdates = false;
     @Nullable private GenericRow deleteRow;
 
@@ -119,6 +126,7 @@ public class FlinkTableSink
         this.distributionMode = distributionMode;
         this.lakeFormat = lakeFormat;
         this.producerId = producerId;
+        this.isAggregationTable = mergeEngineType == MergeEngineType.AGGREGATION;
     }
 
     @Override
@@ -127,10 +135,15 @@ public class FlinkTableSink
             return ChangelogMode.insertOnly();
         } else {
             if (primaryKeyIndexes.length > 0 || sinkIgnoreDelete) {
+                // Align with Paimon: AGGREGATION engine accepts full changelog
+                // including UPDATE_BEFORE for retract semantics
+                if (isAggregationTable) {
+                    return requestedMode;
+                }
                 // primary-key table or ignore_delete mode can accept RowKind.DELETE
                 ChangelogMode.Builder builder = ChangelogMode.newBuilder();
                 for (RowKind kind : requestedMode.getContainedKinds()) {
-                    // optimize out the update_before messages
+                    // optimize out the update_before messages for non-aggregation tables
                     if (kind != RowKind.UPDATE_BEFORE) {
                         builder.addContainedKind(kind);
                     }
@@ -208,7 +221,7 @@ public class FlinkTableSink
 
     private FlinkSink<RowData> getFlinkSink(int[] targetColumnIndexes) {
         // Enable undo recovery for aggregation tables
-        boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
+        boolean enableUndoRecovery = isAggregationTable;
 
         FlinkSink.SinkWriterBuilder<? extends FlinkSinkWriter, RowData> flinkSinkWriterBuilder =
                 (primaryKeyIndexes.length > 0)
@@ -222,7 +235,8 @@ public class FlinkTableSink
                                 partitionKeys,
                                 lakeFormat,
                                 distributionMode,
-                                new RowDataSerializationSchema(false, sinkIgnoreDelete),
+                                new RowDataSerializationSchema(
+                                        false, sinkIgnoreDelete, isAggregationTable),
                                 enableUndoRecovery,
                                 producerId)
                         : new FlinkSink.AppendSinkWriterBuilder<>(

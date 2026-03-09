@@ -26,6 +26,12 @@ import org.apache.fluss.row.Decimal;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.utils.DecimalUtils;
 
+import static org.apache.fluss.server.kv.rowmerger.aggregate.functions.NarrowMathUtils.addExactByte;
+import static org.apache.fluss.server.kv.rowmerger.aggregate.functions.NarrowMathUtils.addExactShort;
+import static org.apache.fluss.server.kv.rowmerger.aggregate.functions.NarrowMathUtils.checkDecimalConsistency;
+import static org.apache.fluss.server.kv.rowmerger.aggregate.functions.NarrowMathUtils.subtractExactByte;
+import static org.apache.fluss.server.kv.rowmerger.aggregate.functions.NarrowMathUtils.subtractExactShort;
+
 /** Sum aggregator - computes the sum of numeric values. */
 public class FieldSumAgg extends FieldAggregator {
 
@@ -47,10 +53,7 @@ public class FieldSumAgg extends FieldAggregator {
             case DECIMAL:
                 Decimal mergeFieldDD = (Decimal) accumulator;
                 Decimal inFieldDD = (Decimal) inputField;
-                assert mergeFieldDD.scale() == inFieldDD.scale()
-                        : "Inconsistent scale of aggregate Decimal!";
-                assert mergeFieldDD.precision() == inFieldDD.precision()
-                        : "Inconsistent precision of aggregate Decimal!";
+                checkDecimalConsistency(mergeFieldDD, inFieldDD);
                 sum =
                         DecimalUtils.add(
                                 mergeFieldDD,
@@ -59,16 +62,16 @@ public class FieldSumAgg extends FieldAggregator {
                                 mergeFieldDD.scale());
                 break;
             case TINYINT:
-                sum = (byte) ((byte) accumulator + (byte) inputField);
+                sum = addExactByte((byte) accumulator, (byte) inputField);
                 break;
             case SMALLINT:
-                sum = (short) ((short) accumulator + (short) inputField);
+                sum = addExactShort((short) accumulator, (short) inputField);
                 break;
             case INTEGER:
-                sum = (int) accumulator + (int) inputField;
+                sum = Math.addExact((int) accumulator, (int) inputField);
                 break;
             case BIGINT:
-                sum = (long) accumulator + (long) inputField;
+                sum = Math.addExact((long) accumulator, (long) inputField);
                 break;
             case FLOAT:
                 sum = (float) accumulator + (float) inputField;
@@ -83,5 +86,49 @@ public class FieldSumAgg extends FieldAggregator {
                 throw new IllegalArgumentException(msg);
         }
         return sum;
+    }
+
+    @Override
+    public Object retract(Object accumulator, Object retractField) {
+        if (accumulator == null) {
+            return null;
+        }
+        if (retractField == null) {
+            return accumulator;
+        }
+
+        Object result;
+        switch (typeRoot) {
+            case DECIMAL:
+                Decimal accDD = (Decimal) accumulator;
+                Decimal retDD = (Decimal) retractField;
+                checkDecimalConsistency(accDD, retDD);
+                result = DecimalUtils.subtract(accDD, retDD, accDD.precision(), accDD.scale());
+                break;
+            case TINYINT:
+                result = subtractExactByte((byte) accumulator, (byte) retractField);
+                break;
+            case SMALLINT:
+                result = subtractExactShort((short) accumulator, (short) retractField);
+                break;
+            case INTEGER:
+                result = Math.subtractExact((int) accumulator, (int) retractField);
+                break;
+            case BIGINT:
+                result = Math.subtractExact((long) accumulator, (long) retractField);
+                break;
+            case FLOAT:
+                result = (float) accumulator - (float) retractField;
+                break;
+            case DOUBLE:
+                result = (double) accumulator - (double) retractField;
+                break;
+            default:
+                String msg =
+                        String.format(
+                                "type %s not support in %s", typeRoot, this.getClass().getName());
+                throw new IllegalArgumentException(msg);
+        }
+        return result;
     }
 }

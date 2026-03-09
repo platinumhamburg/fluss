@@ -35,12 +35,15 @@ import java.util.concurrent.CompletableFuture;
 public class TestUpsertWriter implements UpsertWriter {
     private int upsertCount = 0;
     private int deleteCount = 0;
+    private int retractCount = 0;
     private boolean flushCalled = false;
     private boolean shouldFail = false;
     private InternalRow lastUpsertedRow;
     private InternalRow lastDeletedRow;
+    private InternalRow lastRetractedRow;
     private final List<InternalRow> allUpsertedRows = new ArrayList<>();
     private final List<InternalRow> allDeletedRows = new ArrayList<>();
+    private final List<InternalRow> allRetractedRows = new ArrayList<>();
 
     @Override
     public CompletableFuture<UpsertResult> upsert(InternalRow record) {
@@ -66,6 +69,19 @@ public class TestUpsertWriter implements UpsertWriter {
         lastDeletedRow = record;
         allDeletedRows.add(record);
         return CompletableFuture.completedFuture(new DeleteResult(new TableBucket(1L, 0), 0L));
+    }
+
+    @Override
+    public CompletableFuture<UpsertResult> retract(InternalRow record) {
+        if (shouldFail) {
+            CompletableFuture<UpsertResult> future = new CompletableFuture<>();
+            future.completeExceptionally(new RuntimeException("Simulated write failure"));
+            return future;
+        }
+        retractCount++;
+        lastRetractedRow = record;
+        allRetractedRows.add(record);
+        return CompletableFuture.completedFuture(new UpsertResult(new TableBucket(1L, 0), 0L));
     }
 
     @Override
@@ -101,6 +117,18 @@ public class TestUpsertWriter implements UpsertWriter {
         return allDeletedRows;
     }
 
+    public int getRetractCount() {
+        return retractCount;
+    }
+
+    public InternalRow getLastRetractedRow() {
+        return lastRetractedRow;
+    }
+
+    public List<InternalRow> getAllRetractedRows() {
+        return allRetractedRows;
+    }
+
     public void setShouldFail(boolean shouldFail) {
         this.shouldFail = shouldFail;
     }
@@ -108,11 +136,14 @@ public class TestUpsertWriter implements UpsertWriter {
     public void reset() {
         upsertCount = 0;
         deleteCount = 0;
+        retractCount = 0;
         flushCalled = false;
         shouldFail = false;
         lastUpsertedRow = null;
         lastDeletedRow = null;
+        lastRetractedRow = null;
         allUpsertedRows.clear();
         allDeletedRows.clear();
+        allRetractedRows.clear();
     }
 }

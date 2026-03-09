@@ -23,6 +23,7 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.record.CompactedLogRecord;
 import org.apache.fluss.record.DefaultKvRecord;
 import org.apache.fluss.record.IndexedLogRecord;
+import org.apache.fluss.record.KvMutationType;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.compacted.CompactedRow;
@@ -88,7 +89,8 @@ public final class WriteRecord {
                 writeFormat,
                 targetColumns,
                 estimatedSizeInBytes,
-                mergeMode);
+                mergeMode,
+                KvMutationType.UPSERT);
     }
 
     /** Create a write record for delete operation and partial-delete update. */
@@ -119,7 +121,7 @@ public final class WriteRecord {
             @Nullable int[] targetColumns,
             MergeMode mergeMode) {
         checkNotNull(key, "key must not be null");
-        checkNotNull(bucketKey, "key must not be null");
+        checkNotNull(bucketKey, "bucketKey must not be null");
         checkArgument(writeFormat.isKv(), "writeFormat must be a KV format");
         int estimatedSizeInBytes = DefaultKvRecord.sizeOf(key, null) + RECORD_BATCH_HEADER_SIZE;
         return new WriteRecord(
@@ -131,7 +133,36 @@ public final class WriteRecord {
                 writeFormat,
                 targetColumns,
                 estimatedSizeInBytes,
-                mergeMode);
+                mergeMode,
+                KvMutationType.DELETE);
+    }
+
+    /** Create a write record for retract operation (inverse aggregation on aggregation tables). */
+    public static WriteRecord forRetract(
+            TableInfo tableInfo,
+            PhysicalTablePath tablePath,
+            BinaryRow row,
+            byte[] key,
+            byte[] bucketKey,
+            WriteFormat writeFormat,
+            @Nullable int[] targetColumns) {
+        checkNotNull(row, "retract row must not be null");
+        checkNotNull(key, "key must not be null");
+        checkNotNull(bucketKey, "bucketKey must not be null");
+        checkArgument(writeFormat.isKv(), "writeFormat must be a KV format");
+        int estimatedSizeInBytes = DefaultKvRecord.sizeOf(key, row) + RECORD_BATCH_HEADER_SIZE;
+        return new WriteRecord(
+                tableInfo,
+                tablePath,
+                key,
+                bucketKey,
+                row,
+                writeFormat,
+                targetColumns,
+                estimatedSizeInBytes,
+                // Retract always uses DEFAULT mode; OVERWRITE is for undo recovery only
+                MergeMode.DEFAULT,
+                KvMutationType.RETRACT);
     }
 
     /** Create a write record for append operation for indexed format. */
@@ -152,7 +183,8 @@ public final class WriteRecord {
                 WriteFormat.INDEXED_LOG,
                 null,
                 estimatedSizeInBytes,
-                MergeMode.DEFAULT);
+                MergeMode.DEFAULT,
+                null);
     }
 
     /** Creates a write record for append operation for Arrow format. */
@@ -174,7 +206,8 @@ public final class WriteRecord {
                 WriteFormat.ARROW_LOG,
                 null,
                 estimatedSizeInBytes,
-                MergeMode.DEFAULT);
+                MergeMode.DEFAULT,
+                null);
     }
 
     /** Creates a write record for append operation for Compacted format. */
@@ -195,7 +228,8 @@ public final class WriteRecord {
                 WriteFormat.COMPACTED_LOG,
                 null,
                 estimatedSizeInBytes,
-                MergeMode.DEFAULT);
+                MergeMode.DEFAULT,
+                null);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -213,14 +247,12 @@ public final class WriteRecord {
     private final TableInfo tableInfo;
 
     /**
-     * The merge mode for this record. This controls how the server handles data merging.
-     *
-     * <ul>
-     *   <li>DEFAULT: Normal merge through server-side merge engine
-     *   <li>OVERWRITE: Bypass merge engine, directly replace values (for undo recovery)
-     * </ul>
+     * The merge mode for this record: DEFAULT (normal merge) or OVERWRITE (bypass merge engine).
      */
     private final MergeMode mergeMode;
+
+    /** Normalized mutation type for KV writes. Null for append-only log writes. */
+    private final @Nullable KvMutationType kvMutationType;
 
     private WriteRecord(
             TableInfo tableInfo,
@@ -231,7 +263,8 @@ public final class WriteRecord {
             WriteFormat writeFormat,
             @Nullable int[] targetColumns,
             int estimatedSizeInBytes,
-            MergeMode mergeMode) {
+            MergeMode mergeMode,
+            @Nullable KvMutationType kvMutationType) {
         this.tableInfo = tableInfo;
         this.physicalTablePath = physicalTablePath;
         this.key = key;
@@ -241,6 +274,8 @@ public final class WriteRecord {
         this.targetColumns = targetColumns;
         this.estimatedSizeInBytes = estimatedSizeInBytes;
         this.mergeMode = mergeMode;
+        this.kvMutationType = kvMutationType;
+        validateWriteSemantics();
     }
 
     public PhysicalTablePath getPhysicalTablePath() {
@@ -272,22 +307,33 @@ public final class WriteRecord {
         return writeFormat;
     }
 
-    /**
-     * Get the merge mode for this record.
-     *
-     * @return the merge mode
-     */
+    public boolean isKvWrite() {
+        return writeFormat.isKv();
+    }
+
+    /** Get the merge mode for this record. */
     public MergeMode getMergeMode() {
         return mergeMode;
     }
 
-    /**
-     * Get the estimated size in bytes of the record with batch header.
-     *
-     * @return the estimated size in bytes of the record with batch header
-     * @throws IllegalStateException if the estimated size in bytes is not supported for the write
-     *     format
-     */
+    /** Whether this record is a retract operation. */
+    public boolean isRetract() {
+        return kvMutationType == KvMutationType.RETRACT;
+    }
+
+    /** Returns the normalized mutation type for KV writes. Null for append-only log writes. */
+    @Nullable
+    public KvMutationType getKvMutationType() {
+        return kvMutationType;
+    }
+
+    /** Returns the normalized mutation type for KV writes and fails fast for append-only writes. */
+    public KvMutationType requireKvMutationType() {
+        checkArgument(isKvWrite(), "kv mutation type is only available for kv write records");
+        return checkNotNull(kvMutationType, "kv mutation type must not be null for kv write");
+    }
+
+    /** Returns the estimated size in bytes of the record with batch header. */
     public int getEstimatedSizeInBytes() {
         if (estimatedSizeInBytes < 0) {
             throw new IllegalStateException(
@@ -300,5 +346,19 @@ public final class WriteRecord {
 
     public int getSchemaId() {
         return tableInfo.getSchemaId();
+    }
+
+    private void validateWriteSemantics() {
+        if (writeFormat.isKv()) {
+            checkNotNull(kvMutationType, "kv mutation type must not be null for kv write");
+            if (kvMutationType.requiresRowData()) {
+                checkNotNull(
+                        row, "row data must not be null for kv mutation type %s", kvMutationType);
+            }
+        } else {
+            checkArgument(
+                    kvMutationType == null,
+                    "append-only write records must not carry kv mutation semantics");
+        }
     }
 }

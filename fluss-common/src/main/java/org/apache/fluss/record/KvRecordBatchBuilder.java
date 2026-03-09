@@ -33,6 +33,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 
 import static org.apache.fluss.record.DefaultKvRecordBatch.CRC_OFFSET;
+import static org.apache.fluss.record.DefaultKvRecordBatch.HAS_RECORD_FLAGS_MASK;
 import static org.apache.fluss.record.DefaultKvRecordBatch.LENGTH_LENGTH;
 import static org.apache.fluss.record.DefaultKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.DefaultKvRecordBatch.SCHEMA_ID_OFFSET;
@@ -58,6 +59,7 @@ public class KvRecordBatchBuilder implements AutoCloseable {
     private int sizeInBytes;
     private volatile boolean isClosed;
     private final KvFormat kvFormat;
+    private final KvRecordBatchEncoding batchEncoding;
     private boolean aborted = false;
 
     private KvRecordBatchBuilder(
@@ -65,7 +67,8 @@ public class KvRecordBatchBuilder implements AutoCloseable {
             byte magic,
             int writeLimit,
             AbstractPagedOutputView pagedOutputView,
-            KvFormat kvFormat) {
+            KvFormat kvFormat,
+            KvRecordBatchEncoding batchEncoding) {
         checkArgument(
                 schemaId <= Short.MAX_VALUE,
                 "schemaId shouldn't be greater than the max value of short: " + Short.MAX_VALUE);
@@ -83,12 +86,27 @@ public class KvRecordBatchBuilder implements AutoCloseable {
         pagedOutputView.setPosition(RECORD_BATCH_HEADER_SIZE);
         this.sizeInBytes = RECORD_BATCH_HEADER_SIZE;
         this.kvFormat = kvFormat;
+        this.batchEncoding = batchEncoding;
     }
 
     public static KvRecordBatchBuilder builder(
             int schemaId, int writeLimit, AbstractPagedOutputView outputView, KvFormat kvFormat) {
+        return builder(
+                schemaId,
+                writeLimit,
+                outputView,
+                kvFormat,
+                KvRecordBatchEncoding.WITH_RECORD_FLAGS);
+    }
+
+    public static KvRecordBatchBuilder builder(
+            int schemaId,
+            int writeLimit,
+            AbstractPagedOutputView outputView,
+            KvFormat kvFormat,
+            KvRecordBatchEncoding batchEncoding) {
         return new KvRecordBatchBuilder(
-                schemaId, CURRENT_KV_MAGIC_VALUE, writeLimit, outputView, kvFormat);
+                schemaId, CURRENT_KV_MAGIC_VALUE, writeLimit, outputView, kvFormat, batchEncoding);
     }
 
     /**
@@ -96,7 +114,8 @@ public class KvRecordBatchBuilder implements AutoCloseable {
      * appended, then this returns true.
      */
     public boolean hasRoomFor(byte[] key, @Nullable BinaryRow row) {
-        return sizeInBytes + DefaultKvRecord.sizeOf(key, row) <= writeLimit;
+        int recordSize = DefaultKvRecord.sizeOf(key, row, batchEncoding.usesRecordFlags());
+        return sizeInBytes + recordSize <= writeLimit;
     }
 
     /**
@@ -107,6 +126,32 @@ public class KvRecordBatchBuilder implements AutoCloseable {
      *     KvRecord is for delete the corresponding key.
      */
     public void append(byte[] key, @Nullable BinaryRow row) throws IOException {
+        append(key, row, KvMutationType.fromRow(row));
+    }
+
+    /**
+     * Wrap a KvRecord with the given key, value, isRetract flag and append the KvRecord to
+     * DefaultKvRecordBatch.
+     *
+     * @param key the key in the KvRecord to be appended
+     * @param row the value in the KvRecord to be appended. If the value is null, it means the
+     *     KvRecord is for delete the corresponding key.
+     * @param isRetract whether this record is a retract record
+     */
+    public void append(byte[] key, @Nullable BinaryRow row, boolean isRetract) throws IOException {
+        append(key, row, KvMutationType.fromRowAndRetract(row, isRetract));
+    }
+
+    /**
+     * Wrap a KvRecord with the given key, value, mutation type and append the KvRecord to {@link
+     * DefaultKvRecordBatch}.
+     */
+    public void append(byte[] key, @Nullable BinaryRow row, KvMutationType mutationType)
+            throws IOException {
+        checkArgument(
+                mutationType.requiresRowData() == (row != null),
+                "Mutation type / row data mismatch");
+
         if (aborted) {
             throw new IllegalStateException(
                     "Tried to append a record, but KvRecordBatchBuilder has already been aborted");
@@ -116,7 +161,11 @@ public class KvRecordBatchBuilder implements AutoCloseable {
             throw new IllegalStateException(
                     "Tried to put a record, but KvRecordBatchBuilder is closed for record puts.");
         }
-        int recordByteSizes = DefaultKvRecord.writeTo(pagedOutputView, key, validateRowFormat(row));
+        boolean isRetract = mutationType == KvMutationType.RETRACT;
+        boolean usesRecordFlags = batchEncoding.usesRecordFlags();
+        int recordByteSizes =
+                DefaultKvRecord.writeTo(
+                        pagedOutputView, key, validateRowFormat(row), isRetract, usesRecordFlags);
         currentRecordNumber++;
         if (currentRecordNumber == Integer.MAX_VALUE) {
             throw new IllegalArgumentException(
@@ -208,7 +257,7 @@ public class KvRecordBatchBuilder implements AutoCloseable {
     }
 
     private byte computeAttributes() {
-        return 0;
+        return batchEncoding.usesRecordFlags() ? HAS_RECORD_FLAGS_MASK : 0;
     }
 
     /** Validate the row instance according to the kv format. */

@@ -199,6 +199,27 @@ public enum AggFunctionType {
     }
 
     /**
+     * Returns whether this aggregation function supports retract (UPDATE_BEFORE) records.
+     *
+     * <p>A retract-safe function can reverse a previous aggregation contribution. For example,
+     * {@link #SUM} subtracts, {@link #PRODUCT} divides, {@link #LAST_VALUE} returns null, and
+     * {@link #LAST_VALUE_IGNORE_NULLS} returns null when retracting a non-null value.
+     *
+     * @return true if this function supports retract, false otherwise
+     */
+    public boolean supportsRetract() {
+        switch (this) {
+            case SUM:
+            case PRODUCT:
+            case LAST_VALUE:
+            case LAST_VALUE_IGNORE_NULLS:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
      * Converts a string to an AggFunctionType enum value.
      *
      * <p>This method supports multiple naming formats:
