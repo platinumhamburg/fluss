@@ -415,6 +415,16 @@ public final class IndexDataProducer implements Closeable {
                                 startOffset,
                                 endOffset);
                         coldLoadInProgress.set(false);
+                        // Re-evaluate cold data loading after batch completion.
+                        // Without this, a race condition can cause permanent stall:
+                        // if commitHorizon advanced while this batch was in-flight,
+                        // the advancement signal was "consumed" by Gate A
+                        // (lastIndexCommitHorizon was updated) but Gate B
+                        // (coldLoadInProgress=true) blocked the next batch trigger.
+                        // After this batch completes, no future fetchIndex() call
+                        // will re-enter mayTriggerColdDataLoading because Gate A
+                        // is permanently closed.
+                        mayTriggerColdDataLoading(lastIndexCommitHorizon);
                     }
 
                     @Override
@@ -433,6 +443,10 @@ public final class IndexDataProducer implements Closeable {
                             coldLoadCurrentEndOffset = -1;
                         }
                         coldLoadInProgress.set(false);
+                        // Re-evaluate after failure as well, for the same reason
+                        // as onComplete. The guards inside mayTriggerColdDataLoading
+                        // will handle all edge cases safely.
+                        mayTriggerColdDataLoading(lastIndexCommitHorizon);
                     }
                 };
 
