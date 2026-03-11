@@ -42,29 +42,14 @@ import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.rpc.messages.PbCompoundPredicate;
-import org.apache.fluss.rpc.messages.PbDataType;
-import org.apache.fluss.rpc.messages.PbFieldRef;
 import org.apache.fluss.rpc.messages.PbLeafPredicate;
 import org.apache.fluss.rpc.messages.PbLiteralValue;
 import org.apache.fluss.rpc.messages.PbPredicate;
-import org.apache.fluss.types.BigIntType;
-import org.apache.fluss.types.BinaryType;
-import org.apache.fluss.types.BooleanType;
-import org.apache.fluss.types.BytesType;
-import org.apache.fluss.types.CharType;
+import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
-import org.apache.fluss.types.DateType;
 import org.apache.fluss.types.DecimalType;
-import org.apache.fluss.types.DoubleType;
-import org.apache.fluss.types.FloatType;
-import org.apache.fluss.types.IntType;
-import org.apache.fluss.types.LocalZonedTimestampType;
-import org.apache.fluss.types.SmallIntType;
-import org.apache.fluss.types.StringType;
-import org.apache.fluss.types.TimeType;
-import org.apache.fluss.types.TimestampType;
-import org.apache.fluss.types.TinyIntType;
+import org.apache.fluss.types.RowType;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -81,89 +66,52 @@ public class PredicateMessageUtils {
     //  Deserialization: PbPredicate -> Predicate
     // -------------------------------------------------------------------------
 
-    public static Predicate toPredicate(PbPredicate pbPredicate) {
+    public static Predicate toPredicate(PbPredicate pbPredicate, RowType rowType) {
         PredicateType type = PredicateType.fromValue(pbPredicate.getType());
         switch (type) {
             case LEAF:
-                return toLeafPredicate(pbPredicate.getLeaf());
+                return toLeafPredicate(pbPredicate.getLeaf(), rowType);
             case COMPOUND:
-                return toCompoundPredicate(pbPredicate.getCompound());
+                return toCompoundPredicate(pbPredicate.getCompound(), rowType);
             default:
                 throw new IllegalArgumentException("Unknown predicate type: " + type);
         }
     }
 
-    public static CompoundPredicate toCompoundPredicate(PbCompoundPredicate pbCompound) {
+    public static CompoundPredicate toCompoundPredicate(
+            PbCompoundPredicate pbCompound, RowType rowType) {
         List<Predicate> children =
                 pbCompound.getChildrensList().stream()
-                        .map(PredicateMessageUtils::toPredicate)
+                        .map(child -> toPredicate(child, rowType))
                         .collect(Collectors.toList());
         return new CompoundPredicate(
                 CompoundFunctionCode.fromValue(pbCompound.getFunction()).getFunction(), children);
     }
 
-    private static LeafPredicate toLeafPredicate(PbLeafPredicate pbLeaf) {
-        PbFieldRef fieldRef = pbLeaf.getFieldRef();
+    private static LeafPredicate toLeafPredicate(PbLeafPredicate pbLeaf, RowType rowType) {
+        ResolvedField resolvedField = resolveField(rowType, pbLeaf.getFieldId());
+        DataType fieldType = resolvedField.field.getType();
+        String fieldName = resolvedField.field.getName();
         List<Object> literals =
                 pbLeaf.getLiteralsList().stream()
-                        .map(PredicateMessageUtils::toLiteralValue)
+                        .map(lit -> toLiteralValue(lit, fieldType))
                         .collect(Collectors.toList());
 
         return new LeafPredicate(
                 LeafFunctionCode.fromValue(pbLeaf.getFunction()).getFunction(),
-                toDataType(fieldRef.getDataType()),
-                fieldRef.getFieldIndex(),
-                fieldRef.getFieldName(),
+                fieldType,
+                resolvedField.index,
+                fieldName,
                 literals);
     }
 
-    private static DataType toDataType(PbDataType pbType) {
-        DataTypeRoot root = DataTypeRootCode.fromValue(pbType.getRoot()).getDataTypeRoot();
-        boolean nullable = pbType.isNullable();
-        switch (root) {
-            case BOOLEAN:
-                return new BooleanType(nullable);
-            case TINYINT:
-                return new TinyIntType(nullable);
-            case SMALLINT:
-                return new SmallIntType(nullable);
-            case INTEGER:
-                return new IntType(nullable);
-            case BIGINT:
-                return new BigIntType(nullable);
-            case FLOAT:
-                return new FloatType(nullable);
-            case DOUBLE:
-                return new DoubleType(nullable);
-            case CHAR:
-                return new CharType(nullable, pbType.getLength());
-            case STRING:
-                return new StringType(nullable);
-            case DECIMAL:
-                return new DecimalType(nullable, pbType.getPrecision(), pbType.getScale());
-            case DATE:
-                return new DateType(nullable);
-            case TIME_WITHOUT_TIME_ZONE:
-                return new TimeType(nullable, pbType.getPrecision());
-            case TIMESTAMP_WITHOUT_TIME_ZONE:
-                return new TimestampType(nullable, pbType.getPrecision());
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                return new LocalZonedTimestampType(nullable, pbType.getPrecision());
-            case BINARY:
-                return new BinaryType(pbType.getLength());
-            case BYTES:
-                return new BytesType(nullable);
-            default:
-                throw new IllegalArgumentException("Unknown data type root: " + root);
-        }
-    }
-
-    private static Object toLiteralValue(PbLiteralValue pbLiteral) {
+    private static Object toLiteralValue(PbLiteralValue pbLiteral, DataType fieldType) {
         if (pbLiteral.isIsNull()) {
             return null;
         }
         DataTypeRoot root =
-                DataTypeRootCode.fromValue(pbLiteral.getType().getRoot()).getDataTypeRoot();
+                DataTypeRootCode.fromValue(pbLiteral.getLiteralType()).getDataTypeRoot();
+        validateLiteralType(fieldType, root);
         switch (root) {
             case BOOLEAN:
                 return pbLiteral.isBooleanValue();
@@ -184,16 +132,17 @@ public class PredicateMessageUtils {
                 String stringValue = pbLiteral.getStringValue();
                 return stringValue == null ? null : BinaryString.fromString(stringValue);
             case DECIMAL:
+                DecimalType decimalType = (DecimalType) fieldType;
                 if (pbLiteral.hasDecimalBytes()) {
                     return Decimal.fromUnscaledBytes(
                             pbLiteral.getDecimalBytes(),
-                            pbLiteral.getType().getPrecision(),
-                            pbLiteral.getType().getScale());
+                            decimalType.getPrecision(),
+                            decimalType.getScale());
                 } else {
                     return Decimal.fromUnscaledLong(
                             pbLiteral.getDecimalValue(),
-                            pbLiteral.getType().getPrecision(),
-                            pbLiteral.getType().getScale());
+                            decimalType.getPrecision(),
+                            decimalType.getScale());
                 }
             case DATE:
                 return LocalDate.ofEpochDay(pbLiteral.getBigintValue());
@@ -215,28 +164,59 @@ public class PredicateMessageUtils {
         }
     }
 
+    private static void validateLiteralType(DataType fieldType, DataTypeRoot literalRoot) {
+        DataTypeRoot fieldRoot = fieldType.getTypeRoot();
+        if (fieldRoot == literalRoot) {
+            return;
+        }
+        if (isCharacterString(fieldRoot) && isCharacterString(literalRoot)) {
+            return;
+        }
+        if (isBinaryString(fieldRoot) && isBinaryString(literalRoot)) {
+            return;
+        }
+        throw new IllegalArgumentException(
+                "Literal type "
+                        + literalRoot
+                        + " does not match target schema field type "
+                        + fieldRoot
+                        + ".");
+    }
+
+    private static boolean isCharacterString(DataTypeRoot root) {
+        return root == DataTypeRoot.CHAR || root == DataTypeRoot.STRING;
+    }
+
+    private static boolean isBinaryString(DataTypeRoot root) {
+        return root == DataTypeRoot.BINARY || root == DataTypeRoot.BYTES;
+    }
+
     // -------------------------------------------------------------------------
     //  Serialization: Predicate -> PbPredicate
     // -------------------------------------------------------------------------
 
-    public static PbPredicate toPbPredicate(Predicate predicate) {
+    public static PbPredicate toPbPredicate(Predicate predicate, RowType rowType) {
         return predicate.visit(
                 new PredicateVisitor<PbPredicate>() {
                     @Override
                     public PbPredicate visit(LeafPredicate predicate) {
-                        PbFieldRef fieldRef = new PbFieldRef();
-                        fieldRef.setDataType(toPbDataType(predicate.type()));
-                        fieldRef.setFieldIndex(predicate.index());
-                        fieldRef.setFieldName(predicate.fieldName());
-
+                        DataField field = resolveSourceField(predicate, rowType);
+                        if (field.getFieldId() < 0) {
+                            throw new IllegalArgumentException(
+                                    "Field "
+                                            + field.getName()
+                                            + " at index "
+                                            + predicate.index()
+                                            + " does not have a valid field id.");
+                        }
                         PbLeafPredicate pbLeaf = new PbLeafPredicate();
                         pbLeaf.setFunction(
                                 LeafFunctionCode.fromFunction(predicate.function()).getValue());
-                        pbLeaf.setFieldRef(fieldRef);
+                        pbLeaf.setFieldId(field.getFieldId());
 
                         List<PbLiteralValue> literals = new ArrayList<>();
                         for (Object literal : predicate.literals()) {
-                            literals.add(toPbLiteralValue(predicate.type(), literal));
+                            literals.add(toPbLiteralValue(field.getType(), literal));
                         }
                         pbLeaf.addAllLiterals(literals);
 
@@ -253,7 +233,7 @@ public class PredicateMessageUtils {
                                 CompoundFunctionCode.fromFunction(predicate.function()).getValue());
                         pbCompound.addAllChildrens(
                                 predicate.children().stream()
-                                        .map(PredicateMessageUtils::toPbPredicate)
+                                        .map(child -> toPbPredicate(child, rowType))
                                         .collect(Collectors.toList()));
 
                         PbPredicate pbPredicate = new PbPredicate();
@@ -264,32 +244,9 @@ public class PredicateMessageUtils {
                 });
     }
 
-    private static PbDataType toPbDataType(DataType dataType) {
-        PbDataType pbDataType = new PbDataType();
-        pbDataType.setNullable(dataType.isNullable());
-        pbDataType.setRoot(DataTypeRootCode.fromDataTypeRoot(dataType.getTypeRoot()).getValue());
-
-        // Set type-specific parameters
-        if (dataType instanceof CharType) {
-            pbDataType.setLength(((CharType) dataType).getLength());
-        } else if (dataType instanceof DecimalType) {
-            pbDataType.setPrecision(((DecimalType) dataType).getPrecision());
-            pbDataType.setScale(((DecimalType) dataType).getScale());
-        } else if (dataType instanceof TimeType) {
-            pbDataType.setPrecision(((TimeType) dataType).getPrecision());
-        } else if (dataType instanceof TimestampType) {
-            pbDataType.setPrecision(((TimestampType) dataType).getPrecision());
-        } else if (dataType instanceof LocalZonedTimestampType) {
-            pbDataType.setPrecision(((LocalZonedTimestampType) dataType).getPrecision());
-        } else if (dataType instanceof BinaryType) {
-            pbDataType.setLength(((BinaryType) dataType).getLength());
-        }
-        return pbDataType;
-    }
-
     private static PbLiteralValue toPbLiteralValue(DataType type, Object literal) {
         PbLiteralValue pbLiteral = new PbLiteralValue();
-        pbLiteral.setType(toPbDataType(type));
+        pbLiteral.setLiteralType(DataTypeRootCode.fromDataTypeRoot(type.getTypeRoot()).getValue());
         if (literal == null) {
             pbLiteral.setIsNull(true);
             return pbLiteral;
@@ -355,6 +312,51 @@ public class PredicateMessageUtils {
         return pbLiteral;
     }
 
+    private static DataField resolveSourceField(LeafPredicate predicate, RowType rowType) {
+        if (predicate.index() < 0 || predicate.index() >= rowType.getFieldCount()) {
+            throw new IllegalArgumentException(
+                    "Predicate field index "
+                            + predicate.index()
+                            + " is out of bounds for row type with "
+                            + rowType.getFieldCount()
+                            + " fields.");
+        }
+        DataField field = rowType.getFields().get(predicate.index());
+        if (!field.getName().equals(predicate.fieldName())) {
+            throw new IllegalArgumentException(
+                    "Predicate field name "
+                            + predicate.fieldName()
+                            + " does not match schema field "
+                            + field.getName()
+                            + " at index "
+                            + predicate.index()
+                            + ".");
+        }
+        if (!field.getType().equals(predicate.type())) {
+            throw new IllegalArgumentException(
+                    "Predicate field type "
+                            + predicate.type()
+                            + " does not match schema field type "
+                            + field.getType()
+                            + " for field "
+                            + field.getName()
+                            + ".");
+        }
+        return field;
+    }
+
+    private static ResolvedField resolveField(RowType rowType, int fieldId) {
+        List<DataField> fields = rowType.getFields();
+        for (int i = 0; i < fields.size(); i++) {
+            DataField field = fields.get(i);
+            if (field.getFieldId() == fieldId) {
+                return new ResolvedField(i, field);
+            }
+        }
+        throw new IllegalArgumentException(
+                "Cannot resolve field id " + fieldId + " from row type.");
+    }
+
     // -------------------------------------------------------------------------
     //  Proto int32 <-> domain object mapping enums
     // -------------------------------------------------------------------------
@@ -365,11 +367,11 @@ public class PredicateMessageUtils {
         COMPOUND(1);
 
         private final int value;
-        private static final Map<Integer, PredicateType> VALUE_MAP = new HashMap<>();
+        private static final PredicateType[] VALUES = new PredicateType[2];
 
         static {
             for (PredicateType t : values()) {
-                VALUE_MAP.put(t.value, t);
+                VALUES[t.value] = t;
             }
         }
 
@@ -382,11 +384,10 @@ public class PredicateMessageUtils {
         }
 
         static PredicateType fromValue(int value) {
-            PredicateType t = VALUE_MAP.get(value);
-            if (t == null) {
+            if (value < 0 || value >= VALUES.length) {
                 throw new IllegalArgumentException("Unknown predicate type: " + value);
             }
-            return t;
+            return VALUES[value];
         }
     }
 
@@ -408,13 +409,13 @@ public class PredicateMessageUtils {
 
         private final int value;
         private final LeafFunction function;
-        private static final Map<Integer, LeafFunctionCode> VALUE_MAP = new HashMap<>();
+        private static final LeafFunctionCode[] VALUES = new LeafFunctionCode[13];
         private static final Map<Class<? extends LeafFunction>, LeafFunctionCode> FUNCTION_MAP =
                 new HashMap<>();
 
         static {
             for (LeafFunctionCode c : values()) {
-                VALUE_MAP.put(c.value, c);
+                VALUES[c.value] = c;
                 FUNCTION_MAP.put(c.function.getClass(), c);
             }
         }
@@ -433,11 +434,10 @@ public class PredicateMessageUtils {
         }
 
         static LeafFunctionCode fromValue(int value) {
-            LeafFunctionCode c = VALUE_MAP.get(value);
-            if (c == null) {
+            if (value < 0 || value >= VALUES.length) {
                 throw new IllegalArgumentException("Unknown leaf function: " + value);
             }
-            return c;
+            return VALUES[value];
         }
 
         static LeafFunctionCode fromFunction(LeafFunction function) {
@@ -456,13 +456,13 @@ public class PredicateMessageUtils {
 
         private final int value;
         private final CompoundPredicate.Function function;
-        private static final Map<Integer, CompoundFunctionCode> VALUE_MAP = new HashMap<>();
+        private static final CompoundFunctionCode[] VALUES = new CompoundFunctionCode[2];
         private static final Map<Class<? extends CompoundPredicate.Function>, CompoundFunctionCode>
                 FUNCTION_MAP = new HashMap<>();
 
         static {
             for (CompoundFunctionCode c : values()) {
-                VALUE_MAP.put(c.value, c);
+                VALUES[c.value] = c;
                 FUNCTION_MAP.put(c.function.getClass(), c);
             }
         }
@@ -481,11 +481,10 @@ public class PredicateMessageUtils {
         }
 
         static CompoundFunctionCode fromValue(int value) {
-            CompoundFunctionCode c = VALUE_MAP.get(value);
-            if (c == null) {
+            if (value < 0 || value >= VALUES.length) {
                 throw new IllegalArgumentException("Unknown compound function: " + value);
             }
-            return c;
+            return VALUES[value];
         }
 
         static CompoundFunctionCode fromFunction(CompoundPredicate.Function function) {
@@ -498,7 +497,7 @@ public class PredicateMessageUtils {
     }
 
     /**
-     * Maps PbDataType.root int32 values to {@link DataTypeRoot}.
+     * Maps PbLiteralValue.literal_type int32 values to {@link DataTypeRoot}.
      *
      * <p>Note: proto uses INT/VARCHAR while the domain model uses INTEGER/STRING.
      */
@@ -522,12 +521,12 @@ public class PredicateMessageUtils {
 
         private final int value;
         private final DataTypeRoot dataTypeRoot;
-        private static final Map<Integer, DataTypeRootCode> VALUE_MAP = new HashMap<>();
+        private static final DataTypeRootCode[] VALUES = new DataTypeRootCode[16];
         private static final Map<DataTypeRoot, DataTypeRootCode> ROOT_MAP = new HashMap<>();
 
         static {
             for (DataTypeRootCode c : values()) {
-                VALUE_MAP.put(c.value, c);
+                VALUES[c.value] = c;
                 ROOT_MAP.put(c.dataTypeRoot, c);
             }
         }
@@ -546,11 +545,10 @@ public class PredicateMessageUtils {
         }
 
         static DataTypeRootCode fromValue(int value) {
-            DataTypeRootCode c = VALUE_MAP.get(value);
-            if (c == null) {
+            if (value < 0 || value >= VALUES.length) {
                 throw new IllegalArgumentException("Unknown data type root: " + value);
             }
-            return c;
+            return VALUES[value];
         }
 
         static DataTypeRootCode fromDataTypeRoot(DataTypeRoot root) {
@@ -559,6 +557,16 @@ public class PredicateMessageUtils {
                 throw new IllegalArgumentException("Unknown data type root: " + root);
             }
             return c;
+        }
+    }
+
+    private static final class ResolvedField {
+        private final int index;
+        private final DataField field;
+
+        private ResolvedField(int index, DataField field) {
+            this.index = index;
+            this.field = field;
         }
     }
 }

@@ -37,6 +37,7 @@ import org.apache.fluss.types.BinaryType;
 import org.apache.fluss.types.BooleanType;
 import org.apache.fluss.types.BytesType;
 import org.apache.fluss.types.CharType;
+import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DateType;
 import org.apache.fluss.types.DecimalType;
@@ -44,6 +45,7 @@ import org.apache.fluss.types.DoubleType;
 import org.apache.fluss.types.FloatType;
 import org.apache.fluss.types.IntType;
 import org.apache.fluss.types.LocalZonedTimestampType;
+import org.apache.fluss.types.RowType;
 import org.apache.fluss.types.SmallIntType;
 import org.apache.fluss.types.StringType;
 import org.apache.fluss.types.TimeType;
@@ -52,6 +54,7 @@ import org.apache.fluss.types.TinyIntType;
 
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -60,18 +63,47 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** PredicateMessageUtilsTest. */
 public class PredicateMessageUtilsTest {
+
+    /**
+     * Builds a RowType that covers all field indices used by the given predicates. Positions not
+     * covered by any predicate are filled with a nullable IntType placeholder. Each field gets a
+     * stable, non-ordinal field id so tests validate field-id based serialization.
+     */
+    private static RowType buildRowType(List<LeafPredicate> predicates) {
+        int maxIndex = 0;
+        for (LeafPredicate p : predicates) {
+            if (p.index() > maxIndex) {
+                maxIndex = p.index();
+            }
+        }
+        DataField[] fields = new DataField[maxIndex + 1];
+        for (int i = 0; i <= maxIndex; i++) {
+            fields[i] = new DataField("_placeholder_" + i, new IntType(true), 100 + i * 10);
+        }
+        for (LeafPredicate p : predicates) {
+            fields[p.index()] = new DataField(p.fieldName(), p.type(), 100 + p.index() * 10);
+        }
+        return new RowType(Arrays.asList(fields));
+    }
+
+    private static RowType buildRowType(LeafPredicate... predicates) {
+        return buildRowType(Arrays.asList(predicates));
+    }
 
     @Test
     public void testLeafPredicateIntEqual() {
         DataType type = new IntType(false);
         LeafPredicate predicate =
                 new LeafPredicate(Equal.INSTANCE, type, 0, "id", Collections.singletonList(123));
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+        RowType rowType = buildRowType(predicate);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        assertThat(pb.getLeaf().getFieldId()).isEqualTo(rowType.getFields().get(0).getFieldId());
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(LeafPredicate.class);
         LeafPredicate lp = (LeafPredicate) result;
         assertThat(lp.function()).isEqualTo(Equal.INSTANCE);
@@ -88,9 +120,10 @@ public class PredicateMessageUtilsTest {
                         BinaryString.fromString("bar"),
                         BinaryString.fromString("baz"));
         LeafPredicate predicate = new LeafPredicate(In.INSTANCE, type, 1, "name", values);
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+        RowType rowType = buildRowType(predicate);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(LeafPredicate.class);
         LeafPredicate lp = (LeafPredicate) result;
         assertThat(lp.function()).isEqualTo(In.INSTANCE);
@@ -103,9 +136,10 @@ public class PredicateMessageUtilsTest {
         DataType type = new IntType(true);
         LeafPredicate predicate =
                 new LeafPredicate(IsNull.INSTANCE, type, 2, "age", Collections.emptyList());
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+        RowType rowType = buildRowType(predicate);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(LeafPredicate.class);
         LeafPredicate lp = (LeafPredicate) result;
         assertThat(lp.function()).isEqualTo(IsNull.INSTANCE);
@@ -119,14 +153,19 @@ public class PredicateMessageUtilsTest {
         LeafPredicate predicate =
                 new LeafPredicate(
                         Equal.INSTANCE, type, 3, "amount", Collections.singletonList(decimal));
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+        RowType rowType = buildRowType(predicate);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(LeafPredicate.class);
         LeafPredicate lp = (LeafPredicate) result;
         assertThat(lp.function()).isEqualTo(Equal.INSTANCE);
-
         assertThat(lp.fieldName()).isEqualTo("amount");
+        assertThat(lp.literals()).hasSize(1);
+        assertThat(((Decimal) lp.literals().get(0)).toBigDecimal())
+                .isEqualByComparingTo(decimal.toBigDecimal());
+        assertThat(((Decimal) lp.literals().get(0)).precision()).isEqualTo(decimal.precision());
+        assertThat(((Decimal) lp.literals().get(0)).scale()).isEqualTo(decimal.scale());
     }
 
     @Test
@@ -136,13 +175,19 @@ public class PredicateMessageUtilsTest {
         LeafPredicate predicate =
                 new LeafPredicate(
                         GreaterThan.INSTANCE, type, 4, "ts", Collections.singletonList(ts));
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+        RowType rowType = buildRowType(predicate);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(LeafPredicate.class);
         LeafPredicate lp = (LeafPredicate) result;
         assertThat(lp.function()).isEqualTo(GreaterThan.INSTANCE);
         assertThat(lp.fieldName()).isEqualTo("ts");
+        assertThat(lp.literals()).hasSize(1);
+        assertThat(((TimestampNtz) lp.literals().get(0)).getMillisecond())
+                .isEqualTo(ts.getMillisecond());
+        assertThat(((TimestampNtz) lp.literals().get(0)).getNanoOfMillisecond())
+                .isEqualTo(ts.getNanoOfMillisecond());
     }
 
     @Test
@@ -150,9 +195,10 @@ public class PredicateMessageUtilsTest {
         DataType type = new BooleanType(false);
         LeafPredicate predicate =
                 new LeafPredicate(Equal.INSTANCE, type, 5, "flag", Collections.singletonList(true));
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+        RowType rowType = buildRowType(predicate);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(LeafPredicate.class);
         LeafPredicate lp = (LeafPredicate) result;
         assertThat(lp.function()).isEqualTo(Equal.INSTANCE);
@@ -169,9 +215,10 @@ public class PredicateMessageUtilsTest {
         LeafPredicate p2 =
                 new LeafPredicate(LessThan.INSTANCE, type, 0, "id", Collections.singletonList(100));
         CompoundPredicate andPredicate = new CompoundPredicate(And.INSTANCE, Arrays.asList(p1, p2));
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(andPredicate);
+        RowType rowType = buildRowType(p1, p2);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(andPredicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(CompoundPredicate.class);
         CompoundPredicate cp = (CompoundPredicate) result;
         assertThat(cp.function()).isEqualTo(And.INSTANCE);
@@ -190,9 +237,10 @@ public class PredicateMessageUtilsTest {
         CompoundPredicate orPredicate = new CompoundPredicate(Or.INSTANCE, Arrays.asList(p1, p2));
         CompoundPredicate andPredicate =
                 new CompoundPredicate(And.INSTANCE, Arrays.asList(orPredicate, p1));
-        PbPredicate pb = PredicateMessageUtils.toPbPredicate(andPredicate);
+        RowType rowType = buildRowType(p1, p2);
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(andPredicate, rowType);
         assertThat(pb.totalSize()).isGreaterThan(0);
-        Predicate result = PredicateMessageUtils.toPredicate(pb);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
         assertThat(result).isInstanceOf(CompoundPredicate.class);
         CompoundPredicate cp = (CompoundPredicate) result;
         assertThat(cp.function()).isEqualTo(And.INSTANCE);
@@ -352,10 +400,13 @@ public class PredicateMessageUtilsTest {
                         bytesPredicate,
                         tinyIntPredicate,
                         smallIntPredicate);
+        RowType rowType = buildRowType(predicates);
         for (LeafPredicate predicate : predicates) {
-            PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+            PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
             assertThat(pb.totalSize()).isGreaterThan(0);
-            Predicate result = PredicateMessageUtils.toPredicate(pb);
+            assertThat(pb.getLeaf().getFieldId())
+                    .isEqualTo(rowType.getFields().get(predicate.index()).getFieldId());
+            Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
             assertThat(result).isInstanceOf(LeafPredicate.class);
             LeafPredicate lp = (LeafPredicate) result;
             assertThat(lp.function()).isEqualTo(predicate.function());
@@ -501,10 +552,11 @@ public class PredicateMessageUtilsTest {
                                 "f_smallint_null",
                                 Collections.singletonList(null)));
 
+        RowType rowType = buildRowType(nullPredicates);
         for (LeafPredicate predicate : nullPredicates) {
-            PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate);
+            PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
             assertThat(pb.totalSize()).isGreaterThan(0);
-            Predicate result = PredicateMessageUtils.toPredicate(pb);
+            Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
             assertThat(result).isInstanceOf(LeafPredicate.class);
             LeafPredicate lp = (LeafPredicate) result;
             assertThat(lp.function()).isEqualTo(predicate.function());
@@ -513,5 +565,217 @@ public class PredicateMessageUtilsTest {
             assertThat(lp.type().getClass()).isEqualTo(predicate.type().getClass());
             assertThat(lp.literals().get(0)).isNull();
         }
+    }
+
+    @Test
+    public void testSerializeUsesSchemaFieldIdInsteadOfIndex() {
+        RowType rowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("payload", new StringType(true), 6),
+                                new DataField("ts", new TimestampType(false, 3), 9)));
+        LeafPredicate predicate =
+                new LeafPredicate(
+                        Equal.INSTANCE,
+                        rowType.getTypeAt(1),
+                        1,
+                        "payload",
+                        Collections.singletonList(BinaryString.fromString("foo")));
+
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, rowType);
+
+        assertThat(pb.getLeaf().getFieldId()).isEqualTo(6);
+        Predicate result = PredicateMessageUtils.toPredicate(pb, rowType);
+        LeafPredicate leafPredicate = (LeafPredicate) result;
+        assertThat(leafPredicate.index()).isEqualTo(1);
+        assertThat(leafPredicate.fieldName()).isEqualTo("payload");
+    }
+
+    @Test
+    public void testDeserializeResolvesByFieldIdAcrossSchemaEvolution() {
+        RowType originalRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("name", new StringType(true), 6),
+                                new DataField("score", new BigIntType(true), 9)));
+        LeafPredicate predicate =
+                new LeafPredicate(
+                        Equal.INSTANCE,
+                        originalRowType.getTypeAt(1),
+                        1,
+                        "name",
+                        Collections.singletonList(BinaryString.fromString("Alice")));
+
+        PbPredicate pb = PredicateMessageUtils.toPbPredicate(predicate, originalRowType);
+
+        RowType evolvedRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("age", new IntType(true), 3),
+                                new DataField("full_name", new StringType(true), 6),
+                                new DataField("score", new BigIntType(true), 9)));
+
+        Predicate result = PredicateMessageUtils.toPredicate(pb, evolvedRowType);
+
+        assertThat(result).isInstanceOf(LeafPredicate.class);
+        LeafPredicate leafPredicate = (LeafPredicate) result;
+        assertThat(leafPredicate.index()).isEqualTo(2);
+        assertThat(leafPredicate.fieldName()).isEqualTo("full_name");
+        assertThat(leafPredicate.type()).isEqualTo(evolvedRowType.getTypeAt(2));
+        assertThat(leafPredicate.literals()).containsExactly(BinaryString.fromString("Alice"));
+    }
+
+    @Test
+    public void testRoundTripAcrossSchemaEvolutionUsesFieldIdAsStableAnchor() {
+        RowType sourceRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("name", new StringType(true), 6),
+                                new DataField("score", new BigIntType(true), 9)));
+        LeafPredicate predicate =
+                new LeafPredicate(
+                        Equal.INSTANCE,
+                        sourceRowType.getTypeAt(1),
+                        1,
+                        "name",
+                        Collections.singletonList(BinaryString.fromString("Bob")));
+
+        PbPredicate pbPredicate = PredicateMessageUtils.toPbPredicate(predicate, sourceRowType);
+
+        RowType targetRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("score", new BigIntType(true), 9),
+                                new DataField("age", new IntType(true), 3),
+                                new DataField("customer_name", new StringType(true), 6),
+                                new DataField("id", new IntType(false), 0)));
+
+        LeafPredicate restored =
+                (LeafPredicate) PredicateMessageUtils.toPredicate(pbPredicate, targetRowType);
+
+        assertThat(pbPredicate.getLeaf().getFieldId()).isEqualTo(6);
+        assertThat(restored.index()).isEqualTo(2);
+        assertThat(restored.fieldName()).isEqualTo("customer_name");
+        assertThat(restored.type()).isEqualTo(targetRowType.getTypeAt(2));
+        assertThat(restored.literals()).containsExactly(BinaryString.fromString("Bob"));
+    }
+
+    @Test
+    public void testDeserializeRejectsIncompatibleEvolvedFieldTypeForSameFieldId() {
+        RowType sourceRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("name", new StringType(true), 6)));
+        LeafPredicate predicate =
+                new LeafPredicate(
+                        Equal.INSTANCE,
+                        sourceRowType.getTypeAt(1),
+                        1,
+                        "name",
+                        Collections.singletonList(BinaryString.fromString("Alice")));
+
+        PbPredicate pbPredicate = PredicateMessageUtils.toPbPredicate(predicate, sourceRowType);
+
+        RowType targetRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("name_as_bigint", new BigIntType(true), 6)));
+
+        assertThatThrownBy(() -> PredicateMessageUtils.toPredicate(pbPredicate, targetRowType))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match target schema field type");
+    }
+
+    @Test
+    public void testDeserializeRejectsMissingFieldIdInTargetSchema() {
+        RowType sourceRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("name", new StringType(true), 6)));
+        LeafPredicate predicate =
+                new LeafPredicate(
+                        Equal.INSTANCE,
+                        sourceRowType.getTypeAt(1),
+                        1,
+                        "name",
+                        Collections.singletonList(BinaryString.fromString("Alice")));
+
+        PbPredicate pbPredicate = PredicateMessageUtils.toPbPredicate(predicate, sourceRowType);
+
+        RowType targetRowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("age", new IntType(true), 3)));
+
+        assertThatThrownBy(() -> PredicateMessageUtils.toPredicate(pbPredicate, targetRowType))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Cannot resolve field id 6");
+    }
+
+    @Test
+    public void testSerializeRequiresSchemaFieldId() {
+        RowType rowType =
+                new RowType(Collections.singletonList(new DataField("id", new IntType(false))));
+        LeafPredicate predicate =
+                new LeafPredicate(
+                        Equal.INSTANCE, new IntType(false), 0, "id", Collections.singletonList(1));
+
+        assertThatThrownBy(() -> PredicateMessageUtils.toPbPredicate(predicate, rowType))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not have a valid field id");
+    }
+
+    @Test
+    public void testSerializeRejectsSchemaMismatch() {
+        RowType rowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField("id", new IntType(false), 0),
+                                new DataField("payload", new StringType(true), 6)));
+        LeafPredicate wrongNamePredicate =
+                new LeafPredicate(
+                        Equal.INSTANCE,
+                        rowType.getTypeAt(1),
+                        1,
+                        "wrong_payload",
+                        Collections.singletonList(BinaryString.fromString("foo")));
+        LeafPredicate wrongTypePredicate =
+                new LeafPredicate(
+                        Equal.INSTANCE,
+                        new IntType(true),
+                        1,
+                        "payload",
+                        Collections.singletonList(1));
+
+        assertThatThrownBy(() -> PredicateMessageUtils.toPbPredicate(wrongNamePredicate, rowType))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match schema field");
+        assertThatThrownBy(() -> PredicateMessageUtils.toPbPredicate(wrongTypePredicate, rowType))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match schema field type");
+    }
+
+    @Test
+    public void testTimestampLiteralFieldNumbersFollowReviewerLayout() throws Exception {
+        assertThat(getPbLiteralValueFieldNumber("_TIMESTAMP_MILLIS_VALUE_FIELD_NUMBER"))
+                .isEqualTo(11);
+        assertThat(getPbLiteralValueFieldNumber("_TIMESTAMP_NANO_OF_MILLIS_VALUE_FIELD_NUMBER"))
+                .isEqualTo(12);
+        assertThat(getPbLiteralValueFieldNumber("_DECIMAL_BYTES_FIELD_NUMBER")).isEqualTo(13);
+    }
+
+    private static int getPbLiteralValueFieldNumber(String fieldName) throws Exception {
+        Field field =
+                org.apache.fluss.rpc.messages.PbLiteralValue.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.getInt(null);
     }
 }
