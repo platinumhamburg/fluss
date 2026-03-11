@@ -84,6 +84,7 @@ class IndexFetcherTarget {
     private volatile int failureCount = 0;
     @Nullable private volatile String lastFailureReason;
     private volatile int lastKnownLeaderServerId = INVALID_LEADER_ID;
+    private volatile long lastSuccessfulFetchTimestamp = -1L;
 
     // ==================== Constructor ====================
 
@@ -135,6 +136,10 @@ class IndexFetcherTarget {
         return lastKnownLeaderServerId;
     }
 
+    long getLastSuccessfulFetchTimestamp() {
+        return lastSuccessfulFetchTimestamp;
+    }
+
     // ==================== State Transitions ====================
 
     void setState(State state) {
@@ -148,6 +153,11 @@ class IndexFetcherTarget {
 
     void setLastKnownLeaderServerId(int serverId) {
         this.lastKnownLeaderServerId = serverId;
+    }
+
+    /** Records a successful fetch timestamp for staleness detection. */
+    void recordSuccessfulFetch(long timestamp) {
+        this.lastSuccessfulFetchTimestamp = timestamp;
     }
 
     /**

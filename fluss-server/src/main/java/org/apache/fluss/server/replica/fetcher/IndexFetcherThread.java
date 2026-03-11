@@ -51,6 +51,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -62,6 +63,7 @@ import java.util.function.Predicate;
 import static org.apache.fluss.config.ConfigOptions.INDEX_REPLICA_FETCH_MAX_BYTES;
 import static org.apache.fluss.config.ConfigOptions.INDEX_REPLICA_FETCH_MIN_ADVANCE_OFFSET;
 import static org.apache.fluss.config.ConfigOptions.INDEX_REPLICA_FETCH_WAIT_MAX_TIME;
+import static org.apache.fluss.utils.MapUtils.newConcurrentHashMap;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
@@ -104,6 +106,14 @@ final class IndexFetcherThread extends ShutdownableThread {
 
     private final TabletServerMetricGroup serverMetricGroup;
 
+    /**
+     * Tracks the last successful fetch timestamp per data-index bucket. This is used by
+     * IndexFetcherManager to protect recently-successful fetchers from being killed due to stale
+     * metadata cache. Uses ConcurrentHashMap for lock-free reads from the manager thread.
+     */
+    private final ConcurrentHashMap<DataIndexTableBucket, Long> lastSuccessfulFetchTimestamps =
+            newConcurrentHashMap();
+
     public IndexFetcherThread(
             String name,
             ReplicaManager replicaManager,
@@ -126,6 +136,14 @@ final class IndexFetcherThread extends ShutdownableThread {
 
     public int getBucketCount() {
         return fairIndexBucketStatusMap.size();
+    }
+
+    /**
+     * Returns the last successful fetch timestamp for a given data-index bucket, or -1 if no
+     * successful fetch has been recorded.
+     */
+    public long getLastSuccessfulFetchTimestamp(DataIndexTableBucket bucket) {
+        return lastSuccessfulFetchTimestamps.getOrDefault(bucket, -1L);
     }
 
     /**
@@ -555,6 +573,8 @@ final class IndexFetcherThread extends ShutdownableThread {
                 serverMetricGroup.replicationBytesIn().inc(indexRecords.sizeInBytes());
             }
             fairIndexBucketStatusMap.moveToEnd(dataIndexBucket);
+            // Record successful fetch timestamp for staleness detection by manager
+            lastSuccessfulFetchTimestamps.put(dataIndexBucket, System.currentTimeMillis());
             // Remove this redundant log as it duplicates information already logged above
         } catch (IndexOutOfBoundsException e) {
             LOG.error(

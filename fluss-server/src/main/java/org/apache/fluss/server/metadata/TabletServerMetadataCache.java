@@ -429,6 +429,102 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
         return Optional.of(mainTableInfo);
     }
 
+    /**
+     * Invalidate the cached leader for a specific bucket by setting its leader to -1
+     * (INVALID_LEADER_ID). This is used when a fetch failure indicates the cached leader is stale,
+     * forcing the next leader query to fall back to ZooKeeper.
+     *
+     * <p>Only the specified bucket's leader is affected; all other bucket metadata remains
+     * unchanged.
+     *
+     * @param tableBucket the bucket whose cached leader should be invalidated
+     */
+    public void invalidateBucketLeader(TableBucket tableBucket) {
+        inLock(
+                metadataLock,
+                () -> {
+                    ServerMetadataSnapshot currentSnapshot = serverMetadataSnapshot;
+
+                    // Determine which bucket metadata map to modify
+                    boolean isPartitioned = tableBucket.getPartitionId() != null;
+                    Map<Long, Map<Integer, BucketMetadata>> sourceMap =
+                            isPartitioned
+                                    ? currentSnapshot.getBucketMetadataMapForPartitions()
+                                    : currentSnapshot.getBucketMetadataMapForTables();
+
+                    long key =
+                            isPartitioned ? tableBucket.getPartitionId() : tableBucket.getTableId();
+                    int bucketId = tableBucket.getBucket();
+
+                    Map<Integer, BucketMetadata> bucketMap = sourceMap.get(key);
+                    if (bucketMap == null) {
+                        return;
+                    }
+                    BucketMetadata existing = bucketMap.get(bucketId);
+                    if (existing == null) {
+                        return;
+                    }
+
+                    // Create a new BucketMetadata with leader set to -1
+                    BucketMetadata invalidated =
+                            new BucketMetadata(
+                                    existing.getBucketId(),
+                                    -1,
+                                    existing.getLeaderEpoch().isPresent()
+                                            ? existing.getLeaderEpoch().getAsInt()
+                                            : null,
+                                    existing.getReplicas());
+
+                    // Clone the map and replace the entry
+                    Map<Long, Map<Integer, BucketMetadata>> newMap = new HashMap<>(sourceMap);
+                    Map<Integer, BucketMetadata> newBucketMap = new HashMap<>(bucketMap);
+                    newBucketMap.put(bucketId, invalidated);
+                    newMap.put(key, newBucketMap);
+
+                    // Build new snapshot with only the affected map changed
+                    if (isPartitioned) {
+                        serverMetadataSnapshot =
+                                new ServerMetadataSnapshot(
+                                        currentSnapshot.getCoordinatorServer(),
+                                        currentSnapshot.getAliveTabletServers(),
+                                        currentSnapshot.getTableIdByPath(),
+                                        new HashMap<Long, TablePath>() {
+                                            {
+                                                currentSnapshot
+                                                        .getTableIdByPath()
+                                                        .forEach((path, id) -> put(id, path));
+                                            }
+                                        },
+                                        currentSnapshot.getPartitionIdByPath(),
+                                        currentSnapshot.getBucketMetadataMapForTables(),
+                                        newMap);
+                    } else {
+                        serverMetadataSnapshot =
+                                new ServerMetadataSnapshot(
+                                        currentSnapshot.getCoordinatorServer(),
+                                        currentSnapshot.getAliveTabletServers(),
+                                        currentSnapshot.getTableIdByPath(),
+                                        new HashMap<Long, TablePath>() {
+                                            {
+                                                currentSnapshot
+                                                        .getTableIdByPath()
+                                                        .forEach((path, id) -> put(id, path));
+                                            }
+                                        },
+                                        currentSnapshot.getPartitionIdByPath(),
+                                        newMap,
+                                        currentSnapshot.getBucketMetadataMapForPartitions());
+                    }
+
+                    LOG.info(
+                            "Invalidated cached leader for {} (was {})",
+                            tableBucket,
+                            existing.getLeaderId().isPresent()
+                                    ? existing.getLeaderId().getAsInt()
+                                    : "none");
+                });
+    }
+
     @VisibleForTesting
     public void clearTableMetadata() {
         inLock(

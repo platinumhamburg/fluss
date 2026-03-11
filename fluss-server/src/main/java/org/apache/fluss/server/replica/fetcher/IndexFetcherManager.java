@@ -446,11 +446,41 @@ public class IndexFetcherManager {
                 if (target != null) {
                     target.markFailed(reason, now);
                     LOG.info("Target {} failed: {}", bucket, reason);
+
+                    // Invalidate stale cached leader on connection failures so the next
+                    // retry falls back to ZooKeeper instead of reusing the bad entry.
+                    if (isConnectionFailure(reason)) {
+                        metadataCache.invalidateBucketLeader(target.getDataBucket());
+                        LOG.info(
+                                "Invalidated cached leader for {} due to fetch failure: {}",
+                                target.getDataBucket(),
+                                reason);
+                    }
+
                     count++;
                 }
             }
         }
         return count;
+    }
+
+    /**
+     * Determines whether a failure reason indicates a connection-level problem (e.g. the target
+     * server is unreachable or no longer alive), as opposed to a logical error. Connection failures
+     * mean the cached leader is likely stale and should be invalidated.
+     */
+    private static boolean isConnectionFailure(String reason) {
+        if (reason == null) {
+            return false;
+        }
+        String lower = reason.toLowerCase();
+        return lower.contains("not in cache")
+                || lower.contains("connection")
+                || lower.contains("unreachable")
+                || lower.contains("dead server")
+                || lower.contains("refused")
+                || lower.contains("timeout")
+                || lower.contains("disconnected");
     }
 
     /** Classifies all targets and prepares creation actions. */
@@ -526,6 +556,18 @@ public class IndexFetcherManager {
             return;
         }
 
+        // Sync successful fetch timestamp from the fetcher thread into the target
+        ServerIdAndFetcherId fetcherId = bucketToFetcher.get(target.getDataIndexTableBucket());
+        if (fetcherId != null) {
+            IndexFetcherThread thread = fetcherThreads.get(fetcherId);
+            if (thread != null) {
+                long ts = thread.getLastSuccessfulFetchTimestamp(target.getDataIndexTableBucket());
+                if (ts > target.getLastSuccessfulFetchTimestamp()) {
+                    target.recordSuccessfulFetch(ts);
+                }
+            }
+        }
+
         // Check if the server bound to this target is still alive in the server node cache.
         // This detects node crashes before the metadata cache is updated.
         if (!serverNodeCache.apply(lastLeader).isPresent()) {
@@ -546,6 +588,27 @@ public class IndexFetcherManager {
             target.markFailed("Leader unavailable in cache", now);
             removeFromFetcher(target.getDataIndexTableBucket());
         } else if (leaderIdOpt.get() != lastLeader) {
+            int newLeader = leaderIdOpt.get();
+
+            // Validation 1: new leader not in alive server list → ignore dirty cache
+            if (!serverNodeCache.apply(newLeader).isPresent()) {
+                LOG.warn(
+                        "Cache reports leader change for {} to dead server {}, ignoring",
+                        target.getDataBucket(),
+                        newLeader);
+                return;
+            }
+
+            // Validation 2: current fetcher recently successful → don't kill
+            long timeSinceLastSuccess = now - target.getLastSuccessfulFetchTimestamp();
+            if (timeSinceLastSuccess < RECONCILIATION_INTERVAL_MS * 2) {
+                LOG.debug(
+                        "Ignoring cache leader change for {} — fetcher recently successful ({}ms ago)",
+                        target.getDataBucket(),
+                        timeSinceLastSuccess);
+                return;
+            }
+
             LOG.info(
                     "Leader changed for {} ({} -> {}), marking failed",
                     target.getDataBucket(),
@@ -634,7 +697,9 @@ public class IndexFetcherManager {
             // For failed targets, try cache first, then ZK if same leader or not found
             leaderIdOpt = metadataCache.getBucketLeaderId(target.getDataBucket());
             if (!leaderIdOpt.isPresent()
-                    || leaderIdOpt.get() == target.getLastKnownLeaderServerId()) {
+                    || leaderIdOpt.get() == target.getLastKnownLeaderServerId()
+                    || !serverNodeCache.apply(leaderIdOpt.get()).isPresent()
+                    || target.getFailureCount() >= 2) {
                 // Query ZK directly for fresh leader info
                 try {
                     leaderIdOpt =

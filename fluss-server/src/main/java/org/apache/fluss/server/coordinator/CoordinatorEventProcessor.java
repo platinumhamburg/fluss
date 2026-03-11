@@ -1112,6 +1112,25 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
         // update tabletServer metadata cache by send updateMetadata request.
         updateTabletServerMetadataCache(serverInfos, null, null, bucketsWithOfflineLeader);
+
+        // Retry UpdateMetadata for servers that failed to receive it.
+        // The gateway-not-present failures are reported synchronously, so they are already
+        // tracked by the time we reach here.
+        Set<Integer> failedServers = coordinatorRequestBatch.drainFailedUpdateMetadataServers();
+        if (!failedServers.isEmpty()) {
+            // Only retry for servers that are still alive.
+            Set<ServerInfo> retryServerInfos =
+                    serverInfos.stream()
+                            .filter(s -> failedServers.contains(s.id()))
+                            .collect(Collectors.toSet());
+            if (!retryServerInfos.isEmpty()) {
+                LOG.info(
+                        "Retrying UpdateMetadata for servers that failed in previous attempt: {}",
+                        retryServerInfos.stream().map(ServerInfo::id).collect(Collectors.toList()));
+                updateTabletServerMetadataCache(
+                        retryServerInfos, null, null, bucketsWithOfflineLeader);
+            }
+        }
     }
 
     private AddServerTagResponse processAddServerTag(AddServerTagEvent event) {
