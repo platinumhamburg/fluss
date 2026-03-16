@@ -584,9 +584,48 @@ public class IndexFetcherManager {
         Optional<Integer> leaderIdOpt = metadataCache.getBucketLeaderId(target.getDataBucket());
 
         if (!leaderIdOpt.isPresent() || leaderIdOpt.get() == INVALID_LEADER_ID) {
-            LOG.info("Leader unavailable for {}, marking failed", target.getDataBucket());
-            target.markFailed("Leader unavailable in cache", now);
-            removeFromFetcher(target.getDataIndexTableBucket());
+            // Cache miss or no leader — this can happen when the Coordinator's
+            // UpdateMetadata RPC failed for this server (e.g., during rolling upgrade).
+            // Before marking FAILED, try ZK fallback to check if the current leader
+            // is still valid. This prevents the RUNNING→FAILED dead loop.
+            boolean shouldFail = true;
+            try {
+                Optional<Integer> zkLeaderOpt =
+                        zkClient.getLeaderAndIsr(target.getDataBucket())
+                                .map(leaderAndIsr -> leaderAndIsr.leader());
+                if (zkLeaderOpt.isPresent() && zkLeaderOpt.get() == lastLeader) {
+                    // ZK confirms the current leader is still correct — the cache is just
+                    // missing the entry. Keep the fetcher running.
+                    LOG.debug(
+                            "Cache miss for {} but ZK confirms leader {} is still valid, "
+                                    + "keeping fetcher running",
+                            target.getDataBucket(),
+                            lastLeader);
+                    shouldFail = false;
+                } else if (zkLeaderOpt.isPresent()
+                        && zkLeaderOpt.get() != INVALID_LEADER_ID
+                        && serverNodeCache.apply(zkLeaderOpt.get()).isPresent()) {
+                    // ZK reports a different valid leader — need to switch fetcher
+                    LOG.info(
+                            "Cache miss for {} but ZK reports new leader {} (was {}), "
+                                    + "marking failed to trigger re-creation",
+                            target.getDataBucket(),
+                            zkLeaderOpt.get(),
+                            lastLeader);
+                    shouldFail = true;
+                }
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to query ZK for {} during cache miss handling: {}",
+                        target.getDataBucket(),
+                        e.getMessage());
+            }
+
+            if (shouldFail) {
+                LOG.info("Leader unavailable for {}, marking failed", target.getDataBucket());
+                target.markFailed("Leader unavailable in cache", now);
+                removeFromFetcher(target.getDataIndexTableBucket());
+            }
         } else if (leaderIdOpt.get() != lastLeader) {
             int newLeader = leaderIdOpt.get();
 

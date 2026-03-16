@@ -525,6 +525,48 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                 });
     }
 
+    /**
+     * Remove all bucket metadata for a specific partition from the cache. This simulates the
+     * scenario where a Coordinator's UpdateMetadata RPC failed for this server, leaving the
+     * partition metadata missing from the cache.
+     *
+     * @param partitionId the partition whose bucket metadata should be removed
+     */
+    @VisibleForTesting
+    public void removePartitionBucketMetadata(long partitionId) {
+        inLock(
+                metadataLock,
+                () -> {
+                    ServerMetadataSnapshot currentSnapshot = serverMetadataSnapshot;
+                    Map<Long, Map<Integer, BucketMetadata>> newPartitionMap =
+                            new HashMap<>(currentSnapshot.getBucketMetadataMapForPartitions());
+                    Map<Integer, BucketMetadata> removed = newPartitionMap.remove(partitionId);
+                    if (removed == null) {
+                        return;
+                    }
+
+                    Map<Long, TablePath> pathByTableId = new HashMap<>();
+                    currentSnapshot
+                            .getTableIdByPath()
+                            .forEach((path, id) -> pathByTableId.put(id, path));
+
+                    serverMetadataSnapshot =
+                            new ServerMetadataSnapshot(
+                                    currentSnapshot.getCoordinatorServer(),
+                                    currentSnapshot.getAliveTabletServers(),
+                                    currentSnapshot.getTableIdByPath(),
+                                    pathByTableId,
+                                    currentSnapshot.getPartitionIdByPath(),
+                                    currentSnapshot.getBucketMetadataMapForTables(),
+                                    newPartitionMap);
+
+                    LOG.info(
+                            "Removed partition bucket metadata for partitionId={} ({} buckets removed)",
+                            partitionId,
+                            removed.size());
+                });
+    }
+
     @VisibleForTesting
     public void clearTableMetadata() {
         inLock(

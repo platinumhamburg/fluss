@@ -821,6 +821,25 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 null,
                 null,
                 tableBuckets);
+
+        // Retry UpdateMetadata for servers that failed to receive partition metadata.
+        // This is critical for secondary index tables: if an IndexBucket leader server
+        // misses the DataBucket partition metadata, its IndexFetcherManager will enter
+        // a RUNNING→FAILED dead loop because metadataCache.getBucketLeaderId() returns empty.
+        Set<Integer> failedServers = coordinatorRequestBatch.drainFailedUpdateMetadataServers();
+        if (!failedServers.isEmpty()) {
+            Set<ServerInfo> retryServerInfos =
+                    coordinatorContext.getLiveTabletServers().values().stream()
+                            .filter(s -> failedServers.contains(s.id()))
+                            .collect(Collectors.toSet());
+            if (!retryServerInfos.isEmpty()) {
+                LOG.info(
+                        "Retrying UpdateMetadata for partition {} to servers that failed: {}",
+                        partitionId,
+                        retryServerInfos.stream().map(ServerInfo::id).collect(Collectors.toList()));
+                updateTabletServerMetadataCache(retryServerInfos, null, null, tableBuckets);
+            }
+        }
     }
 
     private void processDropTable(DropTableEvent dropTableEvent) {
