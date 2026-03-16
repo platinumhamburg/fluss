@@ -28,6 +28,7 @@ import org.apache.fluss.utils.CloseableIterator;
 import javax.annotation.Nullable;
 
 import java.util.Iterator;
+import java.util.Optional;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
@@ -55,6 +56,17 @@ public interface LogRecordBatch {
      * @return true If so, false otherwise
      */
     boolean isValid();
+
+    /**
+     * Get the statistics of this record batch using the provided read context.
+     *
+     * <p>This method can deserialize statistics when the read context provides the necessary schema
+     * information.
+     *
+     * @param context The read context that provides schema information
+     * @return Optional containing the statistics if available and valid
+     */
+    Optional<LogRecordBatchStatistics> getStatistics(ReadContext context);
 
     /** Raise an exception if the checksum is not valid. */
     void ensureValid();

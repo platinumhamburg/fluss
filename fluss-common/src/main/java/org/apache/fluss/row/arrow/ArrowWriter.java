@@ -77,6 +77,9 @@ public class ArrowWriter implements AutoCloseable {
     /** Container that holds a set of vectors for the rows. */
     final VectorSchemaRoot root;
 
+    /** The schema of the rows. */
+    private final RowType schema;
+
     /**
      * An array of writers which are responsible for the serialization of each column of the rows.
      */
@@ -114,6 +117,7 @@ public class ArrowWriter implements AutoCloseable {
             ArrowCompressionInfo compressionInfo,
             ArrowCompressionRatioEstimator compressionRatioEstimator) {
         this.writerKey = writerKey;
+        this.schema = schema;
         this.root = VectorSchemaRoot.create(ArrowUtils.toArrowSchema(schema), allocator);
         this.provider = checkNotNull(provider);
         this.compressionCodec = compressionInfo.createCompressionCodec();
@@ -141,6 +145,10 @@ public class ArrowWriter implements AutoCloseable {
 
     public int getWriteLimitInBytes() {
         return writeLimitInBytes;
+    }
+
+    public RowType getSchema() {
+        return schema;
     }
 
     public boolean isFull() {
