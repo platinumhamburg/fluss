@@ -31,6 +31,7 @@ import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.MapUtils;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -558,17 +559,17 @@ class IndexFetcherManagerReconciliationTest {
 
         @Override
         public CompletableFuture<Long> fetchLocalLogEndOffset(TableBucket tableBucket) {
-            return CompletableFuture.failedFuture(exception);
+            return FutureUtils.completedExceptionally(exception);
         }
 
         @Override
         public CompletableFuture<Long> fetchLocalLogStartOffset(TableBucket tableBucket) {
-            return CompletableFuture.failedFuture(exception);
+            return FutureUtils.completedExceptionally(exception);
         }
 
         @Override
         public CompletableFuture<Long> fetchLeaderEndOffsetSnapshot(TableBucket tableBucket) {
-            return CompletableFuture.failedFuture(exception);
+            return FutureUtils.completedExceptionally(exception);
         }
 
         @Override

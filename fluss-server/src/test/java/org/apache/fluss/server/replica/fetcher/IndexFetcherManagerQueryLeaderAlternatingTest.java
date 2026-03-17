@@ -32,6 +32,7 @@ import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.utils.MapUtils;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -257,29 +258,29 @@ class IndexFetcherManagerQueryLeaderAlternatingTest {
 
         @Override
         public CompletableFuture<Long> fetchLocalLogEndOffset(TableBucket tb) {
-            return CompletableFuture.failedFuture(fail());
+            return FutureUtils.completedExceptionally(fail());
         }
 
         @Override
         public CompletableFuture<Long> fetchLocalLogStartOffset(TableBucket tb) {
-            return CompletableFuture.failedFuture(fail());
+            return FutureUtils.completedExceptionally(fail());
         }
 
         @Override
         public CompletableFuture<Long> fetchLeaderEndOffsetSnapshot(TableBucket tb) {
-            return CompletableFuture.failedFuture(fail());
+            return FutureUtils.completedExceptionally(fail());
         }
 
         @Override
         public CompletableFuture<FetchData> fetchLog(FetchLogContext ctx) {
             attempts.incrementAndGet();
-            return CompletableFuture.failedFuture(fail());
+            return FutureUtils.completedExceptionally(fail());
         }
 
         @Override
         public CompletableFuture<FetchIndexData> fetchIndex(FetchIndexContext ctx) {
             attempts.incrementAndGet();
-            return CompletableFuture.failedFuture(fail());
+            return FutureUtils.completedExceptionally(fail());
         }
 
         @Override
