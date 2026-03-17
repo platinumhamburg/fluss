@@ -136,6 +136,9 @@ public class MetricNames {
             "preWriteBufferTruncateAsDuplicatedPerSecond";
     public static final String KV_PRE_WRITE_BUFFER_TRUNCATE_AS_ERROR_RATE =
             "preWriteBufferTruncateAsErrorPerSecond";
+    public static final String KV_OPEN_TOTAL_RATE = "kvOpenPerSecond";
+    public static final String KV_OPEN_FAILED_TOTAL_RATE = "kvOpenFailedPerSecond";
+    public static final String KV_IDLE_RELEASE_TOTAL_RATE = "kvIdleReleasePerSecond";
 
     // --------------------------------------------------------------------------------------------
     // RocksDB metrics

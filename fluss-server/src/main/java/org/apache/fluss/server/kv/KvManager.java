@@ -56,6 +56,7 @@ import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
@@ -64,6 +65,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Semaphore;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -138,6 +140,13 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     /** Current shared rate limiter configuration in bytes per second. */
     private volatile long currentSharedRateLimitBytesPerSec;
 
+    // ---- KV lazy open configuration ----
+    private final boolean lazyOpenEnabled;
+    private final @Nullable Semaphore openSemaphore;
+    private final long openTimeoutMs;
+    private final long failedBackoffBaseMs;
+    private final long failedBackoffMaxMs;
+
     private volatile boolean isShutdown = false;
 
     private KvManager(
@@ -159,6 +168,23 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         this.sharedRocksDBRateLimiter = createSharedRateLimiter(conf);
         this.currentSharedRateLimitBytesPerSec =
                 conf.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
+
+        // KV lazy open configuration
+        this.lazyOpenEnabled = conf.get(ConfigOptions.KV_LAZY_OPEN_ENABLED);
+        if (lazyOpenEnabled) {
+            int maxConcurrentOpens = conf.get(ConfigOptions.KV_LAZY_OPEN_MAX_CONCURRENT_OPENS);
+            this.openSemaphore = new Semaphore(maxConcurrentOpens);
+            this.openTimeoutMs = conf.get(ConfigOptions.KV_LAZY_OPEN_OPEN_TIMEOUT).toMillis();
+            this.failedBackoffBaseMs =
+                    conf.get(ConfigOptions.KV_LAZY_OPEN_FAILED_BACKOFF_BASE).toMillis();
+            this.failedBackoffMaxMs =
+                    conf.get(ConfigOptions.KV_LAZY_OPEN_FAILED_BACKOFF_MAX).toMillis();
+        } else {
+            this.openSemaphore = null;
+            this.openTimeoutMs = 0;
+            this.failedBackoffBaseMs = 0;
+            this.failedBackoffMaxMs = 0;
+        }
     }
 
     private static RateLimiter createSharedRateLimiter(Configuration conf) {
@@ -194,6 +220,26 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                 conf.getInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS),
                 logManager,
                 tabletServerMetricGroup);
+    }
+
+    public boolean isLazyOpenEnabled() {
+        return lazyOpenEnabled;
+    }
+
+    public @Nullable Semaphore getOpenSemaphore() {
+        return openSemaphore;
+    }
+
+    public long getOpenTimeoutMs() {
+        return openTimeoutMs;
+    }
+
+    public long getFailedBackoffBaseMs() {
+        return failedBackoffBaseMs;
+    }
+
+    public long getFailedBackoffMaxMs() {
+        return failedBackoffMaxMs;
     }
 
     public void startup() {
@@ -305,6 +351,55 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     public Optional<KvTablet> getKv(TableBucket tableBucket) {
         return Optional.ofNullable(currentKvs.get(tableBucket));
+    }
+
+    /**
+     * Remove KvTablet from registry without closing or deleting directory. Used for rollback after
+     * failed open attempts.
+     */
+    public void removeKv(TableBucket tableBucket) {
+        inLock(tabletCreationOrDeletionLock, () -> currentKvs.remove(tableBucket));
+    }
+
+    /**
+     * Delete local RocksDB data directory for a tablet. Used for cleanup when tablet has no active
+     * KvTablet object but may have leftover local files.
+     */
+    public void deleteLocalData(PhysicalTablePath tablePath, TableBucket tableBucket) {
+        File tabletDir = getTabletDir(tablePath, tableBucket);
+        if (tabletDir.exists()) {
+            FileUtils.deleteDirectoryQuietly(tabletDir);
+            LOG.info(
+                    "Deleted local data directory for bucket {} at {}.",
+                    tableBucket,
+                    tabletDir.getAbsolutePath());
+        }
+    }
+
+    /**
+     * Close KvTablet and remove from registry, but keep local directory. Used by idle release
+     * controller to release resources while preserving data for reopen.
+     */
+    public void closeKv(TableBucket tableBucket) {
+        inLock(
+                tabletCreationOrDeletionLock,
+                () -> {
+                    KvTablet kvTablet = currentKvs.remove(tableBucket);
+                    if (kvTablet != null) {
+                        try {
+                            kvTablet.close();
+                        } catch (Exception e) {
+                            throw new KvStorageException(
+                                    String.format(
+                                            "Exception while closing KvTablet for %s.",
+                                            tableBucket),
+                                    e);
+                        }
+                        LOG.info("Closed KvTablet for {} (directory preserved)", tableBucket);
+                    } else {
+                        LOG.warn("Attempted to close non-existent KvTablet for {}", tableBucket);
+                    }
+                });
     }
 
     public void dropKv(TableBucket tableBucket) {

@@ -73,7 +73,10 @@ import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.BytesUtils;
+import org.apache.fluss.utils.ExponentialBackoff;
 import org.apache.fluss.utils.FileUtils;
+import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.clock.SystemClock;
 
 import org.rocksdb.RateLimiter;
 import org.slf4j.Logger;
@@ -88,9 +91,16 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.IntSupplier;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
@@ -99,40 +109,119 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
 @ThreadSafe
 public final class KvTablet {
     private static final Logger LOG = LoggerFactory.getLogger(KvTablet.class);
-    private static final long ROW_COUNT_DISABLED = -1;
+    static final long ROW_COUNT_DISABLED = -1;
+
+    /** Coarsen access timestamp updates to reduce volatile writes on hot path. */
+    private static final long ACCESS_TIMESTAMP_GRANULARITY_MS = 1000;
+
+    // ---- Lazy lifecycle states ----
+
+    /** Internal RocksDB lifecycle states. */
+    enum LazyState {
+        /** Not in lazy mode — RocksDB is always open (traditional behavior). */
+        EAGER,
+        /** Lazy mode: RocksDB not yet opened. */
+        LAZY,
+        /** Lazy mode: RocksDB is being opened by another thread. */
+        OPENING,
+        /** Lazy mode: RocksDB is open and serving requests. */
+        OPEN,
+        /** Lazy mode: RocksDB is being released (closing without deleting data). */
+        RELEASING,
+        /** Lazy mode: last open attempt failed, in backoff cooldown. */
+        FAILED,
+        /** Terminal state: tablet is closed. */
+        CLOSED
+    }
+
+    /**
+     * Callback for the actual RocksDB open work. Provided by Replica since it requires access to
+     * snapshot context, log recovery, etc.
+     */
+    @FunctionalInterface
+    public interface OpenCallback {
+        /** Performs the open and returns the opened RocksDB KvTablet instance. */
+        KvTablet doOpen(boolean hasLocalData) throws Exception;
+    }
+
+    /**
+     * Callback invoked after a successful open commit. Used by Replica to install the tablet
+     * reference and start periodic snapshot.
+     */
+    @FunctionalInterface
+    public interface OpenCommitCallback {
+        void onOpenCommitted(KvTablet kvTablet);
+    }
+
+    /** Callback for releasing (closing) RocksDB without destroying local data. */
+    @FunctionalInterface
+    public interface ReleaseCallback {
+        void doRelease(KvTablet kvTablet);
+    }
+
+    /** Callback for dropping (destroying) a KvTablet and cleaning up associated resources. */
+    @FunctionalInterface
+    public interface DropCallback {
+        void doDrop(KvTablet kvTablet);
+    }
+
+    /** Callback for cleaning up local KV directory without an open KvTablet. */
+    @FunctionalInterface
+    public interface CleanLocalCallback {
+        void cleanLocalDirectory();
+    }
+
+    /**
+     * A guard that prevents the underlying RocksDB from being released while held. Use with
+     * try-with-resources. In eager mode, this is a no-op. In lazy mode, it pins the RocksDB
+     * instance and ensures it is open before returning.
+     */
+    public static final class Guard implements AutoCloseable {
+        private final @Nullable KvTablet tablet;
+        private boolean released;
+
+        /** No-op guard for eager mode. */
+        static final Guard NOOP = new Guard(null);
+
+        Guard(@Nullable KvTablet tablet) {
+            this.tablet = tablet;
+        }
+
+        @Override
+        public void close() {
+            if (!released && tablet != null) {
+                released = true;
+                tablet.releasePin();
+            }
+        }
+    }
 
     private final PhysicalTablePath physicalPath;
     private final TableBucket tableBucket;
 
     private final LogTablet logTablet;
-    private final ArrowWriterProvider arrowWriterProvider;
-    private final MemorySegmentPool memorySegmentPool;
-
-    private final File kvTabletDir;
-    private final long writeBatchSize;
-    private final RocksDBKv rocksDBKv;
-    private final KvPreWriteBuffer kvPreWriteBuffer;
-    private final TabletServerMetricGroup serverMetricGroup;
+    private final @Nullable TabletServerMetricGroup serverMetricGroup;
 
     // A lock that guards all modifications to the kv.
     private final ReadWriteLock kvLock = new ReentrantReadWriteLock();
-    private final LogFormat logFormat;
-    private final KvFormat kvFormat;
-    // defines how to merge rows on the same primary key
-    private final RowMerger rowMerger;
-    // Pre-created DefaultRowMerger for OVERWRITE mode (undo recovery scenarios)
-    // This avoids creating a new instance on every putAsLeader call
-    private final RowMerger overwriteRowMerger;
-    private final ArrowCompressionInfo arrowCompressionInfo;
-    private final AutoIncrementManager autoIncrementManager;
 
-    private final SchemaGetter schemaGetter;
+    // ---- Fields that are null in lazy sentinel, populated after RocksDB open ----
 
-    // the changelog image mode for this tablet
-    private final ChangelogImage changelogImage;
-
-    // RocksDB statistics accessor for this tablet
-    @Nullable private final RocksDBStatistics rocksDBStatistics;
+    private volatile @Nullable ArrowWriterProvider arrowWriterProvider;
+    private volatile @Nullable MemorySegmentPool memorySegmentPool;
+    private volatile @Nullable File kvTabletDir;
+    private volatile long writeBatchSize;
+    private volatile @Nullable RocksDBKv rocksDBKv;
+    private volatile @Nullable KvPreWriteBuffer kvPreWriteBuffer;
+    private volatile LogFormat logFormat;
+    private volatile KvFormat kvFormat;
+    private volatile @Nullable RowMerger rowMerger;
+    private volatile @Nullable RowMerger overwriteRowMerger;
+    private volatile @Nullable ArrowCompressionInfo arrowCompressionInfo;
+    private volatile @Nullable AutoIncrementManager autoIncrementManager;
+    private volatile @Nullable SchemaGetter schemaGetter;
+    private volatile ChangelogImage changelogImage;
+    private volatile @Nullable RocksDBStatistics rocksDBStatistics;
 
     /**
      * The kv data in pre-write buffer whose log offset is less than the flushedLogOffset has been
@@ -145,6 +234,62 @@ public final class KvTablet {
     @GuardedBy("kvLock")
     private volatile boolean isClosed = false;
 
+    // ---- Lazy lifecycle fields (only used when lazyState != EAGER) ----
+
+    private volatile LazyState lazyState = LazyState.EAGER;
+
+    /** Lock guarding lazy state transitions. */
+    private final ReentrantLock lazyStateLock = new ReentrantLock();
+
+    private final Condition lazyStateChanged = lazyStateLock.newCondition();
+
+    /** Active pin count — prevents release while operations are in-flight. */
+    private final AtomicInteger activePins = new AtomicInteger(0);
+
+    private volatile boolean rejectNewPins;
+
+    /** Generation counter for fencing stale open results. */
+    private long openGeneration;
+
+    /** Semaphore for throttling concurrent open operations across all tablets. */
+    private @Nullable Semaphore openSemaphore;
+
+    private long openTimeoutMs;
+    private @Nullable ExponentialBackoff failedBackoff;
+    private Clock clock = SystemClock.getInstance();
+
+    /** FAILED state tracking. */
+    private long failedTimestamp;
+
+    private int failureCount;
+    private @Nullable Throwable lastFailureCause;
+
+    /** Cached values served when RocksDB is not open. */
+    private volatile long cachedRowCount;
+
+    /** Whether local RocksDB data directory exists from a previous open. */
+    private boolean hasLocalData;
+
+    /** Access timestamp for idle release decisions (coarsened to reduce volatile writes). */
+    private volatile long lastAccessTimestamp;
+
+    /** Epoch suppliers for fencing stale open results. */
+    private @Nullable IntSupplier leaderEpochSupplier;
+
+    private @Nullable IntSupplier bucketEpochSupplier;
+
+    /** Callbacks (set by Replica after construction for lazy mode). */
+    private @Nullable OpenCallback openCallback;
+
+    private @Nullable OpenCommitCallback commitCallback;
+    private @Nullable DropCallback dropCallback;
+    private @Nullable ReleaseCallback releaseCallback;
+    private @Nullable CleanLocalCallback cleanLocalCallback;
+    private @Nullable Runnable openRollbackCallback;
+
+    private long releaseDrainTimeoutMs = 5000;
+
+    /** Full constructor for eager mode (RocksDB is immediately available). */
     private KvTablet(
             PhysicalTablePath physicalPath,
             TableBucket tableBucket,
@@ -186,6 +331,79 @@ public final class KvTablet {
         this.autoIncrementManager = autoIncrementManager;
         // disable row count for WAL image mode.
         this.rowCount = changelogImage == ChangelogImage.WAL ? ROW_COUNT_DISABLED : 0L;
+    }
+
+    /**
+     * Lazy sentinel constructor: creates a KvTablet in LAZY state without RocksDB. The RocksDB
+     * fields are populated later via {@link #installRocksDB(KvTablet)} when ensureOpen() triggers.
+     */
+    private KvTablet(
+            PhysicalTablePath physicalPath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            @Nullable TabletServerMetricGroup serverMetricGroup) {
+        this.physicalPath = physicalPath;
+        this.tableBucket = tableBucket;
+        this.logTablet = logTablet;
+        this.serverMetricGroup = serverMetricGroup;
+        this.lazyState = LazyState.LAZY;
+    }
+
+    /**
+     * Create a lazy sentinel KvTablet that starts in LAZY state without RocksDB. Use {@link
+     * #configureLazyOpen} and callback setters to configure before use.
+     */
+    public static KvTablet createLazySentinel(
+            PhysicalTablePath physicalPath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            @Nullable TabletServerMetricGroup serverMetricGroup) {
+        return new KvTablet(physicalPath, tableBucket, logTablet, serverMetricGroup);
+    }
+
+    /**
+     * Install RocksDB state from a fully-constructed KvTablet into this lazy sentinel. Called by
+     * commitOpenResult() after a successful open. The source tablet is consumed (its RocksDB
+     * reference is transferred, not copied).
+     */
+    void installRocksDB(KvTablet source) {
+        this.kvTabletDir = source.kvTabletDir;
+        this.rocksDBKv = source.rocksDBKv;
+        this.writeBatchSize = source.writeBatchSize;
+        this.kvPreWriteBuffer = source.kvPreWriteBuffer;
+        this.logFormat = source.logFormat;
+        this.arrowWriterProvider = source.arrowWriterProvider;
+        this.memorySegmentPool = source.memorySegmentPool;
+        this.kvFormat = source.kvFormat;
+        this.rowMerger = source.rowMerger;
+        this.overwriteRowMerger = source.overwriteRowMerger;
+        this.arrowCompressionInfo = source.arrowCompressionInfo;
+        this.schemaGetter = source.schemaGetter;
+        this.changelogImage = source.changelogImage;
+        this.rocksDBStatistics = source.rocksDBStatistics;
+        this.autoIncrementManager = source.autoIncrementManager;
+        this.rowCount = source.rowCount;
+        this.flushedLogOffset = source.flushedLogOffset;
+        this.isClosed = false;
+    }
+
+    /**
+     * Detach RocksDB state from this sentinel (during release). Nulls out RocksDB-related fields so
+     * the sentinel returns to a lightweight state.
+     */
+    void detachRocksDB() {
+        this.kvTabletDir = null;
+        this.rocksDBKv = null;
+        this.kvPreWriteBuffer = null;
+        this.rocksDBStatistics = null;
+        this.arrowWriterProvider = null;
+        this.memorySegmentPool = null;
+        this.rowMerger = null;
+        this.overwriteRowMerger = null;
+        this.autoIncrementManager = null;
+        this.schemaGetter = null;
+        this.arrowCompressionInfo = null;
+        this.isClosed = true;
     }
 
     public static KvTablet create(
@@ -288,6 +506,11 @@ public final class KvTablet {
         return rocksDBStatistics;
     }
 
+    /** Returns the log offset up to which data has been flushed from pre-write buffer into KV. */
+    public long getFlushedLogOffset() {
+        return flushedLogOffset;
+    }
+
     void setFlushedLogOffset(long flushedLogOffset) {
         this.flushedLogOffset = flushedLogOffset;
     }
@@ -298,6 +521,18 @@ public final class KvTablet {
 
     // row_count is volatile, so it's safe to read without lock
     public long getRowCount() {
+        // In LAZY state, RocksDB is not open — return cached value
+        if (lazyState == LazyState.LAZY || lazyState == LazyState.FAILED) {
+            if (cachedRowCount == ROW_COUNT_DISABLED) {
+                throw new InvalidTableException(
+                        String.format(
+                                "Row count is disabled for this table '%s'. "
+                                        + "This usually happens when the table is "
+                                        + "created before v0.9 or the changelog image is set to WAL.",
+                                getTablePath()));
+            }
+            return cachedRowCount;
+        }
         if (rowCount == ROW_COUNT_DISABLED) {
             throw new InvalidTableException(
                     String.format(
@@ -660,6 +895,10 @@ public final class KvTablet {
     }
 
     public void flush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
+        // In lazy sentinel state, no RocksDB is open — nothing to flush
+        if (kvPreWriteBuffer == null) {
+            return;
+        }
         // todo: need to introduce a backpressure mechanism
         // to avoid too much records in kvPreWriteBuffer
         inWriteLock(
@@ -815,5 +1054,585 @@ public final class KvTablet {
     @VisibleForTesting
     public RocksDBKv getRocksDBKv() {
         return rocksDBKv;
+    }
+
+    // ========================================================================
+    //  Lazy lifecycle management
+    // ========================================================================
+
+    /** Returns true if this tablet is in lazy mode (as opposed to eager/traditional mode). */
+    public boolean isLazyMode() {
+        return lazyState != LazyState.EAGER;
+    }
+
+    /** Returns true if this tablet is in lazy mode and currently OPEN (RocksDB loaded). */
+    public boolean isLazyOpen() {
+        return lazyState == LazyState.OPEN;
+    }
+
+    /** Returns the current lazy state. */
+    public LazyState getLazyState() {
+        return lazyState;
+    }
+
+    /**
+     * Acquire a guard that prevents RocksDB from being released while held. In eager mode, returns
+     * a no-op guard immediately. In lazy mode, ensures RocksDB is open (blocking if necessary) and
+     * pins it.
+     *
+     * <p>Must be called OUTSIDE any Replica-level locks (e.g. leaderIsrUpdateLock) to avoid
+     * blocking leader transitions during slow opens.
+     */
+    public Guard acquireGuard() {
+        if (lazyState == LazyState.EAGER) {
+            return Guard.NOOP;
+        }
+
+        // Fast path: try to pin without blocking
+        Guard fast = tryAcquirePinAsGuard();
+        if (fast != null) {
+            return fast;
+        }
+
+        // Slow path: ensure open, then pin
+        ensureOpen();
+        // Between ensureOpen() returning and pin, a concurrent release could happen.
+        // Retry up to 3 times.
+        for (int attempt = 0; ; attempt++) {
+            lazyStateLock.lock();
+            try {
+                if (lazyState == LazyState.OPEN && !rejectNewPins) {
+                    activePins.incrementAndGet();
+                    touchAccessTimestamp();
+                    return new Guard(this);
+                }
+                if (lazyState == LazyState.CLOSED) {
+                    throw new KvStorageException("KvTablet is closed for " + tableBucket);
+                }
+            } finally {
+                lazyStateLock.unlock();
+            }
+            if (attempt >= 2) {
+                throw new KvStorageException(
+                        "Failed to pin KvTablet after open for " + tableBucket);
+            }
+            // Re-open and retry
+            ensureOpen();
+        }
+    }
+
+    /**
+     * Fast-path pin attempt. Returns Guard if OPEN and accepting pins; null otherwise.
+     *
+     * <p>Memory ordering: we read {@code lazyState} before {@code rejectNewPins}. The release path
+     * writes {@code rejectNewPins = true} before {@code lazyState = RELEASING} (both volatile).
+     * This ensures that if we see OPEN, rejectNewPins has not yet been set.
+     */
+    @Nullable
+    private Guard tryAcquirePinAsGuard() {
+        if (lazyState == LazyState.OPEN && !rejectNewPins) {
+            activePins.incrementAndGet();
+            if (lazyState == LazyState.OPEN && !rejectNewPins) {
+                touchAccessTimestamp();
+                return new Guard(this);
+            }
+            decrementAndMaybeSignal();
+        }
+        return null;
+    }
+
+    /** Release a pin. Called by Guard.close(). */
+    private void releasePin() {
+        decrementAndMaybeSignal();
+    }
+
+    private void decrementAndMaybeSignal() {
+        if (activePins.decrementAndGet() == 0) {
+            if (rejectNewPins) {
+                lazyStateLock.lock();
+                try {
+                    lazyStateChanged.signalAll();
+                } finally {
+                    lazyStateLock.unlock();
+                }
+            }
+        }
+    }
+
+    private void touchAccessTimestamp() {
+        long now = clock.milliseconds();
+        if (now - lastAccessTimestamp > ACCESS_TIMESTAMP_GRANULARITY_MS) {
+            lastAccessTimestamp = now;
+        }
+    }
+
+    /**
+     * Ensures RocksDB is open. If already OPEN, returns immediately. If LAZY or FAILED (past
+     * cooldown), triggers a slow-path open. If OPENING or RELEASING, blocks until state changes.
+     */
+    private void ensureOpen() {
+        lazyStateLock.lock();
+        try {
+            while (true) {
+                switch (lazyState) {
+                    case EAGER:
+                    case OPEN:
+                        return;
+
+                    case OPENING:
+                        if (!lazyStateChanged.await(openTimeoutMs, TimeUnit.MILLISECONDS)) {
+                            throw new KvStorageException(
+                                    "KvTablet open timed out for " + tableBucket);
+                        }
+                        continue;
+
+                    case RELEASING:
+                        if (!lazyStateChanged.await(openTimeoutMs, TimeUnit.MILLISECONDS)) {
+                            throw new KvStorageException(
+                                    "KvTablet open timed out waiting for release: " + tableBucket);
+                        }
+                        continue;
+
+                    case FAILED:
+                        long elapsed = clock.milliseconds() - failedTimestamp;
+                        long cooldown = failedBackoff.backoff(failureCount);
+                        if (elapsed < cooldown) {
+                            throw new KvStorageException(
+                                    "KvTablet open failed for "
+                                            + tableBucket
+                                            + ", remaining cooldown: "
+                                            + (cooldown - elapsed)
+                                            + " ms",
+                                    lastFailureCause);
+                        }
+                        // Fall through to LAZY — cooldown expired, retry open.
+
+                    case LAZY:
+                        lazyState = LazyState.OPENING;
+                        openGeneration++;
+                        long myGeneration = openGeneration;
+                        int myLeaderEpoch =
+                                leaderEpochSupplier != null ? leaderEpochSupplier.getAsInt() : -1;
+                        int myBucketEpoch =
+                                bucketEpochSupplier != null ? bucketEpochSupplier.getAsInt() : -1;
+                        boolean localDataExists = hasLocalData;
+                        lazyStateLock.unlock();
+                        try {
+                            doSlowOpen(myGeneration, myLeaderEpoch, myBucketEpoch, localDataExists);
+                        } catch (Throwable t) {
+                            // doSlowOpen already called commitOpenResult() which transitions
+                            // to FAILED, so no need to handle state transition here.
+                            if (t instanceof RuntimeException) {
+                                throw (RuntimeException) t;
+                            }
+                            throw new KvStorageException(
+                                    "KvTablet open failed for " + tableBucket, t);
+                        }
+                        return;
+
+                    case CLOSED:
+                        throw new KvStorageException("KvTablet is closed for " + tableBucket);
+
+                    default:
+                        throw new IllegalStateException("Unexpected state: " + lazyState);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new KvStorageException("Interrupted waiting for KvTablet open: " + tableBucket);
+        } finally {
+            if (lazyStateLock.isHeldByCurrentThread()) {
+                lazyStateLock.unlock();
+            }
+        }
+    }
+
+    private void doSlowOpen(
+            long myGeneration, int myLeaderEpoch, int myBucketEpoch, boolean localDataExists)
+            throws Exception {
+        KvTablet newTablet = null;
+        boolean committed = false;
+
+        if (openSemaphore != null
+                && !openSemaphore.tryAcquire(openTimeoutMs, TimeUnit.MILLISECONDS)) {
+            throw new KvStorageException("KvTablet open semaphore timeout for " + tableBucket);
+        }
+
+        try {
+            newTablet = openCallback.doOpen(localDataExists);
+            committed =
+                    commitOpenResult(myGeneration, myLeaderEpoch, myBucketEpoch, newTablet, null);
+            if (!committed) {
+                throw new CancellationException(
+                        "open result fenced by concurrent epoch/generation change");
+            }
+        } catch (Exception e) {
+            commitOpenResult(myGeneration, myLeaderEpoch, myBucketEpoch, null, e);
+            throw e;
+        } finally {
+            if (openSemaphore != null) {
+                openSemaphore.release();
+            }
+            if (!committed && newTablet != null) {
+                try {
+                    newTablet.close();
+                } catch (Exception ignored) {
+                }
+                if (openRollbackCallback != null) {
+                    try {
+                        openRollbackCallback.run();
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    private boolean commitOpenResult(
+            long myGeneration,
+            int myLeaderEpoch,
+            int myBucketEpoch,
+            @Nullable KvTablet newTablet,
+            @Nullable Exception error) {
+        lazyStateLock.lock();
+        try {
+            if (openGeneration != myGeneration) {
+                if (lazyState == LazyState.OPENING) {
+                    transitionToFailed(
+                            new CancellationException(
+                                    "open superseded by generation " + openGeneration),
+                            true);
+                }
+                return false;
+            }
+
+            if (error != null) {
+                transitionToFailed(error, false);
+                return false;
+            }
+
+            // Epoch fencing
+            int currentLeaderEpoch =
+                    leaderEpochSupplier != null ? leaderEpochSupplier.getAsInt() : -1;
+            int currentBucketEpoch =
+                    bucketEpochSupplier != null ? bucketEpochSupplier.getAsInt() : -1;
+            if (currentLeaderEpoch != myLeaderEpoch || currentBucketEpoch != myBucketEpoch) {
+                transitionToFailed(new CancellationException("epoch changed during open"), true);
+                return false;
+            }
+
+            // Success — absorb RocksDB state from the newly opened tablet
+            installRocksDB(newTablet);
+            lazyState = LazyState.OPEN;
+            failureCount = 0;
+            lastAccessTimestamp = clock.milliseconds();
+            rejectNewPins = false;
+            lazyStateChanged.signalAll();
+        } finally {
+            lazyStateLock.unlock();
+        }
+
+        // Invoke commit callback outside the lock to avoid blocking acquireGuard() callers
+        if (commitCallback != null) {
+            commitCallback.onOpenCommitted(this);
+        }
+        return true;
+    }
+
+    /** Must be called while holding {@code lazyStateLock}. */
+    private void transitionToFailed(Throwable cause, boolean resetCount) {
+        lazyState = LazyState.FAILED;
+        failedTimestamp = clock.milliseconds();
+        if (resetCount) {
+            failureCount = 0;
+        } else {
+            failureCount++;
+        }
+        lastFailureCause = cause;
+        lazyStateChanged.signalAll();
+    }
+
+    // ---- Release logic (idle release by KvManager) ----
+
+    /**
+     * Release RocksDB resources: OPEN -> RELEASING -> LAZY. Caches metadata before close for
+     * serving queries while in LAZY state.
+     *
+     * @return true if release succeeded, false if aborted
+     */
+    public boolean releaseKv() {
+        // Pre-check state outside lock as a fast-path rejection
+        if (lazyState != LazyState.OPEN) {
+            return false;
+        }
+
+        lazyStateLock.lock();
+        try {
+            if (lazyState != LazyState.OPEN) {
+                return false;
+            }
+
+            // Read logEndOffset under lock to avoid TOCTOU — new records could be
+            // appended between an outside read and this check.
+            long logEndOffset = logTablet.localLogEndOffset();
+            if (flushedLogOffset < logEndOffset) {
+                return false;
+            }
+
+            // Cache metadata before close
+            cachedRowCount = rowCount;
+            // Transition to RELEASING — write rejectNewPins before lazyState so that
+            // tryAcquirePinAsGuard() sees the reject flag if it reads OPEN.
+            rejectNewPins = true;
+            lazyState = LazyState.RELEASING;
+
+            if (!drainPins()) {
+                LOG.warn("{} release drain timeout, aborting release", tableBucket);
+                lazyState = LazyState.OPEN;
+                rejectNewPins = false;
+                lazyStateChanged.signalAll();
+                return false;
+            }
+        } finally {
+            lazyStateLock.unlock();
+        }
+
+        // All pins drained, safe to close
+        boolean releaseSucceeded = false;
+        try {
+            if (releaseCallback != null) {
+                releaseCallback.doRelease(this);
+            }
+            detachRocksDB();
+            releaseSucceeded = true;
+        } catch (Exception e) {
+            LOG.warn("{} release callback failed, rolling back to OPEN", tableBucket, e);
+        } finally {
+            lazyStateLock.lock();
+            try {
+                if (releaseSucceeded) {
+                    lazyState = LazyState.LAZY;
+                    hasLocalData = true;
+                } else {
+                    lazyState = LazyState.OPEN;
+                }
+                rejectNewPins = false;
+                lazyStateChanged.signalAll();
+            } finally {
+                lazyStateLock.unlock();
+            }
+        }
+        return releaseSucceeded;
+    }
+
+    /**
+     * Full-state cleanup for lazy mode: handles all states, waits for in-progress operations, then
+     * transitions to CLOSED. Called by Replica.dropKv().
+     */
+    public void dropKvLazy() {
+        lazyStateLock.lock();
+        try {
+            switch (lazyState) {
+                case EAGER:
+                case CLOSED:
+                    break;
+
+                case LAZY:
+                case FAILED:
+                    if (cleanLocalCallback != null) {
+                        cleanLocalCallback.cleanLocalDirectory();
+                    }
+                    break;
+
+                case OPENING:
+                    openGeneration++;
+                    awaitStateExit(LazyState.OPENING, openTimeoutMs * 2);
+                    if (lazyState == LazyState.OPEN) {
+                        rejectNewPins = true;
+                        drainPinsForDrop();
+                        doDropViaCallback();
+                    } else if (lazyState != LazyState.OPENING) {
+                        if (cleanLocalCallback != null) {
+                            cleanLocalCallback.cleanLocalDirectory();
+                        }
+                    }
+                    break;
+
+                case OPEN:
+                    rejectNewPins = true;
+                    drainPinsForDrop();
+                    doDropViaCallback();
+                    break;
+
+                case RELEASING:
+                    awaitStateExit(LazyState.RELEASING, releaseDrainTimeoutMs * 2);
+                    if (cleanLocalCallback != null) {
+                        cleanLocalCallback.cleanLocalDirectory();
+                    }
+                    break;
+
+                default:
+                    throw new IllegalStateException("Unexpected state in dropKvLazy: " + lazyState);
+            }
+
+            lazyState = LazyState.CLOSED;
+            hasLocalData = false;
+            rejectNewPins = false;
+            activePins.set(0);
+            failureCount = 0;
+            failedTimestamp = 0;
+            lastFailureCause = null;
+            lazyStateChanged.signalAll();
+        } finally {
+            lazyStateLock.unlock();
+        }
+    }
+
+    private void drainPinsForDrop() {
+        if (!drainPins()) {
+            LOG.warn("{} drop drain timeout, force-resetting pins", tableBucket);
+            activePins.set(0);
+        }
+    }
+
+    private boolean drainPins() {
+        long deadline = clock.milliseconds() + releaseDrainTimeoutMs;
+        while (activePins.get() > 0) {
+            long remaining = deadline - clock.milliseconds();
+            if (remaining <= 0) {
+                return false;
+            }
+            try {
+                lazyStateChanged.await(remaining, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Wait (under lazyStateLock) until {@code lazyState} is no longer {@code state}, or timeout.
+     */
+    private void awaitStateExit(LazyState state, long timeoutMs) {
+        long deadlineNanos = clock.nanoseconds() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (lazyState == state) {
+            try {
+                long remainNanos = deadlineNanos - clock.nanoseconds();
+                if (remainNanos <= 0
+                        || !lazyStateChanged.await(remainNanos, TimeUnit.NANOSECONDS)) {
+                    break;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
+    private void doDropViaCallback() {
+        if (dropCallback != null) {
+            dropCallback.doDrop(this);
+        }
+    }
+
+    /** Pre-check for idle release eligibility. */
+    public boolean canRelease(long closeIdleIntervalMs, long nowMs) {
+        if (lazyState != LazyState.OPEN) {
+            return false;
+        }
+        if (activePins.get() > 0) {
+            return false;
+        }
+        return nowMs - lastAccessTimestamp >= closeIdleIntervalMs;
+    }
+
+    // ---- Lazy mode initialization ----
+
+    /** Configure lazy open parameters. Must be called before entering lazy mode. */
+    public void configureLazyOpen(
+            Clock clock,
+            Semaphore openSemaphore,
+            long openTimeoutMs,
+            long failedBackoffBaseMs,
+            long failedBackoffMaxMs) {
+        this.clock = clock;
+        this.openSemaphore = openSemaphore;
+        this.openTimeoutMs = openTimeoutMs;
+        this.failedBackoff = new ExponentialBackoff(failedBackoffBaseMs, 2, failedBackoffMaxMs, 0);
+    }
+
+    public void setOpenCallback(OpenCallback callback) {
+        this.openCallback = callback;
+    }
+
+    public void setCommitCallback(OpenCommitCallback callback) {
+        this.commitCallback = callback;
+    }
+
+    public void setDropCallback(DropCallback callback) {
+        this.dropCallback = callback;
+    }
+
+    public void setReleaseCallback(ReleaseCallback callback) {
+        this.releaseCallback = callback;
+    }
+
+    public void setCleanLocalCallback(CleanLocalCallback callback) {
+        this.cleanLocalCallback = callback;
+    }
+
+    public void setOpenRollbackCallback(Runnable callback) {
+        this.openRollbackCallback = callback;
+    }
+
+    public void setLeaderEpochSupplier(IntSupplier supplier) {
+        this.leaderEpochSupplier = supplier;
+    }
+
+    public void setBucketEpochSupplier(IntSupplier supplier) {
+        this.bucketEpochSupplier = supplier;
+    }
+
+    public void initCachedRowCount(long rowCount) {
+        this.cachedRowCount = rowCount;
+    }
+
+    // ---- Lazy state queries ----
+
+    public long getCachedRowCount() {
+        return cachedRowCount;
+    }
+
+    public long getLastAccessTimestamp() {
+        return lastAccessTimestamp;
+    }
+
+    public int getActivePins() {
+        return activePins.get();
+    }
+
+    // ---- Test helpers ----
+
+    @VisibleForTesting
+    void setLazyStateForTesting(LazyState state) {
+        lazyStateLock.lock();
+        try {
+            this.lazyState = state;
+            lazyStateChanged.signalAll();
+        } finally {
+            lazyStateLock.unlock();
+        }
+    }
+
+    @VisibleForTesting
+    void setLastAccessTimestampForTesting(long timestamp) {
+        this.lastAccessTimestamp = timestamp;
+    }
+
+    @VisibleForTesting
+    void setClockForTesting(Clock clock) {
+        this.clock = clock;
     }
 }

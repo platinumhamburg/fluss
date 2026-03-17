@@ -70,6 +70,9 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Histogram kvFlushLatencyHistogram;
     private final Counter kvTruncateAsDuplicatedCount;
     private final Counter kvTruncateAsErrorCount;
+    private final Counter kvOpenTotal;
+    private final Counter kvOpenFailedTotal;
+    private final Counter kvIdleReleaseTotal;
 
     // aggregated replica metrics
     private final Counter isrShrinks;
@@ -126,7 +129,12 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(
                 MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_ERROR_RATE,
                 new MeterView(kvTruncateAsErrorCount));
-
+        kvOpenTotal = new ThreadSafeSimpleCounter();
+        meter(MetricNames.KV_OPEN_TOTAL_RATE, new MeterView(kvOpenTotal));
+        kvOpenFailedTotal = new ThreadSafeSimpleCounter();
+        meter(MetricNames.KV_OPEN_FAILED_TOTAL_RATE, new MeterView(kvOpenFailedTotal));
+        kvIdleReleaseTotal = new ThreadSafeSimpleCounter();
+        meter(MetricNames.KV_IDLE_RELEASE_TOTAL_RATE, new MeterView(kvIdleReleaseTotal));
         // replica metrics
         isrExpands = new SimpleCounter();
         meter(MetricNames.ISR_EXPANDS_RATE, new MeterView(isrExpands));
@@ -226,6 +234,18 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Counter kvTruncateAsErrorCount() {
         return kvTruncateAsErrorCount;
+    }
+
+    public Counter kvOpenTotal() {
+        return kvOpenTotal;
+    }
+
+    public Counter kvOpenFailedTotal() {
+        return kvOpenFailedTotal;
+    }
+
+    public Counter kvIdleReleaseTotal() {
+        return kvIdleReleaseTotal;
     }
 
     public Counter isrShrinks() {

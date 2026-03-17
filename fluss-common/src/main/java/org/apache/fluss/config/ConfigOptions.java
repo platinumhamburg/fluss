@@ -1843,6 +1843,76 @@ public class ConfigOptions {
                             "The max fetch size for fetching log to apply to kv during recovering kv.");
 
     // ------------------------------------------------------------------------
+    //  ConfigOptions for KV lazy open
+    // ------------------------------------------------------------------------
+
+    public static final ConfigOption<Boolean> KV_LAZY_OPEN_ENABLED =
+            key("kv.lazy-open.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("Whether to enable KvTablet lazy open.");
+
+    public static final ConfigOption<Integer> KV_LAZY_OPEN_MAX_CONCURRENT_OPENS =
+            key("kv.lazy-open.max-concurrent-opens")
+                    .intType()
+                    .defaultValue(10)
+                    .withDescription("Max concurrent KvTablet open operations.");
+
+    public static final ConfigOption<Duration> KV_LAZY_OPEN_OPEN_TIMEOUT =
+            key("kv.lazy-open.open-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription("Timeout for a single KvTablet open operation.");
+
+    public static final ConfigOption<Duration> KV_LAZY_OPEN_FAILED_BACKOFF_BASE =
+            key("kv.lazy-open.failed-backoff-base")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(5))
+                    .withDescription("Base interval for failed state exponential backoff.");
+
+    public static final ConfigOption<Duration> KV_LAZY_OPEN_FAILED_BACKOFF_MAX =
+            key("kv.lazy-open.failed-backoff-max")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(5))
+                    .withDescription("Max interval for failed state exponential backoff.");
+
+    public static final ConfigOption<Integer> KV_LAZY_OPEN_PRE_OPEN_COUNT =
+            key("kv.lazy-open.pre-open-count")
+                    .intType()
+                    .defaultValue(64)
+                    .withDescription("Max number of KvTablets to pre-open at startup.");
+
+    public static final ConfigOption<Boolean> KV_LAZY_OPEN_IDLE_RELEASE_ENABLED =
+            key("kv.lazy-open.idle-release.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("Whether to enable background idle release of KvTablets.");
+
+    public static final ConfigOption<Duration> KV_LAZY_OPEN_IDLE_RELEASE_CHECK_INTERVAL =
+            key("kv.lazy-open.idle-release.check-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(60))
+                    .withDescription("Interval between idle release check rounds.");
+
+    public static final ConfigOption<Duration> KV_LAZY_OPEN_IDLE_RELEASE_IDLE_INTERVAL =
+            key("kv.lazy-open.idle-release.idle-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(24))
+                    .withDescription("Idle time before a KvTablet is eligible for release.");
+
+    public static final ConfigOption<Integer> KV_LAZY_OPEN_IDLE_RELEASE_MAX_OPEN_COUNT =
+            key("kv.lazy-open.idle-release.max-open-count")
+                    .intType()
+                    .defaultValue(128)
+                    .withDescription("Max simultaneously open KvTablets.");
+
+    public static final ConfigOption<Integer> KV_LAZY_OPEN_IDLE_RELEASE_MAX_CLOSE_PER_ROUND =
+            key("kv.lazy-open.idle-release.max-close-per-round")
+                    .intType()
+                    .defaultValue(100)
+                    .withDescription("Max KvTablets to release per idle release round.");
+
+    // ------------------------------------------------------------------------
     //  ConfigOptions for metrics
     // ------------------------------------------------------------------------
     public static final ConfigOption<List<String>> METRICS_REPORTERS =

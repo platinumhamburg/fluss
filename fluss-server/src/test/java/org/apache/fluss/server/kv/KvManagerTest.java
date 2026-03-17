@@ -299,6 +299,96 @@ final class KvManagerTest {
         assertThat(kvManager.getKv(tableBucket1)).isPresent();
     }
 
+    @ParameterizedTest
+    @MethodSource("partitionProvider")
+    void testRemoveKv(String partitionName) throws Exception {
+        initTableBuckets(partitionName);
+        KvTablet kv1 = getOrCreateKv(tablePath1, partitionName, tableBucket1);
+        File kvTabletDir = kv1.getKvTabletDir();
+
+        // remove from registry without closing or deleting directory
+        kvManager.removeKv(tableBucket1);
+
+        // verify removed from registry
+        assertThat(kvManager.getKv(tableBucket1)).isNotPresent();
+
+        // verify the local directory still exists on disk
+        assertThat(kvTabletDir).exists();
+    }
+
+    @ParameterizedTest
+    @MethodSource("partitionProvider")
+    void testDeleteLocalData(String partitionName) throws Exception {
+        initTableBuckets(partitionName);
+        KvTablet kv1 = getOrCreateKv(tablePath1, partitionName, tableBucket1);
+        File kvTabletDir = kv1.getKvTabletDir();
+
+        // verify directory exists after creation
+        assertThat(kvTabletDir).exists();
+
+        // close the kv tablet first to release RocksDB resources
+        kv1.close();
+
+        // remove from registry without deleting directory
+        kvManager.removeKv(tableBucket1);
+        assertThat(kvManager.getKv(tableBucket1)).isNotPresent();
+
+        // directory should still exist after removeKv
+        assertThat(kvTabletDir).exists();
+
+        // now delete the local data
+        PhysicalTablePath physicalTablePath =
+                PhysicalTablePath.of(
+                        tablePath1.getDatabaseName(), tablePath1.getTableName(), partitionName);
+        kvManager.deleteLocalData(physicalTablePath, tableBucket1);
+
+        // verify directory is deleted
+        assertThat(kvTabletDir).doesNotExist();
+
+        // verify registry is still empty (unaffected)
+        assertThat(kvManager.getKv(tableBucket1)).isNotPresent();
+    }
+
+    @Test
+    void testDeleteLocalDataNonExistentDir() {
+        initTableBuckets(null);
+        PhysicalTablePath physicalTablePath =
+                PhysicalTablePath.of(tablePath1.getDatabaseName(), tablePath1.getTableName(), null);
+        // should not throw when directory doesn't exist
+        kvManager.deleteLocalData(physicalTablePath, tableBucket1);
+    }
+
+    @ParameterizedTest
+    @MethodSource("partitionProvider")
+    void testCloseKvRemovesFromRegistryAndClosesButKeepsDirectory(String partitionName)
+            throws Exception {
+        initTableBuckets(partitionName);
+        KvTablet kv1 = getOrCreateKv(tablePath1, partitionName, tableBucket1);
+        File kvTabletDir = kv1.getKvTabletDir();
+
+        // close the kv tablet via KvManager
+        kvManager.closeKv(tableBucket1);
+
+        // verify removed from registry
+        assertThat(kvManager.getKv(tableBucket1)).isNotPresent();
+
+        // verify the local directory still exists on disk
+        assertThat(kvTabletDir).exists();
+
+        // verify the RocksDB is closed (checkIfRocksDBClosed should throw)
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                        () -> kv1.getRocksDBKv().checkIfRocksDBClosed())
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("is already closed");
+    }
+
+    @Test
+    void testCloseKvNonExistent() {
+        initTableBuckets(null);
+        // should not throw when closing a non-existent kv tablet
+        kvManager.closeKv(tableBucket1);
+    }
+
     @Test
     void testGetNonExistentKv() {
         initTableBuckets(null);

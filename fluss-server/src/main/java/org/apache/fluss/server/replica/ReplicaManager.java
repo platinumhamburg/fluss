@@ -75,8 +75,10 @@ import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
+import org.apache.fluss.server.kv.KvIdleReleaseController;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
+import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
@@ -107,10 +109,12 @@ import org.apache.fluss.server.replica.fetcher.ReplicaFetcherManager;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.ExecutorUtils;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.MapUtils;
 import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.concurrent.Scheduler;
 
 import org.slf4j.Logger;
@@ -129,9 +133,13 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -204,6 +212,10 @@ public class ReplicaManager {
     private final String internalListenerName;
 
     private final Clock clock;
+
+    private final boolean kvIdleReleaseEnabled;
+    private @Nullable KvIdleReleaseController kvIdleReleaseController;
+    private @Nullable ScheduledExecutorService kvIdleReleaseScheduler;
 
     public ReplicaManager(
             Configuration conf,
@@ -305,6 +317,53 @@ public class ReplicaManager {
         this.userMetrics = userMetrics;
         this.clock = clock;
         this.ioExecutor = ioExecutor;
+        this.kvIdleReleaseEnabled =
+                kvManager.isLazyOpenEnabled()
+                        && conf.get(ConfigOptions.KV_LAZY_OPEN_IDLE_RELEASE_ENABLED);
+        if (kvIdleReleaseEnabled) {
+            long checkIntervalMs =
+                    conf.get(ConfigOptions.KV_LAZY_OPEN_IDLE_RELEASE_CHECK_INTERVAL).toMillis();
+            long closeIdleIntervalMs =
+                    conf.get(ConfigOptions.KV_LAZY_OPEN_IDLE_RELEASE_IDLE_INTERVAL).toMillis();
+            int maxRuntimeOpen = conf.get(ConfigOptions.KV_LAZY_OPEN_IDLE_RELEASE_MAX_OPEN_COUNT);
+            int maxClosePerRound =
+                    conf.get(ConfigOptions.KV_LAZY_OPEN_IDLE_RELEASE_MAX_CLOSE_PER_ROUND);
+            checkArgument(
+                    checkIntervalMs > 0,
+                    "kv.lazy-open.idle-release.check-interval must be positive, got: %s ms",
+                    checkIntervalMs);
+            checkArgument(
+                    closeIdleIntervalMs > 0,
+                    "kv.lazy-open.idle-release.idle-interval must be positive, got: %s ms",
+                    closeIdleIntervalMs);
+            checkArgument(
+                    maxRuntimeOpen > 0,
+                    "kv.lazy-open.idle-release.max-open-count must be positive, got: %s",
+                    maxRuntimeOpen);
+            checkArgument(
+                    maxClosePerRound > 0,
+                    "kv.lazy-open.idle-release.max-close-per-round must be positive, got: %s",
+                    maxClosePerRound);
+            this.kvIdleReleaseScheduler =
+                    Executors.newSingleThreadScheduledExecutor(
+                            new ExecutorThreadFactory("kv-idle-release"));
+            this.kvIdleReleaseController =
+                    new KvIdleReleaseController(
+                            kvIdleReleaseScheduler,
+                            () ->
+                                    onlineReplicas()
+                                            .filter(Replica::isKvTable)
+                                            .map(Replica::getKvTablet)
+                                            .filter(Objects::nonNull)
+                                            .filter(KvTablet::isLazyOpen)
+                                            .collect(Collectors.toList()),
+                            clock,
+                            checkIntervalMs,
+                            closeIdleIntervalMs,
+                            maxRuntimeOpen,
+                            maxClosePerRound,
+                            serverMetricGroup.kvIdleReleaseTotal());
+        }
         registerMetrics();
     }
 
@@ -317,6 +376,11 @@ public class ReplicaManager {
                 this::maybeShrinkIsr,
                 0L,
                 conf.get(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME).toMillis() / 2);
+
+        // Start idle release controller if enabled
+        if (kvIdleReleaseController != null) {
+            kvIdleReleaseController.start();
+        }
     }
 
     public RemoteLogManager getRemoteLogManager() {
@@ -1962,6 +2026,14 @@ public class ReplicaManager {
     public static final class OfflineReplica implements HostedReplica {}
 
     public void shutdown() throws InterruptedException {
+        // Shut down the idle release controller if it was created
+        if (kvIdleReleaseController != null) {
+            kvIdleReleaseController.close();
+        }
+        if (kvIdleReleaseScheduler != null) {
+            ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, kvIdleReleaseScheduler);
+        }
+
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
         replicaFetcherManager.shutdown();
