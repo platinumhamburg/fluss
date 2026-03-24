@@ -31,6 +31,7 @@ import org.apache.fluss.server.index.IndexApplier;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.concurrent.ShutdownableThread;
 
 import org.slf4j.Logger;
@@ -40,6 +41,7 @@ import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -320,15 +322,36 @@ public class IndexFetcherManager {
         public void doWork() {
             List<IndexFetcherThread> threadsToShutdown = null;
             try {
+                // Capture timestamp once for the entire cycle. Phase 2 may take time,
+                // so Phase 3's markFailed() timestamps will be slightly stale — this is
+                // an accepted trade-off (targets may retry ~seconds sooner than the 5s backoff).
+                long now = System.currentTimeMillis();
+
+                // Phase 1: Plan (locked, pure memory)
+                ReconciliationPlan plan;
                 synchronized (lock) {
                     if (!running) {
                         return;
                     }
-                    threadsToShutdown = reconcile();
+                    plan = planReconciliation(now);
                 }
 
-                // Shutdown old threads outside of lock to avoid blocking other operations
-                // This is done before wait() to clean up resources promptly
+                // Phase 2: Resolve (unlocked, batch ZK IO)
+                // null = ZK call failed entirely; empty map = no queries needed or success
+                Map<TableBucket, LeaderAndIsr> zkResults = Collections.emptyMap();
+                if (plan.hasZkQueries()) {
+                    zkResults = resolveLeaders(plan);
+                }
+
+                // Phase 3: Apply (locked, pure memory)
+                synchronized (lock) {
+                    if (!running) {
+                        return;
+                    }
+                    threadsToShutdown = applyPlanAndExecute(plan, zkResults, now);
+                }
+
+                // Phase 4: Cleanup (unlocked)
                 if (threadsToShutdown != null && !threadsToShutdown.isEmpty()) {
                     for (IndexFetcherThread thread : threadsToShutdown) {
                         try {
@@ -354,39 +377,6 @@ public class IndexFetcherManager {
                 LOG.error("Error during reconciliation", e);
             }
         }
-    }
-
-    /**
-     * Main reconciliation logic. Must be called while holding the lock.
-     *
-     * @return list of old threads that need to be shut down outside of lock
-     */
-    @GuardedBy("lock")
-    private List<IndexFetcherThread> reconcile() {
-        long now = System.currentTimeMillis();
-
-        // Step 1: Process failures reported by fetcher threads
-        int failureCount = processFailedBuckets(now);
-
-        // Step 2: Health check - detect fetcher threads bound to dead servers
-        checkFetcherThreadHealth(now);
-
-        // Step 3: Classify targets and determine actions
-        Map<ServerIdAndFetcherId, List<IndexFetcherTarget>> toCreate = new HashMap<>();
-        classifyTargets(now, toCreate);
-
-        // Step 4: Execute creations (may collect threads to shutdown)
-        List<IndexFetcherThread> threadsToShutdown = executeCreations(toCreate, now);
-
-        if (failureCount > 0 || !toCreate.isEmpty()) {
-            LOG.info(
-                    "Reconciliation: {} failures processed, {} targets to create, {} fetcher threads",
-                    failureCount,
-                    toCreate.values().stream().mapToInt(List::size).sum(),
-                    fetcherThreads.size());
-        }
-
-        return threadsToShutdown;
     }
 
     /**
@@ -483,20 +473,30 @@ public class IndexFetcherManager {
                 || lower.contains("disconnected");
     }
 
-    /** Classifies all targets and prepares creation actions. */
+    /**
+     * Phase 1: Plan reconciliation actions. Pure memory operations only. Classifies targets and
+     * collects ZK query needs for Phase 2.
+     */
     @GuardedBy("lock")
-    private void classifyTargets(
-            long now, Map<ServerIdAndFetcherId, List<IndexFetcherTarget>> toCreate) {
+    private ReconciliationPlan planReconciliation(long now) {
+        // Step 1: Process failures reported by fetcher threads (unchanged)
+        processFailedBuckets(now);
+
+        // Step 2: Health check (unchanged)
+        checkFetcherThreadHealth(now);
+
+        // Step 3: Classify targets
+        ReconciliationPlan plan = new ReconciliationPlan();
 
         for (Map<TableBucket, IndexFetcherTarget> indexTargets : targets.values()) {
             for (IndexFetcherTarget target : indexTargets.values()) {
                 switch (target.getState()) {
                     case PENDING:
                     case FAILED:
-                        handlePendingOrFailed(target, toCreate, now);
+                        planPendingOrFailed(target, plan, now);
                         break;
                     case RUNNING:
-                        handleRunning(target, now);
+                        planRunning(target, plan, now);
                         break;
                     case CREATING:
                         handleCreating(target, now);
@@ -504,53 +504,16 @@ public class IndexFetcherManager {
                 }
             }
         }
+
+        return plan;
     }
 
-    /** Handles a target in PENDING or FAILED state. */
+    /**
+     * Plans action for a RUNNING target. No ZK calls. Cache miss targets are deferred to Phase 2
+     * batch ZK query.
+     */
     @GuardedBy("lock")
-    private void handlePendingOrFailed(
-            IndexFetcherTarget target,
-            Map<ServerIdAndFetcherId, List<IndexFetcherTarget>> toCreate,
-            long now) {
-
-        if (!target.isReadyForRetry(now)) {
-            return;
-        }
-
-        // Query leader
-        LeaderInfo leaderInfo = queryLeader(target);
-        if (!leaderInfo.isValid()) {
-            target.markFailed(leaderInfo.reason, now);
-            return;
-        }
-
-        int leaderId = leaderInfo.leaderId;
-        target.setLastKnownLeaderServerId(leaderId);
-
-        // Log state transition
-        if (target.getState() == IndexFetcherTarget.State.PENDING) {
-            LOG.info(
-                    "Starting fetch for {}, leader: {}",
-                    target.getDataIndexTableBucket(),
-                    leaderId);
-        } else {
-            LOG.info(
-                    "Retrying {} (attempt {}), leader: {}, last failure: {}",
-                    target.getDataIndexTableBucket(),
-                    target.getFailureCount() + 1,
-                    leaderId,
-                    target.getLastFailureReason());
-        }
-
-        // Schedule for creation
-        ServerIdAndFetcherId fetcherId =
-                new ServerIdAndFetcherId(leaderId, computeFetcherId(target.getDataBucket()));
-        toCreate.computeIfAbsent(fetcherId, k -> new ArrayList<>()).add(target);
-    }
-
-    /** Handles a target in RUNNING state - checks for server liveness and leader changes. */
-    @GuardedBy("lock")
-    private void handleRunning(IndexFetcherTarget target, long now) {
+    private void planRunning(IndexFetcherTarget target, ReconciliationPlan plan, long now) {
         int lastLeader = target.getLastKnownLeaderServerId();
         if (lastLeader == INVALID_LEADER_ID) {
             return;
@@ -568,8 +531,7 @@ public class IndexFetcherManager {
             }
         }
 
-        // Check if the server bound to this target is still alive in the server node cache.
-        // This detects node crashes before the metadata cache is updated.
+        // Check if the server bound to this target is still alive
         if (!serverNodeCache.apply(lastLeader).isPresent()) {
             LOG.warn(
                     "Server {} is no longer in server node cache for {}, marking failed",
@@ -584,52 +546,18 @@ public class IndexFetcherManager {
         Optional<Integer> leaderIdOpt = metadataCache.getBucketLeaderId(target.getDataBucket());
 
         if (!leaderIdOpt.isPresent() || leaderIdOpt.get() == INVALID_LEADER_ID) {
-            // Cache miss or no leader — this can happen when the Coordinator's
-            // UpdateMetadata RPC failed for this server (e.g., during rolling upgrade).
-            // Before marking FAILED, try ZK fallback to check if the current leader
-            // is still valid. This prevents the RUNNING→FAILED dead loop.
-            boolean shouldFail = true;
-            try {
-                Optional<Integer> zkLeaderOpt =
-                        zkClient.getLeaderAndIsr(target.getDataBucket())
-                                .map(leaderAndIsr -> leaderAndIsr.leader());
-                if (zkLeaderOpt.isPresent() && zkLeaderOpt.get() == lastLeader) {
-                    // ZK confirms the current leader is still correct — the cache is just
-                    // missing the entry. Keep the fetcher running.
-                    LOG.debug(
-                            "Cache miss for {} but ZK confirms leader {} is still valid, "
-                                    + "keeping fetcher running",
+            // Cache miss — defer to Phase 2 batch ZK query instead of blocking here
+            plan.runningNeedsZk.put(
+                    target.getDataIndexTableBucket(),
+                    new PendingLeaderCheck(
+                            target.getDataIndexTableBucket(),
                             target.getDataBucket(),
-                            lastLeader);
-                    shouldFail = false;
-                } else if (zkLeaderOpt.isPresent()
-                        && zkLeaderOpt.get() != INVALID_LEADER_ID
-                        && serverNodeCache.apply(zkLeaderOpt.get()).isPresent()) {
-                    // ZK reports a different valid leader — need to switch fetcher
-                    LOG.info(
-                            "Cache miss for {} but ZK reports new leader {} (was {}), "
-                                    + "marking failed to trigger re-creation",
-                            target.getDataBucket(),
-                            zkLeaderOpt.get(),
-                            lastLeader);
-                    shouldFail = true;
-                }
-            } catch (Exception e) {
-                LOG.warn(
-                        "Failed to query ZK for {} during cache miss handling: {}",
-                        target.getDataBucket(),
-                        e.getMessage());
-            }
-
-            if (shouldFail) {
-                LOG.info("Leader unavailable for {}, marking failed", target.getDataBucket());
-                target.markFailed("Leader unavailable in cache", now);
-                removeFromFetcher(target.getDataIndexTableBucket());
-            }
+                            lastLeader,
+                            target.getState()));
         } else if (leaderIdOpt.get() != lastLeader) {
             int newLeader = leaderIdOpt.get();
 
-            // Validation 1: new leader not in alive server list → ignore dirty cache
+            // Validation 1: new leader not in alive server list -> ignore dirty cache
             if (!serverNodeCache.apply(newLeader).isPresent()) {
                 LOG.warn(
                         "Cache reports leader change for {} to dead server {}, ignoring",
@@ -638,7 +566,7 @@ public class IndexFetcherManager {
                 return;
             }
 
-            // Validation 2: current fetcher recently successful → don't kill
+            // Validation 2: current fetcher recently successful -> don't kill
             long timeSinceLastSuccess = now - target.getLastSuccessfulFetchTimestamp();
             if (timeSinceLastSuccess < RECONCILIATION_INTERVAL_MS * 2) {
                 LOG.debug(
@@ -657,6 +585,276 @@ public class IndexFetcherManager {
                     String.format("Leader changed from %d to %d", lastLeader, leaderIdOpt.get()),
                     now);
             removeFromFetcher(target.getDataIndexTableBucket());
+        }
+        // else: cache hit, leader unchanged -> no action needed
+    }
+
+    /**
+     * Plans action for a PENDING or FAILED target. No ZK calls. Cache miss targets are deferred to
+     * Phase 2 batch ZK query.
+     */
+    @GuardedBy("lock")
+    private void planPendingOrFailed(IndexFetcherTarget target, ReconciliationPlan plan, long now) {
+
+        if (!target.isReadyForRetry(now)) {
+            return;
+        }
+
+        // Try cache first
+        Optional<Integer> leaderIdOpt = metadataCache.getBucketLeaderId(target.getDataBucket());
+
+        boolean needsZk = false;
+        if (!leaderIdOpt.isPresent()) {
+            needsZk = true;
+        } else {
+            int leaderId = leaderIdOpt.get();
+            if (leaderId == INVALID_LEADER_ID) {
+                needsZk = true;
+            } else if (target.getState() == IndexFetcherTarget.State.FAILED) {
+                // For FAILED targets: if cache returns same leader that failed before,
+                // or leader's server is dead, or failed >= 2 times, need ZK verification
+                if (leaderId == target.getLastKnownLeaderServerId()
+                        || !serverNodeCache.apply(leaderId).isPresent()
+                        || target.getFailureCount() >= 2) {
+                    needsZk = true;
+                }
+            }
+        }
+
+        if (needsZk) {
+            // Defer to Phase 2 batch ZK query
+            plan.failedNeedsZk.put(
+                    target.getDataIndexTableBucket(),
+                    new PendingLeaderQuery(
+                            target.getDataIndexTableBucket(),
+                            target.getDataBucket(),
+                            target.getFailureCount(),
+                            target.getLastKnownLeaderServerId(),
+                            target.getLastAttemptTimestamp(),
+                            target.getState()));
+            return;
+        }
+
+        // Cache hit with valid leader — verify server is alive before scheduling
+        int leaderId = leaderIdOpt.get();
+        if (!serverNodeCache.apply(leaderId).isPresent()) {
+            // Leader server is dead — need ZK to find a new leader
+            plan.failedNeedsZk.put(
+                    target.getDataIndexTableBucket(),
+                    new PendingLeaderQuery(
+                            target.getDataIndexTableBucket(),
+                            target.getDataBucket(),
+                            target.getFailureCount(),
+                            target.getLastKnownLeaderServerId(),
+                            target.getLastAttemptTimestamp(),
+                            target.getState()));
+            return;
+        }
+        target.setLastKnownLeaderServerId(leaderId);
+
+        if (target.getState() == IndexFetcherTarget.State.PENDING) {
+            LOG.info(
+                    "Starting fetch for {}, leader: {}",
+                    target.getDataIndexTableBucket(),
+                    leaderId);
+        } else {
+            LOG.info(
+                    "Retrying {} (attempt {}), leader: {}, last failure: {}",
+                    target.getDataIndexTableBucket(),
+                    target.getFailureCount() + 1,
+                    leaderId,
+                    target.getLastFailureReason());
+        }
+
+        ServerIdAndFetcherId fetcherId =
+                new ServerIdAndFetcherId(leaderId, computeFetcherId(target.getDataBucket()));
+        plan.readyToCreate.computeIfAbsent(fetcherId, k -> new ArrayList<>()).add(target);
+    }
+
+    /**
+     * Phase 2: Resolve leaders via batch ZK query. Runs OUTSIDE the lock. Uses
+     * zkClient.getLeaderAndIsrs() which internally uses async background requests.
+     *
+     * @return map of data bucket to its LeaderAndIsr from ZK; null on failure
+     */
+    private Map<TableBucket, LeaderAndIsr> resolveLeaders(ReconciliationPlan plan) {
+        Set<TableBucket> bucketsToQuery = plan.collectZkQueryBuckets();
+        if (bucketsToQuery.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        try {
+            Map<TableBucket, LeaderAndIsr> results = zkClient.getLeaderAndIsrs(bucketsToQuery);
+            LOG.debug(
+                    "Batch ZK query resolved {} of {} buckets",
+                    results.size(),
+                    bucketsToQuery.size());
+            return results;
+        } catch (Exception e) {
+            LOG.warn(
+                    "Batch ZK leader query failed for {} buckets, will retry next cycle",
+                    bucketsToQuery.size(),
+                    e);
+            // Return null (not empty map) to distinguish "ZK call failed entirely"
+            // from "ZK returned no data for these buckets". Phase 3 uses this to
+            // avoid marking RUNNING targets FAILED on transient ZK failures.
+            return null;
+        }
+    }
+
+    /**
+     * Phase 3: Apply ZK results and execute fetcher creations. Pure memory operations only. Detects
+     * stale entries where target state changed between Phase 1 and Phase 3.
+     *
+     * @return list of old threads that need to be shut down outside of lock
+     */
+    @GuardedBy("lock")
+    private List<IndexFetcherThread> applyPlanAndExecute(
+            ReconciliationPlan plan, Map<TableBucket, LeaderAndIsr> zkResults, long now) {
+
+        // Apply ZK results for RUNNING targets with cache miss
+        applyRunningZkResults(plan, zkResults, now);
+
+        // Apply ZK results for FAILED/PENDING targets
+        applyFailedZkResults(plan, zkResults, now);
+
+        // Execute all fetcher creations (cache-hit from Phase 1 + ZK-resolved from above)
+        List<IndexFetcherThread> threadsToShutdown = executeCreations(plan.readyToCreate, now);
+
+        int totalResolved = plan.runningNeedsZk.size() + plan.failedNeedsZk.size();
+        if (totalResolved > 0 || !plan.readyToCreate.isEmpty()) {
+            LOG.info(
+                    "Reconciliation: {} ZK queries resolved, {} targets to create, {} fetcher threads",
+                    totalResolved,
+                    plan.readyToCreate.values().stream().mapToInt(List::size).sum(),
+                    fetcherThreads.size());
+        }
+
+        return threadsToShutdown;
+    }
+
+    /** Applies ZK results for RUNNING targets that had cache miss in Phase 1. */
+    @GuardedBy("lock")
+    private void applyRunningZkResults(
+            ReconciliationPlan plan, Map<TableBucket, LeaderAndIsr> zkResults, long now) {
+
+        if (zkResults == null) {
+            // Batch ZK call failed entirely — leave RUNNING targets as-is,
+            // they will be retried next reconciliation cycle. This avoids
+            // mass RUNNING→FAILED transitions on transient ZK failures.
+            LOG.debug(
+                    "Skipping {} RUNNING ZK results due to batch ZK failure",
+                    plan.runningNeedsZk.size());
+            return;
+        }
+
+        for (PendingLeaderCheck check : plan.runningNeedsZk.values()) {
+            IndexFetcherTarget target = findTarget(check.dataIndexBucket);
+
+            // Stale detection: target removed or state changed since Phase 1
+            if (target == null) {
+                continue;
+            }
+            if (target.getState() != check.expectedState
+                    || target.getLastKnownLeaderServerId() != check.lastKnownLeader) {
+                LOG.debug("Skipping stale RUNNING ZK result for {}", check.dataIndexBucket);
+                continue;
+            }
+
+            LeaderAndIsr leaderAndIsr = zkResults.get(check.dataBucket);
+            if (leaderAndIsr == null) {
+                // ZK has no data or query failed — mark FAILED, retry next cycle
+                LOG.info("Leader unavailable in ZK for {}, marking failed", check.dataBucket);
+                target.markFailed("Leader unavailable in ZK", now);
+                removeFromFetcher(check.dataIndexBucket);
+            } else if (leaderAndIsr.leader() == check.lastKnownLeader) {
+                // ZK confirms current leader is still valid — keep RUNNING
+                LOG.debug(
+                        "ZK confirms leader {} is still valid for {}, keeping fetcher running",
+                        check.lastKnownLeader,
+                        check.dataBucket);
+            } else if (leaderAndIsr.leader() != INVALID_LEADER_ID
+                    && serverNodeCache.apply(leaderAndIsr.leader()).isPresent()) {
+                // ZK reports a different valid leader — mark FAILED to trigger re-creation
+                LOG.info(
+                        "ZK reports new leader {} for {} (was {}), marking failed",
+                        leaderAndIsr.leader(),
+                        check.dataBucket,
+                        check.lastKnownLeader);
+                target.markFailed(
+                        String.format(
+                                "Leader changed from %d to %d (from ZK)",
+                                check.lastKnownLeader, leaderAndIsr.leader()),
+                        now);
+                removeFromFetcher(check.dataIndexBucket);
+            } else {
+                // ZK reports invalid leader or dead server
+                LOG.info("Leader unavailable for {}, marking failed", check.dataBucket);
+                target.markFailed("Leader unavailable in ZK", now);
+                removeFromFetcher(check.dataIndexBucket);
+            }
+        }
+    }
+
+    /** Applies ZK results for FAILED/PENDING targets that needed leader resolution. */
+    @GuardedBy("lock")
+    private void applyFailedZkResults(
+            ReconciliationPlan plan, Map<TableBucket, LeaderAndIsr> zkResults, long now) {
+
+        if (zkResults == null) {
+            // Batch ZK call failed — FAILED/PENDING targets stay as-is,
+            // will retry next cycle
+            return;
+        }
+
+        for (PendingLeaderQuery query : plan.failedNeedsZk.values()) {
+            IndexFetcherTarget target = findTarget(query.dataIndexBucket);
+
+            // Stale detection: target removed or state changed since Phase 1
+            if (target == null) {
+                continue;
+            }
+            if (target.getState() != query.expectedState
+                    || target.getFailureCount() != query.failureCount
+                    || target.getLastAttemptTimestamp() != query.lastAttemptTimestamp) {
+                LOG.debug("Skipping stale FAILED ZK result for {}", query.dataIndexBucket);
+                continue;
+            }
+
+            LeaderAndIsr leaderAndIsr = zkResults.get(query.dataBucket);
+            if (leaderAndIsr == null || leaderAndIsr.leader() == INVALID_LEADER_ID) {
+                // No leader found in ZK
+                target.markFailed("Leader not found in ZK for " + query.dataBucket, now);
+                continue;
+            }
+
+            int leaderId = leaderAndIsr.leader();
+            if (!serverNodeCache.apply(leaderId).isPresent()) {
+                // Leader server is dead
+                target.markFailed(String.format("Leader %d from ZK is not alive", leaderId), now);
+                continue;
+            }
+
+            // Valid leader found — schedule for creation
+            target.setLastKnownLeaderServerId(leaderId);
+
+            if (target.getState() == IndexFetcherTarget.State.PENDING) {
+                LOG.info(
+                        "Starting fetch for {}, leader: {} (from ZK)",
+                        target.getDataIndexTableBucket(),
+                        leaderId);
+            } else {
+                LOG.info(
+                        "Retrying {} (attempt {}), leader: {} (from ZK), last failure: {}",
+                        target.getDataIndexTableBucket(),
+                        target.getFailureCount() + 1,
+                        leaderId,
+                        target.getLastFailureReason());
+            }
+
+            ServerIdAndFetcherId fetcherId =
+                    new ServerIdAndFetcherId(leaderId, computeFetcherId(target.getDataBucket()));
+            plan.readyToCreate.computeIfAbsent(fetcherId, k -> new ArrayList<>()).add(target);
         }
     }
 
@@ -703,74 +901,76 @@ public class IndexFetcherManager {
 
     // ==================== Leader Query ====================
 
-    /** Result of a leader query. */
-    private static class LeaderInfo {
-        final int leaderId;
-        final String reason;
+    /** Plan produced by Phase 1, consumed by Phase 2 and 3. */
+    static class ReconciliationPlan {
+        /** RUNNING targets with cache miss, need ZK to confirm leader validity. */
+        final Map<DataIndexTableBucket, PendingLeaderCheck> runningNeedsZk = new HashMap<>();
 
-        LeaderInfo(int leaderId, String reason) {
-            this.leaderId = leaderId;
-            this.reason = reason;
+        /** FAILED/PENDING targets that need ZK to resolve leader. */
+        final Map<DataIndexTableBucket, PendingLeaderQuery> failedNeedsZk = new HashMap<>();
+
+        /** Cache-hit targets ready to create fetchers. */
+        final Map<ServerIdAndFetcherId, List<IndexFetcherTarget>> readyToCreate = new HashMap<>();
+
+        /** Collect deduplicated data buckets for batch ZK query. */
+        Set<TableBucket> collectZkQueryBuckets() {
+            Set<TableBucket> buckets = new HashSet<>();
+            for (PendingLeaderCheck c : runningNeedsZk.values()) {
+                buckets.add(c.dataBucket);
+            }
+            for (PendingLeaderQuery q : failedNeedsZk.values()) {
+                buckets.add(q.dataBucket);
+            }
+            return buckets;
         }
 
-        boolean isValid() {
-            return leaderId > INVALID_LEADER_ID;
-        }
-
-        static LeaderInfo valid(int leaderId) {
-            return new LeaderInfo(leaderId, null);
-        }
-
-        static LeaderInfo invalid(String reason) {
-            return new LeaderInfo(INVALID_LEADER_ID, reason);
+        boolean hasZkQueries() {
+            return !runningNeedsZk.isEmpty() || !failedNeedsZk.isEmpty();
         }
     }
 
-    /** Queries the leader for a target's data bucket. */
-    @GuardedBy("lock")
-    private LeaderInfo queryLeader(IndexFetcherTarget target) {
-        Optional<Integer> leaderIdOpt;
-        boolean fromZK = false;
+    /** Snapshot of a RUNNING target that needs ZK leader confirmation. */
+    static class PendingLeaderCheck {
+        final DataIndexTableBucket dataIndexBucket;
+        final TableBucket dataBucket;
+        final int lastKnownLeader;
+        final IndexFetcherTarget.State expectedState;
 
-        if (target.getState() == IndexFetcherTarget.State.FAILED) {
-            // For failed targets, try cache first, then ZK if same leader or not found
-            leaderIdOpt = metadataCache.getBucketLeaderId(target.getDataBucket());
-            if (!leaderIdOpt.isPresent()
-                    || leaderIdOpt.get() == target.getLastKnownLeaderServerId()
-                    || !serverNodeCache.apply(leaderIdOpt.get()).isPresent()
-                    || target.getFailureCount() >= 2) {
-                // Query ZK directly for fresh leader info
-                try {
-                    leaderIdOpt =
-                            zkClient.getLeaderAndIsr(target.getDataBucket())
-                                    .map(leaderAndIsr -> leaderAndIsr.leader());
-                    fromZK = true;
-                } catch (Exception e) {
-                    LOG.warn(
-                            "Failed to query leader from ZK for {}: {}",
-                            target.getDataBucket(),
-                            e.getMessage());
-                    return LeaderInfo.invalid("ZK query failed: " + e.getMessage());
-                }
-            }
-        } else {
-            leaderIdOpt = metadataCache.getBucketLeaderId(target.getDataBucket());
+        PendingLeaderCheck(
+                DataIndexTableBucket dataIndexBucket,
+                TableBucket dataBucket,
+                int lastKnownLeader,
+                IndexFetcherTarget.State expectedState) {
+            this.dataIndexBucket = dataIndexBucket;
+            this.dataBucket = dataBucket;
+            this.lastKnownLeader = lastKnownLeader;
+            this.expectedState = expectedState;
         }
+    }
 
-        if (!leaderIdOpt.isPresent()) {
-            String reason =
-                    String.format(
-                            "Leader not found for %s%s",
-                            target.getDataBucket(), fromZK ? " (from ZK)" : "");
-            return LeaderInfo.invalid(reason);
+    /** Snapshot of a FAILED/PENDING target that needs ZK leader resolution. */
+    static class PendingLeaderQuery {
+        final DataIndexTableBucket dataIndexBucket;
+        final TableBucket dataBucket;
+        final int failureCount;
+        final int lastKnownLeader;
+        final long lastAttemptTimestamp;
+        final IndexFetcherTarget.State expectedState;
+
+        PendingLeaderQuery(
+                DataIndexTableBucket dataIndexBucket,
+                TableBucket dataBucket,
+                int failureCount,
+                int lastKnownLeader,
+                long lastAttemptTimestamp,
+                IndexFetcherTarget.State expectedState) {
+            this.dataIndexBucket = dataIndexBucket;
+            this.dataBucket = dataBucket;
+            this.failureCount = failureCount;
+            this.lastKnownLeader = lastKnownLeader;
+            this.lastAttemptTimestamp = lastAttemptTimestamp;
+            this.expectedState = expectedState;
         }
-
-        int leaderId = leaderIdOpt.get();
-        if (leaderId == INVALID_LEADER_ID) {
-            return LeaderInfo.invalid("No leader elected for " + target.getDataBucket());
-        }
-
-        return LeaderInfo.valid(leaderId);
     }
 
     // ==================== Fetcher Management ====================

@@ -764,8 +764,17 @@ public class ReplicaManager {
             int maxBytes) {
         try {
             Replica replica = getReplicaOrException(dataBucket);
-            checkArgument(
-                    replica.isLeader(), "Replica of data bucket %s is not leader", dataBucket);
+            if (!replica.isLeader()) {
+                return Tuple2.of(
+                        0,
+                        DataBucketIndexFetchResult.errorResult(
+                                indexRequests.keySet(),
+                                new ApiError(
+                                        Errors.NOT_LEADER_OR_FOLLOWER,
+                                        "Replica of data bucket "
+                                                + dataBucket
+                                                + " is not leader")));
+            }
 
             Tuple2<Integer, Optional<Map<TableBucket, IndexSegment>>> fetchResult =
                     replica.fetchIndex(indexRequests, params.minAdvancedOffset(), maxBytes, false);

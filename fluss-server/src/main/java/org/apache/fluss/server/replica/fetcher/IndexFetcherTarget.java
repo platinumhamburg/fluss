@@ -140,6 +140,10 @@ class IndexFetcherTarget {
         return lastSuccessfulFetchTimestamp;
     }
 
+    long getLastAttemptTimestamp() {
+        return lastAttemptTimestamp;
+    }
+
     // ==================== State Transitions ====================
 
     void setState(State state) {

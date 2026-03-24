@@ -149,14 +149,15 @@ class IndexFetcherManagerQueryLeaderAlternatingTest {
     }
 
     /**
-     * Reproduces the alternating leader bug.
+     * Verifies that the Plan-Resolve-Apply reconciliation consistently uses the correct leader from
+     * ZK, never the stale leader from cache.
      *
-     * <p>After server 18 crashes and ZK has leader=17, the reconciliation should consistently
-     * converge to leader=17. Instead, with the bug, fetcher creation alternates between 17 and 18.
+     * <p>With the old single-phase reconciliation, queryLeader() would alternate between cache
+     * (stale leader=18) and ZK (correct leader=17). The new three-phase model eliminates this by
+     * always using batch ZK for cache-miss or stale-leader scenarios.
      *
-     * <p>Expected (after fix): all fetcher creations from FAILED state use leader=17.
-     *
-     * <p>Actual (with bug): fetcher creations alternate [18, 17, 18, 17, ...].
+     * <p>Expected: all fetcher creations use the correct leader=17 (from ZK), never the dead
+     * server=18 (from stale cache).
      */
     @Test
     void testQueryLeaderShouldNotAlternateBetweenCacheAndZk() throws Exception {
@@ -172,16 +173,7 @@ class IndexFetcherManagerQueryLeaderAlternatingTest {
 
         fetcherManager.addOrUpdateTargetsForIndexBucket(indexBucket, targetInfos);
 
-        // Do NOT start the background reconciliation thread — drive reconciliation synchronously
-        // to avoid timing issues with async thread shutdown and lock.wait().
-
-        // Drive the reconciliation loop. Each reconcileSync() does one full cycle:
-        //   processFailedBuckets → checkFetcherThreadHealth → classifyTargets → executeCreations
-        // Between cycles, expire the retry backoff so FAILED targets retry immediately.
-        //
-        // After each cycle where the target transitions from FAILED to RUNNING, record which
-        // leader it was assigned to. This captures the alternating pattern even when fetcher
-        // threads are reused (createFetcherThread not called again for same server).
+        // Drive reconciliation synchronously, recording all leader assignments
         List<Integer> assignedLeaders = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
             fetcherManager.expireRetryBackoff(dataIndexBucket);
@@ -189,36 +181,31 @@ class IndexFetcherManagerQueryLeaderAlternatingTest {
             IndexFetcherTarget.State stateBefore = target != null ? target.getState() : null;
             fetcherManager.reconcileSync();
             IndexFetcherTarget.State stateAfter = target != null ? target.getState() : null;
-            // Record the leader when target transitions to RUNNING (i.e., a new fetch assignment)
+            // Record the leader on any transition to RUNNING
             if (stateAfter == IndexFetcherTarget.State.RUNNING
                     && stateBefore != IndexFetcherTarget.State.RUNNING) {
                 assignedLeaders.add(target.getLastKnownLeaderServerId());
             }
+            // Allow fetcher thread time to execute a fetch cycle and report failure
+            Thread.sleep(200);
         }
 
+        // Should have at least 1 assignment (PENDING→RUNNING on first cycle)
+        assertThat(assignedLeaders)
+                .as("Should have at least 1 RUNNING transition across reconciliation cycles")
+                .isNotEmpty();
+
+        // Core invariant: NO assignment should ever use the dead server (stale cache leader).
+        // In the new Plan-Resolve-Apply model, the stale cache leader=18 is detected as dead
+        // in planPendingOrFailed() (serverNodeCache check), so it always falls through to
+        // batch ZK which returns the correct leader=17.
         assertThat(assignedLeaders)
                 .as(
-                        "Should have at least 2 FAILED→RUNNING transitions across reconciliation cycles")
-                .hasSizeGreaterThanOrEqualTo(2);
-
-        // The first assignment is from PENDING state (uses cache → gets 18). That's expected.
-        // All subsequent assignments from FAILED state should consistently use the correct
-        // leader from ZK (17), not alternate between 17 and 18.
-        List<Integer> afterFirstAssignment = assignedLeaders.subList(1, assignedLeaders.size());
-
-        // With the bug: afterFirstAssignment contains both 17 and 18 (alternating)
-        // After fix: afterFirstAssignment should contain only 17
-        boolean hasStaleLeader = afterFirstAssignment.contains(DEAD_SERVER_ID);
-
-        assertThat(hasStaleLeader)
-                .as(
-                        "Bug: queryLeader() alternates between ZK (leader=%d) and stale cache "
-                                + "(leader=%d). Assigned leader sequence: %s. "
-                                + "Root cause: markFailed() does not update lastKnownLeaderServerId, "
-                                + "so the ZK fallback condition 'cache_leader == lastKnownLeader' "
-                                + "only matches every other round.",
-                        CORRECT_LEADER_ID, DEAD_SERVER_ID, assignedLeaders)
-                .isFalse();
+                        "No assignment should use the dead server %d (stale cache). "
+                                + "All assignments should use the correct leader %d (from ZK). "
+                                + "Assigned leader sequence: %s",
+                        DEAD_SERVER_ID, CORRECT_LEADER_ID, assignedLeaders)
+                .doesNotContain(DEAD_SERVER_ID);
     }
 
     // ==================== Test Doubles (No Mockito) ====================
@@ -440,8 +427,8 @@ class IndexFetcherManagerQueryLeaderAlternatingTest {
         }
 
         /**
-         * Runs one synchronous reconciliation cycle, including shutting down old threads. This
-         * avoids the timing issues of the async FetcherReconciliationThread.
+         * Runs one synchronous reconciliation cycle using the Plan-Resolve-Apply three-phase model,
+         * including shutting down old threads.
          */
         void reconcileSync() {
             try {
@@ -449,19 +436,54 @@ class IndexFetcherManagerQueryLeaderAlternatingTest {
                 lockField.setAccessible(true);
                 Object lock = lockField.get(this);
 
-                java.lang.reflect.Method reconcileMethod =
-                        IndexFetcherManager.class.getDeclaredMethod("reconcile");
-                reconcileMethod.setAccessible(true);
+                // Phase 1: Plan (locked)
+                java.lang.reflect.Method planMethod =
+                        IndexFetcherManager.class.getDeclaredMethod(
+                                "planReconciliation", long.class);
+                planMethod.setAccessible(true);
+
+                Object plan;
+                synchronized (lock) {
+                    plan = planMethod.invoke(this, System.currentTimeMillis());
+                }
+
+                // Phase 2: Resolve (unlocked)
+                java.lang.reflect.Method resolveMethod =
+                        IndexFetcherManager.class.getDeclaredMethod(
+                                "resolveLeaders", ReconciliationPlan.class);
+                resolveMethod.setAccessible(true);
+
+                java.lang.reflect.Method hasZkMethod =
+                        ReconciliationPlan.class.getDeclaredMethod("hasZkQueries");
+                hasZkMethod.setAccessible(true);
+
+                @SuppressWarnings("unchecked")
+                Map<TableBucket, org.apache.fluss.server.zk.data.LeaderAndIsr> zkResults =
+                        (boolean) hasZkMethod.invoke(plan)
+                                ? (Map<TableBucket, org.apache.fluss.server.zk.data.LeaderAndIsr>)
+                                        resolveMethod.invoke(this, plan)
+                                : java.util.Collections.emptyMap();
+
+                // Phase 3: Apply (locked)
+                java.lang.reflect.Method applyMethod =
+                        IndexFetcherManager.class.getDeclaredMethod(
+                                "applyPlanAndExecute",
+                                ReconciliationPlan.class,
+                                Map.class,
+                                long.class);
+                applyMethod.setAccessible(true);
 
                 List<?> threadsToShutdown;
                 synchronized (lock) {
                     @SuppressWarnings("unchecked")
                     List<IndexFetcherThread> result =
-                            (List<IndexFetcherThread>) reconcileMethod.invoke(this);
+                            (List<IndexFetcherThread>)
+                                    applyMethod.invoke(
+                                            this, plan, zkResults, System.currentTimeMillis());
                     threadsToShutdown = result;
                 }
 
-                // Shutdown old threads outside of lock (same as the real reconciliation thread)
+                // Shutdown old threads outside of lock
                 if (threadsToShutdown != null) {
                     for (Object thread : threadsToShutdown) {
                         ((IndexFetcherThread) thread).shutdown();

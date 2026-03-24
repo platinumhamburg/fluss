@@ -490,8 +490,14 @@ final class IndexFetcherThread extends ShutdownableThread {
                         indexResultData.getError().message());
                 // Increment error metrics for index fetch failures
                 serverMetricGroup.indexFetchErrors().inc();
-                // Add index bucket to error set for retry
-                indexBucketsWithError.add(dataIndexBucket);
+                // Report to IndexFetcherManager for leader rediscovery instead of
+                // silently retrying on the same (potentially wrong) leader
+                bucketsToInvalidate.put(
+                        dataIndexBucket,
+                        "UNKNOWN_ERROR: "
+                                + indexResultData.getError().error()
+                                + " - "
+                                + indexResultData.getError().message());
         }
     }
 
