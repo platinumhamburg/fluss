@@ -1148,7 +1148,18 @@ public final class Replica {
                 autoIncIDRange = null;
             }
 
-            logTablet.updateMinRetainOffset(restoreStartOffset);
+            // For tables with indexes, do NOT advance minRetainOffset during recovery.
+            // restoreStartOffset reflects the OLD leader's index replication progress,
+            // but IndexBuckets on the NEW leader may recover from an earlier INDEX TABLE
+            // snapshot, requiring WAL data in [indexReplicationOffset, restoreStartOffset).
+            // Advancing minRetainOffset here would allow WAL cleanup before index
+            // replication catches up, causing a permanent deadlock.
+            // minRetainOffset stays at 0 (changelog default) until the first snapshot
+            // completes, at which point flushedLogOffset = min(HW, indexCommitHorizon)
+            // correctly accounts for index replication progress.
+            if (!isTableWithIndexes) {
+                logTablet.updateMinRetainOffset(restoreStartOffset);
+            }
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
 
             // Restore index replication offsets for index tables
