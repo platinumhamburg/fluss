@@ -19,9 +19,6 @@ package org.apache.fluss.record;
 
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.memory.MemorySegment;
-import org.apache.fluss.record.bytesview.BytesView;
-import org.apache.fluss.record.bytesview.FileRegionBytesView;
-import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.FileUtils;
@@ -39,7 +36,6 @@ import java.util.Optional;
 import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
-import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
@@ -106,7 +102,6 @@ public class FileLogInputStream
 
         private DefaultLogRecordBatch fullBatch;
         private DefaultLogRecordBatch batchHeader;
-        private ByteBuffer cachedHeaderBuffer;
 
         // Cache for statistics to avoid repeated parsing
         private Optional<LogRecordBatchStatistics> cachedStatistics = null;
@@ -137,86 +132,6 @@ public class FileLogInputStream
 
         public int position() {
             return position;
-        }
-
-        public BytesView getBytesView() {
-            return getBytesView(false);
-        }
-
-        /**
-         * Get the BytesView of this record batch.
-         *
-         * @param trimStatistics whether to trim statistics data from the batch
-         * @return the BytesView of this record batch, possibly without statistics
-         */
-        public BytesView getBytesView(boolean trimStatistics) {
-            if (!trimStatistics || magic < LOG_MAGIC_VALUE_V2) {
-                // No trimming needed, or statistics not supported in this version
-                return new FileRegionBytesView(fileRecords.channel(), position, sizeInBytes());
-            }
-
-            // Check if this batch has statistics
-            DefaultLogRecordBatch header = loadBatchHeader();
-            int statisticsLength = header.getStatisticsLength();
-
-            if (statisticsLength == 0) {
-                // No statistics present
-                return new FileRegionBytesView(fileRecords.channel(), position, sizeInBytes());
-            }
-
-            // Create a modified view that skips statistics data
-            return createTrimmedBytesView(statisticsLength);
-        }
-
-        /**
-         * Create a BytesView with statistics trimmed by modifying the header fields. In V2 format,
-         * statistics are placed between the header and records, so we skip the statistics portion.
-         *
-         * <p>Note: The CRC in the returned view is invalid because the header is modified (length
-         * updated, statistics flag cleared) without recomputing CRC. Callers must skip CRC
-         * validation for the trimmed batch.
-         *
-         * @param statisticsLength the length of statistics data to skip
-         * @return a BytesView with modified header and trimmed data
-         */
-        private BytesView createTrimmedBytesView(int statisticsLength) {
-            try {
-                int headerSize = recordBatchHeaderSize(magic);
-
-                // Calculate the new batch size without statistics
-                int newBatchSizeInBytes = sizeInBytes() - statisticsLength;
-                // Load the original header
-                byte[] modifiedHeaderBytes = new byte[headerSize];
-                cachedHeaderBuffer.rewind();
-                cachedHeaderBuffer.get(modifiedHeaderBytes);
-                ByteBuffer modifiedHeader = ByteBuffer.wrap(modifiedHeaderBytes);
-                modifiedHeader.order(ByteOrder.LITTLE_ENDIAN);
-
-                // Update the length field
-                modifiedHeader.position(LENGTH_OFFSET);
-                modifiedHeader.putInt(newBatchSizeInBytes - LOG_OVERHEAD);
-
-                // Clear statistics information from header
-                LogRecordBatchFormat.clearStatisticsFromHeader(modifiedHeader, magic);
-
-                // Build the composite BytesView: [modified header] + [records (skip statistics)]
-                MultiBytesView.Builder builder = MultiBytesView.builder();
-
-                // Add the modified header
-                builder.addBytes(modifiedHeaderBytes);
-
-                // Add the records part (skip statistics data between header and records)
-                int recordsStartPos = position + headerSize + statisticsLength;
-                int recordsSize = sizeInBytes() - headerSize - statisticsLength;
-                if (recordsSize > 0) {
-                    builder.addBytes(fileRecords.channel(), recordsStartPos, recordsSize);
-                }
-
-                return builder.build();
-            } catch (Exception e) {
-                LOG.warn("Failed to create trimmed BytesView, fallback to original", e);
-                return new FileRegionBytesView(fileRecords.channel(), position, sizeInBytes());
-            }
         }
 
         @Override
@@ -292,7 +207,7 @@ public class FileLogInputStream
         protected LogRecordBatch loadFullBatch() {
             if (fullBatch == null) {
                 batchHeader = null;
-                fullBatch = loadBatchWithSize(sizeInBytes(), true, "full record batch");
+                fullBatch = loadBatchWithSize(sizeInBytes(), "full record batch");
             }
             return fullBatch;
         }
@@ -303,7 +218,7 @@ public class FileLogInputStream
             }
 
             if (batchHeader == null) {
-                batchHeader = loadBatchWithSize(headerSize(), false, "record batch header");
+                batchHeader = loadBatchWithSize(headerSize(), "record batch header");
             }
 
             return batchHeader;
@@ -323,12 +238,8 @@ public class FileLogInputStream
             }
         }
 
-        private DefaultLogRecordBatch loadBatchWithSize(
-                int size, boolean isFull, String description) {
+        private DefaultLogRecordBatch loadBatchWithSize(int size, String description) {
             ByteBuffer buffer = loadByteBufferWithSize(size, position, description);
-            if (!isFull) {
-                cachedHeaderBuffer = buffer;
-            }
             return toMemoryRecordBatch(buffer);
         }
 
@@ -389,7 +300,7 @@ public class FileLogInputStream
         }
 
         private Optional<LogRecordBatchStatistics> parseStatistics(ReadContext context) {
-            if (magic < LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+            if (magic < LogRecordBatchFormat.LOG_MAGIC_VALUE_V1) {
                 return Optional.empty();
             }
 

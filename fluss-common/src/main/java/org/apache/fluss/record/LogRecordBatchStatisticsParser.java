@@ -18,10 +18,13 @@
 package org.apache.fluss.record;
 
 import org.apache.fluss.memory.MemorySegment;
-import org.apache.fluss.memory.MemorySegmentInputView;
 import org.apache.fluss.types.RowType;
 
-import java.io.IOException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
 import java.nio.ByteBuffer;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.STATISTICS_VERSION;
@@ -50,6 +53,25 @@ import static org.apache.fluss.record.LogRecordBatchFormat.STATISTICS_VERSION;
  */
 public class LogRecordBatchStatisticsParser {
 
+    private static final Logger LOG = LoggerFactory.getLogger(LogRecordBatchStatisticsParser.class);
+
+    // Fixed offsets within the statistics binary format.
+    // Format: Version(1B) | ColumnCount(2B) | ColumnIndexes(2*N B) | NullCounts(4*N B)
+    //         | MinValuesSize(4B) | MinValues(...) | MaxValuesSize(4B) | MaxValues(...)
+    private static final int VERSION_OFFSET = 0;
+    private static final int COLUMN_COUNT_OFFSET = 1;
+    private static final int COLUMN_INDEXES_OFFSET = 3;
+
+    /** Returns the byte offset where null counts begin, given N statistics columns. */
+    private static int nullCountsOffset(int columnCount) {
+        return COLUMN_INDEXES_OFFSET + 2 * columnCount;
+    }
+
+    /** Returns the byte offset where the min-values size field begins. */
+    private static int minValuesSizeOffset(int columnCount) {
+        return nullCountsOffset(columnCount) + 4 * columnCount;
+    }
+
     /**
      * Parse statistics data from a memory segment using the schema-aware format.
      *
@@ -65,59 +87,50 @@ public class LogRecordBatchStatisticsParser {
      * @return A DefaultLogRecordBatchStatistics object with zero-copy access to the data, or null
      *     if the data is invalid, corrupted, or has incompatible version
      */
+    @Nullable
     public static DefaultLogRecordBatchStatistics parseStatistics(
             MemorySegment segment, int position, RowType rowType, int schemaId) {
 
         try {
-            MemorySegmentInputView inputView = new MemorySegmentInputView(segment, position);
-            int currentPos = position;
-
-            // Read version
-            byte version = inputView.readByte();
-            currentPos += 1;
+            // Read version at fixed offset
+            byte version = segment.get(position + VERSION_OFFSET);
             if (version != STATISTICS_VERSION) {
                 return null;
             }
 
-            // Read statistics column count
-            int statisticsColumnCount = inputView.readShort();
-            currentPos += 2;
+            // Read statistics column count at fixed offset
+            short statisticsColumnCount = segment.getShort(position + COLUMN_COUNT_OFFSET);
+            if (statisticsColumnCount <= 0) {
+                return null;
+            }
 
-            // Read statistics column indexes
+            // Read statistics column indexes at fixed offset
+            int indexesStart = position + COLUMN_INDEXES_OFFSET;
             int[] statsIndexMapping = new int[statisticsColumnCount];
             for (int i = 0; i < statisticsColumnCount; i++) {
-                statsIndexMapping[i] = inputView.readShort();
-                currentPos += 2;
+                statsIndexMapping[i] = segment.getShort(indexesStart + 2 * i);
             }
 
-            // Read null counts for statistics columns
+            // Read null counts at fixed offset
+            int nullCountsStart = position + nullCountsOffset(statisticsColumnCount);
             Long[] nullCounts = new Long[statisticsColumnCount];
             for (int i = 0; i < statisticsColumnCount; i++) {
-                nullCounts[i] = (long) inputView.readInt();
-                currentPos += 4;
+                nullCounts[i] = (long) segment.getInt(nullCountsStart + 4 * i);
             }
 
-            // Read min values size
-            int minValuesSize = inputView.readInt();
-            currentPos += 4;
+            // Read min values size at fixed offset
+            int minSizeFieldOffset = minValuesSizeOffset(statisticsColumnCount);
+            int minValuesSize = segment.getInt(position + minSizeFieldOffset);
 
-            // Calculate min values offset
-            int minValuesOffset = currentPos - position;
+            // Min values data starts right after the min-values size field
+            int minValuesOffset = minSizeFieldOffset + 4;
 
-            if (minValuesSize > 0) {
-                currentPos += minValuesSize;
-                // Advance the inputView position to match currentPos
-                for (int i = 0; i < minValuesSize; i++) {
-                    inputView.readByte();
-                }
-            }
+            // Max values size field follows min values data
+            int maxSizeFieldPos = position + minValuesOffset + minValuesSize;
+            int maxValuesSize = segment.getInt(maxSizeFieldPos);
 
-            // Read max values size
-            int maxValuesSize = inputView.readInt();
-            currentPos += 4;
-
-            // Calculate max values offset
-            int maxValuesOffset = currentPos - position;
+            // Max values data starts right after the max-values size field
+            int maxValuesOffset = minValuesOffset + minValuesSize + 4;
 
             return new DefaultLogRecordBatchStatistics(
                     segment,
@@ -132,29 +145,33 @@ public class LogRecordBatchStatisticsParser {
                     maxValuesSize,
                     statsIndexMapping);
         } catch (Exception e) {
+            LOG.warn("Failed to parse statistics for schema {}", schemaId, e);
             return null;
         }
     }
 
     /**
-     * Parse statistics data from a ByteBuffer by wrapping it as an off-heap memory segment.
+     * Parse statistics data from a ByteBuffer by wrapping it as a MemorySegment.
      *
      * <p>This is a convenience method that wraps the ByteBuffer in a MemorySegment and delegates to
-     * the primary parsing method. The ByteBuffer's position is not modified.
+     * the primary parsing method. The ByteBuffer's position is not modified. Note that heap-backed
+     * ByteBuffers incur a data copy during wrapping; direct ByteBuffers are wrapped without
+     * copying.
      *
      * @param buffer The ByteBuffer containing the serialized statistics data, must not be null
      * @param rowType The row type schema used to interpret column types and validate structure
      * @param schemaId The schema identifier for version compatibility and data interpretation
-     * @return A DefaultLogRecordBatchStatistics object with zero-copy access to the data, or null
-     *     if the buffer is null/empty or contains invalid data
+     * @return A DefaultLogRecordBatchStatistics object, or null if the buffer is null/empty or
+     *     contains invalid data
      */
+    @Nullable
     public static DefaultLogRecordBatchStatistics parseStatistics(
             ByteBuffer buffer, RowType rowType, int schemaId) {
         if (buffer == null || buffer.remaining() == 0) {
             return null;
         }
 
-        MemorySegment segment = MemorySegment.wrapOffHeapMemory(buffer);
+        MemorySegment segment = wrapByteBuffer(buffer);
         return parseStatistics(segment, 0, rowType, schemaId);
     }
 
@@ -170,6 +187,7 @@ public class LogRecordBatchStatisticsParser {
      * @return A DefaultLogRecordBatchStatistics object with zero-copy access to the data, or null
      *     if the array is null/empty or contains invalid data
      */
+    @Nullable
     public static DefaultLogRecordBatchStatistics parseStatistics(
             byte[] buffer, RowType rowType, int schemaId) {
         if (buffer == null || buffer.length == 0) {
@@ -207,19 +225,17 @@ public class LogRecordBatchStatisticsParser {
         }
 
         try {
-            MemorySegmentInputView inputView = new MemorySegmentInputView(segment, position);
-
-            // Check version
-            byte version = inputView.readByte();
+            // Check version at fixed offset
+            byte version = segment.get(position + VERSION_OFFSET);
             if (version != STATISTICS_VERSION) {
                 return false;
             }
 
-            // Check statistics column count
-            int statisticsColumnCount = inputView.readShort();
+            // Check statistics column count at fixed offset
+            int statisticsColumnCount = segment.getShort(position + COLUMN_COUNT_OFFSET);
             return statisticsColumnCount <= rowType.getFieldCount() && statisticsColumnCount > 0;
 
-        } catch (IOException e) {
+        } catch (Exception e) {
             return false;
         }
     }
@@ -259,7 +275,7 @@ public class LogRecordBatchStatisticsParser {
             return false;
         }
 
-        MemorySegment segment = MemorySegment.wrapOffHeapMemory(buffer);
+        MemorySegment segment = wrapByteBuffer(buffer);
         return isValidStatistics(segment, 0, buffer.remaining(), rowType);
     }
 
@@ -282,57 +298,24 @@ public class LogRecordBatchStatisticsParser {
         }
 
         try {
-            MemorySegmentInputView inputView = new MemorySegmentInputView(segment, position);
-            int currentPos = position;
-
-            // Skip version
-            inputView.readByte(); // version
-            currentPos += 1;
-
-            // Read statistics column count
-            int statisticsColumnCount = inputView.readShort();
-            currentPos += 2;
-
-            // Skip statistics column indexes (2 bytes each)
-            for (int i = 0; i < statisticsColumnCount; i++) {
-                inputView.readShort();
-            }
-            currentPos += statisticsColumnCount * 2;
-
-            // Skip null counts (4 bytes per statistics column)
-            int nullCountsSize = statisticsColumnCount * 4;
-            for (int i = 0; i < nullCountsSize; i++) {
-                inputView.readByte();
-            }
-            currentPos += nullCountsSize;
-
-            // Read min values size
-            int minValuesSize = inputView.readInt();
-            currentPos += 4;
-
-            // Skip min values
-            if (minValuesSize > 0) {
-                for (int i = 0; i < minValuesSize; i++) {
-                    inputView.readByte();
-                }
-                currentPos += minValuesSize;
+            // Read column count at fixed offset (skip version byte)
+            short statisticsColumnCount = segment.getShort(position + COLUMN_COUNT_OFFSET);
+            if (statisticsColumnCount <= 0) {
+                return -1;
             }
 
-            // Read max values size
-            int maxValuesSize = inputView.readInt();
-            currentPos += 4;
+            // Calculate offset to min-values size field using fixed layout
+            int minSizeFieldOffset = minValuesSizeOffset(statisticsColumnCount);
+            int minValuesSize = segment.getInt(position + minSizeFieldOffset);
 
-            // Skip max values
-            if (maxValuesSize > 0) {
-                for (int i = 0; i < maxValuesSize; i++) {
-                    inputView.readByte();
-                }
-                currentPos += maxValuesSize;
-            }
+            // Max-values size field follows min values data
+            int maxSizeFieldOffset = minSizeFieldOffset + 4 + minValuesSize;
+            int maxValuesSize = segment.getInt(position + maxSizeFieldOffset);
 
-            return currentPos - position;
+            // Total size: up to end of max values data
+            return maxSizeFieldOffset + 4 + maxValuesSize;
 
-        } catch (IOException e) {
+        } catch (Exception e) {
             return -1;
         }
     }
@@ -373,7 +356,29 @@ public class LogRecordBatchStatisticsParser {
             return -1;
         }
 
-        MemorySegment segment = MemorySegment.wrapOffHeapMemory(buffer);
+        MemorySegment segment = wrapByteBuffer(buffer);
         return getStatisticsSize(segment, 0, buffer.remaining());
+    }
+
+    /**
+     * Wraps a ByteBuffer into a MemorySegment, handling both direct and heap buffers correctly.
+     *
+     * <p>Note: For heap-backed ByteBuffers, this method copies the remaining bytes into a new byte
+     * array because heap ByteBuffers cannot be wrapped directly as off-heap memory segments. Direct
+     * ByteBuffers are wrapped without copying.
+     *
+     * @param buffer The ByteBuffer to wrap, must not be null
+     * @return A MemorySegment wrapping the buffer's data
+     */
+    private static MemorySegment wrapByteBuffer(ByteBuffer buffer) {
+        if (buffer.isDirect()) {
+            return MemorySegment.wrapOffHeapMemory(buffer);
+        } else {
+            byte[] bytes = new byte[buffer.remaining()];
+            int pos = buffer.position();
+            buffer.get(bytes);
+            buffer.position(pos);
+            return MemorySegment.wrap(bytes);
+        }
     }
 }

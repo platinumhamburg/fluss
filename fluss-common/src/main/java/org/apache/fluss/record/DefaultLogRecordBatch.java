@@ -34,6 +34,9 @@ import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.MurmurHashUtils;
 import org.apache.fluss.utils.crc.Crc32C;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.nio.ByteBuffer;
@@ -48,7 +51,6 @@ import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
-import static org.apache.fluss.record.LogRecordBatchFormat.STATISTICS_FLAG_MASK;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.batchSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
@@ -74,6 +76,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
  * <ul>
  *   <li>V0 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V0}
  *   <li>V1 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V1}
+ *   <li>V2 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V2}
  * </ul>
  *
  * @since 0.1
@@ -81,6 +84,8 @@ import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
 // TODO rename to MemoryLogRecordBatch
 @PublicEvolving
 public class DefaultLogRecordBatch implements LogRecordBatch {
+    private static final Logger LOG = LoggerFactory.getLogger(DefaultLogRecordBatch.class);
+
     public static final byte APPEND_ONLY_FLAG_MASK = 0x01;
 
     private MemorySegment segment;
@@ -117,7 +122,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
     }
 
     public void setLeaderEpoch(int leaderEpoch) {
-        if (magic >= LOG_MAGIC_VALUE_V1) {
+        if (magic >= LOG_MAGIC_VALUE_V2) {
             segment.putInt(position + leaderEpochOffset(magic), leaderEpoch);
         } else {
             throw new UnsupportedOperationException(
@@ -137,7 +142,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
 
     @Override
     public int leaderEpoch() {
-        if (magic >= LOG_MAGIC_VALUE_V1) {
+        if (magic >= LOG_MAGIC_VALUE_V2) {
             return segment.getInt(position + leaderEpochOffset(magic));
         } else {
             return NO_LEADER_EPOCH;
@@ -222,7 +227,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
     }
 
     public int getStatisticsLength() {
-        if (magic < LOG_MAGIC_VALUE_V2) {
+        if (magic < LOG_MAGIC_VALUE_V1) {
             return 0;
         }
         return segment.getInt(position + statisticsLengthOffset(magic));
@@ -501,7 +506,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
 
     private Optional<LogRecordBatchStatistics> parseStatistics(ReadContext context) {
         try {
-            if (magic < LOG_MAGIC_VALUE_V2 || (attributes() & STATISTICS_FLAG_MASK) == 0) {
+            if (magic < LOG_MAGIC_VALUE_V1) {
                 return Optional.empty();
             }
 
@@ -512,6 +517,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
 
             RowType rowType = context.getRowType(schemaId());
             if (rowType == null) {
+                LOG.debug("Skipping statistics parsing: schema {} not found", schemaId());
                 return Optional.empty();
             }
 
@@ -521,17 +527,18 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
                             segment, position + statsDataOffset, rowType, schemaId());
             return Optional.ofNullable(statistics);
         } catch (Exception e) {
+            LOG.warn("Failed to parse statistics", e);
             return Optional.empty();
         }
     }
 
     /**
-     * Get the offset where records data starts, relative to the batch start. For V2, records start
-     * after the fixed header + statistics data. For V0/V1, records start right after the header.
+     * Get the offset where records data starts, relative to the batch start. For V1+, records start
+     * after the fixed header + statistics data. For V0, records start right after the header.
      */
     private int recordsDataOffset() {
         int headerSize = recordBatchHeaderSize(magic);
-        if (magic >= LOG_MAGIC_VALUE_V2) {
+        if (magic >= LOG_MAGIC_VALUE_V1) {
             int statsLength = segment.getInt(position + statisticsLengthOffset(magic));
             return headerSize + statsLength;
         }

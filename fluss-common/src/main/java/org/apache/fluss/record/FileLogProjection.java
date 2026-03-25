@@ -163,9 +163,9 @@ public class FileLogProjection {
         boolean isAppendOnly =
                 (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
 
-        // For V2, skip statistics data between header and records
+        // For V1+, skip statistics data between header and records
         int statisticsLength = 0;
-        if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+        if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V1) {
             statisticsLength = logHeaderBuffer.getInt(statisticsLengthOffset(magic));
         }
         int recordsStartOffset = recordBatchHeaderSize + statisticsLength;
@@ -222,8 +222,10 @@ public class FileLogProjection {
         logHeaderBuffer.position(LENGTH_OFFSET);
         logHeaderBuffer.putInt(newBatchSizeInBytes - LOG_OVERHEAD);
 
-        // For V2 format, clear statistics information since projection removes statistics
-        LogRecordBatchFormat.clearStatisticsFromHeader(logHeaderBuffer, magic);
+        // For V1+ format, clear statistics information since projection removes statistics
+        if (statisticsLength > 0) {
+            LogRecordBatchFormat.clearStatisticsFromHeader(logHeaderBuffer, magic);
+        }
 
         logHeaderBuffer.rewind();
         // the logHeader can't be reused, as it will be sent to network
@@ -300,9 +302,9 @@ public class FileLogProjection {
             boolean isAppendOnly =
                     (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
 
-            // For V2, skip statistics data between header and records
+            // For V1+, skip statistics data between header and records
             int statisticsLength = 0;
-            if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
+            if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V1) {
                 statisticsLength = logHeaderBuffer.getInt(statisticsLengthOffset(magic));
             }
             int recordsStartOffset = recordBatchHeaderSize + statisticsLength;
@@ -365,7 +367,7 @@ public class FileLogProjection {
             logHeaderBuffer.position(LENGTH_OFFSET);
             logHeaderBuffer.putInt(newBatchSizeInBytes - LOG_OVERHEAD);
 
-            // For V2 format, clear statistics information since projection removes statistics
+            // For V1+ format, clear statistics information since projection removes statistics
             LogRecordBatchFormat.clearStatisticsFromHeader(logHeaderBuffer, magic);
 
             logHeaderBuffer.rewind();

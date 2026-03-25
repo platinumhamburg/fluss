@@ -30,6 +30,7 @@ import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
@@ -57,7 +58,7 @@ public class ArrowLogWriteBatch extends WriteBatch {
             ArrowWriter arrowWriter,
             AbstractPagedOutputView outputView,
             long createdMs,
-            LogRecordBatchStatisticsCollector statisticsCollector) {
+            @Nullable LogRecordBatchStatisticsCollector statisticsCollector) {
         super(bucketId, physicalTablePath, createdMs);
         this.outputView = outputView;
         this.recordsBuilder =

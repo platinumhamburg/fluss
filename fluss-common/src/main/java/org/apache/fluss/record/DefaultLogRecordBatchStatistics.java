@@ -117,7 +117,7 @@ public class DefaultLogRecordBatchStatistics implements LogRecordBatchStatistics
 
     @Override
     public InternalRow getMinValues() {
-        if (minValuesSize <= 0) {
+        if (minValuesSize == 0) {
             return null;
         }
 
@@ -135,7 +135,7 @@ public class DefaultLogRecordBatchStatistics implements LogRecordBatchStatistics
 
     @Override
     public InternalRow getMaxValues() {
-        if (maxValuesSize <= 0) {
+        if (maxValuesSize == 0) {
             return null;
         }
 

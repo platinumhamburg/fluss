@@ -1582,14 +1582,18 @@ public class ConfigOptions {
     public static final ConfigOption<String> TABLE_STATISTICS_COLUMNS =
             key("table.statistics.columns")
                     .stringType()
-                    .defaultValue("*")
+                    .noDefaultValue()
                     .withDescription(
-                            "Configures statistics collection for the table. "
-                                    + "Empty string ('') means disable statistics collection completely. "
-                                    + "The value '*' (default) means collect statistics for all non-binary columns. "
-                                    + "Comma-separated list of column names means collect statistics only for the specified columns. "
-                                    + "Binary and bytes columns are not supported for statistics collection. "
-                                    + "Example: 'id,name,timestamp' to collect statistics only for specified columns.");
+                            "Configures column-level statistics collection for the table. "
+                                    + "By default this option is not set and no column statistics are collected. "
+                                    + "The value '*' means collect statistics for all supported columns. "
+                                    + "A comma-separated list of column names means collect statistics only for the specified columns. "
+                                    + "Supported types include: BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE, "
+                                    + "STRING, CHAR, DECIMAL, DATE, TIME, TIMESTAMP, and TIMESTAMP_LTZ. "
+                                    + "Example: 'id,name,timestamp' to collect statistics only for specified columns. "
+                                    + "Note: enabling column statistics requires the V1 batch format. "
+                                    + "Downstream consumers must be upgraded to Fluss v1.0+ before enabling this option, "
+                                    + "as older versions cannot parse the extended batch format.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv

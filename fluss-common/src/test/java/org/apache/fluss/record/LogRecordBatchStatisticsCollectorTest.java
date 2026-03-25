@@ -273,7 +273,107 @@ public class LogRecordBatchStatisticsCollectorTest {
         int actualSize = collector.writeStatistics(new MemorySegmentOutputView(segment));
 
         assertThat(estimatedSize).isGreaterThan(0);
-        assertThat(estimatedSize).isEqualTo(actualSize);
+        // estimatedSizeInBytes() is a heuristic estimate, not a guaranteed upper bound.
+        // It may underestimate for rows with large variable-length values (STRING, BYTES, etc.)
+        // since it uses a fixed constant for variable-length fields. We verify the estimate
+        // is reasonably close to the actual size (within 2x).
+        assertThat((double) estimatedSize)
+                .as("Heuristic estimate should be reasonably close to actual size")
+                .isGreaterThan(actualSize * 0.5)
+                .isLessThan(actualSize * 2.0);
+    }
+
+    @Test
+    void testZeroRows() throws IOException {
+        // Create a collector but do NOT call processRow()
+        RowType rowType =
+                DataTypes.ROW(
+                        new DataField("id", DataTypes.INT()),
+                        new DataField("name", DataTypes.STRING()),
+                        new DataField("value", DataTypes.DOUBLE()));
+
+        LogRecordBatchStatisticsCollector zeroRowCollector =
+                new LogRecordBatchStatisticsCollector(
+                        rowType,
+                        LogRecordBatchStatisticsTestUtils.createAllColumnsStatsMapping(rowType));
+
+        // Write statistics without processing any rows
+        MemorySegment segment = MemorySegment.allocateHeapMemory(1024);
+        int bytesWritten = zeroRowCollector.writeStatistics(new MemorySegmentOutputView(segment));
+        assertThat(bytesWritten).isGreaterThan(0);
+
+        // Parse back and verify
+        DefaultLogRecordBatchStatistics statistics =
+                LogRecordBatchStatisticsParser.parseStatistics(segment, 0, rowType, 1);
+        assertThat(statistics).isNotNull();
+
+        // All null counts should be 0
+        Long[] nullCounts = statistics.getNullCounts();
+        for (int i = 0; i < rowType.getFieldCount(); i++) {
+            assertThat(nullCounts[i]).isEqualTo(0L);
+        }
+
+        // Min/max values row exists but all fields should be null since no rows were processed
+        InternalRow minValues = statistics.getMinValues();
+        InternalRow maxValues = statistics.getMaxValues();
+        assertThat(minValues).isNotNull();
+        assertThat(maxValues).isNotNull();
+        for (int i = 0; i < rowType.getFieldCount(); i++) {
+            assertThat(minValues.isNullAt(i)).isTrue();
+            assertThat(maxValues.isNullAt(i)).isTrue();
+        }
+    }
+
+    @Test
+    void testAllNullColumn() throws IOException {
+        // Create data where column 2 (value) has ALL null values
+        RowType rowType =
+                DataTypes.ROW(
+                        new DataField("id", DataTypes.INT()),
+                        new DataField("name", DataTypes.STRING()),
+                        new DataField("value", DataTypes.DOUBLE()));
+
+        LogRecordBatchStatisticsCollector allNullCollector =
+                new LogRecordBatchStatisticsCollector(
+                        rowType,
+                        LogRecordBatchStatisticsTestUtils.createAllColumnsStatsMapping(rowType));
+
+        List<Object[]> dataWithAllNullColumn =
+                Arrays.asList(
+                        new Object[] {1, "a", null},
+                        new Object[] {3, "c", null},
+                        new Object[] {5, "e", null},
+                        new Object[] {2, "b", null});
+
+        for (Object[] data : dataWithAllNullColumn) {
+            allNullCollector.processRow(DataTestUtils.row(data));
+        }
+
+        MemorySegment segment = MemorySegment.allocateHeapMemory(1024);
+        allNullCollector.writeStatistics(new MemorySegmentOutputView(segment));
+
+        DefaultLogRecordBatchStatistics statistics =
+                LogRecordBatchStatisticsParser.parseStatistics(segment, 0, rowType, 1);
+        assertThat(statistics).isNotNull();
+
+        // Column 2 (value) null count should equal total row count
+        assertThat(statistics.getNullCounts()[2]).isEqualTo(dataWithAllNullColumn.size());
+
+        // Column 2 min/max should be null (all values were null)
+        InternalRow minValues = statistics.getMinValues();
+        InternalRow maxValues = statistics.getMaxValues();
+        assertThat(minValues).isNotNull();
+        assertThat(maxValues).isNotNull();
+        assertThat(minValues.isNullAt(2)).isTrue();
+        assertThat(maxValues.isNullAt(2)).isTrue();
+
+        // Other columns should have correct min/max
+        assertThat(statistics.getNullCounts()[0]).isEqualTo(0L);
+        assertThat(statistics.getNullCounts()[1]).isEqualTo(0L);
+        assertThat(minValues.getInt(0)).isEqualTo(1);
+        assertThat(maxValues.getInt(0)).isEqualTo(5);
+        assertThat(minValues.getString(1)).isEqualTo(BinaryString.fromString("a"));
+        assertThat(maxValues.getString(1)).isEqualTo(BinaryString.fromString("e"));
     }
 
     @Test

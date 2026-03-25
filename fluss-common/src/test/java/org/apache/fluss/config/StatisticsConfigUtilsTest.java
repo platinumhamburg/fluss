@@ -24,6 +24,7 @@ import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -35,6 +36,9 @@ class StatisticsConfigUtilsTest {
                     .column("id", DataTypes.INT())
                     .column("name", DataTypes.STRING())
                     .column("data", DataTypes.BYTES())
+                    .column("tags", DataTypes.ARRAY(DataTypes.STRING()))
+                    .column("metadata", DataTypes.MAP(DataTypes.STRING(), DataTypes.STRING()))
+                    .column("nested", DataTypes.ROW(DataTypes.FIELD("f1", DataTypes.INT())))
                     .build();
 
     @Test
@@ -51,13 +55,10 @@ class StatisticsConfigUtilsTest {
     }
 
     @Test
-    void testValidateWithDisabled() {
+    void testValidateWithNotSet() {
+        // When the property is not set, statistics is disabled - no validation needed
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(TEST_SCHEMA)
-                        .distributedBy(3)
-                        .property(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), "")
-                        .build();
+                TableDescriptor.builder().schema(TEST_SCHEMA).distributedBy(3).build();
 
         assertThatNoException()
                 .isThrownBy(() -> StatisticsConfigUtils.validateStatisticsConfig(descriptor));
@@ -101,6 +102,82 @@ class StatisticsConfigUtilsTest {
 
         assertThatThrownBy(() -> StatisticsConfigUtils.validateStatisticsConfig(descriptor))
                 .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("Binary column");
+                .hasMessageContaining("is not supported for statistics collection");
+    }
+
+    @Test
+    void testValidateWithArrayColumn() {
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(TEST_SCHEMA)
+                        .distributedBy(3)
+                        .property(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), "tags")
+                        .build();
+
+        assertThatThrownBy(() -> StatisticsConfigUtils.validateStatisticsConfig(descriptor))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("is not supported for statistics collection");
+    }
+
+    @Test
+    void testValidateWithMapColumn() {
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(TEST_SCHEMA)
+                        .distributedBy(3)
+                        .property(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), "metadata")
+                        .build();
+
+        assertThatThrownBy(() -> StatisticsConfigUtils.validateStatisticsConfig(descriptor))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("is not supported for statistics collection");
+    }
+
+    @Test
+    void testValidateWithRowColumn() {
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(TEST_SCHEMA)
+                        .distributedBy(3)
+                        .property(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), "nested")
+                        .build();
+
+        assertThatThrownBy(() -> StatisticsConfigUtils.validateStatisticsConfig(descriptor))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("is not supported for statistics collection");
+    }
+
+    @Test
+    void testTableConfigStatisticsColumnsDisabled() {
+        // Not set -> DISABLED
+        Configuration config = new Configuration();
+        TableConfig tableConfig = new TableConfig(config);
+        StatisticsColumnsConfig columnsConfig = tableConfig.getStatisticsColumns();
+
+        assertThat(columnsConfig.getMode()).isEqualTo(StatisticsColumnsConfig.Mode.DISABLED);
+        assertThat(columnsConfig.isEnabled()).isFalse();
+    }
+
+    @Test
+    void testTableConfigStatisticsColumnsAll() {
+        Configuration config = new Configuration();
+        config.setString(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), "*");
+        TableConfig tableConfig = new TableConfig(config);
+        StatisticsColumnsConfig columnsConfig = tableConfig.getStatisticsColumns();
+
+        assertThat(columnsConfig.getMode()).isEqualTo(StatisticsColumnsConfig.Mode.ALL);
+        assertThat(columnsConfig.isEnabled()).isTrue();
+    }
+
+    @Test
+    void testTableConfigStatisticsColumnsSpecified() {
+        Configuration config = new Configuration();
+        config.setString(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), "id,name");
+        TableConfig tableConfig = new TableConfig(config);
+        StatisticsColumnsConfig columnsConfig = tableConfig.getStatisticsColumns();
+
+        assertThat(columnsConfig.getMode()).isEqualTo(StatisticsColumnsConfig.Mode.SPECIFIED);
+        assertThat(columnsConfig.isEnabled()).isTrue();
+        assertThat(columnsConfig.getColumns()).containsExactly("id", "name");
     }
 }

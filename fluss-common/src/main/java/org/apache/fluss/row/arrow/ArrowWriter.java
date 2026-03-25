@@ -251,6 +251,16 @@ public class ArrowWriter implements AutoCloseable {
         // Whether there is any record to write, we need to advance the position to make sure the
         // batch header will be written in outputView.
         outputView.setPosition(position);
+        return serializeToOutputView(outputView);
+    }
+
+    /**
+     * Serializes the current row batch to Arrow format at the current position of the output view
+     * and returns the written size in bytes. Unlike {@link #serializeToOutputView(
+     * AbstractPagedOutputView, int)}, this method does not call {@code setPosition} and can be used
+     * when pages have already been advanced (e.g., after writing statistics data).
+     */
+    public int serializeToOutputView(AbstractPagedOutputView outputView) throws IOException {
         if (recordsCount == 0) {
             return 0;
         }

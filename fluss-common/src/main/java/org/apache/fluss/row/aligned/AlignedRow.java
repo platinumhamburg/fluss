@@ -561,9 +561,9 @@ public final class AlignedRow extends BinarySection
                                 localZonedTimestampType.getPrecision());
                         break;
                     default:
-                        // For unsupported types, write as null
-                        writer.setNullAt(i);
-                        break;
+                        throw new UnsupportedOperationException(
+                                "Statistics collection is not supported for type: "
+                                        + fieldType.getTypeRoot());
                 }
             }
         }

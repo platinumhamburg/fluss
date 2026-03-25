@@ -19,6 +19,7 @@ package org.apache.fluss.metadata;
 
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.StatisticsColumnsConfig;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeChecks;
@@ -251,8 +252,8 @@ public final class TableInfo {
      *   <li><b>Disabled</b>: Returns an empty array when statistics collection is disabled
      *   <li><b>Specific columns</b>: When specific columns are configured, returns mapping for
      *       those columns only
-     *   <li><b>All columns ("*")</b>: Returns mapping for all non-binary columns in the table
-     *       schema (binary columns are excluded as they are not suitable for statistical analysis)
+     *   <li><b>All columns ("*")</b>: Returns mapping for all supported columns in the table schema
+     *       (unsupported types are excluded as they are not suitable for statistical analysis)
      * </ul>
      *
      * <p>The result is cached after the first computation to avoid repeated processing.
@@ -267,26 +268,30 @@ public final class TableInfo {
             return cachedStatsIndexMapping;
         }
 
-        Optional<List<String>> statsColumnsOpt = tableConfig.getStatisticsColumns();
+        StatisticsColumnsConfig statsConfig = tableConfig.getStatisticsColumns();
         List<String> statsColumns;
 
-        if (statsColumnsOpt == null) {
-            // Statistics collection is disabled (empty string configuration)
-            cachedStatsIndexMapping = new int[0];
-            return cachedStatsIndexMapping;
-        } else if (statsColumnsOpt.isPresent()) {
-            // User specified specific columns for statistics
-            statsColumns = statsColumnsOpt.get();
-        } else {
-            // Collect all non-binary columns ("*" configuration)
-            statsColumns = new ArrayList<>();
-            for (int rowIndex = 0; rowIndex < rowType.getFieldCount(); rowIndex++) {
-                DataType columnType = rowType.getTypeAt(rowIndex);
-                if (!DataTypeChecks.isBinaryType(columnType)) {
-                    String columnName = rowType.getFields().get(rowIndex).getName();
-                    statsColumns.add(columnName);
+        switch (statsConfig.getMode()) {
+            case DISABLED:
+                cachedStatsIndexMapping = new int[0];
+                return cachedStatsIndexMapping;
+            case SPECIFIED:
+                statsColumns = statsConfig.getColumns();
+                break;
+            case ALL:
+                // Collect all supported columns
+                statsColumns = new ArrayList<>();
+                for (int rowIndex = 0; rowIndex < rowType.getFieldCount(); rowIndex++) {
+                    DataType columnType = rowType.getTypeAt(rowIndex);
+                    if (DataTypeChecks.isSupportedStatisticsType(columnType)) {
+                        String columnName = rowType.getFields().get(rowIndex).getName();
+                        statsColumns.add(columnName);
+                    }
                 }
-            }
+                break;
+            default:
+                throw new IllegalStateException(
+                        "Unknown statistics columns mode: " + statsConfig.getMode());
         }
 
         // Build mapping from stats column index to original row column index

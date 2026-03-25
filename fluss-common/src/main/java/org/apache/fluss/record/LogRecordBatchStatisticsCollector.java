@@ -48,8 +48,6 @@ public class LogRecordBatchStatisticsCollector {
     private final Object[] minValues;
     private final Object[] maxValues;
     private final Long[] nullCounts;
-    private final boolean[] minSet;
-    private final boolean[] maxSet;
 
     private final LogRecordBatchStatisticsWriter statisticsWriter;
 
@@ -61,13 +59,9 @@ public class LogRecordBatchStatisticsCollector {
         this.minValues = new Object[statsIndexMapping.length];
         this.maxValues = new Object[statsIndexMapping.length];
         this.nullCounts = new Long[statsIndexMapping.length];
-        this.minSet = new boolean[statsIndexMapping.length];
-        this.maxSet = new boolean[statsIndexMapping.length];
 
         this.statisticsWriter = new LogRecordBatchStatisticsWriter(rowType, statsIndexMapping);
 
-        Arrays.fill(minSet, false);
-        Arrays.fill(maxSet, false);
         Arrays.fill(nullCounts, 0L);
     }
 
@@ -122,8 +116,6 @@ public class LogRecordBatchStatisticsCollector {
 
     /** Reset the collector to collect new statistics. */
     public void reset() {
-        Arrays.fill(minSet, false);
-        Arrays.fill(maxSet, false);
         Arrays.fill(nullCounts, 0L);
         Arrays.fill(minValues, null);
         Arrays.fill(maxValues, null);
@@ -213,9 +205,8 @@ public class LogRecordBatchStatisticsCollector {
             T value,
             java.util.Comparator<T> comparator,
             Function<T, T> valueTransformer) {
-        if (!minSet[statsIndex]) {
+        if (minValues[statsIndex] == null) {
             minValues[statsIndex] = valueTransformer.apply(value);
-            minSet[statsIndex] = true;
         } else {
             T currentMin = (T) minValues[statsIndex];
             if (comparator.compare(value, currentMin) < 0) {
@@ -223,9 +214,8 @@ public class LogRecordBatchStatisticsCollector {
             }
         }
 
-        if (!maxSet[statsIndex]) {
+        if (maxValues[statsIndex] == null) {
             maxValues[statsIndex] = valueTransformer.apply(value);
-            maxSet[statsIndex] = true;
         } else {
             T currentMax = (T) maxValues[statsIndex];
             if (comparator.compare(value, currentMax) > 0) {

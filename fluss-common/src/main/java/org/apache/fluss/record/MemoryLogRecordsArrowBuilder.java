@@ -22,29 +22,26 @@ import org.apache.fluss.memory.AbstractPagedOutputView;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentOutputView;
 import org.apache.fluss.metadata.LogFormat;
-import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
-import org.apache.fluss.utils.crc.Checksums;
 import org.apache.fluss.utils.crc.Crc32C;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.zip.Checksum;
+import javax.annotation.Nullable;
 
-import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
+import java.io.IOException;
+
 import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_LENGTH;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
-import static org.apache.fluss.record.LogRecordBatchFormat.STATISTICS_FLAG_MASK;
-import static org.apache.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
@@ -65,7 +62,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
     private final MemorySegment firstSegment;
     private final AbstractPagedOutputView pagedOutputView;
     private final boolean appendOnly;
-    private final LogRecordBatchStatisticsCollector statisticsCollector;
+    @Nullable private final LogRecordBatchStatisticsCollector statisticsCollector;
 
     private volatile MultiBytesView bytesView = null;
 
@@ -77,8 +74,8 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
     private boolean reCalculateSizeInBytes = false;
     private boolean resetBatchHeader = false;
     private boolean aborted = false;
-    // Serialized statistics bytes (placed between header and records in V2)
-    private byte[] statisticsBytes = null;
+    // Length of statistics bytes written directly to pagedOutputView (V1+)
+    private int statisticsBytesLength = 0;
 
     private MemoryLogRecordsArrowBuilder(
             long baseLogOffset,
@@ -87,7 +84,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
             ArrowWriter arrowWriter,
             AbstractPagedOutputView pagedOutputView,
             boolean appendOnly,
-            LogRecordBatchStatisticsCollector statisticsCollector) {
+            @Nullable LogRecordBatchStatisticsCollector statisticsCollector) {
         this.appendOnly = appendOnly;
         checkArgument(
                 schemaId <= Short.MAX_VALUE,
@@ -104,14 +101,14 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
 
         this.pagedOutputView = pagedOutputView;
         this.firstSegment = pagedOutputView.getCurrentSegment();
-        int arrowChangeTypeOffset = arrowChangeTypeOffset(magic);
+        int headerSize = recordBatchHeaderSize(magic);
         checkArgument(
-                firstSegment.size() >= arrowChangeTypeOffset,
+                firstSegment.size() >= headerSize,
                 "The size of first segment of pagedOutputView is too small, need at least "
-                        + arrowChangeTypeOffset
+                        + headerSize
                         + " bytes.");
-        this.changeTypeWriter = new ChangeTypeVectorWriter(firstSegment, arrowChangeTypeOffset);
-        this.estimatedSizeInBytes = recordBatchHeaderSize(magic);
+        this.changeTypeWriter = new ChangeTypeVectorWriter(firstSegment, headerSize);
+        this.estimatedSizeInBytes = headerSize;
         this.recordCount = 0;
         this.statisticsCollector = statisticsCollector;
     }
@@ -152,30 +149,16 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
             AbstractPagedOutputView outputView,
             boolean appendOnly,
             LogRecordBatchStatisticsCollector statisticsCollector) {
+        // Use V1 when statistics collector is provided, V0 otherwise
+        byte magic = statisticsCollector != null ? LOG_MAGIC_VALUE_V1 : LOG_MAGIC_VALUE_V0;
         return new MemoryLogRecordsArrowBuilder(
                 BUILDER_DEFAULT_OFFSET,
                 schemaId,
-                CURRENT_LOG_MAGIC_VALUE,
+                magic,
                 arrowWriter,
                 outputView,
                 appendOnly,
                 statisticsCollector);
-    }
-
-    /** Builder with limited write size and the memory segment used to serialize records. */
-    public static MemoryLogRecordsArrowBuilder builder(
-            int schemaId,
-            ArrowWriter arrowWriter,
-            AbstractPagedOutputView outputView,
-            boolean appendOnly) {
-        return new MemoryLogRecordsArrowBuilder(
-                BUILDER_DEFAULT_OFFSET,
-                schemaId,
-                CURRENT_LOG_MAGIC_VALUE,
-                arrowWriter,
-                outputView,
-                appendOnly,
-                null);
     }
 
     public MultiBytesView build() throws IOException {
@@ -191,30 +174,46 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
             return bytesView;
         }
 
-        // serialize the arrow batch to dynamically allocated memory segments
-        arrowWriter.serializeToOutputView(
-                pagedOutputView, arrowChangeTypeOffset(magic) + changeTypeWriter.sizeInBytes());
+        int headerSize = recordBatchHeaderSize(magic);
         recordCount = arrowWriter.getRecordsCount();
+        int changeTypeSize = changeTypeWriter.sizeInBytes();
 
-        // For V2, serialize statistics to a separate byte array
-        // (statistics will be placed between header and records in the final layout)
-        if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2
-                && statisticsCollector != null
-                && recordCount > 0) {
+        // For V1+ with statistics, write everything sequentially to pagedOutputView:
+        // [header] [statistics] [changeTypes] [arrow data]
+        // This makes CRC computation zero-copy over contiguous memory segments.
+        if (magic >= LOG_MAGIC_VALUE_V1 && statisticsCollector != null && recordCount > 0) {
+            // Save changeType bytes before they get overwritten. The changeType data lives
+            // in firstSegment at offset headerSize, which is the same memory backing
+            // pagedOutputView — so writing statistics there would clobber it.
+            byte[] changeTypeBytes = new byte[changeTypeSize];
+            firstSegment.get(headerSize, changeTypeBytes, 0, changeTypeSize);
+
+            // Position pagedOutputView right after the header
+            pagedOutputView.setPosition(headerSize);
+
+            // Write statistics directly to pagedOutputView (no temp byte[])
             try {
-                MemorySegment statSegment =
-                        MemorySegment.wrap(new byte[statisticsCollector.estimatedSizeInBytes()]);
-                MemorySegmentOutputView statOutputView = new MemorySegmentOutputView(statSegment);
-                int statsSize = statisticsCollector.writeStatistics(statOutputView);
-                if (statsSize > 0) {
-                    statisticsBytes = new byte[statsSize];
-                    statSegment.get(0, statisticsBytes, 0, statsSize);
-                }
+                statisticsBytesLength = statisticsCollector.writeStatistics(pagedOutputView);
             } catch (Exception e) {
-                // If serialization fails, continue without statistics
                 LOG.error("Failed to serialize statistics for record batch", e);
-                statisticsBytes = null;
+                statisticsBytesLength = 0;
+                // Rewind to undo any partial writes from writeStatistics().
+                // This is safe because statistics data is typically small (a few hundred
+                // bytes) and the first page is usually 1MB+, so no page boundary has
+                // been crossed and setPosition() can rewind within the same page.
+                pagedOutputView.setPosition(headerSize);
             }
+
+            // Write saved changeType bytes to pagedOutputView
+            pagedOutputView.write(changeTypeBytes);
+
+            // Write arrow data to pagedOutputView at current position.
+            // Use the no-position overload since pages may have advanced.
+            arrowWriter.serializeToOutputView(pagedOutputView);
+        } else {
+            // V0 path or no stats: layout is [header] [changeTypes] [arrow data]
+            // changeTypes are already in firstSegment at headerSize offset
+            arrowWriter.serializeToOutputView(pagedOutputView, headerSize + changeTypeSize);
         }
 
         // Reset the statistics collector for reuse
@@ -222,43 +221,11 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
             statisticsCollector.reset();
         }
 
-        // Build MultiBytesView with statistics placed between header and records
-        int headerSize = recordBatchHeaderSize(magic);
-        int statsSize = statisticsBytesLength();
-        List<MemorySegmentBytesView> writtenSegments = pagedOutputView.getWrittenSegments();
-
-        MultiBytesView.Builder viewBuilder = MultiBytesView.builder();
-        if (statsSize > 0) {
-            // Split: [header] + [statistics] + [records from pagedOutputView after header]
-            boolean firstSegment = true;
-            for (MemorySegmentBytesView segView : writtenSegments) {
-                if (firstSegment) {
-                    firstSegment = false;
-                    // Add header portion from first segment
-                    viewBuilder.addBytes(
-                            segView.getMemorySegment(), segView.getPosition(), headerSize);
-                    // Add statistics bytes
-                    viewBuilder.addBytes(statisticsBytes);
-                    // Add remaining records portion from first segment
-                    int remainingSize = segView.getBytesLength() - headerSize;
-                    if (remainingSize > 0) {
-                        viewBuilder.addBytes(
-                                segView.getMemorySegment(),
-                                segView.getPosition() + headerSize,
-                                remainingSize);
-                    }
-                } else {
-                    viewBuilder.addBytes(
-                            segView.getMemorySegment(),
-                            segView.getPosition(),
-                            segView.getBytesLength());
-                }
-            }
-        } else {
-            viewBuilder.addMemorySegmentByteViewList(writtenSegments);
-        }
-
-        bytesView = viewBuilder.build();
+        // Build MultiBytesView from contiguous pagedOutputView segments (zero-copy)
+        bytesView =
+                MultiBytesView.builder()
+                        .addMemorySegmentByteViewList(pagedOutputView.getWrittenSegments())
+                        .build();
         arrowWriter.recycle(writerEpoch);
 
         writeBatchHeader();
@@ -356,11 +323,11 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         if (reCalculateSizeInBytes) {
             // make size in bytes up-to-date
             estimatedSizeInBytes =
-                    arrowChangeTypeOffset(magic)
+                    recordBatchHeaderSize(magic)
                             + changeTypeWriter.sizeInBytes()
                             + arrowWriter.estimatedSizeInBytes();
-            // For V2, add estimated statistics size (placed between header and records)
-            if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2 && statisticsCollector != null) {
+            // For V1+, add estimated statistics size (placed between header and records)
+            if (magic >= LOG_MAGIC_VALUE_V1 && statisticsCollector != null) {
                 estimatedSizeInBytes += statisticsCollector.estimatedSizeInBytes();
             }
         }
@@ -384,7 +351,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         outputView.writeLong(0);
 
         // write empty leaderEpoch which will be overridden on server side
-        if (magic >= LOG_MAGIC_VALUE_V1) {
+        if (magic >= LOG_MAGIC_VALUE_V2) {
             outputView.writeInt(NO_LEADER_EPOCH);
         }
 
@@ -393,16 +360,10 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         // write schema id
         outputView.writeShort((short) schemaId);
 
-        // write attributes (appendOnly flag and statistics flag)
+        // write attributes (appendOnly flag)
         byte attributes = 0;
         if (appendOnly) {
             attributes |= 0x01; // set appendOnly flag
-        }
-
-        int statsSize = statisticsBytesLength();
-
-        if (statsSize > 0) {
-            attributes |= STATISTICS_FLAG_MASK;
         }
 
         outputView.writeByte(attributes);
@@ -419,68 +380,16 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         outputView.writeInt(batchSequence);
         outputView.writeInt(recordCount);
 
-        // For V2, write statistics length
-        if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V2) {
-            outputView.writeInt(statsSize);
+        // For V1+, write statistics length
+        if (magic >= LOG_MAGIC_VALUE_V1) {
+            outputView.writeInt(statisticsBytesLength);
         }
 
         // Update crc - CRC covers from schemaId to end of the batch.
-        // Since statistics bytes are in a separate view (not in pagedOutputView segments),
-        // we need to compute CRC across all views in bytesView.
-        long crc = computeCrc();
+        // All data is contiguous in pagedOutputView, so we can compute CRC directly.
+        long crc = Crc32C.compute(pagedOutputView.getWrittenSegments(), schemaIdOffset(magic));
         outputView.setPosition(crcOffset(magic));
         outputView.writeUnsignedInt(crc);
-    }
-
-    private int statisticsBytesLength() {
-        return statisticsBytes != null ? statisticsBytes.length : 0;
-    }
-
-    /**
-     * Compute CRC over the entire batch content starting from schemaId offset. This handles the
-     * case where statistics bytes are in a separate view between header and records.
-     *
-     * <p>CRC coverage: [header from schemaId..end] + [statistics bytes] + [records]
-     *
-     * <p>This must match the read-side validation in {@link
-     * DefaultLogRecordBatch#computeChecksum()} which computes CRC over a contiguous buffer with the
-     * same layout.
-     */
-    private long computeCrc() {
-        if (statisticsBytesLength() == 0) {
-            return Crc32C.compute(pagedOutputView.getWrittenSegments(), schemaIdOffset(magic));
-        }
-
-        // With statistics, compute CRC incrementally across three regions without copying:
-        // [header from schemaId] + [statistics bytes] + [records from pagedOutputView after header]
-        int headerSize = recordBatchHeaderSize(magic);
-        int schemaIdOff = schemaIdOffset(magic);
-
-        Checksum crc = Crc32C.create();
-
-        // 1. Header bytes from schemaId to end of header
-        List<MemorySegmentBytesView> segments = pagedOutputView.getWrittenSegments();
-        MemorySegmentBytesView firstSeg = segments.get(0);
-        Checksums.update(crc, firstSeg.getByteBuffer(), schemaIdOff, headerSize - schemaIdOff);
-
-        // 2. Statistics bytes
-        crc.update(statisticsBytes, 0, statisticsBytes.length);
-
-        // 3. Records bytes from pagedOutputView (skip header portion)
-        boolean first = true;
-        for (MemorySegmentBytesView segView : segments) {
-            if (first) {
-                first = false;
-                int remaining = segView.getBytesLength() - headerSize;
-                if (remaining > 0) {
-                    Checksums.update(crc, segView.getByteBuffer(), headerSize, remaining);
-                }
-            } else {
-                Checksums.update(crc, segView.getByteBuffer(), 0, segView.getBytesLength());
-            }
-        }
-
-        return crc.getValue();
     }
 
     @VisibleForTesting

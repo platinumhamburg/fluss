@@ -23,8 +23,6 @@ import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAG
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
-import static org.apache.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffset;
-import static org.apache.fluss.record.LogRecordBatchFormat.arrowChangeTypeOffsetWithStats;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.batchSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
@@ -54,8 +52,8 @@ public class LogRecordBatchFormatTest {
     void testLogRecordBatchFormatForMagicV0() {
         byte magic = (byte) 0;
         assertThatThrownBy(() -> leaderEpochOffset(magic))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Unsupported magic value 0");
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("Leader epoch is not supported in V0/V1");
         assertThat(crcOffset(magic)).isEqualTo(21);
         assertThat(schemaIdOffset(magic)).isEqualTo(25);
         assertThat(attributeOffset(magic)).isEqualTo(27);
@@ -64,22 +62,31 @@ public class LogRecordBatchFormatTest {
         assertThat(batchSequenceOffset(magic)).isEqualTo(40);
         assertThat(recordsCountOffset(magic)).isEqualTo(44);
         assertThat(recordBatchHeaderSize(magic)).isEqualTo(48);
-        assertThat(arrowChangeTypeOffset(magic)).isEqualTo(48);
+
+        // V0 does not support statistics
+        assertThatThrownBy(() -> statisticsLengthOffset(magic))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> statisticsDataOffset(magic))
+                .isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
     void testLogRecordBatchFormatForMagicV1() {
         byte magic = (byte) 1;
-        assertThat(leaderEpochOffset(magic)).isEqualTo(21);
-        assertThat(crcOffset(magic)).isEqualTo(25);
-        assertThat(schemaIdOffset(magic)).isEqualTo(29);
-        assertThat(attributeOffset(magic)).isEqualTo(31);
-        assertThat(lastOffsetDeltaOffset(magic)).isEqualTo(32);
-        assertThat(writeClientIdOffset(magic)).isEqualTo(36);
-        assertThat(batchSequenceOffset(magic)).isEqualTo(44);
-        assertThat(recordsCountOffset(magic)).isEqualTo(48);
+        // V1 does not have leaderEpoch
+        assertThatThrownBy(() -> leaderEpochOffset(magic))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("Leader epoch is not supported in V0/V1");
+        assertThat(crcOffset(magic)).isEqualTo(21);
+        assertThat(schemaIdOffset(magic)).isEqualTo(25);
+        assertThat(attributeOffset(magic)).isEqualTo(27);
+        assertThat(lastOffsetDeltaOffset(magic)).isEqualTo(28);
+        assertThat(writeClientIdOffset(magic)).isEqualTo(32);
+        assertThat(batchSequenceOffset(magic)).isEqualTo(40);
+        assertThat(recordsCountOffset(magic)).isEqualTo(44);
+        assertThat(statisticsLengthOffset(magic)).isEqualTo(48);
+        assertThat(statisticsDataOffset(magic)).isEqualTo(52);
         assertThat(recordBatchHeaderSize(magic)).isEqualTo(52);
-        assertThat(arrowChangeTypeOffset(magic)).isEqualTo(52);
     }
 
     @Test
@@ -96,11 +103,5 @@ public class LogRecordBatchFormatTest {
         assertThat(statisticsLengthOffset(magic)).isEqualTo(52);
         assertThat(statisticsDataOffset(magic)).isEqualTo(56);
         assertThat(recordBatchHeaderSize(magic)).isEqualTo(56);
-        assertThat(arrowChangeTypeOffset(magic)).isEqualTo(56);
-
-        // With statistics, arrow change type offset shifts by statistics length
-        int statisticsLength = 100;
-        assertThat(arrowChangeTypeOffsetWithStats(magic, statisticsLength))
-                .isEqualTo(56 + statisticsLength);
     }
 }

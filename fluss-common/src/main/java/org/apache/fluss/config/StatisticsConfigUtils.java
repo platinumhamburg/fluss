@@ -25,8 +25,6 @@ import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeChecks;
 import org.apache.fluss.types.RowType;
 
-import java.util.Arrays;
-import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -49,57 +47,49 @@ public class StatisticsConfigUtils {
      */
     public static void validateStatisticsConfig(TableDescriptor tableDescriptor) {
         Map<String, String> properties = tableDescriptor.getProperties();
-        String statisticsColumns =
-                properties.getOrDefault(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), "*");
+        String statisticsColumns = properties.get(ConfigOptions.TABLE_STATISTICS_COLUMNS.key());
 
-        // Empty string means statistics disabled - no validation needed
-        if (statisticsColumns.isEmpty()) {
+        // Not set means statistics disabled - no validation needed
+        if (statisticsColumns == null) {
             return;
         }
 
         RowType rowType = tableDescriptor.getSchema().getRowType();
 
-        // Wildcard means all non-binary columns - no validation needed
+        // Wildcard means all supported columns - no validation needed
         if ("*".equals(statisticsColumns.trim())) {
             return;
         }
 
-        // Parse and validate specific column names
-        List<String> columnNames = parseColumnNames(statisticsColumns);
-        if (columnNames.isEmpty()) {
+        // Parse using TableConfig's logic via StatisticsColumnsConfig
+        Configuration config = new Configuration();
+        config.setString(ConfigOptions.TABLE_STATISTICS_COLUMNS.key(), statisticsColumns);
+        StatisticsColumnsConfig columnsConfig = new TableConfig(config).getStatisticsColumns();
+
+        if (columnsConfig.getMode() == StatisticsColumnsConfig.Mode.SPECIFIED
+                && columnsConfig.getColumns().isEmpty()) {
             throw new InvalidConfigException(
                     "Statistics columns configuration cannot be empty. "
-                            + "Use '*' to collect statistics for all non-binary columns, "
-                            + "or use empty string '' to disable statistics collection.");
+                            + "Use '*' to collect statistics for all supported columns, "
+                            + "or remove the property to disable statistics collection.");
         }
 
-        validateColumns(rowType, columnNames);
-    }
-
-    /**
-     * Parses comma-separated column names from the configuration string.
-     *
-     * @param columnsConfig the configuration string
-     * @return list of parsed column names
-     */
-    private static List<String> parseColumnNames(String columnsConfig) {
-        return Arrays.stream(columnsConfig.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .collect(Collectors.toList());
+        if (columnsConfig.getMode() == StatisticsColumnsConfig.Mode.SPECIFIED) {
+            validateColumns(rowType, columnsConfig);
+        }
     }
 
     /**
      * Validates that the specified columns exist in the schema and are of supported types.
      *
      * @param rowType the table schema
-     * @param statisticsColumns the list of column names to validate
+     * @param columnsConfig the statistics columns configuration
      * @throws InvalidConfigException if validation fails
      */
-    private static void validateColumns(RowType rowType, List<String> statisticsColumns) {
+    private static void validateColumns(RowType rowType, StatisticsColumnsConfig columnsConfig) {
         Map<String, DataType> columnTypeMap = buildColumnTypeMap(rowType);
 
-        for (String columnName : statisticsColumns) {
+        for (String columnName : columnsConfig.getColumns()) {
             // Check if column exists
             if (!columnTypeMap.containsKey(columnName)) {
                 throw new InvalidConfigException(
@@ -108,14 +98,16 @@ public class StatisticsConfigUtils {
                                 columnName));
             }
 
-            // Check if column type is supported
+            // Check if column type is supported (whitelist approach)
             DataType dataType = columnTypeMap.get(columnName);
-            if (DataTypeChecks.isBinaryType(dataType)) {
+            if (!DataTypeChecks.isSupportedStatisticsType(dataType)) {
                 throw new InvalidConfigException(
                         String.format(
-                                "Binary column '%s' cannot be included in statistics collection. "
-                                        + "Binary and bytes columns are not supported for statistics collection.",
-                                columnName));
+                                "Column '%s' of type '%s' is not supported for statistics collection. "
+                                        + "Supported types are: BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, "
+                                        + "FLOAT, DOUBLE, STRING, CHAR, DECIMAL, DATE, TIME, TIMESTAMP, "
+                                        + "and TIMESTAMP_LTZ.",
+                                columnName, dataType.asSummaryString()));
             }
         }
     }
