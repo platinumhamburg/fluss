@@ -253,11 +253,9 @@ public class LogRecordBatchStatisticsWriter {
      *
      * @param minValues The minimum values as InternalRow, can be null
      * @param maxValues The maximum values as InternalRow, can be null
-     * @param nullCounts The null counts array
      * @return The estimated number of bytes required for serialization
      */
-    public int estimatedSizeInBytes(
-            InternalRow minValues, InternalRow maxValues, Long[] nullCounts) {
+    public int estimatedSizeInBytes(InternalRow minValues, InternalRow maxValues) {
 
         int totalEstimatedBytes = 0;
 

@@ -63,16 +63,6 @@ public final class DataTypeChecks {
     }
 
     /**
-     * Check if the given data type is a binary type (BINARY or BYTES).
-     *
-     * @param dataType the data type to check
-     * @return true if the data type is binary, false otherwise
-     */
-    public static boolean isBinaryType(DataType dataType) {
-        return dataType.isAnyOf(DataTypeRoot.BINARY, DataTypeRoot.BYTES);
-    }
-
-    /**
      * Check if the given data type is supported for statistics collection. Uses a whitelist
      * approach to ensure only types with meaningful statistical properties are included.
      *

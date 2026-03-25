@@ -34,7 +34,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *   <li>{@link Mode#SPECIFIED}: Collect statistics for specific columns only.
  * </ul>
  *
- * @since 0.6
+ * @since 1.0
  */
 @PublicEvolving
 public class StatisticsColumnsConfig {

@@ -120,7 +120,7 @@ public class LogRecordBatchFormat {
      * ------------------------------------------
      * </pre>
      *
-     * @since 0.8
+     * @since 1.0
      */
     public static final byte LOG_MAGIC_VALUE_V2 = 2;
 
@@ -195,7 +195,7 @@ public class LogRecordBatchFormat {
      * ------------------------------------------
      * </pre>
      *
-     * @since 0.8
+     * @since 1.0
      */
     public static final byte LOG_MAGIC_VALUE_V1 = 1;
 

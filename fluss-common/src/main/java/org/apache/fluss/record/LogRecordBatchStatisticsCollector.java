@@ -111,7 +111,7 @@ public class LogRecordBatchStatisticsCollector {
      */
     public int estimatedSizeInBytes() {
         return statisticsWriter.estimatedSizeInBytes(
-                GenericRow.of(minValues), GenericRow.of(maxValues), nullCounts);
+                GenericRow.of(minValues), GenericRow.of(maxValues));
     }
 
     /** Reset the collector to collect new statistics. */

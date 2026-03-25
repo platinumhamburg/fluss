@@ -322,24 +322,39 @@ public class LogRecordBatchStatisticsTest extends LogTestBase {
         Long[] nullCounts = new Long[] {0L, 1L, 2L};
         int[] statsIndexMapping = new int[] {0, 1, 2};
 
-        DefaultLogRecordBatchStatistics stats =
-                new DefaultLogRecordBatchStatistics(
-                        segment,
-                        0,
-                        50,
-                        TestData.STATISTICS_BASIC_ROW_TYPE,
-                        SCHEMA_ID,
-                        nullCounts,
-                        0,
-                        0,
-                        0,
-                        0,
-                        statsIndexMapping);
+        assertThatThrownBy(
+                        () ->
+                                new DefaultLogRecordBatchStatistics(
+                                        segment,
+                                        0,
+                                        50,
+                                        TestData.STATISTICS_BASIC_ROW_TYPE,
+                                        SCHEMA_ID,
+                                        nullCounts,
+                                        0,
+                                        0,
+                                        0,
+                                        10,
+                                        statsIndexMapping))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("minValuesSize must be positive");
 
-        assertThat(stats.hasMinValues()).isFalse();
-        assertThat(stats.hasMaxValues()).isFalse();
-        assertThat(stats.getMinValues()).isNull();
-        assertThat(stats.getMaxValues()).isNull();
+        assertThatThrownBy(
+                        () ->
+                                new DefaultLogRecordBatchStatistics(
+                                        segment,
+                                        0,
+                                        50,
+                                        TestData.STATISTICS_BASIC_ROW_TYPE,
+                                        SCHEMA_ID,
+                                        nullCounts,
+                                        0,
+                                        0,
+                                        10,
+                                        0,
+                                        statsIndexMapping))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("maxValuesSize must be positive");
     }
 
     @Test

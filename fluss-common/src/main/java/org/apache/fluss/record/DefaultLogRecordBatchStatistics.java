@@ -105,6 +105,8 @@ public class DefaultLogRecordBatchStatistics implements LogRecordBatchStatistics
         this.statsNullCounts = nullCounts;
         this.minValuesOffset = minValuesOffset;
         this.maxValuesOffset = maxValuesOffset;
+        checkArgument(minValuesSize > 0, "minValuesSize must be positive");
+        checkArgument(maxValuesSize > 0, "maxValuesSize must be positive");
         this.minValuesSize = minValuesSize;
         this.maxValuesSize = maxValuesSize;
         this.statsIndexMapping = statsIndexMapping;
@@ -117,10 +119,6 @@ public class DefaultLogRecordBatchStatistics implements LogRecordBatchStatistics
 
     @Override
     public InternalRow getMinValues() {
-        if (minValuesSize == 0) {
-            return null;
-        }
-
         // Return cached row if already created
         if (cachedMinRow != null) {
             return cachedMinRow;
@@ -135,10 +133,6 @@ public class DefaultLogRecordBatchStatistics implements LogRecordBatchStatistics
 
     @Override
     public InternalRow getMaxValues() {
-        if (maxValuesSize == 0) {
-            return null;
-        }
-
         // Return cached row if already created
         if (cachedMaxRow != null) {
             return cachedMaxRow;
