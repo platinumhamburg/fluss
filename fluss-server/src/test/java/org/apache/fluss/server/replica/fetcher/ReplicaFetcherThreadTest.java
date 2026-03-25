@@ -427,27 +427,30 @@ public class ReplicaFetcherThreadTest {
             // then the delayed responses arrive after 3s
             timeoutFetcher.start();
 
-            // Wait for at least one timeout + delayed response cycle to complete
-            Thread.sleep(5000);
+            // Wait until at least one delayed response has been allocated
+            retry(
+                    Duration.ofSeconds(10),
+                    () -> assertThat(testingEndpoint.getAllAllocatedByteBufs()).isNotEmpty());
 
             // Shutdown the fetcher to stop new requests
             timeoutFetcher.shutdown();
 
-            // Wait a bit more for any remaining delayed responses to arrive and be cleaned up
-            Thread.sleep(2000);
-
-            // Verify: ALL pooled ByteBufs should have been released by the late-arrival callback
-            java.util.List<ByteBuf> allBufs = testingEndpoint.getAllAllocatedByteBufs();
-            assertThat(allBufs).isNotEmpty();
-            for (int i = 0; i < allBufs.size(); i++) {
-                ByteBuf buf = allBufs.get(i);
-                assertThat(buf.refCnt())
-                        .as(
-                                "Pooled ByteBuf #%d should be released after fetch timeout. "
-                                        + "refCnt > 0 means the buffer leaked.",
-                                i)
-                        .isEqualTo(0);
-            }
+            // Wait until ALL allocated ByteBufs have been released (refCnt == 0).
+            // The thenAccept callback releases them when late responses arrive.
+            retry(
+                    Duration.ofSeconds(15),
+                    () -> {
+                        java.util.List<ByteBuf> allBufs = testingEndpoint.getAllAllocatedByteBufs();
+                        for (int i = 0; i < allBufs.size(); i++) {
+                            assertThat(allBufs.get(i).refCnt())
+                                    .as(
+                                            "Pooled ByteBuf #%d should be released after"
+                                                    + " fetch timeout. refCnt > 0 means the"
+                                                    + " buffer leaked.",
+                                            i)
+                                    .isEqualTo(0);
+                        }
+                    });
         } finally {
             scheduler.shutdownNow();
         }

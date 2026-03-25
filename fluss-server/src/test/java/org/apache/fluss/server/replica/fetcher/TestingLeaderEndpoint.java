@@ -63,9 +63,6 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
 
     private volatile long delayMs;
 
-    /** The last ByteBuf allocated for a delayed fetch response, for leak detection in tests. */
-    private volatile ByteBuf lastAllocatedByteBuf;
-
     /** All ByteBufs allocated for delayed fetch responses, for leak detection in tests. */
     private final java.util.concurrent.CopyOnWriteArrayList<ByteBuf> allocatedByteBufs =
             new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -142,14 +139,6 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
         this.delayMs = 0;
     }
 
-    /**
-     * Returns the last pooled ByteBuf allocated for a delayed fetch response. Used in tests to
-     * verify that the buffer is properly released after timeout.
-     */
-    public ByteBuf getLastAllocatedByteBuf() {
-        return lastAllocatedByteBuf;
-    }
-
     /** Returns all pooled ByteBufs allocated for delayed fetch responses. */
     public java.util.List<ByteBuf> getAllAllocatedByteBufs() {
         return allocatedByteBufs;
@@ -168,7 +157,6 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
             pooledBuf.writeZero(64);
             // Parse from the pooled buffer so that getParsedByteBuf() returns it
             fetchLogResponse.parseFrom(pooledBuf, 0);
-            lastAllocatedByteBuf = pooledBuf;
             allocatedByteBufs.add(pooledBuf);
         }
         return new FetchData(fetchLogResponse, resultMap);
