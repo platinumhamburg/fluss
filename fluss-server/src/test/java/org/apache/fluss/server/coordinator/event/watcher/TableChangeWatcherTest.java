@@ -99,7 +99,7 @@ class TableChangeWatcherTest {
     }
 
     @BeforeEach
-    void before() {
+    void before() throws Exception {
         // Clean up ZK state from previous tests to prevent CuratorCache initial sync
         // from picking up leftover data
         try {
@@ -111,6 +111,15 @@ class TableChangeWatcherTest {
         eventManager = new TestingEventManager();
         tableChangeWatcher = new TableChangeWatcher(zookeeperClient, eventManager);
         tableChangeWatcher.start();
+        // Wait for CuratorCache to complete its initial sync before creating tables.
+        // Without this, the cache may fire NODE_CHANGED events from the initial tree
+        // scan that race with table creation, causing processCreateTable() to read
+        // stale or incomplete ZK state.
+        assertThat(tableChangeWatcher.awaitInitialized(30, java.util.concurrent.TimeUnit.SECONDS))
+                .as("CuratorCache should complete initial sync within timeout")
+                .isTrue();
+        // Clear any events generated during initial sync (e.g., from leftover ZK nodes)
+        eventManager.clearEvents();
     }
 
     @AfterEach

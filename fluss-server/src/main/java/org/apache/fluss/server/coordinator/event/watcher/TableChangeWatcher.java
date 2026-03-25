@@ -48,6 +48,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /** A watcher to watch the table changes(create/delete) in zookeeper. */
 public class TableChangeWatcher {
@@ -59,6 +61,7 @@ public class TableChangeWatcher {
 
     private final EventManager eventManager;
     private final ZooKeeperClient zooKeeperClient;
+    private final CountDownLatch initializedLatch = new CountDownLatch(1);
 
     public TableChangeWatcher(ZooKeeperClient zooKeeperClient, EventManager eventManager) {
         this.zooKeeperClient = zooKeeperClient;
@@ -73,6 +76,15 @@ public class TableChangeWatcher {
         curatorCache.start();
     }
 
+    /**
+     * Waits until the CuratorCache has completed its initial sync with ZooKeeper. This should be
+     * called after {@link #start()} to ensure the cache is fully warmed up before relying on change
+     * events.
+     */
+    public boolean awaitInitialized(long timeout, TimeUnit unit) throws InterruptedException {
+        return initializedLatch.await(timeout, unit);
+    }
+
     public void stop() {
         if (!running) {
             return;
@@ -84,6 +96,12 @@ public class TableChangeWatcher {
 
     /** A listener to monitor the changes of table nodes in zookeeper. */
     private final class TablePathChangeListener implements CuratorCacheListener {
+
+        @Override
+        public void initialized() {
+            LOG.info("CuratorCache initial sync completed for TableChangeWatcher.");
+            initializedLatch.countDown();
+        }
 
         @Override
         public void event(Type type, ChildData oldData, ChildData newData) {
