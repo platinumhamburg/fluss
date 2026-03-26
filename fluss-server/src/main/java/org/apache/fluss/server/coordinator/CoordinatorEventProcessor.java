@@ -2289,7 +2289,16 @@ public class CoordinatorEventProcessor implements EventProcessor {
         }
     }
 
+    private volatile long lastPeriodicElectionCheckMs = 0;
+    private volatile long periodicElectionIntervalMs = 60000;
+
     private void processPeriodicElectionCheck() {
+        long now = System.currentTimeMillis();
+        if (now - lastPeriodicElectionCheckMs < periodicElectionIntervalMs / 2) {
+            return;
+        }
+        lastPeriodicElectionCheckMs = now;
+
         Set<TableBucket> offlineBuckets =
                 coordinatorContext.bucketsInStates(Collections.singleton(OfflineBucket));
 
@@ -2324,6 +2333,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
      * @param intervalMs the interval in milliseconds between checks
      */
     public void startPeriodicElectionCheck(Scheduler scheduler, long intervalMs) {
+        this.periodicElectionIntervalMs = intervalMs;
         scheduler.schedule(
                 "periodic-election-check",
                 () -> coordinatorEventManager.put(new PeriodicElectionCheckEvent()),
