@@ -82,6 +82,7 @@ import org.apache.fluss.server.coordinator.event.NewTabletServerEvent;
 import org.apache.fluss.server.coordinator.event.NotifyKvSnapshotOffsetEvent;
 import org.apache.fluss.server.coordinator.event.NotifyLakeTableOffsetEvent;
 import org.apache.fluss.server.coordinator.event.NotifyLeaderAndIsrResponseReceivedEvent;
+import org.apache.fluss.server.coordinator.event.PeriodicElectionCheckEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
 import org.apache.fluss.server.coordinator.event.SchemaChangeEvent;
@@ -118,6 +119,7 @@ import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.concurrent.Scheduler;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
@@ -635,6 +637,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
         } else if (event instanceof AccessContextEvent) {
             AccessContextEvent<?> accessContextEvent = (AccessContextEvent<?>) event;
             processAccessContext(accessContextEvent);
+        } else if (event instanceof PeriodicElectionCheckEvent) {
+            processPeriodicElectionCheck();
         } else {
             LOG.warn("Unknown event type: {}", event.getClass().getName());
         }
@@ -2283,5 +2287,48 @@ public class CoordinatorEventProcessor implements EventProcessor {
         public int hashCode() {
             return Objects.hash(replicas, addingReplicas, removingReplicas);
         }
+    }
+
+    private void processPeriodicElectionCheck() {
+        Set<TableBucket> offlineBuckets =
+                coordinatorContext.bucketsInStates(Collections.singleton(OfflineBucket));
+
+        offlineBuckets =
+                offlineBuckets.stream()
+                        .filter(tb -> !coordinatorContext.isToBeDeleted(tb))
+                        .collect(Collectors.toSet());
+
+        if (offlineBuckets.isEmpty()) {
+            LOG.debug("Periodic election check: no offline buckets found");
+            return;
+        }
+
+        TableBucketStateMachine.ElectionSummary summary =
+                tableBucketStateMachine.tryElectForOfflineBuckets(offlineBuckets);
+
+        if (summary.recovered > 0) {
+            LOG.info(
+                    "Periodic election check: scanned {} offline buckets, {} recovered, {} still offline",
+                    summary.total,
+                    summary.recovered,
+                    summary.stillOffline);
+        } else {
+            LOG.info("Periodic election check: {} offline buckets, none recovered", summary.total);
+        }
+    }
+
+    /**
+     * Starts the periodic election check using the given scheduler.
+     *
+     * @param scheduler the scheduler to use for periodic task submission
+     * @param intervalMs the interval in milliseconds between checks
+     */
+    public void startPeriodicElectionCheck(Scheduler scheduler, long intervalMs) {
+        scheduler.schedule(
+                "periodic-election-check",
+                () -> coordinatorEventManager.put(new PeriodicElectionCheckEvent()),
+                intervalMs,
+                intervalMs);
+        LOG.info("Started periodic election check with interval {}ms", intervalMs);
     }
 }

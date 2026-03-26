@@ -415,6 +415,99 @@ class TableBucketStateMachineTest {
         assertThat(leaderElectionResult.getLeaderAndIsr().isr()).containsExactlyInAnyOrder(4);
     }
 
+    @Test
+    void testTryElectForOfflineBuckets() throws Exception {
+        TableBucketStateMachine tableBucketStateMachine = createTableBucketStateMachine();
+        TablePath tablePath = TablePath.of("db1", "t_periodic");
+        long tableId = 100;
+        TableBucket tb0 = new TableBucket(tableId, 0);
+
+        // Setup: register table, assignment, live servers
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        tablePath,
+                        tableId,
+                        0,
+                        DATA1_TABLE_DESCRIPTOR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+        coordinatorContext.putTablePath(tableId, tablePath);
+        coordinatorContext.updateBucketReplicaAssignment(tb0, Arrays.asList(0, 1, 2));
+        coordinatorContext.setLiveTabletServers(createServers(Arrays.asList(0, 1, 2)));
+        makeSendLeaderAndStopRequestAlwaysSuccess(
+                coordinatorContext, testCoordinatorChannelManager);
+
+        // Bring bucket online first (NewBucket -> OnlineBucket)
+        coordinatorContext.putBucketState(tb0, NewBucket);
+        tableBucketStateMachine.handleStateChange(Collections.singleton(tb0), OnlineBucket);
+        assertThat(coordinatorContext.getBucketState(tb0)).isEqualTo(OnlineBucket);
+
+        // Simulate leader failure: set bucket to OfflineBucket
+        coordinatorContext.putBucketState(tb0, OfflineBucket);
+
+        // Case 1: ISR member is alive -> should recover
+        TableBucketStateMachine.ElectionSummary summary =
+                tableBucketStateMachine.tryElectForOfflineBuckets(Collections.singleton(tb0));
+
+        assertThat(summary.total).isEqualTo(1);
+        assertThat(summary.recovered).isEqualTo(1);
+        assertThat(summary.stillOffline).isEqualTo(0);
+        assertThat(coordinatorContext.getBucketState(tb0)).isEqualTo(OnlineBucket);
+    }
+
+    @Test
+    void testTryElectForOfflineBucketsNoRecovery() throws Exception {
+        TableBucketStateMachine tableBucketStateMachine = createTableBucketStateMachine();
+        TablePath tablePath = TablePath.of("db1", "t_periodic2");
+        long tableId = 101;
+        TableBucket tb0 = new TableBucket(tableId, 0);
+
+        // Setup
+        coordinatorContext.putTableInfo(
+                TableInfo.of(
+                        tablePath,
+                        tableId,
+                        0,
+                        DATA1_TABLE_DESCRIPTOR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis()));
+        coordinatorContext.putTablePath(tableId, tablePath);
+        coordinatorContext.updateBucketReplicaAssignment(tb0, Arrays.asList(0, 1, 2));
+        coordinatorContext.setLiveTabletServers(createServers(Arrays.asList(0, 1, 2)));
+        makeSendLeaderAndStopRequestAlwaysSuccess(
+                coordinatorContext, testCoordinatorChannelManager);
+
+        // Bring bucket online first
+        coordinatorContext.putBucketState(tb0, NewBucket);
+        tableBucketStateMachine.handleStateChange(Collections.singleton(tb0), OnlineBucket);
+        assertThat(coordinatorContext.getBucketState(tb0)).isEqualTo(OnlineBucket);
+
+        // Simulate: all servers down, bucket offline
+        coordinatorContext.putBucketState(tb0, OfflineBucket);
+        coordinatorContext.setLiveTabletServers(createServers(Collections.emptyList()));
+
+        // No live servers -> should not recover
+        TableBucketStateMachine.ElectionSummary summary =
+                tableBucketStateMachine.tryElectForOfflineBuckets(Collections.singleton(tb0));
+
+        assertThat(summary.total).isEqualTo(1);
+        assertThat(summary.recovered).isEqualTo(0);
+        assertThat(summary.stillOffline).isEqualTo(1);
+        assertThat(coordinatorContext.getBucketState(tb0)).isEqualTo(OfflineBucket);
+    }
+
+    @Test
+    void testTryElectForOfflineBucketsEmpty() {
+        TableBucketStateMachine tableBucketStateMachine = createTableBucketStateMachine();
+
+        TableBucketStateMachine.ElectionSummary summary =
+                tableBucketStateMachine.tryElectForOfflineBuckets(Collections.emptySet());
+
+        assertThat(summary.total).isEqualTo(0);
+        assertThat(summary.recovered).isEqualTo(0);
+        assertThat(summary.stillOffline).isEqualTo(0);
+    }
+
     private TableBucketStateMachine createTableBucketStateMachine() {
         return new TableBucketStateMachine(
                 coordinatorContext, coordinatorRequestBatch, zookeeperClient);

@@ -145,6 +145,64 @@ public class TableBucketStateMachine {
     }
 
     /**
+     * Attempts leader election for offline buckets and returns a summary.
+     *
+     * <p>Unlike {@link #handleStateChange}, this method does not log per-bucket errors. The caller
+     * is responsible for summary logging. This is used by the periodic election safety net.
+     */
+    public ElectionSummary tryElectForOfflineBuckets(Set<TableBucket> offlineBuckets) {
+        int recovered = 0;
+        int stillOffline = 0;
+
+        ReplicaLeaderElection defaultElection = new DefaultLeaderElection();
+
+        try {
+            coordinatorRequestBatch.newBatch();
+
+            for (TableBucket bucket : offlineBuckets) {
+                // Resolve partition name (same as doHandleStateChange)
+                String partitionName = null;
+                if (bucket.getPartitionId() != null) {
+                    partitionName = coordinatorContext.getPartitionName(bucket.getPartitionId());
+                    if (partitionName == null) {
+                        stillOffline++;
+                        continue;
+                    }
+                }
+
+                Optional<ElectionResult> result =
+                        electNewLeaderForTableBuckets(bucket, defaultElection);
+
+                if (result.isPresent()) {
+                    doStateChange(bucket, BucketState.OnlineBucket);
+                    ElectionResult electionResult = result.get();
+                    coordinatorRequestBatch.addNotifyLeaderRequestForTabletServers(
+                            new HashSet<>(electionResult.liveReplicas),
+                            PhysicalTablePath.of(
+                                    coordinatorContext.getTablePathById(bucket.getTableId()),
+                                    partitionName),
+                            bucket,
+                            coordinatorContext.getAssignment(bucket),
+                            electionResult.leaderAndIsr);
+                    recovered++;
+                } else {
+                    stillOffline++;
+                }
+            }
+
+            coordinatorRequestBatch.sendRequestToTabletServers(
+                    coordinatorContext.getCoordinatorEpoch());
+        } catch (Throwable e) {
+            LOG.error(
+                    "Failed during periodic election check for {} offline buckets.",
+                    offlineBuckets.size(),
+                    e);
+        }
+
+        return new ElectionSummary(offlineBuckets.size(), recovered, stillOffline);
+    }
+
+    /**
      * Handle the state change of TableBucket. It's the core state transition logic of the state
      * machine. It ensures that every state transition happens from a legal previous state to the
      * target state. The valid state transitions for the state machine are as follows:
@@ -688,5 +746,18 @@ public class TableBucketStateMachine {
         }
 
         return Optional.empty();
+    }
+
+    /** Summary of a periodic election check. */
+    public static class ElectionSummary {
+        public final int total;
+        public final int recovered;
+        public final int stillOffline;
+
+        public ElectionSummary(int total, int recovered, int stillOffline) {
+            this.total = total;
+            this.recovered = recovered;
+            this.stillOffline = stillOffline;
+        }
     }
 }

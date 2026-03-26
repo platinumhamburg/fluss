@@ -48,6 +48,7 @@ import org.apache.fluss.server.coordinator.event.AdjustIsrReceivedEvent;
 import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
 import org.apache.fluss.server.coordinator.event.CoordinatorEventManager;
+import org.apache.fluss.server.coordinator.event.PeriodicElectionCheckEvent;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.statemachine.BucketState;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaState;
@@ -1035,6 +1036,42 @@ class CoordinatorEventProcessorTest {
 
         // clean up the tablet server 3
         ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupPath(ZkData.ServerIdZNode.path(3));
+    }
+
+    @Test
+    void testPeriodicElectionCheck() throws Exception {
+        // Make sure all requests to gateway should be successful
+        initCoordinatorChannel();
+
+        // Create a table with a single bucket, replication factor 1 on server 0
+        TablePath tablePath = TablePath.of(defaultDatabase, "t_periodic_election");
+        Map<Integer, BucketAssignment> bucketAssignments = new HashMap<>();
+        bucketAssignments.put(0, BucketAssignment.of(0));
+        TableAssignment tableAssignment = new TableAssignment(bucketAssignments);
+        long tableId = metadataManager.createTable(tablePath, TEST_TABLE, tableAssignment, false);
+
+        TableBucket tb0 = new TableBucket(tableId, 0);
+
+        // Wait until the bucket is online
+        retryVerifyContext(ctx -> assertThat(ctx.getBucketState(tb0)).isEqualTo(OnlineBucket));
+
+        // Force the bucket into OfflineBucket state via the coordinator context
+        fromCtx(
+                ctx -> {
+                    ctx.putBucketState(tb0, OfflineBucket);
+                    return null;
+                });
+
+        // Verify it is offline
+        BucketState state = fromCtx(ctx -> ctx.getBucketState(tb0));
+        assertThat(state).isEqualTo(OfflineBucket);
+
+        // Process the PeriodicElectionCheckEvent through the event manager
+        eventProcessor.getCoordinatorEventManager().put(new PeriodicElectionCheckEvent());
+
+        // The periodic election check should recover the bucket back to online
+        // since server 0 is still alive and in the ISR
+        retryVerifyContext(ctx -> assertThat(ctx.getBucketState(tb0)).isEqualTo(OnlineBucket));
     }
 
     private void verifyIsr(TableBucket tb, int expectedLeader, List<Integer> expectedIsr)

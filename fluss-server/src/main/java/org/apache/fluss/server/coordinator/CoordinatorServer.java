@@ -48,6 +48,7 @@ import org.apache.fluss.utils.ExecutorUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
+import org.apache.fluss.utils.concurrent.FlussScheduler;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
@@ -147,6 +148,9 @@ public class CoordinatorServer extends ServerBase {
 
     @GuardedBy("lock")
     private KvSnapshotLeaseManager kvSnapshotLeaseManager;
+
+    @GuardedBy("lock")
+    private FlussScheduler coordinatorScheduler;
 
     public CoordinatorServer(Configuration conf) {
         this(conf, SystemClock.getInstance());
@@ -279,6 +283,13 @@ public class CoordinatorServer extends ServerBase {
                             kvSnapshotLeaseManager);
             coordinatorEventProcessor.startup();
 
+            // Start periodic election check scheduler
+            this.coordinatorScheduler = new FlussScheduler(1, true, "coordinator-scheduler-");
+            coordinatorScheduler.startup();
+            coordinatorEventProcessor.startPeriodicElectionCheck(
+                    coordinatorScheduler,
+                    conf.get(ConfigOptions.COORDINATOR_PERIODIC_ELECTION_INTERVAL).toMillis());
+
             createDefaultDatabase();
         }
     }
@@ -396,6 +407,14 @@ public class CoordinatorServer extends ServerBase {
             try {
                 if (autoPartitionManager != null) {
                     autoPartitionManager.close();
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                if (coordinatorScheduler != null) {
+                    coordinatorScheduler.shutdown();
                 }
             } catch (Throwable t) {
                 exception = ExceptionUtils.firstOrSuppressed(t, exception);

@@ -372,6 +372,14 @@ public class ConfigOptions {
                                     + "Producer offsets older than this TTL will be automatically cleaned up "
                                     + "by the coordinator server. Default is 24 hours.");
 
+    public static final ConfigOption<Duration> COORDINATOR_PERIODIC_ELECTION_INTERVAL =
+            key("coordinator.periodic-election.interval")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(60))
+                    .withDescription(
+                            "Interval for periodic election check of offline buckets. "
+                                    + "Acts as a safety net for event-driven election.");
+
     /** The interval for cleaning up expired producer offsets and orphan files in remote storage. */
     public static final ConfigOption<Duration> COORDINATOR_PRODUCER_OFFSETS_CLEANUP_INTERVAL =
             key("coordinator.producer-offsets.cleanup-interval")
