@@ -997,6 +997,11 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 notifyLeaderAndIsrResultForBuckets) {
             // if the error code is not none, we will consider it as offline
             if (notifyLeaderAndIsrResultForBucket.failed()) {
+                LOG.warn(
+                        "NotifyLeaderAndIsr failed for bucket {} on server {}: {}",
+                        notifyLeaderAndIsrResultForBucket.getTableBucket(),
+                        serverId,
+                        notifyLeaderAndIsrResultForBucket.getError());
                 offlineReplicas.add(
                         new TableBucketReplica(
                                 notifyLeaderAndIsrResultForBucket.getTableBucket(), serverId));
