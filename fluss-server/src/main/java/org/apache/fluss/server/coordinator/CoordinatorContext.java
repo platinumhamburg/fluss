@@ -180,6 +180,13 @@ public class CoordinatorContext {
         replicasOnOffline.remove(serverId);
     }
 
+    /** Check if a replica is in the offline set (for diagnostics). */
+    public boolean isReplicaInOfflineSet(int serverId, TableBucket tableBucket) {
+        return replicasOnOffline
+                .getOrDefault(serverId, Collections.emptySet())
+                .contains(tableBucket);
+    }
+
     public Map<Long, TablePath> allTables() {
         return tablePathById;
     }

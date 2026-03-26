@@ -670,6 +670,23 @@ public class TableBucketStateMachine {
             return Optional.empty();
         }
 
+        // Diagnostic: log why ISR members are not in liveReplicas
+        List<Integer> isr = leaderAndIsr.isr();
+        for (int isrMember : isr) {
+            if (!liveReplicas.contains(isrMember)) {
+                boolean inLiveSet = coordinatorContext.liveTabletServerSet().contains(isrMember);
+                boolean inOffline =
+                        coordinatorContext.isReplicaInOfflineSet(isrMember, tableBucket);
+                LOG.warn(
+                        "ISR member {} for bucket {} not in liveReplicas. "
+                                + "inLiveTabletServerSet={}, inReplicasOnOffline={}",
+                        isrMember,
+                        stringifyBucket(tableBucket),
+                        inLiveSet,
+                        inOffline);
+            }
+        }
+
         Optional<ElectionResult> resultOpt = Optional.empty();
         if (electionStrategy instanceof DefaultLeaderElection) {
             resultOpt =
