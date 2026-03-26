@@ -390,7 +390,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
             Optional<TableBucketStateMachine.ElectionResult> result =
                     election.leaderElection(assignment, aliveReplicas, leaderAndIsr);
             if (result.isPresent()) {
-                newLeaderAndIsrMap.put(bucket, result.get().leaderAndIsr);
+                newLeaderAndIsrMap.put(bucket, result.get().getLeaderAndIsr());
             }
         }
 
