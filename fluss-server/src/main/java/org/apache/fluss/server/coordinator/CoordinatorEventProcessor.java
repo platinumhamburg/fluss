@@ -92,6 +92,7 @@ import org.apache.fluss.server.coordinator.event.watcher.TabletServerChangeWatch
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.rebalance.RebalanceManager;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ControlledShutdownLeaderElection;
+import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.DefaultLeaderElection;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ReassignmentLeaderElection;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaStateMachine;
 import org.apache.fluss.server.coordinator.statemachine.TableBucketStateMachine;
@@ -275,6 +276,19 @@ public class CoordinatorEventProcessor implements EventProcessor {
             throw new FlussRuntimeException("Fail to initialize coordinator context.", e);
         }
 
+        // Recover leaders for buckets that have leader=-1 and single ISR member.
+        // This must happen before ReplicaStateMachine.startup() to avoid the deadlock where
+        // NotifyLeaderAndIsr(leader=-1) causes makeFollower failures that permanently mark
+        // replicas in replicasOnOffline.
+        try {
+            recoverLeaderForSingleIsrBuckets();
+        } catch (Exception e) {
+            LOG.warn(
+                    "Failed to recover leaders for single-ISR buckets, "
+                            + "will fall back to normal election.",
+                    e);
+        }
+
         // We need to send UpdateMetadataRequest after the coordinator context is initialized and
         // before the state machines in tableManager are started. This is because tablet servers
         // need to receive the list of live tablet servers from UpdateMetadataRequest before they
@@ -333,6 +347,70 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
     public int getCoordinatorEpoch() {
         return coordinatorContext.getCoordinatorEpoch();
+    }
+
+    /**
+     * Recover leaders for buckets that have leader=-1 and a single ISR member. This must be called
+     * after initCoordinatorContext() and before ReplicaStateMachine.startup() to prevent the
+     * deadlock where NotifyLeaderAndIsr(leader=-1) causes makeFollower failures that permanently
+     * mark replicas in replicasOnOffline.
+     */
+    private void recoverLeaderForSingleIsrBuckets() throws Exception {
+        Map<TableBucket, LeaderAndIsr> toRecover = new HashMap<>();
+
+        for (Map.Entry<TableBucket, LeaderAndIsr> entry :
+                coordinatorContext.bucketLeaderAndIsr().entrySet()) {
+            LeaderAndIsr leaderAndIsr = entry.getValue();
+            if (leaderAndIsr.leader() == -1
+                    && leaderAndIsr.isr().size() == 1
+                    && coordinatorContext
+                            .liveTabletServerSet()
+                            .contains(leaderAndIsr.isr().get(0))) {
+                toRecover.put(entry.getKey(), leaderAndIsr);
+            }
+        }
+
+        if (toRecover.isEmpty()) {
+            LOG.info("Leader recovery: no leaderless single-ISR buckets found");
+            return;
+        }
+
+        DefaultLeaderElection election = new DefaultLeaderElection();
+        Map<TableBucket, LeaderAndIsr> newLeaderAndIsrMap = new HashMap<>();
+
+        for (Map.Entry<TableBucket, LeaderAndIsr> entry : toRecover.entrySet()) {
+            TableBucket bucket = entry.getKey();
+            LeaderAndIsr leaderAndIsr = entry.getValue();
+            List<Integer> assignment = coordinatorContext.getAssignment(bucket);
+            List<Integer> aliveReplicas =
+                    assignment.stream()
+                            .filter(id -> coordinatorContext.liveTabletServerSet().contains(id))
+                            .collect(Collectors.toList());
+
+            Optional<TableBucketStateMachine.ElectionResult> result =
+                    election.leaderElection(assignment, aliveReplicas, leaderAndIsr);
+            if (result.isPresent()) {
+                newLeaderAndIsrMap.put(bucket, result.get().leaderAndIsr);
+            }
+        }
+
+        if (newLeaderAndIsrMap.isEmpty()) {
+            LOG.warn(
+                    "Leader recovery: found {} leaderless single-ISR buckets but none could be elected",
+                    toRecover.size());
+            return;
+        }
+
+        zooKeeperClient.batchUpdateLeaderAndIsr(newLeaderAndIsrMap);
+
+        for (Map.Entry<TableBucket, LeaderAndIsr> entry : newLeaderAndIsrMap.entrySet()) {
+            coordinatorContext.putBucketLeaderAndIsr(entry.getKey(), entry.getValue());
+        }
+
+        LOG.info(
+                "Leader recovery: elected leaders for {}/{} leaderless single-ISR buckets",
+                newLeaderAndIsrMap.size(),
+                toRecover.size());
     }
 
     private void initCoordinatorContext() throws Exception {
