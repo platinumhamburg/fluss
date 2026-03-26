@@ -130,6 +130,7 @@ import javax.annotation.concurrent.NotThreadSafe;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -338,14 +339,28 @@ public class CoordinatorEventProcessor implements EventProcessor {
         long start = System.currentTimeMillis();
         // get all tablet server's
         int[] currentServers = zooKeeperClient.getSortedTabletServerList();
+        LOG.info(
+                "Got {} tablet servers from ZK: {}",
+                currentServers.length,
+                Arrays.toString(currentServers));
         List<ServerInfo> tabletServerInfos = new ArrayList<>();
         List<ServerNode> internalServerNodes = new ArrayList<>();
 
         long start4loadTabletServer = System.currentTimeMillis();
         Map<Integer, TabletServerRegistration> tabletServerRegistrations =
                 zooKeeperClient.getTabletServers(currentServers);
+        LOG.info(
+                "Got {} tablet server registrations from ZK (requested {})",
+                tabletServerRegistrations.size(),
+                currentServers.length);
+        List<Integer> skippedNullRegistration = new ArrayList<>();
+        List<Integer> skippedNoEndpoint = new ArrayList<>();
         for (int server : currentServers) {
             TabletServerRegistration registration = tabletServerRegistrations.get(server);
+            if (registration == null) {
+                skippedNullRegistration.add(server);
+                continue;
+            }
             ServerInfo serverInfo =
                     new ServerInfo(
                             server,
@@ -359,6 +374,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                         "Can not find endpoint for listener name {} for tablet server {}",
                         internalListenerName,
                         serverInfo);
+                skippedNoEndpoint.add(server);
                 continue;
             }
             tabletServerInfos.add(serverInfo);
@@ -372,8 +388,30 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
         coordinatorContext.setLiveTabletServers(tabletServerInfos);
         LOG.info(
-                "Load tablet servers success in {}ms when initializing coordinator context.",
-                System.currentTimeMillis() - start4loadTabletServer);
+                "Load tablet servers success in {}ms when initializing coordinator context. "
+                        + "ZK returned {} servers, loaded {} into liveSet, "
+                        + "skipped {} (null registration), skipped {} (no endpoint). "
+                        + "Live server IDs: {}",
+                System.currentTimeMillis() - start4loadTabletServer,
+                currentServers.length,
+                tabletServerInfos.size(),
+                skippedNullRegistration.size(),
+                skippedNoEndpoint.size(),
+                tabletServerInfos.stream()
+                        .map(s -> String.valueOf(s.id()))
+                        .collect(Collectors.joining(",")));
+        if (!skippedNullRegistration.isEmpty()) {
+            LOG.warn(
+                    "Skipped {} servers with null ZK registration: {}",
+                    skippedNullRegistration.size(),
+                    skippedNullRegistration);
+        }
+        if (!skippedNoEndpoint.isEmpty()) {
+            LOG.warn(
+                    "Skipped {} servers with no internal endpoint: {}",
+                    skippedNoEndpoint.size(),
+                    skippedNoEndpoint);
+        }
 
         // init tablet server channels
         coordinatorChannelManager.startup(internalServerNodes);
