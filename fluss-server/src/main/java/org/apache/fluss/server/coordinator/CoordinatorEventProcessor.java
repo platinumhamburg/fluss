@@ -2289,15 +2289,14 @@ public class CoordinatorEventProcessor implements EventProcessor {
         }
     }
 
-    private volatile long lastPeriodicElectionCheckMs = 0;
-    private volatile long periodicElectionIntervalMs = 60000;
+    private volatile long lastPeriodicElectionCompleteMs = 0;
+    private volatile long periodicElectionIntervalMs = 300000;
 
     private void processPeriodicElectionCheck() {
         long now = System.currentTimeMillis();
-        if (now - lastPeriodicElectionCheckMs < periodicElectionIntervalMs / 2) {
+        if (now - lastPeriodicElectionCompleteMs < periodicElectionIntervalMs) {
             return;
         }
-        lastPeriodicElectionCheckMs = now;
 
         Set<TableBucket> offlineBuckets =
                 coordinatorContext.bucketsInStates(Collections.singleton(OfflineBucket));
@@ -2309,11 +2308,14 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
         if (offlineBuckets.isEmpty()) {
             LOG.debug("Periodic election check: no offline buckets found");
+            lastPeriodicElectionCompleteMs = System.currentTimeMillis();
             return;
         }
 
         TableBucketStateMachine.ElectionSummary summary =
                 tableBucketStateMachine.tryElectForOfflineBuckets(offlineBuckets);
+
+        lastPeriodicElectionCompleteMs = System.currentTimeMillis();
 
         if (summary.recovered > 0) {
             LOG.info(
