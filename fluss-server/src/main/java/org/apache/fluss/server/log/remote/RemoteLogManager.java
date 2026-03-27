@@ -29,6 +29,7 @@ import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.MapUtils;
@@ -55,6 +56,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 /**
@@ -76,6 +78,7 @@ public class RemoteLogManager implements Closeable {
     private final ScheduledExecutorService rlManagerScheduledThreadPool;
     private final Clock clock;
     private final ZooKeeperClient zkClient;
+    private volatile BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback;
 
     private final Map<TableBucket, TaskWithFuture> rlmTasks = MapUtils.newConcurrentHashMap();
     private final Map<TableBucket, RemoteLogTablet> remoteLogs = MapUtils.newConcurrentHashMap();
@@ -85,7 +88,8 @@ public class RemoteLogManager implements Closeable {
             ZooKeeperClient zkClient,
             CoordinatorGateway coordinatorGateway,
             Clock clock,
-            ExecutorService ioExecutor)
+            ExecutorService ioExecutor,
+            BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback)
             throws IOException {
         this(
                 conf,
@@ -95,7 +99,8 @@ public class RemoteLogManager implements Closeable {
                 Executors.newScheduledThreadPool(
                         conf.getInt(ConfigOptions.REMOTE_LOG_MANAGER_THREAD_POOL_SIZE),
                         new ExecutorThreadFactory(RLM_SCHEDULED_THREAD_PREFIX)),
-                clock);
+                clock,
+                correctiveLeaderAndIsrCallback);
     }
 
     @VisibleForTesting
@@ -107,9 +112,23 @@ public class RemoteLogManager implements Closeable {
             ScheduledExecutorService scheduledExecutor,
             Clock clock)
             throws IOException {
+        this(conf, zkClient, coordinatorGateway, remoteLogStorage, scheduledExecutor, clock, null);
+    }
+
+    @VisibleForTesting
+    public RemoteLogManager(
+            Configuration conf,
+            ZooKeeperClient zkClient,
+            CoordinatorGateway coordinatorGateway,
+            RemoteLogStorage remoteLogStorage,
+            ScheduledExecutorService scheduledExecutor,
+            Clock clock,
+            BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback)
+            throws IOException {
         this.remoteLogStorage = remoteLogStorage;
         this.zkClient = zkClient;
         this.coordinatorGateway = coordinatorGateway;
+        this.correctiveLeaderAndIsrCallback = correctiveLeaderAndIsrCallback;
 
         File dataDir = new File(conf.getString(ConfigOptions.DATA_DIR));
         this.remoteLogIndexCache =
@@ -124,6 +143,10 @@ public class RemoteLogManager implements Closeable {
 
     public RemoteLogStorage getRemoteLogStorage() {
         return remoteLogStorage;
+    }
+
+    public void setCorrectiveLeaderAndIsrCallback(BiConsumer<TableBucket, LeaderAndIsr> callback) {
+        this.correctiveLeaderAndIsrCallback = callback;
     }
 
     public FsPath remoteLogDir() {
@@ -290,7 +313,8 @@ public class RemoteLogManager implements Closeable {
                                     remoteLog,
                                     remoteLogStorage,
                                     coordinatorGateway,
-                                    clock);
+                                    clock,
+                                    correctiveLeaderAndIsrCallback);
                     LOG.info(
                             "Created a new remote log task for table-bucket{}: {} and getting scheduled",
                             tableBucket,

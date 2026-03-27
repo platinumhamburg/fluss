@@ -1342,7 +1342,8 @@ public final class Replica {
                             bucketLeaderEpochSupplier,
                             coordinatorEpochSupplier,
                             lastCompletedSnapshotLogOffset,
-                            snapshotSize);
+                            snapshotSize,
+                            snapshotContext.getCorrectiveLeaderAndIsrCallback());
             this.kvSnapshotManager =
                     PeriodicSnapshotManager.create(
                             tableBucket,

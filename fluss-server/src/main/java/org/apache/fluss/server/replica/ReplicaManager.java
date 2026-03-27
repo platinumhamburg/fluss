@@ -124,6 +124,7 @@ import org.apache.fluss.server.tablet.PartitionChangeWatcherManager;
 import org.apache.fluss.server.tablet.PartitionChangeWatcherManager.SubscriptionHandle;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Sets;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -290,7 +291,7 @@ public class ReplicaManager {
                 fatalErrorHandler,
                 serverMetricGroup,
                 userMetrics,
-                new RemoteLogManager(conf, zkClient, coordinatorGateway, clock, ioExecutor),
+                new RemoteLogManager(conf, zkClient, coordinatorGateway, clock, ioExecutor, null),
                 clock,
                 ioExecutor);
     }
@@ -361,15 +362,22 @@ public class ReplicaManager {
                         metadataCache,
                         zkClient,
                         (nodeId) -> metadataCache.getTabletServer(nodeId, internalListenerName));
-        this.adjustIsrManager = new AdjustIsrManager(scheduler, coordinatorGateway, serverId);
+        this.adjustIsrManager =
+                new AdjustIsrManager(
+                        scheduler, coordinatorGateway, serverId, this::applyCorrectiveLeaderAndIsr);
         this.fatalErrorHandler = fatalErrorHandler;
 
         // for kv snapshot
         this.kvSnapshotResource = KvSnapshotResource.create(serverId, conf, ioExecutor);
         this.kvSnapshotContext =
                 DefaultSnapshotContext.create(
-                        zkClient, completedKvSnapshotCommitter, kvSnapshotResource, conf);
+                        zkClient,
+                        completedKvSnapshotCommitter,
+                        kvSnapshotResource,
+                        conf,
+                        this::applyCorrectiveLeaderAndIsr);
         this.remoteLogManager = remoteLogManager;
+        remoteLogManager.setCorrectiveLeaderAndIsrCallback(this::applyCorrectiveLeaderAndIsr);
         this.serverMetricGroup = serverMetricGroup;
         this.userMetrics = userMetrics;
         this.clock = clock;
@@ -586,6 +594,71 @@ public class ReplicaManager {
                 });
 
         responseCallback.accept(new ArrayList<>(result.values()));
+    }
+
+    /**
+     * Apply corrective LeaderAndIsr received from coordinator's fenced error response. This causes
+     * the stale leader to step down and become a follower.
+     *
+     * <p>This method may be called from AdjustIsr RPC callback threads or snapshot commit threads.
+     * The pre-checks (isLeader, serverId) are best-effort; the real safety comes from epoch
+     * validation inside {@link #becomeLeaderOrFollower}.
+     */
+    public void applyCorrectiveLeaderAndIsr(
+            TableBucket tableBucket, LeaderAndIsr correctiveLeaderAndIsr) {
+        HostedReplica hostedReplica = getReplica(tableBucket);
+        if (!(hostedReplica instanceof OnlineReplica)) {
+            LOG.debug(
+                    "Cannot apply corrective LeaderAndIsr for {}: replica not online", tableBucket);
+            return;
+        }
+
+        Replica replica = ((OnlineReplica) hostedReplica).getReplica();
+
+        // Best-effort pre-check: only apply if we think we're the leader and the corrective
+        // info has a different leader. The real safety comes from epoch validation inside
+        // becomeLeaderOrFollower.
+        if (!replica.isLeader() || correctiveLeaderAndIsr.leader() == serverId) {
+            return;
+        }
+
+        // Run asynchronously to avoid blocking the AdjustIsr/snapshot response processing thread.
+        ioExecutor.execute(
+                () -> {
+                    try {
+                        LOG.info(
+                                "Applying corrective LeaderAndIsr for {}: stepping down as leader, "
+                                        + "new leader={}, leaderEpoch={}",
+                                tableBucket,
+                                correctiveLeaderAndIsr.leader(),
+                                correctiveLeaderAndIsr.leaderEpoch());
+
+                        List<Integer> replicas = new ArrayList<>(correctiveLeaderAndIsr.isr());
+                        if (!replicas.contains(serverId)) {
+                            replicas.add(serverId);
+                        }
+
+                        NotifyLeaderAndIsrData data =
+                                new NotifyLeaderAndIsrData(
+                                        replica.getPhysicalTablePath(),
+                                        tableBucket,
+                                        replicas,
+                                        correctiveLeaderAndIsr);
+
+                        becomeLeaderOrFollower(
+                                correctiveLeaderAndIsr.coordinatorEpoch(),
+                                Collections.singletonList(data),
+                                results -> {});
+                    } catch (Exception e) {
+                        // Corrective info may be stale (e.g., coordinator epoch already advanced,
+                        // or leader epoch already updated). This is safe to ignore.
+                        LOG.debug(
+                                "Failed to apply corrective LeaderAndIsr for {}, "
+                                        + "likely stale: {}",
+                                tableBucket,
+                                e.getMessage());
+                    }
+                });
     }
 
     public void maybeUpdateMetadataCache(int coordinatorEpoch, ClusterMetadata clusterMetadata) {

@@ -127,6 +127,7 @@ import org.apache.fluss.rpc.messages.PbLakeSnapshotForBucket;
 import org.apache.fluss.rpc.messages.PbLakeTableOffsetForBucket;
 import org.apache.fluss.rpc.messages.PbLakeTableSnapshotInfo;
 import org.apache.fluss.rpc.messages.PbLakeTableSnapshotMetadata;
+import org.apache.fluss.rpc.messages.PbLeaderAndIsr;
 import org.apache.fluss.rpc.messages.PbListOffsetsRespForBucket;
 import org.apache.fluss.rpc.messages.PbLookupReqForBucket;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
@@ -1397,6 +1398,16 @@ public class ServerRpcMessageUtils {
             }
             if (bucketResult.failed()) {
                 respForBucket.setError(bucketResult.getErrorCode(), bucketResult.getErrorMessage());
+                // Attach corrective LeaderAndIsr if available (for FENCED_LEADER_EPOCH)
+                LeaderAndIsr corrective = bucketResult.leaderAndIsr();
+                if (corrective != null && corrective.leader() != LeaderAndIsr.NO_LEADER) {
+                    respForBucket
+                            .setLeaderId(corrective.leader())
+                            .setLeaderEpoch(corrective.leaderEpoch())
+                            .setCoordinatorEpoch(corrective.coordinatorEpoch())
+                            .setBucketEpoch(corrective.bucketEpoch())
+                            .setIsrs(corrective.isrArray());
+                }
             } else {
                 LeaderAndIsr leaderAndIsr = bucketResult.leaderAndIsr();
                 respForBucket
@@ -1442,10 +1453,27 @@ public class ServerRpcMessageUtils {
                                         : null,
                                 respForBucket.getBucketId());
                 if (respForBucket.hasErrorCode()) {
-                    adjustIsrResult.put(
-                            tb,
-                            new AdjustIsrResultForBucket(
-                                    tb, ApiError.fromErrorMessage(respForBucket)));
+                    ApiError apiError = ApiError.fromErrorMessage(respForBucket);
+                    if (apiError.error() == Errors.FENCED_LEADER_EPOCH_EXCEPTION
+                            && respForBucket.hasLeaderId()) {
+                        List<Integer> correctiveIsr = new ArrayList<>();
+                        for (int i = 0; i < respForBucket.getIsrsCount(); i++) {
+                            correctiveIsr.add(respForBucket.getIsrAt(i));
+                        }
+                        LeaderAndIsr corrective =
+                                new LeaderAndIsr(
+                                        respForBucket.getLeaderId(),
+                                        respForBucket.getLeaderEpoch(),
+                                        correctiveIsr,
+                                        respForBucket.getCoordinatorEpoch(),
+                                        respForBucket.getBucketEpoch());
+                        adjustIsrResult.put(
+                                tb,
+                                AdjustIsrResultForBucket.withCorrectiveLeaderAndIsr(
+                                        tb, apiError, corrective));
+                    } else {
+                        adjustIsrResult.put(tb, new AdjustIsrResultForBucket(tb, apiError));
+                    }
                     continue;
                 }
 
@@ -1466,6 +1494,31 @@ public class ServerRpcMessageUtils {
             }
         }
         return adjustIsrResult;
+    }
+
+    /** Convert a {@link PbLeaderAndIsr} proto message to a {@link LeaderAndIsr} domain object. */
+    public static LeaderAndIsr fromPbLeaderAndIsr(PbLeaderAndIsr pb) {
+        List<Integer> isr = new ArrayList<>();
+        for (int i = 0; i < pb.getIsrsCount(); i++) {
+            isr.add(pb.getIsrAt(i));
+        }
+        return new LeaderAndIsr(
+                pb.getLeaderId(),
+                pb.getLeaderEpoch(),
+                isr,
+                pb.getCoordinatorEpoch(),
+                pb.getBucketEpoch());
+    }
+
+    /** Convert a {@link LeaderAndIsr} domain object to a {@link PbLeaderAndIsr} proto message. */
+    public static PbLeaderAndIsr toPbLeaderAndIsr(LeaderAndIsr leaderAndIsr, int coordinatorEpoch) {
+        PbLeaderAndIsr pb = new PbLeaderAndIsr();
+        pb.setLeaderId(leaderAndIsr.leader())
+                .setLeaderEpoch(leaderAndIsr.leaderEpoch())
+                .setBucketEpoch(leaderAndIsr.bucketEpoch())
+                .setCoordinatorEpoch(coordinatorEpoch);
+        pb.setIsrs(leaderAndIsr.isrArray());
+        return pb;
     }
 
     public static Set<TableBucket> getListOffsetsData(ListOffsetsRequest request) {

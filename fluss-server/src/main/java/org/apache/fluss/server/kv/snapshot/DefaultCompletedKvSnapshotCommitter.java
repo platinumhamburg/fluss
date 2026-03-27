@@ -22,6 +22,7 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.rpc.GatewayClientProxy;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
 
 import org.slf4j.Logger;
@@ -56,10 +57,10 @@ public class DefaultCompletedKvSnapshotCommitter implements CompletedKvSnapshotC
     }
 
     @Override
-    public void commitKvSnapshot(
+    public CommitKvSnapshotResponse commitKvSnapshot(
             CompletedSnapshot snapshot, int coordinatorEpoch, int bucketLeaderEpoch)
             throws Exception {
-        coordinatorGateway
+        return coordinatorGateway
                 .commitKvSnapshot(
                         makeCommitKvSnapshotRequest(snapshot, coordinatorEpoch, bucketLeaderEpoch))
                 .get();

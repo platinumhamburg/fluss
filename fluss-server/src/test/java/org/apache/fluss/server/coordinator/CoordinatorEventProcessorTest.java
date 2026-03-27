@@ -23,7 +23,6 @@ import org.apache.fluss.cluster.rebalance.RebalancePlanForBucket;
 import org.apache.fluss.cluster.rebalance.RebalanceStatus;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.DatabaseDescriptor;
@@ -43,6 +42,7 @@ import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetRequest;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsRequest;
 import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
 import org.apache.fluss.rpc.protocol.ApiKeys;
+import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.AdjustIsrReceivedEvent;
 import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
@@ -584,9 +584,16 @@ class CoordinatorEventProcessorTest {
                         new CommitKvSnapshotData(
                                 completedSnapshot, coordinatorEpoch, invalidBucketLeaderEpoch),
                         responseCompletableFuture));
-        assertThatThrownBy(responseCompletableFuture::get)
-                .cause()
-                .isInstanceOf(FencedLeaderEpochException.class);
+        // FencedLeaderEpochException is now returned as a complete response with error code
+        // instead of completeExceptionally, to carry corrective LeaderAndIsr metadata.
+        CommitKvSnapshotResponse fencedResponse = responseCompletableFuture.get();
+        assertThat(fencedResponse.hasErrorCode()).isTrue();
+        assertThat(Errors.forCode(fencedResponse.getErrorCode()))
+                .isEqualTo(Errors.FENCED_LEADER_EPOCH_EXCEPTION);
+        // Verify corrective LeaderAndIsr is populated in the fenced response
+        assertThat(fencedResponse.hasCorrectiveLeaderAndIsr()).isTrue();
+        assertThat(fencedResponse.getCorrectiveLeaderAndIsr().getLeaderEpoch())
+                .isEqualTo(bucketLeaderEpoch);
 
         // invalid coordinator epoch
         int invalidCoordinatorEpoch = 1;

@@ -23,12 +23,14 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.function.FunctionWithException;
 
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.BiConsumer;
 
 /** A default implementation for {@link SnapshotContext}. */
 public class DefaultSnapshotContext implements SnapshotContext {
@@ -52,6 +54,8 @@ public class DefaultSnapshotContext implements SnapshotContext {
 
     private final FsPath remoteKvDir;
 
+    private final BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback;
+
     private DefaultSnapshotContext(
             ZooKeeperClient zooKeeperClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -63,7 +67,8 @@ public class DefaultSnapshotContext implements SnapshotContext {
             int writeBufferSizeInBytes,
             FsPath remoteKvDir,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
-            int maxFetchLogSizeInRecoverKv) {
+            int maxFetchLogSizeInRecoverKv,
+            BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback) {
         this.zooKeeperClient = zooKeeperClient;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
         this.snapshotScheduler = snapshotScheduler;
@@ -76,6 +81,7 @@ public class DefaultSnapshotContext implements SnapshotContext {
 
         this.completedSnapshotHandleStore = completedSnapshotHandleStore;
         this.maxFetchLogSizeInRecoverKv = maxFetchLogSizeInRecoverKv;
+        this.correctiveLeaderAndIsrCallback = correctiveLeaderAndIsrCallback;
     }
 
     public static DefaultSnapshotContext create(
@@ -83,6 +89,15 @@ public class DefaultSnapshotContext implements SnapshotContext {
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
             KvSnapshotResource kvSnapshotResource,
             Configuration conf) {
+        return create(zkClient, completedKvSnapshotCommitter, kvSnapshotResource, conf, null);
+    }
+
+    public static DefaultSnapshotContext create(
+            ZooKeeperClient zkClient,
+            CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
+            KvSnapshotResource kvSnapshotResource,
+            Configuration conf,
+            BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback) {
         return new DefaultSnapshotContext(
                 zkClient,
                 completedKvSnapshotCommitter,
@@ -94,7 +109,8 @@ public class DefaultSnapshotContext implements SnapshotContext {
                 (int) conf.get(ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE).getBytes(),
                 FlussPaths.remoteKvDir(conf),
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
-                (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes());
+                (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes(),
+                correctiveLeaderAndIsrCallback);
     }
 
     public ZooKeeperClient getZooKeeperClient() {
@@ -154,6 +170,11 @@ public class DefaultSnapshotContext implements SnapshotContext {
     @Override
     public int maxFetchLogSizeInRecoverKv() {
         return maxFetchLogSizeInRecoverKv;
+    }
+
+    @Override
+    public BiConsumer<TableBucket, LeaderAndIsr> getCorrectiveLeaderAndIsrCallback() {
+        return correctiveLeaderAndIsrCallback;
     }
 
     @Override

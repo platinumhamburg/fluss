@@ -156,6 +156,7 @@ import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.Repl
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeAdjustIsrResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeListRebalanceProgressResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeRebalanceResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPbLeaderAndIsr;
 import static org.apache.fluss.utils.concurrent.FutureUtils.completeFromCallable;
 
 /** An implementation for {@link EventProcessor}. */
@@ -1754,6 +1755,18 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
             try {
                 validateLeaderAndIsr(tableBucket, tryAdjustLeaderAndIsr);
+            } catch (FencedLeaderEpochException e) {
+                ApiError apiError = ApiError.fromThrowable(e);
+                Optional<LeaderAndIsr> currentLeaderAndIsr =
+                        coordinatorContext.getBucketLeaderAndIsr(tableBucket);
+                if (currentLeaderAndIsr.isPresent()) {
+                    result.add(
+                            AdjustIsrResultForBucket.withCorrectiveLeaderAndIsr(
+                                    tableBucket, apiError, currentLeaderAndIsr.get()));
+                } else {
+                    result.add(new AdjustIsrResultForBucket(tableBucket, apiError));
+                }
+                continue;
             } catch (Exception e) {
                 result.add(new AdjustIsrResultForBucket(tableBucket, ApiError.fromThrowable(e)));
                 continue;
@@ -1880,6 +1893,21 @@ public class CoordinatorEventProcessor implements EventProcessor {
         // validate
         try {
             validateFencedEvent(event);
+        } catch (FencedLeaderEpochException e) {
+            TableBucket tb = event.getTableBucket();
+            CommitKvSnapshotResponse response = new CommitKvSnapshotResponse();
+            ApiError apiError = ApiError.fromThrowable(e);
+            response.setErrorCode(apiError.error().code()).setErrorMessage(apiError.message());
+            coordinatorContext
+                    .getBucketLeaderAndIsr(tb)
+                    .ifPresent(
+                            leaderAndIsr ->
+                                    response.setCorrectiveLeaderAndIsr(
+                                            toPbLeaderAndIsr(
+                                                    leaderAndIsr,
+                                                    coordinatorContext.getCoordinatorEpoch())));
+            callback.complete(response);
+            return;
         } catch (Exception e) {
             callback.completeExceptionally(e);
             return;
@@ -1967,6 +1995,20 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     new RemoteLogManifestHandle(
                             manifestData.getRemoteLogManifestPath(),
                             manifestData.getRemoteLogEndOffset()));
+        } catch (FencedLeaderEpochException e) {
+            LOG.error(
+                    "Error when commit remote log manifest, the leader need to revert the commit.",
+                    e);
+            response.setCommitSuccess(false);
+            coordinatorContext
+                    .getBucketLeaderAndIsr(tb)
+                    .ifPresent(
+                            leaderAndIsr ->
+                                    response.setCorrectiveLeaderAndIsr(
+                                            toPbLeaderAndIsr(
+                                                    leaderAndIsr,
+                                                    coordinatorContext.getCoordinatorEpoch())));
+            return response;
         } catch (Exception e) {
             LOG.error(
                     "Error when commit remote log manifest, the leader need to revert the commit.",

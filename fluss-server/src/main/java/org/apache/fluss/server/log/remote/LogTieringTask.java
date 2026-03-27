@@ -25,11 +25,14 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
+import org.apache.fluss.rpc.messages.CommitRemoteLogManifestResponse;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
 import org.apache.fluss.server.log.LogSegment;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.replica.Replica;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.clock.Clock;
 
 import org.slf4j.Logger;
@@ -42,6 +45,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeCommitRemoteLogManifestRequest;
 
@@ -58,6 +62,7 @@ public class LogTieringTask implements Runnable {
     private final RemoteLogStorage remoteLogStorage;
     private final CoordinatorGateway coordinatorGateway;
     private final Clock clock;
+    private final BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback;
 
     // The copied offset is empty initially for a new leader LogTieringTask, and needs to
     // be fetched inside the task's run() method.
@@ -70,7 +75,8 @@ public class LogTieringTask implements Runnable {
             RemoteLogTablet remoteLog,
             RemoteLogStorage remoteLogStorage,
             CoordinatorGateway coordinatorGateway,
-            Clock clock) {
+            Clock clock,
+            BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback) {
         this.replica = replica;
         this.remoteLog = remoteLog;
         this.physicalTablePath = replica.getPhysicalTablePath();
@@ -78,6 +84,7 @@ public class LogTieringTask implements Runnable {
         this.remoteLogStorage = remoteLogStorage;
         this.coordinatorGateway = coordinatorGateway;
         this.clock = clock;
+        this.correctiveLeaderAndIsrCallback = correctiveLeaderAndIsrCallback;
     }
 
     @Override
@@ -391,7 +398,17 @@ public class LogTieringTask implements Runnable {
 
     private boolean commitRemoteLogManifest(CommitRemoteLogManifestData data) throws Exception {
         CommitRemoteLogManifestRequest request = makeCommitRemoteLogManifestRequest(data);
-        return coordinatorGateway.commitRemoteLogManifest(request).get().isCommitSuccess();
+        CommitRemoteLogManifestResponse response =
+                coordinatorGateway.commitRemoteLogManifest(request).get();
+        // Check for corrective LeaderAndIsr in fenced response
+        if (!response.isCommitSuccess()
+                && response.hasCorrectiveLeaderAndIsr()
+                && correctiveLeaderAndIsrCallback != null) {
+            LeaderAndIsr corrective =
+                    ServerRpcMessageUtils.fromPbLeaderAndIsr(response.getCorrectiveLeaderAndIsr());
+            correctiveLeaderAndIsrCallback.accept(tableBucket, corrective);
+        }
+        return response.isCommitSuccess();
     }
 
     private Path toPathIfExists(File file) {

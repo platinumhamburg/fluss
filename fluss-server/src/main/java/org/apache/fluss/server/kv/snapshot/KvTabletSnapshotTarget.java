@@ -23,9 +23,13 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
+import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.SequenceIDCounter;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
@@ -39,6 +43,7 @@ import javax.annotation.concurrent.NotThreadSafe;
 import java.io.IOException;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -71,6 +76,9 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     private final Consumer<Long> updateMinRetainOffset;
     private final Supplier<Integer> bucketLeaderEpochSupplier;
     private final Supplier<Integer> coordinatorEpochSupplier;
+
+    /** Callback for corrective LeaderAndIsr from fenced snapshot commit responses. */
+    private final BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback;
 
     private final SnapshotRunner snapshotRunner;
 
@@ -116,7 +124,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                 bucketLeaderEpochSupplier,
                 coordinatorEpochSupplier,
                 logOffsetOfLatestSnapshot,
-                snapshotSize);
+                snapshotSize,
+                null);
     }
 
     public KvTabletSnapshotTarget(
@@ -134,7 +143,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             Supplier<Integer> bucketLeaderEpochSupplier,
             Supplier<Integer> coordinatorEpochSupplier,
             long logOffsetOfLatestSnapshot,
-            long snapshotSize)
+            long snapshotSize,
+            BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback)
             throws IOException {
         this.tableBucket = tableBucket;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
@@ -152,6 +162,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         this.logOffsetOfLatestSnapshot = logOffsetOfLatestSnapshot;
         this.snapshotSize = snapshotSize;
         this.ioExecutor = ioExecutor;
+        this.correctiveLeaderAndIsrCallback = correctiveLeaderAndIsrCallback;
         this.snapshotRunner = createSnapshotRunner(cancelStreamRegistry);
         this.snapshotsCleaner = new SnapshotsCleaner();
     }
@@ -235,8 +246,23 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                         tabletState.getIndexReplicationOffsets());
         try {
             // commit the completed snapshot
-            completedKvSnapshotCommitter.commitKvSnapshot(
-                    completedSnapshot, coordinatorEpoch, bucketLeaderEpoch);
+            CommitKvSnapshotResponse response =
+                    completedKvSnapshotCommitter.commitKvSnapshot(
+                            completedSnapshot, coordinatorEpoch, bucketLeaderEpoch);
+            // Check for corrective LeaderAndIsr in fenced error response
+            if (response.hasErrorCode()
+                    && Errors.forCode(response.getErrorCode())
+                            == Errors.FENCED_LEADER_EPOCH_EXCEPTION) {
+                if (response.hasCorrectiveLeaderAndIsr()
+                        && correctiveLeaderAndIsrCallback != null) {
+                    LeaderAndIsr corrective =
+                            ServerRpcMessageUtils.fromPbLeaderAndIsr(
+                                    response.getCorrectiveLeaderAndIsr());
+                    correctiveLeaderAndIsrCallback.accept(tableBucket, corrective);
+                }
+                throw new org.apache.fluss.exception.FencedLeaderEpochException(
+                        response.getErrorMessage());
+            }
             // update local state after successful commit
             updateStateOnCommitSuccess(snapshotId, snapshotResult);
         } catch (Exception e) {
