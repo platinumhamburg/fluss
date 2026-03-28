@@ -83,6 +83,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.function.Predicate;
 
 import static org.apache.fluss.utils.Preconditions.checkState;
@@ -129,6 +130,21 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         return DEFAULT_RATE_LIMITER;
     }
 
+    // ---- KV lazy open internal constants ----
+    // Not exposed as ConfigOptions because these are internal tuning parameters that should
+    // rarely need adjustment. If operational experience shows otherwise, promote to ConfigOptions
+    // with keys like "kv.lazy-open.max-concurrent-opens", "kv.lazy-open.open-timeout", etc.
+    private static final int LAZY_OPEN_MAX_CONCURRENT_OPENS = 10;
+    private static final long LAZY_OPEN_TIMEOUT_MS = 300_000;
+    private static final long LAZY_OPEN_FAILED_BACKOFF_BASE_MS = 5_000;
+    private static final long LAZY_OPEN_FAILED_BACKOFF_MAX_MS = 300_000;
+
+    /**
+     * Timeout for draining pins during release in milliseconds. Public because {@link
+     * org.apache.fluss.server.replica.Replica} (different package) needs this value.
+     */
+    public static final long RELEASE_DRAIN_TIMEOUT_MS = 5_000;
+
     private final LogManager logManager;
     private final LocalDiskManager localDiskManager;
 
@@ -174,6 +190,13 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     private final KvFlushScheduler kvFlushScheduler;
 
+    // ---- KV lazy open configuration ----
+    private final boolean lazyOpenEnabled;
+    private final @Nullable Semaphore openSemaphore;
+    private final long openTimeoutMs;
+    private final long failedBackoffBaseMs;
+    private final long failedBackoffMaxMs;
+
     private volatile boolean isShutdown = false;
 
     private KvManager(
@@ -194,6 +217,19 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         this.zkClient = zkClient;
         this.clock = clock;
         this.remoteKvDir = FlussPaths.remoteKvDir(conf);
+        // KV lazy open configuration
+        this.lazyOpenEnabled = conf.get(ConfigOptions.KV_LAZY_OPEN_ENABLED);
+        if (lazyOpenEnabled) {
+            this.openSemaphore = new Semaphore(LAZY_OPEN_MAX_CONCURRENT_OPENS);
+            this.openTimeoutMs = LAZY_OPEN_TIMEOUT_MS;
+            this.failedBackoffBaseMs = LAZY_OPEN_FAILED_BACKOFF_BASE_MS;
+            this.failedBackoffMaxMs = LAZY_OPEN_FAILED_BACKOFF_MAX_MS;
+        } else {
+            this.openSemaphore = null;
+            this.openTimeoutMs = 0;
+            this.failedBackoffBaseMs = 0;
+            this.failedBackoffMaxMs = 0;
+        }
         this.remoteFileSystem = remoteKvDir.getFileSystem();
         this.serverMetricGroup = tabletServerMetricGroup;
         this.sharedRocksDBRateLimiter = createSharedRateLimiter(conf);
@@ -345,6 +381,31 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                 tabletServerMetricGroup,
                 kvFlushScheduler,
                 clock);
+    }
+
+    /** Returns whether KV tablets open their RocksDB resources on first access. */
+    public boolean isLazyOpenEnabled() {
+        return lazyOpenEnabled;
+    }
+
+    /** Returns the semaphore limiting concurrent lazy opens, or null when disabled. */
+    public @Nullable Semaphore getOpenSemaphore() {
+        return openSemaphore;
+    }
+
+    /** Returns the lazy-open wait timeout in milliseconds. */
+    public long getOpenTimeoutMs() {
+        return openTimeoutMs;
+    }
+
+    /** Returns the initial retry backoff after a failed lazy open. */
+    public long getFailedBackoffBaseMs() {
+        return failedBackoffBaseMs;
+    }
+
+    /** Returns the maximum retry backoff after a failed lazy open. */
+    public long getFailedBackoffMaxMs() {
+        return failedBackoffMaxMs;
     }
 
     /**
@@ -549,52 +610,99 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         return inKvLock(
                 tableBucket,
                 () -> {
-                    if (currentKvs.containsKey(tableBucket)) {
-                        return currentKvs.get(tableBucket);
+                    KvTablet existing = currentKvs.get(tableBucket);
+                    if (existing != null) {
+                        return existing;
                     }
-
-                    File tabletDir =
-                            getOrCreateTabletDir(logTablet.getDataDir(), tablePath, tableBucket);
-                    RowMerger merger = RowMerger.create(tableConfig, kvFormat, schemaGetter);
-                    AutoIncrementManager autoIncrementManager =
-                            new AutoIncrementManager(
-                                    schemaGetter,
-                                    tablePath.getTablePath(),
-                                    tableConfig,
-                                    new ZkSequenceGeneratorFactory(zkClient));
-
                     KvTablet tablet =
-                            KvTablet.create(
+                            doCreateKv(
                                     tablePath,
                                     tableBucket,
                                     logTablet,
-                                    tabletDir,
-                                    conf,
-                                    serverMetricGroup,
-                                    arrowBufferAllocator,
-                                    memorySegmentPool,
                                     kvFormat,
-                                    merger,
-                                    arrowCompressionInfo,
                                     schemaGetter,
-                                    tableConfig.getChangelogImage(),
-                                    sharedRocksDBRateLimiter,
-                                    sharedBlockCache,
-                                    sharedWriteBufferManager,
-                                    kvFlushScheduler,
-                                    flushCompleteListener,
-                                    autoIncrementManager,
-                                    clock,
-                                    tableConfig);
+                                    tableConfig,
+                                    arrowCompressionInfo,
+                                    flushCompleteListener);
                     currentKvs.put(tableBucket, tablet);
-
-                    LOG.info(
-                            "Created kv tablet for bucket {} in dir {}.",
-                            tableBucket,
-                            tabletDir.getAbsolutePath());
-
                     return tablet;
                 });
+    }
+
+    /** Creates a tablet without replacing the registered lazy tablet. */
+    public KvTablet createKvTabletUnregistered(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            KvFormat kvFormat,
+            SchemaGetter schemaGetter,
+            TableConfig tableConfig,
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable Runnable flushCompleteListener)
+            throws Exception {
+        return inKvLock(
+                tableBucket,
+                () ->
+                        doCreateKv(
+                                tablePath,
+                                tableBucket,
+                                logTablet,
+                                kvFormat,
+                                schemaGetter,
+                                tableConfig,
+                                arrowCompressionInfo,
+                                flushCompleteListener));
+    }
+
+    private KvTablet doCreateKv(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            KvFormat kvFormat,
+            SchemaGetter schemaGetter,
+            TableConfig tableConfig,
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable Runnable flushCompleteListener)
+            throws Exception {
+        File tabletDir = getOrCreateTabletDir(logTablet.getDataDir(), tablePath, tableBucket);
+        RowMerger merger = RowMerger.create(tableConfig, kvFormat, schemaGetter);
+        AutoIncrementManager autoIncrementManager =
+                new AutoIncrementManager(
+                        schemaGetter,
+                        tablePath.getTablePath(),
+                        tableConfig,
+                        new ZkSequenceGeneratorFactory(zkClient));
+
+        KvTablet tablet =
+                KvTablet.create(
+                        tablePath,
+                        tableBucket,
+                        logTablet,
+                        tabletDir,
+                        conf,
+                        serverMetricGroup,
+                        arrowBufferAllocator,
+                        memorySegmentPool,
+                        kvFormat,
+                        merger,
+                        arrowCompressionInfo,
+                        schemaGetter,
+                        tableConfig.getChangelogImage(),
+                        sharedRocksDBRateLimiter,
+                        sharedBlockCache,
+                        sharedWriteBufferManager,
+                        kvFlushScheduler,
+                        flushCompleteListener,
+                        autoIncrementManager,
+                        clock,
+                        tableConfig);
+
+        LOG.info(
+                "Created kv tablet for bucket {} in dir {}.",
+                tableBucket,
+                tabletDir.getAbsolutePath());
+
+        return tablet;
     }
 
     /**
@@ -675,7 +783,27 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                 physicalTablePath,
                                 tableBucket,
                                 schemaGetter,
-                                flushCompleteListener));
+                                flushCompleteListener,
+                                true));
+    }
+
+    /** Loads local state without replacing the registered lazy tablet. */
+    public KvTablet loadKvUnregistered(
+            File tabletDir, SchemaGetter schemaGetter, @Nullable Runnable flushCompleteListener)
+            throws Exception {
+        Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
+        PhysicalTablePath physicalTablePath = pathAndBucket.f0;
+        TableBucket tableBucket = pathAndBucket.f1;
+        return inKvLock(
+                tableBucket,
+                () ->
+                        doLoadKv(
+                                tabletDir,
+                                physicalTablePath,
+                                tableBucket,
+                                schemaGetter,
+                                flushCompleteListener,
+                                false));
     }
 
     private KvTablet doLoadKv(
@@ -683,10 +811,11 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             PhysicalTablePath physicalTablePath,
             TableBucket tableBucket,
             SchemaGetter schemaGetter,
-            @Nullable Runnable flushCompleteListener)
+            @Nullable Runnable flushCompleteListener,
+            boolean register)
             throws Exception {
         KvTablet currentKv = currentKvs.get(tableBucket);
-        if (currentKv != null) {
+        if (register && currentKv != null) {
             throw new IllegalStateException(
                     String.format(
                             "Duplicate kv tablet directories for bucket %s are found in both %s and %s. "
@@ -748,9 +877,39 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         autoIncrementManager,
                         clock,
                         tableConfig);
-        currentKvs.put(tableBucket, kvTablet);
+        if (register) {
+            currentKvs.put(tableBucket, kvTablet);
+        }
 
         return kvTablet;
+    }
+
+    /** Register a KvTablet (e.g. a lazy sentinel) into the {@code currentKvs} registry. */
+    public void registerKv(TableBucket tableBucket, KvTablet kvTablet) {
+        inKvLock(
+                tableBucket,
+                () -> {
+                    if (currentKvs.containsKey(tableBucket)) {
+                        throw new IllegalStateException(
+                                "KvTablet already registered for " + tableBucket);
+                    }
+                    currentKvs.put(tableBucket, kvTablet);
+                    return null;
+                });
+    }
+
+    /** Remove a KvTablet from the {@code currentKvs} registry (e.g. on drop). */
+    public void unregisterKv(TableBucket tableBucket) {
+        inKvLock(tableBucket, () -> currentKvs.remove(tableBucket));
+    }
+
+    /**
+     * Get the tablet directory path for the given table path and table bucket. This is a read-only
+     * accessor — it does not create the directory.
+     */
+    public File getTabletDirPath(
+            File dataDir, PhysicalTablePath tablePath, TableBucket tableBucket) {
+        return getTabletDir(dataDir, tablePath, tableBucket);
     }
 
     public void deleteRemoteKvSnapshot(
