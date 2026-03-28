@@ -21,6 +21,7 @@ import org.apache.fluss.client.write.WriteFormat;
 import org.apache.fluss.client.write.WriteRecord;
 import org.apache.fluss.client.write.WriterClient;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryRow;
@@ -175,21 +176,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
      */
     @Override
     public CompletableFuture<UpsertResult> upsert(InternalRow row) {
-        checkFieldCount(row);
-        byte[] key = primaryKeyEncoder.encodeKey(row);
-        byte[] bucketKey =
-                bucketKeyEncoder == primaryKeyEncoder ? key : bucketKeyEncoder.encodeKey(row);
-        WriteRecord record =
-                WriteRecord.forUpsert(
-                        tableInfo,
-                        getPhysicalPath(row),
-                        encodeRow(row),
-                        key,
-                        bucketKey,
-                        writeFormat,
-                        targetColumns,
-                        mergeMode);
-        return sendWithResult(record, UpsertResult::new);
+        return sendWithResult(buildUpsertRecord(encodeKvWrite(row)), UpsertResult::new);
     }
 
     /**
@@ -201,20 +188,63 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
      */
     @Override
     public CompletableFuture<DeleteResult> delete(InternalRow row) {
-        checkFieldCount(row);
-        byte[] key = primaryKeyEncoder.encodeKey(row);
-        byte[] bucketKey =
-                bucketKeyEncoder == primaryKeyEncoder ? key : bucketKeyEncoder.encodeKey(row);
+        EncodedKvWrite encodedKvWrite = encodeKvWrite(row, false);
         WriteRecord record =
                 WriteRecord.forDelete(
                         tableInfo,
-                        getPhysicalPath(row),
-                        key,
-                        bucketKey,
+                        encodedKvWrite.physicalTablePath,
+                        encodedKvWrite.key,
+                        encodedKvWrite.bucketKey,
                         writeFormat,
                         targetColumns,
                         mergeMode);
         return sendWithResult(record, DeleteResult::new);
+    }
+
+    @Override
+    public CompletableFuture<UpsertResult> retract(InternalRow row) {
+        EncodedKvWrite encoded = encodeKvWrite(row);
+        WriteRecord record =
+                WriteRecord.forRetract(
+                        tableInfo,
+                        encoded.physicalTablePath,
+                        encoded.encodedRow,
+                        encoded.key,
+                        encoded.bucketKey,
+                        writeFormat,
+                        targetColumns,
+                        mergeMode);
+        return sendWithResult(record, UpsertResult::new);
+    }
+
+    private WriteRecord buildUpsertRecord(EncodedKvWrite encoded) {
+        return buildUpsertRecord(encoded, mergeMode);
+    }
+
+    private WriteRecord buildUpsertRecord(EncodedKvWrite encoded, MergeMode mode) {
+        return WriteRecord.forUpsert(
+                tableInfo,
+                encoded.physicalTablePath,
+                encoded.encodedRow,
+                encoded.key,
+                encoded.bucketKey,
+                writeFormat,
+                targetColumns,
+                mode);
+    }
+
+    private EncodedKvWrite encodeKvWrite(InternalRow row) {
+        return encodeKvWrite(row, true);
+    }
+
+    private EncodedKvWrite encodeKvWrite(InternalRow row, boolean includeRowData) {
+        checkFieldCount(row);
+        byte[] key = primaryKeyEncoder.encodeKey(row);
+        byte[] bucketKey =
+                bucketKeyEncoder == primaryKeyEncoder ? key : bucketKeyEncoder.encodeKey(row);
+        PhysicalTablePath physicalTablePath = getPhysicalPath(row);
+        BinaryRow encodedRow = includeRowData ? encodeRow(row) : null;
+        return new EncodedKvWrite(physicalTablePath, key, bucketKey, encodedRow);
     }
 
     private BinaryRow encodeRow(InternalRow row) {
@@ -230,5 +260,23 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             rowEncoder.encodeField(i, fieldGetters[i].getFieldOrNull(row));
         }
         return rowEncoder.finishRow();
+    }
+
+    private static class EncodedKvWrite {
+        private final PhysicalTablePath physicalTablePath;
+        private final byte[] key;
+        private final byte[] bucketKey;
+        private final @Nullable BinaryRow encodedRow;
+
+        private EncodedKvWrite(
+                PhysicalTablePath physicalTablePath,
+                byte[] key,
+                byte[] bucketKey,
+                @Nullable BinaryRow encodedRow) {
+            this.physicalTablePath = physicalTablePath;
+            this.key = key;
+            this.bucketKey = bucketKey;
+            this.encodedRow = encodedRow;
+        }
     }
 }

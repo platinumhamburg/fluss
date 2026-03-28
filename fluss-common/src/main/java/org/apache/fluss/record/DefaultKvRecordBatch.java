@@ -56,7 +56,7 @@ import java.util.NoSuchElementException;
  *
  * <pre>
  * -----------------------------------------------------------------------------------------------
- * | Unused (0-8)
+ * | Unused (0-7)
  * -----------------------------------------------------------------------------------------------
  * </pre>
  *
@@ -84,6 +84,9 @@ public class DefaultKvRecordBatch implements KvRecordBatch {
     public static final int RECORDS_COUNT_OFFSET = BATCH_SEQUENCE_OFFSET + BATCH_SEQUENCE_LENGTH;
     static final int RECORDS_OFFSET = RECORDS_COUNT_OFFSET + RECORDS_COUNT_LENGTH;
     public static final int RECORD_BATCH_HEADER_SIZE = RECORDS_OFFSET;
+
+    /** Bit mask for V2 record format in the attributes byte. */
+    static final byte V2_FORMAT_ATTRIBUTE_MASK = 0x01;
 
     public static final int KV_OVERHEAD = LENGTH_OFFSET + LENGTH_LENGTH;
 
@@ -156,6 +159,11 @@ public class DefaultKvRecordBatch implements KvRecordBatch {
         return segment.getInt(position + RECORDS_COUNT_OFFSET);
     }
 
+    @Override
+    public boolean isV2Format() {
+        return (segment.get(position + ATTRIBUTES_OFFSET) & V2_FORMAT_ATTRIBUTE_MASK) != 0;
+    }
+
     public MemorySegment getMemorySegment() {
         return segment;
     }
@@ -181,8 +189,12 @@ public class DefaultKvRecordBatch implements KvRecordBatch {
 
             @Override
             protected KvRecord readNext() {
-                KvRecord kvRecord =
-                        DefaultKvRecord.readFrom(segment, position, schemaId, readContext);
+                KvRecord kvRecord;
+                if (DefaultKvRecordBatch.this.isV2Format()) {
+                    kvRecord = DefaultKvRecord.readFromV2(segment, position, schemaId, readContext);
+                } else {
+                    kvRecord = DefaultKvRecord.readFrom(segment, position, schemaId, readContext);
+                }
                 iteratorNumber++;
                 position += kvRecord.getSizeInBytes();
                 return kvRecord;

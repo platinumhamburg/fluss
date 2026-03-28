@@ -26,6 +26,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.row.OperationType;
 import org.apache.fluss.flink.sink.serializer.FlussSerializationSchema;
 import org.apache.fluss.flink.sink.undo.ProducerOffsetReporter;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 
@@ -54,6 +55,12 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
     @Nullable private final ProducerOffsetReporter offsetReporter;
 
     /**
+     * Whether this writer supports RETRACT operations. For aggregation tables this may be enabled
+     * either for the full schema or for a retract-safe partial-update column subset.
+     */
+    private final boolean schemaSupportsRetract;
+
+    /**
      * Creates a new UpsertSinkWriter with ProducerOffsetReporter for UndoRecoveryOperator
      * integration.
      *
@@ -64,6 +71,8 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
      * @param mailboxExecutor the mailbox executor for async operations
      * @param flussSerializationSchema the serialization schema for input records
      * @param offsetReporter optional reporter for reporting offsets to upstream operator
+     * @param schemaSupportsRetract whether this writer can use retract semantics for its target
+     *     columns
      */
     public UpsertSinkWriter(
             TablePath tablePath,
@@ -72,7 +81,8 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             @Nullable int[] targetColumnIndexes,
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> flussSerializationSchema,
-            @Nullable ProducerOffsetReporter offsetReporter) {
+            @Nullable ProducerOffsetReporter offsetReporter,
+            boolean schemaSupportsRetract) {
         super(
                 tablePath,
                 flussConfig,
@@ -81,6 +91,7 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
                 mailboxExecutor,
                 flussSerializationSchema);
         this.offsetReporter = offsetReporter;
+        this.schemaSupportsRetract = schemaSupportsRetract;
     }
 
     @Override
@@ -96,30 +107,36 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
 
     @Override
     CompletableFuture<?> writeRow(OperationType opType, InternalRow internalRow) {
-        if (opType == OperationType.UPSERT) {
-            CompletableFuture<UpsertResult> future = upsertWriter.upsert(internalRow);
-            // Report offset to upstream UndoRecoveryOperator if reporter provided
+        if (opType == OperationType.RETRACT) {
+            if (!schemaSupportsRetract) {
+                throw new UnsupportedOperationException(
+                        "Received RETRACT operation but the schema does not support retract. "
+                                + "This should have been rejected at plan time or serialization.");
+            }
+            CompletableFuture<UpsertResult> future = upsertWriter.retract(internalRow);
             if (offsetReporter != null) {
                 return future.thenAccept(
-                        result -> {
-                            if (result.getBucket() != null && result.getLogEndOffset() >= 0) {
-                                offsetReporter.reportOffset(
-                                        result.getBucket(), result.getLogEndOffset());
-                            }
-                        });
+                        result ->
+                                reportOffsetIfAvailable(
+                                        result.getBucket(), result.getLogEndOffset()));
+            }
+            return future;
+        } else if (opType == OperationType.UPSERT) {
+            CompletableFuture<UpsertResult> future = upsertWriter.upsert(internalRow);
+            if (offsetReporter != null) {
+                return future.thenAccept(
+                        result ->
+                                reportOffsetIfAvailable(
+                                        result.getBucket(), result.getLogEndOffset()));
             }
             return future;
         } else if (opType == OperationType.DELETE) {
             CompletableFuture<DeleteResult> future = upsertWriter.delete(internalRow);
-            // Report offset to upstream UndoRecoveryOperator if reporter provided
             if (offsetReporter != null) {
                 return future.thenAccept(
-                        result -> {
-                            if (result.getBucket() != null && result.getLogEndOffset() >= 0) {
-                                offsetReporter.reportOffset(
-                                        result.getBucket(), result.getLogEndOffset());
-                            }
-                        });
+                        result ->
+                                reportOffsetIfAvailable(
+                                        result.getBucket(), result.getLogEndOffset()));
             }
             return future;
         } else {
@@ -127,10 +144,25 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
         }
     }
 
+    /**
+     * Reports the offset to the upstream UndoRecoveryOperator if the bucket and offset are
+     * available.
+     */
+    private void reportOffsetIfAvailable(@Nullable TableBucket bucket, long logEndOffset) {
+        if (offsetReporter != null && bucket != null && logEndOffset >= 0) {
+            offsetReporter.reportOffset(bucket, logEndOffset);
+        }
+    }
+
     @Override
     public void flush(boolean endOfInput) throws IOException, InterruptedException {
         upsertWriter.flush();
         checkAsyncException();
+    }
+
+    @Override
+    public void close() throws Exception {
+        super.close();
     }
 
     @Override

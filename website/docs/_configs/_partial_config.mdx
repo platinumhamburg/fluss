@@ -241,6 +241,7 @@
 | `remote.data.dir` | `none` | String | The directory used for storing the kv snapshot data files and remote log for log tiered storage  in a Fluss supported filesystem. |
 | `remote.fs.write-buffer-size` | `4 kb` | MemorySize | The default size of the write buffer for writing the local files to remote file systems. |
 | `remote.log.task-interval-duration` | `1 min` | Duration | Interval at which remote log manager runs the scheduled tasks like copy segments, clean up remote log segments, delete local log segments etc. If the value is set to 0, it means that the remote log storage is disabled. |
+| `remote.log.task-max-upload-segments` | `5` | Integer | The maximum number of log segments to upload to remote storage per tiering task execution. This limits the upload batch size to prevent overwhelming the remote storage when there is a large backlog of segments to upload. |
 | `remote.log.index-file-cache-size` | `1 gb` | MemorySize | The total size of the space allocated to store index files fetched from remote storage in the local storage. |
 | `remote.log-manager.thread-pool-size` | `4` | Integer | Size of the thread pool used in scheduling tasks to copy segments, fetch remote log indexes and clean up remote log segments. |
 | `remote.log.data-transfer-thread-num` | `4` | Integer | The number of threads the server uses to transfer (download and upload) remote log file can be  data file, index file and remote log metadata file. This option is deprecated. Please use server.io-pool.size instead. |
@@ -327,5 +328,4 @@
 | `zookeeper.client.ensemble-tracker` | `true` | Boolean | Defines whether Curator should enable ensemble tracker. This can be useful in certain scenarios in which CuratorFramework is accessing to ZK clusters via load balancer or Virtual IPs. Default Curator EnsembleTracking logic watches CuratorEventType.GET_CONFIG events and changes ZooKeeper connection string. It is not desired behaviour when ZooKeeper is running under the Virtual IPs. Under certain configurations EnsembleTracking can lead to setting of ZooKeeper connection string with unresolvable hostnames. |
 | `zookeeper.client.config-path` | `none` | String | The file path from which the ZooKeeper client reads its configuration. This allows each ZooKeeper client instance to load its own configuration file, instead of relying on shared JVM-level environment settings. This enables fine-grained control over ZooKeeper client behavior. |
 | `zookeeper.client.max-buffer-size` | `104857600` | Integer | The maximum buffer size (in bytes) for ZooKeeper client. This corresponds to the jute.maxbuffer property. Default is 100MB to match the RPC frame length limit. |
-
 

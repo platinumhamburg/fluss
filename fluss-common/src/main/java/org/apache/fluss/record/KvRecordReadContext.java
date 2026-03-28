@@ -32,16 +32,23 @@ public class KvRecordReadContext implements KvRecordBatch.ReadContext {
     private final KvFormat kvFormat;
     private final SchemaGetter schemaGetter;
     private final Map<Integer, RowDecoder> rowDecoderCache;
+    private final boolean v2Format;
 
-    private KvRecordReadContext(KvFormat kvFormat, SchemaGetter schemaGetter) {
+    private KvRecordReadContext(KvFormat kvFormat, SchemaGetter schemaGetter, boolean v2Format) {
         this.kvFormat = kvFormat;
         this.schemaGetter = schemaGetter;
         this.rowDecoderCache = new HashMap<>();
+        this.v2Format = v2Format;
     }
 
     public static KvRecordReadContext createReadContext(
             KvFormat kvFormat, SchemaGetter schemaGetter) {
-        return new KvRecordReadContext(kvFormat, schemaGetter);
+        return new KvRecordReadContext(kvFormat, schemaGetter, false);
+    }
+
+    public static KvRecordReadContext createReadContext(
+            KvFormat kvFormat, SchemaGetter schemaGetter, boolean v2Format) {
+        return new KvRecordReadContext(kvFormat, schemaGetter, v2Format);
     }
 
     @Override
@@ -58,5 +65,10 @@ public class KvRecordReadContext implements KvRecordBatch.ReadContext {
                     return RowDecoder.create(
                             kvFormat, schema.getRowType().getChildren().toArray(new DataType[0]));
                 });
+    }
+
+    @Override
+    public boolean isV2Format() {
+        return v2Format;
     }
 }

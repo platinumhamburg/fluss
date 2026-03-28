@@ -33,6 +33,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.record.LogRecordBatchStatisticsCollector;
+import org.apache.fluss.record.MutationType;
 import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
@@ -619,6 +620,7 @@ public final class RecordAccumulator {
                         outputView,
                         writeRecord.getTargetColumns(),
                         writeRecord.getMergeMode(),
+                        writeRecord.getMutationType() == MutationType.RETRACT,
                         clock.milliseconds());
 
             case ARROW_LOG:

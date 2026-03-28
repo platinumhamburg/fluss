@@ -30,6 +30,7 @@ import org.apache.fluss.record.DefaultKvRecord;
 import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.MutationType;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
@@ -78,18 +79,17 @@ class KvWriteBatchTest {
 
     @Test
     void testTryAppendWithWriteLimit() throws Exception {
-        int writeLimit = 100;
+        // Use a write limit that fits exactly N records with no leftover space
+        int headerSize = DefaultKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
+        int numRecords = 5;
+        int writeLimit = headerSize + numRecords * estimatedSizeInBytes;
         KvWriteBatch kvProducerBatch =
                 createKvWriteBatch(
                         new TableBucket(DATA1_TABLE_ID_PK, 0),
                         writeLimit,
                         MemorySegment.allocateHeapMemory(writeLimit));
 
-        for (int i = 0;
-                i
-                        < (writeLimit - DefaultKvRecordBatch.RECORD_BATCH_HEADER_SIZE)
-                                / estimatedSizeInBytes;
-                i++) {
+        for (int i = 0; i < numRecords; i++) {
             boolean appendResult =
                     kvProducerBatch.tryAppend(createWriteRecord(), newWriteCallback());
 
@@ -229,6 +229,7 @@ class KvWriteBatchTest {
                 outputView,
                 null,
                 MergeMode.DEFAULT,
+                false,
                 System.currentTimeMillis());
     }
 
@@ -310,6 +311,33 @@ class KvWriteBatchTest {
         assertThat(batch.getMergeMode()).isEqualTo(MergeMode.DEFAULT);
     }
 
+    @Test
+    void testMixedUpsertAndRetractRecordsViaTryAppend() throws Exception {
+        KvWriteBatch batch = createV2KvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
+
+        // Append an UPSERT record
+        WriteRecord upsertRecord = createWriteRecord();
+        assertThat(upsertRecord.getMutationType()).isEqualTo(MutationType.UPSERT);
+        assertThat(batch.tryAppend(upsertRecord, newWriteCallback())).isTrue();
+
+        // Append a RETRACT record — same mergeMode (DEFAULT), different mutationType
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null,
+                        MergeMode.DEFAULT);
+        assertThat(retractRecord.getMutationType()).isEqualTo(MutationType.RETRACT);
+        assertThat(batch.tryAppend(retractRecord, newWriteCallback())).isTrue();
+
+        // Verify both records are in the batch
+        assertThat(batch.getRecordCount()).isEqualTo(2);
+    }
+
     private KvWriteBatch createKvWriteBatchWithMergeMode(TableBucket tb, MergeMode mergeMode)
             throws Exception {
         PreAllocatedPagedOutputView outputView =
@@ -324,6 +352,7 @@ class KvWriteBatchTest {
                 outputView,
                 null,
                 mergeMode,
+                false,
                 System.currentTimeMillis());
     }
 
@@ -337,5 +366,172 @@ class KvWriteBatchTest {
                 WriteFormat.COMPACTED_KV,
                 null,
                 mergeMode);
+    }
+
+    // ==================== V2 Format Tests ====================
+
+    @Test
+    void testV0BatchRejectsRetract() throws Exception {
+        KvWriteBatch v0Batch = createKvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
+
+        // UPSERT should succeed on V0 batch
+        WriteRecord upsertRecord = createWriteRecord();
+        assertThat(v0Batch.tryAppend(upsertRecord, newWriteCallback())).isTrue();
+
+        // RETRACT should be rejected on V0 batch
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null,
+                        MergeMode.DEFAULT);
+        assertThat(v0Batch.tryAppend(retractRecord, newWriteCallback())).isFalse();
+
+        // Only the UPSERT record should be in the batch
+        assertThat(v0Batch.getRecordCount()).isEqualTo(1);
+    }
+
+    @Test
+    void testV2BatchAcceptsMixed() throws Exception {
+        KvWriteBatch v2Batch = createV2KvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
+
+        // RETRACT should succeed on V2 batch
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null,
+                        MergeMode.DEFAULT);
+        assertThat(v2Batch.tryAppend(retractRecord, newWriteCallback())).isTrue();
+
+        // UPSERT should also succeed on V2 batch
+        WriteRecord upsertRecord = createWriteRecord();
+        assertThat(v2Batch.tryAppend(upsertRecord, newWriteCallback())).isTrue();
+
+        // Both records should be in the batch
+        assertThat(v2Batch.getRecordCount()).isEqualTo(2);
+    }
+
+    @Test
+    void testV2FormatRetractRecordRoundTrip() throws Exception {
+        KvWriteBatch v2Batch = createV2KvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
+
+        // Append a RETRACT record
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null,
+                        MergeMode.DEFAULT);
+        assertThat(retractRecord.getMutationType()).isEqualTo(MutationType.RETRACT);
+        assertThat(v2Batch.tryAppend(retractRecord, newWriteCallback())).isTrue();
+
+        // Build and read back with V2 ReadContext
+        DefaultKvRecordBatch kvRecords = DefaultKvRecordBatch.pointToBytesView(v2Batch.build());
+        assertThat(kvRecords.getRecordCount()).isEqualTo(1);
+
+        KvRecordReadContext v2ReadContext =
+                KvRecordReadContext.createReadContext(
+                        KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA), true);
+        Iterator<KvRecord> iterator = kvRecords.records(v2ReadContext).iterator();
+        assertThat(iterator.hasNext()).isTrue();
+        KvRecord kvRecord = iterator.next();
+        assertThat(toArray(kvRecord.getKey())).isEqualTo(key);
+        assertThat(kvRecord.getRow()).isEqualTo(row);
+        assertThat(kvRecord.getMutationType()).isEqualTo(MutationType.RETRACT);
+    }
+
+    @Test
+    void testV2FormatUpsertRecordRoundTrip() throws Exception {
+        KvWriteBatch v2Batch = createV2KvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
+
+        // Append an UPSERT record
+        WriteRecord upsertRecord = createWriteRecord();
+        assertThat(v2Batch.tryAppend(upsertRecord, newWriteCallback())).isTrue();
+
+        // Build and read back with V2 ReadContext
+        DefaultKvRecordBatch kvRecords = DefaultKvRecordBatch.pointToBytesView(v2Batch.build());
+        assertThat(kvRecords.getRecordCount()).isEqualTo(1);
+
+        KvRecordReadContext v2ReadContext =
+                KvRecordReadContext.createReadContext(
+                        KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA), true);
+        Iterator<KvRecord> iterator = kvRecords.records(v2ReadContext).iterator();
+        assertThat(iterator.hasNext()).isTrue();
+        KvRecord kvRecord = iterator.next();
+        assertThat(toArray(kvRecord.getKey())).isEqualTo(key);
+        assertThat(kvRecord.getRow()).isEqualTo(row);
+        assertThat(kvRecord.getMutationType()).isEqualTo(MutationType.UPSERT);
+    }
+
+    @Test
+    void testV2FormatMixedUpsertAndRetract() throws Exception {
+        KvWriteBatch v2Batch = createV2KvWriteBatch(new TableBucket(DATA1_TABLE_ID_PK, 0));
+
+        // Append an UPSERT record
+        WriteRecord upsertRecord = createWriteRecord();
+        assertThat(v2Batch.tryAppend(upsertRecord, newWriteCallback())).isTrue();
+
+        // Append a RETRACT record
+        WriteRecord retractRecord =
+                WriteRecord.forRetract(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null,
+                        MergeMode.DEFAULT);
+        assertThat(v2Batch.tryAppend(retractRecord, newWriteCallback())).isTrue();
+        assertThat(v2Batch.getRecordCount()).isEqualTo(2);
+
+        // Build and read back with V2 ReadContext
+        DefaultKvRecordBatch kvRecords = DefaultKvRecordBatch.pointToBytesView(v2Batch.build());
+        assertThat(kvRecords.getRecordCount()).isEqualTo(2);
+
+        KvRecordReadContext v2ReadContext =
+                KvRecordReadContext.createReadContext(
+                        KvFormat.COMPACTED, new TestingSchemaGetter(1, DATA1_SCHEMA), true);
+        Iterator<KvRecord> iterator = kvRecords.records(v2ReadContext).iterator();
+
+        // First record: UPSERT
+        assertThat(iterator.hasNext()).isTrue();
+        KvRecord first = iterator.next();
+        assertThat(first.getMutationType()).isEqualTo(MutationType.UPSERT);
+
+        // Second record: RETRACT
+        assertThat(iterator.hasNext()).isTrue();
+        KvRecord second = iterator.next();
+        assertThat(second.getMutationType()).isEqualTo(MutationType.RETRACT);
+    }
+
+    private KvWriteBatch createV2KvWriteBatch(TableBucket tb) throws Exception {
+        PreAllocatedPagedOutputView outputView =
+                new PreAllocatedPagedOutputView(
+                        Collections.singletonList(memoryPool.nextSegment()));
+        return new KvWriteBatch(
+                tb.getBucket(),
+                PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                DATA1_TABLE_INFO_PK.getSchemaId(),
+                KvFormat.COMPACTED,
+                Integer.MAX_VALUE,
+                outputView,
+                null,
+                MergeMode.DEFAULT,
+                true,
+                System.currentTimeMillis());
     }
 }

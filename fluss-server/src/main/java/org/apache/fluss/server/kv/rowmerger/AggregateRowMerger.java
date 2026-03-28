@@ -28,6 +28,7 @@ import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.server.kv.rowmerger.aggregate.AggregateFieldsProcessor;
 import org.apache.fluss.server.kv.rowmerger.aggregate.AggregationContext;
 import org.apache.fluss.server.kv.rowmerger.aggregate.AggregationContextCache;
+import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldAggregator;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -90,22 +91,8 @@ public class AggregateRowMerger implements RowMerger {
         if (oldValue == null || oldValue.row == null) {
             return newValue;
         }
-
-        // Get contexts for schema evolution support
-        AggregationContext oldContext = contextCache.getContext(oldValue.schemaId);
-        AggregationContext newContext = contextCache.getContext(newValue.schemaId);
-        AggregationContext targetContext = contextCache.getContext(targetSchemaId);
-
-        // Use target schema encoder to ensure merged row uses latest schema
-        RowEncoder encoder = targetContext.getRowEncoder();
-        encoder.startNewRow();
-
-        // Aggregate using target schema context to ensure output uses server's latest schema
-        AggregateFieldsProcessor.aggregateAllFieldsWithTargetSchema(
-                oldValue.row, newValue.row, oldContext, newContext, targetContext, encoder);
-        BinaryRow mergedRow = encoder.finishRow();
-
-        return new BinaryValue(targetSchemaId, mergedRow);
+        return applyAllFields(
+                oldValue, newValue, AggregateFieldsProcessor::aggregateAllFieldsWithTargetSchema);
     }
 
     @Override
@@ -115,8 +102,48 @@ public class AggregateRowMerger implements RowMerger {
     }
 
     @Override
+    public BinaryValue retract(BinaryValue oldValue, BinaryValue retractValue) {
+        // No existing row: nothing to retract from
+        if (oldValue == null || oldValue.row == null) {
+            return null;
+        }
+        return applyAllFields(
+                oldValue, retractValue, AggregateFieldsProcessor::retractAllFieldsWithTargetSchema);
+    }
+
+    /** Shared implementation for merge() and retract() on all fields. */
+    private BinaryValue applyAllFields(
+            BinaryValue oldValue, BinaryValue inputValue, AllFieldsOperation operation) {
+        AggregationContext oldContext = contextCache.getContext(oldValue.schemaId);
+        AggregationContext inputContext = contextCache.getContext(inputValue.schemaId);
+        AggregationContext targetContext = contextCache.getContext(targetSchemaId);
+
+        RowEncoder encoder = targetContext.getRowEncoder();
+        encoder.startNewRow();
+        operation.apply(
+                oldValue.row, inputValue.row, oldContext, inputContext, targetContext, encoder);
+        return new BinaryValue(targetSchemaId, encoder.finishRow());
+    }
+
+    @FunctionalInterface
+    private interface AllFieldsOperation {
+        void apply(
+                BinaryRow oldRow,
+                BinaryRow inputRow,
+                AggregationContext oldContext,
+                AggregationContext inputContext,
+                AggregationContext targetContext,
+                RowEncoder encoder);
+    }
+
+    @Override
     public DeleteBehavior deleteBehavior() {
         return deleteBehavior;
+    }
+
+    @Override
+    public boolean supportsRetract() {
+        return allAggregatorsSupportsRetract(contextCache.getContext(targetSchemaId));
     }
 
     @Override
@@ -160,6 +187,15 @@ public class AggregateRowMerger implements RowMerger {
                             latestSchema,
                             latestSchemaId);
                 });
+    }
+
+    private static boolean allAggregatorsSupportsRetract(AggregationContext context) {
+        for (FieldAggregator agg : context.getAggregators()) {
+            if (agg != null && !agg.supportsRetract()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -273,28 +309,54 @@ public class AggregateRowMerger implements RowMerger {
             if (oldValue == null || oldValue.row == null) {
                 return newValue;
             }
+            return applyTargetFields(
+                    oldValue,
+                    newValue,
+                    AggregateFieldsProcessor::aggregateTargetFieldsWithTargetSchema);
+        }
 
-            // Get contexts for schema evolution support
+        @Override
+        public BinaryValue retract(BinaryValue oldValue, BinaryValue retractValue) {
+            // No existing row: nothing to retract from
+            if (oldValue == null || oldValue.row == null) {
+                return null;
+            }
+            return applyTargetFields(
+                    oldValue,
+                    retractValue,
+                    AggregateFieldsProcessor::retractTargetFieldsWithTargetSchema);
+        }
+
+        /** Shared implementation for merge() and retract() on target fields. */
+        private BinaryValue applyTargetFields(
+                BinaryValue oldValue, BinaryValue inputValue, TargetFieldsOperation operation) {
             AggregationContext oldContext = contextCache.getContext(oldValue.schemaId);
-            AggregationContext newContext = contextCache.getContext(newValue.schemaId);
+            AggregationContext inputContext = contextCache.getContext(inputValue.schemaId);
             AggregationContext targetContext = contextCache.getContext(targetSchemaId);
 
-            // Use target schema encoder to ensure merged row uses latest schema
             RowEncoder encoder = targetContext.getRowEncoder();
             encoder.startNewRow();
-
-            // Aggregate using target schema to ensure output uses server's latest schema
-            AggregateFieldsProcessor.aggregateTargetFieldsWithTargetSchema(
+            operation.apply(
                     oldValue.row,
-                    newValue.row,
+                    inputValue.row,
                     oldContext,
-                    newContext,
+                    inputContext,
                     targetContext,
                     targetColumnIdBitSet,
                     encoder);
-            BinaryRow mergedRow = encoder.finishRow();
+            return new BinaryValue(targetSchemaId, encoder.finishRow());
+        }
 
-            return new BinaryValue(targetSchemaId, mergedRow);
+        @FunctionalInterface
+        private interface TargetFieldsOperation {
+            void apply(
+                    BinaryRow oldRow,
+                    BinaryRow inputRow,
+                    AggregationContext oldContext,
+                    AggregationContext inputContext,
+                    AggregationContext targetContext,
+                    BitSet targetColumnIdBitSet,
+                    RowEncoder encoder);
         }
 
         @Override
@@ -350,6 +412,24 @@ public class AggregateRowMerger implements RowMerger {
         @Override
         public DeleteBehavior deleteBehavior() {
             return deleteBehavior;
+        }
+
+        @Override
+        public boolean supportsRetract() {
+            // Only check aggregators for target columns, not all columns.
+            // A partial retract touching only SUM columns should succeed even if
+            // the table has non-retractable columns like MAX/MIN.
+            AggregationContext context = contextCache.getContext(targetSchemaId);
+            List<Schema.Column> columns = context.getSchema().getColumns();
+            FieldAggregator[] aggregators = context.getAggregators();
+            for (int i = 0; i < aggregators.length; i++) {
+                if (aggregators[i] != null
+                        && targetColumnIdBitSet.get(columns.get(i).getColumnId())
+                        && !aggregators[i].supportsRetract()) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         @Override
