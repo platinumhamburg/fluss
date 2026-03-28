@@ -86,8 +86,7 @@ public final class IndexDataExtractor implements Closeable {
 
     private volatile boolean closed = false;
 
-    private final Map<Short, LogRecordReadContext> readContextCache =
-            new ConcurrentHashMap<>();
+    private final Map<Short, LogRecordReadContext> readContextCache = new ConcurrentHashMap<>();
 
     private final List<SingleIndexExtractor> singleIndexExtractors;
 

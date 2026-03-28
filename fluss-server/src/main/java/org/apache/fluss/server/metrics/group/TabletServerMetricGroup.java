@@ -34,6 +34,7 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** The metric group for tablet server. */
 public class TabletServerMetricGroup extends AbstractMetricGroup {
@@ -70,6 +71,9 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Histogram kvFlushLatencyHistogram;
     private final Counter kvTruncateAsDuplicatedCount;
     private final Counter kvTruncateAsErrorCount;
+    private final AtomicInteger kvTabletOpenCount = new AtomicInteger(0);
+    private final AtomicInteger kvTabletLazyCount = new AtomicInteger(0);
+    private final AtomicInteger kvTabletFailedCount = new AtomicInteger(0);
 
     // aggregated replica metrics
     private final Counter isrShrinks;
@@ -141,6 +145,9 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(
                 MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_ERROR_RATE,
                 new MeterView(kvTruncateAsErrorCount));
+        gauge(MetricNames.KV_TABLET_OPEN_COUNT, kvTabletOpenCount::get);
+        gauge(MetricNames.KV_TABLET_LAZY_COUNT, kvTabletLazyCount::get);
+        gauge(MetricNames.KV_TABLET_FAILED_COUNT, kvTabletFailedCount::get);
 
         // replica metrics
         isrExpands = new SimpleCounter();
@@ -267,6 +274,21 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Counter kvTruncateAsErrorCount() {
         return kvTruncateAsErrorCount;
+    }
+
+    /** Returns the gauge-backing counter for currently open lazy KvTablets. */
+    public AtomicInteger kvTabletOpenCount() {
+        return kvTabletOpenCount;
+    }
+
+    /** Returns the gauge-backing counter for KvTablets in LAZY (released) state. */
+    public AtomicInteger kvTabletLazyCount() {
+        return kvTabletLazyCount;
+    }
+
+    /** Returns the gauge-backing counter for KvTablets in FAILED state. */
+    public AtomicInteger kvTabletFailedCount() {
+        return kvTabletFailedCount;
     }
 
     public Counter isrShrinks() {

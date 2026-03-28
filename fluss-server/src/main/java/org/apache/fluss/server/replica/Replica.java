@@ -67,6 +67,7 @@ import org.apache.fluss.server.index.IndexWriteTaskScheduler;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.KvTabletLazyLifecycle;
 import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
@@ -109,6 +110,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableRegistry;
+import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
@@ -162,6 +164,12 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
  */
 @ThreadSafe
 public final class Replica {
+
+    /** Operation executed under a {@link KvTablet.Guard} in {@link #withGuardedLeaderKv}. */
+    @FunctionalInterface
+    private interface GuardedKvOperation<T> {
+        T apply(KvTablet kvTablet) throws Exception;
+    }
 
     private static final Logger LOG = LoggerFactory.getLogger(Replica.class);
 
@@ -228,7 +236,7 @@ public final class Replica {
     // null if table without pk or haven't become leader
     private volatile @Nullable KvTablet kvTablet;
     private volatile @Nullable CloseableRegistry closeableRegistryForKv;
-    private @Nullable PeriodicSnapshotManager kvSnapshotManager;
+    private volatile @Nullable PeriodicSnapshotManager kvSnapshotManager;
 
     // null if no indexes or haven't become leader (IndexDataProducer for data tables with indexes)
     // or index table not become leader (IndexApplier for index tables)
@@ -310,7 +318,17 @@ public final class Replica {
         this.logTablet.updateIsDataLakeEnabled(tableConfig.isDataLakeEnabled());
         this.clock = clock;
         this.remoteLogManager = remoteLogManager;
+
         registerMetrics();
+    }
+
+    /** Stop the periodic snapshot manager (does NOT clear kvTablet — sentinel stays). */
+    private void stopSnapshotManager() {
+        PeriodicSnapshotManager mgr = this.kvSnapshotManager;
+        if (mgr != null) {
+            this.kvSnapshotManager = null;
+            mgr.close();
+        }
     }
 
     private void registerMetrics() {
@@ -369,12 +387,21 @@ public final class Replica {
 
     public long logicalStorageKvSize() {
         if (isLeader() && isKvTable()) {
-            checkNotNull(kvSnapshotManager, "kvSnapshotManager is null");
-            return kvSnapshotManager.getSnapshotSize();
-        } else {
-            // follower doesn't need to report the logical storage size.
+            PeriodicSnapshotManager mgr = this.kvSnapshotManager;
+            if (mgr != null) {
+                return mgr.getSnapshotSize();
+            }
+            // In lazy mode, snapshot manager may be null when tablet is released.
+            // Fall back to committed snapshot size.
+            KvTablet kv = this.kvTablet;
+            if (kv != null && kv.isLazyMode()) {
+                return getLatestKvSnapshotSize();
+            }
+            // Eager mode: snapshot manager not yet initialized (during startup).
+            // Return 0 to avoid blocking metrics thread with ZK calls.
             return 0L;
         }
+        return 0L;
     }
 
     public boolean isKvTable() {
@@ -626,9 +653,8 @@ public final class Replica {
         }
 
         if (isKvTable()) {
-            // if it's become new leader, we must
-            // first destroy the old kv tablet
-            // if exist. Otherwise, it'll use still the old kv tablet which will cause data loss
+            // Destroy the old kv tablet if it exists — reusing a stale tablet from a previous
+            // leader epoch would cause data loss.
             dropKv();
             // now, we can create a new kv tablet (IndexDataProducer is already available if needed)
             createKv();
@@ -925,7 +951,7 @@ public final class Replica {
         try {
             // create a closeable registry for the closable related to kv
             closeableRegistryForKv = new CloseableRegistry();
-            // resister the closeable registry for kv
+            // register the closeable registry for kv
             closeableRegistry.registerCloseable(closeableRegistryForKv);
         } catch (IOException e) {
             LOG.warn(
@@ -934,11 +960,137 @@ public final class Replica {
                     e);
         }
 
+        checkNotNull(kvManager);
+
+        if (kvManager.isLazyOpenEnabled()) {
+            createKvLazy();
+        } else {
+            createKvEager();
+        }
+    }
+
+    private void createKvLazy() {
+        TabletServerMetricGroup serverMetrics =
+                bucketMetricGroup.getTableMetricGroup().getServerMetricGroup();
+
+        // Create a lazy sentinel — no RocksDB yet
+        KvTablet sentinel =
+                KvTablet.createLazySentinel(physicalPath, tableBucket, logTablet, serverMetrics);
+
+        // Configure lazy open parameters via lifecycle
+        KvTabletLazyLifecycle lifecycle = sentinel.getLifecycle();
+        lifecycle.configureLazyOpen(
+                clock,
+                kvManager.getOpenSemaphore(),
+                kvManager.getOpenTimeoutMs(),
+                kvManager.getFailedBackoffBaseMs(),
+                kvManager.getFailedBackoffMaxMs(),
+                KvManager.RELEASE_DRAIN_TIMEOUT_MS);
+        lifecycle.setLeaderEpochSupplier(() -> leaderEpoch);
+        lifecycle.setBucketEpochSupplier(() -> bucketEpoch);
+
+        // Tablet directory supplier for LAZY/FAILED state cleanup
+        lifecycle.setTabletDirSupplier(() -> kvManager.getTabletDirPath(physicalPath, tableBucket));
+
+        // Shared state between open and commit callbacks to pass snapshot reference
+        AtomicReference<CompletedSnapshot> snapshotRef = new AtomicReference<>();
+
+        // Open callback: creates a real KvTablet
+        // If local data exists (reopen after idle release), load from local directory
+        // and replay only incremental logs. Otherwise, do full init (download snapshot).
+        lifecycle.setOpenCallback(
+                hasLocal -> {
+                    if (hasLocal) {
+                        return reopenFromLocalData(sentinel, snapshotRef);
+                    } else {
+                        InitKvResult result = initKvTablet();
+                        snapshotRef.set(result.snapshotUsed.orElse(null));
+                        return result.tablet;
+                    }
+                });
+
+        // Commit callback: start periodic snapshot after RocksDB is installed
+        lifecycle.setCommitCallback(
+                kv -> {
+                    startPeriodicKvSnapshot(kv, snapshotRef.getAndSet(null));
+                    if (kv.getRocksDBStatistics() != null) {
+                        bucketMetricGroup.registerRocksDBStatistics(kv.getRocksDBStatistics());
+                    }
+                });
+
+        // Release callback: stop snapshot and unregister metrics
+        // RocksDB close is handled by detachRocksDB() inside KvTablet
+        lifecycle.setReleaseCallback(
+                kv -> {
+                    try {
+                        stopSnapshotManager();
+                    } catch (Exception e) {
+                        LOG.warn(
+                                "Failed to stop kv snapshot manager during release for {}",
+                                tableBucket,
+                                e);
+                    }
+                    try {
+                        bucketMetricGroup.unregisterRocksDBStatistics();
+                    } catch (Exception e) {
+                        LOG.warn(
+                                "Failed to unregister RocksDB statistics during release for {}",
+                                tableBucket,
+                                e);
+                    }
+                });
+
+        // Drop callback: cleanup metrics and snapshot
+        // Registry removal is handled by Replica.dropKv()
+        lifecycle.setDropCallback(
+                kv -> {
+                    bucketMetricGroup.unregisterRocksDBStatistics();
+                    stopSnapshotManager();
+                });
+
+        // Initialize cached row count from snapshot metadata if available (no RocksDB needed).
+        // This is best-effort — if ZK is unavailable, default to 0 rather than failing
+        // the entire lazy sentinel creation.
+        long initialRowCount;
+        if (tableConfig.getChangelogImage() == ChangelogImage.WAL) {
+            initialRowCount = -1L;
+        } else {
+            try {
+                Long snapshotRowCount =
+                        getLatestSnapshot(tableBucket)
+                                .map(
+                                        s -> {
+                                            try {
+                                                TabletState ts = s.loadTabletState();
+                                                return ts.getRowCount();
+                                            } catch (Exception ex) {
+                                                return null;
+                                            }
+                                        })
+                                .orElse(null);
+                initialRowCount = snapshotRowCount != null ? snapshotRowCount : 0L;
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to read snapshot row count for {}, defaulting to 0",
+                        tableBucket,
+                        e);
+                initialRowCount = 0L;
+            }
+        }
+        lifecycle.initCachedRowCount(initialRowCount);
+
+        // Register sentinel in KvManager registry
+        kvManager.registerKv(tableBucket, sentinel);
+
+        this.kvTablet = sentinel;
+    }
+
+    private void createKvEager() {
         // init kv tablet and get the snapshot it uses to init if have any
         Optional<CompletedSnapshot> snapshotUsed = Optional.empty();
         for (int i = 1; i <= INIT_KV_TABLET_MAX_RETRY_TIMES; i++) {
             try {
-                snapshotUsed = initKvTablet();
+                snapshotUsed = initKvTabletEager();
                 break;
             } catch (Exception e) {
                 LOG.warn(
@@ -948,8 +1100,101 @@ public final class Replica {
                         e);
             }
         }
-        // start periodic kv snapshot
-        startPeriodicKvSnapshot(snapshotUsed.orElse(null));
+        // start periodic kv snapshot (kvTablet may be null if all retries failed)
+        if (kvTablet != null) {
+            startPeriodicKvSnapshot(kvTablet, snapshotUsed.orElse(null));
+        } else {
+            LOG.error(
+                    "Failed to init kv tablet for bucket {} after {} retries. "
+                            + "KvTablet will remain null.",
+                    tableBucket,
+                    INIT_KV_TABLET_MAX_RETRY_TIMES);
+        }
+    }
+
+    /**
+     * Init kv tablet for the eager (non-lazy) path. This method directly sets {@code this.kvTablet}
+     * inside, matching the original behavior where the tablet is visible even if recovery partially
+     * fails. Uses registered KvManager methods (loadKv/getOrCreateKv).
+     *
+     * @return the snapshot used to init kv tablet, empty if no any snapshot.
+     */
+    private Optional<CompletedSnapshot> initKvTabletEager() {
+        checkNotNull(kvManager);
+        long startTime = clock.milliseconds();
+        LOG.info("Start to init kv tablet for {} of table {}.", tableBucket, physicalPath);
+
+        long restoreStartOffset = 0;
+        Optional<CompletedSnapshot> optCompletedSnapshot = getLatestSnapshot(tableBucket);
+        try {
+            Long rowCount;
+            AutoIncIDRange autoIncIDRange;
+            if (optCompletedSnapshot.isPresent()) {
+                LOG.info(
+                        "Use snapshot {} to restore kv tablet for {} of table {}.",
+                        optCompletedSnapshot.get(),
+                        tableBucket,
+                        physicalPath);
+                CompletedSnapshot completedSnapshot = optCompletedSnapshot.get();
+                File tabletDir = kvManager.createTabletDir(physicalPath, tableBucket);
+                downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
+
+                kvTablet =
+                        kvManager.loadKv(
+                                tabletDir, schemaGetter, tableConfig.getCompactionFilterConfig());
+
+                checkNotNull(kvTablet, "kv tablet should not be null.");
+                restoreStartOffset = completedSnapshot.getLogOffset();
+
+                TabletState snapshotTabletState = completedSnapshot.loadTabletState();
+                rowCount = snapshotTabletState.getRowCount();
+                autoIncIDRange =
+                        snapshotTabletState.getAutoIncIDRanges() != null
+                                        && !snapshotTabletState.getAutoIncIDRanges().isEmpty()
+                                ? snapshotTabletState.getAutoIncIDRanges().get(0)
+                                : null;
+            } else {
+                LOG.info(
+                        "No snapshot found for {} of {}, restore from log.",
+                        tableBucket,
+                        physicalPath);
+
+                kvTablet =
+                        kvManager.getOrCreateKv(
+                                physicalPath,
+                                tableBucket,
+                                logTablet,
+                                tableConfig.getKvFormat(),
+                                schemaGetter,
+                                tableConfig,
+                                arrowCompressionInfo,
+                                tableConfig.getCompactionFilterConfig());
+
+                rowCount = tableConfig.getChangelogImage() == ChangelogImage.WAL ? null : 0L;
+                autoIncIDRange = null;
+            }
+
+            logTablet.updateMinRetainOffset(restoreStartOffset);
+            recoverKvTablet(kvTablet, restoreStartOffset, rowCount, autoIncIDRange);
+        } catch (Exception e) {
+            throw new KvStorageException(
+                    String.format(
+                            "Fail to init kv tablet for %s of table %s.",
+                            tableBucket, physicalPath),
+                    e);
+        }
+        long endTime = clock.milliseconds();
+        LOG.info(
+                "Init kv tablet for {} of {} finish, cost {} ms.",
+                physicalPath,
+                tableBucket,
+                endTime - startTime);
+
+        if (kvTablet != null && kvTablet.getRocksDBStatistics() != null) {
+            bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
+        }
+
+        return optCompletedSnapshot;
     }
 
     private void createIndexDataProducer() {
@@ -1052,15 +1297,21 @@ public final class Replica {
         if (closeableRegistry.unregisterCloseable(closeableRegistryForKv)) {
             IOUtils.closeQuietly(closeableRegistryForKv);
         }
-        if (kvTablet != null) {
-            // Unregister RocksDB statistics before dropping KvTablet
-            // This ensures statistics are cleaned up when KvTablet is destroyed
-            bucketMetricGroup.unregisterRocksDBStatistics();
-
-            // drop the kv tablet
-            checkNotNull(kvManager);
-            kvManager.dropKv(tableBucket);
-            kvTablet = null;
+        KvTablet kv = this.kvTablet;
+        if (kv != null) {
+            if (kv.isLazyMode()) {
+                // Delegate to KvTablet's lazy lifecycle which handles all states
+                // (dropCallback inside dropKvLazy already calls stopSnapshotManager)
+                kv.dropKvLazy();
+                // Remove sentinel from KvManager registry
+                checkNotNull(kvManager);
+                kvManager.unregisterKv(tableBucket);
+            } else {
+                bucketMetricGroup.unregisterRocksDBStatistics();
+                checkNotNull(kvManager);
+                kvManager.dropKv(tableBucket);
+            }
+            this.kvTablet = null;
         }
     }
 
@@ -1100,11 +1351,13 @@ public final class Replica {
     }
 
     /**
-     * Init kv tablet from snapshot if any or just from log.
+     * Init kv tablet from snapshot if any or just from log. This is a pure factory method that
+     * creates and returns the KvTablet without installing it into {@code this.kvTablet}. The caller
+     * is responsible for installing the tablet at the appropriate time.
      *
-     * @return the snapshot used to init kv tablet, empty if no any snapshot.
+     * @return the created KvTablet and the snapshot used to init it (if any).
      */
-    private Optional<CompletedSnapshot> initKvTablet() {
+    private InitKvResult initKvTablet() {
         checkNotNull(kvManager);
         long startTime = clock.milliseconds();
         LOG.info("Start to init kv tablet for {} of table {}.", tableBucket, physicalPath);
@@ -1126,6 +1379,7 @@ public final class Replica {
         // get the offset from which, we should restore from. default is 0
         long restoreStartOffset = 0;
         Optional<CompletedSnapshot> optCompletedSnapshot = getLatestSnapshot(tableBucket);
+        KvTablet createdTablet = null;
         try {
             Long rowCount;
             AutoIncIDRange autoIncIDRange;
@@ -1143,11 +1397,11 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet =
-                        kvManager.loadKv(
+                createdTablet =
+                        kvManager.loadKvUnregistered(
                                 tabletDir, schemaGetter, tableConfig.getCompactionFilterConfig());
 
-                checkNotNull(kvTablet, "kv tablet should not be null.");
+                checkNotNull(createdTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
 
                 // Load TabletState from _TABLET_STATE file (or fallback to old _METADATA)
@@ -1167,8 +1421,8 @@ public final class Replica {
 
                 // actually, kv manager always create a kv tablet since we will drop the kv
                 // if it exists before init kv tablet
-                kvTablet =
-                        kvManager.getOrCreateKv(
+                createdTablet =
+                        kvManager.createKvTabletUnregistered(
                                 physicalPath,
                                 tableBucket,
                                 logTablet,
@@ -1193,13 +1447,22 @@ public final class Replica {
             // workaround of not advancing minRetainOffset for indexed tables is no longer
             // needed. All tables uniformly update minRetainOffset during KV recovery.
             logTablet.updateMinRetainOffset(restoreStartOffset);
-            recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
+            recoverKvTablet(createdTablet, restoreStartOffset, rowCount, autoIncIDRange);
 
             // Restore index replication offsets for index tables
             if (tabletState != null && tabletState.getIndexReplicationOffsets() != null) {
                 kvTablet.restoreIndexReplicationOffsets(tabletState.getIndexReplicationOffsets());
             }
         } catch (Exception e) {
+            // Close the partially-initialized tablet to release the RocksDB LOCK file.
+            // Without this, retries would fail with "lock hold by current process".
+            if (createdTablet != null) {
+                try {
+                    createdTablet.close();
+                } catch (Exception closeEx) {
+                    e.addSuppressed(closeEx);
+                }
+            }
             throw new KvStorageException(
                     String.format(
                             "Fail to init kv tablet for %s of table %s.",
@@ -1213,12 +1476,84 @@ public final class Replica {
                 tableBucket,
                 endTime - startTime);
 
-        // Register RocksDB statistics to BucketMetricGroup
-        if (kvTablet != null && kvTablet.getRocksDBStatistics() != null) {
-            bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
-        }
+        return new InitKvResult(createdTablet, optCompletedSnapshot);
+    }
 
-        return optCompletedSnapshot;
+    /**
+     * Reopen a KvTablet from local data after idle release. Loads the existing RocksDB directory
+     * and replays only the incremental logs accumulated since the tablet was released.
+     */
+    private KvTablet reopenFromLocalData(
+            KvTablet sentinel, AtomicReference<CompletedSnapshot> snapshotRef) {
+        checkNotNull(kvManager);
+        long startTime = clock.milliseconds();
+        LOG.info(
+                "Reopening kv tablet from local data for {} of table {}.",
+                tableBucket,
+                physicalPath);
+
+        long cachedFlushedLogOffset = sentinel.getCachedFlushedLogOffset();
+        long cachedRowCount = sentinel.getCachedRowCount();
+
+        KvTablet createdTablet = null;
+        try {
+            File tabletDir = kvManager.getTabletDirPath(physicalPath, tableBucket);
+            createdTablet =
+                    kvManager.loadKvUnregistered(
+                            tabletDir, schemaGetter, tableConfig.getCompactionFilterConfig());
+
+            Long rowCount = cachedRowCount == KvTablet.ROW_COUNT_DISABLED ? null : cachedRowCount;
+            logTablet.updateMinRetainOffset(cachedFlushedLogOffset);
+            recoverKvTablet(createdTablet, cachedFlushedLogOffset, rowCount, null);
+
+            long endTime = clock.milliseconds();
+            LOG.info(
+                    "Reopened kv tablet from local data for {} of table {} "
+                            + "from log offset {}, cost {} ms.",
+                    tableBucket,
+                    physicalPath,
+                    cachedFlushedLogOffset,
+                    endTime - startTime);
+
+            return createdTablet;
+        } catch (Exception e) {
+            LOG.warn(
+                    "Failed to reopen from local data for {} of table {}, "
+                            + "falling back to full init.",
+                    tableBucket,
+                    physicalPath,
+                    e);
+            if (createdTablet != null) {
+                try {
+                    createdTablet.close();
+                } catch (Exception closeEx) {
+                    e.addSuppressed(closeEx);
+                }
+            }
+            // Clean up the potentially corrupted local directory
+            File tabletDir = kvManager.getTabletDirPath(physicalPath, tableBucket);
+            FileUtils.deleteDirectoryQuietly(tabletDir);
+            if (tabletDir.exists()) {
+                LOG.error(
+                        "Failed to delete corrupted tablet dir {} during reopen fallback",
+                        tabletDir.getAbsolutePath());
+            }
+            // Fall back to full init (download snapshot)
+            InitKvResult result = initKvTablet();
+            snapshotRef.set(result.snapshotUsed.orElse(null));
+            return result.tablet;
+        }
+    }
+
+    /** Result of {@link #initKvTablet()}: the created tablet and the snapshot used (if any). */
+    private static class InitKvResult {
+        final KvTablet tablet;
+        final Optional<CompletedSnapshot> snapshotUsed;
+
+        InitKvResult(KvTablet tablet, Optional<CompletedSnapshot> snapshotUsed) {
+            this.tablet = tablet;
+            this.snapshotUsed = snapshotUsed;
+        }
     }
 
     private void downloadKvSnapshots(CompletedSnapshot completedSnapshot, Path kvTabletDir)
@@ -1265,11 +1600,12 @@ public final class Replica {
     }
 
     private void recoverKvTablet(
+            KvTablet tablet,
             long startRecoverLogOffset,
             @Nullable Long rowCount,
             @Nullable AutoIncIDRange autoIncIDRange) {
         long start = clock.milliseconds();
-        checkNotNull(kvTablet, "kv tablet should not be null.");
+        checkNotNull(tablet, "kv tablet should not be null.");
         try {
             KvRecoverHelper.KvRecoverContext recoverContext =
                     new KvRecoverHelper.KvRecoverContext(
@@ -1285,7 +1621,7 @@ public final class Replica {
             try {
                 KvRecoverHelper kvRecoverHelper =
                         new KvRecoverHelper(
-                                kvTablet,
+                                tablet,
                                 logTablet,
                                 startRecoverLogOffset,
                                 rowCount,
@@ -1315,8 +1651,8 @@ public final class Replica {
                 end - start);
     }
 
-    private void startPeriodicKvSnapshot(@Nullable CompletedSnapshot completedSnapshot) {
-        checkNotNull(kvTablet);
+    private void startPeriodicKvSnapshot(
+            KvTablet kvTablet, @Nullable CompletedSnapshot completedSnapshot) {
         KvTabletSnapshotTarget kvTabletSnapshotTarget;
         try {
             // get the snapshot reporter to report the completed snapshot
@@ -1401,7 +1737,8 @@ public final class Replica {
 
     public long getLatestKvSnapshotSize() {
         if (kvSnapshotManager == null) {
-            return 0L;
+            CompletedSnapshot latestSnapshot = getLatestSnapshot(tableBucket).orElse(null);
+            return latestSnapshot != null ? latestSnapshot.getSnapshotSize() : 0L;
         } else {
             return kvSnapshotManager.getSnapshotSize();
         }
@@ -1452,20 +1789,11 @@ public final class Replica {
             MergeMode mergeMode,
             int requiredAcks)
             throws Exception {
-        return inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    if (!isLeader()) {
-                        throw new NotLeaderOrFollowerException(
-                                String.format(
-                                        "Leader not local for bucket %s on tabletServer %d",
-                                        tableBucket, localTabletServerId));
-                    }
-
-                    validateInSyncReplicaSize(requiredAcks);
-                    KvTablet kv = this.kvTablet;
-                    checkNotNull(
-                            kv, "KvTablet for the replica to put kv records shouldn't be null.");
+        return withGuardedLeaderKv(
+                true,
+                requiredAcks,
+                "KvTablet for the replica to put kv records shouldn't be null.",
+                kv -> {
                     LogAppendInfo logAppendInfo;
                     try {
                         logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
@@ -1683,28 +2011,28 @@ public final class Replica {
             throw new NonPrimaryKeyTableException(
                     "the primary key table not exists for " + tableBucket);
         }
-        return inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    try {
-                        if (!isLeader()) {
-                            throw new NotLeaderOrFollowerException(
+        try {
+            return withGuardedLeaderKv(
+                    false,
+                    0,
+                    "KvTablet for the replica to get key shouldn't be null.",
+                    kv -> {
+                        try {
+                            return kv.multiGet(keys);
+                        } catch (IOException e) {
+                            String errorMsg =
                                     String.format(
-                                            "Leader not local for bucket %s on tabletServer %d",
-                                            tableBucket, localTabletServerId));
+                                            "Failed to lookup from local kv for table bucket %s, the cause is: %s",
+                                            tableBucket, e.getMessage());
+                            LOG.error(errorMsg, e);
+                            throw new KvStorageException(errorMsg, e);
                         }
-                        checkNotNull(
-                                kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return kvTablet.multiGet(keys);
-                    } catch (IOException e) {
-                        String errorMsg =
-                                String.format(
-                                        "Failed to lookup from local kv for table bucket %s, the cause is: %s",
-                                        tableBucket, e.getMessage());
-                        LOG.error(errorMsg, e);
-                        throw new KvStorageException(errorMsg, e);
-                    }
-                });
+                    });
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new KvStorageException("Failed to lookup from local kv for " + tableBucket, e);
+        }
     }
 
     public List<byte[]> prefixLookup(byte[] prefixKey) {
@@ -1713,28 +2041,29 @@ public final class Replica {
                     "Try to do prefix lookup on a non primary key table: " + getTablePath());
         }
 
-        return inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    try {
-                        if (!isLeader()) {
-                            throw new NotLeaderOrFollowerException(
+        try {
+            return withGuardedLeaderKv(
+                    false,
+                    0,
+                    "KvTablet for the replica to get key shouldn't be null.",
+                    kv -> {
+                        try {
+                            return kv.prefixLookup(prefixKey);
+                        } catch (IOException e) {
+                            String errorMsg =
                                     String.format(
-                                            "Leader not local for bucket %s on tabletServer %d",
-                                            tableBucket, localTabletServerId));
+                                            "Failed to do prefix lookup from local kv for table bucket %s, the cause is: %s",
+                                            tableBucket, e.getMessage());
+                            LOG.error(errorMsg, e);
+                            throw new KvStorageException(errorMsg, e);
                         }
-                        checkNotNull(
-                                kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return kvTablet.prefixLookup(prefixKey);
-                    } catch (IOException e) {
-                        String errorMsg =
-                                String.format(
-                                        "Failed to do prefix lookup from local kv for table bucket %s, the cause is: %s",
-                                        tableBucket, e.getMessage());
-                        LOG.error(errorMsg, e);
-                        throw new KvStorageException(errorMsg, e);
-                    }
-                });
+                    });
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new KvStorageException(
+                    "Failed to do prefix lookup from local kv for " + tableBucket, e);
+        }
     }
 
     public DefaultValueRecordBatch limitKvScan(int limit) {
@@ -1743,34 +2072,85 @@ public final class Replica {
                     "the primary key table not exists for " + tableBucket);
         }
 
-        return inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    try {
-                        if (!isLeader()) {
+        try {
+            return withGuardedLeaderKv(
+                    false,
+                    0,
+                    "KvTablet for the replica to limit scan shouldn't be null.",
+                    kv -> {
+                        try {
+                            List<byte[]> bytes = kv.limitScan(limit);
+                            DefaultValueRecordBatch.Builder builder =
+                                    DefaultValueRecordBatch.builder();
+                            for (byte[] key : bytes) {
+                                builder.append(key);
+                            }
+                            return builder.build();
+                        } catch (IOException e) {
+                            String errorMsg =
+                                    String.format(
+                                            "Failed to limit scan from local kv for table bucket %s, the cause is: %s",
+                                            tableBucket, e.getMessage());
+                            LOG.error(errorMsg, e);
+                            throw new KvStorageException(errorMsg, e);
+                        }
+                    });
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new KvStorageException(
+                    "Failed to limit scan from local kv for " + tableBucket, e);
+        }
+    }
+
+    // Lock ordering invariant: leaderIsrUpdateLock must never be held when calling
+    // KvTablet.acquireGuard() — acquireGuard may trigger a slow lazy open, and holding
+    // the lock would block leader transitions for the entire duration. Instead, we use
+    // a two-phase protocol: validate leadership under lock, release lock, acquire guard
+    // (potentially slow), then re-validate leadership under lock.
+    private <T> T withGuardedLeaderKv(
+            boolean validateInSyncReplicas,
+            int requiredAcks,
+            String nullKvMessage,
+            GuardedKvOperation<T> action)
+            throws Exception {
+        KvTablet kv =
+                inReadLock(
+                        leaderIsrUpdateLock,
+                        () -> {
+                            ensureLeaderForKvAccess();
+                            if (validateInSyncReplicas) {
+                                validateInSyncReplicaSize(requiredAcks);
+                            }
+                            return checkNotNull(kvTablet, nullKvMessage);
+                        });
+
+        try (KvTablet.Guard ignored = kv.acquireGuard()) {
+            return inReadLock(
+                    leaderIsrUpdateLock,
+                    () -> {
+                        ensureLeaderForKvAccess();
+                        if (this.kvTablet != kv) {
                             throw new NotLeaderOrFollowerException(
                                     String.format(
                                             "Leader not local for bucket %s on tabletServer %d",
                                             tableBucket, localTabletServerId));
                         }
-                        checkNotNull(
-                                kvTablet,
-                                "KvTablet for the replica to limit scan shouldn't be null.");
-                        List<byte[]> bytes = kvTablet.limitScan(limit);
-                        DefaultValueRecordBatch.Builder builder = DefaultValueRecordBatch.builder();
-                        for (byte[] key : bytes) {
-                            builder.append(key);
+                        if (validateInSyncReplicas) {
+                            validateInSyncReplicaSize(requiredAcks);
                         }
-                        return builder.build();
-                    } catch (IOException e) {
-                        String errorMsg =
-                                String.format(
-                                        "Failed to limit scan from local kv for table bucket %s, the cause is: %s",
-                                        tableBucket, e.getMessage());
-                        LOG.error(errorMsg, e);
-                        throw new KvStorageException(errorMsg, e);
-                    }
-                });
+                        return action.apply(kv);
+                    });
+        }
+    }
+
+    private void ensureLeaderForKvAccess() {
+        if (!isLeader()) {
+            throw new NotLeaderOrFollowerException(
+                    String.format(
+                            "Leader not local for bucket %s on tabletServer %d",
+                            tableBucket, localTabletServerId));
+        }
     }
 
     public LogRecords limitLogScan(int limit) {
@@ -1845,18 +2225,15 @@ public final class Replica {
     }
 
     public long getRowCount() {
-        return inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    KvTablet kv = this.kvTablet;
-                    if (kv != null) {
-                        // return materialized row count for primary key table
-                        return kv.getRowCount();
-                    } else {
-                        // return log row count for non-primary key table
-                        return logTablet.getRowCount();
-                    }
-                });
+        KvTablet kv = inReadLock(leaderIsrUpdateLock, () -> kvTablet);
+
+        if (kv != null) {
+            return kv.getRowCount();
+        } else if (isKvTable()) {
+            return 0L;
+        } else {
+            return logTablet.getRowCount();
+        }
     }
 
     private boolean hasIndexReplicaReachedOffset(long requiredOffset) {
@@ -2483,133 +2860,19 @@ public final class Replica {
         return isLeader() && isrState.isr().size() < minInSyncReplicasSupplier.getAsInt();
     }
 
-    /**
-     * Returns a detailed timeout diagnostics message for delayed write operation.
-     *
-     * @param requiredOffset the offset that delayed write is waiting for
-     * @return diagnostics message describing why the write operation timed out
-     */
+    /** Returns a detailed timeout diagnostics message for delayed write operation. */
     public String getTimeoutDiagnostics(long requiredOffset) {
-        StringBuilder diagnostics = new StringBuilder();
-        diagnostics
-                .append("Delayed write operation timed out for table ")
-                .append(physicalPath)
-                .append(", bucket ")
-                .append(tableBucket)
-                .append(". Required offset: ")
-                .append(requiredOffset)
-                .append(". Diagnostics: ");
-
-        appendLogReplicationDiagnostics(diagnostics, requiredOffset);
-        appendIndexReplicationDiagnostics(diagnostics, requiredOffset);
-        appendIsrStatusDiagnostics(diagnostics);
-
-        return diagnostics.toString();
-    }
-
-    private void appendLogReplicationDiagnostics(StringBuilder diagnostics, long requiredOffset) {
-        long highWatermark = logTablet.getHighWatermark();
-        if (highWatermark < requiredOffset) {
-            diagnostics
-                    .append("[Log Replication] High watermark (")
-                    .append(highWatermark)
-                    .append(") has not reached required offset, lag: ")
-                    .append(requiredOffset - highWatermark)
-                    .append(" offsets. ");
-            appendFollowerReplicaDiagnostics(diagnostics, requiredOffset);
-        } else {
-            diagnostics
-                    .append("[Log Replication] High watermark (")
-                    .append(highWatermark)
-                    .append(") has reached required offset. ");
-        }
-    }
-
-    private void appendFollowerReplicaDiagnostics(StringBuilder diagnostics, long requiredOffset) {
-        List<String> followerInfoList = new ArrayList<>();
-        for (Integer replicaId : isrState.maximalIsr()) {
-            if (replicaId != localTabletServerId && followerReplicasMap.containsKey(replicaId)) {
-                FollowerReplica followerReplica = followerReplicasMap.get(replicaId);
-                long followerLogEndOffset = followerReplica.stateSnapshot().getLogEndOffset();
-                long followerLag = requiredOffset - followerLogEndOffset;
-                String status = followerLogEndOffset >= requiredOffset ? "synced" : "lagging";
-                followerInfoList.add(
-                        String.format(
-                                "server-%d: LEO=%d, lag=%d, status=%s",
-                                replicaId, followerLogEndOffset, followerLag, status));
-            }
-        }
-        if (!followerInfoList.isEmpty()) {
-            diagnostics
-                    .append("Follower replicas: ")
-                    .append(String.join(", ", followerInfoList))
-                    .append(". ");
-        }
-    }
-
-    private void appendIndexReplicationDiagnostics(StringBuilder diagnostics, long requiredOffset) {
-        if (!isTableWithIndexes) {
-            return;
-        }
-
-        IndexDataProducer producer = this.indexDataProducer;
-        if (producer == null) {
-            diagnostics.append("[Index Replication] IndexDataProducer is not available. ");
-            return;
-        }
-
-        long indexCommitHorizon = producer.getIndexCommitHorizon();
-        if (indexCommitHorizon < requiredOffset) {
-            diagnostics
-                    .append("[Index Replication] Index commit horizon (")
-                    .append(indexCommitHorizon)
-                    .append(") has not reached required offset, lag: ")
-                    .append(requiredOffset - indexCommitHorizon)
-                    .append(" offsets. ");
-            appendBlockingBucketDiagnostics(diagnostics, producer, requiredOffset);
-        } else {
-            diagnostics
-                    .append("[Index Replication] Index commit horizon (")
-                    .append(indexCommitHorizon)
-                    .append(") has reached required offset. ");
-        }
-    }
-
-    private void appendBlockingBucketDiagnostics(
-            StringBuilder diagnostics, IndexDataProducer producer, long requiredOffset) {
-        Map<TableBucket, String> blockingBuckets =
-                producer.getCacheManager().getBlockingBucketDiagnostics();
-        if (blockingBuckets.isEmpty()) {
-            return;
-        }
-
-        diagnostics.append("Blocking index buckets (at commit horizon): ");
-        for (String bucketDiag : blockingBuckets.values()) {
-            diagnostics.append("\n  - ").append(bucketDiag);
-        }
-
-        diagnostics.append("\n========== Detailed Diagnostic for Blocking IndexBuckets ==========");
-        for (Map.Entry<TableBucket, String> entry : blockingBuckets.entrySet()) {
-            TableBucket indexBucket = entry.getKey();
-            String detailedDiag =
-                    producer.getIndexBucketDiagnosticInfo(
-                            indexBucket, requiredOffset, requiredOffset + 1000);
-            diagnostics.append(detailedDiag);
-        }
-        diagnostics.append("\n============================================. ");
-    }
-
-    private void appendIsrStatusDiagnostics(StringBuilder diagnostics) {
-        diagnostics
-                .append("[ISR Status] Current ISR: ")
-                .append(isrState.isr())
-                .append(", Maximal ISR: ")
-                .append(isrState.maximalIsr())
-                .append(", Min ISR required: ")
-                .append(minInSyncReplicasSupplier.getAsInt())
-                .append(", ISR size sufficient: ")
-                .append(isrState.maximalIsr().size() >= minInSyncReplicasSupplier.getAsInt())
-                .append(".");
+        return ReplicaDiagnostics.getTimeoutDiagnostics(
+                physicalPath,
+                tableBucket,
+                logTablet,
+                localTabletServerId,
+                followerReplicasMap,
+                isrState,
+                minInSyncReplicasSupplier,
+                isTableWithIndexes,
+                indexDataProducer,
+                requiredOffset);
     }
 
     private LogTablet localLogOrThrow(boolean requireLeader) {

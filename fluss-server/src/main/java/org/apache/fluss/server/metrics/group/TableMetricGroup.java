@@ -58,8 +58,7 @@ public class TableMetricGroup extends AbstractMetricGroup {
     private final @Nullable KvMetricGroup kvMetrics;
 
     // Map to track index replication lag suppliers for each bucket
-    private final Map<TableBucket, Supplier<Long>> indexLagSuppliers =
-            new ConcurrentHashMap<>();
+    private final Map<TableBucket, Supplier<Long>> indexLagSuppliers = new ConcurrentHashMap<>();
 
     // Flag to ensure index max replication lag gauge is registered only once
     private volatile boolean indexMaxLagGaugeRegistered = false;

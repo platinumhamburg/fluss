@@ -100,8 +100,7 @@ class AdjustIsrManagerTest {
         coordinatorGateway.setCurrentLeaderEpoch(tb, 5);
 
         // Track corrective LeaderAndIsr received via callback
-        ConcurrentMap<TableBucket, LeaderAndIsr> receivedCorrections =
-                new ConcurrentHashMap<>();
+        ConcurrentMap<TableBucket, LeaderAndIsr> receivedCorrections = new ConcurrentHashMap<>();
         AdjustIsrManager adjustIsrManager =
                 new AdjustIsrManager(
                         new FlussScheduler(1),
