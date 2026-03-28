@@ -186,6 +186,7 @@ import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
+import org.apache.fluss.server.log.FilterInfo;
 import org.apache.fluss.server.metadata.BucketMetadata;
 import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.PartitionMetadata;
@@ -887,6 +888,22 @@ public class ServerRpcMessageUtils {
         return produceResponse;
     }
 
+    public static @Nullable Map<Long, FilterInfo> getTableFilterInfoMap(FetchLogRequest request) {
+        Map<Long, FilterInfo> result = null;
+        for (PbFetchLogReqForTable tableReq : request.getTablesReqsList()) {
+            if (tableReq.hasFilterPredicate()) {
+                if (result == null) {
+                    result = new HashMap<>();
+                }
+                int schemaId = tableReq.hasFilterSchemaId() ? tableReq.getFilterSchemaId() : -1;
+                result.put(
+                        tableReq.getTableId(),
+                        new FilterInfo(tableReq.getFilterPredicate(), schemaId));
+            }
+        }
+        return result;
+    }
+
     public static Map<TableBucket, FetchReqInfo> getFetchLogData(FetchLogRequest request) {
         Map<TableBucket, FetchReqInfo> fetchDataMap = new HashMap<>();
         for (PbFetchLogReqForTable fetchLogReqForTable : request.getTablesReqsList()) {
@@ -933,6 +950,9 @@ public class ServerRpcMessageUtils {
             FetchLogResultForBucket bucketResult = entry.getValue();
             PbFetchLogRespForBucket fetchLogRespForBucket =
                     new PbFetchLogRespForBucket().setBucketId(tb.getBucket());
+            if (bucketResult.getFilteredEndOffset() >= 0) {
+                fetchLogRespForBucket.setFilteredEndOffset(bucketResult.getFilteredEndOffset());
+            }
             if (tb.getPartitionId() != null) {
                 fetchLogRespForBucket.setPartitionId(tb.getPartitionId());
             }
