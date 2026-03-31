@@ -1074,7 +1074,8 @@ public final class Replica {
             KvRecordBatch kvRecords,
             @Nullable int[] targetColumns,
             MergeMode mergeMode,
-            int requiredAcks)
+            int requiredAcks,
+            short apiVersion)
             throws Exception {
         return inReadLock(
                 leaderIsrUpdateLock,
@@ -1092,7 +1093,8 @@ public final class Replica {
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
                     LogAppendInfo logAppendInfo;
                     try {
-                        logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
+                        logAppendInfo =
+                                kv.putAsLeader(kvRecords, targetColumns, mergeMode, apiVersion);
                     } catch (IOException e) {
                         LOG.error("Error while putting records to {}", tableBucket, e);
                         fatalErrorHandler.onFatalError(e);
