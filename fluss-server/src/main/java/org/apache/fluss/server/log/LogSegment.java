@@ -45,6 +45,7 @@ import javax.annotation.concurrent.NotThreadSafe;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
+import java.util.Iterator;
 import java.util.Optional;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
@@ -409,15 +410,14 @@ public final class LogSegment {
                         false);
         if (fetchData == null) {
             return baseOffset;
-        } else {
-            Iterable<LogRecordBatch> batches = fetchData.getRecords().batches();
-            LogRecordBatch lastBatch = Iterables.getLast(batches);
-            if (lastBatch != null) {
-                return lastBatch.nextLogOffset();
-            } else {
-                return baseOffset;
-            }
         }
+        Iterable<LogRecordBatch> batches = fetchData.getRecords().batches();
+        Iterator<LogRecordBatch> iterator = batches.iterator();
+        if (!iterator.hasNext()) {
+            return baseOffset;
+        }
+        LogRecordBatch lastBatch = Iterables.getLast(batches);
+        return lastBatch.nextLogOffset();
     }
 
     /** Flush this log segment to disk. */

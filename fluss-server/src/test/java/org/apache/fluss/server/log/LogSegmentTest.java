@@ -36,6 +36,9 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.stream.Stream;
@@ -298,6 +301,49 @@ final class LogSegmentTest extends LogTestBase {
                                 new Object[] {2, "there"},
                                 new Object[] {2, "you"})));
         assertThat(segment.readNextOffset()).isEqualTo(53);
+    }
+
+    @Test
+    void testReadNextOffsetWithIncompleteTrailingBatch() throws Exception {
+        // After unclean shutdown, the log file may contain only a batch header
+        // without record data. readNextOffset() should handle this gracefully
+        // by returning baseOffset instead of crashing.
+        //
+        // We write a 48-byte fake batch header (V0_RECORD_BATCH_HEADER_SIZE) in
+        // little-endian format (Fluss record format uses LE). The length field is
+        // set to 36 so that LOG_OVERHEAD(12) + length(36) = 48 = file size.
+        // This makes:
+        // 1. searchForOffsetWithSize() find the batch (header is parseable)
+        // 2. read() see adjustedMaxSize(=48) <= V0_RECORD_BATCH_HEADER_SIZE(48),
+        //    returning MemoryLogRecords.EMPTY
+        // 3. readNextOffset() detects empty batches and returns baseOffset
+        LogSegment segment = createSegment(0);
+        File logFile = segment.getFileLogRecords().file();
+        segment.close();
+
+        // Write a 48-byte fake batch header in little-endian byte order.
+        ByteBuffer buf = ByteBuffer.allocate(48);
+        buf.order(ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(0L); // baseOffset = 0
+        buf.putInt(36); // length = 36 (so sizeInBytes = 12 + 36 = 48)
+        buf.put((byte) 0); // magic = 0
+        // Fill remaining 35 bytes with zeros.
+        buf.put(new byte[35]);
+        buf.flip();
+        try (RandomAccessFile raf = new RandomAccessFile(logFile, "rw")) {
+            raf.getChannel().write(buf);
+            raf.setLength(48);
+        }
+        assertThat(logFile.length()).isEqualTo(48);
+
+        // Reopen the segment with the corrupted file.
+        LogSegment reopened = createSegment(0, true, 0);
+
+        // After fix: readNextOffset() should return baseOffset (0) instead of
+        // throwing NoSuchElementException.
+        assertThat(reopened.readNextOffset()).isEqualTo(0);
+
+        reopened.close();
     }
 
     @Test

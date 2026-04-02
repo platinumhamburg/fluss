@@ -24,6 +24,7 @@ import org.apache.fluss.exception.LogSegmentOffsetOverflowException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.server.exception.CorruptIndexException;
+import org.apache.fluss.server.exception.CorruptLogException;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -84,6 +85,20 @@ final class LogLoader {
      * @return the offsets of the Log successfully loaded from disk
      */
     public LoadedLogOffsets load() throws IOException {
+        try {
+            return doLoad();
+        } catch (CorruptLogException e) {
+            throw e;
+        } catch (IOException
+                | CorruptIndexException
+                | LogSegmentOffsetOverflowException
+                | InvalidOffsetException e) {
+            throw new CorruptLogException(
+                    "Failed to load log from " + logTabletDir.getAbsolutePath(), e);
+        }
+    }
+
+    private LoadedLogOffsets doLoad() throws IOException {
         // load all the log and index files.
         logSegments.close();
         logSegments.clear();

@@ -39,6 +39,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -625,6 +626,37 @@ final class LogLoaderTest extends LogTestBase {
                                 .map(snapshotFile -> snapshotFile.offset)
                                 .sorted())
                 .containsExactly(1L, 2L, 4L);
+    }
+
+    @Test
+    void testLoadTruncatesCorruptedLogFileOnRecovery() throws Exception {
+        // Write some valid records, then corrupt the log file to simulate unclean shutdown.
+        // LogLoader recovery should truncate the corrupted segment gracefully.
+        LogTablet logTablet = createLogTablet(true);
+        appendRecords(logTablet, 10);
+        long endOffsetBeforeCorruption = logTablet.localLogEndOffset();
+        assertThat(endOffsetBeforeCorruption).isEqualTo(10);
+        List<LogSegment> segments = logTablet.logSegments();
+        File logFile = segments.get(0).getFileLogRecords().file();
+        logTablet.close();
+
+        // Corrupt the log file by writing garbage and truncating
+        try (RandomAccessFile raf = new RandomAccessFile(logFile, "rw")) {
+            raf.seek(12);
+            raf.write(new byte[] {0x7F, 0x7F, 0x7F, 0x7F});
+            raf.setLength(20);
+        }
+
+        // Delete index files to force recovery which will hit the corrupted data
+        for (LogSegment segment : segments) {
+            segment.offsetIndex().deleteIfExists();
+        }
+
+        // Reopen with recovery (unclean shutdown) — recovery should truncate
+        // the corrupted segment rather than throwing an exception
+        LogTablet recovered = createLogTablet(false);
+        assertThat(recovered.localLogEndOffset()).isLessThan(endOffsetBeforeCorruption);
+        recovered.close();
     }
 
     private LogTablet createLogTablet(boolean isCleanShutdown) throws Exception {

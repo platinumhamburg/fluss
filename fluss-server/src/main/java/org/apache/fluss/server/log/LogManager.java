@@ -29,6 +29,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.TabletManagerBase;
+import org.apache.fluss.server.exception.CorruptLogException;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -492,33 +493,41 @@ public final class LogManager extends TabletManagerBase {
                                 "schema not exist, table for {} has already been dropped, the residual data will be removed.",
                                 tabletDir,
                                 e);
-                        FileUtils.deleteDirectoryQuietly(tabletDir);
-
-                        // Also delete corresponding KV tablet directory if it exists
-                        try {
-                            Tuple2<PhysicalTablePath, TableBucket> pathAndBucket =
-                                    FlussPaths.parseTabletDir(tabletDir);
-                            File kvTabletDir =
-                                    FlussPaths.kvTabletDir(
-                                            dataDir, pathAndBucket.f0, pathAndBucket.f1);
-                            if (kvTabletDir.exists()) {
-                                LOG.info(
-                                        "Also removing corresponding KV tablet directory: {}",
-                                        kvTabletDir);
-                                FileUtils.deleteDirectoryQuietly(kvTabletDir);
-                            }
-                        } catch (Exception kvDeleteException) {
-                            LOG.warn(
-                                    "Failed to delete corresponding KV tablet directory for log {}: {}",
-                                    tabletDir,
-                                    kvDeleteException.getMessage());
-                        }
+                        deleteTabletAndKvDir(tabletDir);
+                        return;
+                    }
+                    if (e instanceof CorruptLogException) {
+                        LOG.error(
+                                "Corrupt log data detected for {}. "
+                                        + "Removing corrupted local data to allow re-replication from leader.",
+                                tabletDir,
+                                e);
+                        deleteTabletAndKvDir(tabletDir);
                         return;
                     }
                     throw new FlussRuntimeException(e);
                 }
             }
         };
+    }
+
+    /** Delete the tablet directory and corresponding KV tablet directory if it exists. */
+    private void deleteTabletAndKvDir(File tabletDir) {
+        FileUtils.deleteDirectoryQuietly(tabletDir);
+        try {
+            Tuple2<PhysicalTablePath, TableBucket> pathAndBucket =
+                    FlussPaths.parseTabletDir(tabletDir);
+            File kvTabletDir = FlussPaths.kvTabletDir(dataDir, pathAndBucket.f0, pathAndBucket.f1);
+            if (kvTabletDir.exists()) {
+                LOG.info("Also removing corresponding KV tablet directory: {}", kvTabletDir);
+                FileUtils.deleteDirectoryQuietly(kvTabletDir);
+            }
+        } catch (Exception e) {
+            LOG.warn(
+                    "Failed to delete corresponding KV tablet directory for log {}: {}",
+                    tabletDir,
+                    e.getMessage());
+        }
     }
 
     @VisibleForTesting
