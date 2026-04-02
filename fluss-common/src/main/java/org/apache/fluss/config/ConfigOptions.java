@@ -335,6 +335,16 @@ public class ConfigOptions {
                                     + "The default value is 10.")
                     .withDeprecatedKeys("coordinator.io-pool.size");
 
+    public static final ConfigOption<Integer> KV_OPERATION_POOL_SIZE =
+            key("server.kv-operation-pool.size")
+                    .intType()
+                    .defaultValue(16)
+                    .withDescription(
+                            "The number of threads for KV operations (RocksDB reads/writes) on tablet servers. "
+                                    + "These threads handle PutKv, Lookup, PrefixLookup, and LimitScan operations "
+                                    + "to avoid blocking Netty worker threads. "
+                                    + "The default value is 16.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Coordinator Server
     // ------------------------------------------------------------------------

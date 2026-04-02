@@ -73,6 +73,8 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -170,6 +172,9 @@ public class TabletServer extends ServerBase {
     @GuardedBy("lock")
     private ExecutorService ioExecutor;
 
+    @GuardedBy("lock")
+    private ExecutorService kvOperationExecutor;
+
     public TabletServer(Configuration conf) {
         this(conf, SystemClock.getInstance());
     }
@@ -253,6 +258,17 @@ public class TabletServer extends ServerBase {
                             conf.get(ConfigOptions.SERVER_IO_POOL_SIZE),
                             new ExecutorThreadFactory("tablet-server-io"));
 
+            int kvPoolSize = conf.get(ConfigOptions.KV_OPERATION_POOL_SIZE);
+            this.kvOperationExecutor =
+                    new ThreadPoolExecutor(
+                            kvPoolSize,
+                            kvPoolSize,
+                            0L,
+                            TimeUnit.MILLISECONDS,
+                            new LinkedBlockingQueue<>(kvPoolSize * 256),
+                            new ExecutorThreadFactory("tablet-server-kv-operation"),
+                            new ThreadPoolExecutor.CallerRunsPolicy());
+
             this.replicaManager =
                     new ReplicaManager(
                             conf,
@@ -270,7 +286,8 @@ public class TabletServer extends ServerBase {
                             tabletServerMetricGroup,
                             userMetrics,
                             clock,
-                            ioExecutor);
+                            ioExecutor,
+                            kvOperationExecutor);
             replicaManager.startup();
 
             // Register DefaultSnapshotContext for dynamic kv.snapshot.interval
@@ -467,6 +484,10 @@ public class TabletServer extends ServerBase {
                 if (ioExecutor != null) {
                     // shutdown io executor
                     ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, ioExecutor);
+                }
+
+                if (kvOperationExecutor != null) {
+                    ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, kvOperationExecutor);
                 }
             } catch (Throwable t) {
                 exception = ExceptionUtils.firstOrSuppressed(t, exception);

@@ -565,6 +565,7 @@ public class ReplicaFetcherThreadTest {
                     serverMetricGroup,
                     USER_METRICS,
                     clock,
+                    ioExecutor,
                     ioExecutor);
         }
 

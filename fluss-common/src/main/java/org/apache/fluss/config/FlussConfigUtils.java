@@ -200,6 +200,7 @@ public class FlussConfigUtils {
         validMinValue(conf, ConfigOptions.DEFAULT_REPLICATION_FACTOR, 1);
         validMinValue(conf, ConfigOptions.KV_MAX_RETAINED_SNAPSHOTS, 1);
         validMinValue(conf, ConfigOptions.SERVER_IO_POOL_SIZE, 1);
+        validMinValue(conf, ConfigOptions.KV_OPERATION_POOL_SIZE, 1);
         validMinValue(conf, ConfigOptions.BACKGROUND_THREADS, 1);
 
         if (conf.get(ConfigOptions.LOG_SEGMENT_FILE_SIZE).getBytes() > Integer.MAX_VALUE) {

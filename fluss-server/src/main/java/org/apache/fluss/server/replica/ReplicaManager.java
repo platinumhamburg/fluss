@@ -167,6 +167,7 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private final TabletServerMetadataCache metadataCache;
     private final ExecutorService ioExecutor;
+    private final ExecutorService kvOperationExecutor;
     private final ProjectionPushdownCache projectionsCache = new ProjectionPushdownCache();
     private final Lock replicaStateChangeLock = new ReentrantLock();
 
@@ -224,7 +225,8 @@ public class ReplicaManager implements ServerReconfigurable {
             TabletServerMetricGroup serverMetricGroup,
             UserMetrics userMetrics,
             Clock clock,
-            ExecutorService ioExecutor)
+            ExecutorService ioExecutor,
+            ExecutorService kvOperationExecutor)
             throws IOException {
         this(
                 conf,
@@ -242,7 +244,8 @@ public class ReplicaManager implements ServerReconfigurable {
                 userMetrics,
                 new RemoteLogManager(conf, zkClient, coordinatorGateway, clock, ioExecutor),
                 clock,
-                ioExecutor);
+                ioExecutor,
+                kvOperationExecutor);
     }
 
     @VisibleForTesting
@@ -262,7 +265,8 @@ public class ReplicaManager implements ServerReconfigurable {
             UserMetrics userMetrics,
             RemoteLogManager remoteLogManager,
             Clock clock,
-            ExecutorService ioExecutor)
+            ExecutorService ioExecutor,
+            ExecutorService kvOperationExecutor)
             throws IOException {
         this.conf = conf;
         this.zkClient = zkClient;
@@ -309,8 +313,23 @@ public class ReplicaManager implements ServerReconfigurable {
         this.userMetrics = userMetrics;
         this.clock = clock;
         this.ioExecutor = ioExecutor;
+        this.kvOperationExecutor = kvOperationExecutor;
         this.minInSyncReplicas = conf.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER);
         registerMetrics();
+    }
+
+    private void executeKvOperation(Runnable operation, Consumer<Exception> errorHandler) {
+        kvOperationExecutor.execute(
+                () -> {
+                    try {
+                        operation.run();
+                    } catch (Exception e) {
+                        if (e instanceof InterruptedException) {
+                            Thread.currentThread().interrupt();
+                        }
+                        errorHandler.accept(e);
+                    }
+                });
     }
 
     public void startup() {
@@ -622,6 +641,9 @@ public class ReplicaManager implements ServerReconfigurable {
      * Put kv records to leader replicas of the buckets, the kv data will write to kv tablet and the
      * response callback need to wait for the cdc log to be replicated to other replicas if needed.
      *
+     * <p>The actual RocksDB operations are offloaded to the kvOperationExecutor thread pool to
+     * avoid blocking Netty worker threads.
+     *
      * @param apiVersion the client API version for backward compatibility validation
      */
     public void putRecordsToKv(
@@ -636,17 +658,36 @@ public class ReplicaManager implements ServerReconfigurable {
             throw new InvalidRequiredAcksException("Invalid required acks: " + requiredAcks);
         }
 
-        long startTime = System.currentTimeMillis();
-        Map<TableBucket, PutKvResultForBucket> kvPutResult =
-                putToLocalKv(entriesPerBucket, targetColumns, mergeMode, requiredAcks, apiVersion);
-        LOG.debug(
-                "Put records to local kv storage and wait generate cdc log in {} ms",
-                System.currentTimeMillis() - startTime);
+        executeKvOperation(
+                () -> {
+                    long startTime = System.currentTimeMillis();
+                    Map<TableBucket, PutKvResultForBucket> kvPutResult =
+                            putToLocalKv(
+                                    entriesPerBucket,
+                                    targetColumns,
+                                    mergeMode,
+                                    requiredAcks,
+                                    apiVersion);
+                    LOG.debug(
+                            "Put records to local kv storage and wait generate cdc log in {} ms",
+                            System.currentTimeMillis() - startTime);
 
-        // maybe do delay write operation to write cdc log to be replicated to other follower
-        // replicas.
-        maybeAddDelayedWrite(
-                timeoutMs, requiredAcks, entriesPerBucket.size(), kvPutResult, responseCallback);
+                    // maybe do delay write operation to write cdc log to be replicated to
+                    // other follower replicas.
+                    maybeAddDelayedWrite(
+                            timeoutMs,
+                            requiredAcks,
+                            entriesPerBucket.size(),
+                            kvPutResult,
+                            responseCallback);
+                },
+                e -> {
+                    List<PutKvResultForBucket> errorResults = new ArrayList<>();
+                    for (TableBucket tb : entriesPerBucket.keySet()) {
+                        errorResults.add(new PutKvResultForBucket(tb, ApiError.fromThrowable(e)));
+                    }
+                    responseCallback.accept(errorResults);
+                });
     }
 
     /** Context for tracking missing keys that need to be inserted. */
@@ -726,9 +767,38 @@ public class ReplicaManager implements ServerReconfigurable {
     /**
      * Lookup with multi key from leader replica of the buckets.
      *
+     * <p>The actual RocksDB operations are offloaded to the kvOperationExecutor thread pool to
+     * avoid blocking Netty worker threads.
+     *
      * @param apiVersion the client API version for backward compatibility validation
      */
     public void lookups(
+            boolean insertIfNotExists,
+            @Nullable Integer timeoutMs,
+            @Nullable Integer requiredAcks,
+            Map<TableBucket, List<byte[]>> entriesPerBucket,
+            short apiVersion,
+            Consumer<Map<TableBucket, LookupResultForBucket>> responseCallback) {
+        executeKvOperation(
+                () ->
+                        lookupsInternal(
+                                insertIfNotExists,
+                                timeoutMs,
+                                requiredAcks,
+                                entriesPerBucket,
+                                apiVersion,
+                                responseCallback),
+                e -> {
+                    Map<TableBucket, LookupResultForBucket> errorResults = new HashMap<>();
+                    for (TableBucket tb : entriesPerBucket.keySet()) {
+                        errorResults.put(
+                                tb, new LookupResultForBucket(tb, ApiError.fromThrowable(e)));
+                    }
+                    responseCallback.accept(errorResults);
+                });
+    }
+
+    private void lookupsInternal(
             boolean insertIfNotExists,
             @Nullable Integer timeoutMs,
             @Nullable Integer requiredAcks,
@@ -855,9 +925,28 @@ public class ReplicaManager implements ServerReconfigurable {
     /**
      * Lookup multi prefixKeys by prefix scan on kv store.
      *
+     * <p>The actual RocksDB operations are offloaded to the kvOperationExecutor thread pool to
+     * avoid blocking Netty worker threads.
+     *
      * @param apiVersion the client API version for backward compatibility validation
      */
     public void prefixLookups(
+            Map<TableBucket, List<byte[]>> entriesPerBucket,
+            short apiVersion,
+            Consumer<Map<TableBucket, PrefixLookupResultForBucket>> responseCallback) {
+        executeKvOperation(
+                () -> prefixLookupsInternal(entriesPerBucket, apiVersion, responseCallback),
+                e -> {
+                    Map<TableBucket, PrefixLookupResultForBucket> errorResults = new HashMap<>();
+                    for (TableBucket tb : entriesPerBucket.keySet()) {
+                        errorResults.put(
+                                tb, new PrefixLookupResultForBucket(tb, ApiError.fromThrowable(e)));
+                    }
+                    responseCallback.accept(errorResults);
+                });
+    }
+
+    private void prefixLookupsInternal(
             Map<TableBucket, List<byte[]>> entriesPerBucket,
             short apiVersion,
             Consumer<Map<TableBucket, PrefixLookupResultForBucket>> responseCallback) {
@@ -1330,7 +1419,25 @@ public class ReplicaManager implements ServerReconfigurable {
         responseCallback.accept(results);
     }
 
+    /**
+     * Limit scan on the given table bucket.
+     *
+     * <p>The actual operations are offloaded to the kvOperationExecutor thread pool to avoid
+     * blocking Netty worker threads.
+     */
     public void limitScan(
+            TableBucket tableBucket,
+            int limit,
+            Consumer<LimitScanResultForBucket> responseCallback) {
+        executeKvOperation(
+                () -> limitScanInternal(tableBucket, limit, responseCallback),
+                e ->
+                        responseCallback.accept(
+                                new LimitScanResultForBucket(
+                                        tableBucket, ApiError.fromThrowable(e))));
+    }
+
+    private void limitScanInternal(
             TableBucket tableBucket,
             int limit,
             Consumer<LimitScanResultForBucket> responseCallback) {

@@ -147,6 +147,7 @@ public class ReplicaTestBase {
     protected TestCoordinatorGateway testCoordinatorGateway;
     private FlussScheduler scheduler;
     private ExecutorService ioExecutor;
+    private ExecutorService kvOperationExecutor;
 
     // remote log related
     protected TestingRemoteLogStorage remoteLogStorage;
@@ -186,6 +187,7 @@ public class ReplicaTestBase {
         scheduler = new FlussScheduler(2);
         scheduler.startup();
         ioExecutor = Executors.newSingleThreadExecutor();
+        kvOperationExecutor = Executors.newSingleThreadExecutor();
 
         manualClock = new ManualClock(System.currentTimeMillis());
         logManager =
@@ -324,7 +326,8 @@ public class ReplicaTestBase {
                 TestingMetricGroups.USER_METRICS,
                 remoteLogManager,
                 manualClock,
-                ioExecutor);
+                ioExecutor,
+                kvOperationExecutor);
     }
 
     @AfterEach
@@ -361,6 +364,10 @@ public class ReplicaTestBase {
 
         if (ioExecutor != null) {
             ioExecutor.shutdown();
+        }
+
+        if (kvOperationExecutor != null) {
+            kvOperationExecutor.shutdown();
         }
 
         // clear zk environment.
