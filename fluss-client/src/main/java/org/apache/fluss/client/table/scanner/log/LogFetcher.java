@@ -50,7 +50,6 @@ import org.apache.fluss.rpc.messages.PbFetchLogReqForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForTable;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForTable;
-import org.apache.fluss.rpc.messages.PbPredicate;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
@@ -97,7 +96,7 @@ public class LogFetcher implements Closeable {
     private final LogRecordReadContext remoteReadContext;
     @Nullable private final Projection projection;
     @Nullable private final Predicate recordBatchFilter;
-    @Nullable private final PbPredicate cachedPbPredicate;
+    @Nullable private final org.apache.fluss.rpc.messages.PbPredicate cachedPbPredicate;
     private final int filterSchemaId;
     private final int maxFetchBytes;
     private final int maxBucketFetchBytes;
