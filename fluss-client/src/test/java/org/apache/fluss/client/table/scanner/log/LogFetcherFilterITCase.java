@@ -154,16 +154,16 @@ public class LogFetcherFilterITCase extends ClientToServerITCaseBase {
                     assertThat(logFetcher.hasAvailableFetches()).isTrue();
                 });
 
-        Map<TableBucket, List<ScanRecord>> records = logFetcher.collectFetch();
+        ScanRecords records = logFetcher.collectFetch();
 
         // Verify that only matching data is returned
         // tb0 should have records (matching data), tb1 should have no records (filtered out)
-        assertThat(records.containsKey(tb0)).isTrue();
-        assertThat(records.get(tb0)).isNotEmpty();
-        assertThat(records.get(tb0).size()).isEqualTo(MATCHING_DATA.size());
+        assertThat(records.buckets()).contains(tb0);
+        assertThat(records.records(tb0)).isNotEmpty();
+        assertThat(records.records(tb0).size()).isEqualTo(MATCHING_DATA.size());
 
         // Verify the content of returned records - all should match filter (a > 5)
-        List<ScanRecord> tb0Records = records.get(tb0);
+        List<ScanRecord> tb0Records = records.records(tb0);
         List<Integer> aValues =
                 tb0Records.stream().map(r -> r.getRow().getInt(0)).collect(Collectors.toList());
         assertThat(aValues).containsExactlyInAnyOrder(6, 7, 8, 9, 10);
@@ -171,7 +171,7 @@ public class LogFetcherFilterITCase extends ClientToServerITCaseBase {
         // Verify tb1 (non-matching data) does not surface user-visible records.
         // The server may return a filteredEndOffset response for the bucket, but collectFetch()
         // only materializes buckets with actual records.
-        assertThat(records.getOrDefault(tb1, Collections.emptyList())).isEmpty();
+        assertThat(records.records(tb1)).isEmpty();
 
         // After collect fetch, the fetcher should be empty
         assertThat(logFetcher.hasAvailableFetches()).isFalse();
@@ -205,15 +205,15 @@ public class LogFetcherFilterITCase extends ClientToServerITCaseBase {
                     assertThat(logFetcher.hasAvailableFetches()).isTrue();
                 });
 
-        Map<TableBucket, List<ScanRecord>> records = logFetcher.collectFetch();
+        ScanRecords records = logFetcher.collectFetch();
 
         // With recordBatchFilter at batch level, the behavior depends on the batch statistics
         // Since mixedData contains values 1,6,3,8,2 (min=1, max=8), and our filter is a > 5,
         // the entire batch should be included because max value (8) > 5
-        assertThat(records.containsKey(tb0)).isTrue();
-        assertThat(records.get(tb0)).isNotEmpty();
+        assertThat(records.buckets()).contains(tb0);
+        assertThat(records.records(tb0)).isNotEmpty();
 
-        List<ScanRecord> tb0Records = records.get(tb0);
+        List<ScanRecord> tb0Records = records.records(tb0);
         // All records in the batch should be returned (including those that don't match
         // individually)
         // because recordBatchFilter works at batch level based on statistics
@@ -253,12 +253,12 @@ public class LogFetcherFilterITCase extends ClientToServerITCaseBase {
                     assertThat(logFetcher.hasAvailableFetches()).isTrue();
                 });
 
-        Map<TableBucket, List<ScanRecord>> records = logFetcher.collectFetch();
+        ScanRecords records = logFetcher.collectFetch();
 
         // For a batch where max value = 5 and filter is a > 5, the entire batch should be
         // filtered out at the server side. collectFetch() may omit the bucket entirely because
         // there are no user-visible records to return.
-        assertThat(records.getOrDefault(tb0, Collections.emptyList())).isEmpty();
+        assertThat(records.records(tb0)).isEmpty();
     }
 
     @Test
