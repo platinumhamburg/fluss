@@ -107,7 +107,6 @@ public class LogFetcher implements Closeable {
     private final LogFetchBuffer logFetchBuffer;
     private final LogFetchCollector logFetchCollector;
     private final RemoteLogDownloader remoteLogDownloader;
-    @Nullable private final BucketFetchRateController fetchRateController;
 
     @GuardedBy("this")
     private final Set<Integer> nodesWithPendingFetchRequests;
@@ -164,15 +163,6 @@ public class LogFetcher implements Closeable {
         this.remoteLogDownloader =
                 new RemoteLogDownloader(tablePath, conf, remoteFileDownloader, scannerMetricGroup);
         remoteLogDownloader.start();
-        if (conf.getBoolean(ConfigOptions.CLIENT_SCANNER_LOG_ADAPTIVE_FETCH_ENABLED)) {
-            this.fetchRateController =
-                    new BucketFetchRateController(
-                            conf.getInt(
-                                    ConfigOptions
-                                            .CLIENT_SCANNER_LOG_ADAPTIVE_FETCH_MAX_SKIP_ROUNDS));
-        } else {
-            this.fetchRateController = null;
-        }
     }
 
     /**
@@ -406,9 +396,7 @@ public class LogFetcher implements Closeable {
                                         + "unsubscribed.",
                                 tb);
                     } else {
-                        boolean hasData;
                         if (fetchResultForBucket.fetchFromRemote()) {
-                            hasData = true;
                             pendRemoteFetches(
                                     fetchResultForBucket.remoteLogFetchInfo(),
                                     fetchOffset,
@@ -416,7 +404,6 @@ public class LogFetcher implements Closeable {
                         } else {
                             LogRecords logRecords = fetchResultForBucket.recordsOrEmpty();
                             boolean hasRecords = !MemoryLogRecords.EMPTY.equals(logRecords);
-                            hasData = hasRecords;
                             if (hasRecords
                                     || fetchResultForBucket.getErrorCode() != Errors.NONE.code()
                                     || fetchResultForBucket.hasFilteredEndOffset()) {
@@ -437,11 +424,6 @@ public class LogFetcher implements Closeable {
                                                 fetchOffset,
                                                 hasRecords ? parsedByteBuf : null));
                             }
-                        }
-                        // Track adaptive fetch rate for successful fetches
-                        if (fetchRateController != null
-                                && fetchResultForBucket.getErrorCode() == Errors.NONE.code()) {
-                            fetchRateController.recordFetchResult(tb, hasData);
                         }
                     }
                 }
@@ -515,16 +497,10 @@ public class LogFetcher implements Closeable {
     Map<Integer, FetchLogRequest> prepareFetchLogRequests() {
         Map<Integer, List<PbFetchLogReqForBucket>> fetchLogReqForBuckets = new HashMap<>();
         int readyForFetchCount = 0;
-        int skippedByAdaptiveFetch = 0;
         Long tableId = null;
         for (TableBucket tb : fetchableBuckets()) {
             if (tableId == null) {
                 tableId = tb.getTableId();
-            }
-            // Adaptive fetch: skip buckets in cool down period
-            if (fetchRateController != null && !fetchRateController.shouldFetch(tb)) {
-                skippedByAdaptiveFetch++;
-                continue;
             }
             Long offset = logScannerStatus.getBucketOffset(tb);
             if (offset == null) {
@@ -565,20 +541,8 @@ public class LogFetcher implements Closeable {
         }
 
         if (readyForFetchCount == 0) {
-            if (skippedByAdaptiveFetch > 0) {
-                LOG.info(
-                        "No fetch requests prepared, {} buckets skipped by adaptive fetch",
-                        skippedByAdaptiveFetch);
-            }
             return Collections.emptyMap();
         } else {
-            if (skippedByAdaptiveFetch > 0) {
-                LOG.info(
-                        "Preparing fetch requests for {} buckets, "
-                                + "{} buckets skipped by adaptive fetch",
-                        readyForFetchCount,
-                        skippedByAdaptiveFetch);
-            }
             Map<Integer, FetchLogRequest> fetchLogRequests = new HashMap<>();
             long finalTableId = tableId;
             fetchLogReqForBuckets.forEach(
