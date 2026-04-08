@@ -95,7 +95,6 @@ public class LogFetcher implements Closeable {
     //  bytes from remote file.
     private final LogRecordReadContext remoteReadContext;
     @Nullable private final Projection projection;
-    @Nullable private final Predicate recordBatchFilter;
     @Nullable private final org.apache.fluss.rpc.messages.PbPredicate cachedPbPredicate;
     private final int filterSchemaId;
     private final int maxFetchBytes;
@@ -134,7 +133,6 @@ public class LogFetcher implements Closeable {
         this.remoteReadContext =
                 LogRecordReadContext.createReadContext(tableInfo, true, projection, schemaGetter);
         this.projection = projection;
-        this.recordBatchFilter = recordBatchFilter;
         this.cachedPbPredicate =
                 recordBatchFilter != null
                         ? PredicateMessageUtils.toPbPredicate(

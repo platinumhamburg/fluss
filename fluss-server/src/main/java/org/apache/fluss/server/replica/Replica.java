@@ -80,7 +80,6 @@ import org.apache.fluss.server.log.LogOffsetMetadata;
 import org.apache.fluss.server.log.LogOffsetSnapshot;
 import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
-import org.apache.fluss.server.log.PredicateSchemaResolver;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
@@ -1539,35 +1538,29 @@ public final class Replica {
         LogRecordReadContext readContext = null;
         try {
             int filterSchemaId = filterInfo.getSchemaId();
-            RowType rowType = null;
-            int schemaIdForContext = -1;
-            if (filterSchemaId >= 0) {
-                Schema filterSchema = schemaGetter.getSchema(filterSchemaId);
-                if (filterSchema == null) {
-                    LOG.warn(
-                            "Filter schema not found (schemaId={}) for {}, falling back to unfiltered read.",
-                            filterSchemaId,
-                            tableBucket);
-                } else {
-                    rowType = filterSchema.getRowType();
-                    schemaIdForContext = filterSchemaId;
-                }
-            } else {
-                rowType = tableInfo.getSchema().getRowType();
-                schemaIdForContext = tableInfo.getSchemaId();
+            if (filterSchemaId < 0) {
+                LOG.warn(
+                        "Invalid filter schema ID ({}) for {}, falling back to unfiltered read.",
+                        filterSchemaId,
+                        tableBucket);
+                return null;
             }
-            if (rowType != null) {
-                Predicate resolvedFilter =
-                        PredicateMessageUtils.toPredicate(filterInfo.getPbPredicate(), rowType);
-                if (resolvedFilter != null) {
-                    readContext =
-                            LogRecordReadContext.createArrowReadContext(
-                                    rowType, schemaIdForContext, schemaGetter);
-                    PredicateSchemaResolver predicateResolver =
-                            new PredicateSchemaResolver(
-                                    resolvedFilter, schemaIdForContext, schemaGetter);
-                    return new FilterContext(resolvedFilter, readContext, predicateResolver);
-                }
+            Schema filterSchema = schemaGetter.getSchema(filterSchemaId);
+            if (filterSchema == null) {
+                LOG.warn(
+                        "Filter schema not found (schemaId={}) for {}, falling back to unfiltered read.",
+                        filterSchemaId,
+                        tableBucket);
+                return null;
+            }
+            RowType rowType = filterSchema.getRowType();
+            Predicate resolvedFilter =
+                    PredicateMessageUtils.toPredicate(filterInfo.getPbPredicate(), rowType);
+            if (resolvedFilter != null) {
+                readContext =
+                        LogRecordReadContext.createArrowReadContext(
+                                rowType, filterSchemaId, schemaGetter);
+                return new FilterContext(resolvedFilter, readContext, filterSchemaId, schemaGetter);
             }
             return null;
         } catch (Exception e) {

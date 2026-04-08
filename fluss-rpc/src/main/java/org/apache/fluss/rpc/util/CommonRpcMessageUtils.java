@@ -207,6 +207,7 @@ public class CommonRpcMessageUtils {
                     fetchLogResultForBucket =
                             new FetchLogResultForBucket(
                                     tb,
+                                    records,
                                     respForBucket.getHighWatermark(),
                                     respForBucket.getFilteredEndOffset());
                 } else {

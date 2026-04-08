@@ -17,31 +17,37 @@
 
 package org.apache.fluss.server.log;
 
+import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.record.LogRecordReadContext;
 
-import javax.annotation.Nullable;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /**
  * Encapsulates the filter-related parameters for server-side filter pushdown during log reads.
  *
- * <p>All three parameters are logically coupled: the predicate defines what to filter, the read
- * context provides batch statistics for filter evaluation, and the predicate resolver handles
- * schema evolution. This class enforces that they are always passed together.
+ * <p>All parameters are logically coupled: the predicate defines what to filter, the read context
+ * provides batch statistics for filter evaluation, and the predicate resolver handles schema
+ * evolution. The resolver is derived internally from the predicate, schema ID, and schema getter.
  */
 public final class FilterContext {
 
     private final Predicate recordBatchFilter;
     private final LogRecordReadContext readContext;
-    @Nullable private final PredicateSchemaResolver predicateResolver;
+    private final PredicateSchemaResolver predicateResolver;
 
     public FilterContext(
             Predicate recordBatchFilter,
             LogRecordReadContext readContext,
-            @Nullable PredicateSchemaResolver predicateResolver) {
-        this.recordBatchFilter = recordBatchFilter;
-        this.readContext = readContext;
-        this.predicateResolver = predicateResolver;
+            int filterSchemaId,
+            SchemaGetter schemaGetter) {
+        this.recordBatchFilter = checkNotNull(recordBatchFilter, "recordBatchFilter");
+        this.readContext = checkNotNull(readContext, "readContext");
+        this.predicateResolver =
+                new PredicateSchemaResolver(
+                        recordBatchFilter,
+                        filterSchemaId,
+                        checkNotNull(schemaGetter, "schemaGetter"));
     }
 
     public Predicate getRecordBatchFilter() {
@@ -52,7 +58,6 @@ public final class FilterContext {
         return readContext;
     }
 
-    @Nullable
     public PredicateSchemaResolver getPredicateResolver() {
         return predicateResolver;
     }

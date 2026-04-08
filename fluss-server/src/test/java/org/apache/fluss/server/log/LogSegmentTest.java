@@ -496,7 +496,13 @@ final class LogSegmentTest extends LogTestBase {
                         DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
             FetchDataInfo read =
                     segment.read(
-                            50, 300, segment.getSizeInBytes(), true, null, predicate, readContext);
+                            50,
+                            300,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new FilterContext(
+                                    predicate, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
 
@@ -559,8 +565,11 @@ final class LogSegmentTest extends LogTestBase {
                             segment.getSizeInBytes(),
                             true,
                             null,
-                            greaterThanPredicate,
-                            readContext);
+                            new FilterContext(
+                                    greaterThanPredicate,
+                                    readContext,
+                                    DEFAULT_SCHEMA_ID,
+                                    TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
 
             List<Integer> returnedValues = new ArrayList<>();
@@ -600,8 +609,11 @@ final class LogSegmentTest extends LogTestBase {
                             segment.getSizeInBytes(),
                             true,
                             null,
-                            equalPredicate,
-                            readContext);
+                            new FilterContext(
+                                    equalPredicate,
+                                    readContext,
+                                    DEFAULT_SCHEMA_ID,
+                                    TEST_SCHEMA_GETTER));
             assertThat(read).isNull();
         }
     }
@@ -643,7 +655,13 @@ final class LogSegmentTest extends LogTestBase {
                         DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
             FetchDataInfo read =
                     segment.read(
-                            50, 1000, segment.getSizeInBytes(), true, null, predicate, readContext);
+                            50,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new FilterContext(
+                                    predicate, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             // All batches filtered out — records should be empty
             assertThat(read.getRecords().sizeInBytes()).isEqualTo(0);
@@ -700,8 +718,11 @@ final class LogSegmentTest extends LogTestBase {
                             segment.getSizeInBytes(),
                             true,
                             null,
-                            throwingPredicate,
-                            readContext);
+                            new FilterContext(
+                                    throwingPredicate,
+                                    readContext,
+                                    DEFAULT_SCHEMA_ID,
+                                    TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
         }
@@ -758,8 +779,8 @@ final class LogSegmentTest extends LogTestBase {
                             segment.getSizeInBytes(),
                             true,
                             projection,
-                            filter,
-                            readContext);
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
 
@@ -820,8 +841,8 @@ final class LogSegmentTest extends LogTestBase {
                             segment.getSizeInBytes(),
                             true,
                             projection,
-                            filter,
-                            readContext);
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isEqualTo(0);
             assertThat(read.getFilteredEndOffset()).isGreaterThanOrEqualTo(50L);
@@ -864,7 +885,13 @@ final class LogSegmentTest extends LogTestBase {
                         DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
             FetchDataInfo read =
                     segment.read(
-                            50, 1000, segment.getSizeInBytes(), true, null, filter, readContext);
+                            50,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             // The offset metadata should use the requested startOffset (50),
             // NOT the first included batch's baseLogOffset (53)
@@ -925,8 +952,8 @@ final class LogSegmentTest extends LogTestBase {
                             segment.getSizeInBytes(),
                             true,
                             projection,
-                            filter,
-                            readContext);
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
 
             int batchCount = 0;
@@ -976,7 +1003,13 @@ final class LogSegmentTest extends LogTestBase {
                         DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
             FetchDataInfo read =
                     segment.read(
-                            50, 1000, segment.getSizeInBytes(), true, null, filter, readContext);
+                            50,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             // Should return batch 1 data
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
@@ -1029,7 +1062,13 @@ final class LogSegmentTest extends LogTestBase {
                         DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
             FetchDataInfo read =
                     segment.read(
-                            50, 1000, segment.getSizeInBytes(), true, null, filter, readContext);
+                            50,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
             // No trailing filtered batches — filteredEndOffset should NOT be set
@@ -1075,8 +1114,8 @@ final class LogSegmentTest extends LogTestBase {
                             segment.getSizeInBytes(),
                             false,
                             null,
-                            filter,
-                            readContext);
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
             // Size break — not all batches scanned, so no filteredEndOffset
@@ -1122,7 +1161,13 @@ final class LogSegmentTest extends LogTestBase {
                         DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
             FetchDataInfo read =
                     segment.read(
-                            50, 1000, segment.getSizeInBytes(), true, null, filter, readContext);
+                            50,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
 
@@ -1174,7 +1219,13 @@ final class LogSegmentTest extends LogTestBase {
                         DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER)) {
             FetchDataInfo read =
                     segment.read(
-                            50, 1000, segment.getSizeInBytes(), true, null, filter, readContext);
+                            50,
+                            1000,
+                            segment.getSizeInBytes(),
+                            true,
+                            null,
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(read).isNotNull();
             assertThat(read.getRecords().sizeInBytes()).isGreaterThan(0);
             // Last batch matches — no trailing filtered batches

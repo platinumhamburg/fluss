@@ -902,10 +902,17 @@ public class ServerRpcMessageUtils {
                             "Filter predicate is set but filterSchemaId is missing for table "
                                     + tableReq.getTableId());
                 }
+                int schemaId = tableReq.getFilterSchemaId();
+                if (schemaId < 0) {
+                    throw new IllegalArgumentException(
+                            "Invalid filterSchemaId ("
+                                    + schemaId
+                                    + ") for table "
+                                    + tableReq.getTableId());
+                }
                 if (result == null) {
                     result = new HashMap<>();
                 }
-                int schemaId = tableReq.getFilterSchemaId();
                 result.put(
                         tableReq.getTableId(),
                         new FilterInfo(tableReq.getFilterPredicate(), schemaId));

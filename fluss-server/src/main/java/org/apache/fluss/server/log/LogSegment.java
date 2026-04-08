@@ -18,7 +18,6 @@
 package org.apache.fluss.server.log;
 
 import org.apache.fluss.annotation.Internal;
-import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.CorruptRecordException;
@@ -35,7 +34,6 @@ import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordBatchStatistics;
-import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.TimestampAndOffset;
@@ -418,7 +416,6 @@ public final class LogSegment {
                         fileLogRecords.sizeInBytes(),
                         false,
                         null,
-                        null,
                         null);
         if (fetchData == null) {
             return baseOffset;
@@ -489,43 +486,7 @@ public final class LogSegment {
     public FetchDataInfo read(
             long startOffset, int maxSize, long maxPosition, boolean minOneMessage)
             throws IOException {
-        return read(startOffset, maxSize, maxPosition, minOneMessage, null, null, null);
-    }
-
-    /**
-     * Read a message set from this segment beginning with the first offset >= startOffset. The
-     * message set will include no more than maxSize bytes and will end before maxOffset if a
-     * maxOffset is specified.
-     *
-     * @param startOffset A lower bound on the first offset to include in the message set we read
-     * @param maxSize The maximum number of bytes to include in the message set we read
-     * @param maxPosition The maximum position in the log segment that should be exposed for read
-     * @param minOneMessage If this is true, the first message will be returned even if it exceeds
-     *     `maxSize` (if one exists)
-     * @param projection The column projection to apply to the log records
-     * @param recordBatchFilter The filter to apply to the log records (must be null if readContext
-     *     is null)
-     * @param readContext The read context for batch filtering (must be null if recordBatchFilter is
-     *     null)
-     * @throws LogOffsetOutOfRangeException If startOffset is beyond the log start and end offset
-     * @return The fetch data information including fetch starting offset metadata and messages
-     *     read.
-     */
-    @VisibleForTesting
-    FetchDataInfo read(
-            long startOffset,
-            int maxSize,
-            long maxPosition,
-            boolean minOneMessage,
-            @Nullable FileLogProjection projection,
-            @Nullable Predicate recordBatchFilter,
-            @Nullable LogRecordReadContext readContext)
-            throws IOException {
-        FilterContext filterContext = null;
-        if (recordBatchFilter != null && readContext != null) {
-            filterContext = new FilterContext(recordBatchFilter, readContext, null);
-        }
-        return read(startOffset, maxSize, maxPosition, minOneMessage, projection, filterContext);
+        return read(startOffset, maxSize, maxPosition, minOneMessage, null, null);
     }
 
     /**
@@ -686,10 +647,7 @@ public final class LogSegment {
                 Optional<LogRecordBatchStatistics> statsOpt = batch.getStatistics(readContext);
                 if (statsOpt.isPresent()) {
                     LogRecordBatchStatistics stats = statsOpt.get();
-                    Predicate effectivePredicate =
-                            predicateResolver != null
-                                    ? predicateResolver.resolve(stats.getSchemaId())
-                                    : recordBatchFilter;
+                    Predicate effectivePredicate = predicateResolver.resolve(stats.getSchemaId());
                     if (effectivePredicate != null) {
                         include =
                                 effectivePredicate.test(

@@ -458,7 +458,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
 
             assertThat(result).isNotNull();
             // Should have found data from segment 3, skipping segments 1 and 2
@@ -522,7 +523,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
 
             assertThat(result).isNotNull();
             // All segments filtered out — should return empty records with filteredEndOffset
@@ -563,7 +565,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
 
             assertThat(result).isNotNull();
             assertThat(result.getRecords().sizeInBytes()).isGreaterThan(0);
@@ -635,7 +638,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
 
             assertThat(result).isNotNull();
             assertThat(result.getRecords().sizeInBytes()).isGreaterThan(0);
@@ -698,7 +702,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(result1).isNotNull();
             assertThat(result1.getRecords().sizeInBytes()).isGreaterThan(0);
 
@@ -710,7 +715,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
             assertThat(result2).isNotNull();
             assertThat(result2.getRecords().sizeInBytes()).isEqualTo(0);
             // filteredEndOffset should be set to advance past the filtered data
@@ -749,7 +755,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
 
             assertThat(result).isNotNull();
             // Should return batch 1 data
@@ -816,7 +823,8 @@ final class LocalLogTest extends LogTestBase {
                             false,
                             localLog.getLocalLogEndOffsetMetadata(),
                             null,
-                            new FilterContext(filter, readContext, null));
+                            new FilterContext(
+                                    filter, readContext, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER));
 
             assertThat(result).isNotNull();
             // Should return segment 1 batch 1 data (first non-empty result)
