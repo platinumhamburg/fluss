@@ -243,22 +243,46 @@ public class LogFetcherFilterITCase extends ClientToServerITCaseBase {
                         allNonMatchingData, FILTER_TEST_ROW_TYPE, 0L, DEFAULT_SCHEMA_ID);
         addRecordsToBucket(tb0, nonMatchingRecords);
 
+        // Send fetch and wait for the response. The server should filter out the
+        // entire batch (max=5, filter is a>5) and return a filteredEndOffset.
         logFetcher.sendFetches();
 
-        retry(
-                Duration.ofMinutes(1),
-                () -> {
-                    // The fetch may complete even if all batches are filtered out
-                    // depending on implementation
-                    assertThat(logFetcher.hasAvailableFetches()).isTrue();
-                });
+        retry(Duration.ofMinutes(1), () -> assertThat(logFetcher.hasAvailableFetches()).isTrue());
 
         ScanRecords records = logFetcher.collectFetch();
 
-        // For a batch where max value = 5 and filter is a > 5, the entire batch should be
-        // filtered out at the server side. collectFetch() may omit the bucket entirely because
-        // there are no user-visible records to return.
+        // No user-visible records should be returned
         assertThat(records.records(tb0)).isEmpty();
+
+        // If the server hasn't advanced HW yet, the offset may still be 0 on the
+        // first fetch. Use a retry loop with send-wait-collect to ensure the
+        // filteredEndOffset propagates through the full RPC round-trip.
+        if (logFetcher.getLogScannerStatus().getBucketOffset(tb0) == 0L) {
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        logFetcher.sendFetches();
+                        retry(
+                                Duration.ofSeconds(30),
+                                () -> assertThat(logFetcher.hasAvailableFetches()).isTrue());
+                        logFetcher.collectFetch();
+
+                        Long tb0Offset = logFetcher.getLogScannerStatus().getBucketOffset(tb0);
+                        assertThat(tb0Offset)
+                                .as(
+                                        "Fetch offset must advance past filtered data, "
+                                                + "confirming filteredEndOffset survived RPC round-trip")
+                                .isGreaterThan(0L);
+                    });
+        } else {
+            // Offset already advanced on first fetch — filteredEndOffset RPC round-trip confirmed
+            assertThat(logFetcher.getLogScannerStatus().getBucketOffset(tb0))
+                    .as("Fetch offset must advance past filtered data")
+                    .isGreaterThan(0L);
+        }
+
+        // After offset advancement, fetcher should be clean
+        assertThat(logFetcher.getCompletedFetchesSize()).isEqualTo(0);
     }
 
     @Test
