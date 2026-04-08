@@ -1449,9 +1449,6 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
 
             // Write each batch separately to ensure proper RecordBatch formation
             writeRows(conn, tablePath, batchRows, true);
-
-            // Small delay to ensure batches are processed distinctly
-            Thread.sleep(20);
         }
 
         // Define three ranges to filter: 6500-6999, 8350-8400, 9400-10000

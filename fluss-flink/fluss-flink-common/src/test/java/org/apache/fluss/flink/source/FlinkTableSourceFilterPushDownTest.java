@@ -23,6 +23,7 @@ import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
+import org.apache.fluss.row.GenericRow;
 
 import org.apache.flink.shaded.guava31.com.google.common.collect.Maps;
 import org.apache.flink.table.api.DataTypes;
@@ -263,7 +264,41 @@ public class FlinkTableSourceFilterPushDownTest {
             // Range filters should be pushed down as record batch filter
             assertThat(result.getAcceptedFilters()).hasSize(2);
             assertThat(result.getRemainingFilters()).hasSize(2);
-            assertThat(tableSource.getLogRecordBatchFilter()).isNotNull();
+            Predicate predicate = tableSource.getLogRecordBatchFilter();
+            assertThat(predicate).isNotNull();
+
+            // Verify the predicate actually evaluates correctly against statistics.
+            // Schema: id(INT), name(STRING), value(BIGINT), region(STRING)
+            // Filter: id > 3 AND id < 10
+            int fieldCount = 4;
+            Long[] noNulls = new Long[] {0L, 0L, 0L, 0L};
+
+            // Batch with id range [5, 8] → should match (5 > 3 is possible, 8 < 10 is possible)
+            assertThat(
+                            predicate.test(
+                                    100,
+                                    GenericRow.of(5, null, null, null),
+                                    GenericRow.of(8, null, null, null),
+                                    noNulls))
+                    .isTrue();
+
+            // Batch with id range [1, 2] → should NOT match (max=2, not > 3)
+            assertThat(
+                            predicate.test(
+                                    100,
+                                    GenericRow.of(1, null, null, null),
+                                    GenericRow.of(2, null, null, null),
+                                    noNulls))
+                    .isFalse();
+
+            // Batch with id range [11, 20] → should NOT match (min=11, not < 10)
+            assertThat(
+                            predicate.test(
+                                    100,
+                                    GenericRow.of(11, null, null, null),
+                                    GenericRow.of(20, null, null, null),
+                                    noNulls))
+                    .isFalse();
         }
 
         @Test

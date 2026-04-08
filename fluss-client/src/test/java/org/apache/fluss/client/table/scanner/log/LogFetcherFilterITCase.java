@@ -308,9 +308,8 @@ public class LogFetcherFilterITCase extends ClientToServerITCaseBase {
                 LogRecordBatchStatisticsTestUtils.createLogRecordsWithStatistics(
                         MATCHING_DATA, FILTER_TEST_ROW_TYPE, 0L, DEFAULT_SCHEMA_ID));
 
-        // Use retry loop to handle the case where bucket 0's HW hasn't advanced yet
-        // on the first fetch cycle. The filtered-empty response (with filteredEndOffset)
-        // is only returned when the server has data up to HW to scan.
+        // Flatten retry: send-wait-collect in a single loop until bucket 0's offset advances.
+        // This avoids the fragile nested retry pattern that could accumulate in-flight requests.
         retry(
                 Duration.ofMinutes(1),
                 () -> {
