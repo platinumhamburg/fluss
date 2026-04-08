@@ -158,85 +158,7 @@ public class FileLogProjection {
             return builder.build();
         }
 
-        boolean isAppendOnly =
-                (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
-
-        // For V1+, skip statistics data between header and records
-        int statisticsLength = 0;
-        if (magic >= LOG_MAGIC_VALUE_V1) {
-            statisticsLength = logHeaderBuffer.getInt(statisticsLengthOffset(magic));
-        }
-        int recordsStartOffset = recordBatchHeaderSize + statisticsLength;
-
-        final int changeTypeBytes;
-        final long arrowHeaderOffset;
-        if (isAppendOnly) {
-            changeTypeBytes = 0;
-            arrowHeaderOffset = position + recordsStartOffset;
-        } else {
-            changeTypeBytes = logHeaderBuffer.getInt(recordsCountOffset(magic));
-            arrowHeaderOffset = position + recordsStartOffset + changeTypeBytes;
-        }
-
-        // read arrow header
-        arrowHeaderBuffer.rewind();
-        readFullyOrFail(channel, arrowHeaderBuffer, arrowHeaderOffset, "arrow header");
-        arrowHeaderBuffer.position(ARROW_IPC_METADATA_SIZE_OFFSET);
-        int arrowMetadataSize = arrowHeaderBuffer.getInt();
-
-        resizeArrowMetadataBuffer(arrowMetadataSize);
-        arrowMetadataBuffer.rewind();
-        readFullyOrFail(
-                channel,
-                arrowMetadataBuffer,
-                arrowHeaderOffset + ARROW_HEADER_SIZE,
-                "arrow metadata");
-
-        arrowMetadataBuffer.rewind();
-        Message metadata = Message.getRootAsMessage(arrowMetadataBuffer);
-        ProjectedArrowBatch projectedArrowBatch =
-                projectArrowBatch(
-                        metadata,
-                        currentProjection.nodesProjection,
-                        currentProjection.buffersProjection,
-                        currentProjection.bufferCount);
-        long arrowBodyLength = projectedArrowBatch.bodyLength();
-
-        int newBatchSizeInBytes =
-                recordBatchHeaderSize
-                        + changeTypeBytes
-                        + currentProjection.arrowMetadataLength
-                        + (int) arrowBodyLength;
-
-        // create new arrow batch metadata which already projected
-        byte[] headerMetadata =
-                serializeArrowRecordBatchMetadata(
-                        projectedArrowBatch, arrowBodyLength, currentProjection.bodyCompression);
-        checkState(
-                headerMetadata.length == currentProjection.arrowMetadataLength,
-                "Invalid metadata length");
-
-        // update and copy log batch header
-        logHeaderBuffer.position(LENGTH_OFFSET);
-        logHeaderBuffer.putInt(newBatchSizeInBytes - LOG_OVERHEAD);
-
-        // For V1+ format, clear statistics information since projection removes statistics
-        LogRecordBatchFormat.clearStatisticsFromHeader(logHeaderBuffer, magic);
-
-        logHeaderBuffer.rewind();
-        byte[] logHeader = new byte[recordBatchHeaderSize];
-        logHeaderBuffer.get(logHeader);
-
-        // build log records
-        builder.addBytes(logHeader);
-        if (!isAppendOnly) {
-            builder.addBytes(channel, position + recordsStartOffset, changeTypeBytes);
-        }
-        builder.addBytes(headerMetadata);
-        final long bufferOffset = arrowHeaderOffset + ARROW_HEADER_SIZE + arrowMetadataSize;
-        projectedArrowBatch.buffers.forEach(
-                b -> builder.addBytes(channel, bufferOffset + b.getOffset(), (int) b.getSize()));
-
+        projectSingleBatch(channel, position, currentProjection, builder, Integer.MAX_VALUE);
         return builder.build();
     }
 
@@ -294,99 +216,128 @@ public class FileLogProjection {
                 continue;
             }
 
-            boolean isAppendOnly =
-                    (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
-
-            // For V1+, skip statistics data between header and records
-            int statisticsLength = 0;
-            if (magic >= LogRecordBatchFormat.LOG_MAGIC_VALUE_V1) {
-                statisticsLength = logHeaderBuffer.getInt(statisticsLengthOffset(magic));
-            }
-            int recordsStartOffset = recordBatchHeaderSize + statisticsLength;
-
-            final int changeTypeBytes;
-            final long arrowHeaderOffset;
-            if (isAppendOnly) {
-                changeTypeBytes = 0;
-                arrowHeaderOffset = position + recordsStartOffset;
-            } else {
-                changeTypeBytes = logHeaderBuffer.getInt(recordsCountOffset(magic));
-                arrowHeaderOffset = position + recordsStartOffset + changeTypeBytes;
-            }
-
-            // read arrow header
-            arrowHeaderBuffer.rewind();
-            readFullyOrFail(channel, arrowHeaderBuffer, arrowHeaderOffset, "arrow header");
-            arrowHeaderBuffer.position(ARROW_IPC_METADATA_SIZE_OFFSET);
-            int arrowMetadataSize = arrowHeaderBuffer.getInt();
-
-            resizeArrowMetadataBuffer(arrowMetadataSize);
-            arrowMetadataBuffer.rewind();
-            readFullyOrFail(
-                    channel,
-                    arrowMetadataBuffer,
-                    arrowHeaderOffset + ARROW_HEADER_SIZE,
-                    "arrow metadata");
-
-            arrowMetadataBuffer.rewind();
-            Message metadata = Message.getRootAsMessage(arrowMetadataBuffer);
-            ProjectedArrowBatch projectedArrowBatch =
-                    projectArrowBatch(
-                            metadata,
-                            currentProjection.nodesProjection,
-                            currentProjection.buffersProjection,
-                            currentProjection.bufferCount);
-            long arrowBodyLength = projectedArrowBatch.bodyLength();
-
             int newBatchSizeInBytes =
-                    recordBatchHeaderSize
-                            + changeTypeBytes
-                            + currentProjection.arrowMetadataLength
-                            + (int) arrowBodyLength;
-            if (newBatchSizeInBytes > maxBytes) {
-                // the remaining bytes in the file are not enough to read a full batch
+                    projectSingleBatch(channel, position, currentProjection, builder, maxBytes);
+            if (newBatchSizeInBytes < 0) {
+                // the projected batch exceeds the remaining budget, stop here
                 return new BytesViewLogRecords(builder.build());
             }
-
-            // 3. create new arrow batch metadata which already projected.
-            byte[] headerMetadata =
-                    serializeArrowRecordBatchMetadata(
-                            projectedArrowBatch,
-                            arrowBodyLength,
-                            currentProjection.bodyCompression);
-            checkState(
-                    headerMetadata.length == currentProjection.arrowMetadataLength,
-                    "Invalid metadata length");
-
-            // 4. update and copy log batch header
-            logHeaderBuffer.position(LENGTH_OFFSET);
-            logHeaderBuffer.putInt(newBatchSizeInBytes - LOG_OVERHEAD);
-
-            // For V1+ format, clear statistics information since projection removes statistics
-            LogRecordBatchFormat.clearStatisticsFromHeader(logHeaderBuffer, magic);
-
-            logHeaderBuffer.rewind();
-            // the logHeader can't be reused, as it will be sent to network
-            byte[] logHeader = new byte[recordBatchHeaderSize];
-            logHeaderBuffer.get(logHeader);
-
-            // 5. build log records
-            builder.addBytes(logHeader);
-            if (!isAppendOnly) {
-                builder.addBytes(channel, position + recordsStartOffset, changeTypeBytes);
-            }
-            builder.addBytes(headerMetadata);
-            final long bufferOffset = arrowHeaderOffset + ARROW_HEADER_SIZE + arrowMetadataSize;
-            projectedArrowBatch.buffers.forEach(
-                    b ->
-                            builder.addBytes(
-                                    channel, bufferOffset + b.getOffset(), (int) b.getSize()));
 
             maxBytes -= newBatchSizeInBytes;
             position += batchSizeInBytes;
         }
 
         return new BytesViewLogRecords(builder.build());
+    }
+
+    /**
+     * Project a single non-empty record batch and append the projected bytes to the builder.
+     *
+     * <p>The caller must have already read the log header into {@link #logHeaderBuffer} and
+     * verified that the batch is non-empty (i.e., batchSizeInBytes != recordBatchHeaderSize).
+     *
+     * @param channel the file channel to read from
+     * @param position the start position of the batch in the file
+     * @param currentProjection the projection info for the current schema
+     * @param builder the builder to append projected bytes to
+     * @param maxBytes the maximum allowed projected batch size; returns -1 if exceeded
+     * @return the projected batch size in bytes, or -1 if the projected size exceeds maxBytes
+     */
+    private int projectSingleBatch(
+            FileChannel channel,
+            int position,
+            ProjectionInfo currentProjection,
+            MultiBytesView.Builder builder,
+            int maxBytes)
+            throws IOException {
+        logHeaderBuffer.rewind();
+        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
+        int recordBatchHeaderSize = recordBatchHeaderSize(magic);
+
+        boolean isAppendOnly =
+                (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
+
+        // For V1+, skip statistics data between header and records
+        int statisticsLength = 0;
+        if (magic >= LOG_MAGIC_VALUE_V1) {
+            statisticsLength = logHeaderBuffer.getInt(statisticsLengthOffset(magic));
+        }
+        int recordsStartOffset = recordBatchHeaderSize + statisticsLength;
+
+        final int changeTypeBytes;
+        final long arrowHeaderOffset;
+        if (isAppendOnly) {
+            changeTypeBytes = 0;
+            arrowHeaderOffset = position + recordsStartOffset;
+        } else {
+            changeTypeBytes = logHeaderBuffer.getInt(recordsCountOffset(magic));
+            arrowHeaderOffset = position + recordsStartOffset + changeTypeBytes;
+        }
+
+        // read arrow header
+        arrowHeaderBuffer.rewind();
+        readFullyOrFail(channel, arrowHeaderBuffer, arrowHeaderOffset, "arrow header");
+        arrowHeaderBuffer.position(ARROW_IPC_METADATA_SIZE_OFFSET);
+        int arrowMetadataSize = arrowHeaderBuffer.getInt();
+
+        resizeArrowMetadataBuffer(arrowMetadataSize);
+        arrowMetadataBuffer.rewind();
+        readFullyOrFail(
+                channel,
+                arrowMetadataBuffer,
+                arrowHeaderOffset + ARROW_HEADER_SIZE,
+                "arrow metadata");
+
+        arrowMetadataBuffer.rewind();
+        Message metadata = Message.getRootAsMessage(arrowMetadataBuffer);
+        ProjectedArrowBatch projectedArrowBatch =
+                projectArrowBatch(
+                        metadata,
+                        currentProjection.nodesProjection,
+                        currentProjection.buffersProjection,
+                        currentProjection.bufferCount);
+        long arrowBodyLength = projectedArrowBatch.bodyLength();
+
+        int newBatchSizeInBytes =
+                recordBatchHeaderSize
+                        + changeTypeBytes
+                        + currentProjection.arrowMetadataLength
+                        + (int) arrowBodyLength;
+
+        if (newBatchSizeInBytes > maxBytes) {
+            return -1;
+        }
+
+        // create new arrow batch metadata which already projected
+        byte[] headerMetadata =
+                serializeArrowRecordBatchMetadata(
+                        projectedArrowBatch, arrowBodyLength, currentProjection.bodyCompression);
+        checkState(
+                headerMetadata.length == currentProjection.arrowMetadataLength,
+                "Invalid metadata length");
+
+        // update and copy log batch header
+        logHeaderBuffer.position(LENGTH_OFFSET);
+        logHeaderBuffer.putInt(newBatchSizeInBytes - LOG_OVERHEAD);
+
+        // For V1+ format, clear statistics information since projection removes statistics
+        LogRecordBatchFormat.clearStatisticsFromHeader(logHeaderBuffer, magic);
+
+        logHeaderBuffer.rewind();
+        byte[] logHeader = new byte[recordBatchHeaderSize];
+        logHeaderBuffer.get(logHeader);
+
+        // build log records
+        builder.addBytes(logHeader);
+        if (!isAppendOnly) {
+            builder.addBytes(channel, position + recordsStartOffset, changeTypeBytes);
+        }
+        builder.addBytes(headerMetadata);
+        final long bufferOffset = arrowHeaderOffset + ARROW_HEADER_SIZE + arrowMetadataSize;
+        projectedArrowBatch.buffers.forEach(
+                b -> builder.addBytes(channel, bufferOffset + b.getOffset(), (int) b.getSize()));
+
+        return newBatchSizeInBytes;
     }
 
     private ProjectedArrowBatch projectArrowBatch(
