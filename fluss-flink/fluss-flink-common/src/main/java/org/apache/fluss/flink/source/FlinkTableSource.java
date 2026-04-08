@@ -679,15 +679,15 @@ public class FlinkTableSource
      * @return set of column names that have statistics available
      */
     private Set<String> computeAvailableStatsColumns(RowType flussRowType) {
-        Set<String> availableStatsColumns = new HashSet<>();
+        Set<String> columns = new HashSet<>();
 
         // Get the configured statistics columns
         String columnsConfig = tableConfig.get(ConfigOptions.TABLE_STATISTICS_COLUMNS);
 
         // Check if statistics are enabled for the table
-        if (null == columnsConfig || columnsConfig.isEmpty()) {
+        if (columnsConfig == null || columnsConfig.isEmpty()) {
             LOG.debug("Statistics collection is disabled for the table");
-            return availableStatsColumns;
+            return columns;
         }
 
         if ("*".equals(columnsConfig)) {
@@ -695,7 +695,7 @@ public class FlinkTableSource
             for (int i = 0; i < flussRowType.getFieldCount(); i++) {
                 org.apache.fluss.types.DataType fieldType = flussRowType.getTypeAt(i);
                 if (!DataTypeChecks.isBinaryType(fieldType)) {
-                    availableStatsColumns.add(flussRowType.getFieldNames().get(i));
+                    columns.add(flussRowType.getFieldNames().get(i));
                 }
             }
         } else {
@@ -712,7 +712,7 @@ public class FlinkTableSource
                 if (columnIndex >= 0) {
                     org.apache.fluss.types.DataType fieldType = flussRowType.getTypeAt(columnIndex);
                     if (!DataTypeChecks.isBinaryType(fieldType)) {
-                        availableStatsColumns.add(columnName);
+                        columns.add(columnName);
                     } else {
                         LOG.trace(
                                 "Configured statistics column '{}' is a binary type and will be ignored",
@@ -726,7 +726,7 @@ public class FlinkTableSource
             }
         }
 
-        return availableStatsColumns;
+        return columns;
     }
 
     @Override

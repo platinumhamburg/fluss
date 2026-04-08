@@ -156,11 +156,12 @@ public class FlinkAsFlussRow implements InternalRow {
         return new FlinkAsFlussRow(flinkRow.getRow(pos, numFields));
     }
 
-    public static Object fromFlinkObject(Object o, org.apache.flink.table.types.DataType type) {
-        if (o == null) {
+    public static Object fromFlinkObject(
+            Object flinkValue, org.apache.flink.table.types.DataType type) {
+        if (flinkValue == null) {
             return null;
         }
         return InternalRow.createFieldGetter(FlinkConversions.toFlussType(type), 0)
-                .getFieldOrNull((new FlinkAsFlussRow()).replace(GenericRowData.of(o)));
+                .getFieldOrNull((new FlinkAsFlussRow()).replace(GenericRowData.of(flinkValue)));
     }
 }

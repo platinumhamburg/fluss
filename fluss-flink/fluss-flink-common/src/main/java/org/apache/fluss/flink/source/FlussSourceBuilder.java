@@ -176,7 +176,7 @@ public class FlussSourceBuilder<OUT> {
         return this;
     }
 
-    public FlussSourceBuilder<OUT> setlogRecordBatchFilter(Predicate logRecordBatchFilter) {
+    public FlussSourceBuilder<OUT> setLogRecordBatchFilter(Predicate logRecordBatchFilter) {
         checkNotNull(logRecordBatchFilter, "logRecordBatchFilter must not be null");
         this.logRecordBatchFilter = logRecordBatchFilter;
         return this;
