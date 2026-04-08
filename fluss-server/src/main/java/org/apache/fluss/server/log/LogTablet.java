@@ -395,6 +395,24 @@ public final class LogTablet {
         return append(records, false);
     }
 
+    /** Read messages from the local log without projection or filter. */
+    public FetchDataInfo read(
+            long readOffset, int maxLength, FetchIsolation fetchIsolation, boolean minOneMessage)
+            throws IOException {
+        return read(readOffset, maxLength, fetchIsolation, minOneMessage, null, null);
+    }
+
+    /** Read messages from the local log with projection but without filter. */
+    public FetchDataInfo read(
+            long readOffset,
+            int maxLength,
+            FetchIsolation fetchIsolation,
+            boolean minOneMessage,
+            @Nullable FileLogProjection projection)
+            throws IOException {
+        return read(readOffset, maxLength, fetchIsolation, minOneMessage, projection, null);
+    }
+
     /**
      * Read messages from the local log.
      *
