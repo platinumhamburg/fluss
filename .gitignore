@@ -29,6 +29,9 @@ dependency-reduced-pom.xml
 ### Mac OS ###
 .DS_Store
 
+### microbench output ###
+.microbench/
+
 # website & docs
 website/node_modules
 website/build
