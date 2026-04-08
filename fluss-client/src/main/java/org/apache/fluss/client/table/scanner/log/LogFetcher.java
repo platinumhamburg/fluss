@@ -416,6 +416,7 @@ public class LogFetcher implements Closeable {
                         } else {
                             LogRecords logRecords = fetchResultForBucket.recordsOrEmpty();
                             boolean hasRecords = !MemoryLogRecords.EMPTY.equals(logRecords);
+                            hasData = hasRecords;
                             if (hasRecords
                                     || fetchResultForBucket.getErrorCode() != Errors.NONE.code()
                                     || fetchResultForBucket.hasFilteredEndOffset()) {
