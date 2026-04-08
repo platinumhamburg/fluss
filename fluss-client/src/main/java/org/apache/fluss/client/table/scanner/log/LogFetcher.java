@@ -434,7 +434,7 @@ public class LogFetcher implements Closeable {
                                                 // the data is pruned
                                                 isCheckCrcs,
                                                 fetchOffset,
-                                                parsedByteBuf));
+                                                hasRecords ? parsedByteBuf : null));
                             }
                         }
                         // Track adaptive fetch rate for successful fetches
