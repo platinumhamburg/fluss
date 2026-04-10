@@ -102,12 +102,15 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         this.pagedOutputView = pagedOutputView;
         this.firstSegment = pagedOutputView.getCurrentSegment();
         int headerSize = recordBatchHeaderSize(magic);
+        // Change type bytes are stored immediately after the batch header, so the
+        // offset equals the header size.
+        int changeTypeOffset = headerSize;
         checkArgument(
                 firstSegment.size() >= headerSize,
                 "The size of first segment of pagedOutputView is too small, need at least "
                         + headerSize
                         + " bytes.");
-        this.changeTypeWriter = new ChangeTypeVectorWriter(firstSegment, headerSize);
+        this.changeTypeWriter = new ChangeTypeVectorWriter(firstSegment, changeTypeOffset);
         this.estimatedSizeInBytes = headerSize;
         this.recordCount = 0;
         this.statisticsCollector = statisticsCollector;

@@ -21,6 +21,7 @@ import org.apache.fluss.client.write.WriteFormat;
 import org.apache.fluss.client.write.WriteRecord;
 import org.apache.fluss.client.write.WriterClient;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryRow;
@@ -53,7 +54,6 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
     private final WriteFormat writeFormat;
     private final RowEncoder rowEncoder;
     private final FieldGetter[] fieldGetters;
-
     /** The merge mode for this writer. This controls how the server handles data merging. */
     private final MergeMode mergeMode;
 
@@ -77,6 +77,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
                 rowType,
                 tableInfo.getPrimaryKeys(),
                 tableInfo.getSchema().getAutoIncrementColumnNames(),
+                tableInfo.getSchema().getIndexes(),
                 partialUpdateColumns);
 
         this.targetColumns = partialUpdateColumns;
@@ -108,6 +109,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             RowType rowType,
             List<String> primaryKeys,
             List<String> autoIncrementColumnNames,
+            List<Schema.Index> indexes,
             @Nullable int[] targetColumns) {
         // skip check when target columns is null
         if (targetColumns == null) {
@@ -152,15 +154,27 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             autoIncrementColumnSet.set(autoIncrementColumnIndex);
         }
 
+        // Collect index column indices for sparse index support
+        BitSet indexColumnSet = new BitSet();
+        for (Schema.Index index : indexes) {
+            for (String indexCol : index.getColumnNames()) {
+                int colIndex = rowType.getFieldIndex(indexCol);
+                if (colIndex >= 0) {
+                    indexColumnSet.set(colIndex);
+                }
+            }
+        }
+
         // check the columns not in targetColumns should be nullable
+        // Note: index columns are exempt from this check to support sparse index behavior
         for (int i = 0; i < rowType.getFieldCount(); i++) {
-            // column not in primary key and not in auto increment column
-            if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i)) {
+            // column not in primary key, not in auto increment column, and not in index columns
+            if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i) && !indexColumnSet.get(i)) {
                 // the column should be nullable
                 if (!rowType.getTypeAt(i).isNullable()) {
                     throw new IllegalArgumentException(
                             String.format(
-                                    "Partial Update requires all columns except primary key to be nullable, but column %s is NOT NULL.",
+                                    "Partial Update requires all columns except primary key and index columns to be nullable, but column %s is NOT NULL.",
                                     rowType.getFieldNames().get(i)));
                 }
             }

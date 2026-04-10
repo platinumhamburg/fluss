@@ -213,7 +213,8 @@ class KvTabletTest {
                 schemaGetter,
                 tableConf.getChangelogImage(),
                 KvManager.getDefaultRateLimiter(),
-                autoIncrementManager);
+                autoIncrementManager,
+                tableConf.getCompactionFilterConfig());
     }
 
     @Test
@@ -255,11 +256,11 @@ class KvTabletTest {
         assertThatThrownBy(() -> kvTablet.putAsLeader(kvRecordBatch, new int[] {0, 1}))
                 .isInstanceOf(InvalidTargetColumnException.class)
                 .hasMessage(
-                        "Partial Update requires all columns except primary key to be nullable, but column c is NOT NULL.");
+                        "Partial Update requires all columns except primary key and index columns to be nullable, but column c is NOT NULL.");
         assertThatThrownBy(() -> kvTablet.putAsLeader(kvRecordBatch, new int[] {0, 2}))
                 .isInstanceOf(InvalidTargetColumnException.class)
                 .hasMessage(
-                        "Partial Update requires all columns except primary key to be nullable, but column c is NOT NULL.");
+                        "Partial Update requires all columns except primary key and index columns to be nullable, but column c is NOT NULL.");
     }
 
     @Test
@@ -677,9 +678,9 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(
                         Arrays.asList(
                                 recordFactory.ofRecord(
-                                        "k1".getBytes(), new Object[] {"k1", null, null}),
+                                        "k1".getBytes(), new Object[] {"k1", 0, null}),
                                 recordFactory.ofRecord(
-                                        "k2".getBytes(), new Object[] {"k2", null, null})));
+                                        "k2".getBytes(), new Object[] {"k2", 0, null})));
         // target columns contain auto-increment column
         assertThatThrownBy(() -> kvTablet.putAsLeader(kvRecordBatch, new int[] {0, 1}))
                 .isInstanceOf(InvalidTargetColumnException.class)

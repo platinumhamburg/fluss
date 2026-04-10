@@ -19,17 +19,40 @@ package org.apache.fluss.record;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.memory.AbstractPagedOutputView;
+import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.memory.MemorySegmentOutputView;
+import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
+import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.indexed.IndexedRow;
+import org.apache.fluss.utils.crc.Crc32C;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
+import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_LENGTH;
+import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
+import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
+import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
+import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
+import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
 
 /**
  * Default builder for {@link MemoryLogRecords} of log records in {@link
  * org.apache.fluss.metadata.LogFormat#INDEXED} format.
  */
 public class MemoryLogRecordsIndexedBuilder extends MemoryLogRecordsRowBuilder<IndexedRow> {
+
+    @Nullable private final List<MemorySegmentBytesView> preWrittenBytesView;
+    private final int preWrittenRecordCount;
+    private long commitTimestamp = 0L;
 
     private MemoryLogRecordsIndexedBuilder(
             long baseLogOffset,
@@ -39,6 +62,26 @@ public class MemoryLogRecordsIndexedBuilder extends MemoryLogRecordsRowBuilder<I
             AbstractPagedOutputView pagedOutputView,
             boolean appendOnly) {
         super(baseLogOffset, schemaId, writeLimit, magic, pagedOutputView, appendOnly);
+        this.preWrittenBytesView = null;
+        this.preWrittenRecordCount = 0;
+    }
+
+    private MemoryLogRecordsIndexedBuilder(
+            int schemaId,
+            List<MemorySegmentBytesView> preWrittenBytesView,
+            int preWrittenRecordCount,
+            byte magic,
+            AbstractPagedOutputView pagedOutputView,
+            boolean appendOnly) {
+        super(
+                BUILDER_DEFAULT_OFFSET,
+                schemaId,
+                Integer.MAX_VALUE, // no write limit for pre-written mode
+                magic,
+                pagedOutputView,
+                appendOnly);
+        this.preWrittenBytesView = preWrittenBytesView;
+        this.preWrittenRecordCount = preWrittenRecordCount;
     }
 
     public static MemoryLogRecordsIndexedBuilder builder(
@@ -64,6 +107,123 @@ public class MemoryLogRecordsIndexedBuilder extends MemoryLogRecordsRowBuilder<I
                 baseLogOffset, schemaId, writeLimit, magic, outputView, false);
     }
 
+    /**
+     * Creates a builder with pre-written bytes view.
+     *
+     * @param schemaId the schema ID
+     * @param preWrittenBytesView the pre-written bytes view containing serialized records
+     * @param preWrittenRecordCount the number of records in the pre-written bytes view
+     * @param appendOnly whether this is append-only
+     * @return a new builder instance
+     */
+    public static MemoryLogRecordsIndexedBuilder builder(
+            int schemaId,
+            List<MemorySegmentBytesView> preWrittenBytesView,
+            int preWrittenRecordCount,
+            boolean appendOnly) {
+        byte magic = CURRENT_LOG_MAGIC_VALUE;
+        return new MemoryLogRecordsIndexedBuilder(
+                schemaId,
+                preWrittenBytesView,
+                preWrittenRecordCount,
+                magic,
+                new PreWrittenOutputView(preWrittenBytesView, magic),
+                appendOnly);
+    }
+
+    /**
+     * Sets the commit timestamp for this batch. This is only effective when using
+     * preWrittenBytesView mode.
+     *
+     * @param timestamp the commit timestamp to set
+     */
+    public void setCommitTimestamp(long timestamp) {
+        this.commitTimestamp = timestamp;
+    }
+
+    @Override
+    public BytesView build() throws IOException {
+        if (preWrittenBytesView != null) {
+            return buildFromPreWritten();
+        }
+        return super.build();
+    }
+
+    /**
+     * Build MemoryLogRecords from pre-written bytes view (for IndexCache scenario).
+     *
+     * <p>This method is used when the record data has already been serialized, and we only need to
+     * add the batch header.
+     */
+    private BytesView buildFromPreWritten() throws IOException {
+        if (preWrittenBytesView == null) {
+            throw new IllegalStateException("preWrittenBytesView is null");
+        }
+
+        // Calculate total size: header + pre-written data
+        int batchHeaderSize = recordBatchHeaderSize(magic);
+        int dataSize = 0;
+        for (MemorySegmentBytesView view : preWrittenBytesView) {
+            dataSize += view.getBytesLength();
+        }
+
+        // Write batch header (including base offset and length)
+        MemorySegment headerSegment = MemorySegment.allocateHeapMemory(batchHeaderSize);
+        MemorySegmentOutputView headerView = new MemorySegmentOutputView(headerSegment);
+
+        // Base offset
+        headerView.writeLong(baseLogOffset);
+        // Batch length (excluding base offset and length field itself)
+        int batchLengthValue = (batchHeaderSize - BASE_OFFSET_LENGTH - LENGTH_LENGTH) + dataSize;
+        headerView.writeInt(batchLengthValue);
+        // Magic
+        headerView.writeByte(magic);
+        // Commit timestamp (use set value if provided, otherwise 0)
+        headerView.writeLong(commitTimestamp);
+        // Leader epoch (will be overridden on server side)
+        if (magic >= LOG_MAGIC_VALUE_V1) {
+            headerView.writeInt(NO_LEADER_EPOCH);
+        }
+
+        // CRC placeholder (will be computed later)
+        int crcPosition = headerView.getPosition();
+        headerView.writeUnsignedInt(0);
+
+        // Schema ID
+        headerView.writeShort((short) schemaId);
+        // Attributes (appendOnly flag)
+        headerView.writeBoolean(appendOnly);
+
+        // Last offset delta
+        if (preWrittenRecordCount > 0) {
+            headerView.writeInt(preWrittenRecordCount - 1);
+        } else {
+            headerView.writeInt(0);
+        }
+        // Writer ID
+        headerView.writeLong(NO_WRITER_ID);
+        // Batch sequence
+        headerView.writeInt(NO_BATCH_SEQUENCE);
+        // Record count
+        headerView.writeInt(preWrittenRecordCount);
+
+        // Build the complete bytes view
+        List<MemorySegmentBytesView> allViews = new ArrayList<>();
+        allViews.add(new MemorySegmentBytesView(headerSegment, 0, batchHeaderSize));
+        allViews.addAll(preWrittenBytesView);
+
+        MultiBytesView.Builder builder = MultiBytesView.builder();
+        builder.addMemorySegmentByteViewList(allViews);
+        BytesView completeView = builder.build();
+
+        // Compute and update CRC
+        long crc = Crc32C.compute(allViews, schemaIdOffset(magic));
+        headerView.setPosition(crcPosition);
+        headerView.writeUnsignedInt(crc);
+
+        return completeView;
+    }
+
     @Override
     protected int sizeOf(IndexedRow row) {
         return IndexedLogRecord.sizeOf(row);
@@ -72,5 +232,40 @@ public class MemoryLogRecordsIndexedBuilder extends MemoryLogRecordsRowBuilder<I
     @Override
     protected int writeRecord(ChangeType changeType, IndexedRow row) throws IOException {
         return IndexedLogRecord.writeTo(pagedOutputView, changeType, row);
+    }
+
+    /** A minimal output view for pre-written bytes view mode. */
+    private static class PreWrittenOutputView extends AbstractPagedOutputView {
+        private final List<MemorySegmentBytesView> segments;
+
+        PreWrittenOutputView(List<MemorySegmentBytesView> segments, byte magic) {
+            super(
+                    segments.isEmpty()
+                            // Allocate enough space for the header + 1 to avoid setPosition()
+                            // overflow
+                            // since setPosition checks (size <= position)
+                            ? MemorySegment.allocateHeapMemory(recordBatchHeaderSize(magic) + 1)
+                            : segments.get(0).getMemorySegment(),
+                    segments.isEmpty()
+                            ? recordBatchHeaderSize(magic) + 1
+                            : segments.get(0).getMemorySegment().size());
+            this.segments = segments;
+        }
+
+        @Override
+        protected MemorySegment nextSegment() throws IOException {
+            throw new UnsupportedOperationException(
+                    "PreWrittenOutputView does not support writing");
+        }
+
+        @Override
+        public List<MemorySegment> allocatedPooledSegments() {
+            return Collections.emptyList();
+        }
+
+        @Override
+        public List<MemorySegmentBytesView> getWrittenSegments() {
+            return segments;
+        }
     }
 }

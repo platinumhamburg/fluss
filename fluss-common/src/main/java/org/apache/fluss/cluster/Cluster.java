@@ -114,7 +114,8 @@ public final class Cluster {
         this.pathByTableId = Collections.unmodifiableMap(tempPathByTableId);
     }
 
-    public Cluster invalidPhysicalTableBucketMeta(Set<PhysicalTablePath> physicalTablesToInvalid) {
+    public Cluster invalidatePhysicalTableBucketMetadata(
+            Set<PhysicalTablePath> physicalTablesToInvalid) {
         // should remove invalid tables from current availableLocationsByPath
         Map<PhysicalTablePath, List<BucketLocation>> newBucketLocationsByPath = new HashMap<>();
         // copy the metadata from current availableLocationsByPath to newBucketLocationsByPath

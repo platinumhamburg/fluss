@@ -187,7 +187,19 @@ public class KeyRecordBatch implements KvRecordBatch {
                 keyFieldGetters[i] = InternalRow.createFieldGetter(keyFieldType, i);
             }
 
-            this.rowEncoder = RowEncoder.create(kvFormat, rowType);
+            // Make non-key field types nullable so the encoder accepts null values for them.
+            // Non-key fields (e.g., auto-increment NOT NULL columns) are set to null here
+            // and will be filled in later by KvTablet.processKvRecords.
+            DataType[] fieldTypes = new DataType[fieldCount];
+            for (int i = 0; i < fieldCount; i++) {
+                DataType type = rowType.getTypeAt(i);
+                if (keyIdxByFieldIdx[i] == -1) {
+                    fieldTypes[i] = type.copy(true);
+                } else {
+                    fieldTypes[i] = type;
+                }
+            }
+            this.rowEncoder = RowEncoder.create(kvFormat, fieldTypes);
         }
 
         @Override

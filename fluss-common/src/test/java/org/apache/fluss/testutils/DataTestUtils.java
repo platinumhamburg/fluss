@@ -32,6 +32,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.DefaultLogRecordBatch;
 import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.record.IndexedLogRecord;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordTestUtils;
@@ -42,6 +43,7 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.MemoryLogRecordsArrowBuilder;
 import org.apache.fluss.record.MemoryLogRecordsIndexedBuilder;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericArray;
@@ -426,18 +428,19 @@ public class DataTestUtils {
         }
 
         File logFile = FlussPaths.logFile(segmentDir, baseOffset);
-        FileLogRecords fileLogRecords = FileLogRecords.open(logFile, false, 1024 * 1024, false);
-        fileLogRecords.append(
-                createRecordsWithoutBaseLogOffset(
-                        rowType,
-                        DEFAULT_SCHEMA_ID,
-                        baseOffset,
-                        System.currentTimeMillis(),
-                        CURRENT_LOG_MAGIC_VALUE,
-                        objects,
-                        logFormat));
-        fileLogRecords.flush();
-        fileLogRecords.close();
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(logFile, false, 1024 * 1024, false)) {
+            fileLogRecords.append(
+                    createRecordsWithoutBaseLogOffset(
+                            rowType,
+                            DEFAULT_SCHEMA_ID,
+                            baseOffset,
+                            System.currentTimeMillis(),
+                            CURRENT_LOG_MAGIC_VALUE,
+                            objects,
+                            logFormat));
+            fileLogRecords.flush();
+        }
         return logFile;
     }
 
@@ -842,5 +845,32 @@ public class DataTestUtils {
                 assertThat(expectVal[i]).isNull();
             }
         }
+    }
+
+    /**
+     * Generates MemoryLogRecords for testing IndexCache/IndexApplier scenarios.
+     *
+     * @param rows the list of indexed rows to include in the records
+     * @param dataBucket the data bucket these index records correspond to
+     * @param dataEndOffset the end offset in the data bucket (exclusive)
+     * @return MemoryLogRecords
+     * @throws Exception if building the records fails
+     */
+    public static MemoryLogRecords genIndexedMemoryLogRecordsWithState(
+            List<IndexedRow> rows, TableBucket dataBucket, long dataEndOffset) throws Exception {
+        List<MemorySegmentBytesView> preWrittenBytesView = new java.util.ArrayList<>();
+        if (!rows.isEmpty()) {
+            UnmanagedPagedOutputView tempOutputView = new UnmanagedPagedOutputView(1024);
+            for (IndexedRow row : rows) {
+                IndexedRow copiedRow = row.copy();
+                IndexedLogRecord.writeTo(tempOutputView, ChangeType.APPEND_ONLY, copiedRow);
+            }
+            preWrittenBytesView = tempOutputView.getWrittenSegments();
+        }
+
+        MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.builder(
+                        DEFAULT_SCHEMA_ID, preWrittenBytesView, rows.size(), true);
+        return MemoryLogRecords.pointToBytesView(builder.build());
     }
 }

@@ -51,6 +51,9 @@ abstract class AbstractLookuper implements Lookuper {
 
     private final SchemaGetter schemaGetter;
 
+    /** Prefix length for encoded values (e.g., 8 bytes for TTL timestamp). */
+    private final int prefixLength;
+
     /**
      * Cache for row decoders for different schema ids. Use CopyOnWriteMap for fast access, as it is
      * not frequently updated.
@@ -67,12 +70,16 @@ abstract class AbstractLookuper implements Lookuper {
         this.lookupClient = lookupClient;
         this.targetSchemaId = (short) tableInfo.getSchemaId();
         this.schemaGetter = schemaGetter;
+        // Get prefix length from compaction filter config
+        this.prefixLength = tableInfo.getCompactionFilterConfig().getPrefixLength();
         this.decoders = new CopyOnWriteMap<>();
         // initialize the decoder for the same schema
         this.decoders.put(
                 targetSchemaId,
                 new FixedSchemaDecoder(
-                        tableInfo.getTableConfig().getKvFormat(), tableInfo.getSchema()));
+                        tableInfo.getTableConfig().getKvFormat(),
+                        tableInfo.getSchema(),
+                        prefixLength));
     }
 
     protected void handleLookupResponse(
@@ -85,7 +92,10 @@ abstract class AbstractLookuper implements Lookuper {
                 continue;
             }
             MemorySegment memorySegment = MemorySegment.wrap(valueBytes);
-            short schemaId = memorySegment.getShort(0);
+            // For prefixed encoding format, schema id is at offset prefixLength
+            // For normal format, schema id is at offset 0
+            int schemaIdOffset = prefixLength;
+            short schemaId = memorySegment.getShort(schemaIdOffset);
             if (targetSchemaId != schemaId) {
                 allTargetSchema = false;
                 if (!decoders.containsKey(schemaId)) {
@@ -141,7 +151,8 @@ abstract class AbstractLookuper implements Lookuper {
     protected LookupResult processSchemaMismatchedRows(List<MemorySegment> valueList) {
         List<InternalRow> rowList = new ArrayList<>(valueList.size());
         for (MemorySegment value : valueList) {
-            short schemaId = value.getShort(0);
+            int schemaIdOffset = prefixLength;
+            short schemaId = value.getShort(schemaIdOffset);
             FixedSchemaDecoder decoder = decoders.get(schemaId);
             checkArgument(decoder != null, "Decoder for schema id %s not found", schemaId);
             InternalRow row = decoder.decode(value);
@@ -161,7 +172,8 @@ abstract class AbstractLookuper implements Lookuper {
         // process the value list to convert to target schema
         List<InternalRow> rowList = new ArrayList<>(valueList.size());
         for (MemorySegment value : valueList) {
-            short schemaId = value.getShort(0);
+            int schemaIdOffset = prefixLength;
+            short schemaId = value.getShort(schemaIdOffset);
             FixedSchemaDecoder decoder =
                     decoders.computeIfAbsent(
                             schemaId,
@@ -170,7 +182,8 @@ abstract class AbstractLookuper implements Lookuper {
                                 return new FixedSchemaDecoder(
                                         tableInfo.getTableConfig().getKvFormat(),
                                         sourceSchema,
-                                        tableInfo.getSchema());
+                                        tableInfo.getSchema(),
+                                        prefixLength);
                             });
             InternalRow row = decoder.decode(value);
             rowList.add(row);

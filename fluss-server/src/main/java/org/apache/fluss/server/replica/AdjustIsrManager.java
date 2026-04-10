@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrResponseData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeAdjustIsrRequest;
@@ -60,6 +61,12 @@ public class AdjustIsrManager {
     private final Scheduler scheduler;
     private final int serverId;
 
+    /**
+     * Callback invoked when a FENCED_LEADER_EPOCH response carries corrective LeaderAndIsr
+     * metadata. This allows the stale leader to step down without an extra RPC round-trip.
+     */
+    private final BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback;
+
     /** Used to allow only one pending adjust Isr request per bucket (visible for testing). */
     protected final Map<TableBucket, AdjustIsrItem> unsentAdjustIsrMap =
             MapUtils.newConcurrentHashMap();
@@ -68,10 +75,14 @@ public class AdjustIsrManager {
     private final AtomicBoolean inflightRequest = new AtomicBoolean(false);
 
     public AdjustIsrManager(
-            Scheduler scheduler, CoordinatorGateway coordinatorGateway, int serverId) {
+            Scheduler scheduler,
+            CoordinatorGateway coordinatorGateway,
+            int serverId,
+            BiConsumer<TableBucket, LeaderAndIsr> correctiveLeaderAndIsrCallback) {
         this.coordinatorGateway = coordinatorGateway;
         this.scheduler = scheduler;
         this.serverId = serverId;
+        this.correctiveLeaderAndIsrCallback = correctiveLeaderAndIsrCallback;
     }
 
     public CompletableFuture<LeaderAndIsr> submit(
@@ -177,6 +188,14 @@ public class AdjustIsrManager {
                         AdjustIsrResultForBucket resultForBucket =
                                 resultForBucketMap.get(tableBucket);
                         if (resultForBucket.failed()) {
+                            // If the error carries corrective LeaderAndIsr, notify the callback
+                            // so the stale leader can step down.
+                            LeaderAndIsr corrective = resultForBucket.leaderAndIsr();
+                            if (corrective != null
+                                    && corrective.leader() != LeaderAndIsr.NO_LEADER
+                                    && correctiveLeaderAndIsrCallback != null) {
+                                correctiveLeaderAndIsrCallback.accept(tableBucket, corrective);
+                            }
                             adjustIsrItem.future.completeExceptionally(
                                     resultForBucket.getError().exception());
                         } else {

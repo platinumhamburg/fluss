@@ -107,8 +107,10 @@ class CoordinatorChannelManagerTest {
                     return gateway.updateMetadata(request);
                 },
                 (response, throwable) -> {
-                    // receive response, set to 2
-                    sendFlag.set(2);
+                    if (throwable == null) {
+                        // receive success response, set to 2
+                        sendFlag.set(2);
+                    }
                 });
 
         // if expect can send, flag is 2;

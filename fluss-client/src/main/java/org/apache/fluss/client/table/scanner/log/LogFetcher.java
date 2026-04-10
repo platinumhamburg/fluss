@@ -322,7 +322,7 @@ public class LogFetcher implements Closeable {
         Set<PhysicalTablePath> physicalTablePaths =
                 metadataUpdater.getPhysicalTablePathByIds(
                         tableOrPartitions.tableIds, tableOrPartitions.tablePartitions);
-        metadataUpdater.invalidPhysicalTableBucketMeta(physicalTablePaths);
+        metadataUpdater.invalidatePhysicalTableBucketMetadata(physicalTablePaths);
     }
 
     private void handleFetchLogException(

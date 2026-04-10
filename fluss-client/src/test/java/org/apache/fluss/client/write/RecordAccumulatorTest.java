@@ -328,7 +328,6 @@ class RecordAccumulatorTest {
         assertThat(writeBatches).hasSize(1);
         WriteBatch batch = writeBatches.peek();
         assertThat(batch).isInstanceOf(IndexedLogWriteBatch.class);
-        assertThat(batch).isNotNull();
         MemoryLogRecords memoryLogRecords = MemoryLogRecords.pointToBytesView(batch.build());
         Iterator<? extends LogRecordBatch> iterator = memoryLogRecords.batches().iterator();
         assertThat(iterator.hasNext()).isTrue();

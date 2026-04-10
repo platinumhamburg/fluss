@@ -20,10 +20,12 @@ package org.apache.fluss.server.kv.snapshot;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.function.FunctionWithException;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.BiConsumer;
 
 /**
  * A context to provide necessary objects/parameters used by kv snapshot and recover from snapshot.
@@ -82,4 +84,12 @@ public interface SnapshotContext {
      * log during recovering.
      */
     int maxFetchLogSizeInRecoverKv();
+
+    /**
+     * Get the callback for corrective LeaderAndIsr received from fenced snapshot commit responses.
+     * May return null if no callback is configured.
+     */
+    default BiConsumer<TableBucket, LeaderAndIsr> getCorrectiveLeaderAndIsrCallback() {
+        return null;
+    }
 }

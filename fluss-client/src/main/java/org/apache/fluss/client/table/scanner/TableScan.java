@@ -30,6 +30,7 @@ import org.apache.fluss.client.table.scanner.log.TypedLogScanner;
 import org.apache.fluss.client.table.scanner.log.TypedLogScannerImpl;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
@@ -192,6 +193,7 @@ public class TableScan implements Scan {
                     e);
         }
 
+        CompactionFilterConfig compactionFilterConfig = tableInfo.getCompactionFilterConfig();
         return new KvSnapshotBatchScanner(
                 tableInfo.getSchemaId(),
                 tableInfo.getSchema(),
@@ -201,7 +203,8 @@ public class TableScan implements Scan {
                 projectedColumns,
                 scannerTmpDir,
                 tableInfo.getTableConfig().getKvFormat(),
-                conn.getOrCreateRemoteFileDownloader());
+                conn.getOrCreateRemoteFileDownloader(),
+                compactionFilterConfig);
     }
 
     @Override

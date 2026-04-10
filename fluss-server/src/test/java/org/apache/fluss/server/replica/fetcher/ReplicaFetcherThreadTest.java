@@ -511,6 +511,8 @@ public class ReplicaFetcherThreadTest {
                         manualClock,
                         TestingMetricGroups.TABLET_SERVER_METRICS);
         logManager.startup();
+        MetadataManager metadataManager =
+                new MetadataManager(null, conf, new LakeCatalogDynamicLoader(conf, null, true));
         ReplicaManager replicaManager =
                 new TestingReplicaManager(
                         conf,
@@ -519,11 +521,8 @@ public class ReplicaFetcherThreadTest {
                         null,
                         zkClient,
                         serverId,
-                        new TabletServerMetadataCache(
-                                new MetadataManager(
-                                        null,
-                                        conf,
-                                        new LakeCatalogDynamicLoader(conf, null, true))),
+                        new TabletServerMetadataCache(metadataManager),
+                        metadataManager,
                         RpcClient.create(conf, TestingClientMetricGroup.newInstance()),
                         TestingMetricGroups.TABLET_SERVER_METRICS,
                         manualClock,
@@ -545,6 +544,7 @@ public class ReplicaFetcherThreadTest {
                 ZooKeeperClient zkClient,
                 int serverId,
                 TabletServerMetadataCache metadataCache,
+                MetadataManager metadataManager,
                 RpcClient rpcClient,
                 TabletServerMetricGroup serverMetricGroup,
                 Clock clock,
@@ -558,6 +558,7 @@ public class ReplicaFetcherThreadTest {
                     zkClient,
                     serverId,
                     metadataCache,
+                    metadataManager,
                     rpcClient,
                     new TestCoordinatorGateway(),
                     new TestingCompletedKvSnapshotCommitter(),

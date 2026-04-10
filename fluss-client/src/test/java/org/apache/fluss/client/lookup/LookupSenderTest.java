@@ -49,6 +49,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -56,6 +57,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_INFO_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -272,6 +274,7 @@ public class LookupSenderTest {
     void testRetryStopsIfFutureCompleted() throws Exception {
         // setup: always fail with retriable exception
         AtomicInteger attemptCount = new AtomicInteger(0);
+        CountDownLatch futureCompleted = new CountDownLatch(1);
         gateway.setLookupHandler(
                 request -> {
                     int attempt = attemptCount.incrementAndGet();
@@ -279,10 +282,11 @@ public class LookupSenderTest {
                         // first attempt fails
                         return createFailedResponse(request, new TimeoutException("timeout"));
                     } else {
+                        // Wait for external completion before proceeding
                         try {
-                            // Avoid attempting again too quickly
-                            Thread.sleep(100);
+                            futureCompleted.await(5, TimeUnit.SECONDS);
                         } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
                             throw new RuntimeException(e);
                         }
                         // subsequent attempts should not happen if we complete the future
@@ -299,6 +303,7 @@ public class LookupSenderTest {
         // complete the future externally before retry happens
         waitUntil(() -> attemptCount.get() >= 1, Duration.ofSeconds(5), "first attempt to be made");
         query.future().complete("external".getBytes());
+        futureCompleted.countDown();
 
         // verify: completed externally
         byte[] result = query.future().get(1, TimeUnit.SECONDS);
@@ -409,8 +414,9 @@ public class LookupSenderTest {
             assertThat(query.retries()).isEqualTo(expectedRetries);
         }
 
-        // wait a bit to ensure no more attempts
-        Thread.sleep(200);
+        // Verify no more attempts occur after completion
+        int finalCount = attemptCount.get();
+        retry(Duration.ofMillis(200), () -> assertThat(attemptCount.get()).isEqualTo(finalCount));
     }
 
     private CompletableFuture<LookupResponse> createSuccessResponse(

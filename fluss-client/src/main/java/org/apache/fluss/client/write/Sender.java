@@ -425,12 +425,12 @@ public class Sender implements Runnable {
             ProduceLogRequest request,
             long tableId,
             Map<TableBucket, ReadyWriteBatch> recordsByBucket) {
-        long startTime = System.currentTimeMillis();
+        long startTimeNs = System.nanoTime();
         gateway.produceLog(request)
                 .whenComplete(
                         (produceLogResponse, e) -> {
                             writerMetricGroup.setSendLatencyInMs(
-                                    System.currentTimeMillis() - startTime);
+                                    (System.nanoTime() - startTimeNs) / 1_000_000);
                             if (e != null) {
                                 handleWriteRequestException(e, recordsByBucket);
                             } else {
@@ -445,12 +445,12 @@ public class Sender implements Runnable {
             PutKvRequest request,
             long tableId,
             Map<TableBucket, ReadyWriteBatch> recordsByBucket) {
-        long startTime = System.currentTimeMillis();
+        long startTimeNs = System.nanoTime();
         gateway.putKv(request)
                 .whenComplete(
                         (putKvResponse, e) -> {
                             writerMetricGroup.setSendLatencyInMs(
-                                    System.currentTimeMillis() - startTime);
+                                    (System.nanoTime() - startTimeNs) / 1_000_000);
                             if (e != null) {
                                 handleWriteRequestException(e, recordsByBucket);
                             } else {
@@ -482,7 +482,7 @@ public class Sender implements Runnable {
                 completeBatch(writeBatch);
             }
         }
-        metadataUpdater.invalidPhysicalTableBucketMeta(invalidMetadataTablesSet);
+        metadataUpdater.invalidatePhysicalTableBucketMetadata(invalidMetadataTablesSet);
     }
 
     private void handlePutKvResponse(
@@ -509,7 +509,7 @@ public class Sender implements Runnable {
                 completeBatch(writeBatch, tb, logEndOffset);
             }
         }
-        metadataUpdater.invalidPhysicalTableBucketMeta(invalidMetadataTablesSet);
+        metadataUpdater.invalidatePhysicalTableBucketMetadata(invalidMetadataTablesSet);
     }
 
     private void handleWriteRequestException(
@@ -524,7 +524,7 @@ public class Sender implements Runnable {
             invalidMetadataTablesSet.addAll(invalidMetadataTables);
         }
 
-        metadataUpdater.invalidPhysicalTableBucketMeta(invalidMetadataTablesSet);
+        metadataUpdater.invalidatePhysicalTableBucketMetadata(invalidMetadataTablesSet);
     }
 
     /** Handle the exception and return a set of tables for which the metadata is invalid. */

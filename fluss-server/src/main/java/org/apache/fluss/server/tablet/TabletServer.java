@@ -262,6 +262,7 @@ public class TabletServer extends ServerBase {
                             zkClient,
                             serverId,
                             metadataCache,
+                            metadataManager,
                             rpcClient,
                             coordinatorGateway,
                             DefaultCompletedKvSnapshotCommitter.create(

@@ -161,7 +161,7 @@ public class RemoteLogDownloader implements Closeable {
             FsPathAndFileName fsPathAndFileName = request.getFsPathAndFileName();
             scannerMetricGroup.remoteFetchRequestCount().inc();
 
-            long startTime = System.currentTimeMillis();
+            long startTimeNs = System.nanoTime();
             // download the remote file to local
             remoteFileDownloader
                     .downloadFileAsync(fsPathAndFileName, localLogDir)
@@ -185,7 +185,7 @@ public class RemoteLogDownloader implements Closeable {
                                                     + "table bucket {} cost {} ms.",
                                             fsPathAndFileName.getFileName(),
                                             tableBucket,
-                                            System.currentTimeMillis() - startTime);
+                                            (System.nanoTime() - startTimeNs) / 1_000_000);
                                     File localFile =
                                             new File(
                                                     localLogDir.toFile(),

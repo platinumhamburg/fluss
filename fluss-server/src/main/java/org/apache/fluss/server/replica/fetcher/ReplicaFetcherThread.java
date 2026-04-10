@@ -41,6 +41,7 @@ import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.replica.fetcher.LeaderEndpoint.FetchData;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
 import org.apache.fluss.shaded.netty4.io.netty.util.ReferenceCountUtil;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.concurrent.ShutdownableThread;
@@ -62,7 +63,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -241,7 +244,15 @@ final class ReplicaFetcherThread extends ShutdownableThread {
             responseData = fetchFuture.get(timeoutSeconds, TimeUnit.SECONDS);
         } catch (Throwable t) {
             if (isRunning()) {
-                LOG.warn("Error in response for fetch log request {}", fetchLogRequest, t);
+                Throwable e = ExceptionUtils.stripException(t, ExecutionException.class);
+                if (e instanceof TimeoutException) {
+                    LOG.warn("fetch log timeout from leader {}", leader.leaderServerId());
+                } else {
+                    LOG.warn(
+                            "Error in response for fetch log request from leader {}",
+                            leader.leaderServerId(),
+                            t);
+                }
                 inLock(
                         bucketStatusMapLock,
                         () -> bucketsWithError.addAll(fairBucketStatusMap.bucketSet()));
@@ -398,7 +409,8 @@ final class ReplicaFetcherThread extends ShutdownableThread {
     private void truncateToLeaderEndOffsetSnapshot(TableBucket tableBucket, TablePath tablePath)
             throws Exception {
         long leaderLocalEndOffsetWhileBecomeLeader =
-                leader.fetchLeaderEndOffsetSnapshot(tableBucket).get();
+                leader.fetchLeaderEndOffsetSnapshot(tableBucket)
+                        .get(timeoutSeconds, TimeUnit.SECONDS);
         long localLogEndOffset =
                 replicaManager.getReplicaOrException(tableBucket).getLocalLogEndOffset();
         if (leaderLocalEndOffsetWhileBecomeLeader != 0L
@@ -624,8 +636,9 @@ final class ReplicaFetcherThread extends ShutdownableThread {
             log.writerStateManager().truncateFullyAndStartAt(0L);
 
             // 2. download writer id snapshots from remote storage.
-            File snapshotFile = FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
-            buildWriterIdSnapshotFile(snapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
+            File writerSnapshotFile =
+                    FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
+            buildWriterIdSnapshotFile(writerSnapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
 
             // 3. Perform a reloadSnapshots after buildWriterIdSnapshotFile() to load the latest
             // downloaded writerId snapshot file into the writerStateManager.
@@ -640,6 +653,9 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                     tb,
                     log.writerStateManager().activeWriters().size(),
                     nextFetchOffset);
+
+            // 4. BucketState has been removed; index replication state is now tracked via
+            // KvTablet's indexReplicationOffsets and persisted through TabletState snapshots.
         } catch (Exception e) {
             LOG.error(
                     "Failed to truncate and restore writer snapshot for {} while log hash been moved to remote",

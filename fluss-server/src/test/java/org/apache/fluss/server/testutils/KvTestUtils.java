@@ -20,12 +20,18 @@ package org.apache.fluss.server.testutils;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.DefaultKvRecordBatch;
+import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.LookupResponse;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbPrefixLookupRespForBucket;
+import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PbValue;
 import org.apache.fluss.rpc.messages.PbValueList;
 import org.apache.fluss.rpc.messages.PrefixLookupResponse;
+import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
@@ -178,6 +184,14 @@ public class KvTestUtils {
         assertThat(lookupValue).isEqualTo(expectedValue);
     }
 
+    public static void assertLookupResponseNotNull(LookupResponse lookupResponse) {
+        assertThat(lookupResponse.getBucketsRespsCount()).isEqualTo(1);
+        PbLookupRespForBucket pbLookupRespForBucket = lookupResponse.getBucketsRespAt(0);
+        assertThat(pbLookupRespForBucket.getValuesCount()).isEqualTo(1);
+        PbValue pbValue = pbLookupRespForBucket.getValueAt(0);
+        assertThat(pbValue.hasValues()).isTrue();
+    }
+
     public static void assertPrefixLookupResponse(
             PrefixLookupResponse prefixLookupResponse, List<List<byte[]>> expectedValues) {
         assertThat(prefixLookupResponse.getBucketsRespsCount()).isEqualTo(1);
@@ -193,5 +207,24 @@ public class KvTestUtils {
                 assertThat(pbValueList.getValueAt(j)).isEqualTo(bytesResultForOnePrefixKey.get(j));
             }
         }
+    }
+
+    /** Create a PutKvRequest for a partitioned table and send it via the gateway. */
+    public static PutKvResponse putKvToPartition(
+            TabletServerGateway gateway,
+            long tableId,
+            long partitionId,
+            int bucketId,
+            KvRecordBatch kvRecordBatch)
+            throws Exception {
+        PutKvRequest putKvRequest = new PutKvRequest();
+        putKvRequest.setTableId(tableId).setAcks(-1).setTimeoutMs(30000);
+        PbPutKvReqForBucket pbPutKvReqForBucket = new PbPutKvReqForBucket();
+        pbPutKvReqForBucket.setPartitionId(partitionId).setBucketId(bucketId);
+        DefaultKvRecordBatch batch = (DefaultKvRecordBatch) kvRecordBatch;
+        pbPutKvReqForBucket.setRecords(
+                batch.getMemorySegment(), batch.getPosition(), batch.sizeInBytes());
+        putKvRequest.addAllBucketsReqs(Collections.singletonList(pbPutKvReqForBucket));
+        return gateway.putKv(putKvRequest).get();
     }
 }

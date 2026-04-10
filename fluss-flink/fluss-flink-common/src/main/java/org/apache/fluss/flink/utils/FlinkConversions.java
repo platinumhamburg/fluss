@@ -59,6 +59,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -71,6 +72,8 @@ import static org.apache.flink.table.utils.EncodingUtils.encodeBytesToBase64;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
 import static org.apache.fluss.config.ConfigOptions.TABLE_MERGE_ENGINE;
+import static org.apache.fluss.config.ConfigOptions.TABLE_SECONDARY_INDEX_BUCKET_NUM;
+import static org.apache.fluss.config.ConfigOptions.TABLE_SECONDARY_INDEX_COLUMNS;
 import static org.apache.fluss.config.FlussConfigUtils.isTableStorageConfig;
 import static org.apache.fluss.flink.FlinkConnectorOptions.AUTO_INCREMENT_FIELDS;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BUCKET_KEY;
@@ -204,13 +207,20 @@ public class FlinkConversions {
         ResolvedSchema resolvedSchema = catalogBaseTable.getResolvedSchema();
 
         // now, build Fluss's table
-        Schema.Builder schemBuilder = Schema.newBuilder();
+        Schema.Builder schemaBuilder = Schema.newBuilder();
         if (resolvedSchema.getPrimaryKey().isPresent()) {
-            schemBuilder.primaryKey(resolvedSchema.getPrimaryKey().get().getColumns());
+            schemaBuilder.primaryKey(resolvedSchema.getPrimaryKey().get().getColumns());
         }
 
         // Check if aggregation merge engine is enabled to optimize parsing
         boolean isAggregationEngine = isAggregationMergeEngine(flinkTableConf);
+
+        // parse global secondary indexes from options
+        parseGlobalSecondaryIndexes(flinkTableConf, schemaBuilder);
+
+        // convert some flink options to fluss table configs.
+        Map<String, String> storageProperties =
+                convertFlinkOptionsToFlussTableProperties(flinkTableConf);
 
         // Build schema with physical columns
         resolvedSchema.getColumns().stream()
@@ -218,19 +228,18 @@ public class FlinkConversions {
                 .forEachOrdered(
                         column ->
                                 addColumnToSchema(
-                                        schemBuilder, column, flinkTableConf, isAggregationEngine));
+                                        schemaBuilder,
+                                        column,
+                                        flinkTableConf,
+                                        isAggregationEngine));
 
         // Configure auto-increment columns based on the 'auto-increment.fields' option.
         if (flinkTableConf.containsKey(AUTO_INCREMENT_FIELDS.key())) {
             for (String autoIncrementColumn :
                     flinkTableConf.get(AUTO_INCREMENT_FIELDS).split(",")) {
-                schemBuilder.enableAutoIncrement(autoIncrementColumn.trim());
+                schemaBuilder.enableAutoIncrement(autoIncrementColumn.trim());
             }
         }
-
-        // convert some flink options to fluss table configs.
-        Map<String, String> storageProperties =
-                convertFlinkOptionsToFlussTableProperties(flinkTableConf);
 
         // serialize computed column and watermark spec to custom properties
         Map<String, String> customProperties =
@@ -240,7 +249,15 @@ public class FlinkConversions {
         CatalogPropertiesUtils.serializeWatermarkSpecs(
                 customProperties, catalogBaseTable.getResolvedSchema().getWatermarkSpecs());
 
-        Schema schema = schemBuilder.build();
+        // add index bucket num configuration if present
+        String indexBucketNumKey = TABLE_SECONDARY_INDEX_BUCKET_NUM.key();
+        if (flinkTableConf.containsKey(indexBucketNumKey)) {
+            customProperties.put(
+                    TABLE_SECONDARY_INDEX_BUCKET_NUM.key(),
+                    flinkTableConf.toMap().get(indexBucketNumKey));
+        }
+
+        Schema schema = schemaBuilder.build();
 
         resolvedSchema.getColumns().stream()
                 .filter(col -> col instanceof Column.MetadataColumn)
@@ -714,5 +731,101 @@ public class FlinkConversions {
         customProperties.remove(BUCKET_KEY.key());
         customProperties.remove(BUCKET_NUMBER.key());
         return customProperties;
+    }
+
+    /**
+     * Parse global secondary indexes from Flink table options.
+     *
+     * <p>Supports configuration format:
+     *
+     * <ul>
+     *   <li>indexes.columns: semicolon-separated indexes, comma-separated columns within each index
+     * </ul>
+     *
+     * <p>Additional option: - index.bucket.num: bucket count for index tables (default: 3)
+     *
+     * @param options Flink table configuration options
+     * @param schemaBuilder Schema builder to add indexes to
+     */
+    private static void parseGlobalSecondaryIndexes(
+            Configuration options, Schema.Builder schemaBuilder) {
+        Map<String, List<String>> indexColumns = new LinkedHashMap<>();
+
+        // Parse the table.secondary-index.columns format - use the correct key from ConfigOptions
+        String indexColumnsKey = TABLE_SECONDARY_INDEX_COLUMNS.key();
+        if (options.containsKey(indexColumnsKey)) {
+            parseIndexesColumns(options.getString(indexColumnsKey, ""), indexColumns);
+        }
+
+        // Add indexes to schema builder
+        for (Map.Entry<String, List<String>> entry : indexColumns.entrySet()) {
+            schemaBuilder.index(entry.getKey(), entry.getValue());
+        }
+    }
+
+    /**
+     * Parse indexes using the indexes.columns format. Format: 'col1,col2;col3,col4' - multiple
+     * indexes separated by ';', columns within each index separated by ','
+     *
+     * @param configValue the configuration value
+     * @param indexColumns output map to store parsed index configurations
+     */
+    private static void parseIndexesColumns(
+            String configValue, Map<String, List<String>> indexColumns) {
+        if (StringUtils.isNullOrWhitespaceOnly(configValue)) {
+            return;
+        }
+
+        String[] indexConfigs = configValue.split(";");
+        for (String indexConfig : indexConfigs) {
+            indexConfig = indexConfig.trim();
+            if (StringUtils.isNullOrWhitespaceOnly(indexConfig)) {
+                continue;
+            }
+
+            List<String> columns =
+                    Arrays.stream(indexConfig.split(","))
+                            .map(String::trim)
+                            .filter(col -> !StringUtils.isNullOrWhitespaceOnly(col))
+                            .collect(Collectors.toList());
+
+            if (columns.isEmpty()) {
+                throw new CatalogException(
+                        "Index configuration '"
+                                + indexConfig
+                                + "' must define at least one column");
+            }
+
+            // Check for duplicate columns within the same index
+            if (columns.size() != columns.stream().distinct().count()) {
+                throw new CatalogException(
+                        "Index configuration '" + indexConfig + "' contains duplicate columns");
+            }
+
+            // Generate index name automatically: idx_{sorted_column_names}
+            String indexName = generateIndexName(columns);
+
+            // Check for duplicate index configurations
+            if (indexColumns.containsKey(indexName)) {
+                throw new CatalogException(
+                        "Duplicate index configuration found for columns: "
+                                + String.join(",", columns));
+            }
+
+            indexColumns.put(indexName, columns);
+        }
+    }
+
+    /**
+     * Generate index name automatically based on column names. Format:
+     * idx_{sorted_column_names_joined_by_underscore}
+     *
+     * @param columns list of column names for the index
+     * @return generated index name
+     */
+    private static String generateIndexName(List<String> columns) {
+        List<String> sorted = new ArrayList<>(columns);
+        Collections.sort(sorted);
+        return "idx_" + String.join("_", sorted);
     }
 }

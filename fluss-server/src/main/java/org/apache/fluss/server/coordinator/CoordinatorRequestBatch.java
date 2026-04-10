@@ -59,6 +59,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_ID;
@@ -109,6 +110,9 @@ public class CoordinatorRequestBatch {
 
     private final Map<Integer, Map<TableBucket, PbNotifyLakeTableOffsetReqForBucket>>
             notifyLakeTableOffsetRequestMap = new HashMap<>();
+
+    // Track servers that failed to receive UpdateMetadata, for retry by the caller.
+    private final Set<Integer> failedUpdateMetadataServers = ConcurrentHashMap.newKeySet();
 
     private final CoordinatorChannelManager coordinatorChannelManager;
     private final EventManager eventManager;
@@ -545,7 +549,11 @@ public class CoordinatorRequestBatch {
                     updateMetadataRequest,
                     (response, throwable) -> {
                         if (throwable != null) {
-                            LOG.debug("Failed to send update metadata request.", throwable);
+                            LOG.warn(
+                                    "Failed to send update metadata request to tablet server {}.",
+                                    serverId,
+                                    throwable);
+                            failedUpdateMetadataServers.add(serverId);
                         } else {
                             LOG.debug("Update metadata for server {} success.", serverId);
                         }
@@ -554,6 +562,16 @@ public class CoordinatorRequestBatch {
         updateMetadataRequestTabletServerSet.clear();
         updateMetadataRequestBucketMap.clear();
         updateMetadataRequestPartitionMap.clear();
+    }
+
+    /**
+     * Drain and return the set of server IDs that failed to receive UpdateMetadata requests. The
+     * returned servers are removed from the internal tracking set so they won't be returned again.
+     */
+    public Set<Integer> drainFailedUpdateMetadataServers() {
+        Set<Integer> failed = new HashSet<>(failedUpdateMetadataServers);
+        failedUpdateMetadataServers.removeAll(failed);
+        return failed;
     }
 
     public void sendNotifyRemoteLogOffsetsRequest(int coordinatorEpoch) {

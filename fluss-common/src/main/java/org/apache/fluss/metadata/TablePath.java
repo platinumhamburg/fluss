@@ -128,7 +128,49 @@ public class TablePath implements Serializable {
     }
 
     // -------------------------------------------------------------------------------------------
-    // Helper methods
+    // Index Table Methods
+    // -------------------------------------------------------------------------------------------
+
+    /** The naming pattern prefix for index tables. */
+    private static final String INDEX_TABLE_PREFIX = "__";
+
+    /** The naming pattern infix for index tables. */
+    private static final String INDEX_TABLE_INFIX = "__index__";
+
+    /**
+     * Creates a table path for an index table based on the main table path and index name.
+     *
+     * <p>The index table name follows the pattern: __mainTableName__index__indexName
+     *
+     * @param mainTablePath the path of the main table
+     * @param indexName the name of the index
+     * @return the table path for the index table
+     */
+    public static TablePath forIndexTable(TablePath mainTablePath, String indexName) {
+        String indexTableName =
+                INDEX_TABLE_PREFIX + mainTablePath.getTableName() + INDEX_TABLE_INFIX + indexName;
+        return new TablePath(mainTablePath.getDatabaseName(), indexTableName);
+    }
+
+    /**
+     * Checks if this table path represents an index table based on the naming pattern.
+     *
+     * <p>Index table names follow the pattern: __mainTableName__index__indexName
+     *
+     * <p>Note: This method only checks the naming pattern. For authoritative determination, use
+     * {@link TableDescriptor#isIndexTable()} or {@link TableInfo#isIndexTable()} which check the
+     * table properties.
+     *
+     * @return true if the table name matches the index table pattern, false otherwise
+     */
+    public boolean isIndexTableName() {
+        return tableName != null
+                && tableName.startsWith(INDEX_TABLE_PREFIX)
+                && tableName.contains(INDEX_TABLE_INFIX);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Validation Helper methods
     // -------------------------------------------------------------------------------------------
 
     public static void validateDatabaseName(String databaseName) throws InvalidDatabaseException {

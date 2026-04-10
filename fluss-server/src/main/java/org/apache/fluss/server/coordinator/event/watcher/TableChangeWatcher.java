@@ -187,9 +187,7 @@ public class TableChangeWatcher {
                             eventManager.put(
                                     new DropTableEvent(
                                             table.tableId,
-                                            tableConfig
-                                                    .getAutoPartitionStrategy()
-                                                    .isAutoPartitionEnabled(),
+                                            table.isPartitioned(),
                                             tableConfig.isDataLakeEnabled()));
                         }
                         break;

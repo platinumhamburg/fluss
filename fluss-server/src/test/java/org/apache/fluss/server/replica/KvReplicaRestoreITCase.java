@@ -31,6 +31,7 @@ import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.kv.snapshot.TabletState;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.utils.ExceptionUtils;
@@ -237,14 +238,15 @@ class KvReplicaRestoreITCase {
 
         FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tablePath);
 
-        // Verify the snapshot contains row count
+        // Verify the snapshot contains row count (loaded from _TABLET_STATE)
         CompletedSnapshot completedSnapshot =
                 completedSnapshotHandleStore
                         .getLatestCompletedSnapshotHandle(tableBucket)
                         .get()
                         .retrieveCompleteSnapshot();
-        assertThat(completedSnapshot.getRowCount()).isNotNull();
-        assertThat(completedSnapshot.getRowCount()).isEqualTo(recordCount);
+        TabletState snapshotTabletState = completedSnapshot.loadTabletState();
+        assertThat(snapshotTabletState.getRowCount()).isNotNull();
+        assertThat(snapshotTabletState.getRowCount()).isEqualTo(recordCount);
 
         // Trigger another write to generate changelogs not in snapshot
         List<KvRecord> moreRecords = new ArrayList<>();

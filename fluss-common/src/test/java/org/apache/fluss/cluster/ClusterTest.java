@@ -87,7 +87,7 @@ class ClusterTest {
         for (int i = 0; i < 10000; i++) {
             // mock invalid meta
             cluster =
-                    cluster.invalidPhysicalTableBucketMeta(
+                    cluster.invalidatePhysicalTableBucketMetadata(
                             Collections.singleton(DATA1_PHYSICAL_TABLE_PATH));
             // mock update meta
             cluster =

@@ -22,12 +22,14 @@ import org.apache.fluss.annotation.PublicStable;
 import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.ConfigurationUtils;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.TableDescriptorJsonSerde;
 
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -37,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -68,6 +71,24 @@ public final class TableDescriptor implements Serializable {
     // column names for $binlog virtual table nested row fields
     public static final String BEFORE_COLUMN = "before";
     public static final String AFTER_COLUMN = "after";
+
+    /** System column used for KV TTL timestamp (epoch millis) in index tables. */
+    public static final String INDEX_TTL_COLUMN_NAME = "__ttl_ts";
+
+    /** System columns for tracking source information in index tables. */
+    public static final String INDEX_SOURCE_PARTITION_ID_COLUMN = "__source_partition_id";
+
+    public static final String INDEX_SOURCE_BUCKET_ID_COLUMN = "__source_bucket_id";
+    public static final String INDEX_SOURCE_OFFSET_COLUMN = "__source_offset";
+
+    /** System column names reserved for index tables. */
+    private static final Set<String> INDEX_SYSTEM_COLUMN_NAMES =
+            new HashSet<>(
+                    java.util.Arrays.asList(
+                            INDEX_TTL_COLUMN_NAME,
+                            INDEX_SOURCE_PARTITION_ID_COLUMN,
+                            INDEX_SOURCE_BUCKET_ID_COLUMN,
+                            INDEX_SOURCE_OFFSET_COLUMN));
 
     private final Schema schema;
     private final @Nullable String comment;
@@ -128,6 +149,14 @@ public final class TableDescriptor implements Serializable {
                                             f));
         }
 
+        // validate indexes: indexes are only supported for primary key tables
+        if (!schema.getIndexes().isEmpty()) {
+            checkArgument(
+                    schema.getPrimaryKey().isPresent(),
+                    "Global secondary indexes are only supported for primary key tables. Found %d indexes but no primary key.",
+                    schema.getIndexes().size());
+        }
+
         checkArgument(
                 properties.entrySet().stream()
                         .allMatch(e -> e.getKey() != null && e.getValue() != null),
@@ -145,6 +174,217 @@ public final class TableDescriptor implements Serializable {
     /** Creates a builder based on an existing TableDescriptor. */
     public static Builder builder(TableDescriptor origin) {
         return new Builder(origin);
+    }
+
+    /**
+     * Creates a table descriptor for an index table based on the main table descriptor and index
+     * definition.
+     *
+     * <p>The index table schema includes:
+     *
+     * <ul>
+     *   <li>All index columns
+     *   <li>All primary key columns from the main table
+     * </ul>
+     *
+     * <p>The primary key of the index table consists of index columns + primary key columns to
+     * ensure uniqueness.
+     *
+     * @param mainTableDescriptor the descriptor of the main table
+     * @param index the index definition
+     * @param mainTableId the table ID of the main table
+     * @param mainTableName the table name of the main table (same database as index table)
+     * @return the table descriptor for the index table
+     */
+    public static TableDescriptor forIndexTable(
+            TableDescriptor mainTableDescriptor,
+            Schema.Index index,
+            long mainTableId,
+            String mainTableName) {
+        Schema mainSchema = mainTableDescriptor.getSchema();
+
+        // Step 1: Build ordered column list (index columns + PK columns)
+        List<String> orderedColumnNames =
+                buildOrderedColumnNames(
+                        index.getColumnNames(), mainSchema.getPrimaryKeyColumnNames());
+
+        // Step 2: Build index table columns from main schema
+        List<Schema.Column> indexTableColumns =
+                buildIndexTableColumns(mainSchema, orderedColumnNames);
+
+        // Step 3: Add system columns (TTL + source tracking)
+        long ttlMillis =
+                AutoPartitionStrategy.from(mainTableDescriptor.getProperties())
+                        .toApproximateTtlMillis();
+        addSystemColumns(indexTableColumns, ttlMillis);
+
+        // Step 4: Build index table schema with primary key
+        Schema indexTableSchema = buildIndexTableSchema(indexTableColumns, index, mainSchema);
+
+        // Step 5: Build table descriptor with properties
+        return buildIndexTableDescriptor(
+                indexTableSchema,
+                index,
+                mainTableDescriptor,
+                mainTableId,
+                mainTableName,
+                ttlMillis);
+    }
+
+    // ==================== forIndexTable helper methods ====================
+
+    /**
+     * Builds the ordered column name list: index columns first, then PK columns (excluding
+     * duplicates). Validates no collision with reserved system column names.
+     */
+    private static List<String> buildOrderedColumnNames(
+            List<String> indexColumns, List<String> mainPrimaryKeyColumns) {
+        List<String> orderedColumnNames = new ArrayList<>();
+        Set<String> addedColumns = new HashSet<>();
+
+        for (String indexColumn : indexColumns) {
+            if (!addedColumns.contains(indexColumn)) {
+                orderedColumnNames.add(indexColumn);
+                addedColumns.add(indexColumn);
+            }
+        }
+        for (String pkColumn : mainPrimaryKeyColumns) {
+            if (!addedColumns.contains(pkColumn)) {
+                orderedColumnNames.add(pkColumn);
+                addedColumns.add(pkColumn);
+            }
+        }
+
+        // Validate no collision with reserved system column names
+        for (String columnName : orderedColumnNames) {
+            checkArgument(
+                    !INDEX_SYSTEM_COLUMN_NAMES.contains(columnName),
+                    "Column name '%s' is reserved for index table system use and cannot be used as an index or primary key column.",
+                    columnName);
+        }
+        return orderedColumnNames;
+    }
+
+    /** Builds index table columns from the main schema in the specified order. */
+    private static List<Schema.Column> buildIndexTableColumns(
+            Schema mainSchema, List<String> orderedColumnNames) {
+        Map<String, Schema.Column> columnMap = new HashMap<>();
+        for (Schema.Column column : mainSchema.getColumns()) {
+            columnMap.put(column.getName(), column);
+        }
+        List<Schema.Column> columns = new ArrayList<>();
+        for (String columnName : orderedColumnNames) {
+            columns.add(columnMap.get(columnName));
+        }
+        return columns;
+    }
+
+    /**
+     * Adds system columns to the index table column list: TTL column (if ttlMillis > 0) and source
+     * tracking columns (always).
+     */
+    private static void addSystemColumns(List<Schema.Column> columns, long ttlMillis) {
+        if (ttlMillis > 0) {
+            int nextColumnId = nextColumnId(columns);
+            columns.add(
+                    new Schema.Column(
+                            INDEX_TTL_COLUMN_NAME,
+                            org.apache.fluss.types.DataTypes.BIGINT(),
+                            "System column for KV TTL timestamp (epoch millis).",
+                            nextColumnId));
+        }
+
+        int nextColumnId = nextColumnId(columns);
+        columns.add(
+                new Schema.Column(
+                        INDEX_SOURCE_PARTITION_ID_COLUMN,
+                        new org.apache.fluss.types.BigIntType(true),
+                        "Source partition ID (null for non-partitioned tables).",
+                        nextColumnId));
+        columns.add(
+                new Schema.Column(
+                        INDEX_SOURCE_BUCKET_ID_COLUMN,
+                        org.apache.fluss.types.DataTypes.INT(),
+                        "Source data bucket ID.",
+                        nextColumnId + 1));
+        columns.add(
+                new Schema.Column(
+                        INDEX_SOURCE_OFFSET_COLUMN,
+                        org.apache.fluss.types.DataTypes.BIGINT(),
+                        "Source record offset in the data bucket.",
+                        nextColumnId + 2));
+    }
+
+    private static int nextColumnId(List<Schema.Column> columns) {
+        return columns.stream()
+                        .mapToInt(Schema.Column::getColumnId)
+                        .max()
+                        .orElse(Schema.Column.UNKNOWN_COLUMN_ID)
+                + 1;
+    }
+
+    /** Builds the index table schema with primary key = index columns + PK columns. */
+    private static Schema buildIndexTableSchema(
+            List<Schema.Column> indexTableColumns, Schema.Index index, Schema mainSchema) {
+        List<String> indexTablePrimaryKey = new ArrayList<>(index.getColumnNames());
+        for (String pkColumn : mainSchema.getPrimaryKeyColumnNames()) {
+            if (!indexTablePrimaryKey.contains(pkColumn)) {
+                indexTablePrimaryKey.add(pkColumn);
+            }
+        }
+        return Schema.newBuilder()
+                .fromColumns(indexTableColumns)
+                .primaryKeyNamed("pk_" + index.getIndexName(), indexTablePrimaryKey)
+                .build();
+    }
+
+    /** Builds the final index table descriptor with all properties. */
+    private static TableDescriptor buildIndexTableDescriptor(
+            Schema indexTableSchema,
+            Schema.Index index,
+            TableDescriptor mainTableDescriptor,
+            long mainTableId,
+            String mainTableName,
+            long ttlMillis) {
+        int indexBucketCount =
+                Optional.ofNullable(
+                                mainTableDescriptor
+                                        .getProperties()
+                                        .get(ConfigOptions.TABLE_SECONDARY_INDEX_BUCKET_NUM.key()))
+                        .map(Integer::parseInt)
+                        .orElse(ConfigOptions.TABLE_SECONDARY_INDEX_BUCKET_NUM.defaultValue());
+
+        Builder builder =
+                builder()
+                        .schema(indexTableSchema)
+                        .kvFormat(KvFormat.INDEXED)
+                        .logFormat(LogFormat.INDEXED)
+                        .distributedBy(indexBucketCount, index.getColumnNames())
+                        .property(ConfigOptions.TABLE_TYPE, TableType.INDEX_TABLE)
+                        .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, mainTableId)
+                        .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_NAME, mainTableName);
+
+        if (ttlMillis > 0) {
+            builder.property(
+                            ConfigOptions.TABLE_KV_COMPACTION_FILTER_TYPE, CompactionFilterType.TTL)
+                    .property(
+                            ConfigOptions.TABLE_KV_COMPACTION_FILTER_TTL_COLUMN,
+                            INDEX_TTL_COLUMN_NAME)
+                    .property(
+                            ConfigOptions.TABLE_KV_COMPACTION_FILTER_TTL_RETENTION,
+                            Duration.ofMillis(ttlMillis));
+        }
+
+        String mainTableReplicationFactor =
+                mainTableDescriptor
+                        .getProperties()
+                        .get(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
+        if (mainTableReplicationFactor != null) {
+            builder.property(
+                    ConfigOptions.TABLE_REPLICATION_FACTOR.key(), mainTableReplicationFactor);
+        }
+
+        return builder.build();
     }
 
     /** Returns the {@link Schema} of the table. */
@@ -301,6 +541,47 @@ public final class TableDescriptor implements Serializable {
 
     public Optional<String> getComment() {
         return Optional.ofNullable(comment);
+    }
+
+    /**
+     * Returns whether this table is an index table (secondary index).
+     *
+     * <p>Index tables are created automatically by the system when a user defines global secondary
+     * indexes on a main table. They are managed internally and should not be directly modified by
+     * users.
+     *
+     * @return true if this is an index table, false otherwise
+     */
+    public boolean isIndexTable() {
+        String tableType = properties.get(ConfigOptions.TABLE_TYPE.key());
+        return TableType.INDEX_TABLE.name().equals(tableType);
+    }
+
+    /**
+     * Returns the table ID of the main table for index tables.
+     *
+     * <p>For index tables, this returns the table ID of the main table that this index belongs to.
+     * For non-index tables, this returns empty.
+     *
+     * @return the main table ID if this is an index table, empty otherwise
+     */
+    public OptionalLong getMainTableId() {
+        String value = properties.get(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key());
+        return value == null ? OptionalLong.empty() : OptionalLong.of(Long.parseLong(value));
+    }
+
+    /**
+     * Returns the table name of the main table for index tables.
+     *
+     * <p>For index tables, this returns the table name of the main table that this index belongs
+     * to. Since index tables are always in the same database as their main table, this name can be
+     * combined with the index table's database name to construct the full TablePath.
+     *
+     * @return the main table name if this is an index table, empty otherwise
+     */
+    public Optional<String> getMainTableName() {
+        return Optional.ofNullable(
+                properties.get(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_NAME.key()));
     }
 
     /**

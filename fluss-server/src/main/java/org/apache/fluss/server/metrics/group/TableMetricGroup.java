@@ -33,6 +33,7 @@ import org.apache.fluss.utils.MapUtils;
 import javax.annotation.Nullable;
 
 import java.util.Map;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.metrics.utils.MetricGroupUtils.makeScope;
@@ -55,6 +56,13 @@ public class TableMetricGroup extends AbstractMetricGroup {
 
     // table-level  metrics for kv, will be null if the table isn't a kv table
     private final @Nullable KvMetricGroup kvMetrics;
+
+    // Map to track index replication lag suppliers for each bucket
+    private final Map<TableBucket, Supplier<Long>> indexLagSuppliers =
+            MapUtils.newConcurrentHashMap();
+
+    // Flag to ensure index max replication lag gauge is registered only once
+    private volatile boolean indexMaxLagGaugeRegistered = false;
 
     public TableMetricGroup(
             MetricRegistry registry,
@@ -388,6 +396,52 @@ public class TableMetricGroup extends AbstractMetricGroup {
                         allRocksDBStatistics()
                                 .mapToLong(RocksDBStatistics::getBlockCachePinnedUsage)
                                 .sum());
+    }
+
+    /**
+     * Register index replication lag supplier for a specific bucket. The table-level gauge will
+     * compute the maximum lag across all registered buckets.
+     *
+     * @param tableBucket the table bucket
+     * @param lagSupplier supplier to calculate the replication lag for this bucket
+     */
+    public void registerBucketIndexLagSupplier(
+            TableBucket tableBucket, Supplier<Long> lagSupplier) {
+        indexLagSuppliers.put(tableBucket, lagSupplier);
+
+        // Register table-level gauge only once for the first bucket
+        if (!indexMaxLagGaugeRegistered) {
+            synchronized (this) {
+                if (!indexMaxLagGaugeRegistered) {
+                    gauge(MetricNames.INDEX_MAX_REPLICATION_LAG_OFFSET, this::getMaxIndexLag);
+                    indexMaxLagGaugeRegistered = true;
+                }
+            }
+        }
+    }
+
+    /**
+     * Unregister index replication lag supplier when a bucket is removed.
+     *
+     * @param tableBucket the table bucket
+     */
+    public void unregisterBucketIndexLagSupplier(TableBucket tableBucket) {
+        indexLagSuppliers.remove(tableBucket);
+    }
+
+    @Override
+    public void close() {
+        indexLagSuppliers.clear();
+        super.close();
+    }
+
+    /**
+     * Calculate the maximum index replication lag across all buckets of this table.
+     *
+     * @return the maximum lag, or 0 if no buckets are reporting lag
+     */
+    private long getMaxIndexLag() {
+        return indexLagSuppliers.values().stream().mapToLong(Supplier::get).max().orElse(0L);
     }
 
     /** Metric group for specific kind of tablet of a table. */

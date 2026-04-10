@@ -297,12 +297,21 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
                     }
                     AdjustIsrResultForBucket adjustIsrResultForBucket;
                     if (requestLeaderEpoch < currentLeaderEpoch) {
+                        // Return corrective LeaderAndIsr with the actual leader info
+                        LeaderAndIsr corrective =
+                                new LeaderAndIsr(
+                                        leaderAndIsr.leader(),
+                                        currentLeaderEpoch,
+                                        leaderAndIsr.isr(),
+                                        leaderAndIsr.coordinatorEpoch(),
+                                        leaderAndIsr.bucketEpoch());
                         adjustIsrResultForBucket =
-                                new AdjustIsrResultForBucket(
+                                AdjustIsrResultForBucket.withCorrectiveLeaderAndIsr(
                                         tb,
                                         ApiError.fromThrowable(
                                                 new FencedLeaderEpochException(
-                                                        "request leader epoch is fenced.")));
+                                                        "request leader epoch is fenced.")),
+                                        corrective);
                     } else if (!ineligibleReplicas.isEmpty()) {
                         adjustIsrResultForBucket =
                                 new AdjustIsrResultForBucket(
