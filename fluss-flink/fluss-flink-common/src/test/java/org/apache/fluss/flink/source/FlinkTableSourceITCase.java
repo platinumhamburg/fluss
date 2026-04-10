@@ -1488,6 +1488,164 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         }
     }
 
+    /**
+     * Tests that ALTER TABLE can dynamically change statistics columns configuration, and filter
+     * pushdown works correctly across different statistics modes: disabled → subset → wildcard.
+     *
+     * <p>Each phase writes data, then verifies filter pushdown behavior. Since {@code writeRows}
+     * re-creates the Table instance each time, the writer picks up the latest TableInfo after ALTER
+     * TABLE, so new batches are written with the updated statistics configuration.
+     */
+    @Test
+    void testAlterTableStatisticsColumnsWithFilterPushDown() throws Exception {
+        // Create table WITHOUT statistics columns (disabled mode)
+        tEnv.executeSql(
+                "create table alter_stats_test "
+                        + "(id int, amount bigint, region varchar, score double) "
+                        + "with ("
+                        + "'table.log.format' = 'ARROW', "
+                        + "'client.writer.batch-size' = '16kb', "
+                        + "'client.writer.batch-timeout' = '10ms'"
+                        + ")");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "alter_stats_test");
+
+        // ========== Phase 1: Statistics DISABLED ==========
+        // Write data with amount range [0, 900], step=100
+        List<InternalRow> phase1Rows = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            phase1Rows.add(row(i, (long) (i * 100), "HangZhou", i * 1.5));
+        }
+        writeRows(conn, tablePath, phase1Rows, true);
+
+        // Without statistics columns configured, filter is NOT pushed to source for record
+        // batch filtering — it only appears in the Calc operator
+        String query1 = "select id, amount from alter_stats_test where amount > 500";
+        String plan1 = tEnv.explainSql(query1);
+        assertThat(plan1).contains("filter=[]");
+        assertThat(plan1).contains("where=");
+
+        // Verify correctness: amount > 500 means amount in {600, 700, 800, 900}
+        List<String> expected1 = new ArrayList<>();
+        for (int i = 6; i < 10; i++) {
+            expected1.add(String.format("+I[%d, %d]", i, i * 100));
+        }
+        try (CloseableIterator<Row> iter = tEnv.executeSql(query1).collect()) {
+            assertResultsIgnoreOrder(iter, expected1, true);
+        }
+
+        // ========== Phase 2: ALTER TABLE to enable statistics on subset ('amount') ==========
+        tEnv.executeSql("alter table alter_stats_test set ('table.statistics.columns' = 'amount')");
+
+        // Write new data with amount range [1000, 1900], step=100
+        List<InternalRow> phase2Rows = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            phase2Rows.add(row(10 + i, (long) (1000 + i * 100), "Shanghai", (10 + i) * 1.5));
+        }
+        writeRows(conn, tablePath, phase2Rows, true);
+
+        // Filter on 'amount' column — statistics should be collected for new batches
+        String query2 = "select id, amount from alter_stats_test where amount > 1500";
+        String plan2 = tEnv.explainSql(query2);
+        assertThat(plan2).contains("filter=[>(amount, 1500)]");
+
+        // Verify correctness: amount > 1500 means amount in {1600, 1700, 1800, 1900}
+        List<String> expected2 = new ArrayList<>();
+        for (int i = 6; i < 10; i++) {
+            expected2.add(String.format("+I[%d, %d]", 10 + i, 1000 + i * 100));
+        }
+        try (CloseableIterator<Row> iter = tEnv.executeSql(query2).collect()) {
+            assertResultsIgnoreOrder(iter, expected2, true);
+        }
+
+        // Filter on 'score' column — no statistics for 'score' in subset mode,
+        // filter is NOT pushed to source for record batch filtering, only in Calc operator.
+        // Select integer columns to avoid fragile double formatting in assertions.
+        String query2b = "select id, amount from alter_stats_test where score > 20.0";
+        String plan2b = tEnv.explainSql(query2b);
+        assertThat(plan2b).contains("filter=[]");
+        assertThat(plan2b).contains("where=");
+
+        List<String> expected2b = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            double score = (10 + i) * 1.5;
+            if (score > 20.0) {
+                expected2b.add(String.format("+I[%d, %d]", 10 + i, 1000 + i * 100));
+            }
+        }
+        try (CloseableIterator<Row> iter = tEnv.executeSql(query2b).collect()) {
+            assertResultsIgnoreOrder(iter, expected2b, true);
+        }
+
+        // ========== Phase 3: ALTER TABLE to wildcard '*' (all supported columns) ==========
+        tEnv.executeSql("alter table alter_stats_test set ('table.statistics.columns' = '*')");
+
+        // Write new data with amount range [2000, 2900], step=100
+        List<InternalRow> phase3Rows = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            phase3Rows.add(row(20 + i, (long) (2000 + i * 100), "Beijing", (20 + i) * 1.5));
+        }
+        writeRows(conn, tablePath, phase3Rows, true);
+
+        // Filter on 'amount' — statistics available
+        String query3 = "select id, amount, region from alter_stats_test where amount >= 2500";
+        String plan3 = tEnv.explainSql(query3);
+        assertThat(plan3).contains("filter=[>=(amount, 2500)]");
+
+        // Verify correctness: amount >= 2500 means amount in {2500, 2600, 2700, 2800, 2900}
+        List<String> expected3 = new ArrayList<>();
+        for (int i = 5; i < 10; i++) {
+            expected3.add(String.format("+I[%d, %d, Beijing]", 20 + i, 2000 + i * 100));
+        }
+        try (CloseableIterator<Row> iter = tEnv.executeSql(query3).collect()) {
+            assertResultsIgnoreOrder(iter, expected3, true);
+        }
+
+        // Combined filter on 'amount' and 'region' — both have statistics in wildcard mode,
+        // so the filter should be pushed to source (not empty)
+        String query3b =
+                "select id, amount, region from alter_stats_test "
+                        + "where amount >= 1000 and region = 'Beijing'";
+        String plan3b = tEnv.explainSql(query3b);
+        assertThat(plan3b)
+                .contains(
+                        "filter=[and(>=(amount, 1000), "
+                                + "=(region, _UTF-16LE'Beijing':VARCHAR(2147483647) CHARACTER SET \"UTF-16LE\"))]");
+
+        // Verify: amount >= 1000 AND region = 'Beijing' → only phase3 rows
+        // (phase2 rows have region='Shanghai', so they are excluded by the region filter)
+        List<String> expected3b = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            expected3b.add(String.format("+I[%d, %d, Beijing]", 20 + i, 2000 + i * 100));
+        }
+        try (CloseableIterator<Row> iter = tEnv.executeSql(query3b).collect()) {
+            assertResultsIgnoreOrder(iter, expected3b, true);
+        }
+
+        // ========== Phase 4: Cross-phase query — all data, mixed statistics coverage ==========
+        // Query across all phases: phase1 batches have no stats, phase2 has partial (amount only),
+        // phase3 has full stats. The filter should still be pushed down because the latest
+        // table config has statistics enabled, and batches without stats are conservatively
+        // included.
+        String query4 =
+                "select id, amount from alter_stats_test "
+                        + "where amount >= 500 and amount < 1500";
+        String plan4 = tEnv.explainSql(query4);
+        assertThat(plan4).contains("filter=[and(>=(amount, 500), <(amount, 1500))]");
+
+        List<String> expected4 = new ArrayList<>();
+        // Phase 1 rows: amount in {500, 600, 700, 800, 900}
+        for (int i = 5; i < 10; i++) {
+            expected4.add(String.format("+I[%d, %d]", i, i * 100));
+        }
+        // Phase 2 rows: amount in {1000, 1100, 1200, 1300, 1400}
+        for (int i = 0; i < 5; i++) {
+            expected4.add(String.format("+I[%d, %d]", 10 + i, 1000 + i * 100));
+        }
+        try (CloseableIterator<Row> iter = tEnv.executeSql(query4).collect()) {
+            assertResultsIgnoreOrder(iter, expected4, true);
+        }
+    }
+
     private List<String> writeRowsToTwoPartition(TablePath tablePath, Collection<String> partitions)
             throws Exception {
         List<InternalRow> rows = new ArrayList<>();
