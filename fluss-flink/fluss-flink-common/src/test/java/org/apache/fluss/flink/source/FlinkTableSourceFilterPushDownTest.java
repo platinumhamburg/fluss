@@ -19,6 +19,7 @@ package org.apache.fluss.flink.source;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
 import org.apache.fluss.metadata.TablePath;
@@ -84,7 +85,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             tablePath,
                             flussConfig,
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             tableOutputType,
                             new int[] {0}, // primary key indexes (id)
                             new int[] {}, // bucket key indexes
@@ -191,7 +192,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             tablePath,
                             flussConfig,
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             tableOutputType,
                             new int[] {}, // no primary key indexes
                             new int[] {}, // bucket key indexes
@@ -388,7 +389,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             tablePath,
                             flussConfig,
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             tableOutputType,
                             new int[] {0}, // primary key indexes (id)
                             new int[] {}, // bucket key indexes
@@ -486,7 +487,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             tablePath,
                             flussConfig,
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             tableOutputType,
                             new int[] {}, // no primary key indexes
                             new int[] {}, // bucket key indexes
@@ -684,7 +685,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             tablePath,
                             flussConfig,
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             tableOutputType,
                             new int[] {}, // no primary key indexes
                             new int[] {}, // bucket key indexes
@@ -861,7 +862,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             TablePath.of("test_db", "test_empty_stats_table"),
                             new Configuration(),
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             tableOutputType,
                             new int[] {}, // no primary key indexes
                             new int[] {}, // bucket key indexes
@@ -929,7 +930,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             tablePath,
                             flussConfig,
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             tableOutputType,
                             new int[] {0}, // primary key indexes (id)
                             new int[] {}, // bucket key indexes
@@ -1023,7 +1024,7 @@ public class FlinkTableSourceFilterPushDownTest {
                     new FlinkTableSource(
                             TablePath.of("test_db", "test_batch_table"),
                             new Configuration(),
-                            tableConfig,
+                            new TableConfig(tableConfig),
                             nonFullStartupTableOutputType,
                             new int[] {0}, // primary key indexes
                             new int[] {}, // bucket key indexes

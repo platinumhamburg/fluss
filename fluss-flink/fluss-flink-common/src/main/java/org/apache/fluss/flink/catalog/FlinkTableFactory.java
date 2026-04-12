@@ -19,6 +19,7 @@ package org.apache.fluss.flink.catalog;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.lake.LakeFlinkCatalog;
 import org.apache.fluss.flink.lake.LakeTableFactory;
@@ -275,7 +276,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         return flussConfig;
     }
 
-    private static Configuration toFlussTableConfig(ReadableConfig tableOptions) {
+    private static TableConfig toFlussTableConfig(ReadableConfig tableOptions) {
         Configuration tableConfig = new Configuration();
 
         // forward all table-level configs by iterating through known table options
@@ -290,7 +291,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
             }
         }
 
-        return tableConfig;
+        return new TableConfig(tableConfig);
     }
 
     private static TablePath toFlussTablePath(ObjectIdentifier tablePath) {

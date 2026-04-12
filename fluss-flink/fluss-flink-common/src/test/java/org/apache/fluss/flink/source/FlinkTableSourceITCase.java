@@ -24,6 +24,7 @@ import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
@@ -1664,6 +1665,26 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                 .rootCause()
                 .hasMessageContaining(
                         "Statistics columns are not supported for primary key tables");
+    }
+
+    /** Tests that ALTER TABLE rejects invalid statistics columns on log tables. */
+    @Test
+    void testAlterTableInvalidStatisticsColumnsOnLogTableShouldFail() {
+        // Create a PK table without statistics columns
+        tEnv.executeSql(
+                "create table log_stats_reject_test "
+                        + "(id int not null, amount bigint, content bytes)");
+
+        // ALTER TABLE to add statistics columns should fail for PK tables
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "alter table log_stats_reject_test "
+                                                + "set ('table.statistics.columns' = 'content')"))
+                .rootCause()
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(
+                        "Column 'content' of type 'BYTES' is not supported for statistics collection.");
     }
 
     private List<String> writeRowsToTwoPartition(TablePath tablePath, Collection<String> partitions)

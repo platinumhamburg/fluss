@@ -140,7 +140,7 @@ public class FlinkTableSource
     @Nullable private final MergeEngineType mergeEngineType;
 
     // table-level configuration
-    private final Configuration tableConfig;
+    private final TableConfig tableConfig;
 
     // pre-computed available statistics columns
     private final Set<String> availableStatsColumns;
@@ -171,7 +171,7 @@ public class FlinkTableSource
     public FlinkTableSource(
             TablePath tablePath,
             Configuration flussConfig,
-            Configuration tableConfig,
+            TableConfig tableConfig,
             org.apache.flink.table.types.logical.RowType tableOutputType,
             int[] primaryKeyIndexes,
             int[] bucketKeyIndexes,
@@ -684,7 +684,7 @@ public class FlinkTableSource
      * @return set of column names that have statistics available
      */
     private Set<String> computeAvailableStatsColumns(RowType flussRowType) {
-        StatisticsColumnsConfig statsConfig = new TableConfig(tableConfig).getStatisticsColumns();
+        StatisticsColumnsConfig statsConfig = tableConfig.getStatisticsColumns();
 
         if (!statsConfig.isEnabled()) {
             LOG.debug("Statistics collection is disabled for the table");
