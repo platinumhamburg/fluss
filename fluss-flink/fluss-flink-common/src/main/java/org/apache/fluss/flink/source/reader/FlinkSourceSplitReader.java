@@ -21,7 +21,6 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.table.Table;
-import org.apache.fluss.client.table.scanner.Scan;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
@@ -138,11 +137,11 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
 
         this.flinkSourceReaderMetrics = flinkSourceReaderMetrics;
         sanityCheck(table.getTableInfo().getRowType(), projectedFields);
-        Scan tableScan = table.newScan().project(projectedFields);
-        if (logRecordBatchFilter != null) {
-            tableScan = tableScan.filter(logRecordBatchFilter);
-        }
-        this.logScanner = tableScan.createLogScanner();
+        this.logScanner =
+                table.newScan()
+                        .project(projectedFields)
+                        .filter(logRecordBatchFilter)
+                        .createLogScanner();
         this.stoppingOffsets = new HashMap<>();
         this.emptyLogSplits = new HashSet<>();
         this.lakeSource = lakeSource;

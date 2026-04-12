@@ -241,7 +241,6 @@ public class FlinkTableSourceFilterPushDownTest {
             // Verify the predicate evaluates correctly against statistics.
             // Schema: id(INT), name(STRING), value(BIGINT), region(STRING)
             // Filter: region = 'HangZhou' AND value > 1000
-            int fieldCount = 4;
             Long[] noNulls = new Long[] {0L, 0L, 0L, 0L};
 
             // Batch with value range [2000, 5000] and region ['HangZhou', 'HangZhou']
@@ -312,7 +311,6 @@ public class FlinkTableSourceFilterPushDownTest {
             // Verify the predicate actually evaluates correctly against statistics.
             // Schema: id(INT), name(STRING), value(BIGINT), region(STRING)
             // Filter: id > 3 AND id < 10
-            int fieldCount = 4;
             Long[] noNulls = new Long[] {0L, 0L, 0L, 0L};
 
             // Batch with id range [5, 8] → should match (5 > 3 is possible, 8 < 10 is possible)

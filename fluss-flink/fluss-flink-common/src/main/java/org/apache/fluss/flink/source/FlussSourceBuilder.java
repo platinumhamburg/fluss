@@ -177,14 +177,17 @@ public class FlussSourceBuilder<OUT> {
     }
 
     /**
-     * Sets the predicate used for server-side record batch filtering based on column statistics.
+     * Sets the filter predicate for server-side record batch filtering based on column statistics.
      *
-     * @param logRecordBatchFilter the predicate to filter record batches
+     * <p>The predicate is evaluated against per-batch column statistics (min/max values) to skip
+     * entire record batches that cannot contain matching rows.
+     *
+     * @param filter the predicate to filter record batches
      * @return this builder
      */
-    public FlussSourceBuilder<OUT> setLogRecordBatchFilter(Predicate logRecordBatchFilter) {
-        checkNotNull(logRecordBatchFilter, "logRecordBatchFilter must not be null");
-        this.logRecordBatchFilter = logRecordBatchFilter;
+    public FlussSourceBuilder<OUT> setFilter(Predicate filter) {
+        checkNotNull(filter, "filter must not be null");
+        this.logRecordBatchFilter = filter;
         return this;
     }
 

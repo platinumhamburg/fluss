@@ -20,6 +20,8 @@ package org.apache.fluss.flink.source;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.StatisticsColumnsConfig;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
 import org.apache.fluss.flink.source.lookup.FlinkAsyncLookupFunction;
@@ -93,7 +95,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import static org.apache.fluss.flink.utils.LakeSourceUtils.createLakeSource;
 import static org.apache.fluss.flink.utils.PredicateConverter.convertToFlussPredicate;
@@ -683,18 +684,15 @@ public class FlinkTableSource
      * @return set of column names that have statistics available
      */
     private Set<String> computeAvailableStatsColumns(RowType flussRowType) {
-        Set<String> columns = new HashSet<>();
+        StatisticsColumnsConfig statsConfig = new TableConfig(tableConfig).getStatisticsColumns();
 
-        // Get the configured statistics columns
-        String columnsConfig = tableConfig.get(ConfigOptions.TABLE_STATISTICS_COLUMNS);
-
-        // Check if statistics are enabled for the table
-        if (columnsConfig == null || columnsConfig.isEmpty()) {
+        if (!statsConfig.isEnabled()) {
             LOG.debug("Statistics collection is disabled for the table");
-            return columns;
+            return Collections.emptySet();
         }
 
-        if ("*".equals(columnsConfig)) {
+        Set<String> columns = new HashSet<>();
+        if (statsConfig.getMode() == StatisticsColumnsConfig.Mode.ALL) {
             // Collect all columns with supported statistics types
             for (int i = 0; i < flussRowType.getFieldCount(); i++) {
                 org.apache.fluss.types.DataType fieldType = flussRowType.getTypeAt(i);
@@ -704,14 +702,7 @@ public class FlinkTableSource
             }
         } else {
             // Use user-specified columns (validate they exist and have supported types)
-            List<String> configuredColumns =
-                    Arrays.stream(columnsConfig.split(","))
-                            .map(String::trim)
-                            .filter(s -> !s.isEmpty())
-                            .collect(Collectors.toList());
-
-            for (String columnName : configuredColumns) {
-                // Find the column in the row type
+            for (String columnName : statsConfig.getColumns()) {
                 int columnIndex = flussRowType.getFieldNames().indexOf(columnName);
                 if (columnIndex >= 0) {
                     org.apache.fluss.types.DataType fieldType = flussRowType.getTypeAt(columnIndex);

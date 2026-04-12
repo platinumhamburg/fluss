@@ -21,6 +21,7 @@ import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.ReadableConfig;
+import org.apache.fluss.config.StatisticsConfigUtils;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidConfigException;
@@ -118,6 +119,7 @@ public class TableDescriptorValidation {
         checkTieredLog(tableConf);
         checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema.getRowType());
         checkSystemColumns(schema.getRowType());
+        StatisticsConfigUtils.validateStatisticsConfig(tableDescriptor);
     }
 
     public static void validateAlterTableProperties(

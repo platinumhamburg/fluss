@@ -1376,11 +1376,12 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         }
         writeRows(conn, tablePath, rows, true);
 
+        List<InternalRow> rows2 = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
-            rows.add(row(i, "v" + i, "2026", i * 100));
+            rows2.add(row(i, "v" + i, "2026", i * 100));
         }
 
-        writeRows(conn, tablePath, rows, true);
+        writeRows(conn, tablePath, rows2, true);
 
         String plan =
                 tEnv.explainSql(
@@ -1644,6 +1645,25 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         try (CloseableIterator<Row> iter = tEnv.executeSql(query4).collect()) {
             assertResultsIgnoreOrder(iter, expected4, true);
         }
+    }
+
+    /** Tests that ALTER TABLE rejects statistics columns on primary key tables. */
+    @Test
+    void testAlterTableStatisticsColumnsOnPkTableShouldFail() {
+        // Create a PK table without statistics columns
+        tEnv.executeSql(
+                "create table pk_stats_reject_test "
+                        + "(id int not null, amount bigint, primary key (id) not enforced)");
+
+        // ALTER TABLE to add statistics columns should fail for PK tables
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "alter table pk_stats_reject_test "
+                                                + "set ('table.statistics.columns' = 'amount')"))
+                .rootCause()
+                .hasMessageContaining(
+                        "Statistics columns are not supported for primary key tables");
     }
 
     private List<String> writeRowsToTwoPartition(TablePath tablePath, Collection<String> partitions)
