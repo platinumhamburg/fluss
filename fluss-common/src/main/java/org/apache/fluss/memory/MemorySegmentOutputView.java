@@ -25,7 +25,7 @@ import java.util.Arrays;
  *
  * <p>NOTE: currently it only works on-heap {@link MemorySegment}, see {@link #resize(int)}.
  */
-public class MemorySegmentOutputView implements OutputView, MemorySegmentWritable {
+public class MemorySegmentOutputView implements MemorySegmentWritableOutputView {
     private MemorySegment memorySegment;
     private int position;
 
@@ -37,6 +37,12 @@ public class MemorySegmentOutputView implements OutputView, MemorySegmentWritabl
 
     public MemorySegmentOutputView(MemorySegment memorySegment) {
         this.memorySegment = memorySegment;
+        this.position = 0;
+    }
+
+    /** Resets this view to wrap a new memory segment, starting at position 0. */
+    public void wrap(MemorySegment segment) {
+        this.memorySegment = segment;
         this.position = 0;
     }
 

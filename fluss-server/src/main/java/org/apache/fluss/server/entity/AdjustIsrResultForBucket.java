@@ -35,6 +35,15 @@ public class AdjustIsrResultForBucket extends ResultForBucket {
         this(tableBucket, new LeaderAndIsr(-1, 0), error);
     }
 
+    /**
+     * Create a result with an error and corrective LeaderAndIsr metadata. Used when coordinator
+     * returns FENCED_LEADER_EPOCH with the correct leader info so the stale leader can self-heal.
+     */
+    public static AdjustIsrResultForBucket withCorrectiveLeaderAndIsr(
+            TableBucket tableBucket, ApiError error, LeaderAndIsr correctiveLeaderAndIsr) {
+        return new AdjustIsrResultForBucket(tableBucket, correctiveLeaderAndIsr, error);
+    }
+
     private AdjustIsrResultForBucket(
             TableBucket tableBucket, LeaderAndIsr leaderAndIsr, ApiError error) {
         super(tableBucket, error);

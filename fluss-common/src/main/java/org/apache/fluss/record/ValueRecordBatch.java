@@ -71,5 +71,14 @@ public interface ValueRecordBatch {
          * @param schemaId the schema of the kv records
          */
         RowDecoder getRowDecoder(int schemaId);
+
+        /**
+         * Returns the prefix length in bytes for encoded values.
+         *
+         * @return the prefix length (0 for no prefix)
+         */
+        default int prefixLength() {
+            return 0;
+        }
     }
 }

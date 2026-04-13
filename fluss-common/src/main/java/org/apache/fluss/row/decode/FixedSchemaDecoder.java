@@ -48,24 +48,30 @@ public class FixedSchemaDecoder {
     /** Indicates whether there is no projection between source schema and target schema. */
     private final boolean noProjection;
 
-    public FixedSchemaDecoder(KvFormat kvFormat, Schema sourceSchema, Schema targetSchema) {
+    /** Prefix length for encoded values (e.g., 8 bytes for TTL timestamp). */
+    private final int prefixLength;
+
+    public FixedSchemaDecoder(
+            KvFormat kvFormat, Schema sourceSchema, Schema targetSchema, int prefixLength) {
         this.rowDecoder =
                 RowDecoder.create(
                         kvFormat, sourceSchema.getRowType().getChildren().toArray(new DataType[0]));
         this.fieldIdMapping = SchemaUtil.getIndexMapping(sourceSchema, targetSchema);
         this.noProjection = false;
+        this.prefixLength = prefixLength;
     }
 
     /**
      * Creates a FixedSchemaDecoder without projection, i.e., the source schema is the same as the
      * target schema.
      */
-    public FixedSchemaDecoder(KvFormat kvFormat, Schema schema) {
+    public FixedSchemaDecoder(KvFormat kvFormat, Schema schema, int prefixLength) {
         this.rowDecoder =
                 RowDecoder.create(
                         kvFormat, schema.getRowType().getChildren().toArray(new DataType[0]));
         this.fieldIdMapping = null;
         this.noProjection = true;
+        this.prefixLength = prefixLength;
     }
 
     /**
@@ -90,6 +96,7 @@ public class FixedSchemaDecoder {
      * adheres to the fixed {@code targetSchema}.
      */
     public InternalRow decode(MemorySegment valueSegment) {
-        return decode(valueSegment, SCHEMA_ID_LENGTH, valueSegment.size() - SCHEMA_ID_LENGTH);
+        int headerLength = prefixLength + SCHEMA_ID_LENGTH;
+        return decode(valueSegment, headerLength, valueSegment.size() - headerLength);
     }
 }

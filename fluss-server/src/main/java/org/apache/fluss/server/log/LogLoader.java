@@ -125,6 +125,37 @@ final class LogLoader {
     }
 
     /**
+     * Just recovers the given segment, without adding it to the provided segments.
+     *
+     * @param segment Segment to recover
+     * @return The number of bytes truncated from the segment
+     * @throws LogSegmentOffsetOverflowException if the segment contains messages that cause index
+     *     offset overflow
+     */
+    private int recoverSegment(LogSegment segment) throws IOException {
+        WriterStateManager writerStateManager =
+                new WriterStateManager(
+                        logSegments.getTableBucket(),
+                        logTabletDir,
+                        this.writerStateManager.writerExpirationMs());
+        // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
+        // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
+        // there may be cases where logStartOffset is not updated. As a result, logStartOffset is
+        // not yet reliable. Once the issue with correctly updating logStartOffset is resolved in
+        // issue https://github.com/apache/fluss/issues/744, we can use logStartOffset here.
+        // Additionally, using 0 versus using logStartOffset does not affect correctness—they both
+        // can restore the complete WriterState. The only difference is that using logStartOffset
+        // can potentially skip over more segments.
+        LogTablet.rebuildWriterState(
+                writerStateManager, logSegments, 0, segment.getBaseOffset(), false);
+        int bytesTruncated = segment.recover();
+        // once we have recovered the segment's data, take a snapshot to ensure that we won't
+        // need to reload the same segment again while recovering another segment.
+        writerStateManager.takeSnapshot();
+        return bytesTruncated;
+    }
+
+    /**
      * Recover the log segments (if there was an unclean shutdown). Ensures there is at least one
      * active segment, and returns the updated recovery point and next offset after recovery.
      *
@@ -240,37 +271,6 @@ final class LogLoader {
                         e);
             }
         }
-    }
-
-    /**
-     * Just recovers the given segment, without adding it to the provided segments.
-     *
-     * @param segment Segment to recover
-     * @return The number of bytes truncated from the segment
-     * @throws LogSegmentOffsetOverflowException if the segment contains messages that cause index
-     *     offset overflow
-     */
-    private int recoverSegment(LogSegment segment) throws IOException {
-        WriterStateManager writerStateManager =
-                new WriterStateManager(
-                        logSegments.getTableBucket(),
-                        logTabletDir,
-                        this.writerStateManager.writerExpirationMs());
-        // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
-        // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
-        // there may be cases where logStartOffset is not updated. As a result, logStartOffset is
-        // not yet reliable. Once the issue with correctly updating logStartOffset is resolved in
-        // issue https://github.com/apache/fluss/issues/744, we can use logStartOffset here.
-        // Additionally, using 0 versus using logStartOffset does not affect correctness—they both
-        // can restore the complete WriterState. The only difference is that using logStartOffset
-        // can potentially skip over more segments.
-        LogTablet.rebuildWriterState(
-                writerStateManager, logSegments, 0, segment.getBaseOffset(), false);
-        int bytesTruncated = segment.recover();
-        // once we have recovered the segment's data, take a snapshot to ensure that we won't
-        // need to reload the same segment again while recovering another segment.
-        writerStateManager.takeSnapshot();
-        return bytesTruncated;
     }
 
     /** Loads segments from disk into the provided segments. */

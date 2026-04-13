@@ -22,7 +22,7 @@ import org.apache.fluss.remote.RemoteLogSegment;
 import javax.annotation.Nullable;
 
 import java.nio.file.Path;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -40,14 +40,20 @@ public class LogSegmentFiles {
     private final Path offsetIndex;
     private final Path timeIndex;
     private final @Nullable Path writerIdIndex;
+    private final @Nullable Path bucketStateSnapshot;
     // TODO add leader epoch index after introduce leader epoch.
 
     public LogSegmentFiles(
-            Path logSegment, Path offsetIndex, Path timeIndex, @Nullable Path writerIdIndex) {
+            Path logSegment,
+            Path offsetIndex,
+            Path timeIndex,
+            @Nullable Path writerIdIndex,
+            @Nullable Path bucketStateSnapshot) {
         this.logSegment = checkNotNull(logSegment, "logSegment can not be null");
         this.offsetIndex = checkNotNull(offsetIndex, "offsetIndex can not be null");
         this.timeIndex = checkNotNull(timeIndex, "timeIndex can not be null");
         this.writerIdIndex = writerIdIndex;
+        this.bucketStateSnapshot = bucketStateSnapshot;
     }
 
     public Path logSegment() {
@@ -66,8 +72,22 @@ public class LogSegmentFiles {
         return writerIdIndex;
     }
 
+    public @Nullable Path bucketStateSnapshot() {
+        return bucketStateSnapshot;
+    }
+
     public List<Path> getAllPaths() {
-        return Arrays.asList(logSegment, offsetIndex, timeIndex, writerIdIndex);
+        List<Path> paths = new ArrayList<>();
+        paths.add(logSegment);
+        paths.add(offsetIndex);
+        paths.add(timeIndex);
+        if (writerIdIndex != null) {
+            paths.add(writerIdIndex);
+        }
+        if (bucketStateSnapshot != null) {
+            paths.add(bucketStateSnapshot);
+        }
+        return paths;
     }
 
     @Override
@@ -82,12 +102,13 @@ public class LogSegmentFiles {
         return Objects.equals(logSegment, that.logSegment)
                 && Objects.equals(offsetIndex, that.offsetIndex)
                 && Objects.equals(timeIndex, that.timeIndex)
-                && Objects.equals(writerIdIndex, that.writerIdIndex);
+                && Objects.equals(writerIdIndex, that.writerIdIndex)
+                && Objects.equals(bucketStateSnapshot, that.bucketStateSnapshot);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(logSegment, offsetIndex, timeIndex, writerIdIndex);
+        return Objects.hash(logSegment, offsetIndex, timeIndex, writerIdIndex, bucketStateSnapshot);
     }
 
     @Override
@@ -101,6 +122,8 @@ public class LogSegmentFiles {
                 + timeIndex
                 + ", writerIdIndex="
                 + writerIdIndex
+                + ", bucketStateSnapshot="
+                + bucketStateSnapshot
                 + '}';
     }
 }

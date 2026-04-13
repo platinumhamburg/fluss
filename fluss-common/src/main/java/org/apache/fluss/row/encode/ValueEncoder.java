@@ -17,6 +17,7 @@
 
 package org.apache.fluss.row.encode;
 
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.utils.UnsafeUtils;
 
@@ -29,6 +30,8 @@ public class ValueEncoder {
      * Encode the {@code row} with a {@code schemaId} to a byte array value to be expected persisted
      * to kv store.
      *
+     * <p>The encoded value format is: [schemaId(2 bytes)][row data]
+     *
      * @param schemaId the schema id of the row
      * @param row the row to encode
      */
@@ -36,6 +39,48 @@ public class ValueEncoder {
         byte[] values = new byte[SCHEMA_ID_LENGTH + row.getSizeInBytes()];
         UnsafeUtils.putShort(values, 0, schemaId);
         row.copyTo(values, SCHEMA_ID_LENGTH);
+        return values;
+    }
+
+    /**
+     * Encode the {@code row} with a {@code schemaId} and an 8-byte long prefix based on the
+     * compaction filter configuration.
+     *
+     * <p>The encoded value format depends on the compaction filter configuration:
+     *
+     * <ul>
+     *   <li>No prefix: [schemaId(2 bytes)][row data]
+     *   <li>With 8-byte prefix: [prefix(8 bytes)][schemaId(2 bytes)][row data]
+     * </ul>
+     *
+     * @param prefixValue the prefix value (e.g., timestamp for TTL compaction filter)
+     * @param schemaId the schema id of the row
+     * @param row the row to encode
+     * @param compactionFilterConfig the compaction filter configuration
+     */
+    public static byte[] encodeValueWithLongPrefix(
+            long prefixValue,
+            short schemaId,
+            BinaryRow row,
+            CompactionFilterConfig compactionFilterConfig) {
+        int prefixLength = compactionFilterConfig.getPrefixLength();
+        if (prefixLength == 0) {
+            return encodeValue(schemaId, row);
+        }
+
+        // Assert that prefix length is 8 bytes for long encoding
+        if (prefixLength != 8) {
+            throw new IllegalArgumentException(
+                    "Prefix length must be 8 bytes for long prefix encoding, but got: "
+                            + prefixLength);
+        }
+
+        // Encode with 8-byte prefix
+        byte[] values = new byte[prefixLength + SCHEMA_ID_LENGTH + row.getSizeInBytes()];
+        // Encode prefix as big-endian for compaction filter compatibility
+        UnsafeUtils.putLongBigEndian(values, 0, prefixValue);
+        UnsafeUtils.putShort(values, prefixLength, schemaId);
+        row.copyTo(values, prefixLength + SCHEMA_ID_LENGTH);
         return values;
     }
 }

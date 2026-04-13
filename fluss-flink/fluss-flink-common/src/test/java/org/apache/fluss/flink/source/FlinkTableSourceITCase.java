@@ -119,6 +119,11 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         admin = conn.getAdmin();
     }
 
+    /** Returns the catalog type identifier used to create the catalog. */
+    protected String catalogType() {
+        return "fluss";
+    }
+
     @BeforeEach
     void before() {
         // initialize env and table env

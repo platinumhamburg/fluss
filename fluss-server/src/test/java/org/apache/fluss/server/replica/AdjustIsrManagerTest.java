@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.replica;
 
+import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
@@ -27,6 +28,8 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -41,7 +44,7 @@ class AdjustIsrManagerTest {
         int tabletServerId = 0;
         AdjustIsrManager adjustIsrManager =
                 new AdjustIsrManager(
-                        new FlussScheduler(1), new TestCoordinatorGateway(), tabletServerId);
+                        new FlussScheduler(1), new TestCoordinatorGateway(), tabletServerId, null);
 
         // shrink isr
         TableBucket tb = new TableBucket(150001L, 0);
@@ -66,7 +69,8 @@ class AdjustIsrManagerTest {
         // Make all AdjustIsr requests fail with NetworkException.
         coordinatorGateway.setNetworkIssueEnable(true);
         AdjustIsrManager adjustIsrManager =
-                new AdjustIsrManager(new FlussScheduler(1), coordinatorGateway, tabletServerId);
+                new AdjustIsrManager(
+                        new FlussScheduler(1), coordinatorGateway, tabletServerId, null);
 
         // The RPC-level exception is propagated to the submit future.
         TableBucket tb = new TableBucket(150001L, 0);
@@ -84,5 +88,39 @@ class AdjustIsrManagerTest {
         LeaderAndIsr result = adjustIsrManager.submit(tb, adjustIsr).get();
         assertThat(result)
                 .isEqualTo(new LeaderAndIsr(tabletServerId, 0, Arrays.asList(1, 2), 0, 1));
+    }
+
+    @Test
+    void testCorrectiveLeaderAndIsrCallbackOnFencedEpoch() throws Exception {
+        int tabletServerId = 0;
+        TestCoordinatorGateway coordinatorGateway = new TestCoordinatorGateway();
+        TableBucket tb = new TableBucket(150001L, 0);
+
+        // Simulate coordinator has advanced the leader epoch to 5
+        coordinatorGateway.setCurrentLeaderEpoch(tb, 5);
+
+        // Track corrective LeaderAndIsr received via callback
+        ConcurrentMap<TableBucket, LeaderAndIsr> receivedCorrections =
+                new ConcurrentHashMap<>();
+        AdjustIsrManager adjustIsrManager =
+                new AdjustIsrManager(
+                        new FlussScheduler(1),
+                        coordinatorGateway,
+                        tabletServerId,
+                        receivedCorrections::put);
+
+        // Submit with stale epoch (0 < 5), should get FencedLeaderEpochException
+        List<Integer> currentIsr = Arrays.asList(1, 2);
+        LeaderAndIsr adjustIsr = new LeaderAndIsr(tabletServerId, 0, currentIsr, 0, 0);
+        assertThatThrownBy(() -> adjustIsrManager.submit(tb, adjustIsr).get())
+                .rootCause()
+                .isInstanceOf(FencedLeaderEpochException.class);
+
+        // Verify the callback received the corrective LeaderAndIsr
+        assertThat(receivedCorrections).containsKey(tb);
+        LeaderAndIsr corrective = receivedCorrections.get(tb);
+        assertThat(corrective.leaderEpoch()).isEqualTo(5);
+        assertThat(corrective.leader()).isEqualTo(tabletServerId);
+        assertThat(corrective.isr()).isEqualTo(Arrays.asList(1, 2));
     }
 }

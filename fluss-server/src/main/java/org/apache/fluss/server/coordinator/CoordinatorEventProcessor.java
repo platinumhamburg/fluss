@@ -56,6 +56,7 @@ import org.apache.fluss.rpc.messages.CommitRemoteLogManifestResponse;
 import org.apache.fluss.rpc.messages.ControlledShutdownResponse;
 import org.apache.fluss.rpc.messages.ListRebalanceProgressResponse;
 import org.apache.fluss.rpc.messages.PbCommitLakeTableSnapshotRespForTable;
+import org.apache.fluss.rpc.messages.PbLeaderAndIsr;
 import org.apache.fluss.rpc.messages.RebalanceResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
@@ -142,6 +143,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.coordinator.statemachine.BucketState.OfflineBucket;
@@ -156,6 +158,7 @@ import static org.apache.fluss.server.coordinator.statemachine.ReplicaState.Repl
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeAdjustIsrResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeListRebalanceProgressResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeRebalanceResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPbLeaderAndIsr;
 import static org.apache.fluss.utils.concurrent.FutureUtils.completeFromCallable;
 
 /** An implementation for {@link EventProcessor}. */
@@ -430,10 +433,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     }
                 }
                 // if the table is auto partition, put the partitions info
-                if (tableInfo
-                        .getTableConfig()
-                        .getAutoPartitionStrategy()
-                        .isAutoPartitionEnabled()) {
+                if (tableInfo.getAutoPartitionStrategy().isAutoPartitionEnabled()) {
                     autoPartitionTables.add(tableInfo);
                 }
             }
@@ -856,6 +856,25 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 null,
                 null,
                 tableBuckets);
+
+        // Retry UpdateMetadata for servers that failed to receive partition metadata.
+        // This is critical for secondary index tables: if an IndexBucket leader server
+        // misses the DataBucket partition metadata, its IndexFetcherManager will enter
+        // a RUNNING→FAILED dead loop because metadataCache.getBucketLeaderId() returns empty.
+        Set<Integer> failedServers = coordinatorRequestBatch.drainFailedUpdateMetadataServers();
+        if (!failedServers.isEmpty()) {
+            Set<ServerInfo> retryServerInfos =
+                    coordinatorContext.getLiveTabletServers().values().stream()
+                            .filter(s -> failedServers.contains(s.id()))
+                            .collect(Collectors.toSet());
+            if (!retryServerInfos.isEmpty()) {
+                LOG.info(
+                        "Retrying UpdateMetadata for partition {} to servers that failed: {}",
+                        partitionId,
+                        retryServerInfos.stream().map(ServerInfo::id).collect(Collectors.toList()));
+                updateTabletServerMetadataCache(retryServerInfos, null, null, tableBuckets);
+            }
+        }
     }
 
     private void processDropTable(DropTableEvent dropTableEvent) {
@@ -1177,6 +1196,25 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
         // update tabletServer metadata cache by send updateMetadata request.
         updateTabletServerMetadataCache(serverInfos, null, null, bucketsWithOfflineLeader);
+
+        // Retry UpdateMetadata for servers that failed to receive it.
+        // The gateway-not-present failures are reported synchronously, so they are already
+        // tracked by the time we reach here.
+        Set<Integer> failedServers = coordinatorRequestBatch.drainFailedUpdateMetadataServers();
+        if (!failedServers.isEmpty()) {
+            // Only retry for servers that are still alive.
+            Set<ServerInfo> retryServerInfos =
+                    serverInfos.stream()
+                            .filter(s -> failedServers.contains(s.id()))
+                            .collect(Collectors.toSet());
+            if (!retryServerInfos.isEmpty()) {
+                LOG.info(
+                        "Retrying UpdateMetadata for servers that failed in previous attempt: {}",
+                        retryServerInfos.stream().map(ServerInfo::id).collect(Collectors.toList()));
+                updateTabletServerMetadataCache(
+                        retryServerInfos, null, null, bucketsWithOfflineLeader);
+            }
+        }
     }
 
     private AddServerTagResponse processAddServerTag(AddServerTagEvent event) {
@@ -1662,6 +1700,18 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
             try {
                 validateLeaderAndIsr(tableBucket, tryAdjustLeaderAndIsr);
+            } catch (FencedLeaderEpochException e) {
+                ApiError apiError = ApiError.fromThrowable(e);
+                Optional<LeaderAndIsr> currentLeaderAndIsr =
+                        coordinatorContext.getBucketLeaderAndIsr(tableBucket);
+                if (currentLeaderAndIsr.isPresent()) {
+                    result.add(
+                            AdjustIsrResultForBucket.withCorrectiveLeaderAndIsr(
+                                    tableBucket, apiError, currentLeaderAndIsr.get()));
+                } else {
+                    result.add(new AdjustIsrResultForBucket(tableBucket, apiError));
+                }
+                continue;
             } catch (Exception e) {
                 result.add(new AdjustIsrResultForBucket(tableBucket, ApiError.fromThrowable(e)));
                 continue;
@@ -1792,6 +1842,14 @@ public class CoordinatorEventProcessor implements EventProcessor {
         // validate
         try {
             validateFencedEvent(event);
+        } catch (FencedLeaderEpochException e) {
+            TableBucket tb = event.getTableBucket();
+            CommitKvSnapshotResponse response = new CommitKvSnapshotResponse();
+            ApiError apiError = ApiError.fromThrowable(e);
+            response.setErrorCode(apiError.error().code()).setErrorMessage(apiError.message());
+            populateCorrectiveLeaderAndIsr(response::setCorrectiveLeaderAndIsr, tb);
+            callback.complete(response);
+            return;
         } catch (Exception e) {
             callback.completeExceptionally(e);
             return;
@@ -1879,6 +1937,14 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     new RemoteLogManifestHandle(
                             manifestData.getRemoteLogManifestPath(),
                             manifestData.getRemoteLogEndOffset()));
+        } catch (FencedLeaderEpochException e) {
+            LOG.warn(
+                    "Fenced leader epoch when committing remote log manifest for {}, "
+                            + "returning corrective LeaderAndIsr.",
+                    tb);
+            response.setCommitSuccess(false);
+            populateCorrectiveLeaderAndIsr(response::setCorrectiveLeaderAndIsr, tb);
+            return response;
         } catch (Exception e) {
             LOG.error(
                     "Error when commit remote log manifest, the leader need to revert the commit.",
@@ -2115,6 +2181,21 @@ public class CoordinatorEventProcessor implements EventProcessor {
                         .map(ServerRpcMessageUtils::fromTableBucket)
                         .collect(Collectors.toList()));
         return response;
+    }
+
+    /**
+     * Populate corrective LeaderAndIsr into a fenced error response, enabling stale leader
+     * self-healing.
+     */
+    private void populateCorrectiveLeaderAndIsr(Consumer<PbLeaderAndIsr> setter, TableBucket tb) {
+        coordinatorContext
+                .getBucketLeaderAndIsr(tb)
+                .ifPresent(
+                        leaderAndIsr ->
+                                setter.accept(
+                                        toPbLeaderAndIsr(
+                                                leaderAndIsr,
+                                                coordinatorContext.getCoordinatorEpoch())));
     }
 
     private void validateFencedEvent(FencedCoordinatorEvent event) {

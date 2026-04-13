@@ -17,6 +17,8 @@
 
 package org.apache.fluss.server.kv.snapshot;
 
+import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
+
 /** An interface for reporting a {@link CompletedSnapshot}. */
 public interface CompletedKvSnapshotCommitter {
 
@@ -26,8 +28,11 @@ public interface CompletedKvSnapshotCommitter {
      * @param snapshot CompletedSnapshot to be reported
      * @param coordinatorEpoch the coordinator epoch when the snapshot is triggered
      * @param bucketLeaderEpoch the bucket leader epoch when the snapshot is triggered
+     * @return the response from coordinator, which may contain corrective LeaderAndIsr on fenced
+     *     errors
      * @throws Exception if report completed snapshot failed
      */
-    void commitKvSnapshot(CompletedSnapshot snapshot, int coordinatorEpoch, int bucketLeaderEpoch)
+    CommitKvSnapshotResponse commitKvSnapshot(
+            CompletedSnapshot snapshot, int coordinatorEpoch, int bucketLeaderEpoch)
             throws Exception;
 }

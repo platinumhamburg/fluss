@@ -191,6 +191,12 @@ class LookupSender implements Runnable {
             sendLookupRequest(destination, lookupBatches, true);
         } else if (lookupType == LookupType.PREFIX_LOOKUP) {
             sendPrefixLookupRequest(destination, lookupBatches);
+        } else if (lookupType == LookupType.SECONDARY_INDEX_LOOKUP) {
+            // Secondary index lookups are decomposed into PREFIX_LOOKUP + LOOKUP
+            // by SecondaryIndexLookuper and should never reach LookupSender directly.
+            throw new IllegalStateException(
+                    "SECONDARY_INDEX_LOOKUP should not be dispatched to LookupSender directly. "
+                            + "It should be decomposed by SecondaryIndexLookuper into prefix and primary key lookups.");
         } else {
             throw new IllegalArgumentException("Unsupported lookup type: " + lookupType);
         }

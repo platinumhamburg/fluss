@@ -18,6 +18,7 @@
 package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 
 import java.time.Duration;
 import java.util.Deque;
@@ -41,7 +42,7 @@ public class TestingCompletedKvSnapshotCommitter implements CompletedKvSnapshotC
             new HashMap<>();
 
     @Override
-    public void commitKvSnapshot(
+    public CommitKvSnapshotResponse commitKvSnapshot(
             CompletedSnapshot snapshot, int coordinatorEpoch, int bucketLeaderEpoch) {
         snapshots
                 .computeIfAbsent(snapshot.getTableBucket(), k -> new LinkedBlockingDeque<>())
@@ -49,6 +50,7 @@ public class TestingCompletedKvSnapshotCommitter implements CompletedKvSnapshotC
         bucketSnapshotLeaderEpoch
                 .computeIfAbsent(snapshot.getTableBucket(), k -> new HashMap<>())
                 .put(snapshot.getSnapshotID(), bucketLeaderEpoch);
+        return new CommitKvSnapshotResponse();
     }
 
     public CompletedSnapshot waitUntilSnapshotComplete(

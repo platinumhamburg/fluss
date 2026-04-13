@@ -88,6 +88,9 @@ public class MetricNames {
             "delayedFetchFromFollowerExpiresPerSecond";
     public static final String DELAYED_FETCH_FROM_CLIENT_EXPIRES_RATE =
             "delayedFetchFromClientExpiresPerSecond";
+    public static final String DELAYED_INDEX_FETCH_COUNT = "delayedIndexFetchCount";
+    public static final String DELAYED_INDEX_FETCH_FROM_FOLLOWER_EXPIRES_RATE =
+            "delayedIndexFetchFromFollowerExpiresPerSecond";
 
     public static final String SERVER_LOGICAL_STORAGE_LOG_SIZE = "logSize";
     public static final String SERVER_LOGICAL_STORAGE_KV_SIZE = "kvSize";
@@ -138,6 +141,21 @@ public class MetricNames {
     public static final String ISR_EXPANDS_RATE = "isrExpandsPerSecond";
     public static final String ISR_SHRINKS_RATE = "isrShrinksPerSecond";
     public static final String FAILED_ISR_UPDATES_RATE = "failedIsrUpdatesPerSecond";
+
+    // for index replication
+    public static final String INDEX_FETCH_REQUESTS_RATE = "indexFetchRequestsPerSecond";
+    public static final String INDEX_FETCH_ERRORS_RATE = "indexFetchErrorsPerSecond";
+    public static final String INDEX_FETCH_LATENCY_MS = "indexFetchLatencyMs";
+    public static final String INDEX_FETCH_BUCKETS_PER_REQUEST = "indexFetchBucketsPerRequest";
+    public static final String INDEX_FETCH_EARLY_FIRE_RATE = "indexFetchEarlyFirePerSecond";
+    public static final String INDEX_APPLY_REQUESTS_RATE = "indexApplyRequestsPerSecond";
+    public static final String INDEX_APPLY_ERRORS_RATE = "indexApplyErrorsPerSecond";
+    public static final String INDEX_APPLY_LATENCY_MS = "indexApplyLatencyMs";
+    public static final String INDEX_APPLY_BATCH_SIZE = "indexApplyBatchSize";
+    public static final String INDEX_MAX_REPLICATION_LAG_OFFSET = "indexMaxReplicationLagOffset";
+
+    // for index cache memory
+    public static final String INDEX_CACHE_MEMORY_USAGE_PERCENT = "indexCacheMemoryUsagePercent";
 
     // for log tablet
     public static final String LOG_FLUSH_RATE = "logFlushPerSecond";

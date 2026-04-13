@@ -21,6 +21,9 @@ import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 
+import javax.annotation.Nullable;
+
+import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
 
@@ -50,13 +53,41 @@ public class AutoPartitionStrategy {
     }
 
     public static AutoPartitionStrategy from(Map<String, String> options) {
-        return from(Configuration.fromMap(options));
+        return from(Configuration.fromMap(options), null);
     }
 
     public static AutoPartitionStrategy from(Configuration conf) {
+        return from(conf, null);
+    }
+
+    /**
+     * Creates an AutoPartitionStrategy from configuration with partition keys. For single-column
+     * partitioned tables, the key will be set to that partition column automatically.
+     *
+     * @param conf the configuration
+     * @param partitionKeys the list of partition keys, can be null if not available
+     * @return the auto partition strategy
+     */
+    public static AutoPartitionStrategy from(
+            Configuration conf, @Nullable List<String> partitionKeys) {
+        String configuredKey = conf.getString(ConfigOptions.TABLE_AUTO_PARTITION_KEY);
+
+        // Determine the effective key based on partition keys
+        String effectiveKey;
+        if ((configuredKey == null || configuredKey.isEmpty())
+                && partitionKeys != null
+                && partitionKeys.size() == 1) {
+            // For single-column partitioned tables, default to that column as the time partition
+            // key only when no explicit key is configured
+            effectiveKey = partitionKeys.get(0);
+        } else {
+            // Use the explicitly configured key, or null if not configured
+            effectiveKey = configuredKey;
+        }
+
         return new AutoPartitionStrategy(
                 conf.getBoolean(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED),
-                conf.getString(ConfigOptions.TABLE_AUTO_PARTITION_KEY),
+                effectiveKey,
                 conf.get(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT),
                 conf.getInt(ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE),
                 conf.getInt(ConfigOptions.TABLE_AUTO_PARTITION_NUM_RETENTION),
@@ -85,5 +116,21 @@ public class AutoPartitionStrategy {
 
     public TimeZone timeZone() {
         return timeZone;
+    }
+
+    /**
+     * Calculates the approximate TTL in milliseconds based on the retention configuration.
+     *
+     * <p>This is useful for index tables that need to expire data based on the main table's
+     * auto-partition retention policy.
+     *
+     * @return TTL in milliseconds, or -1 if TTL should not be enabled (auto-partition not enabled
+     *     or retention not configured)
+     */
+    public long toApproximateTtlMillis() {
+        if (!autoPartitionEnable || numToRetain < 0 || timeUnit == null) {
+            return -1;
+        }
+        return timeUnit.toApproximateTtlMillis(numToRetain);
     }
 }

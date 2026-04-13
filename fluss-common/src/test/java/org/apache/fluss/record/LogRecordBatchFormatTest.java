@@ -104,4 +104,12 @@ public class LogRecordBatchFormatTest {
         assertThat(statisticsDataOffset(magic)).isEqualTo(56);
         assertThat(recordBatchHeaderSize(magic)).isEqualTo(56);
     }
+
+    @Test
+    void testUnsupportedMagicValue() {
+        byte magic = (byte) 3;
+        assertThatThrownBy(() -> crcOffset(magic))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported magic value");
+    }
 }

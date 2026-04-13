@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client.table.scanner.batch;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.metadata.KvFormat;
@@ -86,6 +87,21 @@ public class LimitBatchScanner implements BatchScanner {
             MetadataUpdater metadataUpdater,
             @Nullable int[] projectedFields,
             int limit) {
+        this(
+                tableInfo,
+                schemaGetter,
+                projectedFields,
+                limit,
+                sendLimitScan(tableInfo, tableBucket, metadataUpdater, limit));
+    }
+
+    @VisibleForTesting
+    LimitBatchScanner(
+            TableInfo tableInfo,
+            SchemaGetter schemaGetter,
+            @Nullable int[] projectedFields,
+            int limit,
+            CompletableFuture<LimitScanResponse> scanFuture) {
         this.tableInfo = tableInfo;
         this.projectedFields = projectedFields;
         this.limit = limit;
@@ -96,7 +112,17 @@ public class LimitBatchScanner implements BatchScanner {
         for (int i = 0; i < rowType.getFieldCount(); i++) {
             this.fieldGetters[i] = InternalRow.createFieldGetter(rowType.getTypeAt(i), i);
         }
+        this.scanFuture = scanFuture;
+        this.kvFormat = tableInfo.getTableConfig().getKvFormat();
+        this.endOfInput = false;
+        this.chunkedFactory = new ChunkedAllocationManager.ChunkedFactory();
+    }
 
+    private static CompletableFuture<LimitScanResponse> sendLimitScan(
+            TableInfo tableInfo,
+            TableBucket tableBucket,
+            MetadataUpdater metadataUpdater,
+            int limit) {
         LimitScanRequest limitScanRequest =
                 new LimitScanRequest()
                         .setTableId(tableBucket.getTableId())
@@ -116,11 +142,7 @@ public class LimitBatchScanner implements BatchScanner {
             throw new LeaderNotAvailableException(
                     "Server " + leader + " is not found in metadata cache.");
         }
-        this.scanFuture = gateway.limitScan(limitScanRequest);
-
-        this.kvFormat = tableInfo.getTableConfig().getKvFormat();
-        this.endOfInput = false;
-        this.chunkedFactory = new ChunkedAllocationManager.ChunkedFactory();
+        return gateway.limitScan(limitScanRequest);
     }
 
     @Nullable
@@ -163,7 +185,8 @@ public class LimitBatchScanner implements BatchScanner {
             DefaultValueRecordBatch valueRecords =
                     DefaultValueRecordBatch.pointToByteBuffer(recordsBuffer);
             ValueRecordReadContext readContext =
-                    ValueRecordReadContext.createReadContext(schemaGetter, kvFormat);
+                    ValueRecordReadContext.createReadContext(
+                            schemaGetter, kvFormat, tableInfo.getCompactionFilterConfig());
             for (ValueRecord record : valueRecords.records(readContext)) {
                 InternalRow row = record.getRow();
                 if (targetSchemaId != record.schemaId()) {

@@ -17,12 +17,14 @@
 
 package org.apache.fluss.server.kv;
 
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metadata.TtlCompactionFilterConfig;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -77,6 +79,8 @@ public class KvRecoverHelper {
     private final SchemaGetter schemaGetter;
 
     private InternalRow.FieldGetter[] currentFieldGetters;
+    private @Nullable InternalRow.FieldGetter ttlTimestampFieldGetter;
+    private @Nullable String kvTtlColumn;
 
     public KvRecoverHelper(
             KvTablet kvTablet,
@@ -290,6 +294,9 @@ public class KvRecoverHelper {
         } else if (logFormat == LogFormat.COMPACTED) {
             return LogRecordReadContext.createCompactedRowReadContext(
                     currentRowType, currentSchemaId);
+        } else if (logFormat == LogFormat.INDEXED) {
+            return LogRecordReadContext.createIndexedReadContext(
+                    currentRowType, currentSchemaId, schemaGetter);
         } else {
             throw new UnsupportedOperationException("Unsupported log format: " + logFormat);
         }
@@ -324,6 +331,39 @@ public class KvRecoverHelper {
         currentRowType = schemaGetter.getSchema(schemaId).getRowType();
         DataType[] dataTypes = currentRowType.getChildren().toArray(new DataType[0]);
         currentSchemaId = schemaId;
+
+        if (kvTablet.kvTtlEnabled()) {
+            CompactionFilterConfig compactionFilterConfig = tableInfo.getCompactionFilterConfig();
+            if (compactionFilterConfig instanceof TtlCompactionFilterConfig) {
+                TtlCompactionFilterConfig ttlConfig =
+                        (TtlCompactionFilterConfig) compactionFilterConfig;
+                kvTtlColumn =
+                        ttlConfig
+                                .getTtlColumn()
+                                .orElseThrow(
+                                        () ->
+                                                new IllegalStateException(
+                                                        "TTL encoding is enabled but table.kv.compaction-filter.ttl.column is not configured for table "
+                                                                + tableInfo.getTablePath()));
+                int ttlFieldIndex = currentRowType.getFieldIndex(kvTtlColumn);
+                if (ttlFieldIndex < 0) {
+                    throw new IllegalStateException(
+                            "TTL column '"
+                                    + kvTtlColumn
+                                    + "' does not exist in schema during recovery.");
+                }
+                if (currentRowType.getTypeAt(ttlFieldIndex).getTypeRoot() != DataTypeRoot.BIGINT) {
+                    throw new IllegalStateException(
+                            "TTL column '" + kvTtlColumn + "' must be BIGINT (epoch millis).");
+                }
+                ttlTimestampFieldGetter =
+                        InternalRow.createFieldGetter(
+                                currentRowType.getTypeAt(ttlFieldIndex), ttlFieldIndex);
+            }
+        } else {
+            kvTtlColumn = null;
+            ttlTimestampFieldGetter = null;
+        }
 
         keyEncoder =
                 KeyEncoder.ofPrimaryKeyEncoder(

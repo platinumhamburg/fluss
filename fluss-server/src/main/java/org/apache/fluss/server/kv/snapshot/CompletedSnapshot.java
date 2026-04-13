@@ -18,18 +18,25 @@
 package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
+import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -51,13 +58,19 @@ import java.util.concurrent.Executor;
  *
  * <h2>Metadata Persistence</h2>
  *
- * <p>The metadata of the CompletedSnapshot is also persisted in the snapshot directory with the
- * name {@link #SNAPSHOT_METADATA_FILE_NAME}.
+ * <p>The coordination metadata of the CompletedSnapshot is persisted in the snapshot directory with
+ * the name {@link #SNAPSHOT_METADATA_FILE_NAME}. The recovery state (row count, auto-increment ID
+ * ranges, index replication offsets) is persisted separately in {@link #TABLET_STATE_FILE_NAME} to
+ * keep the Coordinator's in-memory footprint small.
  */
 @NotThreadSafe
 public class CompletedSnapshot {
 
+    private static final Logger LOG = LoggerFactory.getLogger(CompletedSnapshot.class);
+
     private static final String SNAPSHOT_METADATA_FILE_NAME = "_METADATA";
+
+    @VisibleForTesting static final String TABLET_STATE_FILE_NAME = "_TABLET_STATE";
 
     /** The table bucket that this snapshot belongs to. */
     private final TableBucket tableBucket;
@@ -71,18 +84,6 @@ public class CompletedSnapshot {
     /** The next log offset when the snapshot is triggered. */
     private final long logOffset;
 
-    /**
-     * The row count of the snapshot, null for legacy tables that doesn't support row count
-     * statistics.
-     */
-    @Nullable private final Long rowCount;
-
-    /**
-     * The auto-increment ID ranges of the snapshot, null for legacy tables that doesn't support or
-     * doesn't have auto-increment columns.
-     */
-    @Nullable private final List<AutoIncIDRange> autoIncIDRanges;
-
     /** The location where the snapshot is stored. */
     private final FsPath snapshotLocation;
 
@@ -93,16 +94,45 @@ public class CompletedSnapshot {
             long snapshotID,
             FsPath snapshotLocation,
             KvSnapshotHandle kvSnapshotHandle,
-            long logOffset,
-            @Nullable Long rowCount,
-            @Nullable List<AutoIncIDRange> autoIncIDRanges) {
+            long logOffset) {
         this.tableBucket = tableBucket;
         this.snapshotID = snapshotID;
         this.snapshotLocation = snapshotLocation;
         this.kvSnapshotHandle = kvSnapshotHandle;
         this.logOffset = logOffset;
-        this.rowCount = rowCount;
-        this.autoIncIDRanges = autoIncIDRanges;
+    }
+
+    /**
+     * Backward-compatible constructor that accepts TabletState fields but ignores them. This allows
+     * old code paths (e.g., deserializing old _METADATA files) to still construct a
+     * CompletedSnapshot without breaking.
+     */
+    public CompletedSnapshot(
+            TableBucket tableBucket,
+            long snapshotID,
+            FsPath snapshotLocation,
+            KvSnapshotHandle kvSnapshotHandle,
+            long logOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges) {
+        this(tableBucket, snapshotID, snapshotLocation, kvSnapshotHandle, logOffset);
+    }
+
+    /**
+     * Backward-compatible constructor that accepts TabletState fields but ignores them. This allows
+     * old code paths (e.g., deserializing old _METADATA files) to still construct a
+     * CompletedSnapshot without breaking.
+     */
+    public CompletedSnapshot(
+            TableBucket tableBucket,
+            long snapshotID,
+            FsPath snapshotLocation,
+            KvSnapshotHandle kvSnapshotHandle,
+            long logOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            @Nullable Map<TableBucket, Long> indexReplicationOffsets) {
+        this(tableBucket, snapshotID, snapshotLocation, kvSnapshotHandle, logOffset);
     }
 
     @VisibleForTesting
@@ -111,7 +141,7 @@ public class CompletedSnapshot {
             long snapshotID,
             FsPath snapshotLocation,
             KvSnapshotHandle kvSnapshotHandle) {
-        this(tableBucket, snapshotID, snapshotLocation, kvSnapshotHandle, 0, null, null);
+        this(tableBucket, snapshotID, snapshotLocation, kvSnapshotHandle, 0);
     }
 
     public long getSnapshotID() {
@@ -130,26 +160,49 @@ public class CompletedSnapshot {
         return logOffset;
     }
 
-    @Nullable
-    public Long getRowCount() {
-        return rowCount;
-    }
-
-    @Nullable
-    public List<AutoIncIDRange> getAutoIncIDRanges() {
-        return autoIncIDRanges;
-    }
-
-    @Nullable
-    public AutoIncIDRange getFirstAutoIncIDRange() {
-        if (autoIncIDRanges == null || autoIncIDRanges.isEmpty()) {
-            return null;
-        }
-        return autoIncIDRanges.get(0);
-    }
-
     public long getSnapshotSize() {
         return kvSnapshotHandle.getSnapshotSize();
+    }
+
+    /**
+     * Loads the {@link TabletState} from the snapshot location. Tries to read from the dedicated
+     * {@code _TABLET_STATE} file first. If that file does not exist, falls back to parsing the
+     * TabletState fields from the old {@code _METADATA} file (backward compatibility). Returns
+     * {@link TabletState#empty()} if neither source contains TabletState data.
+     */
+    public TabletState loadTabletState() throws IOException {
+        // Try _TABLET_STATE file first
+        FsPath tabletStatePath = getTabletStateFilePath();
+        FileSystem fs = tabletStatePath.getFileSystem();
+        if (fs.exists(tabletStatePath)) {
+            byte[] bytes = readFileBytes(fs, tabletStatePath);
+            return TabletStateJsonSerde.fromJson(bytes);
+        }
+
+        // Fallback: try parsing TabletState fields from old _METADATA file
+        FsPath metadataPath = getMetadataFilePath();
+        if (fs.exists(metadataPath)) {
+            try {
+                byte[] bytes = readFileBytes(fs, metadataPath);
+                return TabletStateJsonSerde.fromJson(bytes);
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to parse TabletState from _METADATA file for snapshot {}, "
+                                + "returning empty TabletState.",
+                        snapshotID,
+                        e);
+            }
+        }
+
+        return TabletState.empty();
+    }
+
+    private static byte[] readFileBytes(FileSystem fs, FsPath path) throws IOException {
+        try (FSDataInputStream in = fs.open(path)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            IOUtils.copyBytes(in, out);
+            return out.toByteArray();
+        }
     }
 
     /**
@@ -172,8 +225,13 @@ public class CompletedSnapshot {
         CompletableFuture<Void> discardMetaFileFuture =
                 FutureUtils.runAsync(this::disposeMetadata, ioExecutor);
 
+        CompletableFuture<Void> discardTabletStateFuture =
+                FutureUtils.runAsync(this::disposeTabletState, ioExecutor);
+
         return FutureUtils.runAfterwards(
-                FutureUtils.completeAll(Arrays.asList(discardKvFuture, discardMetaFileFuture)),
+                FutureUtils.completeAll(
+                        Arrays.asList(
+                                discardKvFuture, discardMetaFileFuture, discardTabletStateFuture)),
                 this::disposeSnapshotStorage);
     }
 
@@ -195,10 +253,33 @@ public class CompletedSnapshot {
         return new FsPath(snapshotLocation, SNAPSHOT_METADATA_FILE_NAME);
     }
 
+    /** Return the tablet state file path that stores recovery state for the snapshot. */
+    public FsPath getTabletStateFilePath() {
+        return new FsPath(snapshotLocation, TABLET_STATE_FILE_NAME);
+    }
+
+    public static FsPath getTabletStateFilePath(FsPath snapshotLocation) {
+        return new FsPath(snapshotLocation, TABLET_STATE_FILE_NAME);
+    }
+
     private void disposeMetadata() throws IOException {
         FsPath metadataFilePath = getMetadataFilePath();
         FileSystem fileSystem = metadataFilePath.getFileSystem();
         fileSystem.delete(metadataFilePath, false);
+    }
+
+    private void disposeTabletState() throws IOException {
+        FsPath tabletStatePath = getTabletStateFilePath();
+        FileSystem fileSystem = tabletStatePath.getFileSystem();
+        // Best-effort: silently ignore if file does not exist (old snapshots)
+        try {
+            fileSystem.delete(tabletStatePath, false);
+        } catch (IOException e) {
+            LOG.debug(
+                    "Could not delete _TABLET_STATE file for snapshot {} (may not exist): {}",
+                    snapshotID,
+                    e.getMessage());
+        }
     }
 
     public FsPath getSnapshotLocation() {
@@ -225,20 +306,11 @@ public class CompletedSnapshot {
                 && logOffset == that.logOffset
                 && Objects.equals(tableBucket, that.tableBucket)
                 && Objects.equals(kvSnapshotHandle, that.kvSnapshotHandle)
-                && Objects.equals(rowCount, that.rowCount)
-                && Objects.equals(autoIncIDRanges, that.autoIncIDRanges)
                 && Objects.equals(snapshotLocation, that.snapshotLocation);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(
-                tableBucket,
-                snapshotID,
-                kvSnapshotHandle,
-                logOffset,
-                rowCount,
-                autoIncIDRanges,
-                snapshotLocation);
+        return Objects.hash(tableBucket, snapshotID, kvSnapshotHandle, logOffset, snapshotLocation);
     }
 }

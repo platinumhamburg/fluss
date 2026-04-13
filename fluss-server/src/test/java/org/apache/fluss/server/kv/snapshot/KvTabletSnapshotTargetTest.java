@@ -23,6 +23,7 @@ import org.apache.fluss.exception.FlussException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.kv.rocksdb.RocksDBExtension;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
@@ -699,10 +700,11 @@ class KvTabletSnapshotTargetTest {
         }
 
         @Override
-        public void commitKvSnapshot(
+        public CommitKvSnapshotResponse commitKvSnapshot(
                 CompletedSnapshot snapshot, int coordinatorEpoch, int bucketLeaderEpoch)
                 throws Exception {
             completedSnapshotStore.add(snapshot);
+            return new CommitKvSnapshotResponse();
         }
     }
 }

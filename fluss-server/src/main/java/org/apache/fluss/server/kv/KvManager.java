@@ -29,6 +29,7 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.memory.LazyMemorySegmentPool;
 import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.metadata.CompactionFilterConfig;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -231,6 +232,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
      * @param tableBucket the table bucket
      * @param logTablet the cdc log tablet of the kv tablet
      * @param kvFormat the kv format
+     * @param compactionFilterConfig the compaction filter configuration
      */
     public KvTablet getOrCreateKv(
             PhysicalTablePath tablePath,
@@ -239,7 +241,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             KvFormat kvFormat,
             SchemaGetter schemaGetter,
             TableConfig tableConfig,
-            ArrowCompressionInfo arrowCompressionInfo)
+            ArrowCompressionInfo arrowCompressionInfo,
+            CompactionFilterConfig compactionFilterConfig)
             throws Exception {
         return inLock(
                 tabletCreationOrDeletionLock,
@@ -273,7 +276,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     schemaGetter,
                                     tableConfig.getChangelogImage(),
                                     sharedRocksDBRateLimiter,
-                                    autoIncrementManager);
+                                    autoIncrementManager,
+                                    compactionFilterConfig);
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -343,7 +347,11 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         }
     }
 
-    public KvTablet loadKv(File tabletDir, SchemaGetter schemaGetter) throws Exception {
+    public KvTablet loadKv(
+            File tabletDir,
+            SchemaGetter schemaGetter,
+            CompactionFilterConfig compactionFilterConfig)
+            throws Exception {
         Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TableBucket tableBucket = pathAndBucket.f1;
@@ -386,11 +394,12 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         memorySegmentPool,
                         tableConfig.getKvFormat(),
                         rowMerger,
-                        tableConfig.getArrowCompressionInfo(),
+                        tableInfo.getTableConfig().getArrowCompressionInfo(),
                         schemaGetter,
                         tableConfig.getChangelogImage(),
                         sharedRocksDBRateLimiter,
-                        autoIncrementManager);
+                        autoIncrementManager,
+                        compactionFilterConfig);
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(

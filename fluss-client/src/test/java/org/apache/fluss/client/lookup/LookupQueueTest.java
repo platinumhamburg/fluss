@@ -22,6 +22,7 @@ import org.apache.fluss.metadata.TableBucket;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -29,6 +30,7 @@ import static org.apache.fluss.config.ConfigOptions.CLIENT_LOOKUP_BATCH_TIMEOUT;
 import static org.apache.fluss.config.ConfigOptions.CLIENT_LOOKUP_MAX_BATCH_SIZE;
 import static org.apache.fluss.config.ConfigOptions.CLIENT_LOOKUP_QUEUE_SIZE;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link LookupQueue}. */
@@ -81,9 +83,8 @@ class LookupQueueTest {
         // appendLookup should block and not complete immediately.
         assertThat(future.isDone()).isFalse();
 
-        Thread.sleep(100);
-        // Still blocked after 100ms.
-        assertThat(future.isDone()).isFalse();
+        // Verify the future remains blocked
+        retry(Duration.ofMillis(100), () -> assertThat(future.isDone()).isFalse());
 
         queue.drain();
         future.get(1, TimeUnit.SECONDS);

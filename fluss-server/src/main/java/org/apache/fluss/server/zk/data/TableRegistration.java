@@ -95,6 +95,10 @@ public class TableRegistration {
         return !partitionKeys.isEmpty();
     }
 
+    public boolean isIndexTable() {
+        return properties.containsKey(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key());
+    }
+
     public TableConfig getTableConfig() {
         return new TableConfig(Configuration.fromMap(properties));
     }

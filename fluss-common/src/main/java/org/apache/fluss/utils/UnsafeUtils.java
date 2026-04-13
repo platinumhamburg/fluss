@@ -19,6 +19,8 @@ package org.apache.fluss.utils;
 
 import org.apache.fluss.memory.MemoryUtils;
 
+import static org.apache.fluss.shaded.arrow.org.apache.arrow.memory.util.MemoryUtil.LITTLE_ENDIAN;
+
 /* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
@@ -80,6 +82,14 @@ public class UnsafeUtils {
 
     public static long getLong(byte[] target, long offset) {
         return MemoryUtils.UNSAFE.getLong(target, BYTE_ARRAY_BASE_OFFSET + offset);
+    }
+
+    public static void putLongBigEndian(byte[] target, int offset, long value) {
+        if (LITTLE_ENDIAN) {
+            putLong(target, offset, Long.reverseBytes(value));
+        } else {
+            putLong(target, offset, value);
+        }
     }
 
     private static int byteIndex(int bitIndex) {

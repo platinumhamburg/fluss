@@ -22,9 +22,13 @@ import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.ReadableConfig;
+import org.apache.fluss.metadata.CompactionFilterConfig;
+import org.apache.fluss.metadata.TtlCompactionFilterConfig;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.clock.SystemClock;
 
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.BloomFilter;
@@ -33,6 +37,7 @@ import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.CompactionStyle;
 import org.rocksdb.CompressionType;
 import org.rocksdb.DBOptions;
+import org.rocksdb.FlinkCompactionFilter;
 import org.rocksdb.InfoLogLevel;
 import org.rocksdb.LRUCache;
 import org.rocksdb.PlainTableConfig;
@@ -88,23 +93,44 @@ public class RocksDBResourceContainer implements AutoCloseable {
     /** The block cache for RocksDB, shared across column families. */
     @Nullable private Cache blockCache;
 
+    /** Compaction filter configuration for KV storage. */
+    private final CompactionFilterConfig compactionFilterConfig;
+
+    /** Clock for time-related operations. */
+    private final Clock clock;
+
     /** The handles to be closed when the container is closed. */
     private final ArrayList<AutoCloseable> handlesToClose;
 
     @VisibleForTesting
     RocksDBResourceContainer() {
-        this(new Configuration(), null, false, KvManager.getDefaultRateLimiter());
+        this(
+                new Configuration(),
+                null,
+                false,
+                KvManager.getDefaultRateLimiter(),
+                CompactionFilterConfig.none());
     }
 
     public RocksDBResourceContainer(ReadableConfig configuration, @Nullable File instanceBasePath) {
-        this(configuration, instanceBasePath, false, KvManager.getDefaultRateLimiter());
+        this(
+                configuration,
+                instanceBasePath,
+                false,
+                KvManager.getDefaultRateLimiter(),
+                CompactionFilterConfig.none());
     }
 
     public RocksDBResourceContainer(
             ReadableConfig configuration,
             @Nullable File instanceBasePath,
             boolean enableStatistics) {
-        this(configuration, instanceBasePath, enableStatistics, KvManager.getDefaultRateLimiter());
+        this(
+                configuration,
+                instanceBasePath,
+                enableStatistics,
+                KvManager.getDefaultRateLimiter(),
+                CompactionFilterConfig.none());
     }
 
     public RocksDBResourceContainer(
@@ -112,6 +138,52 @@ public class RocksDBResourceContainer implements AutoCloseable {
             @Nullable File instanceBasePath,
             boolean enableStatistics,
             RateLimiter sharedRateLimiter) {
+        this(
+                configuration,
+                instanceBasePath,
+                enableStatistics,
+                sharedRateLimiter,
+                CompactionFilterConfig.none(),
+                SystemClock.getInstance());
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            CompactionFilterConfig compactionFilterConfig,
+            Clock clock) {
+        this(
+                configuration,
+                instanceBasePath,
+                enableStatistics,
+                KvManager.getDefaultRateLimiter(),
+                compactionFilterConfig,
+                clock);
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            RateLimiter sharedRateLimiter,
+            CompactionFilterConfig compactionFilterConfig) {
+        this(
+                configuration,
+                instanceBasePath,
+                enableStatistics,
+                sharedRateLimiter,
+                compactionFilterConfig,
+                SystemClock.getInstance());
+    }
+
+    public RocksDBResourceContainer(
+            ReadableConfig configuration,
+            @Nullable File instanceBasePath,
+            boolean enableStatistics,
+            RateLimiter sharedRateLimiter,
+            CompactionFilterConfig compactionFilterConfig,
+            Clock clock) {
         this.configuration = configuration;
 
         this.instanceRocksDBPath =
@@ -121,6 +193,9 @@ public class RocksDBResourceContainer implements AutoCloseable {
         this.enableStatistics = enableStatistics;
         this.sharedRateLimiter =
                 checkNotNull(sharedRateLimiter, "sharedRateLimiter must not be null");
+        this.compactionFilterConfig =
+                checkNotNull(compactionFilterConfig, "compactionFilterConfig must not be null");
+        this.clock = clock;
 
         this.handlesToClose = new ArrayList<>();
     }
@@ -174,6 +249,40 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
         // load configurable options on top of pre-defined profile
         setColumnFamilyOptionsFromConfigurableOptions(opt, handlesToClose);
+
+        // Configure CompactionFilter based on the compaction filter configuration
+        if (compactionFilterConfig instanceof TtlCompactionFilterConfig) {
+            TtlCompactionFilterConfig ttlConfig =
+                    (TtlCompactionFilterConfig) compactionFilterConfig;
+            if (ttlConfig.isEnabled()) {
+                // TimeProvider provides current timestamp for expiration checks
+                // Use Clock.milliseconds() which is test-friendly and high-performance
+                FlinkCompactionFilter.TimeProvider timeProvider = clock::milliseconds;
+                FlinkCompactionFilter.FlinkCompactionFilterFactory filterFactory =
+                        new FlinkCompactionFilter.FlinkCompactionFilterFactory(timeProvider);
+
+                // Configure for value state with timestamp at offset 0
+                // Value format: [timestamp(8)][schemaId(2)][row bytes]
+                FlinkCompactionFilter.Config config =
+                        FlinkCompactionFilter.Config.createForValue(
+                                ttlConfig.getRetentionMs(), // TTL in milliseconds
+                                100 // queryTimeAfterNumEntries - balance between accuracy and
+                                // performance
+                                );
+                filterFactory.configure(config);
+                opt.setCompactionFilterFactory(filterFactory);
+                handlesToClose.add(filterFactory);
+
+                String instancePath =
+                        instanceRocksDBPath != null
+                                ? instanceRocksDBPath.getAbsolutePath()
+                                : "unknown";
+                LOG.info(
+                        "Configured TTL CompactionFilter for {} with retention: {} ms",
+                        instancePath,
+                        ttlConfig.getRetentionMs());
+            }
+        }
 
         return opt;
     }

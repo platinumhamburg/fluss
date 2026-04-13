@@ -262,7 +262,7 @@ public class AutoPartitionManager implements AutoCloseable {
             return partitionName;
         }
 
-        String autoPartitionKey = tableInfo.getTableConfig().getAutoPartitionStrategy().key();
+        String autoPartitionKey = tableInfo.getAutoPartitionStrategy().key();
         int autoPartitionKeyIndex = tableInfo.getPartitionKeys().indexOf(autoPartitionKey);
         return partitionName.split("\\$")[autoPartitionKeyIndex];
     }
@@ -339,7 +339,7 @@ public class AutoPartitionManager implements AutoCloseable {
                     tablePath,
                     tableInfo.getPartitionKeys(),
                     createPartitionInstant,
-                    tableInfo.getTableConfig().getAutoPartitionStrategy(),
+                    tableInfo.getAutoPartitionStrategy(),
                     currentPartitions);
             createPartitions(tableInfo, createPartitionInstant, currentPartitions);
         }
@@ -354,7 +354,7 @@ public class AutoPartitionManager implements AutoCloseable {
                 partitionNamesToPreCreate(
                         tableInfo.getPartitionKeys(),
                         currentInstant,
-                        tableInfo.getTableConfig().getAutoPartitionStrategy(),
+                        tableInfo.getAutoPartitionStrategy(),
                         currentPartitions);
         if (partitionsToPreCreate.isEmpty()) {
             return;

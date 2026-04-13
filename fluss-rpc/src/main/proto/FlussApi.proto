@@ -240,6 +240,18 @@ message FetchLogResponse {
 // AGG_MODE_OVERWRITE = 1: Bypass merge engine, directly replace values (for undo recovery)
 // AGG_MODE_LOCAL_AGGREGATE = 2: Client-side local aggregation (reserved for future implementation)
 
+// fetch index request and response
+message FetchIndexRequest {
+  required int32 max_bytes = 1;
+  optional int32 max_wait_ms = 2;
+  optional int32 min_advance_offset = 3;
+  repeated PbFetchIndexReqForTableBucket req_for_table_buckets = 4;
+}
+
+message FetchIndexResponse {
+  repeated PbFetchIndexRespForIndexTableBucket resp_for_index_table_buckets = 1;
+}
+
 // put kv request and response
 message PutKvRequest {
   required int32 acks = 1;
@@ -405,6 +417,10 @@ message CommitKvSnapshotRequest {
 }
 
 message CommitKvSnapshotResponse {
+  optional int32 error_code = 1;
+  optional string error_message = 2;
+  // Populated when error_code is FENCED_LEADER_EPOCH to enable stale leader self-healing.
+  optional PbLeaderAndIsr corrective_leader_and_isr = 3;
 }
 
 // notify the log offset about kv snapshot
@@ -538,6 +554,8 @@ message CommitRemoteLogManifestRequest {
 
 message CommitRemoteLogManifestResponse {
   required bool commitSuccess = 1;
+  // Populated when fenced to enable stale leader self-healing.
+  optional PbLeaderAndIsr corrective_leader_and_isr = 2;
 }
 
 // notify remote log offsets request and response
@@ -887,6 +905,40 @@ message PbFetchLogRespForBucket {
   optional int64 filtered_end_offset = 9;
 }
 
+message PbFetchIndexReqForIndexTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  required int64 fetch_offset = 4;
+  required int64 index_commit_offset = 5;
+}
+
+message PbFetchIndexReqForTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  repeated PbFetchIndexReqForIndexTableBucket req_for_index_buckets = 4;
+}
+
+message PbFetchIndexRespForTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  optional int32 error_code = 4;
+  optional string error_message = 5;
+  optional int64 start_offset = 6;
+  optional int64 end_offset = 7;
+  optional bytes records = 8;
+  optional bool is_data_ready = 9;
+}
+
+message PbFetchIndexRespForIndexTableBucket {
+  required int64 table_id = 1;
+  optional int64 partition_id = 2;
+  required int32 bucket_id = 3;
+  repeated PbFetchIndexRespForTableBucket resp_for_tables = 4;
+}
+
 message PbPutKvReqForBucket {
   optional int64 partition_id = 1;
   required int32 bucket_id = 2;
@@ -983,6 +1035,16 @@ message PbListOffsetsRespForBucket {
   optional int32 error_code = 2;
   optional string error_message = 3;
   optional int64 offset = 4;
+}
+
+// Reusable LeaderAndIsr message - the proto representation of LeaderAndIsr.
+// Used as corrective metadata in fenced error responses to enable stale leader self-healing.
+message PbLeaderAndIsr {
+  required int32 leader_id = 1;
+  required int32 leader_epoch = 2;
+  repeated int32 isr = 3 [packed = true];
+  required int32 bucket_epoch = 4;
+  required int32 coordinator_epoch = 5;
 }
 
 message PbNotifyLeaderAndIsrReqForBucket {

@@ -94,6 +94,9 @@ public final class LogSegments {
         return segments.size();
     }
 
+    /**
+     * @return the base offsets of all segments in base offset ascending order.
+     */
     public List<Long> baseOffsets() {
         return segments.values().stream()
                 .map(LogSegment::getBaseOffset)
