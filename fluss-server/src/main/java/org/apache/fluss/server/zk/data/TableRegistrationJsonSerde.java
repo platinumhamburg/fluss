@@ -19,6 +19,7 @@ package org.apache.fluss.server.zk.data;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.TableDescriptor.TableDistribution;
+import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.fluss.utils.json.JsonDeserializer;
@@ -43,13 +44,15 @@ public class TableRegistrationJsonSerde
     static final String PARTITION_KEY_NAME = "partition_key";
     static final String BUCKET_KEY_NAME = "bucket_key";
     static final String BUCKET_COUNT_NAME = "bucket_count";
+    static final String TABLE_TYPE_NAME = "table_type";
+    static final String PARENT_TABLE_ID_NAME = "parent_table_id";
     static final String PROPERTIES_NAME = "properties";
     static final String CUSTOM_PROPERTIES_NAME = "custom_properties";
     static final String REMOTE_DATA_DIR = "remote_data_dir";
     static final String CREATED_TIME = "created_time";
     static final String MODIFIED_TIME = "modified_time";
     private static final String VERSION_KEY = "version";
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
 
     @Override
     public void serialize(TableRegistration tableReg, JsonGenerator generator) throws IOException {
@@ -87,6 +90,11 @@ public class TableRegistrationJsonSerde
         // serialize bucket count.
         generator.writeNumberField(BUCKET_COUNT_NAME, tableReg.bucketCount);
 
+        generator.writeStringField(TABLE_TYPE_NAME, tableReg.tableType.name());
+        if (tableReg.parentTableId != null) {
+            generator.writeNumberField(PARENT_TABLE_ID_NAME, tableReg.parentTableId);
+        }
+
         // serialize properties.
         generator.writeObjectFieldStart(PROPERTIES_NAME);
         for (Map.Entry<String, String> entry : tableReg.properties.entrySet()) {
@@ -117,6 +125,7 @@ public class TableRegistrationJsonSerde
 
     @Override
     public TableRegistration deserialize(JsonNode node) {
+        int version = node.has(VERSION_KEY) ? node.get(VERSION_KEY).asInt() : 1;
         long tableId = node.get(TABLE_ID_NAME).asLong();
 
         JsonNode commentNode = node.get(COMMENT_NAME);
@@ -142,6 +151,14 @@ public class TableRegistrationJsonSerde
         }
         int bucketCount = node.get(BUCKET_COUNT_NAME).asInt();
         TableDistribution distribution = new TableDistribution(bucketCount, bucketKeys);
+        TableType tableType =
+                version >= 2 && node.has(TABLE_TYPE_NAME)
+                        ? TableType.valueOf(node.get(TABLE_TYPE_NAME).asText())
+                        : TableType.TABLE;
+        Long parentTableId =
+                version >= 2 && node.has(PARENT_TABLE_ID_NAME)
+                        ? node.get(PARENT_TABLE_ID_NAME).asLong()
+                        : null;
 
         Map<String, String> properties = deserializeProperties(node.get(PROPERTIES_NAME));
         Map<String, String> customProperties =
@@ -162,6 +179,8 @@ public class TableRegistrationJsonSerde
                 comment,
                 partitionKeys,
                 distribution,
+                tableType,
+                parentTableId,
                 properties,
                 customProperties,
                 remoteDataDir,

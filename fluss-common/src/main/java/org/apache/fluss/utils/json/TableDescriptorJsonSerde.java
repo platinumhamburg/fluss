@@ -20,6 +20,7 @@ package org.apache.fluss.utils.json;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 
@@ -42,11 +43,13 @@ public class TableDescriptorJsonSerde
     static final String PARTITION_KEY_NAME = "partition_key";
     static final String BUCKET_KEY_NAME = "bucket_key";
     static final String BUCKET_COUNT_NAME = "bucket_count";
+    static final String TABLE_TYPE_NAME = "table_type";
+    static final String PARENT_TABLE_ID_NAME = "parent_table_id";
     static final String PROPERTIES_NAME = "properties";
     static final String CUSTOM_PROPERTIES_NAME = "custom_properties";
 
     private static final String VERSION_KEY = "version";
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
 
     @Override
     public void serialize(TableDescriptor tableDescriptor, JsonGenerator generator)
@@ -86,6 +89,12 @@ public class TableDescriptorJsonSerde
             }
         }
 
+        generator.writeStringField(TABLE_TYPE_NAME, tableDescriptor.getTableType().name());
+        if (tableDescriptor.getParentTableId().isPresent()) {
+            generator.writeNumberField(
+                    PARENT_TABLE_ID_NAME, tableDescriptor.getParentTableId().getAsLong());
+        }
+
         // serialize properties.
         generator.writeObjectFieldStart(PROPERTIES_NAME);
         for (Map.Entry<String, String> entry : tableDescriptor.getProperties().entrySet()) {
@@ -106,6 +115,7 @@ public class TableDescriptorJsonSerde
     @Override
     public TableDescriptor deserialize(JsonNode node) {
         TableDescriptor.Builder builder = TableDescriptor.builder();
+        int version = node.has(VERSION_KEY) ? node.get(VERSION_KEY).asInt() : 1;
 
         Schema schema = SchemaJsonSerde.INSTANCE.deserialize(node.get(SCHEMA_NAME));
         builder.schema(schema);
@@ -136,6 +146,15 @@ public class TableDescriptorJsonSerde
             } else {
                 builder.distributedBy(null, bucketKeys);
             }
+        }
+
+        if (version >= 2 && node.has(TABLE_TYPE_NAME)) {
+            builder.tableType(TableType.valueOf(node.get(TABLE_TYPE_NAME).asText()));
+        } else {
+            builder.tableType(TableType.TABLE);
+        }
+        if (version >= 2 && node.has(PARENT_TABLE_ID_NAME)) {
+            builder.parentTableId(node.get(PARENT_TABLE_ID_NAME).asLong());
         }
 
         builder.properties(deserializeProperties(node.get(PROPERTIES_NAME)));

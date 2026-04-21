@@ -33,6 +33,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+
 /**
  * Information of a created table metadata, includes table id (unique identifier of the table in the
  * cluster), schema, distribution, partitioning, etc.
@@ -55,6 +57,8 @@ public final class TableInfo {
     private final int schemaId;
     private final Schema schema;
     private final RowType rowType;
+    private final TableType tableType;
+    private final @Nullable Long parentTableId;
     private final List<String> primaryKeys;
     private final List<String> physicalPrimaryKeys;
     private final List<String> bucketKeys;
@@ -76,6 +80,8 @@ public final class TableInfo {
             long tableId,
             int schemaId,
             Schema schema,
+            TableType tableType,
+            @Nullable Long parentTableId,
             List<String> bucketKeys,
             List<String> partitionKeys,
             int numBuckets,
@@ -90,6 +96,14 @@ public final class TableInfo {
         this.schemaId = schemaId;
         this.schema = schema;
         this.rowType = schema.getRowType();
+        this.tableType = tableType;
+        this.parentTableId = parentTableId;
+        checkArgument(tableType != null, "tableType must not be null.");
+        checkArgument(
+                tableType == TableType.INDEX_TABLE ? parentTableId != null : parentTableId == null,
+                tableType == TableType.INDEX_TABLE
+                        ? "Index table metadata must define parentTableId explicitly."
+                        : "Only index tables can carry parent table metadata.");
         this.primaryKeys = schema.getPrimaryKeyColumnNames();
         this.physicalPrimaryKeys = generatePhysicalPrimaryKey(primaryKeys, partitionKeys);
         this.bucketKeys = bucketKeys;
@@ -102,6 +116,38 @@ public final class TableInfo {
         this.comment = comment;
         this.createdTime = createdTime;
         this.modifiedTime = modifiedTime;
+    }
+
+    public TableInfo(
+            TablePath tablePath,
+            long tableId,
+            int schemaId,
+            Schema schema,
+            List<String> bucketKeys,
+            List<String> partitionKeys,
+            int numBuckets,
+            Configuration properties,
+            Configuration customProperties,
+            @Nullable String remoteDataDir,
+            @Nullable String comment,
+            long createdTime,
+            long modifiedTime) {
+        this(
+                tablePath,
+                tableId,
+                schemaId,
+                schema,
+                TableType.TABLE,
+                null,
+                bucketKeys,
+                partitionKeys,
+                numBuckets,
+                properties,
+                customProperties,
+                remoteDataDir,
+                comment,
+                createdTime,
+                modifiedTime);
     }
 
     /**
@@ -162,6 +208,16 @@ public final class TableInfo {
     /** Check if the table has primary key or not. */
     public boolean hasPrimaryKey() {
         return !primaryKeys.isEmpty();
+    }
+
+    /** Returns the object type of the table metadata. */
+    public TableType getTableType() {
+        return tableType;
+    }
+
+    /** Returns the parent table id for index tables. */
+    public Optional<Long> getParentTableId() {
+        return Optional.ofNullable(parentTableId);
     }
 
     /**
@@ -401,14 +457,19 @@ public final class TableInfo {
      * table.
      */
     public TableDescriptor toTableDescriptor() {
-        return TableDescriptor.builder()
-                .schema(schema)
-                .partitionedBy(partitionKeys)
-                .distributedBy(numBuckets, bucketKeys)
-                .properties(properties.toMap())
-                .customProperties(customProperties.toMap())
-                .comment(comment)
-                .build();
+        TableDescriptor.Builder builder =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .tableType(tableType)
+                        .partitionedBy(partitionKeys)
+                        .distributedBy(numBuckets, bucketKeys)
+                        .properties(properties.toMap())
+                        .customProperties(customProperties.toMap())
+                        .comment(comment);
+        if (parentTableId != null) {
+            builder.parentTableId(parentTableId);
+        }
+        return builder.build();
     }
 
     /** Utility to create a {@link TableInfo} from a {@link TableDescriptor} and other metadata. */
@@ -434,6 +495,10 @@ public final class TableInfo {
                 tableId,
                 schemaId,
                 schema,
+                tableDescriptor.getTableType(),
+                tableDescriptor.getParentTableId().isPresent()
+                        ? tableDescriptor.getParentTableId().getAsLong()
+                        : null,
                 tableDescriptor.getBucketKeys(),
                 tableDescriptor.getPartitionKeys(),
                 numBuckets,
@@ -457,6 +522,8 @@ public final class TableInfo {
                 && numBuckets == that.numBuckets
                 && Objects.equals(tablePath, that.tablePath)
                 && Objects.equals(rowType, that.rowType)
+                && tableType == that.tableType
+                && Objects.equals(parentTableId, that.parentTableId)
                 && Objects.equals(primaryKeys, that.primaryKeys)
                 && Objects.equals(physicalPrimaryKeys, that.physicalPrimaryKeys)
                 && Objects.equals(bucketKeys, that.bucketKeys)
@@ -475,6 +542,8 @@ public final class TableInfo {
                 tableId,
                 schemaId,
                 rowType,
+                tableType,
+                parentTableId,
                 primaryKeys,
                 physicalPrimaryKeys,
                 bucketKeys,
@@ -497,6 +566,10 @@ public final class TableInfo {
                 + schemaId
                 + ", schema="
                 + schema
+                + ", tableType="
+                + tableType
+                + ", parentTableId="
+                + parentTableId
                 + ", physicalPrimaryKeys="
                 + physicalPrimaryKeys
                 + ", bucketKeys="

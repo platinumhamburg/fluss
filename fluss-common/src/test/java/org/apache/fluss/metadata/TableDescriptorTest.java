@@ -29,11 +29,15 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link org.apache.fluss.metadata.TableDescriptor}. */
 class TableDescriptorTest {
+
+    private static final int DEFAULT_INDEX_BUCKET_NUMBER = 3;
+    private static final long MAIN_TABLE_ID = 1001L;
 
     private static final Schema SCHEMA_1 =
             Schema.newBuilder()
@@ -387,5 +391,135 @@ class TableDescriptorTest {
         // valid case
         AggFunctions.of(AggFunctionType.LAST_VALUE, params).validateDataType(DataTypes.STRING());
         AggFunctions.of(AggFunctionType.LISTAGG, params).validateDataType(DataTypes.STRING());
+    }
+
+    @Test
+    void testIndexesWithPrimaryKeyTable() {
+        // Test that indexes work with primary key tables
+        final Schema schemaWithIndex =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .primaryKey("f0", "f2")
+                        .secondaryIndex("idx1", "f1")
+                        .build();
+
+        TableDescriptor descriptor = TableDescriptor.builder().schema(schemaWithIndex).build();
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName()).isEqualTo("idx1");
+        assertThat(descriptor.getSchema().getIndexes().get(0).getColumnNames())
+                .containsExactly("f1");
+    }
+
+    @Test
+    void testIndexesWithoutPrimaryKeyTable() {
+        // Test that indexes are not allowed without primary key
+        final Schema schemaWithIndexNoPK =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .secondaryIndex("idx1", "f1")
+                        .build();
+
+        assertThatThrownBy(() -> TableDescriptor.builder().schema(schemaWithIndexNoPK).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(
+                        "Secondary index 'idx1' is only supported for primary key tables");
+    }
+
+    @Test
+    void testMultipleIndexes() {
+        // Test multiple indexes
+        final Schema schemaWithMultipleIndexes =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.BIGINT())
+                        .column("f2", DataTypes.STRING())
+                        .column("f3", DataTypes.INT())
+                        .primaryKey("f0", "f2")
+                        .secondaryIndex("idx1", "f1")
+                        .secondaryIndex("idx2", "f3")
+                        .build();
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(schemaWithMultipleIndexes).build();
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(2);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName()).isEqualTo("idx1");
+        assertThat(descriptor.getSchema().getIndexes().get(1).getIndexName()).isEqualTo("idx2");
+    }
+
+    @Test
+    void testTableTypeDefaultsToTable() {
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(SCHEMA_1).distributedBy(3, "f3").build();
+
+        assertThat(descriptor.getTableType()).isEqualTo(TableType.TABLE);
+        assertThat(descriptor.getParentTableId()).isEmpty();
+        assertThat(descriptor.isIndexTable()).isFalse();
+    }
+
+    @Test
+    void testIndexTableRequiresParentTableId() {
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptor.builder()
+                                        .schema(SCHEMA_1)
+                                        .tableType(TableType.INDEX_TABLE)
+                                        .distributedBy(3, "f3")
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("parentTableId");
+    }
+
+    @Test
+    void testRegularTableCannotCarryParentTableId() {
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptor.builder()
+                                        .schema(SCHEMA_1)
+                                        .parentTableId(MAIN_TABLE_ID)
+                                        .distributedBy(3, "f3")
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Only index tables can carry parent table metadata");
+    }
+
+    @Test
+    void testIndexTableMetadataIsExplicit() {
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(Schema.newBuilder().fromSchema(DATA1_SCHEMA_PK).build())
+                        .tableType(TableType.INDEX_TABLE)
+                        .parentTableId(MAIN_TABLE_ID)
+                        .distributedBy(DEFAULT_INDEX_BUCKET_NUMBER, "a")
+                        .build();
+
+        assertThat(descriptor.getTableType()).isEqualTo(TableType.INDEX_TABLE);
+        assertThat(descriptor.getParentTableId()).hasValue(MAIN_TABLE_ID);
+        assertThat(descriptor.isIndexTable()).isTrue();
+    }
+
+    @Test
+    void testIndexTableCannotDefineNestedIndexes() {
+        Schema schemaWithIndex =
+                Schema.newBuilder()
+                        .fromSchema(DATA1_SCHEMA_PK)
+                        .secondaryIndex("b_idx", "b")
+                        .build();
+
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptor.builder()
+                                        .schema(schemaWithIndex)
+                                        .tableType(TableType.INDEX_TABLE)
+                                        .parentTableId(MAIN_TABLE_ID)
+                                        .distributedBy(DEFAULT_INDEX_BUCKET_NUMBER, "a")
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not define nested index metadata");
     }
 }

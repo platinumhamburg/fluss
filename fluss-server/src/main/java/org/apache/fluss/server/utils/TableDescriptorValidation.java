@@ -36,6 +36,7 @@ import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
@@ -124,9 +125,11 @@ public class TableDescriptorValidation {
         checkDeleteBehavior(tableConf, hasPrimaryKey);
         checkTieredLog(tableConf);
         checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema.getRowType());
+        checkIndexes(tableConf, tableDescriptor.getPartitionKeys(), schema);
         checkSystemColumns(schema.getRowType());
         validateStatisticsConfig(tableDescriptor);
         checkTableLakeFormatMatchesCluster(tableConf, clusterDataLakeFormat);
+        checkTableType(tableDescriptor);
     }
 
     private static void checkTableLakeFormatMatchesCluster(
@@ -216,6 +219,23 @@ public class TableDescriptorValidation {
                                     + "The reserved system columns are: %s",
                             String.join(", ", unsupportedColumns),
                             String.join(", ", SYSTEM_COLUMNS)));
+        }
+    }
+
+    private static void checkTableType(TableDescriptor tableDescriptor) {
+        TableType tableType = tableDescriptor.getTableType();
+        boolean hasParentTable = tableDescriptor.getParentTableId().isPresent();
+
+        if (tableType == TableType.INDEX_TABLE && !hasParentTable) {
+            throw new InvalidTableException(
+                    "Index table metadata must define parentTableId explicitly.");
+        }
+
+        if (tableType != TableType.INDEX_TABLE && hasParentTable) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Only index tables can carry parent table metadata, but got table type %s.",
+                            tableType));
         }
     }
 
@@ -479,6 +499,81 @@ public class TableDescriptorValidation {
                                     ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT.key()));
                 }
             }
+        }
+    }
+
+    /**
+     * Dispatches index validation to type-specific rules.
+     *
+     * <p>The metadata model is extensible, but the current server behavior only defines runtime
+     * validation rules for secondary indexes. New index types should add a dedicated validation
+     * branch instead of widening the shared secondary-index rules.
+     */
+    private static void checkIndexes(
+            Configuration tableConf, List<String> partitionKeys, Schema schema) {
+        List<Schema.Index> indexes = schema.getIndexes();
+        if (indexes.isEmpty()) {
+            return;
+        }
+
+        for (Schema.Index index : indexes) {
+            switch (index.getIndexType()) {
+                case SECONDARY:
+                    checkSecondaryIndex(tableConf, partitionKeys, schema, index);
+                    break;
+                default:
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Unsupported index type '%s' in table validation.",
+                                    index.getIndexType()));
+            }
+        }
+    }
+
+    /**
+     * Validates secondary-index-specific constraints.
+     *
+     * <p>Secondary index data derives retention from the main table's auto-partition settings. For
+     * partitioned tables, secondary indexes therefore require auto-partition to be enabled.
+     */
+    private static void checkSecondaryIndex(
+            Configuration tableConf,
+            List<String> partitionKeys,
+            Schema schema,
+            Schema.Index index) {
+        List<String> primaryKeyColumns = schema.getPrimaryKeyColumnNames();
+        Set<String> pkSet = new LinkedHashSet<>(primaryKeyColumns);
+        Set<String> partitionSet = new LinkedHashSet<>(partitionKeys);
+        Set<String> indexColumnSet = new LinkedHashSet<>(index.getColumnNames());
+
+        if (indexColumnSet.equals(pkSet)) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Secondary index '%s' columns %s cannot be exactly the same as primary key columns %s. "
+                                    + "Primary key already provides unique lookup capability.",
+                            index.getIndexName(), index.getColumnNames(), primaryKeyColumns));
+        }
+
+        if (!partitionKeys.isEmpty() && indexColumnSet.equals(partitionSet)) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Secondary index '%s' columns %s cannot be exactly the same as partition columns %s. "
+                                    + "Partition columns are typically time-based and not suitable for secondary index lookup.",
+                            index.getIndexName(), index.getColumnNames(), partitionKeys));
+        }
+
+        if (partitionKeys.isEmpty()) {
+            return;
+        }
+
+        AutoPartitionStrategy autoPartition = AutoPartitionStrategy.from(tableConf);
+        if (!autoPartition.isAutoPartitionEnabled()) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Secondary indexes are not supported on partitioned tables without auto-partition enabled. "
+                                    + "Secondary index retention is derived from partition retention, which requires auto-partition. "
+                                    + "Please enable auto-partition by setting '%s' to true, or remove the secondary indexes.",
+                            ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key()));
         }
     }
 

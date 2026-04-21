@@ -26,6 +26,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableDescriptor.TableDistribution;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metadata.TableType;
 
 import javax.annotation.Nullable;
 
@@ -50,6 +51,8 @@ public class TableRegistration {
     public final List<String> partitionKeys;
     public final List<String> bucketKeys;
     public final int bucketCount;
+    public final TableType tableType;
+    public final @Nullable Long parentTableId;
     public final Map<String, String> properties;
     public final Map<String, String> customProperties;
 
@@ -71,6 +74,8 @@ public class TableRegistration {
             @Nullable String comment,
             List<String> partitionKeys,
             TableDistribution tableDistribution,
+            TableType tableType,
+            @Nullable Long parentTableId,
             Map<String, String> properties,
             Map<String, String> customProperties,
             @Nullable String remoteDataDir,
@@ -84,6 +89,14 @@ public class TableRegistration {
         this.partitionKeys = partitionKeys;
         this.bucketCount = tableDistribution.getBucketCount().get();
         this.bucketKeys = tableDistribution.getBucketKeys();
+        this.tableType = tableType;
+        this.parentTableId = parentTableId;
+        checkArgument(tableType != null, "Table type is required for table registration.");
+        checkArgument(
+                tableType == TableType.INDEX_TABLE ? parentTableId != null : parentTableId == null,
+                tableType == TableType.INDEX_TABLE
+                        ? "Index table registration must define parentTableId explicitly."
+                        : "Only index tables can carry parent table metadata.");
         this.properties = properties;
         this.customProperties = customProperties;
         this.remoteDataDir = remoteDataDir;
@@ -91,8 +104,36 @@ public class TableRegistration {
         this.modifiedTime = modifiedTime;
     }
 
+    public TableRegistration(
+            long tableId,
+            @Nullable String comment,
+            List<String> partitionKeys,
+            TableDistribution tableDistribution,
+            Map<String, String> properties,
+            Map<String, String> customProperties,
+            @Nullable String remoteDataDir,
+            long createdTime,
+            long modifiedTime) {
+        this(
+                tableId,
+                comment,
+                partitionKeys,
+                tableDistribution,
+                TableType.TABLE,
+                null,
+                properties,
+                customProperties,
+                remoteDataDir,
+                createdTime,
+                modifiedTime);
+    }
+
     public boolean isPartitioned() {
         return !partitionKeys.isEmpty();
+    }
+
+    public boolean isIndexTable() {
+        return tableType == TableType.INDEX_TABLE;
     }
 
     public TableConfig getTableConfig() {
@@ -119,6 +160,8 @@ public class TableRegistration {
                 this.tableId,
                 schemaInfo.getSchemaId(),
                 schemaInfo.getSchema(),
+                this.tableType,
+                this.parentTableId,
                 this.bucketKeys,
                 this.partitionKeys,
                 this.bucketCount,
@@ -141,6 +184,10 @@ public class TableRegistration {
                 tableDescriptor.getComment().orElse(null),
                 tableDescriptor.getPartitionKeys(),
                 tableDescriptor.getTableDistribution().get(),
+                tableDescriptor.getTableType(),
+                tableDescriptor.getParentTableId().isPresent()
+                        ? tableDescriptor.getParentTableId().getAsLong()
+                        : null,
                 tableDescriptor.getProperties(),
                 tableDescriptor.getCustomProperties(),
                 remoteDataDir,
@@ -156,6 +203,8 @@ public class TableRegistration {
                 comment,
                 partitionKeys,
                 new TableDistribution(bucketCount, bucketKeys),
+                tableType,
+                parentTableId,
                 newProperties,
                 newCustomProperties,
                 remoteDataDir,
@@ -177,6 +226,8 @@ public class TableRegistration {
                 comment,
                 partitionKeys,
                 new TableDistribution(bucketCount, bucketKeys),
+                tableType,
+                parentTableId,
                 properties,
                 customProperties,
                 remoteDataDir,
@@ -201,6 +252,8 @@ public class TableRegistration {
                 && Objects.equals(partitionKeys, that.partitionKeys)
                 && Objects.equals(bucketCount, that.bucketCount)
                 && Objects.equals(bucketKeys, that.bucketKeys)
+                && tableType == that.tableType
+                && Objects.equals(parentTableId, that.parentTableId)
                 && Objects.equals(properties, that.properties)
                 && Objects.equals(customProperties, that.customProperties)
                 && Objects.equals(remoteDataDir, that.remoteDataDir);
@@ -214,6 +267,8 @@ public class TableRegistration {
                 partitionKeys,
                 bucketCount,
                 bucketKeys,
+                tableType,
+                parentTableId,
                 properties,
                 customProperties,
                 remoteDataDir,
@@ -235,6 +290,10 @@ public class TableRegistration {
                 + bucketCount
                 + ", bucketKeys="
                 + bucketKeys
+                + ", tableType="
+                + tableType
+                + ", parentTableId="
+                + parentTableId
                 + ", properties="
                 + properties
                 + ", customProperties="

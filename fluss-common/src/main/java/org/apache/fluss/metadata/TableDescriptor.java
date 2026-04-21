@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -70,6 +71,8 @@ public final class TableDescriptor implements Serializable {
     public static final String AFTER_COLUMN = "after";
 
     private final Schema schema;
+    private final TableType tableType;
+    private final @Nullable Long parentTableId;
     private final @Nullable String comment;
     private final List<String> partitionKeys;
     private final @Nullable TableDistribution tableDistribution;
@@ -78,12 +81,16 @@ public final class TableDescriptor implements Serializable {
 
     private TableDescriptor(
             Schema schema,
+            TableType tableType,
+            @Nullable Long parentTableId,
             @Nullable String comment,
             List<String> partitionKeys,
             @Nullable TableDistribution tableDistribution,
             Map<String, String> properties,
             Map<String, String> customProperties) {
         this.schema = checkNotNull(schema, "schema must not be null.");
+        this.tableType = checkNotNull(tableType, "tableType must not be null.");
+        this.parentTableId = parentTableId;
         this.comment = comment;
         this.partitionKeys = checkNotNull(partitionKeys, "partition keys must not be null.");
         this.properties = unmodifiableMap(checkNotNull(properties, "options must not be null."));
@@ -128,6 +135,20 @@ public final class TableDescriptor implements Serializable {
                                             f));
         }
 
+        validateIndexDefinitions(schema);
+
+        if (tableType == TableType.INDEX_TABLE) {
+            checkArgument(
+                    parentTableId != null,
+                    "Index table metadata must define parentTableId explicitly.");
+            checkArgument(
+                    schema.getIndexes().isEmpty(),
+                    "Index table schema must not define nested index metadata.");
+        } else {
+            checkArgument(
+                    parentTableId == null, "Only index tables can carry parent table metadata.");
+        }
+
         checkArgument(
                 properties.entrySet().stream()
                         .allMatch(e -> e.getKey() != null && e.getValue() != null),
@@ -150,6 +171,16 @@ public final class TableDescriptor implements Serializable {
     /** Returns the {@link Schema} of the table. */
     public Schema getSchema() {
         return schema;
+    }
+
+    /** Returns the object type of this table metadata. */
+    public TableType getTableType() {
+        return tableType;
+    }
+
+    /** Returns the parent table id for index tables. */
+    public OptionalLong getParentTableId() {
+        return parentTableId == null ? OptionalLong.empty() : OptionalLong.of(parentTableId);
     }
 
     /** Returns the bucket key of the table, empty if no bucket key is set. */
@@ -242,7 +273,14 @@ public final class TableDescriptor implements Serializable {
      */
     public TableDescriptor withProperties(Map<String, String> newProperties) {
         return new TableDescriptor(
-                schema, comment, partitionKeys, tableDistribution, newProperties, customProperties);
+                schema,
+                tableType,
+                parentTableId,
+                comment,
+                partitionKeys,
+                tableDistribution,
+                newProperties,
+                customProperties);
     }
 
     /**
@@ -253,6 +291,8 @@ public final class TableDescriptor implements Serializable {
             Map<String, String> newProperties, Map<String, String> newCustomProperties) {
         return new TableDescriptor(
                 schema,
+                tableType,
+                parentTableId,
                 comment,
                 partitionKeys,
                 tableDistribution,
@@ -288,6 +328,8 @@ public final class TableDescriptor implements Serializable {
     public TableDescriptor withBucketCount(int newBucketCount) {
         return new TableDescriptor(
                 schema,
+                tableType,
+                parentTableId,
                 comment,
                 partitionKeys,
                 new TableDistribution(
@@ -301,6 +343,11 @@ public final class TableDescriptor implements Serializable {
 
     public Optional<String> getComment() {
         return Optional.ofNullable(comment);
+    }
+
+    /** Returns whether this table is an internal index table. */
+    public boolean isIndexTable() {
+        return tableType == TableType.INDEX_TABLE;
     }
 
     /**
@@ -331,6 +378,8 @@ public final class TableDescriptor implements Serializable {
         }
         TableDescriptor table = (TableDescriptor) o;
         return Objects.equals(schema, table.schema)
+                && tableType == table.tableType
+                && Objects.equals(parentTableId, table.parentTableId)
                 && Objects.equals(comment, table.comment)
                 && Objects.equals(partitionKeys, table.partitionKeys)
                 && Objects.equals(tableDistribution, table.tableDistribution)
@@ -341,7 +390,14 @@ public final class TableDescriptor implements Serializable {
     @Override
     public int hashCode() {
         return Objects.hash(
-                schema, comment, partitionKeys, tableDistribution, properties, customProperties);
+                schema,
+                tableType,
+                parentTableId,
+                comment,
+                partitionKeys,
+                tableDistribution,
+                properties,
+                customProperties);
     }
 
     @Override
@@ -349,6 +405,10 @@ public final class TableDescriptor implements Serializable {
         return "TableDescriptor{"
                 + "schema="
                 + schema
+                + ", tableType="
+                + tableType
+                + ", parentTableId="
+                + parentTableId
                 + ", comment='"
                 + comment
                 + '\''
@@ -434,6 +494,28 @@ public final class TableDescriptor implements Serializable {
         return bucketKeys;
     }
 
+    private static void validateIndexDefinitions(Schema schema) {
+        for (Schema.Index index : schema.getIndexes()) {
+            switch (index.getIndexType()) {
+                case SECONDARY:
+                    validateSecondaryIndexDefinition(schema, index);
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            String.format(
+                                    "Unsupported index type '%s' in table descriptor validation.",
+                                    index.getIndexType()));
+            }
+        }
+    }
+
+    private static void validateSecondaryIndexDefinition(Schema schema, Schema.Index index) {
+        checkArgument(
+                schema.getPrimaryKey().isPresent(),
+                "Secondary index '%s' is only supported for primary key tables.",
+                index.getIndexName());
+    }
+
     // ----------------------------------------------------------------------------------------
 
     /**
@@ -493,6 +575,8 @@ public final class TableDescriptor implements Serializable {
     public static class Builder {
 
         private @Nullable Schema schema;
+        private TableType tableType = TableType.TABLE;
+        private @Nullable Long parentTableId;
         private final Map<String, String> properties;
         private final Map<String, String> customProperties;
         private final List<String> partitionKeys;
@@ -507,6 +591,11 @@ public final class TableDescriptor implements Serializable {
 
         protected Builder(TableDescriptor descriptor) {
             this.schema = descriptor.getSchema();
+            this.tableType = descriptor.getTableType();
+            this.parentTableId =
+                    descriptor.getParentTableId().isPresent()
+                            ? descriptor.getParentTableId().getAsLong()
+                            : null;
             this.properties = new HashMap<>(descriptor.getProperties());
             this.customProperties = new HashMap<>(descriptor.getCustomProperties());
             this.partitionKeys = new ArrayList<>(descriptor.getPartitionKeys());
@@ -517,6 +606,18 @@ public final class TableDescriptor implements Serializable {
         /** Define the schema of the {@link TableDescriptor}. */
         public Builder schema(Schema schema) {
             this.schema = schema;
+            return this;
+        }
+
+        /** Sets the object type of the table metadata. */
+        public Builder tableType(TableType tableType) {
+            this.tableType = checkNotNull(tableType, "tableType must not be null.");
+            return this;
+        }
+
+        /** Sets the parent table id for index tables. */
+        public Builder parentTableId(long parentTableId) {
+            this.parentTableId = parentTableId;
             return this;
         }
 
@@ -639,6 +740,8 @@ public final class TableDescriptor implements Serializable {
         public TableDescriptor build() {
             return new TableDescriptor(
                     schema,
+                    tableType,
+                    parentTableId,
                     comment,
                     partitionKeys,
                     tableDistribution,
