@@ -57,6 +57,7 @@ import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
+import org.apache.fluss.rpc.messages.CleanupOrphanMetadataRequest;
 import org.apache.fluss.rpc.messages.CreateAclsRequest;
 import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
 import org.apache.fluss.rpc.messages.CreateTableRequest;
@@ -735,6 +736,28 @@ public class FlussAdmin implements Admin {
         request.setProducerId(producerId);
 
         return gateway.deleteProducerOffsets(request).thenApply(r -> null);
+    }
+
+    @Override
+    public CompletableFuture<CleanupOrphanMetadataResult> cleanupOrphanMetadata() {
+        CleanupOrphanMetadataRequest request = new CleanupOrphanMetadataRequest();
+        return gateway.cleanupOrphanMetadata(request)
+                .thenApply(
+                        r -> {
+                            List<Long> tableIds = new ArrayList<>();
+                            for (long id : r.getCleanedTableIds()) {
+                                tableIds.add(id);
+                            }
+                            List<Long> partitionIds = new ArrayList<>();
+                            for (long id : r.getCleanedPartitionIds()) {
+                                partitionIds.add(id);
+                            }
+                            return new CleanupOrphanMetadataResult(
+                                    r.getOrphanTableCount(),
+                                    r.getOrphanPartitionCount(),
+                                    tableIds,
+                                    partitionIds);
+                        });
     }
 
     @Override

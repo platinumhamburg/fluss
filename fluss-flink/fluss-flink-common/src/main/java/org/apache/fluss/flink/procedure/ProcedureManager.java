@@ -78,7 +78,9 @@ public class ProcedureManager {
         REBALANCE("sys.rebalance", RebalanceProcedure.class),
         CANCEL_REBALANCE("sys.cancel_rebalance", CancelRebalanceProcedure.class),
         LIST_REBALANCE_PROGRESS("sys.list_rebalance", ListRebalanceProcessProcedure.class),
-        DROP_KV_SNAPSHOT_LEASE("sys.drop_kv_snapshot_lease", DropKvSnapshotLeaseProcedure.class);
+        DROP_KV_SNAPSHOT_LEASE("sys.drop_kv_snapshot_lease", DropKvSnapshotLeaseProcedure.class),
+        CLEANUP_ORPHAN_METADATA(
+                "sys.cleanup_orphan_metadata", CleanupOrphanMetadataProcedure.class);
 
         private final String path;
         private final Class<? extends ProcedureBase> procedureClass;

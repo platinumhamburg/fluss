@@ -104,7 +104,8 @@ public enum ApiKeys {
     GET_TABLE_STATS(1059, 0, 0, PUBLIC),
     ALTER_DATABASE(1060, 0, 0, PUBLIC),
     FETCH_INDEX(1061, 0, 0, PRIVATE),
-    SCAN_KV(1062, 0, 0, PUBLIC);
+    SCAN_KV(1062, 0, 0, PUBLIC),
+    CLEANUP_ORPHAN_METADATA(1063, 0, 0, PUBLIC);
 
     private static final Map<Integer, ApiKeys> ID_TO_TYPE =
             Arrays.stream(ApiKeys.values())

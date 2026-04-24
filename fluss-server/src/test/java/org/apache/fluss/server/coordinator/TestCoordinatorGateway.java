@@ -38,6 +38,8 @@ import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CleanupOrphanMetadataRequest;
+import org.apache.fluss.rpc.messages.CleanupOrphanMetadataResponse;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
@@ -484,6 +486,12 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
     @Override
     public CompletableFuture<DeleteProducerOffsetsResponse> deleteProducerOffsets(
             DeleteProducerOffsetsRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<CleanupOrphanMetadataResponse> cleanupOrphanMetadata(
+            CleanupOrphanMetadataRequest request) {
         throw new UnsupportedOperationException();
     }
 

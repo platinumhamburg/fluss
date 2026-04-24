@@ -29,6 +29,8 @@ import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.AlterTableResponse;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CleanupOrphanMetadataRequest;
+import org.apache.fluss.rpc.messages.CleanupOrphanMetadataResponse;
 import org.apache.fluss.rpc.messages.CreateAclsRequest;
 import org.apache.fluss.rpc.messages.CreateAclsResponse;
 import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
@@ -213,6 +215,10 @@ public interface AdminGateway extends AdminReadOnlyGateway {
     @RPC(api = ApiKeys.DROP_KV_SNAPSHOT_LEASE)
     CompletableFuture<DropKvSnapshotLeaseResponse> dropKvSnapshotLease(
             DropKvSnapshotLeaseRequest request);
+
+    @RPC(api = ApiKeys.CLEANUP_ORPHAN_METADATA)
+    CompletableFuture<CleanupOrphanMetadataResponse> cleanupOrphanMetadata(
+            CleanupOrphanMetadataRequest request);
 
     // todo: rename table & alter table
 

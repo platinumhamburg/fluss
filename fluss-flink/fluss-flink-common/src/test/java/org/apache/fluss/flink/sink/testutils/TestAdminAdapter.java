@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.sink.testutils;
 
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.admin.CleanupOrphanMetadataResult;
 import org.apache.fluss.client.admin.CreateAclsResult;
 import org.apache.fluss.client.admin.DropAclsResult;
 import org.apache.fluss.client.admin.KvSnapshotLease;
@@ -315,6 +316,11 @@ public class TestAdminAdapter implements Admin {
 
     @Override
     public CompletableFuture<LakeSnapshot> getReadableLakeSnapshot(TablePath tablePath) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public CompletableFuture<CleanupOrphanMetadataResult> cleanupOrphanMetadata() {
         throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
     }
 }

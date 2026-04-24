@@ -144,7 +144,8 @@ public abstract class FlinkProcedureITCase {
                             "+I[sys.rebalance]",
                             "+I[sys.cancel_rebalance]",
                             "+I[sys.list_rebalance]",
-                            "+I[sys.drop_kv_snapshot_lease]");
+                            "+I[sys.drop_kv_snapshot_lease]",
+                            "+I[sys.cleanup_orphan_metadata]");
             // make sure no more results is unread.
             assertResultsIgnoreOrder(showProceduresIterator, expectedShowProceduresResult, true);
         }
@@ -818,6 +819,42 @@ public abstract class FlinkProcedureITCase {
                                 CATALOG_NAME))
                 .await();
         assertThat(zkClient.getKvSnapshotLeaseMetadata(leaseId)).isNotPresent();
+    }
+
+    @Test
+    void testCleanupOrphanMetadata() throws Exception {
+        // Step 1: Create a table
+        String tableName = "orphan_cleanup_test_table";
+        tEnv.executeSql(
+                String.format(
+                        "create table %s (a int, b varchar) with ('connector' = 'fluss')",
+                        tableName));
+        long tableId = admin.getTableInfo(TablePath.of(DEFAULT_DB, tableName)).get().getTableId();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        // Step 2: Delete the metadata ZK node to simulate a crash between two-phase deletion.
+        // The assignment node remains, becoming an orphan.
+        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        zkClient.deleteTable(TablePath.of(DEFAULT_DB, tableName));
+
+        // Verify the assignment still exists
+        assertThat(zkClient.getTableAssignment(tableId)).isPresent();
+
+        // Step 3: Call cleanup_orphan_metadata procedure
+        try (CloseableIterator<Row> resultIterator =
+                tEnv.executeSql(
+                                String.format(
+                                        "Call %s.sys.cleanup_orphan_metadata()", CATALOG_NAME))
+                        .collect()) {
+            List<Row> results = CollectionUtil.iteratorToList(resultIterator);
+            assertThat(results).hasSize(1);
+            String result = results.get(0).getField(0).toString();
+            assertThat(result).contains("orphan table");
+            assertThat(result).contains(String.valueOf(tableId));
+        }
+
+        // Step 4: Verify the orphan assignment has been cleaned up
+        assertThat(zkClient.getTableAssignment(tableId)).isNotPresent();
     }
 
     private static Configuration initConfig() {

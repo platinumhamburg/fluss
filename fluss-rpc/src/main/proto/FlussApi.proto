@@ -1429,3 +1429,14 @@ message PbLiteralValue {
   optional int32 timestamp_nano_of_millis_value = 12; // Nano of millis
   optional bytes decimal_bytes = 13;   // Serialized decimal (non-compact mode)
 }
+
+// cleanup orphan metadata request and response
+message CleanupOrphanMetadataRequest {
+}
+
+message CleanupOrphanMetadataResponse {
+  required int32 orphan_table_count = 1;
+  required int32 orphan_partition_count = 2;
+  repeated int64 cleaned_table_ids = 3;
+  repeated int64 cleaned_partition_ids = 4;
+}

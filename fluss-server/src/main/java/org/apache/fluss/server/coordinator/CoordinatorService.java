@@ -73,6 +73,8 @@ import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.AlterTableResponse;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CleanupOrphanMetadataRequest;
+import org.apache.fluss.rpc.messages.CleanupOrphanMetadataResponse;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
@@ -179,6 +181,7 @@ import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 import org.apache.fluss.utils.json.TableBucketOffsets;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1651,6 +1654,88 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                 "Failed to delete producer offsets for producer "
                                         + request.getProducerId(),
                                 e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<CleanupOrphanMetadataResponse> cleanupOrphanMetadata(
+            CleanupOrphanMetadataRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        // Step 1: collect all valid IDs from metadata layer
+                        Tuple2<Set<Long>, Set<Long>> metadataIds = zkClient.collectAllMetadataIds();
+                        Set<Long> validTableIds = metadataIds.f0;
+                        Set<Long> validPartitionIds = metadataIds.f1;
+
+                        // Step 2: collect all IDs from assignment layer
+                        Set<Long> assignmentTableIds = zkClient.getAllAssignmentTableIds();
+                        Set<Long> assignmentPartitionIds = zkClient.getAllAssignmentPartitionIds();
+
+                        // Step 3: compute orphans (in assignment but not in metadata)
+                        Set<Long> orphanTableIds = new HashSet<>(assignmentTableIds);
+                        orphanTableIds.removeAll(validTableIds);
+
+                        Set<Long> orphanPartitionIds = new HashSet<>(assignmentPartitionIds);
+                        orphanPartitionIds.removeAll(validPartitionIds);
+
+                        // Step 4: cleanup orphans
+                        List<Long> cleanedTableIds = new ArrayList<>();
+                        for (Long tableId : orphanTableIds) {
+                            try {
+                                zkClient.deleteTableAssignment(tableId);
+                                cleanedTableIds.add(tableId);
+                            } catch (Exception e) {
+                                LOG.warn(
+                                        "Failed to delete orphan table assignment for table id {}.",
+                                        tableId,
+                                        e);
+                            }
+                        }
+
+                        List<Long> cleanedPartitionIds = new ArrayList<>();
+                        for (Long partitionId : orphanPartitionIds) {
+                            try {
+                                zkClient.deletePartitionAssignment(partitionId);
+                                cleanedPartitionIds.add(partitionId);
+                            } catch (Exception e) {
+                                LOG.warn(
+                                        "Failed to delete orphan partition assignment for "
+                                                + "partition id {}.",
+                                        partitionId,
+                                        e);
+                            }
+                        }
+
+                        LOG.info(
+                                "Cleaned up {} orphan table assignments and {} orphan partition "
+                                        + "assignments. Table IDs: {}, Partition IDs: {}",
+                                cleanedTableIds.size(),
+                                cleanedPartitionIds.size(),
+                                cleanedTableIds,
+                                cleanedPartitionIds);
+
+                        CleanupOrphanMetadataResponse response =
+                                new CleanupOrphanMetadataResponse();
+                        response.setOrphanTableCount(cleanedTableIds.size());
+                        response.setOrphanPartitionCount(cleanedPartitionIds.size());
+                        for (Long id : cleanedTableIds) {
+                            response.addCleanedTableId(id);
+                        }
+                        for (Long id : cleanedPartitionIds) {
+                            response.addCleanedPartitionId(id);
+                        }
+                        return response;
+                    } catch (ApiException e) {
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException("Failed to cleanup orphan metadata", e);
                     }
                 },
                 ioExecutor);

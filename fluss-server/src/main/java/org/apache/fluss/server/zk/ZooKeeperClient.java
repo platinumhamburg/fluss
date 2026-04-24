@@ -1557,6 +1557,75 @@ public class ZooKeeperClient implements AutoCloseable {
         deletePath(ServerTagsZNode.path());
     }
 
+    // --------------------------------------------------------------------------------------------
+    // Orphan metadata cleanup
+    // --------------------------------------------------------------------------------------------
+
+    /** Get all table IDs from the assignment layer (/tabletservers/tables). */
+    public Set<Long> getAllAssignmentTableIds() throws Exception {
+        List<String> children = getChildren(ZkData.TableIdsZNode.path());
+        Set<Long> ids = new HashSet<>();
+        for (String child : children) {
+            try {
+                ids.add(Long.parseLong(child));
+            } catch (NumberFormatException e) {
+                LOG.warn("Skipping non-numeric table assignment node: {}", child);
+            }
+        }
+        return ids;
+    }
+
+    /** Get all partition IDs from the assignment layer (/tabletservers/partitions). */
+    public Set<Long> getAllAssignmentPartitionIds() throws Exception {
+        List<String> children = getChildren(ZkData.PartitionIdsZNode.path());
+        Set<Long> ids = new HashSet<>();
+        for (String child : children) {
+            try {
+                ids.add(Long.parseLong(child));
+            } catch (NumberFormatException e) {
+                LOG.warn("Skipping non-numeric partition assignment node: {}", child);
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Collect all valid table IDs and partition IDs from the metadata layer by traversing all
+     * databases and tables.
+     */
+    public Tuple2<Set<Long>, Set<Long>> collectAllMetadataIds() throws Exception {
+        Set<Long> tableIds = new HashSet<>();
+        Set<Long> partitionIds = new HashSet<>();
+
+        List<String> databases = listDatabases();
+        for (String db : databases) {
+            List<String> tables = listTables(db);
+            for (String tableName : tables) {
+                TablePath tablePath = TablePath.of(db, tableName);
+                Optional<TableRegistration> tableOpt = getTable(tablePath);
+                if (tableOpt.isPresent()) {
+                    tableIds.add(tableOpt.get().tableId);
+                    // collect partition IDs for partitioned tables
+                    if (tableOpt.get().isPartitioned()) {
+                        List<String> partitions = getChildren(PartitionsZNode.path(tablePath));
+                        for (String partitionName : partitions) {
+                            Optional<PartitionRegistration> partOpt =
+                                    getPartition(tablePath, partitionName);
+                            if (partOpt.isPresent()) {
+                                partitionIds.add(partOpt.get().getPartitionId());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Tuple2.of(tableIds, partitionIds);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Rebalance
+    // --------------------------------------------------------------------------------------------
+
     public void registerRebalanceTask(RebalanceTask rebalanceTask) throws Exception {
         String path = RebalanceZNode.path();
         Stat stat = zkClient.checkExists().forPath(path);

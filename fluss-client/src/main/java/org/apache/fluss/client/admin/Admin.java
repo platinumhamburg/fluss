@@ -770,4 +770,16 @@ public interface Admin extends AutoCloseable {
      * @since 0.9
      */
     CompletableFuture<Void> deleteProducerOffsets(String producerId);
+
+    /**
+     * Cleanup orphan metadata left behind by incomplete table deletions.
+     *
+     * <p>When a table is deleted, the metadata layer is cleaned first, then the assignment layer.
+     * If the Coordinator crashes between these two phases, assignment nodes become orphans. This
+     * method detects and removes such orphan table and partition assignments.
+     *
+     * @return a CompletableFuture containing the cleanup result with counts and IDs of cleaned
+     *     orphans
+     */
+    CompletableFuture<CleanupOrphanMetadataResult> cleanupOrphanMetadata();
 }
