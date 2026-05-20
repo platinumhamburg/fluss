@@ -153,9 +153,12 @@ class DynamicServerConfig {
 
     private void updateCurrentConfig(Map<String, String> newDynamicConfigs, boolean skipErrorConfig)
             throws Exception {
-        // Compute effective config changes (merge with initial configs)
+        // Compute effective config changes (merge with initial configs).
+        // Validation-failed keys are accumulated in skippedConfigs so we can keep them out of the
+        // applied configuration and out of the dynamicConfigs state.
+        Set<String> skippedConfigs = new HashSet<>();
         Map<String, String> effectiveChanges =
-                computeEffectiveChanges(newDynamicConfigs, skipErrorConfig);
+                computeEffectiveChanges(newDynamicConfigs, skippedConfigs, skipErrorConfig);
 
         // Early return if no effective changes
         if (effectiveChanges.isEmpty()) {
@@ -163,15 +166,28 @@ class DynamicServerConfig {
             return;
         }
 
-        // Build new configuration by merging initial + dynamic configs
-        Map<String, String> newConfigMap = buildConfigMap(newDynamicConfigs);
+        // Build the dynamic-config map that will actually be applied: drop validation-skipped
+        // entries, and for any skipped key that was already dynamic, preserve its previous value
+        // (we cannot honor the new value, but we also must not silently revert to initial).
+        Map<String, String> appliedDynamicConfigs = new HashMap<>(newDynamicConfigs);
+        for (String skipped : skippedConfigs) {
+            String previousDynamic = dynamicConfigs.get(skipped);
+            if (previousDynamic != null) {
+                appliedDynamicConfigs.put(skipped, previousDynamic);
+            } else {
+                appliedDynamicConfigs.remove(skipped);
+            }
+        }
+
+        // Build new configuration by merging initial + applied dynamic configs
+        Map<String, String> newConfigMap = buildConfigMap(appliedDynamicConfigs);
         Configuration newConfig = Configuration.fromMap(newConfigMap);
 
         // Apply changes to all registered ServerReconfigurable instances
         applyToServerReconfigurables(newConfig, skipErrorConfig);
 
         // Update internal state
-        updateInternalState(newConfig, newConfigMap, newDynamicConfigs);
+        updateInternalState(newConfig, newConfigMap, appliedDynamicConfigs);
         LOG.info("Dynamic configs changed: {}", effectiveChanges);
     }
 
@@ -179,14 +195,19 @@ class DynamicServerConfig {
      * Computes effective config changes by validating new configs and handling deletions.
      *
      * @param newDynamicConfigs new dynamic configs from ZooKeeper
+     * @param skippedConfigs out-param populated with keys whose validation failed (only meaningful
+     *     when {@code skipErrorConfig=true}; on {@code false} a {@link ConfigException} is thrown
+     *     instead)
      * @param skipErrorConfig whether to skip invalid configs
-     * @return map of config changes that passed validation
+     * @return map of config changes that passed validation (delta vs current state)
      * @throws ConfigException if validation fails and skipErrorConfig is false
      */
     private Map<String, String> computeEffectiveChanges(
-            Map<String, String> newDynamicConfigs, boolean skipErrorConfig) throws ConfigException {
+            Map<String, String> newDynamicConfigs,
+            Set<String> skippedConfigs,
+            boolean skipErrorConfig)
+            throws ConfigException {
         Map<String, String> effectiveChanges = new HashMap<>();
-        Set<String> skippedConfigs = new HashSet<>();
 
         // Process deleted configs: restore to initial value or remove
         processDeletions(newDynamicConfigs, effectiveChanges, skippedConfigs, skipErrorConfig);
@@ -201,7 +222,13 @@ class DynamicServerConfig {
         return effectiveChanges;
     }
 
-    /** Processes config deletions by restoring to initial values or removing them. */
+    /**
+     * Processes config deletions by restoring to initial values or removing them. Keys still
+     * present in {@code newDynamicConfigs} are deliberately ignored here — they are handled by
+     * {@link #processModifications}, which validates first and only stages real changes. Letting
+     * "still present" keys fall through here would (a) bypass validation when the new value is
+     * invalid, and (b) pollute {@code effectiveChanges} with no-op entries.
+     */
     private void processDeletions(
             Map<String, String> newDynamicConfigs,
             Map<String, String> effectiveChanges,
@@ -210,8 +237,7 @@ class DynamicServerConfig {
             throws ConfigException {
         for (String configKey : dynamicConfigs.keySet()) {
             if (newDynamicConfigs.containsKey(configKey)) {
-                effectiveChanges.put(configKey, newDynamicConfigs.get(configKey));
-                continue; // Not deleted
+                continue; // Not deleted: processModifications will handle it.
             }
 
             String currentValue = currentConfigMap.get(configKey);
@@ -367,15 +393,25 @@ class DynamicServerConfig {
             }
         }
 
-        // Business validation with registered validators (if any)
+        // Business validation with registered validators (if any).
+        // For typed configs we pass the parsed values; for prefix-only configs (no ConfigOption)
+        // we pass the raw strings so that validators registered on those keys still run.
         List<ConfigValidator<?>> validators = configValidatorsByKey.get(configKey);
-        if (validators != null && !validators.isEmpty() && configOption != null) {
-            Object oldValue =
-                    oldValueStr != null
-                            ? currentConfig.getOptional(configOption).orElse(null)
-                            : null;
+        if (validators != null && !validators.isEmpty()) {
+            Object oldVal;
+            Object newVal;
+            if (configOption != null) {
+                oldVal =
+                        oldValueStr != null
+                                ? currentConfig.getOptional(configOption).orElse(null)
+                                : null;
+                newVal = newValue;
+            } else {
+                oldVal = oldValueStr;
+                newVal = newValueStr;
+            }
             for (ConfigValidator<?> validator : validators) {
-                invokeValidator(validator, oldValue, newValue);
+                invokeValidator(validator, oldVal, newVal);
             }
         }
     }
@@ -391,6 +427,7 @@ class DynamicServerConfig {
             throws Exception {
         Configuration oldConfig = currentConfig;
         Set<ServerReconfigurable> appliedSet = new HashSet<>();
+        Set<ServerReconfigurable> failedValidation = new HashSet<>();
 
         // Validate all first
         for (ServerReconfigurable reconfigurable : serverReconfigures.values()) {
@@ -405,12 +442,17 @@ class DynamicServerConfig {
                 if (!skipErrorConfig) {
                     throw e;
                 }
+                // skipErrorConfig: remember the failure and skip apply for this instance.
+                failedValidation.add(reconfigurable);
             }
         }
 
-        // Apply to all instances
+        // Apply to all instances that passed validation.
         Exception throwable = null;
         for (ServerReconfigurable reconfigurable : serverReconfigures.values()) {
+            if (failedValidation.contains(reconfigurable)) {
+                continue;
+            }
             try {
                 reconfigurable.reconfigure(newConfig);
                 appliedSet.add(reconfigurable);
@@ -427,9 +469,22 @@ class DynamicServerConfig {
             }
         }
 
-        // Rollback if there was an error
+        // Rollback if there was an error. Each rollback is wrapped in its own try/catch so that a
+        // failing rollback for one instance does not skip the rest, and rollback exceptions are
+        // attached to the original throwable as suppressed rather than masking it.
         if (throwable != null) {
-            appliedSet.forEach(r -> r.reconfigure(oldConfig));
+            for (ServerReconfigurable r : appliedSet) {
+                try {
+                    r.reconfigure(oldConfig);
+                } catch (Exception rollbackEx) {
+                    LOG.error(
+                            "Rollback failed for {}: {}",
+                            r.getClass().getSimpleName(),
+                            rollbackEx.getMessage(),
+                            rollbackEx);
+                    throwable.addSuppressed(rollbackEx);
+                }
+            }
             throw throwable;
         }
     }
