@@ -18,6 +18,7 @@
 package org.apache.fluss.metadata;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.StatisticsColumnsConfig;
 import org.apache.fluss.config.TableConfig;
@@ -31,6 +32,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.stream.Collectors;
 
 /**
@@ -390,6 +392,32 @@ public final class TableInfo {
      */
     public long getModifiedTime() {
         return modifiedTime;
+    }
+
+    /**
+     * Returns true if this table is an internal {@link TableType#INDEX_TABLE} managed by Fluss for
+     * a global secondary index, as identified by the {@link ConfigOptions#TABLE_TYPE} property.
+     */
+    public boolean isIndexTable() {
+        return TableType.INDEX_TABLE == properties.get(ConfigOptions.TABLE_TYPE);
+    }
+
+    /**
+     * Returns the table id of the main table that this index table belongs to, or empty if this
+     * table is not an index table (or the back-link is not set).
+     */
+    public OptionalLong getMainTableId() {
+        Optional<Long> v = properties.getOptional(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID);
+        return v.isPresent() ? OptionalLong.of(v.get()) : OptionalLong.empty();
+    }
+
+    /**
+     * Returns the fully-qualified {@code database.table} name of the main table that this index
+     * table belongs to, or empty if this table is not an index table (or the back-link is not
+     * set).
+     */
+    public Optional<String> getMainTableName() {
+        return properties.getOptional(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_NAME);
     }
 
     /**
