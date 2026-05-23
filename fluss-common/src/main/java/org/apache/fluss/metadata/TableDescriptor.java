@@ -22,6 +22,9 @@ import org.apache.fluss.annotation.PublicStable;
 import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.ConfigurationUtils;
+import org.apache.fluss.types.DataType;
+import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.TableDescriptorJsonSerde;
 
@@ -36,6 +39,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -157,6 +161,115 @@ public final class TableDescriptor implements Serializable {
     }
 
     /**
+     * Derives the {@link TableDescriptor} for the system-managed Index Table backing the named
+     * secondary index on {@code mainDescriptor}.
+     *
+     * <p>The derived schema is composed of the index columns (in declared order) followed by the
+     * base primary-key columns (deduplicated against the index columns). When the main table is
+     * partitioned, an additional {@link IndexTableUtils#PARTITION_ID_SYSTEM_COLUMN} (BIGINT NOT
+     * NULL) is appended so partition tombstone cleanup can identify dead rows. The derived primary
+     * key is {@code idxCols + basePK} (deduplicated, in that order); {@code __partition_id} is
+     * NEVER part of the derived primary key.
+     *
+     * <p>Bucket count resolution: prefer the per-index override {@code
+     * secondary-index.<name>.bucket.num} on the main table; otherwise inherit
+     * {@code mainDescriptor.getTableDistribution().getBucketCount()}; otherwise leave unset and let
+     * the Fluss cluster decide.
+     *
+     * <p>The derived descriptor pins {@link KvFormat#COMPACTED}, {@link LogFormat#COMPACTED} and
+     * {@link ChangelogImage#WAL}, and stamps the {@link ConfigOptions#TABLE_TYPE} as {@link
+     * TableType#INDEX_TABLE} together with the main-table back-link properties {@link
+     * ConfigOptions#TABLE_INDEX_META_MAIN_TABLE_ID} and {@link
+     * ConfigOptions#TABLE_INDEX_META_MAIN_TABLE_NAME}.
+     *
+     * @throws IllegalArgumentException if {@code indexName} is not declared on the main table.
+     * @throws IllegalStateException if the main table has no primary key.
+     */
+    public static TableDescriptor deriveIndexTableDescriptor(
+            TableDescriptor mainDescriptor,
+            long mainTableId,
+            String mainTableName,
+            String indexName) {
+        Schema.Index index = null;
+        for (Schema.Index candidate : mainDescriptor.getSchema().getIndexes()) {
+            if (candidate.getIndexName().equals(indexName)) {
+                index = candidate;
+                break;
+            }
+        }
+        if (index == null) {
+            throw new IllegalArgumentException(
+                    "Unknown index '" + indexName + "' on table " + mainTableName);
+        }
+
+        boolean partitioned = mainDescriptor.isPartitioned();
+        Optional<Schema.PrimaryKey> mainPk = mainDescriptor.getSchema().getPrimaryKey();
+        if (!mainPk.isPresent()) {
+            throw new IllegalStateException("Indexed main table must have a primary key");
+        }
+        List<String> basePk = mainPk.get().getColumnNames();
+
+        Set<String> seen = new LinkedHashSet<>();
+        Schema.Builder sb = Schema.newBuilder();
+        for (String c : index.getColumnNames()) {
+            if (seen.add(c)) {
+                sb.column(c, lookupColumnType(mainDescriptor.getSchema(), c));
+            }
+        }
+        for (String c : basePk) {
+            if (seen.add(c)) {
+                sb.column(c, lookupColumnType(mainDescriptor.getSchema(), c));
+            }
+        }
+        if (partitioned) {
+            sb.systemColumn(
+                    IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN, DataTypes.BIGINT().copy(false));
+        }
+        List<String> idxPk = new ArrayList<>(seen);
+        sb.primaryKey(idxPk);
+        Schema derivedSchema = sb.build();
+
+        String bucketProp =
+                mainDescriptor
+                        .getProperties()
+                        .get(ConfigOptions.secondaryIndexBucketNumKey(indexName));
+        Integer bucketCount;
+        if (bucketProp != null) {
+            bucketCount = Integer.parseInt(bucketProp);
+        } else {
+            bucketCount =
+                    mainDescriptor
+                            .getTableDistribution()
+                            .flatMap(TableDistribution::getBucketCount)
+                            .orElse(null);
+        }
+
+        Builder b =
+                builder()
+                        .schema(derivedSchema)
+                        .kvFormat(KvFormat.COMPACTED)
+                        .logFormat(LogFormat.COMPACTED)
+                        .changelogImage(ChangelogImage.WAL)
+                        .property(ConfigOptions.TABLE_TYPE, TableType.INDEX_TABLE)
+                        .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, mainTableId)
+                        .property(
+                                ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_NAME, mainTableName);
+        if (bucketCount != null) {
+            b.distributedBy(bucketCount, idxPk);
+        }
+        return b.build();
+    }
+
+    private static DataType lookupColumnType(Schema schema, String column) {
+        for (Schema.Column c : schema.getColumns()) {
+            if (c.getName().equals(column)) {
+                return c.getDataType();
+            }
+        }
+        throw new IllegalArgumentException("Unknown column '" + column + "'");
+    }
+
+    /**
      * Translates the legacy {@code table.secondary-index.columns} single-index property to the V2
      * namespaced form {@code secondary-index.<name>.columns} (default index name {@code
      * idx_default}). Returns the input unchanged if the legacy key is absent or empty.
@@ -213,6 +326,44 @@ public final class TableDescriptor implements Serializable {
     /** Returns the {@link Schema} of the table. */
     public Schema getSchema() {
         return schema;
+    }
+
+    /**
+     * Returns the configured {@link KvFormat} for this table, falling back to the default value of
+     * {@link ConfigOptions#TABLE_KV_FORMAT} when not explicitly set.
+     */
+    public KvFormat getKvFormat() {
+        String v = properties.get(ConfigOptions.TABLE_KV_FORMAT.key());
+        return v == null ? ConfigOptions.TABLE_KV_FORMAT.defaultValue() : KvFormat.fromString(v);
+    }
+
+    /**
+     * Returns the configured {@link LogFormat} for this table, falling back to the default value of
+     * {@link ConfigOptions#TABLE_LOG_FORMAT} when not explicitly set.
+     */
+    public LogFormat getLogFormat() {
+        String v = properties.get(ConfigOptions.TABLE_LOG_FORMAT.key());
+        return v == null ? ConfigOptions.TABLE_LOG_FORMAT.defaultValue() : LogFormat.fromString(v);
+    }
+
+    /**
+     * Returns the configured {@link ChangelogImage} for this table, falling back to the default
+     * value of {@link ConfigOptions#TABLE_CHANGELOG_IMAGE} when not explicitly set.
+     */
+    public ChangelogImage getChangelogImage() {
+        String v = properties.get(ConfigOptions.TABLE_CHANGELOG_IMAGE.key());
+        return v == null
+                ? ConfigOptions.TABLE_CHANGELOG_IMAGE.defaultValue()
+                : ChangelogImage.fromString(v);
+    }
+
+    /**
+     * Returns {@code true} when this descriptor is for a system-managed Index Table (i.e. {@link
+     * ConfigOptions#TABLE_TYPE} is {@link TableType#INDEX_TABLE}).
+     */
+    public boolean isIndexTable() {
+        String v = properties.get(ConfigOptions.TABLE_TYPE.key());
+        return v != null && TableType.INDEX_TABLE.name().equals(v.toUpperCase());
     }
 
     /** Returns the bucket key of the table, empty if no bucket key is set. */
@@ -592,6 +743,12 @@ public final class TableDescriptor implements Serializable {
         /** Sets the kv format of the table. */
         public Builder kvFormat(KvFormat kvFormat) {
             property(ConfigOptions.TABLE_KV_FORMAT, kvFormat);
+            return this;
+        }
+
+        /** Sets the changelog image mode of the table. */
+        public Builder changelogImage(ChangelogImage image) {
+            property(ConfigOptions.TABLE_CHANGELOG_IMAGE, image);
             return this;
         }
 
