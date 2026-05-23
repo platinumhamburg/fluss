@@ -37,6 +37,7 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.SecondaryIndexVisibility;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -1712,11 +1713,16 @@ public class ReplicaManager implements ServerReconfigurable {
         if (delayedWriteRequired(requiredAcks, requestBucketSize, writeResults)) {
             Map<TableBucket, DelayedWrite.DelayedBucketStatus<T>> bucketStatusMap = new HashMap<>();
             writeResults.forEach(
-                    (tb, result) ->
-                            bucketStatusMap.put(
-                                    tb,
-                                    new DelayedWrite.DelayedBucketStatus<>(
-                                            result.getWriteLogEndOffset(), result)));
+                    (tb, result) -> {
+                        long writeOffset = result.getWriteLogEndOffset();
+                        long requiredIndexOffset =
+                                computeRequiredIndexOffset(
+                                        resolveTableInfoForVisibility(tb), writeOffset);
+                        bucketStatusMap.put(
+                                tb,
+                                new DelayedWrite.DelayedBucketStatus<>(
+                                        writeOffset, requiredIndexOffset, result));
+                    });
             DelayedWrite<T> delayedWrite =
                     new DelayedWrite<>(
                             timeoutMs,
@@ -1736,6 +1742,57 @@ public class ReplicaManager implements ServerReconfigurable {
         } else {
             responseCallback.accept(new ArrayList<>(writeResults.values()));
         }
+    }
+
+    /**
+     * Resolves the {@link TableInfo} for the given bucket, returning {@code null} if the local
+     * replica cannot be looked up. Errors here MUST NOT break the write path — callers fall back to
+     * {@link DelayedWrite.DelayedBucketStatus#NO_INDEX_OFFSET_REQUIRED} when this returns null.
+     */
+    @Nullable
+    private TableInfo resolveTableInfoForVisibility(TableBucket tableBucket) {
+        try {
+            return getReplicaOrException(tableBucket).getTableInfo();
+        } catch (Exception e) {
+            LOG.debug(
+                    "Cannot resolve replica {} while computing secondary-index visibility; "
+                            + "falling back to no index-offset requirement",
+                    tableBucket,
+                    e);
+            return null;
+        }
+    }
+
+    /**
+     * Returns the index-pushed-offset that a {@link DelayedWrite.DelayedBucketStatus} must wait
+     * for before acking, honoring the {@code secondary-index.visibility} table property.
+     *
+     * <ul>
+     *   <li>{@code tableInfo == null} (replica lookup failed) →
+     *       {@link DelayedWrite.DelayedBucketStatus#NO_INDEX_OFFSET_REQUIRED};
+     *   <li>table has no secondary indexes → {@code NO_INDEX_OFFSET_REQUIRED} regardless of the
+     *       visibility property (nothing to wait on);
+     *   <li>table has indexes and visibility is {@link SecondaryIndexVisibility#ASYNC} →
+     *       {@code NO_INDEX_OFFSET_REQUIRED};
+     *   <li>table has indexes and visibility is {@link SecondaryIndexVisibility#SYNC} (default) →
+     *       {@code writeOffset}.
+     * </ul>
+     */
+    @VisibleForTesting
+    static long computeRequiredIndexOffset(@Nullable TableInfo tableInfo, long writeOffset) {
+        if (tableInfo == null) {
+            return DelayedWrite.DelayedBucketStatus.NO_INDEX_OFFSET_REQUIRED;
+        }
+        List<Schema.Index> indexes = tableInfo.getSchema().getIndexes();
+        if (indexes.isEmpty()) {
+            return DelayedWrite.DelayedBucketStatus.NO_INDEX_OFFSET_REQUIRED;
+        }
+        SecondaryIndexVisibility visibility =
+                tableInfo.getProperties().get(ConfigOptions.SECONDARY_INDEX_VISIBILITY);
+        if (visibility == SecondaryIndexVisibility.ASYNC) {
+            return DelayedWrite.DelayedBucketStatus.NO_INDEX_OFFSET_REQUIRED;
+        }
+        return writeOffset;
     }
 
     private void maybeAddDelayedFetchLog(
