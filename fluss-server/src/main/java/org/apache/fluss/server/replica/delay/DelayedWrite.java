@@ -120,8 +120,9 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
             // skip those buckets that have already been satisfied.
             if (delayedBucketStatus.isAcksPending()) {
                 Tuple2<Boolean, Errors> result;
+                Replica replica = null;
                 try {
-                    Replica replica = replicaManager.getReplicaOrException(tableBucket);
+                    replica = replicaManager.getReplicaOrException(tableBucket);
                     result =
                             replica.checkEnoughReplicasReachOffset(
                                     delayedBucketStatus.getRequiredOffset());
@@ -131,9 +132,24 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
 
                 // Case B || C.1 || C.2.
                 Errors errors = result.f1;
-                if (errors != Errors.NONE || result.f0) {
+                if (errors != Errors.NONE) {
+                    // Error path: errors don't wait on index-pushed-offset; complete immediately.
                     delayedBucketStatus.setAcksPending(false);
                     delayedBucketStatus.setDelayedError(errors);
+                } else if (result.f0) {
+                    // HW satisfied; additionally gate on the index-pushed-offset watermark when
+                    // a requirement is configured (replica is non-null here because no exception
+                    // was thrown above).
+                    long requiredIndexOffset = delayedBucketStatus.getRequiredIndexOffset();
+                    boolean indexOk =
+                            requiredIndexOffset
+                                            == DelayedBucketStatus.NO_INDEX_OFFSET_REQUIRED
+                                    || replica.getIndexPushedOffset() >= requiredIndexOffset;
+                    if (indexOk) {
+                        delayedBucketStatus.setAcksPending(false);
+                        delayedBucketStatus.setDelayedError(errors);
+                    }
+                    // else: keep pending; wait for index-pushed-offset to advance.
                 }
 
                 if (delayedBucketStatus.isAcksPending()) {
@@ -209,7 +225,11 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
 
     /** DelayedProduceMetadata. */
     public static class DelayedBucketStatus<T extends WriteResultForBucket> {
+        /** Sentinel meaning "no index-pushed-offset requirement". */
+        public static final long NO_INDEX_OFFSET_REQUIRED = -1L;
+
         private final long requiredOffset;
+        private final long requiredIndexOffset;
         private final T writeResultForBucket;
         /** Whether this bucket is waiting acks. */
         private volatile boolean acksPending;
@@ -217,7 +237,13 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
         private volatile Errors delayedError;
 
         public DelayedBucketStatus(long requiredOffset, T writeResultForBucket) {
+            this(requiredOffset, NO_INDEX_OFFSET_REQUIRED, writeResultForBucket);
+        }
+
+        public DelayedBucketStatus(
+                long requiredOffset, long requiredIndexOffset, T writeResultForBucket) {
             this.requiredOffset = requiredOffset;
+            this.requiredIndexOffset = requiredIndexOffset;
             this.writeResultForBucket = writeResultForBucket;
             this.acksPending = false;
             this.delayedError = null;
@@ -225,6 +251,10 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
 
         public long getRequiredOffset() {
             return requiredOffset;
+        }
+
+        public long getRequiredIndexOffset() {
+            return requiredIndexOffset;
         }
 
         public T getWriteResultForBucket() {
@@ -252,6 +282,8 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
             return "DelayedBucketStatus{"
                     + "requiredOffset="
                     + requiredOffset
+                    + ", requiredIndexOffset="
+                    + requiredIndexOffset
                     + ", writeResultForBucket="
                     + writeResultForBucket
                     + ", acksPending="
