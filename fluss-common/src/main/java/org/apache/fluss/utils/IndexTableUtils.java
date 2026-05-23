@@ -38,5 +38,69 @@ public final class IndexTableUtils {
     public static final Set<String> RESERVED_INDEX_SYSTEM_COLUMNS =
             Collections.singleton(PARTITION_ID_SYSTEM_COLUMN);
 
+    /** Fixed-width Big-Endian int64 prefix for partitioned Index Table values. */
+    public static final int PARTITION_ID_PREFIX_SIZE = 8;
+
     private IndexTableUtils() {}
+
+    /**
+     * Prepends the 8-byte Big-Endian int64 partitionId to the given value body.
+     *
+     * @return a new byte array of length {@code 8 + valueBody.length}
+     */
+    public static byte[] prependPartitionIdPrefix(long partitionId, byte[] valueBody) {
+        if (valueBody == null) {
+            throw new IllegalArgumentException("valueBody must not be null");
+        }
+        byte[] out = new byte[PARTITION_ID_PREFIX_SIZE + valueBody.length];
+        out[0] = (byte) (partitionId >>> 56);
+        out[1] = (byte) (partitionId >>> 48);
+        out[2] = (byte) (partitionId >>> 40);
+        out[3] = (byte) (partitionId >>> 32);
+        out[4] = (byte) (partitionId >>> 24);
+        out[5] = (byte) (partitionId >>> 16);
+        out[6] = (byte) (partitionId >>> 8);
+        out[7] = (byte) partitionId;
+        System.arraycopy(valueBody, 0, out, PARTITION_ID_PREFIX_SIZE, valueBody.length);
+        return out;
+    }
+
+    /**
+     * Decodes the first 8 bytes of {@code value} as a Big-Endian int64 partitionId.
+     *
+     * @throws IllegalArgumentException if {@code value} is null or shorter than 8 bytes
+     */
+    public static long decodePartitionIdPrefix(byte[] value) {
+        if (value == null || value.length < PARTITION_ID_PREFIX_SIZE) {
+            throw new IllegalArgumentException(
+                    "Partitioned Index Table value must be at least "
+                            + PARTITION_ID_PREFIX_SIZE
+                            + " bytes for the partitionId prefix");
+        }
+        return ((long) (value[0] & 0xFF) << 56)
+                | ((long) (value[1] & 0xFF) << 48)
+                | ((long) (value[2] & 0xFF) << 40)
+                | ((long) (value[3] & 0xFF) << 32)
+                | ((long) (value[4] & 0xFF) << 24)
+                | ((long) (value[5] & 0xFF) << 16)
+                | ((long) (value[6] & 0xFF) << 8)
+                | ((long) value[7] & 0xFF);
+    }
+
+    /**
+     * Returns the value body without the 8-byte partitionId prefix.
+     *
+     * @throws IllegalArgumentException if {@code value} is null or shorter than 8 bytes
+     */
+    public static byte[] stripPartitionIdPrefix(byte[] value) {
+        if (value == null || value.length < PARTITION_ID_PREFIX_SIZE) {
+            throw new IllegalArgumentException(
+                    "Partitioned Index Table value must be at least "
+                            + PARTITION_ID_PREFIX_SIZE
+                            + " bytes");
+        }
+        byte[] body = new byte[value.length - PARTITION_ID_PREFIX_SIZE];
+        System.arraycopy(value, PARTITION_ID_PREFIX_SIZE, body, 0, body.length);
+        return body;
+    }
 }
