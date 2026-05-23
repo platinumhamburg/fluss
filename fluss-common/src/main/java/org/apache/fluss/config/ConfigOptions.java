@@ -26,6 +26,7 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
+import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.utils.ArrayUtils;
 
 import java.lang.reflect.Field;
@@ -1674,6 +1675,71 @@ public class ConfigOptions {
                                     + "Note: enabling column statistics requires the V1 batch format. "
                                     + "Downstream consumers must be upgraded to Fluss v1.0+ before enabling this option, "
                                     + "as older versions cannot parse the extended batch format.");
+
+    // ------------------------------------------------------------------------
+    //  Table Type & Secondary Index Definition Configs
+    //  (per-index, namespaced: secondary-index.<name>.{columns,bucket.num})
+    //  (visibility: secondary-index.visibility)
+    //  (index table metadata: table.index-meta.*)
+    // ------------------------------------------------------------------------
+
+    public static final ConfigOption<TableType> TABLE_TYPE =
+            key("table.type")
+                    .enumType(TableType.class)
+                    .defaultValue(TableType.DATA_TABLE)
+                    .withDescription(
+                            "Table type identifying whether this table is a user-facing DATA_TABLE "
+                                    + "or an internal INDEX_TABLE managed by Fluss for global secondary "
+                                    + "indexes. INDEX_TABLE is system-set and must not be configured by users.");
+
+    /** Visibility semantics for writes to a table that owns secondary indexes. */
+    public enum SecondaryIndexVisibility {
+        SYNC,
+        ASYNC
+    }
+
+    public static final ConfigOption<SecondaryIndexVisibility> SECONDARY_INDEX_VISIBILITY =
+            key("secondary-index.visibility")
+                    .enumType(SecondaryIndexVisibility.class)
+                    .defaultValue(SecondaryIndexVisibility.SYNC)
+                    .withDescription(
+                            "Visibility semantics for writes to a table that owns secondary indexes. "
+                                    + "'sync' (default) blocks PutKv ack until all index mutations are "
+                                    + "applied. 'async' acks once the data WAL is committed and lets "
+                                    + "index mutations land asynchronously.");
+
+    public static final ConfigOption<Long> TABLE_INDEX_META_MAIN_TABLE_ID =
+            key("table.index-meta.main-table-id")
+                    .longType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The table id of the main table that this index table belongs to. "
+                                    + "Set automatically by the system when creating index tables; "
+                                    + "users must not modify it. Used to look up the main table during "
+                                    + "index push and lookup paths.");
+
+    public static final ConfigOption<String> TABLE_INDEX_META_MAIN_TABLE_NAME =
+            key("table.index-meta.main-table-name")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The fully-qualified (database.table) name of the main table that this "
+                                    + "index table belongs to. Set automatically by the system; users "
+                                    + "must not modify it.");
+
+    public static final String SECONDARY_INDEX_PREFIX = "secondary-index.";
+    public static final String SECONDARY_INDEX_COLUMNS_SUFFIX = ".columns";
+    public static final String SECONDARY_INDEX_BUCKET_NUM_SUFFIX = ".bucket.num";
+
+    /** Builds the per-index columns config key: {@code secondary-index.<name>.columns}. */
+    public static String secondaryIndexColumnsKey(String indexName) {
+        return SECONDARY_INDEX_PREFIX + indexName + SECONDARY_INDEX_COLUMNS_SUFFIX;
+    }
+
+    /** Builds the per-index bucket-num config key: {@code secondary-index.<name>.bucket.num}. */
+    public static String secondaryIndexBucketNumKey(String indexName) {
+        return SECONDARY_INDEX_PREFIX + indexName + SECONDARY_INDEX_BUCKET_NUM_SUFFIX;
+    }
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv
