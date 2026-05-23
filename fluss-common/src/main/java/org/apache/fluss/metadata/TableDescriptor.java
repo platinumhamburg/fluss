@@ -25,6 +25,9 @@ import org.apache.fluss.config.ConfigurationUtils;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.TableDescriptorJsonSerde;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
@@ -55,6 +58,12 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 @PublicEvolving
 public final class TableDescriptor implements Serializable {
     private static final long serialVersionUID = 1L;
+
+    private static final Logger LOG = LoggerFactory.getLogger(TableDescriptor.class);
+
+    // Secondary Index legacy alias
+    static final String LEGACY_SECONDARY_INDEX_COLUMNS_KEY = "table.secondary-index.columns";
+    static final String LEGACY_DEFAULT_INDEX_NAME = "idx_default";
 
     public static final String OFFSET_COLUMN_NAME = "__offset";
     public static final String TIMESTAMP_COLUMN_NAME = "__timestamp";
@@ -145,6 +154,60 @@ public final class TableDescriptor implements Serializable {
     /** Creates a builder based on an existing TableDescriptor. */
     public static Builder builder(TableDescriptor origin) {
         return new Builder(origin);
+    }
+
+    /**
+     * Translates the legacy {@code table.secondary-index.columns} single-index property to the V2
+     * namespaced form {@code secondary-index.<name>.columns} (default index name {@code
+     * idx_default}). Returns the input unchanged if the legacy key is absent or empty.
+     *
+     * <p>The V1 multi-group form (separated by {@code ;}) is no longer supported and will throw.
+     * The legacy and namespaced forms must not coexist on the same table.
+     *
+     * @throws IllegalArgumentException when the legacy value uses {@code ;} multi-group form, or
+     *     when a {@code secondary-index.*.columns} key is also present.
+     */
+    public static Map<String, String> translateLegacyIndexProperties(Map<String, String> input) {
+        if (!input.containsKey(LEGACY_SECONDARY_INDEX_COLUMNS_KEY)) {
+            return input;
+        }
+        String legacyValue = input.get(LEGACY_SECONDARY_INDEX_COLUMNS_KEY);
+        if (legacyValue == null || legacyValue.isEmpty()) {
+            return input;
+        }
+        if (legacyValue.contains(";")) {
+            throw new IllegalArgumentException(
+                    "Legacy '"
+                            + LEGACY_SECONDARY_INDEX_COLUMNS_KEY
+                            + "' no longer supports multiple indexes separated by ';'. "
+                            + "Use namespaced 'secondary-index.<name>.columns' per index.");
+        }
+        boolean hasNamespaced =
+                input.keySet().stream()
+                        .anyMatch(
+                                k ->
+                                        k.startsWith(ConfigOptions.SECONDARY_INDEX_PREFIX)
+                                                && k.endsWith(
+                                                        ConfigOptions
+                                                                .SECONDARY_INDEX_COLUMNS_SUFFIX));
+        if (hasNamespaced) {
+            throw new IllegalArgumentException(
+                    "Legacy '"
+                            + LEGACY_SECONDARY_INDEX_COLUMNS_KEY
+                            + "' and namespaced 'secondary-index.*.columns' cannot coexist. "
+                            + "Migrate fully to the namespaced form.");
+        }
+        LOG.warn(
+                "Property '{}' is deprecated; translating to '{}' (index name '{}'). "
+                        + "This alias will be removed in the next release.",
+                LEGACY_SECONDARY_INDEX_COLUMNS_KEY,
+                ConfigOptions.secondaryIndexColumnsKey(LEGACY_DEFAULT_INDEX_NAME),
+                LEGACY_DEFAULT_INDEX_NAME);
+        Map<String, String> translated = new HashMap<>(input);
+        translated.remove(LEGACY_SECONDARY_INDEX_COLUMNS_KEY);
+        translated.put(
+                ConfigOptions.secondaryIndexColumnsKey(LEGACY_DEFAULT_INDEX_NAME), legacyValue);
+        return translated;
     }
 
     /** Returns the {@link Schema} of the table. */
