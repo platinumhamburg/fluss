@@ -161,6 +161,8 @@ public class ReplicaManager implements ServerReconfigurable {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicaManager.class);
 
     public static final String HIGH_WATERMARK_CHECKPOINT_FILE_NAME = "high-watermark-checkpoint";
+    public static final String INDEX_PUSHED_OFFSET_CHECKPOINT_FILE_NAME =
+            "index-pushed-offset-checkpoint";
     private final Configuration conf;
     private final Scheduler scheduler;
     private final LogManager logManager;
@@ -169,6 +171,7 @@ public class ReplicaManager implements ServerReconfigurable {
     protected final int serverId;
     private final AtomicBoolean highWatermarkCheckPointThreadStarted = new AtomicBoolean(false);
     private final Map<File, OffsetCheckpointFile> highWatermarkCheckpoints;
+    private final Map<File, OffsetCheckpointFile> indexPushedOffsetCheckpoints;
     private final LocalDiskManager localDiskManager;
 
     @GuardedBy("replicaStateChangeLock")
@@ -313,11 +316,16 @@ public class ReplicaManager implements ServerReconfigurable {
         this.metadataCache = metadataCache;
 
         this.highWatermarkCheckpoints = new HashMap<>();
+        this.indexPushedOffsetCheckpoints = new HashMap<>();
         for (File dataDir : localDiskManager.dataDirs()) {
             highWatermarkCheckpoints.put(
                     dataDir,
                     new OffsetCheckpointFile(
                             new File(dataDir, HIGH_WATERMARK_CHECKPOINT_FILE_NAME)));
+            indexPushedOffsetCheckpoints.put(
+                    dataDir,
+                    new OffsetCheckpointFile(
+                            new File(dataDir, INDEX_PUSHED_OFFSET_CHECKPOINT_FILE_NAME)));
         }
         this.delayedWriteManager =
                 new DelayedOperationManager<>(
@@ -1602,12 +1610,19 @@ public class ReplicaManager implements ServerReconfigurable {
      */
     private void startHighWatermarkCheckPointThread() {
         if (highWatermarkCheckPointThreadStarted.compareAndSet(false, true)) {
+            long intervalMs =
+                    conf.get(ConfigOptions.LOG_REPLICA_HIGH_WATERMARK_CHECKPOINT_INTERVAL)
+                            .toMillis();
             scheduler.schedule(
                     "highWatermark-checkpoint",
                     this::checkpointHighWatermarks,
                     0L,
-                    conf.get(ConfigOptions.LOG_REPLICA_HIGH_WATERMARK_CHECKPOINT_INTERVAL)
-                            .toMillis());
+                    intervalMs);
+            scheduler.schedule(
+                    "indexPushedOffset-checkpoint",
+                    this::checkpointIndexPushedOffsets,
+                    0L,
+                    intervalMs);
         }
     }
 
@@ -1634,6 +1649,45 @@ public class ReplicaManager implements ServerReconfigurable {
                 } catch (Exception e) {
                     throw new LogStorageException("Error while writing to high watermark file", e);
                 }
+            }
+        }
+    }
+
+    /**
+     * Flushes the {@code indexPushedOffset} watermark for all buckets that have an advanced offset
+     * ({@code != -1L}) to the per-dataDir {@link #INDEX_PUSHED_OFFSET_CHECKPOINT_FILE_NAME} file.
+     * Replicas whose offset is still {@code -1L} (no data pushed yet) are skipped — there is no
+     * value to persist and we do not want to overwrite a previously checkpointed offset on a
+     * follower that has not advanced this leader epoch.
+     */
+    @VisibleForTesting
+    void checkpointIndexPushedOffsets() {
+        List<Replica> onlineReplicasList = getOnlineReplicaList();
+        if (onlineReplicasList.isEmpty()) {
+            return;
+        }
+
+        Map<File, Map<TableBucket, Long>> indexOffsetsByDir = new HashMap<>();
+        for (Replica replica : onlineReplicasList) {
+            long offset = replica.getIndexPushedOffset();
+            if (offset == -1L) {
+                continue;
+            }
+            LogTablet logTablet = replica.getLogTablet();
+            indexOffsetsByDir
+                    .computeIfAbsent(logTablet.getDataDir(), ignored -> new HashMap<>())
+                    .put(logTablet.getTableBucket(), offset);
+        }
+
+        for (Map.Entry<File, Map<TableBucket, Long>> entry : indexOffsetsByDir.entrySet()) {
+            if (entry.getValue().isEmpty()) {
+                continue;
+            }
+            try {
+                indexPushedOffsetCheckpoints.get(entry.getKey()).write(entry.getValue());
+            } catch (Exception e) {
+                throw new LogStorageException(
+                        "Error while writing to index pushed offset checkpoint file", e);
             }
         }
     }
@@ -2025,6 +2079,16 @@ public class ReplicaManager implements ServerReconfigurable {
                 if (!existingLogTabletOpt.isPresent()) {
                     localDiskManager.recordReplicaLoad(dataDir, isKvTable);
                 }
+                // P2T10: seed indexPushedOffset from the per-dataDir checkpoint file so that the
+                // double-watermark logic (P2T8) does not have to replay from offset 0 after a
+                // restart. Missing entries leave the offset at -1L (no offset pushed yet).
+                OffsetCheckpointFile indexCheckpoint = indexPushedOffsetCheckpoints.get(dataDir);
+                if (indexCheckpoint != null) {
+                    Long seeded = indexCheckpoint.read().get(tb);
+                    if (seeded != null) {
+                        replica.seedIndexPushedOffsetOnLoad(seeded);
+                    }
+                }
                 allReplicas.put(tb, new OnlineReplica(replica));
                 replicaOpt = Optional.of(replica);
             } else if (hostedReplica instanceof OnlineReplica) {
@@ -2189,6 +2253,8 @@ public class ReplicaManager implements ServerReconfigurable {
 
         // Checkpoint highWatermark.
         checkpointHighWatermarks();
+        // Checkpoint indexPushedOffset (P2T10).
+        checkpointIndexPushedOffsets();
     }
 
     private void validateClientVersionForPkTable(int apiVersion, TableInfo tableInfo) {
