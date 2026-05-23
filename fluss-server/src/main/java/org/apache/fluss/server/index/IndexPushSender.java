@@ -31,8 +31,17 @@ import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.MergeMode;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.concurrent.GuardedBy;
+import javax.annotation.concurrent.ThreadSafe;
+
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,11 +67,22 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * {@code UpsertWriter} / {@code IdempotenceManager}. Idempotence is provided by the Index Table's
  * primary key: replays of the same (key, value) UPSERT or (key) DELETE are safe.
  *
+ * <p><b>Per-{@link IndexPushTracker.Target} FIFO ordering is preserved</b>: at most one batch is
+ * in flight per Target at a time, and retries do not overtake queued successors. This protects
+ * against the classic newer-then-older overwrite hazard where a retried older batch would land at
+ * the Index leader AFTER a successor batch and stomp a more recent value. Concretely, if batch B1
+ * (sourceOffset=N) fails and is queued for retry, batch B2 (sourceOffset=N+1) is held in the
+ * per-Target queue until B1's retry succeeds (or B1 is abandoned via {@link #close()} /
+ * executor shutdown, draining the rest of the queue).
+ *
  * <p>Thread-safety: {@link #send(List)} may be invoked from multiple threads concurrently; ack
  * callbacks may fire on the gateway's callback thread or on the retry executor.
  */
 @Internal
+@ThreadSafe
 public final class IndexPushSender implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(IndexPushSender.class);
 
     /** Resolves the TabletServer id hosting the leader for a given Index Bucket. */
     @FunctionalInterface
@@ -92,6 +112,15 @@ public final class IndexPushSender implements AutoCloseable {
     private final Object drainLock = new Object();
     private volatile boolean closed = false;
 
+    /**
+     * Per-Target FIFO of pending batches. The head batch is the one currently being attempted
+     * (or about to be re-attempted after a backoff). All accesses are guarded by {@link #lock}.
+     */
+    private final Object lock = new Object();
+
+    @GuardedBy("lock")
+    private final Map<IndexPushTracker.Target, Deque<Batch>> pendingByTarget = new HashMap<>();
+
     public IndexPushSender(
             Function<Integer, TabletServerGateway> gatewayFactory,
             LeaderResolver leaderResolver,
@@ -108,8 +137,9 @@ public final class IndexPushSender implements AutoCloseable {
 
     /**
      * Groups {@code mutations} by {@code (indexTableId, indexBucket)}, splits each group into
-     * batches of at most {@link #maxBatchSize}, and dispatches every batch. Returns immediately
-     * after enqueueing; ack callbacks fire asynchronously.
+     * batches of at most {@link #maxBatchSize}, and enqueues them on the per-Target FIFO. Only the
+     * head batch of each Target is dispatched immediately; the rest wait for the head to ack.
+     * Returns immediately after enqueueing; ack callbacks fire asynchronously.
      */
     public void send(List<IndexMutation> mutations) {
         checkNotNull(mutations, "mutations");
@@ -125,23 +155,48 @@ public final class IndexPushSender implements AutoCloseable {
                     new IndexPushTracker.Target(m.getIndexTableId(), m.getIndexBucket());
             grouped.computeIfAbsent(target, k -> new ArrayList<>()).add(m);
         }
-        for (Map.Entry<IndexPushTracker.Target, List<IndexMutation>> e : grouped.entrySet()) {
-            List<IndexMutation> all = e.getValue();
-            for (int i = 0; i < all.size(); i += maxBatchSize) {
-                int end = Math.min(i + maxBatchSize, all.size());
-                List<IndexMutation> batch = new ArrayList<>(all.subList(i, end));
-                inFlight.incrementAndGet();
-                attempt(e.getKey(), batch, INITIAL_BACKOFF_MS);
+        // Decide dispatch heads under the lock; perform the dispatch outside to avoid
+        // running gateway/callback code while holding the lock.
+        List<IndexPushTracker.Target> dispatchTargets = new ArrayList<>();
+        List<Batch> dispatchBatches = new ArrayList<>();
+        synchronized (lock) {
+            for (Map.Entry<IndexPushTracker.Target, List<IndexMutation>> e : grouped.entrySet()) {
+                IndexPushTracker.Target target = e.getKey();
+                List<IndexMutation> all = e.getValue();
+                Deque<Batch> queue =
+                        pendingByTarget.computeIfAbsent(target, k -> new ArrayDeque<>());
+                boolean wasEmpty = queue.isEmpty();
+                for (int i = 0; i < all.size(); i += maxBatchSize) {
+                    int end = Math.min(i + maxBatchSize, all.size());
+                    Batch batch = new Batch(new ArrayList<>(all.subList(i, end)));
+                    queue.add(batch);
+                    inFlight.incrementAndGet();
+                }
+                if (wasEmpty) {
+                    dispatchTargets.add(target);
+                    dispatchBatches.add(queue.peek());
+                }
             }
+        }
+        for (int i = 0; i < dispatchTargets.size(); i++) {
+            attempt(dispatchTargets.get(i), dispatchBatches.get(i));
         }
     }
 
     /**
      * Stops accepting new sends and blocks until every in-flight batch has either been acked or
      * given up (when the retry executor refuses further scheduling).
+     *
+     * <p>Mutations whose retries are abandoned (because {@code close()} was called before
+     * successful ack) will NOT trigger {@code ackCallback}. The surrounding {@link
+     * IndexPushTracker} will have unresolved offsets requiring WAL replay on next leader
+     * promotion to re-push. Callers must coordinate {@code close()} with a clean shutdown to
+     * avoid silent data loss windows.
      */
     @Override
     public void close() {
+        int entrySnapshot = inFlight.get();
+        LOG.info("IndexPushSender.close() entered; in-flight batches: {}", entrySnapshot);
         closed = true;
         synchronized (drainLock) {
             while (inFlight.get() > 0) {
@@ -149,18 +204,33 @@ public final class IndexPushSender implements AutoCloseable {
                     drainLock.wait(100);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
+                    LOG.info(
+                            "IndexPushSender.close() interrupted; in-flight remaining={}",
+                            inFlight.get());
                     return;
                 }
             }
         }
+        LOG.info(
+                "IndexPushSender.close() exiting; drained inFlight from {} to 0", entrySnapshot);
     }
 
     // ------------------------------------------------------------------------
     // Internal: dispatch + retry
     // ------------------------------------------------------------------------
 
-    private void attempt(
-            IndexPushTracker.Target target, List<IndexMutation> batch, long nextBackoffMs) {
+    /** Mutable per-batch state — owned by exactly one dispatch at a time (single-flight per Target). */
+    private static final class Batch {
+        final List<IndexMutation> mutations;
+        long nextBackoffMs = INITIAL_BACKOFF_MS;
+        int attemptCount = 0;
+
+        Batch(List<IndexMutation> mutations) {
+            this.mutations = mutations;
+        }
+    }
+
+    private void attempt(IndexPushTracker.Target target, Batch batch) {
         TabletServerGateway gateway;
         PutKvRequest request;
         try {
@@ -169,12 +239,12 @@ public final class IndexPushSender implements AutoCloseable {
                             target.getIndexTableId(), target.getIndexBucket());
             gateway = gatewayFactory.apply(leaderId);
             if (gateway == null) {
-                scheduleRetry(target, batch, nextBackoffMs);
+                handleFailure(target, batch, null);
                 return;
             }
-            request = buildRequest(target, batch);
+            request = buildRequest(target, batch.mutations);
         } catch (Throwable t) {
-            scheduleRetry(target, batch, nextBackoffMs);
+            handleFailure(target, batch, t);
             return;
         }
 
@@ -182,43 +252,104 @@ public final class IndexPushSender implements AutoCloseable {
         try {
             future = gateway.putKv(request);
         } catch (Throwable t) {
-            scheduleRetry(target, batch, nextBackoffMs);
+            handleFailure(target, batch, t);
             return;
         }
         if (future == null) {
-            scheduleRetry(target, batch, nextBackoffMs);
+            handleFailure(target, batch, null);
             return;
         }
         future.whenComplete(
                 (resp, err) -> {
                     if (err != null || hasError(resp)) {
-                        scheduleRetry(target, batch, nextBackoffMs);
+                        handleFailure(target, batch, err);
                     } else {
-                        try {
-                            for (IndexMutation m : batch) {
-                                ackCallback.accept(m.getSourceOffset(), target);
-                            }
-                        } finally {
-                            completeOne();
-                        }
+                        handleSuccess(target, batch);
                     }
                 });
+        LOG.debug("Dispatched batch to {} (size={})", target, batch.mutations.size());
     }
 
-    private void scheduleRetry(
-            IndexPushTracker.Target target, List<IndexMutation> batch, long delayMs) {
-        if (closed) {
-            // Give up: stop holding back the drain.
+    private void handleSuccess(IndexPushTracker.Target target, Batch batch) {
+        Batch next = null;
+        try {
+            for (IndexMutation m : batch.mutations) {
+                ackCallback.accept(m.getSourceOffset(), target);
+            }
+        } finally {
+            synchronized (lock) {
+                Deque<Batch> queue = pendingByTarget.get(target);
+                if (queue != null) {
+                    // The just-acked batch should be at the head.
+                    queue.poll();
+                    if (queue.isEmpty()) {
+                        pendingByTarget.remove(target);
+                    } else {
+                        next = queue.peek();
+                    }
+                }
+            }
             completeOne();
+        }
+        if (next != null) {
+            attempt(target, next);
+        }
+    }
+
+    private void handleFailure(
+            IndexPushTracker.Target target, Batch batch, Throwable lastError) {
+        batch.attemptCount++;
+        if (batch.attemptCount == 1) {
+            LOG.warn(
+                    "First retry escalation for batch indexTableId={}, indexBucket={}, attempt={}, lastError={}",
+                    target.getIndexTableId(),
+                    target.getIndexBucket(),
+                    batch.attemptCount,
+                    lastError == null ? "<no exception>" : lastError.getMessage());
+        }
+
+        long delayMs = batch.nextBackoffMs;
+        batch.nextBackoffMs = Math.min((long) (delayMs * BACKOFF_MULTIPLIER), MAX_BACKOFF_MS);
+
+        if (closed) {
+            // Give up the head batch AND drain its queued successors so close() can return.
+            giveUpQueue(target);
             return;
         }
-        long nextBackoff = Math.min((long) (delayMs * BACKOFF_MULTIPLIER), MAX_BACKOFF_MS);
         try {
             retryExecutor.schedule(
-                    () -> attempt(target, batch, nextBackoff), delayMs, TimeUnit.MILLISECONDS);
+                    () -> attempt(target, batch), delayMs, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException rex) {
-            // Executor shut down: give up so close() can drain.
+            LOG.warn(
+                    "Retry rejected — executor shut down. Abandoning batch and {} queued successor(s) for {} (batchSize={})",
+                    queueSizeMinusOne(target),
+                    target,
+                    batch.mutations.size());
+            giveUpQueue(target);
+        }
+    }
+
+    /**
+     * Drops the entire per-Target queue (head batch plus any queued successors) and decrements
+     * {@link #inFlight} by the dropped count. Used when the head batch cannot be retried (close
+     * or executor shutdown): queued successors would otherwise be stranded forever because
+     * nothing would ever dispatch them.
+     */
+    private void giveUpQueue(IndexPushTracker.Target target) {
+        int dropped;
+        synchronized (lock) {
+            Deque<Batch> queue = pendingByTarget.remove(target);
+            dropped = (queue == null) ? 0 : queue.size();
+        }
+        for (int i = 0; i < dropped; i++) {
             completeOne();
+        }
+    }
+
+    private int queueSizeMinusOne(IndexPushTracker.Target target) {
+        synchronized (lock) {
+            Deque<Batch> q = pendingByTarget.get(target);
+            return q == null ? 0 : Math.max(0, q.size() - 1);
         }
     }
 

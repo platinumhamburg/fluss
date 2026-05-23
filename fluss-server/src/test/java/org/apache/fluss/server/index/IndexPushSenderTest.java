@@ -177,6 +177,80 @@ class IndexPushSenderTest {
     }
 
     @Test
+    void testPerTargetOrderingIsPreservedAcrossRetries() throws Exception {
+        CapturingGateway gw = new CapturingGateway();
+        // Pre-stage three controlled futures:
+        // attempt #1 -> batch_1 first try (we will fail it via per-bucket errorCode).
+        // attempt #2 -> batch_1 retry (we will succeed).
+        // attempt #3 -> batch_2 dispatch after batch_1's retry succeeds.
+        CompletableFuture<PutKvResponse> attempt1 = new CompletableFuture<>();
+        CompletableFuture<PutKvResponse> attempt2 = new CompletableFuture<>();
+        CompletableFuture<PutKvResponse> attempt3 = new CompletableFuture<>();
+        gw.responses.add(attempt1);
+        gw.responses.add(attempt2);
+        gw.responses.add(attempt3);
+
+        List<long[]> acks = new CopyOnWriteArrayList<>();
+        CountDownLatch ackLatch = new CountDownLatch(2);
+        // maxBatchSize == 1 so each mutation becomes its own batch.
+        IndexPushSender sender = newSender(gw, acks, ackLatch, 1);
+
+        // Two mutations targeting the SAME (indexTableId=1, indexBucket=0).
+        sender.send(
+                Arrays.asList(
+                        IndexMutation.upsert(1L, 0, k("k1"), v("v1"), 100L),
+                        IndexMutation.upsert(1L, 0, k("k2"), v("v2"), 101L)));
+
+        // Wait until first batch dispatched, then assert exactly one is in flight
+        // (batch_2 must wait behind batch_1 in the per-target FIFO).
+        long deadline = System.currentTimeMillis() + 2000;
+        while (gw.received.isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(gw.received).hasSize(1);
+
+        // Fail batch_1's first attempt with a per-bucket error response.
+        PutKvResponse fail = new PutKvResponse();
+        PbPutKvRespForBucket fb = fail.addBucketsResp();
+        fb.setBucketId(0);
+        fb.setErrorCode(1);
+        attempt1.complete(fail);
+
+        // Give a brief moment to confirm batch_2 is NOT dispatched immediately
+        // after batch_1 failed (it must wait for batch_1 to succeed in retry).
+        Thread.sleep(50);
+        assertThat(gw.received).hasSize(1);
+
+        // The 200ms backoff retry should fire and dispatch batch_1 AGAIN.
+        deadline = System.currentTimeMillis() + 2000;
+        while (gw.received.size() < 2 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(gw.received).hasSize(2);
+        // batch_2 still not dispatched because batch_1's retry is still pending.
+
+        // Succeed batch_1's retry.
+        attempt2.complete(successResponse());
+
+        // Now batch_2 should be dispatched.
+        deadline = System.currentTimeMillis() + 2000;
+        while (gw.received.size() < 3 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(gw.received).hasSize(3);
+
+        // Succeed batch_2.
+        attempt3.complete(successResponse());
+
+        assertThat(ackLatch.await(5, TimeUnit.SECONDS)).isTrue();
+        // Acks must arrive in source-offset order: 100 first, then 101.
+        assertThat(acks).hasSize(2);
+        assertThat(acks.get(0)[0]).isEqualTo(100L);
+        assertThat(acks.get(1)[0]).isEqualTo(101L);
+        sender.close();
+    }
+
+    @Test
     void testCloseDrainsInFlightBeforeReturning() throws Exception {
         CapturingGateway gw = new CapturingGateway();
         // Pre-stage a manually controlled future so we can hold the request in-flight.
