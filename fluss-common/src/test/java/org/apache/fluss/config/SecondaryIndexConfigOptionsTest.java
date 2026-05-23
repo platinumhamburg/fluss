@@ -17,6 +17,7 @@
 
 package org.apache.fluss.config;
 
+import org.apache.fluss.metadata.SecondaryIndexVisibility;
 import org.apache.fluss.metadata.TableType;
 
 import org.junit.jupiter.api.Test;
@@ -29,7 +30,7 @@ class SecondaryIndexConfigOptionsTest {
     @Test
     void testVisibilityDefaultIsSync() {
         assertThat(ConfigOptions.SECONDARY_INDEX_VISIBILITY.defaultValue())
-                .isEqualTo(ConfigOptions.SecondaryIndexVisibility.SYNC);
+                .isEqualTo(SecondaryIndexVisibility.SYNC);
     }
 
     @Test

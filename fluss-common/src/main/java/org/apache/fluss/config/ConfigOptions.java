@@ -26,6 +26,7 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
+import org.apache.fluss.metadata.SecondaryIndexVisibility;
 import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.utils.ArrayUtils;
 
@@ -1691,12 +1692,6 @@ public class ConfigOptions {
                             "Table type identifying whether this table is a user-facing DATA_TABLE "
                                     + "or an internal INDEX_TABLE managed by Fluss for global secondary "
                                     + "indexes. INDEX_TABLE is system-set and must not be configured by users.");
-
-    /** Visibility semantics for writes to a table that owns secondary indexes. */
-    public enum SecondaryIndexVisibility {
-        SYNC,
-        ASYNC
-    }
 
     public static final ConfigOption<SecondaryIndexVisibility> SECONDARY_INDEX_VISIBILITY =
             key("secondary-index.visibility")
