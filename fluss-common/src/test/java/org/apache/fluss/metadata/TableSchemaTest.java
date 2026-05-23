@@ -428,7 +428,7 @@ class TableSchemaTest {
     }
 
     @Test
-    void should_build_schema_with_single_secondary_index() {
+    void testBuildSchemaWithSingleSecondaryIndex() {
         Schema schema =
                 Schema.newBuilder()
                         .column("order_id", DataTypes.BIGINT())
@@ -444,7 +444,7 @@ class TableSchemaTest {
     }
 
     @Test
-    void should_reject_index_name_with_double_underscore() {
+    void testRejectIndexNameWithDoubleUnderscore() {
         Schema.Builder b =
                 Schema.newBuilder()
                         .column("id", DataTypes.BIGINT())
@@ -457,12 +457,25 @@ class TableSchemaTest {
     }
 
     @Test
-    void should_reject_empty_index_columns() {
+    void testRejectEmptyIndexColumns() {
         Schema.Builder b =
                 Schema.newBuilder().column("id", DataTypes.BIGINT()).primaryKey("id");
 
         assertThatThrownBy(() -> b.index("idx_empty"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("at least a single column");
+    }
+
+    @Test
+    void testRejectIndexNameWithIllegalCharacter() {
+        Schema.Builder b =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("u", DataTypes.BIGINT())
+                        .primaryKey("id");
+
+        assertThatThrownBy(() -> b.index("idx-bad", "u"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("letters, digits, and underscores");
     }
 }

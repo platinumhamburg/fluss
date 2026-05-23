@@ -43,6 +43,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -73,19 +74,6 @@ public final class Schema implements Serializable {
      * schema. Otherwise, the removed columns will influence it.
      */
     private final int highestFieldId;
-
-    private Schema(
-            List<Column> columns,
-            @Nullable PrimaryKey primaryKey,
-            int highestFieldId,
-            List<String> autoIncrementColumnNames) {
-        this(
-                columns,
-                primaryKey,
-                highestFieldId,
-                autoIncrementColumnNames,
-                Collections.emptyList());
-    }
 
     private Schema(
             List<Column> columns,
@@ -592,6 +580,10 @@ public final class Schema implements Serializable {
                     !StringUtils.isNullOrWhitespaceOnly(indexName),
                     "Index name must not be empty.");
             checkArgument(
+                    Index.INDEX_NAME_PATTERN.matcher(indexName).matches(),
+                    "Index name '%s' may only contain letters, digits, and underscores.",
+                    indexName);
+            checkArgument(
                     !indexName.contains("__"),
                     "Index name '%s' cannot contain double underscores '__'.",
                     indexName);
@@ -809,6 +801,8 @@ public final class Schema implements Serializable {
 
         private static final long serialVersionUID = 1L;
 
+        static final Pattern INDEX_NAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]+$");
+
         private final String indexName;
         private final List<String> columnNames;
 
@@ -816,6 +810,10 @@ public final class Schema implements Serializable {
             checkArgument(
                     !StringUtils.isNullOrWhitespaceOnly(indexName),
                     "Index name must not be null or empty.");
+            checkArgument(
+                    INDEX_NAME_PATTERN.matcher(indexName).matches(),
+                    "Index name '%s' may only contain letters, digits, and underscores.",
+                    indexName);
             checkArgument(
                     !indexName.contains("__"),
                     "Index name '%s' cannot contain double underscores '__'.",
