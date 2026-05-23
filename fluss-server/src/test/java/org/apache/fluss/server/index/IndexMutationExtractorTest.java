@@ -37,6 +37,7 @@ import java.util.Set;
 import java.util.function.ToLongFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Unit tests for {@link IndexMutationExtractor}. */
 class IndexMutationExtractorTest {
@@ -224,6 +225,8 @@ class IndexMutationExtractorTest {
         assertThat(result.get(0).getKey()).containsExactly(0xA);
         assertThat(result.get(1).getOp()).isEqualTo(IndexMutationOp.UPSERT);
         assertThat(result.get(1).getKey()).containsExactly(0xB);
+        assertThat(result.get(0).getSourceOffset()).isEqualTo(5L);
+        assertThat(result.get(1).getSourceOffset()).isEqualTo(5L);
     }
 
     @Test
@@ -371,6 +374,68 @@ class IndexMutationExtractorTest {
         List<IndexMutation> result =
                 IndexMutationExtractor.extract(
                         ctx, row(Collections.emptySet()), row(Collections.emptySet()), 5L);
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void testUpdateWithNewIdxColsAllNullEmitsDeleteOnly() {
+        IndexMutationExtractor.IndexPlan plan =
+                new IndexMutationExtractor.IndexPlan(
+                        1L,
+                        new int[] {0},
+                        fixedKeyEncoder((byte) 7),
+                        fixedValueEncoder((byte) 9),
+                        fixedBucket(3));
+        IndexMutationExtractor.Context ctx =
+                new IndexMutationExtractor.Context(
+                        Collections.singletonList(plan), new int[] {0}, false, null);
+
+        InternalRow oldR = row(Collections.emptySet());
+        Set<Integer> newAllNull = new HashSet<>();
+        newAllNull.add(0);
+        InternalRow newR = row(newAllNull);
+
+        List<IndexMutation> result = IndexMutationExtractor.extract(ctx, oldR, newR, 100L);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getOp()).isEqualTo(IndexMutationOp.DELETE);
+        assertThat(result.get(0).getSourceOffset()).isEqualTo(100L);
+    }
+
+    @Test
+    void testContextRejectsPartitionedTrueWithNullResolver() {
+        IndexMutationExtractor.IndexPlan plan =
+                new IndexMutationExtractor.IndexPlan(
+                        1L,
+                        new int[] {0},
+                        fixedKeyEncoder((byte) 1),
+                        fixedValueEncoder((byte) 2),
+                        fixedBucket(3));
+        assertThatThrownBy(
+                        () ->
+                                new IndexMutationExtractor.Context(
+                                        Collections.singletonList(plan),
+                                        new int[] {0},
+                                        /* partitioned= */ true,
+                                        /* partitionIdResolver= */ null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("partitionIdResolver");
+    }
+
+    @Test
+    void testBothRowsNullReturnsEmptyList() {
+        IndexMutationExtractor.IndexPlan plan =
+                new IndexMutationExtractor.IndexPlan(
+                        1L,
+                        new int[] {0},
+                        fixedKeyEncoder((byte) 1),
+                        fixedValueEncoder((byte) 2),
+                        fixedBucket(3));
+        IndexMutationExtractor.Context ctx =
+                new IndexMutationExtractor.Context(
+                        Collections.singletonList(plan), new int[] {0}, false, null);
+
+        List<IndexMutation> result = IndexMutationExtractor.extract(ctx, null, null, 5L);
         assertThat(result).isEmpty();
     }
 }
