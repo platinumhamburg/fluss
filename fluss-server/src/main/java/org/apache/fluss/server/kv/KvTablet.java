@@ -47,6 +47,7 @@ import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.server.index.IndexedRowEmitter;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementUpdater;
@@ -140,6 +141,11 @@ public final class KvTablet {
 
     // RocksDB statistics accessor for this tablet
     @Nullable private final RocksDBStatistics rocksDBStatistics;
+
+    // Callback invoked from the apply path for each KV record, used by the Global Secondary Index
+    // push pipeline. Default is the no-op emitter; a non-no-op emitter also disables the WAL
+    // changelog fast-path so that pre-image rows remain available for index mutation generation.
+    private volatile IndexedRowEmitter indexedRowEmitter = IndexedRowEmitter.NO_OP;
 
     /**
      * The kv data in pre-write buffer whose log offset is less than the flushedLogOffset has been
@@ -293,6 +299,20 @@ public final class KvTablet {
     @Nullable
     public RocksDBStatistics getRocksDBStatistics() {
         return rocksDBStatistics;
+    }
+
+    /**
+     * Install the {@link IndexedRowEmitter} invoked from the apply path for each KV record.
+     *
+     * <p>When a non-no-op emitter is installed, the WAL changelog fast-path that skips reading the
+     * pre-image is disabled so that {@link IndexedRowEmitter#emit} receives a non-null {@code
+     * oldRow} for updates — the Global Secondary Index push pipeline needs it to generate the DELETE
+     * companion for an UPDATE.
+     *
+     * <p>Passing {@code null} restores the default no-op emitter.
+     */
+    public void setIndexedRowEmitter(@Nullable IndexedRowEmitter emitter) {
+        this.indexedRowEmitter = emitter == null ? IndexedRowEmitter.NO_OP : emitter;
     }
 
     void setFlushedLogOffset(long flushedLogOffset) {
@@ -561,9 +581,12 @@ public final class KvTablet {
         // and there is no auto-increment column, we can skip fetching old value for better
         // performance since the result always reflects the new value. In this case, both INSERT and
         // UPDATE will produce UPDATE_AFTER.
+        // When an IndexedRowEmitter is installed, force pre-image read so the emitter can see the
+        // old row for UPDATE — the index push pipeline needs it to generate the DELETE companion.
         if (changelogImage == ChangelogImage.WAL
                 && !autoIncrementUpdater.hasAutoIncrement()
-                && currentMerger instanceof DefaultRowMerger) {
+                && currentMerger instanceof DefaultRowMerger
+                && indexedRowEmitter == IndexedRowEmitter.NO_OP) {
             return applyUpdate(key, null, currentValue, walBuilder, latestSchemaRow, logOffset);
         }
 
@@ -597,6 +620,9 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
+        if (indexedRowEmitter != IndexedRowEmitter.NO_OP) {
+            indexedRowEmitter.emit(key.get(), oldValue.row, null, logOffset);
+        }
         walBuilder.append(ChangeType.DELETE, latestSchemaRow.replaceRow(oldValue.row));
         kvPreWriteBuffer.delete(key, logOffset);
         return logOffset + 1;
@@ -611,6 +637,9 @@ public final class KvTablet {
             AutoIncrementUpdater autoIncrementUpdater)
             throws Exception {
         BinaryValue newValue = autoIncrementUpdater.updateAutoIncrementColumns(currentValue);
+        if (indexedRowEmitter != IndexedRowEmitter.NO_OP) {
+            indexedRowEmitter.emit(key.get(), null, newValue.row, logOffset);
+        }
         walBuilder.append(ChangeType.INSERT, latestSchemaRow.replaceRow(newValue.row));
         kvPreWriteBuffer.insert(key, newValue.encodeValue(), logOffset);
         return logOffset + 1;
@@ -624,6 +653,10 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
+        if (indexedRowEmitter != IndexedRowEmitter.NO_OP) {
+            indexedRowEmitter.emit(
+                    key.get(), oldValue == null ? null : oldValue.row, newValue.row, logOffset);
+        }
         if (changelogImage == ChangelogImage.WAL) {
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
             kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset);
