@@ -216,6 +216,14 @@ public final class Replica {
     private @Nullable PeriodicSnapshotManager kvSnapshotManager;
 
     /**
+     * Per-replica state for the index-pushed-offset watermark. Used by the index-push pipeline
+     * (P2T2-P2T9) to track how far the leader has confirmed index mutations applied to downstream
+     * index tables. P2T9 wires the advance callback to {@code
+     * ReplicaManager.completeDelayedOperations}.
+     */
+    private final IndexPushedOffsetState indexPushedOffsetState = new IndexPushedOffsetState();
+
+    /**
      * Server-wide {@link ScannerManager}. Active sessions for this bucket are closed in {@link
      * #dropKv()} under the {@code leaderIsrUpdateLock} write lock; {@link #openScan} registers
      * under the read lock, so registration cannot race a leadership flip.
@@ -374,6 +382,41 @@ public final class Replica {
 
     public TableBucket getTableBucket() {
         return tableBucket;
+    }
+
+    /**
+     * Returns the current index-pushed-offset watermark, or {@code -1L} if no offset has been
+     * advanced. See {@link IndexPushedOffsetState}.
+     */
+    public long getIndexPushedOffset() {
+        return indexPushedOffsetState.get();
+    }
+
+    /**
+     * Sets a callback fired when {@link #advanceIndexPushedOffset(long)} strictly increases the
+     * offset. Defaults to a no-op; P2T9 wires this to {@code
+     * ReplicaManager.completeDelayedOperations(TableBucket)} so DelayedWrite operations can
+     * re-check completion. A {@code null} callback is normalized to a no-op.
+     */
+    public void setOnIndexPushedOffsetAdvanced(Runnable callback) {
+        indexPushedOffsetState.setOnAdvanced(callback);
+    }
+
+    /**
+     * Monotonically advances the index-pushed-offset watermark. Idempotent; a stale (non-greater)
+     * value is silently dropped. On strict increase, fires the advance callback.
+     */
+    public void advanceIndexPushedOffset(long newOffset) {
+        indexPushedOffsetState.advance(newOffset);
+    }
+
+    /**
+     * Seeds the index-pushed-offset watermark during leader-startup checkpoint replay. Shares the
+     * monotonic semantics of {@link #advanceIndexPushedOffset(long)} but does NOT fire the
+     * callback.
+     */
+    public void seedIndexPushedOffsetOnLoad(long offset) {
+        indexPushedOffsetState.seed(offset);
     }
 
     public long getLogTTLMs() {
