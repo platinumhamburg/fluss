@@ -426,4 +426,43 @@ class TableSchemaTest {
         assertThat(schemaStringAgg.getAggFunction("items").get().getParameter("delimiter"))
                 .isEqualTo(", ");
     }
+
+    @Test
+    void should_build_schema_with_single_secondary_index() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("order_id", DataTypes.BIGINT())
+                        .column("user_id", DataTypes.BIGINT())
+                        .primaryKey("order_id")
+                        .index("idx_user", "user_id")
+                        .build();
+
+        assertThat(schema.getIndexes()).hasSize(1);
+        Schema.Index idx = schema.getIndexes().get(0);
+        assertThat(idx.getIndexName()).isEqualTo("idx_user");
+        assertThat(idx.getColumnNames()).containsExactly("user_id");
+    }
+
+    @Test
+    void should_reject_index_name_with_double_underscore() {
+        Schema.Builder b =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("u", DataTypes.BIGINT())
+                        .primaryKey("id");
+
+        assertThatThrownBy(() -> b.index("idx__bad", "u"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("__");
+    }
+
+    @Test
+    void should_reject_empty_index_columns() {
+        Schema.Builder b =
+                Schema.newBuilder().column("id", DataTypes.BIGINT()).primaryKey("id");
+
+        assertThatThrownBy(() -> b.index("idx_empty"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at least a single column");
+    }
 }

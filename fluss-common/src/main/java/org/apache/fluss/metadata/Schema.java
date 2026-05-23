@@ -65,6 +65,7 @@ public final class Schema implements Serializable {
     private final List<Column> columns;
     private final @Nullable PrimaryKey primaryKey;
     private final List<String> autoIncrementColumnNames;
+    private final List<Index> indexes;
     private final RowType rowType;
 
     /**
@@ -78,10 +79,27 @@ public final class Schema implements Serializable {
             @Nullable PrimaryKey primaryKey,
             int highestFieldId,
             List<String> autoIncrementColumnNames) {
+        this(
+                columns,
+                primaryKey,
+                highestFieldId,
+                autoIncrementColumnNames,
+                Collections.emptyList());
+    }
+
+    private Schema(
+            List<Column> columns,
+            @Nullable PrimaryKey primaryKey,
+            int highestFieldId,
+            List<String> autoIncrementColumnNames,
+            List<Index> indexes) {
         this.columns =
                 normalizeColumns(columns, primaryKey, autoIncrementColumnNames, highestFieldId);
         this.primaryKey = primaryKey;
         this.autoIncrementColumnNames = autoIncrementColumnNames;
+        this.indexes =
+                Collections.unmodifiableList(
+                        new ArrayList<>(checkNotNull(indexes, "indexes must not be null.")));
         // pre-create the row type as it is the most frequently used part of the schema
         this.rowType =
                 new RowType(
@@ -123,6 +141,10 @@ public final class Schema implements Serializable {
 
     public List<String> getAutoIncrementColumnNames() {
         return autoIncrementColumnNames;
+    }
+
+    public List<Index> getIndexes() {
+        return indexes;
     }
 
     public RowType getRowType() {
@@ -233,6 +255,8 @@ public final class Schema implements Serializable {
                 + primaryKey
                 + ", autoIncrementColumnNames="
                 + autoIncrementColumnNames
+                + ", indexes="
+                + indexes
                 + ", highestFieldId="
                 + highestFieldId
                 + '}';
@@ -250,12 +274,13 @@ public final class Schema implements Serializable {
         return Objects.equals(columns, schema.columns)
                 && Objects.equals(autoIncrementColumnNames, schema.autoIncrementColumnNames)
                 && Objects.equals(primaryKey, schema.primaryKey)
-                && highestFieldId == schema.highestFieldId;
+                && highestFieldId == schema.highestFieldId
+                && Objects.equals(indexes, schema.indexes);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(columns, primaryKey, autoIncrementColumnNames, highestFieldId);
+        return Objects.hash(columns, primaryKey, autoIncrementColumnNames, highestFieldId, indexes);
     }
 
     // --------------------------------------------------------------------------------------------
@@ -275,11 +300,13 @@ public final class Schema implements Serializable {
         private final List<Column> columns;
         private @Nullable PrimaryKey primaryKey;
         private final List<String> autoIncrementColumnNames;
+        private final List<Index> indexes;
         private AtomicInteger highestFieldId;
 
         private Builder() {
             columns = new ArrayList<>();
             autoIncrementColumnNames = new ArrayList<>();
+            indexes = new ArrayList<>();
             highestFieldId = new AtomicInteger(-1);
         }
 
@@ -287,7 +314,10 @@ public final class Schema implements Serializable {
         public Builder fromSchema(Schema schema) {
             // Check that the builder is empty before adopting from an existing schema
             checkState(
-                    columns.isEmpty() && autoIncrementColumnNames.isEmpty() && primaryKey == null,
+                    columns.isEmpty()
+                            && autoIncrementColumnNames.isEmpty()
+                            && primaryKey == null
+                            && indexes.isEmpty(),
                     "Schema.Builder#fromSchema should be the first API to be called on the builder.");
 
             // Adopt columns while preserving their original IDs
@@ -299,6 +329,7 @@ public final class Schema implements Serializable {
             // Copy the metadata members
             this.autoIncrementColumnNames.addAll(schema.getAutoIncrementColumnNames());
             schema.getPrimaryKey().ifPresent(pk -> this.primaryKey = pk);
+            this.indexes.addAll(schema.getIndexes());
 
             return this;
         }
@@ -542,6 +573,33 @@ public final class Schema implements Serializable {
         }
 
         /**
+         * Declares a global secondary index for a set of given columns. Index names can only
+         * contain letters, digits, and underscores.
+         */
+        public Builder index(String indexName, String... columnNames) {
+            return index(indexName, Arrays.asList(columnNames));
+        }
+
+        /**
+         * Declares a global secondary index for a set of given columns. Index names can only
+         * contain letters, digits, and underscores.
+         */
+        public Builder index(String indexName, List<String> columnNames) {
+            checkArgument(
+                    columnNames != null && !columnNames.isEmpty(),
+                    "Index constraint must be defined for at least a single column.");
+            checkArgument(
+                    !StringUtils.isNullOrWhitespaceOnly(indexName),
+                    "Index name must not be empty.");
+            checkArgument(
+                    !indexName.contains("__"),
+                    "Index name '%s' cannot contain double underscores '__'.",
+                    indexName);
+            indexes.add(new Index(indexName, columnNames));
+            return this;
+        }
+
+        /**
          * Declares a column to be auto-incremented. With an auto-increment column in the table,
          * whenever a new row is inserted into the table, the new row will be assigned with the next
          * available value from the auto-increment sequence. A table can have at most one auto
@@ -567,7 +625,12 @@ public final class Schema implements Serializable {
 
         /** Returns an instance of an {@link Schema}. */
         public Schema build() {
-            return new Schema(columns, primaryKey, highestFieldId.get(), autoIncrementColumnNames);
+            return new Schema(
+                    columns,
+                    primaryKey,
+                    highestFieldId.get(),
+                    autoIncrementColumnNames,
+                    indexes);
         }
     }
 
@@ -733,6 +796,65 @@ public final class Schema implements Serializable {
         @Override
         public int hashCode() {
             return Objects.hash(super.hashCode(), columnNames);
+        }
+    }
+
+    /**
+     * Index in a schema.
+     *
+     * @since 0.10
+     */
+    @PublicEvolving
+    public static final class Index implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String indexName;
+        private final List<String> columnNames;
+
+        public Index(String indexName, List<String> columnNames) {
+            checkArgument(
+                    !StringUtils.isNullOrWhitespaceOnly(indexName),
+                    "Index name must not be null or empty.");
+            checkArgument(
+                    !indexName.contains("__"),
+                    "Index name '%s' cannot contain double underscores '__'.",
+                    indexName);
+            checkArgument(
+                    columnNames != null && !columnNames.isEmpty(),
+                    "Index must reference at least one column.");
+            this.indexName = indexName;
+            this.columnNames = Collections.unmodifiableList(new ArrayList<>(columnNames));
+        }
+
+        public String getIndexName() {
+            return indexName;
+        }
+
+        public List<String> getColumnNames() {
+            return columnNames;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof Index)) {
+                return false;
+            }
+            Index other = (Index) o;
+            return indexName.equals(other.indexName) && columnNames.equals(other.columnNames);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(indexName, columnNames);
+        }
+
+        @Override
+        public String toString() {
+            return "Index{name=" + indexName + ", columns=" + columnNames + "}";
         }
     }
 
