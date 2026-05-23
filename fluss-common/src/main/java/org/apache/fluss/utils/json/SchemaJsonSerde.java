@@ -39,6 +39,9 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
     private static final String AUTO_INCREMENT_COLUMN_NAME = "auto_increment_column";
     private static final String VERSION_KEY = "version";
     private static final String HIGHEST_FIELD_ID = "highest_field_id";
+    private static final String INDEXES_NAME = "indexes";
+    private static final String INDEX_NAME = "name";
+    private static final String INDEX_COLUMNS_NAME = "columns";
     private static final int VERSION = 1;
 
     @Override
@@ -72,6 +75,22 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
             generator.writeEndArray();
         }
 
+        List<Schema.Index> indexes = schema.getIndexes();
+        if (!indexes.isEmpty()) {
+            generator.writeArrayFieldStart(INDEXES_NAME);
+            for (Schema.Index index : indexes) {
+                generator.writeStartObject();
+                generator.writeStringField(INDEX_NAME, index.getIndexName());
+                generator.writeArrayFieldStart(INDEX_COLUMNS_NAME);
+                for (String columnName : index.getColumnNames()) {
+                    generator.writeString(columnName);
+                }
+                generator.writeEndArray();
+                generator.writeEndObject();
+            }
+            generator.writeEndArray();
+        }
+
         generator.writeNumberField(HIGHEST_FIELD_ID, schema.getHighestFieldId());
 
         generator.writeEndObject();
@@ -100,6 +119,20 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
                     node.get(AUTO_INCREMENT_COLUMN_NAME).elements();
             while (autoIncrementColumnJsons.hasNext()) {
                 builder.enableAutoIncrement(autoIncrementColumnJsons.next().asText());
+            }
+        }
+
+        if (node.has(INDEXES_NAME)) {
+            Iterator<JsonNode> indexJsons = node.get(INDEXES_NAME).elements();
+            while (indexJsons.hasNext()) {
+                JsonNode indexNode = indexJsons.next();
+                String indexName = indexNode.get(INDEX_NAME).asText();
+                Iterator<JsonNode> indexColumnJsons = indexNode.get(INDEX_COLUMNS_NAME).elements();
+                List<String> columnNames = new ArrayList<>();
+                while (indexColumnJsons.hasNext()) {
+                    columnNames.add(indexColumnJsons.next().asText());
+                }
+                builder.index(indexName, columnNames);
             }
         }
 

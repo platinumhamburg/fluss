@@ -179,4 +179,40 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
 
         return new String[] {oldSchemaJson1, oldSchemaJson2, oldSchemaJson2, oldSchemaJson3};
     }
+
+    @Test
+    void testRoundTripWithIndexes() {
+        Schema original =
+                Schema.newBuilder()
+                        .column("order_id", DataTypes.BIGINT())
+                        .column("user_id", DataTypes.BIGINT())
+                        .column("region_id", DataTypes.INT())
+                        .primaryKey("order_id")
+                        .index("idx_user", "user_id")
+                        .index("idx_region", "region_id")
+                        .build();
+
+        byte[] bytes = JsonSerdeUtils.writeValueAsBytes(original, SchemaJsonSerde.INSTANCE);
+        Schema decoded = JsonSerdeUtils.readValue(bytes, SchemaJsonSerde.INSTANCE);
+
+        assertThat(decoded.getIndexes()).isEqualTo(original.getIndexes());
+    }
+
+    @Test
+    void testDeserializeLegacyPayloadWithoutIndexesFieldYieldsEmptyList() {
+        // Serialize a schema with NO indexes — the resulting JSON should not contain the
+        // "indexes" field. Deserialize and confirm decoded.getIndexes() is empty.
+        Schema legacy =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .primaryKey("id")
+                        .build();
+
+        byte[] bytes = JsonSerdeUtils.writeValueAsBytes(legacy, SchemaJsonSerde.INSTANCE);
+        String json = new String(bytes, StandardCharsets.UTF_8);
+        assertThat(json).doesNotContain("indexes");
+
+        Schema decoded = JsonSerdeUtils.readValue(bytes, SchemaJsonSerde.INSTANCE);
+        assertThat(decoded.getIndexes()).isEmpty();
+    }
 }
