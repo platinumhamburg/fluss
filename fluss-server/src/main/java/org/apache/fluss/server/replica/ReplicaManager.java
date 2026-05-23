@@ -77,6 +77,8 @@ import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
+import org.apache.fluss.server.index.IndexPushSender;
+import org.apache.fluss.server.index.IndexPushTracker;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.scan.ScannerManager;
@@ -135,9 +137,13 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -213,6 +219,21 @@ public class ReplicaManager implements ServerReconfigurable {
     private final Clock clock;
 
     private final ScannerManager scannerManager;
+
+    /**
+     * Lazily initialized retry executor shared by every {@link IndexPushSender} this manager
+     * creates. Created on first {@link #createIndexPushSender} invocation so that tablet servers
+     * without secondary indexes do not spawn an extra thread pool.
+     *
+     * <p>TODO P2T13/P2T14: wire shutdown into {@link #shutdown()} once the ITCase exercises the
+     * full lifecycle. The current scope is structural plumbing (P2T9) — the executor leaks on JVM
+     * shutdown but does not accumulate work because tasks are short-lived per-batch retries.
+     */
+    @GuardedBy("indexPushSenderLock")
+    @Nullable
+    private ScheduledExecutorService indexPushRetryExecutor;
+
+    private final Object indexPushSenderLock = new Object();
 
     public ReplicaManager(
             Configuration conf,
@@ -1761,7 +1782,12 @@ public class ReplicaManager implements ServerReconfigurable {
                 || error == Errors.UNKNOWN_TABLE_OR_BUCKET_EXCEPTION;
     }
 
-    private void completeDelayedOperations(TableBucket tableBucket) {
+    /**
+     * Package-visible so {@link Replica} can wire the {@code indexPushedOffset} advance callback to
+     * re-check {@link DelayedWrite} completion when the second watermark advances (FIP V2 §3 push
+     * pipeline). Previously {@code private}; the visibility relaxation is part of P2T9.
+     */
+    void completeDelayedOperations(TableBucket tableBucket) {
         DelayedTableBucketKey delayedTableBucketKey = new DelayedTableBucketKey(tableBucket);
         delayedWriteManager.checkAndComplete(delayedTableBucketKey);
         delayedFetchLogManager.checkAndComplete(delayedTableBucketKey);
@@ -1994,7 +2020,8 @@ public class ReplicaManager implements ServerReconfigurable {
                                 tableInfo,
                                 clock,
                                 remoteLogManager,
-                                scannerManager);
+                                scannerManager,
+                                this);
                 if (!existingLogTabletOpt.isPresent()) {
                     localDiskManager.recordReplicaLoad(dataDir, isKvTable);
                 }
@@ -2084,12 +2111,81 @@ public class ReplicaManager implements ServerReconfigurable {
     /** This TabletServer hosts the {@link Replica}, but it is in an offline log directory. */
     public static final class OfflineReplica implements HostedReplica {}
 
+    /**
+     * Build an {@link IndexPushSender} for a leader {@link Replica}. Used by {@code
+     * Replica.onBecomeNewLeader} (P2T9) so that {@link Replica} does not need to know about {@code
+     * RpcClient} / {@code GatewayClientProxy} plumbing.
+     *
+     * <p><b>Current state (P2T9 structural scope)</b>: the {@code LeaderResolver} and {@code
+     * gatewayFactory} are stub sentinels that throw {@link UnsupportedOperationException} on first
+     * call. The push pipeline is therefore inert at runtime — leaders that have indexes will still
+     * construct a scheduler and the {@link IndexedRowEmitter} hook will still fire, but any actual
+     * mutation flowing through the sender will surface the stub exception. This is intentional and
+     * tracked for follow-up:
+     *
+     * <ul>
+     *   <li>TODO P2T13: wire {@code LeaderResolver} against {@link
+     *       TabletServerMetadataCache#getTabletServer} to look up the leader of {@code
+     *       (indexTableId, indexBucket)} via the cluster metadata cache.
+     *   <li>TODO P2T13: wire {@code gatewayFactory} via {@code
+     *       GatewayClientProxy.createGatewayProxy} using the {@code RpcClient} threaded through
+     *       {@code TabletServer.start()}; the cleanest form will likely be a shared {@code
+     *       RpcGatewayManager<TabletServerGateway>}.
+     * </ul>
+     */
+    IndexPushSender createIndexPushSender(BiConsumer<Long, IndexPushTracker.Target> ackCallback) {
+        checkNotNull(ackCallback, "ackCallback");
+        ScheduledExecutorService retryExecutor = getOrCreateIndexPushRetryExecutor();
+        IndexPushSender.LeaderResolver leaderResolver =
+                (indexTableId, indexBucket) -> {
+                    throw new UnsupportedOperationException(
+                            "IndexPushSender.LeaderResolver is not yet wired (P2T9 structural"
+                                    + " plumbing only; full wiring follows in P2T13).");
+                };
+        return new IndexPushSender(
+                serverId -> {
+                    throw new UnsupportedOperationException(
+                            "IndexPushSender gatewayFactory is not yet wired (P2T9 structural"
+                                    + " plumbing only; full wiring follows in P2T13).");
+                },
+                leaderResolver,
+                retryExecutor,
+                ackCallback,
+                /* maxBatchSize */ 256);
+    }
+
+    private ScheduledExecutorService getOrCreateIndexPushRetryExecutor() {
+        synchronized (indexPushSenderLock) {
+            if (indexPushRetryExecutor == null) {
+                ScheduledThreadPoolExecutor exec =
+                        new ScheduledThreadPoolExecutor(
+                                1,
+                                runnable -> {
+                                    Thread t = Executors.defaultThreadFactory().newThread(runnable);
+                                    t.setName("index-push-retry-" + serverId);
+                                    t.setDaemon(true);
+                                    return t;
+                                });
+                exec.setRemoveOnCancelPolicy(true);
+                indexPushRetryExecutor = exec;
+            }
+            return indexPushRetryExecutor;
+        }
+    }
+
     public void shutdown() throws InterruptedException {
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
         replicaFetcherManager.shutdown();
         delayedWriteManager.shutdown();
         delayedFetchLogManager.shutdown();
+
+        synchronized (indexPushSenderLock) {
+            if (indexPushRetryExecutor != null) {
+                indexPushRetryExecutor.shutdownNow();
+                indexPushRetryExecutor = null;
+            }
+        }
 
         // Checkpoint highWatermark.
         checkpointHighWatermarks();

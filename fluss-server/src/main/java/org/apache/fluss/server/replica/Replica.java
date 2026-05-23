@@ -56,6 +56,10 @@ import org.apache.fluss.rpc.util.PredicateMessageUtils;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.index.IndexMutationExtractor;
+import org.apache.fluss.server.index.IndexPushScheduler;
+import org.apache.fluss.server.index.IndexPushTracker;
+import org.apache.fluss.server.index.IndexedRowEmitter;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
@@ -216,6 +220,24 @@ public final class Replica {
     private @Nullable PeriodicSnapshotManager kvSnapshotManager;
 
     /**
+     * Per-leader push-pipeline orchestrator. Non-null only while this replica is the leader of a
+     * main table that declares at least one secondary index (see {@link
+     * org.apache.fluss.metadata.Schema#getIndexes()}). Created in {@link
+     * #maybeStartIndexPushScheduler()} after the KV tablet is initialized, torn down in {@link
+     * #stopIndexPushScheduler()}.
+     */
+    private volatile @Nullable IndexPushScheduler indexPushScheduler;
+
+    /**
+     * Back-reference to the owning {@link ReplicaManager}. Used by the index-push pipeline to (1)
+     * build {@link org.apache.fluss.server.index.IndexPushSender}s via {@link
+     * ReplicaManager#createIndexPushSender} and (2) wire the {@code indexPushedOffset} advance
+     * callback to {@link ReplicaManager#completeDelayedOperations} so DelayedWrites can re-check
+     * the second watermark.
+     */
+    private final ReplicaManager replicaManager;
+
+    /**
      * Per-replica state for the index-pushed-offset watermark. Used by the index-push pipeline
      * (P2T2-P2T9) to track how far the leader has confirmed index mutations applied to downstream
      * index tables. P2T9 wires the advance callback to {@code
@@ -257,7 +279,8 @@ public final class Replica {
             TableInfo tableInfo,
             Clock clock,
             RemoteLogManager remoteLogManager,
-            ScannerManager scannerManager)
+            ScannerManager scannerManager,
+            @Nullable ReplicaManager replicaManager)
             throws Exception {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
@@ -291,6 +314,7 @@ public final class Replica {
         this.clock = clock;
         this.remoteLogManager = remoteLogManager;
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
+        this.replicaManager = replicaManager;
         registerMetrics();
     }
 
@@ -433,6 +457,16 @@ public final class Replica {
 
     public @Nullable KvTablet getKvTablet() {
         return kvTablet;
+    }
+
+    /**
+     * Returns the currently installed {@link IndexPushScheduler}, or {@code null} if this replica
+     * is not a leader of an indexed main table. Visible for tests and not part of the public
+     * surface.
+     */
+    @VisibleForTesting
+    public @Nullable IndexPushScheduler getIndexPushScheduler() {
+        return indexPushScheduler;
     }
 
     public TablePath getTablePath() {
@@ -620,6 +654,10 @@ public final class Replica {
             dropKv();
             // now, we can create a new kv tablet
             createKv();
+            // After KV is ready, wire the index-push pipeline if this main table declares any
+            // secondary indexes. No-op for tables without indexes or when ReplicaManager wasn't
+            // injected (test fixtures that bypass the full lifecycle).
+            maybeStartIndexPushScheduler();
         }
     }
 
@@ -763,6 +801,10 @@ public final class Replica {
         // blocks waiting for them. Runs under leaderIsrUpdateLock(W), so no concurrent register.
         scannerManager.closeScannersForBucket(tableBucket);
 
+        // Detach the index-push pipeline BEFORE the KvTablet is closed so the emitter never sees a
+        // half-closed tablet. Safe to call when no scheduler is running (no-op).
+        stopIndexPushScheduler();
+
         if (closeableRegistry.unregisterCloseable(closeableRegistryForKv)) {
             IOUtils.closeQuietly(closeableRegistryForKv);
         }
@@ -780,6 +822,161 @@ public final class Replica {
         if (kvTablet != null) {
             kvTablet.flush(newHighWatermark, fatalErrorHandler);
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Index-push pipeline lifecycle (P2T9 — FIP V2 §3 structural plumbing)
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Build the {@link IndexPushScheduler} when this replica becomes leader of a main table that
+     * declares at least one secondary index. No-op for index tables, tables without indexes, or
+     * test fixtures that did not inject a {@link ReplicaManager}.
+     *
+     * <p>The scheduler is installed AFTER {@link #initKvTablet()} returns successfully so the
+     * extractor can rely on a fully restored KV view. The {@link IndexedRowEmitter} hook is wired
+     * into the {@link KvTablet} apply path so every base-row mutation reaches the scheduler with
+     * its WAL offset; the advance callback re-checks {@link DelayedWrite} completion via the second
+     * watermark plumbing (P2T8).
+     *
+     * <p><b>Stubbed sub-components for P2T9 structural scope</b>: the {@link
+     * IndexMutationExtractor.KeyEncoder} / {@link IndexMutationExtractor.ValueEncoder} / {@link
+     * IndexMutationExtractor.BucketAssigner} and partition-id resolver throw {@link
+     * UnsupportedOperationException} on first use; the {@link
+     * org.apache.fluss.server.index.IndexPushSender} returned by {@link
+     * ReplicaManager#createIndexPushSender} likewise stubs gateway / leader resolution. The
+     * scheduler exists and the emitter wiring compiles, but any actual mutation will surface the
+     * stub exception — full materialization is tracked by:
+     *
+     * <ul>
+     *   <li>TODO P2T13: replace stub KeyEncoder/ValueEncoder/BucketAssigner with the real index-row
+     *       encoders and the bucket-id assigner used by Index Tables.
+     *   <li>TODO P2T13: replace the partition-id resolver stub with a function that reads the
+     *       partition key column(s) from the base row (requires partition-key column index lookup
+     *       from {@link TableInfo#getPartitionKeys()}).
+     * </ul>
+     */
+    private void maybeStartIndexPushScheduler() {
+        if (replicaManager == null) {
+            // Test fixture that constructed Replica without a ReplicaManager — nothing to wire.
+            return;
+        }
+        if (tableInfo.isIndexTable()) {
+            // Index tables themselves do not push further — they ARE the push target.
+            return;
+        }
+        List<Schema.Index> indexes = tableInfo.getSchema().getIndexes();
+        if (indexes.isEmpty()) {
+            return;
+        }
+        KvTablet kv = this.kvTablet;
+        if (kv == null) {
+            LOG.warn(
+                    "Skipping IndexPushScheduler wiring for {}: kvTablet is null after createKv()",
+                    tableBucket);
+            return;
+        }
+
+        IndexMutationExtractor.Context extractorContext = buildIndexExtractorContext(indexes);
+        IndexPushTracker tracker = new IndexPushTracker();
+        IndexPushScheduler scheduler =
+                new IndexPushScheduler(
+                        extractorContext,
+                        tracker,
+                        replicaManager::createIndexPushSender,
+                        this::advanceIndexPushedOffset);
+        // Advance callback re-checks DelayedWrite completion when the second watermark moves.
+        setOnIndexPushedOffsetAdvanced(() -> replicaManager.completeDelayedOperations(tableBucket));
+        // Install the emitter LAST so we don't get notifications for a half-built scheduler.
+        kv.setIndexedRowEmitter(
+                (key, oldRow, newRow, sourceOffset) ->
+                        scheduler.submit(sourceOffset, oldRow, newRow));
+        this.indexPushScheduler = scheduler;
+        LOG.info("IndexPushScheduler started for {} (indexes={})", tableBucket, indexes.size());
+    }
+
+    /**
+     * Tear down the index-push pipeline on demotion / drop. Called from {@link #dropKv()} BEFORE
+     * the {@link KvTablet} is closed so the emitter never references a half-closed tablet. Safe to
+     * call when no scheduler is running.
+     */
+    private void stopIndexPushScheduler() {
+        IndexPushScheduler scheduler = this.indexPushScheduler;
+        if (scheduler != null) {
+            KvTablet kv = this.kvTablet;
+            if (kv != null) {
+                kv.setIndexedRowEmitter(IndexedRowEmitter.NO_OP);
+            }
+            try {
+                scheduler.close();
+            } catch (Throwable t) {
+                LOG.warn("Error closing IndexPushScheduler for {}", tableBucket, t);
+            }
+            // Reset the advance callback so a stale Runnable doesn't fire across leadership flips.
+            setOnIndexPushedOffsetAdvanced(null);
+            this.indexPushScheduler = null;
+            LOG.info("IndexPushScheduler stopped for {}", tableBucket);
+        }
+    }
+
+    /**
+     * Build the per-main-table {@link IndexMutationExtractor.Context} used by the scheduler. The
+     * encoders / bucket assigner / partition-id resolver are stubs that throw {@link
+     * UnsupportedOperationException} on first invocation; P2T13 will replace them with the real
+     * Index-Table encoding plumbing.
+     */
+    private IndexMutationExtractor.Context buildIndexExtractorContext(List<Schema.Index> indexes) {
+        Schema schema = tableInfo.getSchema();
+        int[] basePkColumnIndices = schema.getPrimaryKeyIndexes();
+        boolean partitioned = tableInfo.isPartitioned();
+
+        List<IndexMutationExtractor.IndexPlan> plans = new ArrayList<>(indexes.size());
+        for (Schema.Index index : indexes) {
+            int[] idxColumnIndices = schema.getColumnIndexes(index.getColumnNames());
+            // TODO P2T13: replace the stubs with the real Index-Table KeyEncoder /
+            //  ValueEncoder / BucketAssigner used by the secondary-index push pipeline.
+            IndexMutationExtractor.KeyEncoder keyEncoder =
+                    (row, idx, basePk) -> {
+                        throw new UnsupportedOperationException(
+                                "Index KeyEncoder not yet wired (P2T9 structural plumbing only).");
+                    };
+            IndexMutationExtractor.ValueEncoder valueEncoder =
+                    (row, idx, basePk, partitionId) -> {
+                        throw new UnsupportedOperationException(
+                                "Index ValueEncoder not yet wired (P2T9 structural plumbing"
+                                        + " only).");
+                    };
+            IndexMutationExtractor.BucketAssigner bucketAssigner =
+                    key -> {
+                        throw new UnsupportedOperationException(
+                                "Index BucketAssigner not yet wired (P2T9 structural plumbing"
+                                        + " only).");
+                    };
+            // TODO P2T13: once index-table-id resolution lands, replace 0L with the real
+            //  Index Table id resolved from {@code tableInfo.getTableId()} + index name via the
+            //  metadata cache or the back-link properties.
+            plans.add(
+                    new IndexMutationExtractor.IndexPlan(
+                            /* indexTableId */ 0L,
+                            idxColumnIndices,
+                            keyEncoder,
+                            valueEncoder,
+                            bucketAssigner));
+        }
+        // TODO P2T13: resolve partition column position(s) from {@link
+        // TableInfo#getPartitionKeys()}
+        //  and replace this stub with a real ToLongFunction reading the partition column.
+        return new IndexMutationExtractor.Context(
+                plans,
+                basePkColumnIndices,
+                partitioned,
+                partitioned
+                        ? row -> {
+                            throw new UnsupportedOperationException(
+                                    "partitionIdResolver not yet wired (P2T9 structural"
+                                            + " plumbing only).");
+                        }
+                        : null);
     }
 
     /**

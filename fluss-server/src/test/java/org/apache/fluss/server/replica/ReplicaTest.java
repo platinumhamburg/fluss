@@ -121,6 +121,30 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(kvReplica.getKvTablet()).isNotNull();
     }
 
+    /**
+     * P2T9 regression: the empty-indexes leader-promotion path must NOT construct an {@link
+     * org.apache.fluss.server.index.IndexPushScheduler}. {@code DATA1_TABLE_INFO_PK} (the KV table
+     * fixture this test base uses) declares no secondary indexes, so the scheduler field must
+     * remain {@code null} after {@code makeLeader} and after a subsequent demote-via-follower
+     * cycle.
+     */
+    @Test
+    void testIndexPushSchedulerNotConstructedForTableWithoutIndexes() throws Exception {
+        Replica kvReplica =
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
+        assertThat(kvReplica.getIndexPushScheduler()).isNull();
+
+        makeKvReplicaAsLeader(kvReplica);
+        assertThat(kvReplica.getIndexPushScheduler())
+                .as("Table without indexes should not construct an IndexPushScheduler.")
+                .isNull();
+
+        // Demote — scheduler should still be null, and demote path must not throw even when nothing
+        // is wired.
+        makeKvReplicaAsFollower(kvReplica, INITIAL_LEADER_EPOCH + 1);
+        assertThat(kvReplica.getIndexPushScheduler()).isNull();
+    }
+
     @Test
     void testAppendRecordsToLeader() throws Exception {
         Replica logReplica =
