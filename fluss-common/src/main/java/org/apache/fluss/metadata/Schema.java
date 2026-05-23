@@ -513,12 +513,10 @@ public final class Schema implements Serializable {
         }
 
         private static void checkReservedSystemColumn(String columnName) {
-            if (IndexTableUtils.RESERVED_INDEX_SYSTEM_COLUMNS.contains(columnName)) {
-                throw new IllegalArgumentException(
-                        "Column name '"
-                                + columnName
-                                + "' is reserved for Index Table system use.");
-            }
+            checkArgument(
+                    !IndexTableUtils.RESERVED_INDEX_SYSTEM_COLUMNS.contains(columnName),
+                    "Column name '%s' is reserved for Index Table system use.",
+                    columnName);
         }
 
         /** Apply comment to the previous column. */

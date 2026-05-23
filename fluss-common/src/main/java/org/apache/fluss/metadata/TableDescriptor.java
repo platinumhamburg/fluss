@@ -50,6 +50,7 @@ import java.util.stream.Collectors;
 import static java.util.Collections.unmodifiableMap;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
  * Represents the metadata of a table in Fluss.
@@ -190,23 +191,23 @@ public final class TableDescriptor implements Serializable {
             long mainTableId,
             String mainTableName,
             String indexName) {
-        Schema.Index index = null;
-        for (Schema.Index candidate : mainDescriptor.getSchema().getIndexes()) {
-            if (candidate.getIndexName().equals(indexName)) {
-                index = candidate;
-                break;
-            }
-        }
-        if (index == null) {
-            throw new IllegalArgumentException(
-                    "Unknown index '" + indexName + "' on table " + mainTableName);
-        }
+        Schema.Index index =
+                mainDescriptor.getSchema().getIndexes().stream()
+                        .filter(i -> i.getIndexName().equals(indexName))
+                        .findFirst()
+                        .orElse(null);
+        checkArgument(
+                index != null,
+                "Unknown index '%s' on table %s",
+                indexName,
+                mainTableName);
 
         boolean partitioned = mainDescriptor.isPartitioned();
         Optional<Schema.PrimaryKey> mainPk = mainDescriptor.getSchema().getPrimaryKey();
-        if (!mainPk.isPresent()) {
-            throw new IllegalStateException("Indexed main table must have a primary key");
-        }
+        checkState(
+                mainPk.isPresent(),
+                "Indexed main table '%s' must have a primary key",
+                mainTableName);
         List<String> basePk = mainPk.get().getColumnNames();
 
         Set<String> seen = new LinkedHashSet<>();
@@ -261,12 +262,13 @@ public final class TableDescriptor implements Serializable {
     }
 
     private static DataType lookupColumnType(Schema schema, String column) {
-        for (Schema.Column c : schema.getColumns()) {
-            if (c.getName().equals(column)) {
-                return c.getDataType();
-            }
-        }
-        throw new IllegalArgumentException("Unknown column '" + column + "'");
+        Schema.Column col =
+                schema.getColumns().stream()
+                        .filter(c -> c.getName().equals(column))
+                        .findFirst()
+                        .orElse(null);
+        checkArgument(col != null, "Unknown column '%s'", column);
+        return col.getDataType();
     }
 
     /**

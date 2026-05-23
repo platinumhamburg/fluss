@@ -70,6 +70,8 @@ class TableDescriptorIndexTableDeriveTest {
         assertThat(dSchema.getPrimaryKey()).isPresent();
         assertThat(dSchema.getPrimaryKey().get().getColumnNames())
                 .containsExactly("user_id", "order_id", "dt");
+        assertThat(dSchema.getPrimaryKey().get().getColumnNames())
+                .doesNotContain(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
         assertThat(dSchema.getColumns())
                 .extracting(Schema.Column::getName)
                 .contains(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
