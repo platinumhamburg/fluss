@@ -892,7 +892,45 @@ public final class Replica {
                 (key, oldRow, newRow, sourceOffset) ->
                         scheduler.submit(sourceOffset, oldRow, newRow));
         this.indexPushScheduler = scheduler;
+        // Recovery hook (FIP V2 §2.6): re-submit any HW-committed WAL records past the
+        // last persisted indexPushedOffset checkpoint so dropped acks from the previous
+        // leader are healed. MUST run AFTER the scheduler field is assigned so the
+        // submit calls land on a live pipeline.
+        recoverIndexPushFromWal();
         LOG.info("IndexPushScheduler started for {} (indexes={})", tableBucket, indexes.size());
+    }
+
+    /**
+     * Replay HW-committed WAL records in {@code [indexPushedOffset+1, HW)} through the index push
+     * scheduler. Invoked on leader promotion AFTER scheduler construction.
+     *
+     * <p>Idempotent: the index side is keyed by (idxCols, basePK) and the Index PutKv path
+     * naturally tolerates duplicates. INV-1 (no replay past HW) is enforced via the strict {@code
+     * < HW} upper bound.
+     *
+     * <p>Current scope (P2T11): structural hook only. Real WAL scan + decode is materialized in
+     * P2T13 alongside the real encoders.
+     */
+    private void recoverIndexPushFromWal() {
+        if (indexPushScheduler == null) {
+            return;
+        }
+        long indexPushed = getIndexPushedOffset();
+        long hw = logTablet.getHighWatermark();
+        if (indexPushed + 1 >= hw) {
+            LOG.info(
+                    "Index push recovery for {}: no replay required (indexPushed={}, HW={}).",
+                    tableBucket,
+                    indexPushed,
+                    hw);
+            return;
+        }
+        LOG.warn(
+                "Index push recovery for {} needs replay of [{}, {}) -- full WAL scan deferred to P2T13.",
+                tableBucket,
+                indexPushed + 1,
+                hw);
+        // TODO P2T13: implement WAL scan + decode + scheduler.submit per record.
     }
 
     /**

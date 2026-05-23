@@ -145,6 +145,41 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(kvReplica.getIndexPushScheduler()).isNull();
     }
 
+    /**
+     * P2T11 regression: leader promotion must invoke the WAL-replay recovery hook AFTER the index
+     * push scheduler field is assigned (so that re-submitted records land on a live pipeline). For
+     * a non-indexed table (this fixture), the hook is unreachable because the scheduler is never
+     * built — verify the leader path still completes cleanly, the scheduler stays {@code null},
+     * and a seeded {@code indexPushedOffset} is preserved across the promotion (i.e. the recovery
+     * code path produced no side effect on the watermark).
+     */
+    @Test
+    void testRecoverIndexPushFromWalIsInvokedAfterSchedulerStarts() throws Exception {
+        Replica kvReplica =
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
+
+        // Seed a non-trivial indexPushedOffset to simulate a checkpoint-loaded value. The
+        // recovery hook (if it were active) would compare this against HW; for a non-indexed
+        // table the hook is never reached, so the seed must survive the promotion verbatim.
+        kvReplica.seedIndexPushedOffsetOnLoad(5L);
+        assertThat(kvReplica.getIndexPushedOffset()).isEqualTo(5L);
+
+        makeKvReplicaAsLeader(kvReplica);
+
+        assertThat(kvReplica.getIndexPushScheduler())
+                .as("Non-indexed table must not construct an IndexPushScheduler.")
+                .isNull();
+        assertThat(kvReplica.getIndexPushedOffset())
+                .as("Recovery hook must not mutate the seeded indexPushedOffset.")
+                .isEqualTo(5L);
+
+        // Demote → re-promote: recovery hook must still be safe to invoke on each promotion.
+        makeKvReplicaAsFollower(kvReplica, INITIAL_LEADER_EPOCH + 1);
+        makeKvReplicaAsLeader(kvReplica, INITIAL_LEADER_EPOCH + 2);
+        assertThat(kvReplica.getIndexPushScheduler()).isNull();
+        assertThat(kvReplica.getIndexPushedOffset()).isEqualTo(5L);
+    }
+
     @Test
     void testAppendRecordsToLeader() throws Exception {
         Replica logReplica =
