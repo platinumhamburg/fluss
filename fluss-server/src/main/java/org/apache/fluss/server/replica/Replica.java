@@ -47,8 +47,11 @@ import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.predicate.Predicate;
+import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -114,6 +117,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
@@ -903,20 +907,32 @@ public final class Replica {
      * Replay HW-committed WAL records in {@code [indexPushedOffset+1, HW)} through the index push
      * scheduler. Invoked on leader promotion AFTER scheduler construction.
      *
-     * <p>Idempotent: the index side is keyed by (idxCols, basePK) and the Index PutKv path
+     * <p>Idempotent: the index side is keyed by {@code (idxCols, basePK)} and the Index PutKv path
      * naturally tolerates duplicates. INV-1 (no replay past HW) is enforced via the strict {@code <
-     * HW} upper bound.
+     * HW} upper bound and {@link FetchIsolation#HIGH_WATERMARK}.
      *
-     * <p>Current scope (P2T11): structural hook only. Real WAL scan + decode is materialized in
-     * P2T13 alongside the real encoders.
+     * <p><b>Pre-image handling (FIP V2 §2.6):</b> in {@code ChangelogImage.WAL} mode the WAL only
+     * carries the post-image for INSERT/UPDATE_AFTER and the pre-image for DELETE — it never
+     * carries both for the same UPDATE. Reconstructing the pre-image would require reading the KV
+     * state, which is expensive and not guaranteed to be at the right point during recovery. We
+     * therefore submit each WAL record as if {@code (oldRow=null, newRow=post)} for
+     * INSERT/UPDATE_AFTER and {@code (oldRow=pre, newRow=null)} for DELETE. The resulting index
+     * mutations are best-effort: a fresh leader after failure may re-emit the post-image UPSERT
+     * (idempotent) but cannot synthesize the DELETE companion for the old idxCols of an UPDATE
+     * whose pre-image has been lost. The Plan 5 compaction filter cleans up any orphaned entries.
+     *
+     * <p>{@link ChangeType#UPDATE_BEFORE} records are skipped: they only appear in non-WAL
+     * changelog modes alongside an UPDATE_AFTER carrying the post-image, which is what we want.
      */
     private void recoverIndexPushFromWal() {
-        if (indexPushScheduler == null) {
+        IndexPushScheduler scheduler = this.indexPushScheduler;
+        if (scheduler == null) {
             return;
         }
         long indexPushed = getIndexPushedOffset();
         long hw = logTablet.getHighWatermark();
-        if (indexPushed + 1 >= hw) {
+        long from = indexPushed + 1;
+        if (from >= hw) {
             LOG.info(
                     "Index push recovery for {}: no replay required (indexPushed={}, HW={}).",
                     tableBucket,
@@ -924,12 +940,110 @@ public final class Replica {
                     hw);
             return;
         }
-        LOG.warn(
-                "Index push recovery for {} needs replay of [{}, {}) -- full WAL scan deferred to P2T13.",
+        LOG.info(
+                "Index push recovery for {}: replaying WAL records in [{}, {}).",
                 tableBucket,
-                indexPushed + 1,
+                from,
                 hw);
-        // TODO P2T13c: implement WAL scan + decode + scheduler.submit per record.
+        long replayed = 0L;
+        long skippedUpdateBefore = 0L;
+        long unsupported = 0L;
+        LogRecordReadContext readContext = null;
+        try {
+            readContext =
+                    LogRecordReadContext.createReadContext(tableInfo, false, null, schemaGetter);
+            long nextOffset = from;
+            while (nextOffset < hw) {
+                FetchDataInfo dataInfo =
+                        logTablet.read(
+                                nextOffset,
+                                Integer.MAX_VALUE,
+                                FetchIsolation.HIGH_WATERMARK,
+                                true);
+                LogRecords records = dataInfo.getRecords();
+                if (records == null || records.sizeInBytes() == 0) {
+                    break;
+                }
+                long progressOffset = nextOffset;
+                for (LogRecordBatch batch : records.batches()) {
+                    if (batch.baseLogOffset() >= hw) {
+                        // INV-1: never replay records at or past HW.
+                        break;
+                    }
+                    try (CloseableIterator<LogRecord> it = batch.records(readContext)) {
+                        while (it.hasNext()) {
+                            LogRecord rec = it.next();
+                            long recOffset = rec.logOffset();
+                            if (recOffset < from) {
+                                continue;
+                            }
+                            if (recOffset >= hw) {
+                                // Defensive: stop strictly below HW even if the batch extends past
+                                // it (FetchIsolation.HIGH_WATERMARK should already enforce this).
+                                break;
+                            }
+                            ChangeType ct = rec.getChangeType();
+                            InternalRow row = rec.getRow();
+                            switch (ct) {
+                                case INSERT:
+                                case UPDATE_AFTER:
+                                    scheduler.submit(recOffset, null, row);
+                                    replayed++;
+                                    break;
+                                case DELETE:
+                                    scheduler.submit(recOffset, row, null);
+                                    replayed++;
+                                    break;
+                                case UPDATE_BEFORE:
+                                    // Companion of UPDATE_AFTER in non-WAL changelog modes; the
+                                    // UPDATE_AFTER carries the post-image we replay, so skip this.
+                                    skippedUpdateBefore++;
+                                    break;
+                                default:
+                                    // KV table WAL should never carry APPEND_ONLY; record once.
+                                    unsupported++;
+                                    break;
+                            }
+                        }
+                    }
+                    progressOffset = Math.max(progressOffset, batch.nextLogOffset());
+                }
+                if (progressOffset <= nextOffset) {
+                    // Defensive: if read returned no progress, bail to avoid an infinite loop.
+                    LOG.warn(
+                            "Index push recovery for {} stalled at offset {} (HW={}); aborting replay.",
+                            tableBucket,
+                            nextOffset,
+                            hw);
+                    break;
+                }
+                nextOffset = progressOffset;
+            }
+            LOG.info(
+                    "Index push recovery for {}: replayed {} record(s) in [{}, {}) "
+                            + "(skipped UPDATE_BEFORE={}, unsupported={}).",
+                    tableBucket,
+                    replayed,
+                    from,
+                    hw,
+                    skippedUpdateBefore,
+                    unsupported);
+        } catch (Throwable t) {
+            // Recovery is best-effort: a partial replay is still better than none. Plan 5
+            // compaction will eventually reconcile any orphaned index entries.
+            LOG.warn(
+                    "Index push recovery for {} failed after replaying {} record(s) in [{}, {}); "
+                            + "indexes will converge eventually via the compaction filter.",
+                    tableBucket,
+                    replayed,
+                    from,
+                    hw,
+                    t);
+        } finally {
+            if (readContext != null) {
+                IOUtils.closeQuietly(readContext);
+            }
+        }
     }
 
     /**
