@@ -24,6 +24,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.exception.CoordinatorEpochFencedException;
 import org.apache.fluss.metadata.DatabaseSummary;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.Schema;
@@ -72,6 +73,7 @@ import org.apache.fluss.server.zk.data.ZkData.LakeTableZNode;
 import org.apache.fluss.server.zk.data.ZkData.LeaderAndIsrZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionSequenceIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.PartitionTombstoneZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionsZNode;
 import org.apache.fluss.server.zk.data.ZkData.ProducerIdZNode;
@@ -101,6 +103,8 @@ import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.CreateMode;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.data.Stat;
 import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.json.JsonSerdeUtils;
+import org.apache.fluss.utils.json.PartitionTombstoneJsonSerde;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
@@ -1058,6 +1062,46 @@ public class ZooKeeperClient implements AutoCloseable {
     public void deletePartition(TablePath tablePath, String partitionName) throws Exception {
         String path = PartitionZNode.path(tablePath, partitionName);
         zkClient.delete().forPath(path);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Partition Tombstone (per main table)
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Reads the {@link PartitionTombstone} for the given main table from ZK. Returns
+     * {@link PartitionTombstone#EMPTY} when the znode does not exist (i.e. no partition has ever
+     * been dropped for this table).
+     */
+    public PartitionTombstone getPartitionTombstone(TablePath tablePath) throws Exception {
+        String path = PartitionTombstoneZNode.path(tablePath);
+        Optional<byte[]> data = getOrEmpty(path);
+        if (data.isPresent()) {
+            return JsonSerdeUtils.readValue(data.get(), PartitionTombstoneJsonSerde.INSTANCE);
+        }
+        return PartitionTombstone.EMPTY;
+    }
+
+    /**
+     * Persists the {@link PartitionTombstone} for the given main table to ZK, creating the znode
+     * (and any missing parents) if it does not yet exist, otherwise overwriting it. Each successive
+     * write should advance {@link PartitionTombstone#getVersion()}.
+     */
+    public void setOrCreatePartitionTombstone(TablePath tablePath, PartitionTombstone tombstone)
+            throws Exception {
+        String path = PartitionTombstoneZNode.path(tablePath);
+        byte[] bytes =
+                JsonSerdeUtils.writeValueAsBytes(tombstone, PartitionTombstoneJsonSerde.INSTANCE);
+        if (getStat(path).isPresent()) {
+            zkClient.setData().forPath(path, bytes);
+        } else {
+            zkClient.create().creatingParentsIfNeeded().forPath(path, bytes);
+        }
+    }
+
+    /** Deletes the {@link PartitionTombstone} znode for the given main table, if it exists. */
+    public void deletePartitionTombstone(TablePath tablePath) throws Exception {
+        deletePath(PartitionTombstoneZNode.path(tablePath));
     }
 
     /** Register partition assignment and metadata in transaction. */
