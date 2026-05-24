@@ -25,9 +25,11 @@ import javax.annotation.concurrent.NotThreadSafe;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /**
@@ -40,8 +42,12 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * and point-get the main table. A main lookup returning an empty result list means the row was
  * deleted (stale Index Table pointer) and is skipped from the aggregated output.
  *
- * <p>The recheck step that re-validates surviving main rows against the original {@code lookupKey}
- * is intentionally NOT performed here — it is added in P4T3.
+ * <p>Recheck (FIP V2 §2.7): after Hop 2 returns, every surviving main row is re-validated against
+ * the user's original {@code lookupKey}. Index columns are extracted from both sides using
+ * positional {@link InternalRow.FieldGetter}s and compared via {@link Objects#equals}. Any row
+ * whose current {@code idxCols} disagree with the lookup key is discarded as a stale index pointer
+ * (covers both the async-visibility window and the natural lag during partition-tombstone
+ * cleanup).
  */
 @Internal
 @NotThreadSafe
@@ -50,6 +56,7 @@ public final class SecondaryIndexLookuper implements Lookuper {
     private final Lookuper indexTablePrefixLookuper;
     private final Lookuper mainTablePointLookuper;
     private final int[] idxColumnIndicesInMainRow;
+    private final InternalRow.FieldGetter[] idxColumnGettersInLookupKey;
     private final InternalRow.FieldGetter[] idxColumnGettersInMainRow;
     private final Function<InternalRow, InternalRow> basePkExtractorFromIndexRow;
 
@@ -57,6 +64,7 @@ public final class SecondaryIndexLookuper implements Lookuper {
             Lookuper indexTablePrefixLookuper,
             Lookuper mainTablePointLookuper,
             int[] idxColumnIndicesInMainRow,
+            InternalRow.FieldGetter[] idxColumnGettersInLookupKey,
             InternalRow.FieldGetter[] idxColumnGettersInMainRow,
             Function<InternalRow, InternalRow> basePkExtractorFromIndexRow) {
         this.indexTablePrefixLookuper =
@@ -65,8 +73,16 @@ public final class SecondaryIndexLookuper implements Lookuper {
                 checkNotNull(mainTablePointLookuper, "mainTablePointLookuper");
         this.idxColumnIndicesInMainRow =
                 checkNotNull(idxColumnIndicesInMainRow, "idxColumnIndicesInMainRow").clone();
+        this.idxColumnGettersInLookupKey =
+                checkNotNull(idxColumnGettersInLookupKey, "idxColumnGettersInLookupKey").clone();
         this.idxColumnGettersInMainRow =
                 checkNotNull(idxColumnGettersInMainRow, "idxColumnGettersInMainRow").clone();
+        checkArgument(
+                this.idxColumnGettersInLookupKey.length == this.idxColumnGettersInMainRow.length,
+                "idxColumnGettersInLookupKey and idxColumnGettersInMainRow must have the same length");
+        checkArgument(
+                this.idxColumnIndicesInMainRow.length == this.idxColumnGettersInMainRow.length,
+                "idxColumnIndicesInMainRow and idxColumnGettersInMainRow must have the same length");
         this.basePkExtractorFromIndexRow =
                 checkNotNull(basePkExtractorFromIndexRow, "basePkExtractorFromIndexRow");
     }
@@ -74,12 +90,15 @@ public final class SecondaryIndexLookuper implements Lookuper {
     @Override
     public CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
         // Hop 1: prefix scan the Index Table for candidate (idxCols, basePK) rows.
-        // Hop 2: fan out one point-get per candidate basePK against the main table and aggregate.
-        // Recheck (P4T3) is intentionally not performed here.
-        return indexTablePrefixLookuper.lookup(lookupKey).thenCompose(this::doHop2);
+        // Hop 2: fan out one point-get per candidate basePK against the main table, then re-check
+        // each surviving main row against the original lookupKey to discard stale pointers.
+        return indexTablePrefixLookuper
+                .lookup(lookupKey)
+                .thenCompose(hop1Result -> doHop2(hop1Result, lookupKey));
     }
 
-    private CompletableFuture<LookupResult> doHop2(LookupResult hop1Result) {
+    private CompletableFuture<LookupResult> doHop2(
+            LookupResult hop1Result, InternalRow lookupKey) {
         List<InternalRow> candidateIndexRows = hop1Result.getRowList();
         if (candidateIndexRows.isEmpty()) {
             return CompletableFuture.completedFuture(
@@ -98,9 +117,25 @@ public final class SecondaryIndexLookuper implements Lookuper {
                             for (CompletableFuture<LookupResult> f : mainFutures) {
                                 LookupResult r = f.join();
                                 // Empty list signals a deleted / missing main row -> skip.
-                                aggregated.addAll(r.getRowList());
+                                for (InternalRow mainRow : r.getRowList()) {
+                                    if (idxColsMatch(lookupKey, mainRow)) {
+                                        aggregated.add(mainRow);
+                                    }
+                                    // else: stale index pointer -> discard.
+                                }
                             }
                             return new LookupResult(aggregated);
                         });
+    }
+
+    private boolean idxColsMatch(InternalRow lookupKey, InternalRow mainRow) {
+        for (int i = 0; i < idxColumnGettersInLookupKey.length; i++) {
+            Object expected = idxColumnGettersInLookupKey[i].getFieldOrNull(lookupKey);
+            Object actual = idxColumnGettersInMainRow[i].getFieldOrNull(mainRow);
+            if (!Objects.equals(expected, actual)) {
+                return false;
+            }
+        }
+        return true;
     }
 }
