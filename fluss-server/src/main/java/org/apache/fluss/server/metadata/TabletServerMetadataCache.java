@@ -30,11 +30,16 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.tablet.TabletServer;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -44,6 +49,7 @@ import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -56,6 +62,8 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /** The implement of {@link ServerMetadataCache} for {@link TabletServer}. */
 public class TabletServerMetadataCache implements ServerMetadataCache {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TabletServerMetadataCache.class);
 
     private final Lock metadataLock = new ReentrantLock();
 
@@ -82,6 +90,19 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
      */
     private final ConcurrentHashMap<Long, PartitionTombstone> partitionTombstones =
             new ConcurrentHashMap<>();
+
+    /**
+     * Optional ZooKeeper client used to rebuild {@link #partitionTombstones} from ZK on the first
+     * cluster-metadata update after a TabletServer restart (P3T12). Wired by {@link
+     * TabletServer#startServices()} via {@link #setZooKeeperClient(ZooKeeperClient)}. Stays {@code
+     * null} in unit tests that exercise the cache without a real ZK client; in that case automatic
+     * seeding is disabled and tests can call {@link #seedPartitionTombstonesFromZk(ZooKeeperClient,
+     * Collection)} directly.
+     */
+    @Nullable private volatile ZooKeeperClient zkClientForTombstoneSeed;
+
+    /** One-shot guard so the automatic ZK-seed only fires on the first non-empty metadata batch. */
+    private final AtomicBoolean tombstonesSeededFromZk = new AtomicBoolean(false);
 
     public TabletServerMetadataCache(MetadataManager metadataManager) {
         this.serverMetadataSnapshot = ServerMetadataSnapshot.empty();
@@ -340,6 +361,24 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                             updatePartitionTombstone(e.getKey(), e.getValue());
                         }
                     }
+
+                    // 6. (P3T12) on first non-empty metadata after a TabletServer restart, rebuild
+                    // tombstones from ZK for the just-populated tables. The Coordinator only ships
+                    // tombstones in {@code UpdateMetadataRequest} when it advances them; without
+                    // this seed, a freshly-started TabletServer would not know about partitions
+                    // that were dropped before it came up until the Coordinator next advances a
+                    // tombstone. Idempotent: guarded by {@link #tombstonesSeededFromZk}.
+                    ZooKeeperClient zk = zkClientForTombstoneSeed;
+                    if (zk != null
+                            && !clusterMetadata.getTableMetadataList().isEmpty()
+                            && tombstonesSeededFromZk.compareAndSet(false, true)) {
+                        List<TableInfo> tableInfos =
+                                new ArrayList<>(clusterMetadata.getTableMetadataList().size());
+                        for (TableMetadata tm : clusterMetadata.getTableMetadataList()) {
+                            tableInfos.add(tm.getTableInfo());
+                        }
+                        seedPartitionTombstonesFromZk(zk, tableInfos);
+                    }
                 });
     }
 
@@ -508,5 +547,75 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
      */
     public void updatePartitionTombstone(long mainTableId, PartitionTombstone tombstone) {
         partitionTombstones.put(mainTableId, checkNotNull(tombstone, "tombstone"));
+    }
+
+    /**
+     * Wires a {@link ZooKeeperClient} that the cache can use to rebuild {@link
+     * #partitionTombstones} from ZK on the first non-empty cluster-metadata update (P3T12). Called
+     * by {@link TabletServer#startServices()}; tests that exercise the seed directly skip this
+     * setter and pass a real ZK client to {@link #seedPartitionTombstonesFromZk(ZooKeeperClient,
+     * Collection)} themselves.
+     */
+    public void setZooKeeperClient(ZooKeeperClient zkClient) {
+        this.zkClientForTombstoneSeed = zkClient;
+    }
+
+    /**
+     * Reseeds the in-memory partition-tombstone cache from ZK for the given tables (P3T12). On a
+     * TabletServer restart, the Coordinator does not proactively re-broadcast historical tombstones
+     * — it only ships them in {@code UpdateMetadataRequest} when it advances them. Without this
+     * seed, newly-pushed PutKv records targeting an already-tombstoned partition could land before
+     * the apply-path filter knows to drop them.
+     *
+     * <p>For each table:
+     *
+     * <ul>
+     *   <li>Index Tables are skipped — only main tables carry tombstones.
+     *   <li>Non-partitioned tables are skipped — partition tombstones only apply to partitioned
+     *       tables.
+     *   <li>{@link PartitionTombstone#EMPTY} (the no-op value returned by {@link
+     *       ZooKeeperClient#getPartitionTombstone(TablePath)} when the znode is absent) is skipped
+     *       to avoid clobbering any concurrently-applied non-empty cache entry.
+     *   <li>Per-table failures are logged at WARN and seeding continues — startup must not crash on
+     *       a single corrupted znode.
+     * </ul>
+     *
+     * <p>Idempotent: calling multiple times is safe. Each call re-reads ZK and overwrites the
+     * cached value, which is desired since {@link #updatePartitionTombstone(long,
+     * PartitionTombstone)} is the canonical update primitive and ZK reflects the latest version.
+     */
+    public void seedPartitionTombstonesFromZk(
+            ZooKeeperClient zkClient, Collection<TableInfo> tables) {
+        checkNotNull(zkClient, "zkClient");
+        checkNotNull(tables, "tables");
+        int seededCount = 0;
+        for (TableInfo tableInfo : tables) {
+            if (tableInfo.isIndexTable()) {
+                continue;
+            }
+            if (!tableInfo.isPartitioned()) {
+                continue;
+            }
+            TablePath tablePath = tableInfo.getTablePath();
+            try {
+                PartitionTombstone tombstone = zkClient.getPartitionTombstone(tablePath);
+                if (!PartitionTombstone.EMPTY.equals(tombstone)) {
+                    updatePartitionTombstone(tableInfo.getTableId(), tombstone);
+                    seededCount++;
+                }
+            } catch (Exception e) {
+                LOG.warn(
+                        "Failed to seed partition tombstone from ZK for table {} (tableId={}); "
+                                + "continuing startup.",
+                        tablePath,
+                        tableInfo.getTableId(),
+                        e);
+            }
+        }
+        if (seededCount > 0) {
+            LOG.info(
+                    "Seeded {} partition tombstone(s) from ZK on TabletServer startup.",
+                    seededCount);
+        }
     }
 }

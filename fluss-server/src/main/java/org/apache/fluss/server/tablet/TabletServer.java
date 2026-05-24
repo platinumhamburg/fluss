@@ -230,6 +230,12 @@ public class TabletServer extends ServerBase {
             dynamicConfigManager.register(lakeCatalogDynamicLoader);
 
             this.metadataCache = new TabletServerMetadataCache(metadataManager);
+            // P3T12: hand the cache a ZK client so it can rebuild PartitionTombstone state on the
+            // first cluster-metadata update after this TabletServer restart. Without this, a
+            // server restart leaves the cache empty until the Coordinator next advances a
+            // tombstone — leaving a window where PutKv for already-tombstoned partitions is not
+            // filtered.
+            this.metadataCache.setZooKeeperClient(zkClient);
 
             this.localDiskManager = LocalDiskManager.create(conf);
             this.logManager =
