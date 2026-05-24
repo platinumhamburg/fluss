@@ -20,17 +20,25 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
+import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SecondaryIndexVisibility;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchBuilder;
 import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.compacted.CompactedRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.types.DataField;
@@ -45,6 +53,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.util.Collections;
 
@@ -71,6 +80,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>{@link #testAsyncVisibilityEventuallyVisible()} — with {@code
  *       secondary-index.visibility=ASYNC} the PutKv ack does not wait for the push, but the index
  *       entry is eventually visible.
+ *   <li>{@link #testDroppedPartitionEntriesAreFilteredFromIndex()} — Plan 3 §2.9.8: with a
+ *       partition tombstone injected into the TabletServer's metadata cache, an Index Table
+ *       PutKv whose value carries the tombstoned partitionId prefix is silently dropped by the
+ *       apply-path filter while the rest of the apply path continues to function.
  * </ul>
  *
  * <h2>Naming convention</h2>
@@ -228,6 +241,99 @@ class IndexPushReplicationITCase {
         waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, /* present */ true);
     }
 
+    /**
+     * Scenario #5 (Plan 3 §2.9.8, partition tombstone): once the TabletServer's metadata cache
+     * holds a tombstone for a given {@code (mainTableId, partitionId)} pair, any subsequent Index
+     * Table PutKv whose value carries that partitionId in the 8-byte BE prefix must be silently
+     * dropped by the apply-path filter — no KV state change, no error, the surrounding batch is
+     * still acked normally.
+     *
+     * <p><b>Pragmatic scoping (per P3T13 spec):</b> driving the full multi-partition + drop +
+     * propagation chain through {@link FlussClusterExtension} is fixture-heavy and largely covered
+     * by per-component tests (advancer, JSON serde, ZK persistence, propagation, filter). This
+     * ITCase therefore exercises the end-to-end apply-path drop in-process by:
+     *
+     * <ol>
+     *   <li>asserting a normal main-table push lands an Index entry (apply path is healthy);
+     *   <li>injecting a tombstone for the {@code mainTableId} back-link the Index Table replica
+     *       was constructed with directly into the TabletServer's metadata cache (simulating the
+     *       Coordinator → TabletServer propagation that P3T6/P3T7 already cover);
+     *   <li>sending a synthetic PutKv straight to the Index Table whose value bytes carry the
+     *       tombstoned partitionId in the 8-byte prefix — bypassing the main table to control
+     *       the wire bytes exactly the way a partitioned production push would shape them;
+     *   <li>asserting the synthetic key is invisible (filter dropped) AND the original control
+     *       entry is still visible (filter is targeted, the apply path itself still works).
+     * </ol>
+     */
+    @Test
+    void testDroppedPartitionEntriesAreFilteredFromIndex() throws Exception {
+        String mainName = "main_t_tombstone";
+        Fixture f = setupTables(mainName, /* visibility */ null);
+
+        // (1) Insert a control row through the normal main-table push path. With no tombstone
+        // injected yet the apply path runs unobstructed and the entry shows up in the Index Table.
+        f.mainGateway
+                .putKv(
+                        newPutKvRequest(
+                                f.mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "hello"})))
+                .get();
+        byte[] controlIndexKey = encodeIndexKey("hello", 1);
+        waitForIndexEntry(f.indexGateway, f.indexTableId, controlIndexKey, /* present */ true);
+
+        // (2) Inject a tombstone into the TabletServer's metadata cache. The Index Table replica
+        // installs PartitionTombstoneFilter using the back-link mainTableId from its TableInfo —
+        // setupTables creates the Index Table with the placeholder back-link mainTableId=-1L, so
+        // we tombstone DROPPED_PARTITION_ID under that same key. This is the same primitive the
+        // production Coordinator → TabletServer propagation eventually invokes (P3T6).
+        int indexLeaderServerId =
+                FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(f.indexTableId, 0));
+        TabletServerMetadataCache cache =
+                FLUSS_CLUSTER_EXTENSION
+                        .getTabletServerById(indexLeaderServerId)
+                        .getMetadataCache();
+        final long mainTableIdBackLink = -1L;
+        final long droppedPartitionId = 4242L;
+        try {
+            cache.updatePartitionTombstone(
+                    mainTableIdBackLink,
+                    new PartitionTombstone(
+                            /* floor */ -1L,
+                            Collections.singleton(droppedPartitionId),
+                            /* version */ 1L));
+            assertThat(
+                            cache.getPartitionTombstone(mainTableIdBackLink)
+                                    .isTombstoned(droppedPartitionId))
+                    .as("tombstone is observable on the Index Table leader's metadata cache")
+                    .isTrue();
+
+            // (3) Send a synthetic PutKv DIRECTLY to the Index Table whose value bytes carry the
+            // 8-byte BE int64 prefix encoding the now-tombstoned partitionId — exactly the shape
+            // the production push pipeline would produce for a partitioned main table (see
+            // Replica#buildIndexExtractorContext + IndexTableUtils#prependPartitionIdPrefix).
+            byte[] droppedIndexKey = encodeIndexKey("dropped", 99);
+            byte[] tombstonedValue =
+                    IndexTableUtils.prependPartitionIdPrefix(
+                            droppedPartitionId, /* arbitrary body */ new byte[] {1, 2, 3, 4});
+            KvRecordBatch dropBatch = synthesizeIndexBatch(droppedIndexKey, tombstonedValue);
+            f.indexGateway.putKv(newPutKvRequest(f.indexTableId, 0, 1, dropBatch)).get();
+
+            // (4) The filter dropped the record silently (no WAL append, no KV state change), so
+            // the lookup for the synthetic key must return empty. waitForIndexEntry polls long
+            // enough that any latent apply would have shown up.
+            waitForIndexEntry(
+                    f.indexGateway, f.indexTableId, droppedIndexKey, /* present */ false);
+
+            // (5) The control entry from step (1) is still visible — the filter only suppresses
+            // records whose prefix is tombstoned, the apply path remains healthy for the rest.
+            waitForIndexEntry(
+                    f.indexGateway, f.indexTableId, controlIndexKey, /* present */ true);
+        } finally {
+            // Reset the tombstone so subsequent tests sharing this cluster see a clean cache
+            // for mainTableId=-1L (other scenarios in this file also use that placeholder).
+            cache.updatePartitionTombstone(mainTableIdBackLink, PartitionTombstone.EMPTY);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Disabled scenarios — re-enable as the dependent infrastructure lands.
     // ---------------------------------------------------------------------------------------------
@@ -366,5 +472,36 @@ class IndexPushReplicationITCase {
         row.setField(0, fromString(b));
         row.setField(1, a);
         return encoder.encodeKey(row);
+    }
+
+    /**
+     * Build a single-record {@link KvRecordBatch} whose value's raw bytes are exactly {@code
+     * valueBytes} — bypassing the row-type encoder so the test can control the partitionId prefix
+     * byte-for-byte.
+     *
+     * <p>Mirrors the production {@code IndexPushSender#wrapBytesAsCompactedRow}: a fresh empty
+     * {@link CompactedRow} is pointed at the supplied byte array so {@link KvRecordBatchBuilder}
+     * serializes the bytes verbatim to the wire. The receiving {@code KvTablet}'s apply-path
+     * filter inspects exactly these bytes via {@code BinaryRow.copyTo(byte[], int)} (see
+     * {@code KvTablet#processUpsert}).
+     */
+    private static KvRecordBatch synthesizeIndexBatch(byte[] key, byte[] valueBytes)
+            throws IOException {
+        KvRecordBatchBuilder builder =
+                KvRecordBatchBuilder.builder(
+                        /* schemaId */ 1,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(4096),
+                        KvFormat.COMPACTED);
+        try {
+            CompactedRow row = new CompactedRow(/* arity */ 0, /* deserializer */ null);
+            row.pointTo(MemorySegment.wrap(valueBytes), 0, valueBytes.length);
+            builder.append(key, row);
+            KvRecordBatch batch = DefaultKvRecordBatch.pointToBytesView(builder.build());
+            batch.ensureValid();
+            return batch;
+        } finally {
+            builder.close();
+        }
     }
 }
