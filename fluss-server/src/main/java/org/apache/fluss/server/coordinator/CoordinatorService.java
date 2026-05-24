@@ -50,6 +50,7 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -172,6 +173,7 @@ import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 import org.apache.fluss.utils.json.TableBucketOffsets;
 
@@ -494,10 +496,69 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         // then create table;
-        metadataManager.createTable(
-                tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+        long mainTableId =
+                metadataManager.createTable(
+                        tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+
+        // auto-derive Index Tables for any indexes declared on the main table's schema; this is
+        // synchronous so that the Coordinator returns success only when both the main table and
+        // every Index Table are persisted in ZK. Each Index Table is created with
+        // ignoreIfExists=true so a retried CREATE TABLE after a partial failure is recoverable.
+        autoDeriveIndexTables(tablePath, tableDescriptor, mainTableId);
 
         return CompletableFuture.completedFuture(new CreateTableResponse());
+    }
+
+    private void autoDeriveIndexTables(
+            TablePath mainTablePath, TableDescriptor mainDescriptor, long createdMainTableId) {
+        if (mainDescriptor.getSchema().getIndexes().isEmpty()) {
+            return;
+        }
+        long mainTableId = createdMainTableId;
+        if (mainTableId == -1L) {
+            // ignoreIfExists=true and the main table already existed: re-fetch the persisted
+            // tableId so the back-link properties on derived Index Tables are correct.
+            mainTableId = metadataManager.getTable(mainTablePath).getTableId();
+        }
+        int mainReplicationFactor = mainDescriptor.getReplicationFactor();
+        List<TableDescriptor> derivedDescriptors =
+                IndexTableAutoDerive.deriveIndexTables(mainDescriptor, mainTableId, mainTablePath);
+        List<Schema.Index> indexes = mainDescriptor.getSchema().getIndexes();
+        for (int i = 0; i < derivedDescriptors.size(); i++) {
+            Schema.Index index = indexes.get(i);
+            TableDescriptor indexDescriptor = derivedDescriptors.get(i);
+            // Ensure the replication factor is set: deriveIndexTableDescriptor does not
+            // propagate it, but generateAssignment requires it.
+            if (!indexDescriptor
+                    .getProperties()
+                    .containsKey(ConfigOptions.TABLE_REPLICATION_FACTOR.key())) {
+                indexDescriptor = indexDescriptor.withReplicationFactor(mainReplicationFactor);
+            }
+            TablePath indexTablePath =
+                    TablePath.of(
+                            mainTablePath.getDatabaseName(),
+                            IndexTableUtils.indexTableName(
+                                    mainTablePath.getTableName(), index.getIndexName()));
+            TableAssignment indexAssignment = null;
+            if (!indexDescriptor.isPartitioned()) {
+                //noinspection OptionalGetWithoutIsPresent
+                int indexBucketCount =
+                        indexDescriptor
+                                .getTableDistribution()
+                                .get()
+                                .getBucketCount()
+                                .get();
+                int indexReplicaFactor = indexDescriptor.getReplicationFactor();
+                TabletServerInfo[] servers = metadataCache.getLiveServers();
+                indexAssignment =
+                        generateAssignment(indexBucketCount, indexReplicaFactor, servers);
+            }
+            metadataManager.createTable(
+                    indexTablePath,
+                    indexDescriptor,
+                    indexAssignment,
+                    /* ignoreIfExists= */ true);
+        }
     }
 
     @Override
