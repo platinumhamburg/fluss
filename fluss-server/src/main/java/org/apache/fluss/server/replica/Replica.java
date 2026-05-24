@@ -18,6 +18,7 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.TableConfig;
@@ -34,6 +35,7 @@ import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.TooManyScannersException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -50,6 +52,10 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.row.BinaryRow;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
@@ -92,7 +98,7 @@ import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
-import org.apache.fluss.server.metadata.ServerMetadataCache;
+import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
@@ -106,10 +112,12 @@ import org.apache.fluss.server.zk.ZkSequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -142,9 +150,11 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
+import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
 
@@ -173,7 +183,7 @@ public final class Replica {
     private final CloseableRegistry closeableRegistry;
 
     private final IntSupplier minInSyncReplicasSupplier;
-    private final ServerMetadataCache metadataCache;
+    private final TabletServerMetadataCache metadataCache;
     private final FatalErrorHandler fatalErrorHandler;
     private final BucketMetricGroup bucketMetricGroup;
 
@@ -839,22 +849,11 @@ public final class Replica {
      * its WAL offset; the advance callback re-checks {@link DelayedWrite} completion via the second
      * watermark plumbing (P2T8).
      *
-     * <p><b>Stubbed sub-components for P2T9 structural scope</b>: the {@link
-     * IndexMutationExtractor.KeyEncoder} / {@link IndexMutationExtractor.ValueEncoder} / {@link
-     * IndexMutationExtractor.BucketAssigner} and partition-id resolver throw {@link
-     * UnsupportedOperationException} on first use; the {@link
-     * org.apache.fluss.server.index.IndexPushSender} returned by {@link
-     * ReplicaManager#createIndexPushSender} likewise stubs gateway / leader resolution. The
-     * scheduler exists and the emitter wiring compiles, but any actual mutation will surface the
-     * stub exception — full materialization is tracked by:
-     *
-     * <ul>
-     *   <li>TODO P2T13: replace stub KeyEncoder/ValueEncoder/BucketAssigner with the real index-row
-     *       encoders and the bucket-id assigner used by Index Tables.
-     *   <li>TODO P2T13: replace the partition-id resolver stub with a function that reads the
-     *       partition key column(s) from the base row (requires partition-key column index lookup
-     *       from {@link TableInfo#getPartitionKeys()}).
-     * </ul>
+     * <p>The encoders / bucket assigner / partition resolver / index-table-id are materialized in
+     * {@link #buildIndexExtractorContext}. Index Table metadata is resolved from the {@link
+     * TabletServerMetadataCache} cached snapshot — if a target Index Table is not yet visible in
+     * the cache the construction is aborted with {@link IllegalStateException} so the leader
+     * promotion fails loudly rather than silently dropping mutations.
      */
     private void maybeStartIndexPushScheduler() {
         if (replicaManager == null) {
@@ -905,8 +904,8 @@ public final class Replica {
      * scheduler. Invoked on leader promotion AFTER scheduler construction.
      *
      * <p>Idempotent: the index side is keyed by (idxCols, basePK) and the Index PutKv path
-     * naturally tolerates duplicates. INV-1 (no replay past HW) is enforced via the strict {@code
-     * < HW} upper bound.
+     * naturally tolerates duplicates. INV-1 (no replay past HW) is enforced via the strict {@code <
+     * HW} upper bound.
      *
      * <p>Current scope (P2T11): structural hook only. Real WAL scan + decode is materialized in
      * P2T13 alongside the real encoders.
@@ -930,7 +929,7 @@ public final class Replica {
                 tableBucket,
                 indexPushed + 1,
                 hw);
-        // TODO P2T13: implement WAL scan + decode + scheduler.submit per record.
+        // TODO P2T13c: implement WAL scan + decode + scheduler.submit per record.
     }
 
     /**
@@ -958,63 +957,177 @@ public final class Replica {
     }
 
     /**
-     * Build the per-main-table {@link IndexMutationExtractor.Context} used by the scheduler. The
-     * encoders / bucket assigner / partition-id resolver are stubs that throw {@link
-     * UnsupportedOperationException} on first invocation; P2T13 will replace them with the real
-     * Index-Table encoding plumbing.
+     * Build the per-main-table {@link IndexMutationExtractor.Context} used by the scheduler.
+     *
+     * <p>For each declared {@link Schema.Index} this resolves the target Index Table from the
+     * {@link TabletServerMetadataCache} (path is {@code <mainTable>$<indexName>}; bucket count
+     * comes from the cached {@link TableInfo#getNumBuckets()}) and constructs:
+     *
+     * <ul>
+     *   <li>a {@link CompactedKeyEncoder} pinned to the dedup'd composite {@code idxCols + basePK}
+     *       column indices in the main row (matches the Index Table's PK encoding because {@code
+     *       deriveIndexTableDescriptor} pins {@code KvFormat.COMPACTED} with no lake format);
+     *   <li>a {@link RowEncoder} producing the Index Table value body from those same columns;
+     *       partitioned Index Tables prepend the 8-byte BE int64 partitionId per {@link
+     *       IndexTableUtils#prependPartitionIdPrefix};
+     *   <li>a {@link FlussBucketingFunction}-backed bucket assigner over the Index Table's bucket
+     *       count.
+     * </ul>
+     *
+     * <p>The partition-id resolver returns the constant partitionId carried by this leader's {@link
+     * TableBucket}, since each replica owns exactly one (partition, bucket) pair on a partitioned
+     * table.
+     *
+     * @throws IllegalStateException if any Index Table is not yet in the metadata cache or its
+     *     bucket count is not configured.
      */
     private IndexMutationExtractor.Context buildIndexExtractorContext(List<Schema.Index> indexes) {
         Schema schema = tableInfo.getSchema();
         int[] basePkColumnIndices = schema.getPrimaryKeyIndexes();
         boolean partitioned = tableInfo.isPartitioned();
+        RowType mainRowType = tableInfo.getRowType();
 
         List<IndexMutationExtractor.IndexPlan> plans = new ArrayList<>(indexes.size());
         for (Schema.Index index : indexes) {
             int[] idxColumnIndices = schema.getColumnIndexes(index.getColumnNames());
-            // TODO P2T13: replace the stubs with the real Index-Table KeyEncoder /
-            //  ValueEncoder / BucketAssigner used by the secondary-index push pipeline.
+            int[] indexValueColumnIndices =
+                    composeIndexValueColumnIndices(idxColumnIndices, basePkColumnIndices);
+
+            long indexTableId = resolveIndexTableId(index.getIndexName());
+            int indexBucketCount = resolveIndexBucketCount(index.getIndexName());
+
+            CompactedKeyEncoder underlyingKeyEncoder =
+                    new CompactedKeyEncoder(mainRowType, indexValueColumnIndices);
             IndexMutationExtractor.KeyEncoder keyEncoder =
-                    (row, idx, basePk) -> {
-                        throw new UnsupportedOperationException(
-                                "Index KeyEncoder not yet wired (P2T9 structural plumbing only).");
-                    };
+                    (row, idxIdx, basePkIdx) -> underlyingKeyEncoder.encodeKey(row);
+
+            DataType[] valueFieldTypes = new DataType[indexValueColumnIndices.length];
+            InternalRow.FieldGetter[] valueFieldGetters =
+                    new InternalRow.FieldGetter[indexValueColumnIndices.length];
+            for (int i = 0; i < indexValueColumnIndices.length; i++) {
+                int idxInMain = indexValueColumnIndices[i];
+                DataType type = mainRowType.getTypeAt(idxInMain);
+                valueFieldTypes[i] = type;
+                valueFieldGetters[i] = InternalRow.createFieldGetter(type, idxInMain);
+            }
+            RowEncoder valueRowEncoder = RowEncoder.create(KvFormat.COMPACTED, valueFieldTypes);
             IndexMutationExtractor.ValueEncoder valueEncoder =
-                    (row, idx, basePk, partitionId) -> {
-                        throw new UnsupportedOperationException(
-                                "Index ValueEncoder not yet wired (P2T9 structural plumbing"
-                                        + " only).");
+                    (row, idxIdx, basePkIdx, partitionId) -> {
+                        valueRowEncoder.startNewRow();
+                        for (int i = 0; i < valueFieldGetters.length; i++) {
+                            valueRowEncoder.encodeField(
+                                    i, valueFieldGetters[i].getFieldOrNull(row));
+                        }
+                        BinaryRow encoded = valueRowEncoder.finishRow();
+                        byte[] body = new byte[encoded.getSizeInBytes()];
+                        encoded.copyTo(body, 0);
+                        return partitioned
+                                ? IndexTableUtils.prependPartitionIdPrefix(partitionId, body)
+                                : body;
                     };
+
+            FlussBucketingFunction bucketingFunction = new FlussBucketingFunction();
             IndexMutationExtractor.BucketAssigner bucketAssigner =
-                    key -> {
-                        throw new UnsupportedOperationException(
-                                "Index BucketAssigner not yet wired (P2T9 structural plumbing"
-                                        + " only).");
-                    };
-            // TODO P2T13: once index-table-id resolution lands, replace 0L with the real
-            //  Index Table id resolved from {@code tableInfo.getTableId()} + index name via the
-            //  metadata cache or the back-link properties.
+                    key -> bucketingFunction.bucketing(key, indexBucketCount);
+
             plans.add(
                     new IndexMutationExtractor.IndexPlan(
-                            /* indexTableId */ 0L,
+                            indexTableId,
                             idxColumnIndices,
                             keyEncoder,
                             valueEncoder,
                             bucketAssigner));
         }
-        // TODO P2T13: resolve partition column position(s) from {@link
-        // TableInfo#getPartitionKeys()}
-        //  and replace this stub with a real ToLongFunction reading the partition column.
+
+        ToLongFunction<InternalRow> partitionIdResolver =
+                partitioned ? buildPartitionIdResolver() : null;
+
         return new IndexMutationExtractor.Context(
-                plans,
-                basePkColumnIndices,
-                partitioned,
-                partitioned
-                        ? row -> {
-                            throw new UnsupportedOperationException(
-                                    "partitionIdResolver not yet wired (P2T9 structural"
-                                            + " plumbing only).");
-                        }
-                        : null);
+                plans, basePkColumnIndices, partitioned, partitionIdResolver);
+    }
+
+    /**
+     * Returns {@code idxColumnIndices ++ basePkColumnIndices} with duplicates removed (preserving
+     * idx-cols-first order). Mirrors the dedup logic in {@code TableDescriptor
+     * .deriveIndexTableDescriptor} so the encoder column layout matches the Index Table's PK and
+     * row schema exactly.
+     */
+    private static int[] composeIndexValueColumnIndices(
+            int[] idxColumnIndices, int[] basePkColumnIndices) {
+        Set<Integer> seen = new HashSet<>();
+        int[] tmp = new int[idxColumnIndices.length + basePkColumnIndices.length];
+        int len = 0;
+        for (int i : idxColumnIndices) {
+            if (seen.add(i)) {
+                tmp[len++] = i;
+            }
+        }
+        for (int i : basePkColumnIndices) {
+            if (seen.add(i)) {
+                tmp[len++] = i;
+            }
+        }
+        int[] out = new int[len];
+        System.arraycopy(tmp, 0, out, 0, len);
+        return out;
+    }
+
+    /**
+     * Resolve the {@code tableId} of the Index Table for {@code indexName} from the metadata cache.
+     * The Index Table's logical path is {@code <mainTable>$<indexName>} (see {@code
+     * IndexTableFoundationITCase} for the canonical naming convention).
+     */
+    private long resolveIndexTableId(String indexName) {
+        TablePath indexTablePath = indexTablePathFor(indexName);
+        OptionalLong idOpt = metadataCache.getTableId(indexTablePath);
+        checkState(
+                idOpt.isPresent(),
+                "Index Table %s for main table %s is not yet visible in the metadata"
+                        + " cache; cannot start IndexPushScheduler.",
+                indexTablePath,
+                tableInfo.getTablePath());
+        return idOpt.getAsLong();
+    }
+
+    /**
+     * Resolve the bucket count of the Index Table for {@code indexName} from the metadata cache.
+     * Index Tables always declare a bucket count at derive time (see {@code
+     * TableDescriptor.deriveIndexTableDescriptor}) so the cached {@link TableInfo#getNumBuckets()}
+     * is authoritative.
+     */
+    private int resolveIndexBucketCount(String indexName) {
+        TablePath indexTablePath = indexTablePathFor(indexName);
+        Optional<TableMetadata> metaOpt = metadataCache.getTableMetadata(indexTablePath);
+        checkState(
+                metaOpt.isPresent(),
+                "Index Table %s for main table %s is not yet resolvable in the metadata"
+                        + " cache; cannot start IndexPushScheduler.",
+                indexTablePath,
+                tableInfo.getTablePath());
+        return metaOpt.get().getTableInfo().getNumBuckets();
+    }
+
+    private TablePath indexTablePathFor(String indexName) {
+        TablePath mainPath = tableInfo.getTablePath();
+        return TablePath.of(mainPath.getDatabaseName(), mainPath.getTableName() + "$" + indexName);
+    }
+
+    /**
+     * Build a partition-id resolver for partitioned main tables. Since each {@link Replica} is
+     * bound to exactly one (partition, bucket) pair, the partitionId is constant for this leader's
+     * lifetime and can be read directly from {@link #tableBucket} — there is no need to decode
+     * partition column values from the row at runtime.
+     */
+    private ToLongFunction<InternalRow> buildPartitionIdResolver() {
+        Long partitionId = tableBucket.getPartitionId();
+        checkState(
+                partitionId != null,
+                "Partitioned main table %s replica %s has no partitionId on its TableBucket;"
+                        + " cannot wire IndexPushScheduler.",
+                tableInfo.getTablePath(),
+                tableBucket);
+        final long partitionIdValue = partitionId;
+        return row -> partitionIdValue;
     }
 
     /**

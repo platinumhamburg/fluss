@@ -18,6 +18,7 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
@@ -49,6 +50,7 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.rpc.GatewayClientProxy;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
@@ -60,6 +62,7 @@ import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.entity.TableStatsResultForBucket;
 import org.apache.fluss.rpc.entity.WriteResultForBucket;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
@@ -135,6 +138,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -223,6 +227,24 @@ public class ReplicaManager implements ServerReconfigurable {
     private final Clock clock;
 
     private final ScannerManager scannerManager;
+
+    /**
+     * Shared {@link RpcClient} retained for index-push gateway construction. The same client is
+     * already threaded through {@link ReplicaFetcherManager}; we keep our own reference so the
+     * gateway factory can build {@link TabletServerGateway} proxies on demand without revisiting
+     * the constructor.
+     */
+    private final RpcClient rpcClient;
+
+    /**
+     * Per-leader-server {@link TabletServerGateway} cache shared by every {@link IndexPushSender}
+     * built via {@link #createIndexPushSender}. Each entry is a thin {@code GatewayClientProxy}
+     * bound to a {@link Supplier} that resolves the latest {@link
+     * org.apache.fluss.cluster.ServerNode} from the metadata cache, so cluster membership changes
+     * are picked up automatically without invalidating the cache.
+     */
+    private final Map<Integer, TabletServerGateway> indexPushGatewayCache =
+            new ConcurrentHashMap<>();
 
     /**
      * Lazily initialized retry executor shared by every {@link IndexPushSender} this manager
@@ -315,6 +337,7 @@ public class ReplicaManager implements ServerReconfigurable {
         this.kvManager = kvManager;
         this.serverId = serverId;
         this.metadataCache = metadataCache;
+        this.rpcClient = checkNotNull(rpcClient, "rpcClient");
 
         this.highWatermarkCheckpoints = new HashMap<>();
         this.indexPushedOffsetCheckpoints = new HashMap<>();
@@ -1615,10 +1638,7 @@ public class ReplicaManager implements ServerReconfigurable {
                     conf.get(ConfigOptions.LOG_REPLICA_HIGH_WATERMARK_CHECKPOINT_INTERVAL)
                             .toMillis();
             scheduler.schedule(
-                    "highWatermark-checkpoint",
-                    this::checkpointHighWatermarks,
-                    0L,
-                    intervalMs);
+                    "highWatermark-checkpoint", this::checkpointHighWatermarks, 0L, intervalMs);
             scheduler.schedule(
                     "indexPushedOffset-checkpoint",
                     this::checkpointIndexPushedOffsets,
@@ -1764,16 +1784,16 @@ public class ReplicaManager implements ServerReconfigurable {
     }
 
     /**
-     * Returns the index-pushed-offset that a {@link DelayedWrite.DelayedBucketStatus} must wait
-     * for before acking, honoring the {@code secondary-index.visibility} table property.
+     * Returns the index-pushed-offset that a {@link DelayedWrite.DelayedBucketStatus} must wait for
+     * before acking, honoring the {@code secondary-index.visibility} table property.
      *
      * <ul>
-     *   <li>{@code tableInfo == null} (replica lookup failed) →
-     *       {@link DelayedWrite.DelayedBucketStatus#NO_INDEX_OFFSET_REQUIRED};
+     *   <li>{@code tableInfo == null} (replica lookup failed) → {@link
+     *       DelayedWrite.DelayedBucketStatus#NO_INDEX_OFFSET_REQUIRED};
      *   <li>table has no secondary indexes → {@code NO_INDEX_OFFSET_REQUIRED} regardless of the
      *       visibility property (nothing to wait on);
-     *   <li>table has indexes and visibility is {@link SecondaryIndexVisibility#ASYNC} →
-     *       {@code NO_INDEX_OFFSET_REQUIRED};
+     *   <li>table has indexes and visibility is {@link SecondaryIndexVisibility#ASYNC} → {@code
+     *       NO_INDEX_OFFSET_REQUIRED};
      *   <li>table has indexes and visibility is {@link SecondaryIndexVisibility#SYNC} (default) →
      *       {@code writeOffset}.
      * </ul>
@@ -2234,45 +2254,68 @@ public class ReplicaManager implements ServerReconfigurable {
 
     /**
      * Build an {@link IndexPushSender} for a leader {@link Replica}. Used by {@code
-     * Replica.onBecomeNewLeader} (P2T9) so that {@link Replica} does not need to know about {@code
+     * Replica.onBecomeNewLeader} so that {@link Replica} does not need to know about {@code
      * RpcClient} / {@code GatewayClientProxy} plumbing.
      *
-     * <p><b>Current state (P2T9 structural scope)</b>: the {@code LeaderResolver} and {@code
-     * gatewayFactory} are stub sentinels that throw {@link UnsupportedOperationException} on first
-     * call. The push pipeline is therefore inert at runtime — leaders that have indexes will still
-     * construct a scheduler and the {@link IndexedRowEmitter} hook will still fire, but any actual
-     * mutation flowing through the sender will surface the stub exception. This is intentional and
-     * tracked for follow-up:
+     * <p>The {@code LeaderResolver} consults the cached {@link TabletServerMetadataCache} bucket
+     * leader map; the {@code gatewayFactory} returns cached {@link TabletServerGateway} proxies
+     * (one per leader server id) bound to a {@code Supplier<ServerNode>} that re-resolves through
+     * the metadata cache on every RPC, so cluster topology changes are picked up without
+     * invalidating the gateway cache.
      *
-     * <ul>
-     *   <li>TODO P2T13: wire {@code LeaderResolver} against {@link
-     *       TabletServerMetadataCache#getTabletServer} to look up the leader of {@code
-     *       (indexTableId, indexBucket)} via the cluster metadata cache.
-     *   <li>TODO P2T13: wire {@code gatewayFactory} via {@code
-     *       GatewayClientProxy.createGatewayProxy} using the {@code RpcClient} threaded through
-     *       {@code TabletServer.start()}; the cleanest form will likely be a shared {@code
-     *       RpcGatewayManager<TabletServerGateway>}.
-     * </ul>
+     * <p>If the metadata cache does not yet know the leader for {@code (indexTableId, indexBucket)}
+     * the resolver throws an unchecked exception; the surrounding {@link IndexPushSender} treats
+     * this as a transient failure and retries with backoff, so leader election races recover
+     * without losing mutations.
      */
     IndexPushSender createIndexPushSender(BiConsumer<Long, IndexPushTracker.Target> ackCallback) {
         checkNotNull(ackCallback, "ackCallback");
         ScheduledExecutorService retryExecutor = getOrCreateIndexPushRetryExecutor();
         IndexPushSender.LeaderResolver leaderResolver =
                 (indexTableId, indexBucket) -> {
-                    throw new UnsupportedOperationException(
-                            "IndexPushSender.LeaderResolver is not yet wired (P2T9 structural"
-                                    + " plumbing only; full wiring follows in P2T13).");
+                    OptionalInt leaderOpt =
+                            metadataCache.getBucketLeader(indexTableId, indexBucket);
+                    if (!leaderOpt.isPresent()) {
+                        throw new IllegalStateException(
+                                String.format(
+                                        "No cached leader for index bucket (tableId=%d,"
+                                                + " bucket=%d); will retry.",
+                                        indexTableId, indexBucket));
+                    }
+                    return leaderOpt.getAsInt();
                 };
         return new IndexPushSender(
-                serverId -> {
-                    throw new UnsupportedOperationException(
-                            "IndexPushSender gatewayFactory is not yet wired (P2T9 structural"
-                                    + " plumbing only; full wiring follows in P2T13).");
-                },
+                this::indexPushGatewayFor,
                 leaderResolver,
                 retryExecutor,
                 ackCallback,
                 /* maxBatchSize */ 256);
+    }
+
+    /**
+     * Returns a cached {@link TabletServerGateway} for the given leader {@code serverId}. The
+     * gateway is a thin {@code GatewayClientProxy} that resolves the {@link
+     * org.apache.fluss.cluster.ServerNode} on every RPC via the metadata cache, so a single cached
+     * entry remains valid across cluster membership changes.
+     */
+    private TabletServerGateway indexPushGatewayFor(int leaderServerId) {
+        return indexPushGatewayCache.computeIfAbsent(
+                leaderServerId,
+                id ->
+                        GatewayClientProxy.createGatewayProxy(
+                                () -> {
+                                    Optional<ServerNode> nodeOpt =
+                                            metadataCache.getTabletServer(id, internalListenerName);
+                                    if (!nodeOpt.isPresent()) {
+                                        throw new IllegalStateException(
+                                                "Index-push leader server "
+                                                        + id
+                                                        + " is not in the metadata cache");
+                                    }
+                                    return nodeOpt.get();
+                                },
+                                rpcClient,
+                                TabletServerGateway.class));
     }
 
     private ScheduledExecutorService getOrCreateIndexPushRetryExecutor() {

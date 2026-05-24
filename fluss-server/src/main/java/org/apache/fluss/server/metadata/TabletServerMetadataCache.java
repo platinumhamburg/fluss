@@ -39,6 +39,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.locks.Lock;
@@ -114,6 +115,36 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
 
     public Optional<PhysicalTablePath> getPhysicalTablePath(long partitionId) {
         return serverMetadataSnapshot.getPhysicalTablePath(partitionId);
+    }
+
+    /**
+     * Returns the cached {@code tableId} for the given {@link TablePath}, or empty if the cache
+     * does not yet know about the table. Cache-only — does NOT consult ZK.
+     */
+    public OptionalLong getTableId(TablePath tablePath) {
+        return serverMetadataSnapshot.getTableId(tablePath);
+    }
+
+    /**
+     * Returns the cached {@code partitionId} for the given {@link PhysicalTablePath}, or empty if
+     * the cache does not yet know about the partition. Cache-only — does NOT consult ZK.
+     */
+    public Optional<Long> getPartitionId(PhysicalTablePath physicalTablePath) {
+        return serverMetadataSnapshot.getPartitionId(physicalTablePath);
+    }
+
+    /**
+     * Returns the cached leader server id for {@code (tableId, bucketId)} of a non-partitioned
+     * table, or empty if the cache does not yet know the leader (e.g. mid-election). Cache-only —
+     * does NOT consult ZK. Used by the index-push pipeline to locate the Index Bucket leader.
+     */
+    public OptionalInt getBucketLeader(long tableId, int bucketId) {
+        BucketMetadata bucketMetadata =
+                serverMetadataSnapshot.getBucketMetadataForTable(tableId).get(bucketId);
+        if (bucketMetadata == null) {
+            return OptionalInt.empty();
+        }
+        return bucketMetadata.getLeaderId();
     }
 
     public Optional<TableMetadata> getTableMetadata(TablePath tablePath) {
