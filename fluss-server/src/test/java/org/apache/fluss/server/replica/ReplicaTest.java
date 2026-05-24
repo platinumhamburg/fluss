@@ -21,9 +21,12 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecordBatch;
@@ -40,12 +43,18 @@ import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
+import org.apache.fluss.server.metadata.BucketMetadata;
+import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
+import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
@@ -78,6 +87,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA2;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
+import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
@@ -149,9 +159,9 @@ final class ReplicaTest extends ReplicaTestBase {
      * P2T11 regression: leader promotion must invoke the WAL-replay recovery hook AFTER the index
      * push scheduler field is assigned (so that re-submitted records land on a live pipeline). For
      * a non-indexed table (this fixture), the hook is unreachable because the scheduler is never
-     * built — verify the leader path still completes cleanly, the scheduler stays {@code null},
-     * and a seeded {@code indexPushedOffset} is preserved across the promotion (i.e. the recovery
-     * code path produced no side effect on the watermark).
+     * built — verify the leader path still completes cleanly, the scheduler stays {@code null}, and
+     * a seeded {@code indexPushedOffset} is preserved across the promotion (i.e. the recovery code
+     * path produced no side effect on the watermark).
      */
     @Test
     void testRecoverIndexPushFromWalIsInvokedAfterSchedulerStarts() throws Exception {
@@ -178,6 +188,61 @@ final class ReplicaTest extends ReplicaTestBase {
         makeKvReplicaAsLeader(kvReplica, INITIAL_LEADER_EPOCH + 2);
         assertThat(kvReplica.getIndexPushScheduler()).isNull();
         assertThat(kvReplica.getIndexPushedOffset()).isEqualTo(5L);
+    }
+
+    /**
+     * P3T14 regression: when {@link Replica#maybeStartIndexPushScheduler()} runs on leader
+     * promotion but the auto-derived Index Table is not yet visible in the local {@link
+     * org.apache.fluss.server.metadata.TabletServerMetadataCache}, the scheduler must NOT crash
+     * with {@code IllegalStateException}. Instead it must defer initialization (set the deferred
+     * flag) so the next cluster-metadata update can retry it.
+     */
+    @Test
+    void testIndexPushSchedulerInitDefersWhenIndexTableNotYetInCache() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        // Index table is registered in ZK but NOT broadcast to the metadata cache yet — so the
+        // pre-check in maybeStartIndexPushScheduler must defer rather than throw.
+        assertThat(serverMetadataCache.getTableId(f.indexTablePath))
+                .as("precondition: cache does not yet know the auto-derived Index Table")
+                .isEmpty();
+
+        // Promote the main-table replica to leader. The pre-check should detect the missing
+        // index, log "deferring", and return WITHOUT throwing.
+        makeIndexedMainReplicaAsLeader(f);
+
+        assertThat(f.replica.getIndexPushScheduler())
+                .as("scheduler must not be wired while index table is invisible")
+                .isNull();
+        assertThat(f.replica.isIndexPushSchedulerInitDeferred())
+                .as("deferred flag must be raised")
+                .isTrue();
+    }
+
+    /**
+     * P3T14 retry path: after the auto-derived Index Table propagates into the cache, the next
+     * cluster-metadata update (or an explicit {@code retryMaybeStartIndexPushScheduler()} call)
+     * must wire the scheduler and clear the deferred flag.
+     */
+    @Test
+    void testIndexPushSchedulerInitRetriesAfterMetadataUpdate() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        makeIndexedMainReplicaAsLeader(f);
+        assertThat(f.replica.isIndexPushSchedulerInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexPushScheduler()).isNull();
+
+        // Populate the cache with the index-table metadata — exactly what the Coordinator
+        // broadcast does once the auto-derived CreateTableEvent is processed.
+        publishIndexTableToCache(f);
+
+        // Explicitly call the retry hook the way ReplicaManager would after the cache update.
+        f.replica.retryMaybeStartIndexPushScheduler();
+
+        assertThat(f.replica.getIndexPushScheduler())
+                .as("scheduler must be wired now that the index table is visible")
+                .isNotNull();
+        assertThat(f.replica.isIndexPushSchedulerInitDeferred())
+                .as("deferred flag must be cleared after a successful retry")
+                .isFalse();
     }
 
     @Test
@@ -976,5 +1041,147 @@ final class ReplicaTest extends ReplicaTestBase {
         public void reset() {
             isScheduled = false;
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Helpers for the P3T14 deferred / retry tests.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Per-test fixture: a fresh main-table {@link Replica} carrying one declared {@link
+     * Schema.Index}, registered in ZK alongside the auto-derived Index Table — but with the index
+     * NOT yet propagated into the local metadata cache.
+     */
+    private static final class IndexedFixture {
+        final Replica replica;
+        final TablePath mainPath;
+        final long mainTableId;
+        final TablePath indexTablePath;
+        final long indexTableId;
+        final TableInfo indexTableInfo;
+
+        IndexedFixture(
+                Replica replica,
+                TablePath mainPath,
+                long mainTableId,
+                TablePath indexTablePath,
+                long indexTableId,
+                TableInfo indexTableInfo) {
+            this.replica = replica;
+            this.mainPath = mainPath;
+            this.mainTableId = mainTableId;
+            this.indexTablePath = indexTablePath;
+            this.indexTableId = indexTableId;
+            this.indexTableInfo = indexTableInfo;
+        }
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica() throws Exception {
+        String indexName = "idx_b";
+        String mainName = "test_indexed_main";
+        long mainTableId = 9001L;
+        long indexTableId = 9002L;
+
+        TablePath mainPath = TablePath.of(DATA1_TABLE_PATH_PK.getDatabaseName(), mainName);
+        TablePath indexPath =
+                TablePath.of(
+                        mainPath.getDatabaseName(),
+                        IndexTableUtils.indexTableName(mainName, indexName));
+
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .primaryKey("a")
+                        .index(indexName, "b")
+                        .build();
+        TableDescriptor mainDescriptor =
+                TableDescriptor.builder()
+                        .schema(mainSchema)
+                        .distributedBy(1, "a")
+                        .property(ConfigOptions.secondaryIndexBucketNumKey(indexName), "1")
+                        .build();
+        TableDescriptor indexDescriptor =
+                TableDescriptor.deriveIndexTableDescriptor(
+                        mainDescriptor, mainTableId, mainPath.toString(), indexName);
+
+        long now = System.currentTimeMillis();
+        TableInfo mainTableInfo =
+                TableInfo.of(
+                        mainPath,
+                        mainTableId,
+                        DEFAULT_SCHEMA_ID,
+                        mainDescriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+        TableInfo indexTableInfo =
+                TableInfo.of(
+                        indexPath,
+                        indexTableId,
+                        DEFAULT_SCHEMA_ID,
+                        indexDescriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+
+        if (!zkClient.tableExist(mainPath)) {
+            zkClient.registerTable(
+                    mainPath,
+                    TableRegistration.newTable(
+                            mainTableId, DEFAULT_REMOTE_DATA_DIR, mainDescriptor));
+            zkClient.registerFirstSchema(mainPath, mainSchema);
+        }
+        if (!zkClient.tableExist(indexPath)) {
+            zkClient.registerTable(
+                    indexPath,
+                    TableRegistration.newTable(
+                            indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
+            zkClient.registerFirstSchema(indexPath, indexDescriptor.getSchema());
+        }
+
+        TableBucket mainBucket = new TableBucket(mainTableId, 0);
+        Replica replica = makeKvReplica(PhysicalTablePath.of(mainPath), mainBucket, mainTableInfo);
+        return new IndexedFixture(
+                replica, mainPath, mainTableId, indexPath, indexTableId, indexTableInfo);
+    }
+
+    private void makeIndexedMainReplicaAsLeader(IndexedFixture f) throws Exception {
+        f.replica.makeLeader(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(f.mainPath),
+                        new TableBucket(f.mainTableId, 0),
+                        Collections.singletonList(TABLET_SERVER_ID),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID,
+                                INITIAL_LEADER_EPOCH,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                INITIAL_LEADER_EPOCH)));
+    }
+
+    /**
+     * Push the auto-derived Index Table's metadata into the {@link
+     * org.apache.fluss.server.metadata.TabletServerMetadataCache} the way the production
+     * Coordinator → TabletServer broadcast does. After this call the cache knows the index table id
+     * + bucket layout so {@code retryMaybeStartIndexPushScheduler()} can succeed.
+     */
+    private void publishIndexTableToCache(IndexedFixture f) {
+        BucketMetadata bucketMetadata =
+                new BucketMetadata(
+                        0,
+                        TABLET_SERVER_ID,
+                        INITIAL_LEADER_EPOCH,
+                        Collections.singletonList(TABLET_SERVER_ID));
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        null,
+                        Collections.emptySet(),
+                        Collections.singletonList(
+                                new TableMetadata(
+                                        f.indexTableInfo,
+                                        Collections.singletonList(bucketMetadata))),
+                        Collections.emptyList()));
     }
 }

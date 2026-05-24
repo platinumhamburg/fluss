@@ -81,9 +81,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       secondary-index.visibility=ASYNC} the PutKv ack does not wait for the push, but the index
  *       entry is eventually visible.
  *   <li>{@link #testDroppedPartitionEntriesAreFilteredFromIndex()} — Plan 3 §2.9.8: with a
- *       partition tombstone injected into the TabletServer's metadata cache, an Index Table
- *       PutKv whose value carries the tombstoned partitionId prefix is silently dropped by the
- *       apply-path filter while the rest of the apply path continues to function.
+ *       partition tombstone injected into the TabletServer's metadata cache, an Index Table PutKv
+ *       whose value carries the tombstoned partitionId prefix is silently dropped by the apply-path
+ *       filter while the rest of the apply path continues to function.
  * </ul>
  *
  * <h2>Naming convention</h2>
@@ -255,12 +255,12 @@ class IndexPushReplicationITCase {
      *
      * <ol>
      *   <li>asserting a normal main-table push lands an Index entry (apply path is healthy);
-     *   <li>injecting a tombstone for the {@code mainTableId} back-link the Index Table replica
-     *       was constructed with directly into the TabletServer's metadata cache (simulating the
+     *   <li>injecting a tombstone for the {@code mainTableId} back-link the Index Table replica was
+     *       constructed with directly into the TabletServer's metadata cache (simulating the
      *       Coordinator → TabletServer propagation that P3T6/P3T7 already cover);
      *   <li>sending a synthetic PutKv straight to the Index Table whose value bytes carry the
-     *       tombstoned partitionId in the 8-byte prefix — bypassing the main table to control
-     *       the wire bytes exactly the way a partitioned production push would shape them;
+     *       tombstoned partitionId in the 8-byte prefix — bypassing the main table to control the
+     *       wire bytes exactly the way a partitioned production push would shape them;
      *   <li>asserting the synthetic key is invisible (filter dropped) AND the original control
      *       entry is still visible (filter is targeted, the apply path itself still works).
      * </ol>
@@ -282,16 +282,15 @@ class IndexPushReplicationITCase {
 
         // (2) Inject a tombstone into the TabletServer's metadata cache. The Index Table replica
         // installs PartitionTombstoneFilter using the back-link mainTableId from its TableInfo —
-        // setupTables creates the Index Table with the placeholder back-link mainTableId=-1L, so
-        // we tombstone DROPPED_PARTITION_ID under that same key. This is the same primitive the
-        // production Coordinator → TabletServer propagation eventually invokes (P3T6).
+        // with auto-derive (P3T8) the Coordinator stamps the real main-table id into the derived
+        // descriptor, so we tombstone DROPPED_PARTITION_ID under that same key. This is the same
+        // primitive the production Coordinator → TabletServer propagation eventually invokes
+        // (P3T6).
         int indexLeaderServerId =
                 FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(f.indexTableId, 0));
         TabletServerMetadataCache cache =
-                FLUSS_CLUSTER_EXTENSION
-                        .getTabletServerById(indexLeaderServerId)
-                        .getMetadataCache();
-        final long mainTableIdBackLink = -1L;
+                FLUSS_CLUSTER_EXTENSION.getTabletServerById(indexLeaderServerId).getMetadataCache();
+        final long mainTableIdBackLink = f.mainTableId;
         final long droppedPartitionId = 4242L;
         try {
             cache.updatePartitionTombstone(
@@ -320,16 +319,14 @@ class IndexPushReplicationITCase {
             // (4) The filter dropped the record silently (no WAL append, no KV state change), so
             // the lookup for the synthetic key must return empty. waitForIndexEntry polls long
             // enough that any latent apply would have shown up.
-            waitForIndexEntry(
-                    f.indexGateway, f.indexTableId, droppedIndexKey, /* present */ false);
+            waitForIndexEntry(f.indexGateway, f.indexTableId, droppedIndexKey, /* present */ false);
 
             // (5) The control entry from step (1) is still visible — the filter only suppresses
             // records whose prefix is tombstoned, the apply path remains healthy for the rest.
-            waitForIndexEntry(
-                    f.indexGateway, f.indexTableId, controlIndexKey, /* present */ true);
+            waitForIndexEntry(f.indexGateway, f.indexTableId, controlIndexKey, /* present */ true);
         } finally {
-            // Reset the tombstone so subsequent tests sharing this cluster see a clean cache
-            // for mainTableId=-1L (other scenarios in this file also use that placeholder).
+            // Reset the tombstone for this test's main-table id so any later interaction with
+            // the same cache instance sees a clean state.
             cache.updatePartitionTombstone(mainTableIdBackLink, PartitionTombstone.EMPTY);
         }
     }
@@ -376,8 +373,12 @@ class IndexPushReplicationITCase {
     }
 
     /**
-     * Creates the Index Table first, then the main table (so leader promotion can resolve the Index
-     * Table via the metadata cache), then returns ready-to-use gateways and ids.
+     * Creates the main table only — the Coordinator auto-derives the matching Index Table as part
+     * of {@code processCreateTable} (P3T8). The {@code IndexPushScheduler} init on the main-table
+     * leader uses the defer-and-retry path (P3T14): if {@code NotifyLeaderAndIsr} for the main
+     * table reaches the TabletServer before the auto-derived Index Table's metadata broadcast, the
+     * scheduler init is deferred and retried once the cache catches up. This helper polls until the
+     * scheduler is wired so the rest of the test can proceed deterministically.
      */
     private static Fixture setupTables(
             String mainName, @Nullable SecondaryIndexVisibility visibility) throws Exception {
@@ -386,21 +387,36 @@ class IndexPushReplicationITCase {
                 TablePath.of(DB, IndexTableUtils.indexTableName(mainName, INDEX_NAME));
 
         TableDescriptor mainDescriptor = buildMainTableDescriptor(visibility);
-        TableDescriptor indexDescriptor =
-                TableDescriptor.deriveIndexTableDescriptor(
-                        mainDescriptor, /* mainTableId */ -1L, DB + "." + mainName, INDEX_NAME);
-
-        long indexTableId = createTable(FLUSS_CLUSTER_EXTENSION, indexPath, indexDescriptor);
-        TableBucket indexBucket = new TableBucket(indexTableId, 0);
-        FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(indexBucket);
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, mainDescriptor);
         TableBucket mainBucket = new TableBucket(mainTableId, 0);
         Replica mainLeaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
         int mainLeaderServer = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(mainBucket);
-        // The IndexPushScheduler must have wired up — otherwise the leader promotion would have
-        // thrown out of buildIndexExtractorContext().
-        assertThat(mainLeaderReplica.getIndexPushScheduler()).isNotNull();
+
+        // Look up the auto-derived Index Table id directly from ZK — the Coordinator persisted
+        // it during {@code processCreateTable} (P3T8) before returning.
+        long indexTableId =
+                FLUSS_CLUSTER_EXTENSION
+                        .getZooKeeperClient()
+                        .getTable(indexPath)
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "Auto-derived Index Table "
+                                                        + indexPath
+                                                        + " was not registered in ZK."))
+                        .tableId;
+        TableBucket indexBucket = new TableBucket(indexTableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(indexBucket);
+
+        // The IndexPushScheduler may be deferred at the moment NotifyLeaderAndIsr arrives if the
+        // index-table broadcast lost the race; the cache update fires the retry hook so the
+        // scheduler is eventually wired. Poll until that completes.
+        waitUntil(
+                () -> mainLeaderReplica.getIndexPushScheduler() != null,
+                Duration.ofSeconds(30),
+                "wait for IndexPushScheduler to be wired on the main-table leader after"
+                        + " auto-derived Index Table metadata propagates");
 
         TabletServerGateway mainGateway =
                 FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(mainLeaderServer);
@@ -481,9 +497,9 @@ class IndexPushReplicationITCase {
      *
      * <p>Mirrors the production {@code IndexPushSender#wrapBytesAsCompactedRow}: a fresh empty
      * {@link CompactedRow} is pointed at the supplied byte array so {@link KvRecordBatchBuilder}
-     * serializes the bytes verbatim to the wire. The receiving {@code KvTablet}'s apply-path
-     * filter inspects exactly these bytes via {@code BinaryRow.copyTo(byte[], int)} (see
-     * {@code KvTablet#processUpsert}).
+     * serializes the bytes verbatim to the wire. The receiving {@code KvTablet}'s apply-path filter
+     * inspects exactly these bytes via {@code BinaryRow.copyTo(byte[], int)} (see {@code
+     * KvTablet#processUpsert}).
      */
     private static KvRecordBatch synthesizeIndexBatch(byte[] key, byte[] valueBytes)
             throws IOException {

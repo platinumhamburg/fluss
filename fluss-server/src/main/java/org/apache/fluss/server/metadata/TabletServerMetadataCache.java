@@ -104,6 +104,16 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
     /** One-shot guard so the automatic ZK-seed only fires on the first non-empty metadata batch. */
     private final AtomicBoolean tombstonesSeededFromZk = new AtomicBoolean(false);
 
+    /**
+     * Optional callback fired after every successful {@link #updateClusterMetadata} so the
+     * surrounding {@code ReplicaManager} can retry any {@link
+     * org.apache.fluss.server.replica.Replica} whose {@code IndexPushScheduler} init was deferred
+     * because the auto-derived Index Table was not yet visible in the cache (P3T14). Wired by
+     * {@link org.apache.fluss.server.replica.ReplicaManager}; left {@code null} in unit-test
+     * fixtures that exercise the cache without a ReplicaManager.
+     */
+    @Nullable private volatile Runnable replicaRetryHook;
+
     public TabletServerMetadataCache(MetadataManager metadataManager) {
         this.serverMetadataSnapshot = ServerMetadataSnapshot.empty();
         this.metadataManager = metadataManager;
@@ -380,6 +390,34 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                         seedPartitionTombstonesFromZk(zk, tableInfos);
                     }
                 });
+
+        // 7. (P3T14) Notify the surrounding ReplicaManager so any Replica whose IndexPushScheduler
+        // init was deferred because its auto-derived Index Table had not yet propagated to this
+        // cache can retry now that the cache has been refreshed. Fired OUTSIDE the metadataLock so
+        // the retry callback (which may iterate replicas) does not contend with concurrent cache
+        // updates. {@code null} when no ReplicaManager is wired (test fixtures that exercise the
+        // cache in isolation).
+        Runnable hook = replicaRetryHook;
+        if (hook != null) {
+            try {
+                hook.run();
+            } catch (Throwable t) {
+                LOG.warn(
+                        "Replica retry hook fired after updateClusterMetadata threw; ignoring so"
+                                + " metadata propagation continues.",
+                        t);
+            }
+        }
+    }
+
+    /**
+     * Wires the {@link ReplicaManager}-supplied retry callback fired at the end of every {@link
+     * #updateClusterMetadata}. Used to re-attempt {@code IndexPushScheduler} construction for
+     * leader replicas whose auto-derived Index Table had not yet shown up in the cache (FIP V2 §3 +
+     * P3T14). Idempotent — calling again replaces the previous hook.
+     */
+    public void setReplicaRetryHook(@Nullable Runnable hook) {
+        this.replicaRetryHook = hook;
     }
 
     @VisibleForTesting

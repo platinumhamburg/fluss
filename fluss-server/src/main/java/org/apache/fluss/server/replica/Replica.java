@@ -244,6 +244,17 @@ public final class Replica {
     private volatile @Nullable IndexPushScheduler indexPushScheduler;
 
     /**
+     * Set to {@code true} when {@link #maybeStartIndexPushScheduler()} ran on leader promotion but
+     * could not finish because at least one auto-derived Index Table is not yet visible in the
+     * local {@link TabletServerMetadataCache}. The {@code Coordinator} → {@code TabletServer}
+     * metadata broadcast for the index table arrives on a separate event from the main table's
+     * {@code NotifyLeaderAndIsr}, so the two can race. Cleared once {@link
+     * #retryMaybeStartIndexPushScheduler()} successfully wires the scheduler. Per-replica state —
+     * never shared across replicas.
+     */
+    private volatile boolean indexPushSchedulerInitDeferred = false;
+
+    /**
      * Back-reference to the owning {@link ReplicaManager}. Used by the index-push pipeline to (1)
      * build {@link org.apache.fluss.server.index.IndexPushSender}s via {@link
      * ReplicaManager#createIndexPushSender} and (2) wire the {@code indexPushedOffset} advance
@@ -859,9 +870,11 @@ public final class Replica {
      *
      * <p>The encoders / bucket assigner / partition resolver / index-table-id are materialized in
      * {@link #buildIndexExtractorContext}. Index Table metadata is resolved from the {@link
-     * TabletServerMetadataCache} cached snapshot — if a target Index Table is not yet visible in
-     * the cache the construction is aborted with {@link IllegalStateException} so the leader
-     * promotion fails loudly rather than silently dropping mutations.
+     * TabletServerMetadataCache} cached snapshot — if any target Index Table is not yet visible in
+     * the cache, this method logs and sets {@link #indexPushSchedulerInitDeferred} so the next
+     * cluster-metadata update fires {@link #retryMaybeStartIndexPushScheduler()}. This handles the
+     * race where the main table's {@code NotifyLeaderAndIsr} arrives at the TabletServer before the
+     * auto-derived Index Table's {@code UpdateMetadataRequest} (FIP V2 §3 + P3T8/P3T14).
      */
     private void maybeStartIndexPushScheduler() {
         if (replicaManager == null) {
@@ -884,6 +897,27 @@ public final class Replica {
             return;
         }
 
+        // Pre-check that all referenced Index Tables are visible in the metadata cache. The
+        // Coordinator auto-derives Index Tables synchronously with the main-table CREATE TABLE
+        // (P3T8), but the broadcast of the index TableId to this TabletServer's cache races
+        // against the main table's NotifyLeaderAndIsr. If any index is missing, defer the
+        // scheduler init — TabletServerMetadataCache#updateClusterMetadata will retry via
+        // ReplicaManager#retryDeferredIndexPushSchedulers once the cache catches up.
+        for (Schema.Index index : indexes) {
+            TablePath indexPath = indexTablePathFor(index.getIndexName());
+            if (!metadataCache.getTableId(indexPath).isPresent()
+                    || !metadataCache.getTableMetadata(indexPath).isPresent()) {
+                indexPushSchedulerInitDeferred = true;
+                LOG.info(
+                        "Index table {} for main table {} not yet visible in the metadata cache —"
+                                + " deferring IndexPushScheduler start; will retry on next"
+                                + " cluster-metadata update.",
+                        indexPath,
+                        tableInfo.getTablePath());
+                return;
+            }
+        }
+
         IndexMutationExtractor.Context extractorContext = buildIndexExtractorContext(indexes);
         IndexPushTracker tracker = new IndexPushTracker();
         IndexPushScheduler scheduler =
@@ -899,6 +933,8 @@ public final class Replica {
                 (key, oldRow, newRow, sourceOffset) ->
                         scheduler.submit(sourceOffset, oldRow, newRow));
         this.indexPushScheduler = scheduler;
+        // Successful start clears any pending deferred flag set by an earlier attempt.
+        indexPushSchedulerInitDeferred = false;
         // Recovery hook (FIP V2 §2.6): re-submit any HW-committed WAL records past the
         // last persisted indexPushedOffset checkpoint so dropped acks from the previous
         // leader are healed. MUST run AFTER the scheduler field is assigned so the
@@ -908,15 +944,44 @@ public final class Replica {
     }
 
     /**
+     * Re-attempts a previously deferred {@link #maybeStartIndexPushScheduler()} after a metadata
+     * cache update. No-op if the scheduler is already running, the deferred flag is false, or the
+     * replica is no longer the leader of an indexed main table. Invoked by {@link
+     * ReplicaManager#retryDeferredIndexPushSchedulers()} which fires from the {@link
+     * TabletServerMetadataCache#updateClusterMetadata} hook.
+     */
+    public void retryMaybeStartIndexPushScheduler() {
+        if (!indexPushSchedulerInitDeferred) {
+            return;
+        }
+        if (indexPushScheduler != null) {
+            // Already running — clear the flag defensively and exit.
+            indexPushSchedulerInitDeferred = false;
+            return;
+        }
+        if (!isLeader()) {
+            // No longer leader — leadership transition will re-decide on next promotion.
+            indexPushSchedulerInitDeferred = false;
+            return;
+        }
+        maybeStartIndexPushScheduler();
+    }
+
+    @VisibleForTesting
+    public boolean isIndexPushSchedulerInitDeferred() {
+        return indexPushSchedulerInitDeferred;
+    }
+
+    /**
      * Install the apply-path partition-tombstone filter on the Index Table's {@link KvTablet} so
-     * incoming PutKv records sourced from a dropped main-table partition are silently dropped
-     * (FIP V2 §2.9.8). No-op for main tables (which never carry partition-prefixed values),
-     * for test fixtures without a {@link ReplicaManager}, or when this Index Table is missing the
-     * back-link to its main table id (defensive — should not happen post Plan 1 P1T9).
+     * incoming PutKv records sourced from a dropped main-table partition are silently dropped (FIP
+     * V2 §2.9.8). No-op for main tables (which never carry partition-prefixed values), for test
+     * fixtures without a {@link ReplicaManager}, or when this Index Table is missing the back-link
+     * to its main table id (defensive — should not happen post Plan 1 P1T9).
      *
-     * <p>The filter is installed after {@link #createKv()} returns so the {@link KvTablet} is
-     * ready to receive predicate updates. It is automatically dropped along with the tablet on
-     * leader demotion via {@link #dropKv()} — no separate teardown is needed.
+     * <p>The filter is installed after {@link #createKv()} returns so the {@link KvTablet} is ready
+     * to receive predicate updates. It is automatically dropped along with the tablet on leader
+     * demotion via {@link #dropKv()} — no separate teardown is needed.
      */
     private void maybeInstallIndexTableTombstoneFilter() {
         if (replicaManager == null) {
@@ -1005,10 +1070,7 @@ public final class Replica {
             while (nextOffset < hw) {
                 FetchDataInfo dataInfo =
                         logTablet.read(
-                                nextOffset,
-                                Integer.MAX_VALUE,
-                                FetchIsolation.HIGH_WATERMARK,
-                                true);
+                                nextOffset, Integer.MAX_VALUE, FetchIsolation.HIGH_WATERMARK, true);
                 LogRecords records = dataInfo.getRecords();
                 if (records == null || records.sizeInBytes() == 0) {
                     break;
@@ -1117,6 +1179,9 @@ public final class Replica {
             this.indexPushScheduler = null;
             LOG.info("IndexPushScheduler stopped for {}", tableBucket);
         }
+        // Clear any pending deferred init flag — a follower / dropped replica must not retry on
+        // the next cluster-metadata update.
+        indexPushSchedulerInitDeferred = false;
     }
 
     /**

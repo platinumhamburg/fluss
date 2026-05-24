@@ -386,6 +386,10 @@ public class ReplicaManager implements ServerReconfigurable {
         this.minInSyncReplicas = conf.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER);
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
         registerMetrics();
+        // P3T14: wire a retry hook so cluster-metadata updates re-attempt deferred
+        // IndexPushScheduler init on leader replicas whose auto-derived Index Tables had not yet
+        // propagated to this TabletServer's cache when NotifyLeaderAndIsr arrived.
+        metadataCache.setReplicaRetryHook(this::retryDeferredIndexPushSchedulers);
     }
 
     public void startup() {
@@ -600,6 +604,36 @@ public class ReplicaManager implements ServerReconfigurable {
                     metadataCache.updateClusterMetadata(clusterMetadata);
                     updateReplicaTableConfig(clusterMetadata);
                 });
+    }
+
+    /**
+     * Walks all online replicas and re-attempts {@link Replica#retryMaybeStartIndexPushScheduler()}
+     * on each that previously deferred its IndexPushScheduler init. Wired as a callback into {@link
+     * TabletServerMetadataCache#setReplicaRetryHook(Runnable)} so it fires after every {@code
+     * updateClusterMetadata} (P3T14). Per-replica failures are logged at WARN and never propagate —
+     * a single bad replica must not stop other replicas from being retried, and must not corrupt
+     * cache propagation.
+     */
+    public void retryDeferredIndexPushSchedulers() {
+        for (Map.Entry<TableBucket, HostedReplica> entry : allReplicas.entrySet()) {
+            HostedReplica hostedReplica = entry.getValue();
+            if (!(hostedReplica instanceof OnlineReplica)) {
+                continue;
+            }
+            Replica replica = ((OnlineReplica) hostedReplica).getReplica();
+            if (!replica.isIndexPushSchedulerInitDeferred()) {
+                continue;
+            }
+            try {
+                replica.retryMaybeStartIndexPushScheduler();
+            } catch (Throwable t) {
+                LOG.warn(
+                        "Retry of deferred IndexPushScheduler init failed for {}; will retry on"
+                                + " next cluster-metadata update.",
+                        replica.getTableBucket(),
+                        t);
+            }
+        }
     }
 
     private void updateReplicaTableConfig(ClusterMetadata clusterMetadata) {
