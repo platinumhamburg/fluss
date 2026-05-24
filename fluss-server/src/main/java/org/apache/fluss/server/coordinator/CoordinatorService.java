@@ -36,6 +36,7 @@ import org.apache.fluss.exception.LakeTableAlreadyExistException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
@@ -185,6 +186,7 @@ import javax.annotation.Nullable;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -730,8 +732,50 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         authorizeTable(OperationType.DROP, tablePath);
 
         DropTableResponse response = new DropTableResponse();
+        // cascade-drop derived Index Tables BEFORE the main table so any in-flight push from a
+        // leader of the main table cannot land on an Index Table whose main has already been
+        // unregistered. Each Index Table is dropped with ignoreIfNotExists=true so a retried
+        // DROP TABLE after a partial failure is recoverable. The main-table drop honors the
+        // user-facing ignoreIfNotExists flag from the request.
+        cascadeDropIndexTables(tablePath);
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
         return CompletableFuture.completedFuture(response);
+    }
+
+    private void cascadeDropIndexTables(TablePath mainTablePath) {
+        List<TablePath> indexPaths;
+        try {
+            TableInfo mainInfo = metadataManager.getTable(mainTablePath);
+            indexPaths = indexTablePathsFor(mainTablePath, mainInfo.getSchema());
+        } catch (TableNotExistException e) {
+            // main table missing: nothing to cascade. The subsequent dropTable call will surface
+            // the appropriate error or no-op according to the request's ignoreIfNotExists flag.
+            return;
+        }
+        for (TablePath indexPath : indexPaths) {
+            metadataManager.dropTable(indexPath, /* ignoreIfNotExists= */ true);
+        }
+    }
+
+    /**
+     * Returns the set of Index Table paths derived from {@code mainPath} for every index declared
+     * in {@code schema}. Returns an empty list when the schema has no indexes.
+     */
+    @VisibleForTesting
+    static List<TablePath> indexTablePathsFor(TablePath mainPath, Schema schema) {
+        List<Schema.Index> indexes = schema.getIndexes();
+        if (indexes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<TablePath> result = new ArrayList<>(indexes.size());
+        for (Schema.Index index : indexes) {
+            result.add(
+                    TablePath.of(
+                            mainPath.getDatabaseName(),
+                            IndexTableUtils.indexTableName(
+                                    mainPath.getTableName(), index.getIndexName())));
+        }
+        return result;
     }
 
     @Override
