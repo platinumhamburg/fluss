@@ -330,6 +330,16 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                     partitionIdByPath,
                                     bucketMetadataMapForTables,
                                     bucketMetadataMapForPartitions);
+
+                    // 5. apply partition tombstones (P3T6). Each entry replaces the cached
+                    // tombstone for the given main table id.
+                    Map<Long, PartitionTombstone> tombstones =
+                            clusterMetadata.getPartitionTombstones();
+                    if (tombstones != null && !tombstones.isEmpty()) {
+                        for (Map.Entry<Long, PartitionTombstone> e : tombstones.entrySet()) {
+                            updatePartitionTombstone(e.getKey(), e.getValue());
+                        }
+                    }
                 });
     }
 
