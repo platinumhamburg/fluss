@@ -22,6 +22,7 @@ import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.cluster.TabletServerInfo;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -50,6 +51,7 @@ import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITI
 import static org.apache.fluss.server.metadata.TableMetadata.DELETED_TABLE_ID;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.NO_LEADER;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link TabletServerMetadataCache}. */
 public class TabletServerMetadataCacheTest {
@@ -493,6 +495,34 @@ public class TabletServerMetadataCacheTest {
         assertThat(serverMetadataCache.getTablePath(DATA1_TABLE_ID)).isPresent();
         assertThat(serverMetadataCache.getTablePath(DATA1_TABLE_ID).get())
                 .isEqualTo(DATA1_TABLE_PATH);
+    }
+
+    @Test
+    void testGetPartitionTombstoneReturnsEmptyForUnknownTable() {
+        assertThat(serverMetadataCache.getPartitionTombstone(42L))
+                .isEqualTo(PartitionTombstone.EMPTY);
+    }
+
+    @Test
+    void testUpdatePartitionTombstoneTakesEffect() {
+        PartitionTombstone t = new PartitionTombstone(5L, Collections.emptySet(), 1L);
+        serverMetadataCache.updatePartitionTombstone(42L, t);
+        assertThat(serverMetadataCache.getPartitionTombstone(42L)).isEqualTo(t);
+    }
+
+    @Test
+    void testUpdatePartitionTombstoneOverwrites() {
+        PartitionTombstone t1 = new PartitionTombstone(0L, Collections.emptySet(), 1L);
+        PartitionTombstone t2 = new PartitionTombstone(5L, Collections.emptySet(), 2L);
+        serverMetadataCache.updatePartitionTombstone(42L, t1);
+        serverMetadataCache.updatePartitionTombstone(42L, t2);
+        assertThat(serverMetadataCache.getPartitionTombstone(42L)).isEqualTo(t2);
+    }
+
+    @Test
+    void testUpdatePartitionTombstoneRejectsNull() {
+        assertThatThrownBy(() -> serverMetadataCache.updatePartitionTombstone(42L, null))
+                .isInstanceOf(NullPointerException.class);
     }
 
     @Test

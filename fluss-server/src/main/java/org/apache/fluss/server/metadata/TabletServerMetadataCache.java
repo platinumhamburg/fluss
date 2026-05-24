@@ -20,6 +20,7 @@ package org.apache.fluss.server.metadata;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -42,6 +43,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -49,6 +51,7 @@ import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITI
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_NAME;
 import static org.apache.fluss.server.metadata.TableMetadata.DELETED_TABLE_ID;
 import static org.apache.fluss.server.metadata.TableMetadata.DELETED_TABLE_PATH;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /** The implement of {@link ServerMetadataCache} for {@link TabletServer}. */
@@ -70,6 +73,15 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
     private final MetadataManager metadataManager;
 
     private final ServerSchemaCache serverSchemaCache;
+
+    /**
+     * Cached partition tombstones keyed by main table id. Populated by metadata propagation from
+     * the Coordinator (P3T6). Read on the apply path to filter writes targeting tombstoned source
+     * partitions. Concurrent map provides lock-free reads with safe per-entry replacement on
+     * update.
+     */
+    private final ConcurrentHashMap<Long, PartitionTombstone> partitionTombstones =
+            new ConcurrentHashMap<>();
 
     public TabletServerMetadataCache(MetadataManager metadataManager) {
         this.serverMetadataSnapshot = ServerMetadataSnapshot.empty();
@@ -468,5 +480,23 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
     @VisibleForTesting
     public ServerSchemaCache getServerSchemaCache() {
         return serverSchemaCache;
+    }
+
+    /**
+     * Returns the cached {@link PartitionTombstone} for the given main table id, or {@link
+     * PartitionTombstone#EMPTY} if the cache has not yet observed a tombstone for that table.
+     * Cache-only — does NOT consult ZK.
+     */
+    public PartitionTombstone getPartitionTombstone(long mainTableId) {
+        PartitionTombstone t = partitionTombstones.get(mainTableId);
+        return t == null ? PartitionTombstone.EMPTY : t;
+    }
+
+    /**
+     * Updates the cached tombstone for the given main table id. Called from the metadata
+     * propagation receiver (P3T6).
+     */
+    public void updatePartitionTombstone(long mainTableId, PartitionTombstone tombstone) {
+        partitionTombstones.put(mainTableId, checkNotNull(tombstone, "tombstone"));
     }
 }
