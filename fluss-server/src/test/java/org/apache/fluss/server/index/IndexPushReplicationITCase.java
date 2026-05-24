@@ -119,25 +119,12 @@ class IndexPushReplicationITCase {
      * Happy-path scenario #1 (FIP V2 §3, sync visibility): write 1 row to the indexed main table,
      * verify the corresponding entry shows up in the Index Table.
      *
-     * <p>{@code @Disabled} because of a NEW blocker downstream of the {@code __} naming fix:
-     * {@code TableDescriptorValidation.validateTableDescriptor} validates every property key
-     * against the static {@code TABLE_OPTIONS} map and throws {@code InvalidConfigException}
-     * for any unknown key. Plan 1's per-index namespaced property keys
-     * {@code secondary-index.<name>.bucket.num} (and the visibility/columns siblings) are
-     * dynamic and therefore not in {@code TABLE_OPTIONS} — so {@code createTable} via the
-     * RPC path rejects the main-table descriptor with: <pre>
-     *   InvalidConfigException: 'secondary-index.idx_b.bucket.num' is not a Fluss table property.
-     * </pre>
-     * Re-enable once the validator special-cases the {@code secondary-index.*} namespace
-     * (Plan 1 follow-up — independent of the Index Table naming convention).
+     * <p>The earlier {@code TableDescriptorValidation} blocker was resolved when the validator
+     * learned to accept the namespaced {@code secondary-index.<name>.{columns,bucket.num}}
+     * properties (and the static {@code secondary-index.visibility} sibling) — see {@code
+     * TableDescriptorValidationTest}.
      */
     @Test
-    @Disabled(
-            "BLOCKED P1 follow-up: TableDescriptorValidation rejects namespaced"
-                    + " secondary-index.<name>.* properties because they are not in the static"
-                    + " TABLE_OPTIONS map. The naming gap is fixed (uses '__' separator now);"
-                    + " this is a separate property-validation gap. Re-enable once the validator"
-                    + " accepts the secondary-index.* namespace.")
     void testInsertOnMainTablePushesEntryToIndexTable() throws Exception {
         // (1) Pre-create the Index Table FIRST so the main-table leader promotion can resolve it
         // via the metadata cache. mainTableId=-1 here is a placeholder for the Plan 1
