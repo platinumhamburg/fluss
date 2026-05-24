@@ -69,6 +69,7 @@ import org.apache.fluss.server.index.IndexMutationExtractor;
 import org.apache.fluss.server.index.IndexPushScheduler;
 import org.apache.fluss.server.index.IndexPushTracker;
 import org.apache.fluss.server.index.IndexedRowEmitter;
+import org.apache.fluss.server.index.PartitionTombstoneFilter;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
@@ -672,6 +673,9 @@ public final class Replica {
             // secondary indexes. No-op for tables without indexes or when ReplicaManager wasn't
             // injected (test fixtures that bypass the full lifecycle).
             maybeStartIndexPushScheduler();
+            // Install the apply-path partition-tombstone filter if this replica is itself an Index
+            // Table; no-op for main tables (which never carry partition-prefixed values).
+            maybeInstallIndexTableTombstoneFilter();
         }
     }
 
@@ -901,6 +905,51 @@ public final class Replica {
         // submit calls land on a live pipeline.
         recoverIndexPushFromWal();
         LOG.info("IndexPushScheduler started for {} (indexes={})", tableBucket, indexes.size());
+    }
+
+    /**
+     * Install the apply-path partition-tombstone filter on the Index Table's {@link KvTablet} so
+     * incoming PutKv records sourced from a dropped main-table partition are silently dropped
+     * (FIP V2 §2.9.8). No-op for main tables (which never carry partition-prefixed values),
+     * for test fixtures without a {@link ReplicaManager}, or when this Index Table is missing the
+     * back-link to its main table id (defensive — should not happen post Plan 1 P1T9).
+     *
+     * <p>The filter is installed after {@link #createKv()} returns so the {@link KvTablet} is
+     * ready to receive predicate updates. It is automatically dropped along with the tablet on
+     * leader demotion via {@link #dropKv()} — no separate teardown is needed.
+     */
+    private void maybeInstallIndexTableTombstoneFilter() {
+        if (replicaManager == null) {
+            return;
+        }
+        if (!tableInfo.isIndexTable()) {
+            return;
+        }
+        KvTablet kv = this.kvTablet;
+        if (kv == null) {
+            LOG.warn(
+                    "Skipping Index Table tombstone filter wiring for {}: kvTablet is null after"
+                            + " createKv()",
+                    tableBucket);
+            return;
+        }
+        OptionalLong mainTableIdOpt = tableInfo.getMainTableId();
+        if (!mainTableIdOpt.isPresent()) {
+            LOG.warn(
+                    "Index Table {} is missing the main-table-id back-link; the partition"
+                            + " tombstone filter will not be installed.",
+                    tableInfo.getTablePath());
+            return;
+        }
+        final long mainTableId = mainTableIdOpt.getAsLong();
+        kv.setValueFilter(
+                valueBytes ->
+                        PartitionTombstoneFilter.shouldDrop(
+                                valueBytes, mainTableId, metadataCache));
+        LOG.info(
+                "Index Table partition-tombstone filter installed for {} (mainTableId={})",
+                tableBucket,
+                mainTableId);
     }
 
     /**

@@ -35,6 +35,7 @@ import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.server.index.IndexedRowEmitter;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.LogTestUtils;
@@ -57,6 +58,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
@@ -291,6 +293,92 @@ class KvTabletIndexHookTest {
 
         // No exceptions thrown — workload completed.
         assertThat(logTablet.localLogEndOffset()).isGreaterThan(0L);
+    }
+
+    @Test
+    void testValueFilterDropsRecordWithoutWalAppendOrKvUpdate() throws Exception {
+        // Filter that always returns true — every upsert is dropped before any state change.
+        kvTablet.setValueFilter(bytes -> true);
+
+        // Install an emitter so we can also verify that the apply path was NOT taken.
+        RecordingEmitter recorder = new RecordingEmitter();
+        kvTablet.setIndexedRowEmitter(recorder);
+
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, "v1"})),
+                null);
+
+        // No emission means no apply path ran.
+        assertThat(recorder.events).isEmpty();
+        // KV state has not changed: lookup returns null in pre-write buffer.
+        assertThat(kvTablet.getKvPreWriteBuffer().get(KvPreWriteBuffer.Key.of("k1".getBytes())))
+                .isNull();
+    }
+
+    @Test
+    void testValueFilterPassesThroughWhenAllowed() throws Exception {
+        // Filter that always returns false — every upsert is admitted.
+        kvTablet.setValueFilter(bytes -> false);
+
+        RecordingEmitter recorder = new RecordingEmitter();
+        kvTablet.setIndexedRowEmitter(recorder);
+
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, "v1"})),
+                null);
+
+        // Apply path ran exactly once; the record is in the pre-write buffer.
+        assertThat(recorder.events).hasSize(1);
+        assertThat(kvTablet.getKvPreWriteBuffer().get(KvPreWriteBuffer.Key.of("k1".getBytes())))
+                .isNotNull();
+    }
+
+    @Test
+    void testValueFilterIsNotInvokedForDeletes() throws Exception {
+        // First, with the filter disabled, insert a row so we have something to delete.
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, "v1"})),
+                null);
+
+        // Now install a recording filter — we want to assert that DELETE never invokes it.
+        AtomicInteger filterInvocations = new AtomicInteger();
+        kvTablet.setValueFilter(
+                bytes -> {
+                    filterInvocations.incrementAndGet();
+                    return false;
+                });
+
+        // Send a DELETE record (row == null). It must pass through processDeletion, never the
+        // upsert filter.
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(kvRecordFactory.ofRecord("k1".getBytes(), null)),
+                null);
+
+        assertThat(filterInvocations.get())
+                .as("Delete records must not be passed through the apply-path value filter")
+                .isZero();
+    }
+
+    @Test
+    void testNullValueFilterRestoresDefaultNoOp() throws Exception {
+        // Install a drop-everything filter, then clear it; subsequent upserts must apply normally.
+        kvTablet.setValueFilter(bytes -> true);
+        kvTablet.setValueFilter(null);
+
+        RecordingEmitter recorder = new RecordingEmitter();
+        kvTablet.setIndexedRowEmitter(recorder);
+
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k1".getBytes(), new Object[] {1, "v1"})),
+                null);
+
+        assertThat(recorder.events).hasSize(1);
+        assertThat(kvTablet.getKvPreWriteBuffer().get(KvPreWriteBuffer.Key.of("k1".getBytes())))
+                .isNotNull();
     }
 
     /** Captured emission. */

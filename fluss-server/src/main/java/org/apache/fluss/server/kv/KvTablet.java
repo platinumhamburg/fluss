@@ -99,6 +99,7 @@ import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Predicate;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
@@ -146,6 +147,16 @@ public final class KvTablet {
     // push pipeline. Default is the no-op emitter; a non-no-op emitter also disables the WAL
     // changelog fast-path so that pre-image rows remain available for index mutation generation.
     private volatile IndexedRowEmitter indexedRowEmitter = IndexedRowEmitter.NO_OP;
+
+    // Apply-path drop predicate for incoming PutKv values. Defaults to a no-op that never drops, so
+    // tables that don't install a custom filter (i.e. all non-Index Tables and Index Tables on
+    // unpartitioned main tables) pay zero cost. Index Table replicas install a partition-tombstone
+    // filter via {@link #setValueFilter} so that records sourced from a dropped main-table
+    // partition are silently dropped before any KV / WAL state changes (FIP V2 §2.9.8). The filter
+    // sees the raw row bytes (for partitioned Index Tables this is {@code [8B partitionId | body]});
+    // returning {@code true} means "drop this record".
+    private static final Predicate<byte[]> NO_OP_VALUE_FILTER = bytes -> false;
+    private volatile Predicate<byte[]> valueFilter = NO_OP_VALUE_FILTER;
 
     /**
      * The kv data in pre-write buffer whose log offset is less than the flushedLogOffset has been
@@ -313,6 +324,20 @@ public final class KvTablet {
      */
     public void setIndexedRowEmitter(@Nullable IndexedRowEmitter emitter) {
         this.indexedRowEmitter = emitter == null ? IndexedRowEmitter.NO_OP : emitter;
+    }
+
+    /**
+     * Install the apply-path value filter (FIP V2 §2.9.8). The filter is invoked from {@link
+     * #processUpsert} for every incoming upsert (DELETEs are never filtered). If the predicate
+     * returns {@code true}, the record is silently dropped: no WAL append, no KV state change. The
+     * surrounding batch is still acked normally.
+     *
+     * <p>Default is the no-op filter that never drops; non-Index-Table tablets and Index Tables
+     * derived from unpartitioned main tables can leave the default in place. Passing {@code null}
+     * restores the default.
+     */
+    public void setValueFilter(@Nullable Predicate<byte[]> filter) {
+        this.valueFilter = filter == null ? NO_OP_VALUE_FILTER : filter;
     }
 
     void setFlushedLogOffset(long flushedLogOffset) {
@@ -577,6 +602,22 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
+        // Apply-path tombstone filter (FIP V2 §2.9.8). Index Table replicas install a partition
+        // tombstone filter; non-Index tablets keep the no-op default and skip this entirely. When
+        // the predicate fires we drop the record silently — no WAL append, no KV state change —
+        // returning {@code logOffset} unchanged so the WAL offset is reused by the next record.
+        // The surrounding batch is still acked normally because {@link #processKvRecords} simply
+        // continues to the next record.
+        Predicate<byte[]> filter = this.valueFilter;
+        if (filter != NO_OP_VALUE_FILTER) {
+            BinaryRow row = currentValue.row;
+            byte[] valueBytes = new byte[row.getSizeInBytes()];
+            row.copyTo(valueBytes, 0);
+            if (filter.test(valueBytes)) {
+                return logOffset;
+            }
+        }
+
         // Optimization: IN WAL mode，when using DefaultRowMerger (full update, not partial update)
         // and there is no auto-increment column, we can skip fetching old value for better
         // performance since the result always reflects the new value. In this case, both INSERT and
