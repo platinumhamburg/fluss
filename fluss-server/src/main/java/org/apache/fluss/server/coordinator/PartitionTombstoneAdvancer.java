@@ -19,6 +19,8 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.PartitionTombstone;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.zk.ZooKeeperClient;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -58,5 +60,20 @@ public final class PartitionTombstoneAdvancer {
             explicit.remove(floor);
         }
         return new PartitionTombstone(floor, explicit, before.getVersion() + 1);
+    }
+
+    /**
+     * Reads the current {@link PartitionTombstone} for {@code tablePath} from ZK, advances it via
+     * {@link #dropPartition(PartitionTombstone, long)} for the given {@code partitionId}, persists
+     * the new value back to ZK, and returns it. Used by the Coordinator on a partition drop to keep
+     * the per-table tombstone in sync before fanning the new value out to TabletServers via
+     * {@code UpdateMetadataRequest}.
+     */
+    public static PartitionTombstone advanceAndPersist(
+            ZooKeeperClient zkClient, TablePath tablePath, long partitionId) throws Exception {
+        PartitionTombstone current = zkClient.getPartitionTombstone(tablePath);
+        PartitionTombstone updated = dropPartition(current, partitionId);
+        zkClient.setOrCreatePartitionTombstone(tablePath, updated);
+        return updated;
     }
 }

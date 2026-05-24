@@ -40,6 +40,7 @@ import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TabletServerNotAvailableException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
@@ -907,12 +908,36 @@ public class CoordinatorEventProcessor implements EventProcessor {
         tableManager.onDeletePartition(tableId, dropPartitionEvent.getPartitionId());
         autoPartitionManager.removePartition(tableId, dropPartitionEvent.getPartitionName());
 
+        // For main tables that declare secondary indexes, advance the per-table PartitionTombstone
+        // in ZK and ship the new value to live TabletServers in the same UpdateMetadataRequest.
+        // Skipping the advance for non-indexed tables avoids creating tombstone state we have no
+        // consumer for. (P3T7)
+        Map<Long, PartitionTombstone> partitionTombstones = Collections.emptyMap();
+        if (!dropTableInfo.getSchema().getIndexes().isEmpty()) {
+            try {
+                PartitionTombstone updated =
+                        PartitionTombstoneAdvancer.advanceAndPersist(
+                                zooKeeperClient,
+                                dropTableInfo.getTablePath(),
+                                dropPartitionEvent.getPartitionId());
+                partitionTombstones = Collections.singletonMap(tableId, updated);
+            } catch (Exception e) {
+                throw new FlussRuntimeException(
+                        "Failed to advance PartitionTombstone for table "
+                                + dropTableInfo.getTablePath()
+                                + " on drop of partition "
+                                + dropPartitionEvent.getPartitionId(),
+                        e);
+            }
+        }
+
         // send update metadata request.
         updateTabletServerMetadataCache(
                 new HashSet<>(coordinatorContext.getLiveTabletServers().values()),
                 tableId,
                 tablePartition.getPartitionId(),
-                Collections.emptySet());
+                Collections.emptySet(),
+                partitionTombstones);
 
         // remove partition metrics.
         coordinatorMetricGroup.removeTablePartitionMetricsGroup(
@@ -2205,11 +2230,31 @@ public class CoordinatorEventProcessor implements EventProcessor {
             @Nullable Long tableId,
             @Nullable Long partitionId,
             Set<TableBucket> tableBuckets) {
+        updateTabletServerMetadataCache(
+                aliveTabletServers,
+                tableId,
+                partitionId,
+                tableBuckets,
+                Collections.emptyMap());
+    }
+
+    /**
+     * Variant of {@link #updateTabletServerMetadataCache(Set, Long, Long, Set)} that piggybacks
+     * advanced {@link PartitionTombstone} entries onto the same {@code UpdateMetadataRequest}.
+     * Used by partition-drop handling to fan out the new tombstone in lockstep with the metadata
+     * update, so live TabletServers see the deletion the moment they observe the metadata change.
+     */
+    private void updateTabletServerMetadataCache(
+            Set<ServerInfo> aliveTabletServers,
+            @Nullable Long tableId,
+            @Nullable Long partitionId,
+            Set<TableBucket> tableBuckets,
+            Map<Long, PartitionTombstone> partitionTombstones) {
         coordinatorRequestBatch.newBatch();
         Set<Integer> serverIds =
                 aliveTabletServers.stream().map(ServerInfo::id).collect(Collectors.toSet());
         coordinatorRequestBatch.addUpdateMetadataRequestForTabletServers(
-                serverIds, tableId, partitionId, tableBuckets);
+                serverIds, tableId, partitionId, tableBuckets, partitionTombstones);
         coordinatorRequestBatch.sendUpdateMetadataRequest();
     }
 
