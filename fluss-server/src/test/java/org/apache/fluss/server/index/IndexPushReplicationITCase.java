@@ -21,6 +21,7 @@ import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.SecondaryIndexVisibility;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
@@ -36,12 +37,16 @@ import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import javax.annotation.Nullable;
+
 import java.time.Duration;
+import java.util.Collections;
 
 import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
@@ -55,36 +60,30 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End-to-end ITCase for the FIP V2 secondary-index push replication pipeline (Plan 2 §3 — KV apply
  * hook → IndexPushScheduler → IndexPushSender → PutKv to the Index Table leader).
  *
- * <p>The intended scenario is straightforward: stand up a single-tablet-server Fluss cluster,
- * pre-create the Index Table, create the indexed main table, write one PK row, and verify the
- * index entry is visible via a Lookup against the Index Table. With {@code
- * secondary-index.visibility=SYNC} (the FIP V2 default) the {@code putKv} ack is gated on the
- * index push completing, so by the time the future resolves the index entry must be present and
- * the {@code indexPushedOffset} watermark must have advanced.
+ * <p>Scenarios:
+ *
+ * <ul>
+ *   <li>{@link #testInsertOnMainTablePushesEntryToIndexTable()} — sync visibility, INSERT pushes a
+ *       single UPSERT to the Index Table.
+ *   <li>{@link #testUpdateRewritesIndexEntry()} — UPDATE on the indexed column produces a DELETE on
+ *       the old composite key and an UPSERT on the new composite key.
+ *   <li>{@link #testDeleteRemovesIndexEntry()} — DELETE on the main table removes the index entry.
+ *   <li>{@link #testAsyncVisibilityEventuallyVisible()} — with {@code
+ *       secondary-index.visibility=ASYNC} the PutKv ack does not wait for the push, but the index
+ *       entry is eventually visible.
+ * </ul>
  *
  * <h2>Naming convention</h2>
  *
- * <p>The push pipeline in {@link Replica#indexTablePathFor} builds the Index Table path as
- * {@code <main>__<indexName>} (see {@link IndexTableUtils#INDEX_TABLE_NAME_SEPARATOR}). The
- * {@code __} separator is in the {@code [a-zA-Z0-9_-]} character set permitted by
- * {@code TablePath.detectInvalidName}, and user index names are validated by {@code Schema.Index}
- * to forbid {@code __}, so the composed name unambiguously decomposes back to its parts.
- *
- * <h2>Update / delete / async / recovery scenarios</h2>
- *
- * <p>Several follow-on scenarios remain blocked on later plans (see the {@code @Disabled} reasons
- * on each {@code @Test} below).
+ * <p>The push pipeline in {@link Replica#indexTablePathFor} builds the Index Table path as {@code
+ * <main>__<indexName>} (see {@link IndexTableUtils#INDEX_TABLE_NAME_SEPARATOR}). Each test uses a
+ * distinct main-table name so that the shared {@link FlussClusterExtension} cluster does not see
+ * colliding paths across scenarios.
  */
 class IndexPushReplicationITCase {
 
     private static final String DB = "test_db";
-    private static final String MAIN_TABLE = "main_t";
     private static final String INDEX_NAME = "idx_b";
-    private static final TablePath MAIN_TABLE_PATH = TablePath.of(DB, MAIN_TABLE);
-    // Canonical Index Table path: "<main>__<indexName>" (matches Replica.indexTablePathFor via
-    // IndexTableUtils.indexTableName). The '__' separator passes TablePath.detectInvalidName.
-    private static final TablePath INDEX_TABLE_PATH =
-            TablePath.of(DB, IndexTableUtils.indexTableName(MAIN_TABLE, INDEX_NAME));
 
     /**
      * Single tablet server keeps replication trivial — both the main table's data leader and the
@@ -106,40 +105,190 @@ class IndexPushReplicationITCase {
     }
 
     /**
-     * Index value row type {@code (b STRING NOT NULL, a INT NOT NULL)} — composite of idx cols
-     * (b) followed by the base PK (a), with {@code NOT NULL} forced because both make up the
-     * Index Table's PK after {@link TableDescriptor#deriveIndexTableDescriptor}.
+     * Index value row type {@code (b STRING NOT NULL, a INT NOT NULL)} — composite of idx cols (b)
+     * followed by the base PK (a), with {@code NOT NULL} forced because both make up the Index
+     * Table's PK after {@link TableDescriptor#deriveIndexTableDescriptor}.
      */
     private static final RowType INDEX_VALUE_ROW_TYPE =
             DataTypes.ROW(
                     new DataField("b", DataTypes.STRING().copy(false)),
                     new DataField("a", DataTypes.INT().copy(false)));
 
+    /** Bounded poll deadline for index visibility checks — well above the longest observed push. */
+    private static final Duration INDEX_VISIBILITY_TIMEOUT = Duration.ofSeconds(30);
+
     /**
      * Happy-path scenario #1 (FIP V2 §3, sync visibility): write 1 row to the indexed main table,
      * verify the corresponding entry shows up in the Index Table.
-     *
-     * <p>The earlier {@code TableDescriptorValidation} blocker was resolved when the validator
-     * learned to accept the namespaced {@code secondary-index.<name>.{columns,bucket.num}}
-     * properties (and the static {@code secondary-index.visibility} sibling) — see {@code
-     * TableDescriptorValidationTest}.
      */
     @Test
     void testInsertOnMainTablePushesEntryToIndexTable() throws Exception {
-        // (1) Pre-create the Index Table FIRST so the main-table leader promotion can resolve it
-        // via the metadata cache. mainTableId=-1 here is a placeholder for the Plan 1
-        // back-link property — Plan 2's push pipeline only consults the path-based name, not the
-        // back-link, so a placeholder is harmless.
-        TableDescriptor indexDescriptor = buildIndexTableDescriptorPlaceholderMain();
-        long indexTableId = createTable(FLUSS_CLUSTER_EXTENSION, INDEX_TABLE_PATH, indexDescriptor);
+        String mainName = "main_t_insert";
+        Fixture f = setupTables(mainName, /* visibility */ null);
+
+        KvRecordBatch batch = genKvRecordBatch(new Object[] {1, "hello"});
+        PutKvRequest putKvRequest =
+                newPutKvRequest(f.mainTableId, /* bucketId */ 0, /* acks */ 1, batch);
+        f.mainGateway.putKv(putKvRequest).get();
+
+        // Verify the index entry shows up under the encoded composite key. The Index Table PK
+        // is (b, a) → 'hello' || 1; the Index bucket layout uses FlussBucketingFunction over
+        // that encoded key, but with a single Index bucket the assignment is trivially 0.
+        byte[] indexKey = encodeIndexKey("hello", 1);
+        int targetIndexBucket = new FlussBucketingFunction().bucketing(indexKey, 1);
+        assertThat(targetIndexBucket).isEqualTo(0);
+
+        waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, /* present */ true);
+
+        // The push pipeline is sync-by-default (FIP V2 secondary-index.visibility=SYNC), so by the
+        // time putKv ack returned the indexPushedOffset should already cover the write offset.
+        assertThat(f.mainLeaderReplica.getIndexPushedOffset())
+                .as("indexPushedOffset on main-table leader after sync write")
+                .isGreaterThanOrEqualTo(0L);
+    }
+
+    /**
+     * Scenario #2 (FIP V2 §2.5 update rule): an UPDATE that changes the indexed column emits a
+     * DELETE for the old key plus an UPSERT for the new key. After a brief poll the old key must be
+     * gone and the new key must be present.
+     */
+    @Test
+    void testUpdateRewritesIndexEntry() throws Exception {
+        String mainName = "main_t_update";
+        Fixture f = setupTables(mainName, /* visibility */ null);
+
+        // (1) Insert (a=1, b="hello"); wait for the index entry to land.
+        f.mainGateway
+                .putKv(
+                        newPutKvRequest(
+                                f.mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "hello"})))
+                .get();
+        byte[] oldIndexKey = encodeIndexKey("hello", 1);
+        waitForIndexEntry(f.indexGateway, f.indexTableId, oldIndexKey, /* present */ true);
+
+        // (2) Update the same PK row with a different idx column value.
+        f.mainGateway
+                .putKv(
+                        newPutKvRequest(
+                                f.mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "world"})))
+                .get();
+
+        // (3) The old composite key disappears, the new one appears.
+        byte[] newIndexKey = encodeIndexKey("world", 1);
+        waitForIndexEntry(f.indexGateway, f.indexTableId, newIndexKey, /* present */ true);
+        waitForIndexEntry(f.indexGateway, f.indexTableId, oldIndexKey, /* present */ false);
+    }
+
+    /**
+     * Scenario #3 (FIP V2 §2.5 delete rule): a DELETE on the main table emits a DELETE on the index
+     * entry. After polling, the index lookup for the previously-inserted key must come back empty.
+     */
+    @Test
+    void testDeleteRemovesIndexEntry() throws Exception {
+        String mainName = "main_t_delete";
+        Fixture f = setupTables(mainName, /* visibility */ null);
+
+        // (1) Insert a row, wait for the index entry to land.
+        f.mainGateway
+                .putKv(
+                        newPutKvRequest(
+                                f.mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "hello"})))
+                .get();
+        byte[] indexKey = encodeIndexKey("hello", 1);
+        waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, /* present */ true);
+
+        // (2) Delete the row by sending a KvRecord with a null value (tombstone) for the same PK.
+        KvRecordBatch deleteBatch =
+                genKvRecordBatch(
+                        Collections.singletonList(Tuple2.of(new Object[] {1}, /* value */ null)));
+        f.mainGateway.putKv(newPutKvRequest(f.mainTableId, 0, 1, deleteBatch)).get();
+
+        // (3) The index entry for ("hello", 1) goes away.
+        waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, /* present */ false);
+    }
+
+    /**
+     * Scenario #4 (FIP V2 §2.6, async visibility): with {@code secondary-index.visibility=ASYNC}
+     * the PutKv ack returns BEFORE the index push completes; the entry is only eventually visible.
+     * We don't assert immediate invisibility (would be flaky on fast machines / single-process
+     * self-RPC) — the contract under test is "eventual visibility under ASYNC".
+     */
+    @Test
+    void testAsyncVisibilityEventuallyVisible() throws Exception {
+        String mainName = "main_t_async";
+        Fixture f = setupTables(mainName, SecondaryIndexVisibility.ASYNC);
+
+        f.mainGateway
+                .putKv(
+                        newPutKvRequest(
+                                f.mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "hello"})))
+                .get();
+
+        byte[] indexKey = encodeIndexKey("hello", 1);
+        waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, /* present */ true);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Disabled scenarios — re-enable as the dependent infrastructure lands.
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    @Disabled(
+            "TODO P2T14: leader-failover recovery requires a multi-tablet-server cluster (>=2"
+                    + " replicas) plus replicationFactor>=2 so that stopping the data leader still"
+                    + " leaves a live index-table replica to receive replays. The shared"
+                    + " FlussClusterExtension here is a single-node setup; rewiring it for"
+                    + " multi-node failover (and setting deterministic ISR/leader-elect timing)"
+                    + " is out of scope for this batch — the recovery code path is already"
+                    + " covered at unit-scope by Replica WAL replay tests.")
+    void testLeaderFailoverReplaysViaWal() {}
+
+    // ---------------------------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------------------------
+
+    /** Per-scenario state: ids, paths, gateways, and the main-table leader replica handle. */
+    private static final class Fixture {
+        final long mainTableId;
+        final long indexTableId;
+        final Replica mainLeaderReplica;
+        final TabletServerGateway mainGateway;
+        final TabletServerGateway indexGateway;
+
+        Fixture(
+                long mainTableId,
+                long indexTableId,
+                Replica mainLeaderReplica,
+                TabletServerGateway mainGateway,
+                TabletServerGateway indexGateway) {
+            this.mainTableId = mainTableId;
+            this.indexTableId = indexTableId;
+            this.mainLeaderReplica = mainLeaderReplica;
+            this.mainGateway = mainGateway;
+            this.indexGateway = indexGateway;
+        }
+    }
+
+    /**
+     * Creates the Index Table first, then the main table (so leader promotion can resolve the Index
+     * Table via the metadata cache), then returns ready-to-use gateways and ids.
+     */
+    private static Fixture setupTables(
+            String mainName, @Nullable SecondaryIndexVisibility visibility) throws Exception {
+        TablePath mainPath = TablePath.of(DB, mainName);
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainName, INDEX_NAME));
+
+        TableDescriptor mainDescriptor = buildMainTableDescriptor(visibility);
+        TableDescriptor indexDescriptor =
+                TableDescriptor.deriveIndexTableDescriptor(
+                        mainDescriptor, /* mainTableId */ -1L, DB + "." + mainName, INDEX_NAME);
+
+        long indexTableId = createTable(FLUSS_CLUSTER_EXTENSION, indexPath, indexDescriptor);
         TableBucket indexBucket = new TableBucket(indexTableId, 0);
         FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(indexBucket);
 
-        // (2) Create the main table with Schema.index(...) so the leader's onBecomeNewLeader hook
-        // wires the IndexPushScheduler. By the time this returns, the Index Table is already in
-        // the metadata cache.
-        TableDescriptor mainDescriptor = buildMainTableDescriptor();
-        long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, MAIN_TABLE_PATH, mainDescriptor);
+        long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, mainDescriptor);
         TableBucket mainBucket = new TableBucket(mainTableId, 0);
         Replica mainLeaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
         int mainLeaderServer = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(mainBucket);
@@ -147,79 +296,41 @@ class IndexPushReplicationITCase {
         // thrown out of buildIndexExtractorContext().
         assertThat(mainLeaderReplica.getIndexPushScheduler()).isNotNull();
 
-        // (3) Write one PK row (a=1, b="hello") to the main table.
-        KvRecordBatch batch = genKvRecordBatch(new Object[] {1, "hello"});
-        TabletServerGateway leaderGateway =
+        TabletServerGateway mainGateway =
                 FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(mainLeaderServer);
-        PutKvRequest putKvRequest =
-                newPutKvRequest(mainTableId, /* bucketId */ 0, /* acks */ 1, batch);
-        leaderGateway.putKv(putKvRequest).get();
-
-        // (4) Verify the index entry shows up under the encoded composite key. The Index Table
-        // PK is (b, a) → 'hello' || 1; the Index bucket layout uses FlussBucketingFunction over
-        // that encoded key, but with a single Index bucket the assignment is trivially 0.
-        byte[] indexKey = encodeIndexKey("hello", 1);
-        int targetIndexBucket = new FlussBucketingFunction().bucketing(indexKey, 1);
-        assertThat(targetIndexBucket).isEqualTo(0);
-
-        TabletServerGateway indexLeaderGateway =
+        TabletServerGateway indexGateway =
                 FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(
                         FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(indexBucket));
+        return new Fixture(mainTableId, indexTableId, mainLeaderReplica, mainGateway, indexGateway);
+    }
+
+    /**
+     * Polls the Index Table until the lookup for {@code key} matches the expected presence.
+     * "Present" means the bucket response contains a value with non-null payload; "absent" means
+     * the bucket returns no value or returns a tombstone.
+     */
+    private static void waitForIndexEntry(
+            TabletServerGateway indexLeaderGateway,
+            long indexTableId,
+            byte[] key,
+            boolean expectPresent) {
+        String desc =
+                expectPresent
+                        ? "wait for index entry to be visible on the Index Table"
+                        : "wait for index entry to disappear from the Index Table";
         waitUntil(
                 () -> {
                     PbLookupRespForBucket resp =
                             indexLeaderGateway
-                                    .lookup(newLookupRequest(indexTableId, 0, indexKey))
+                                    .lookup(newLookupRequest(indexTableId, 0, key))
                                     .get()
                                     .getBucketsRespAt(0);
-                    return resp.getValuesCount() > 0 && resp.getValueAt(0).hasValues();
+                    boolean present = resp.getValuesCount() > 0 && resp.getValueAt(0).hasValues();
+                    return present == expectPresent;
                 },
-                Duration.ofMinutes(1),
-                "Fail to wait for the index entry to be visible on the Index Table.");
-
-        // The push pipeline is sync-by-default (FIP V2 secondary-index.visibility=SYNC), so by the
-        // time putKv ack returned the indexPushedOffset should already cover the write offset.
-        // We assert the watermark crossed the write offset to catch regressions where the
-        // pipeline never advances (e.g. acks dropped on the floor).
-        assertThat(mainLeaderReplica.getIndexPushedOffset())
-                .as("indexPushedOffset on main-table leader after sync write")
-                .isGreaterThanOrEqualTo(0L);
+                INDEX_VISIBILITY_TIMEOUT,
+                desc);
     }
-
-    // ---------------------------------------------------------------------------------------------
-    // Disabled scenarios — re-enable as the dependent plans land.
-    // ---------------------------------------------------------------------------------------------
-
-    @Test
-    @Disabled(
-            "TODO P2T14: update path requires UPDATE_BEFORE pre-image emission via the IndexedRow"
-                    + " hook so the extractor can DELETE the old idxCols; covered in Plan 4.")
-    void testUpdateRewritesIndexEntry() {}
-
-    @Test
-    @Disabled(
-            "TODO P2T14: delete path requires the WAL to carry the pre-image (DELETE row) which"
-                    + " ChangelogImage.WAL only writes for explicit DELETE — exercising it"
-                    + " end-to-end via genKvRecordBatch needs a tombstone-style record batch.")
-    void testDeleteRemovesIndexEntry() {}
-
-    @Test
-    @Disabled(
-            "TODO P2T14: async-visibility path needs an explicit secondary-index.visibility=ASYNC"
-                    + " on the main table plus a poll-loop; left out until the basic SYNC path is"
-                    + " stable in CI.")
-    void testAsyncVisibilityEventuallyVisible() {}
-
-    @Test
-    @Disabled(
-            "TODO P2T14: leader-failover recovery needs at least 2 tablet servers and forced"
-                    + " leader migration plus a deterministic snapshot point; out of scope for"
-                    + " the minimum-viable push ITCase.")
-    void testLeaderFailoverReplaysViaWal() {}
-
-    // ---------------------------------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------------------------------
 
     private static Schema buildMainSchema() {
         return Schema.newBuilder()
@@ -230,33 +341,24 @@ class IndexPushReplicationITCase {
                 .build();
     }
 
-    private static TableDescriptor buildMainTableDescriptor() {
-        return TableDescriptor.builder()
-                .schema(buildMainSchema())
-                .distributedBy(1, "a")
-                // Match the Index Table's bucket count so resolveIndexBucketCount agrees.
-                .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "1")
-                .build();
+    private static TableDescriptor buildMainTableDescriptor(
+            @Nullable SecondaryIndexVisibility visibility) {
+        TableDescriptor.Builder b =
+                TableDescriptor.builder()
+                        .schema(buildMainSchema())
+                        .distributedBy(1, "a")
+                        // Match the Index Table's bucket count so resolveIndexBucketCount agrees.
+                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "1");
+        if (visibility != null) {
+            b.property(ConfigOptions.SECONDARY_INDEX_VISIBILITY, visibility);
+        }
+        return b.build();
     }
 
     /**
-     * Build the Index Table descriptor as if {@link TableDescriptor#deriveIndexTableDescriptor}
-     * were running with a placeholder mainTableId. The push pipeline only consults the
-     * path-based name {@code <main>__<indexName>}; the back-link properties are read by Plan 4.
-     */
-    private static TableDescriptor buildIndexTableDescriptorPlaceholderMain() {
-        // Pretend mainTableId is unknown — Plan 2 doesn't care.
-        return TableDescriptor.deriveIndexTableDescriptor(
-                buildMainTableDescriptor(),
-                /* mainTableId */ -1L,
-                DB + "." + MAIN_TABLE,
-                INDEX_NAME);
-    }
-
-    /**
-     * Encode the composite Index Table PK {@code (b, a)} the same way the production
-     * {@code IndexMutationExtractor.KeyEncoder} does — a {@link CompactedKeyEncoder} over the
-     * derived index value row type.
+     * Encode the composite Index Table PK {@code (b, a)} the same way the production {@code
+     * IndexMutationExtractor.KeyEncoder} does — a {@link CompactedKeyEncoder} over the derived
+     * index value row type.
      */
     private static byte[] encodeIndexKey(String b, int a) {
         CompactedKeyEncoder encoder = new CompactedKeyEncoder(INDEX_VALUE_ROW_TYPE);
