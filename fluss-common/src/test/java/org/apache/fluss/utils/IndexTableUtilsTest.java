@@ -97,4 +97,15 @@ class IndexTableUtilsTest {
     void testPartitionIdPrefixSizeIs8() {
         assertThat(IndexTableUtils.PARTITION_ID_PREFIX_SIZE).isEqualTo(8);
     }
+
+    @Test
+    void testIndexTableNameSeparatorIsDoubleUnderscore() {
+        assertThat(IndexTableUtils.INDEX_TABLE_NAME_SEPARATOR).isEqualTo("__");
+    }
+
+    @Test
+    void testIndexTableNameComposes() {
+        assertThat(IndexTableUtils.indexTableName("orders", "idx_user"))
+                .isEqualTo("orders__idx_user");
+    }
 }

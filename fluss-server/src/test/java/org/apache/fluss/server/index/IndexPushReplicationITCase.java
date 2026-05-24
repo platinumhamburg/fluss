@@ -35,6 +35,7 @@ import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.IndexTableUtils;
 
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
@@ -61,52 +62,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * index push completing, so by the time the future resolves the index entry must be present and
  * the {@code indexPushedOffset} watermark must have advanced.
  *
- * <h2>BLOCKED — production gap on Index Table naming</h2>
+ * <h2>Naming convention</h2>
  *
- * <p>The push pipeline in {@link Replica#indexTablePathFor} (see {@code Replica.java:1224}) builds
- * the Index Table path as {@code <main>$<indexName>} — the {@code $} character is the canonical
- * separator chosen during Plan 1. However {@link TablePath#validate()} (called from {@code
- * CoordinatorService.createTable} at {@code CoordinatorService.java:436}) restricts table names
- * to {@code [a-zA-Z0-9_-]} and rejects any name containing {@code $}:
- *
- * <pre>
- *   InvalidTableException: Table name main_t$idx_b is invalid: 'main_t$idx_b' contains
- *   one or more characters other than ASCII alphanumerics, '_' and '-'
- * </pre>
- *
- * <p>So no real Index Table can ever be created via the public CreateTable RPC, and {@code
- * resolveIndexTableId} on the main-table leader will never find one. The push pipeline cannot run
- * end-to-end through the production CreateTable path until ONE of the following lands:
- *
- * <ul>
- *   <li>relax {@link TablePath#detectInvalidName} for system-created Index Tables (e.g. allow
- *       {@code $} only when the descriptor declares {@code TABLE_TYPE=INDEX_TABLE}), OR
- *   <li>change the Plan 1 naming convention to use a separator already in the allowed set
- *       (e.g. {@code __idx__} or a {@code -} separator), AND update {@code
- *       Replica.indexTablePathFor} accordingly, OR
- *   <li>have the Coordinator auto-create Index Tables internally on a path that bypasses {@link
- *       TablePath#validate()} — Plan 3 territory.
- * </ul>
- *
- * <p>The body of the test below is intentionally fully written and {@code @Disabled} at the class
- * level so the next Plan 2/3 owner can re-enable it once the gap is fixed; the helper code
- * (encoder, descriptor builders, lookup glue) is reusable as-is.
- *
- * <h2>Reproducer</h2>
- *
- * <p>Removing {@code @Disabled} below and running:
- *
- * <pre>
- *   mvn test -pl fluss-server -Dtest=IndexPushReplicationITCase
- * </pre>
- *
- * <p>fails with the {@code InvalidTableException} above on the very first {@code createTable} call
- * (line where the Index Table is pre-created). All other assertions are downstream of that.
+ * <p>The push pipeline in {@link Replica#indexTablePathFor} builds the Index Table path as
+ * {@code <main>__<indexName>} (see {@link IndexTableUtils#INDEX_TABLE_NAME_SEPARATOR}). The
+ * {@code __} separator is in the {@code [a-zA-Z0-9_-]} character set permitted by
+ * {@code TablePath.detectInvalidName}, and user index names are validated by {@code Schema.Index}
+ * to forbid {@code __}, so the composed name unambiguously decomposes back to its parts.
  *
  * <h2>Update / delete / async / recovery scenarios</h2>
  *
- * <p>Even after the naming gap is fixed, several follow-on scenarios remain blocked on later
- * plans (see the {@code @Disabled} reasons on each {@code @Test} below).
+ * <p>Several follow-on scenarios remain blocked on later plans (see the {@code @Disabled} reasons
+ * on each {@code @Test} below).
  */
 class IndexPushReplicationITCase {
 
@@ -114,10 +81,10 @@ class IndexPushReplicationITCase {
     private static final String MAIN_TABLE = "main_t";
     private static final String INDEX_NAME = "idx_b";
     private static final TablePath MAIN_TABLE_PATH = TablePath.of(DB, MAIN_TABLE);
-    // Canonical Index Table path: "<main>$<indexName>" (matches Replica.indexTablePathFor at
-    // Replica.java:1224). The '$' separator is the production gap — validate() rejects it.
+    // Canonical Index Table path: "<main>__<indexName>" (matches Replica.indexTablePathFor via
+    // IndexTableUtils.indexTableName). The '__' separator passes TablePath.detectInvalidName.
     private static final TablePath INDEX_TABLE_PATH =
-            TablePath.of(DB, MAIN_TABLE + "$" + INDEX_NAME);
+            TablePath.of(DB, IndexTableUtils.indexTableName(MAIN_TABLE, INDEX_NAME));
 
     /**
      * Single tablet server keeps replication trivial — both the main table's data leader and the
@@ -152,14 +119,25 @@ class IndexPushReplicationITCase {
      * Happy-path scenario #1 (FIP V2 §3, sync visibility): write 1 row to the indexed main table,
      * verify the corresponding entry shows up in the Index Table.
      *
-     * <p>{@code @Disabled} until the {@code $}-separator naming gap is resolved (see class
-     * javadoc). The body is fully written so re-enabling is a one-line change.
+     * <p>{@code @Disabled} because of a NEW blocker downstream of the {@code __} naming fix:
+     * {@code TableDescriptorValidation.validateTableDescriptor} validates every property key
+     * against the static {@code TABLE_OPTIONS} map and throws {@code InvalidConfigException}
+     * for any unknown key. Plan 1's per-index namespaced property keys
+     * {@code secondary-index.<name>.bucket.num} (and the visibility/columns siblings) are
+     * dynamic and therefore not in {@code TABLE_OPTIONS} — so {@code createTable} via the
+     * RPC path rejects the main-table descriptor with: <pre>
+     *   InvalidConfigException: 'secondary-index.idx_b.bucket.num' is not a Fluss table property.
+     * </pre>
+     * Re-enable once the validator special-cases the {@code secondary-index.*} namespace
+     * (Plan 1 follow-up — independent of the Index Table naming convention).
      */
     @Test
     @Disabled(
-            "BLOCKED P2T13: Replica.indexTablePathFor builds '<main>$<idx>' but"
-                    + " TablePath.validate() rejects '$'. Re-enable once the naming convention is"
-                    + " reconciled (see class javadoc for proposed fixes).")
+            "BLOCKED P1 follow-up: TableDescriptorValidation rejects namespaced"
+                    + " secondary-index.<name>.* properties because they are not in the static"
+                    + " TABLE_OPTIONS map. The naming gap is fixed (uses '__' separator now);"
+                    + " this is a separate property-validation gap. Re-enable once the validator"
+                    + " accepts the secondary-index.* namespace.")
     void testInsertOnMainTablePushesEntryToIndexTable() throws Exception {
         // (1) Pre-create the Index Table FIRST so the main-table leader promotion can resolve it
         // via the metadata cache. mainTableId=-1 here is a placeholder for the Plan 1
@@ -228,30 +206,28 @@ class IndexPushReplicationITCase {
     @Test
     @Disabled(
             "TODO P2T14: update path requires UPDATE_BEFORE pre-image emission via the IndexedRow"
-                    + " hook so the extractor can DELETE the old idxCols; covered in Plan 4."
-                    + " Also blocked on the same naming gap as scenario #1.")
+                    + " hook so the extractor can DELETE the old idxCols; covered in Plan 4.")
     void testUpdateRewritesIndexEntry() {}
 
     @Test
     @Disabled(
             "TODO P2T14: delete path requires the WAL to carry the pre-image (DELETE row) which"
                     + " ChangelogImage.WAL only writes for explicit DELETE — exercising it"
-                    + " end-to-end via genKvRecordBatch needs a tombstone-style record batch."
-                    + " Also blocked on the same naming gap as scenario #1.")
+                    + " end-to-end via genKvRecordBatch needs a tombstone-style record batch.")
     void testDeleteRemovesIndexEntry() {}
 
     @Test
     @Disabled(
             "TODO P2T14: async-visibility path needs an explicit secondary-index.visibility=ASYNC"
                     + " on the main table plus a poll-loop; left out until the basic SYNC path is"
-                    + " stable in CI. Also blocked on the same naming gap as scenario #1.")
+                    + " stable in CI.")
     void testAsyncVisibilityEventuallyVisible() {}
 
     @Test
     @Disabled(
             "TODO P2T14: leader-failover recovery needs at least 2 tablet servers and forced"
                     + " leader migration plus a deterministic snapshot point; out of scope for"
-                    + " the minimum-viable push ITCase. Also blocked on the same naming gap.")
+                    + " the minimum-viable push ITCase.")
     void testLeaderFailoverReplaysViaWal() {}
 
     // ---------------------------------------------------------------------------------------------
@@ -279,7 +255,7 @@ class IndexPushReplicationITCase {
     /**
      * Build the Index Table descriptor as if {@link TableDescriptor#deriveIndexTableDescriptor}
      * were running with a placeholder mainTableId. The push pipeline only consults the
-     * path-based name {@code <main>$<indexName>}; the back-link properties are read by Plan 4.
+     * path-based name {@code <main>__<indexName>}; the back-link properties are read by Plan 4.
      */
     private static TableDescriptor buildIndexTableDescriptorPlaceholderMain() {
         // Pretend mainTableId is unknown — Plan 2 doesn't care.

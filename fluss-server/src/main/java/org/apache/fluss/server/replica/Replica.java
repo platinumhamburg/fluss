@@ -1074,7 +1074,7 @@ public final class Replica {
      * Build the per-main-table {@link IndexMutationExtractor.Context} used by the scheduler.
      *
      * <p>For each declared {@link Schema.Index} this resolves the target Index Table from the
-     * {@link TabletServerMetadataCache} (path is {@code <mainTable>$<indexName>}; bucket count
+     * {@link TabletServerMetadataCache} (path is {@code <mainTable>__<indexName>}; bucket count
      * comes from the cached {@link TableInfo#getNumBuckets()}) and constructs:
      *
      * <ul>
@@ -1188,8 +1188,8 @@ public final class Replica {
 
     /**
      * Resolve the {@code tableId} of the Index Table for {@code indexName} from the metadata cache.
-     * The Index Table's logical path is {@code <mainTable>$<indexName>} (see {@code
-     * IndexTableFoundationITCase} for the canonical naming convention).
+     * The Index Table's logical path is {@code <mainTable>__<indexName>} (see {@link
+     * IndexTableUtils#INDEX_TABLE_NAME_SEPARATOR} for the canonical naming convention).
      */
     private long resolveIndexTableId(String indexName) {
         TablePath indexTablePath = indexTablePathFor(indexName);
@@ -1223,7 +1223,9 @@ public final class Replica {
 
     private TablePath indexTablePathFor(String indexName) {
         TablePath mainPath = tableInfo.getTablePath();
-        return TablePath.of(mainPath.getDatabaseName(), mainPath.getTableName() + "$" + indexName);
+        return TablePath.of(
+                mainPath.getDatabaseName(),
+                IndexTableUtils.indexTableName(mainPath.getTableName(), indexName));
     }
 
     /**

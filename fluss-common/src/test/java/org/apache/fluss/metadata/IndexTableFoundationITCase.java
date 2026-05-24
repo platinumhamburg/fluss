@@ -75,7 +75,9 @@ class IndexTableFoundationITCase {
         long now = System.currentTimeMillis();
         TableInfo info =
                 TableInfo.of(
-                        TablePath.of("tdb", "orders$idx_user"),
+                        TablePath.of(
+                                "tdb",
+                                IndexTableUtils.indexTableName("orders", "idx_user")),
                         200L,
                         1,
                         derived,

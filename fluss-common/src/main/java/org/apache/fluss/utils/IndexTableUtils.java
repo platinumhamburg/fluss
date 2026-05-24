@@ -41,7 +41,23 @@ public final class IndexTableUtils {
     /** Fixed-width Big-Endian int64 prefix for partitioned Index Table values. */
     public static final int PARTITION_ID_PREFIX_SIZE = 8;
 
+    /**
+     * Separator between main table name and index name in Index Table paths.
+     *
+     * <p>Chosen so the composed Index Table name passes {@code TablePath.detectInvalidName}
+     * (which restricts table names to {@code [a-zA-Z0-9_-]}) while remaining unambiguous: user
+     * index names are validated by {@code Schema.Index} to match {@code ^[A-Za-z0-9_]+$} AND to
+     * forbid {@code __}, so a name {@code <main>__<index>} unambiguously decomposes back to its
+     * parts.
+     */
+    public static final String INDEX_TABLE_NAME_SEPARATOR = "__";
+
     private IndexTableUtils() {}
+
+    /** Builds the Index Table name from a main table name and an index name. */
+    public static String indexTableName(String mainTableName, String indexName) {
+        return mainTableName + INDEX_TABLE_NAME_SEPARATOR + indexName;
+    }
 
     /**
      * Prepends the 8-byte Big-Endian int64 partitionId to the given value body.
