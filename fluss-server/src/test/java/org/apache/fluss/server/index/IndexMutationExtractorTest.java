@@ -151,7 +151,7 @@ class IndexMutationExtractorTest {
     }
 
     private static IndexMutationExtractor.BucketAssigner fixedBucket(final int b) {
-        return k -> b;
+        return (k, r) -> b;
     }
 
     @Test

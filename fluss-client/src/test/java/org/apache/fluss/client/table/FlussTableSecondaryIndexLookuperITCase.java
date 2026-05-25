@@ -31,7 +31,6 @@ import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.IndexTableUtils;
 
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import javax.annotation.Nullable;
@@ -80,25 +79,6 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
     private static final Duration INDEX_VISIBILITY_TIMEOUT = Duration.ofSeconds(30);
 
     @Test
-    @Disabled(
-            "BLOCKS on production-source bug surfaced by this very ITCase:"
-                    + " TableDescriptor.deriveIndexTableDescriptor declares the Index Table's"
-                    + " bucket key as the full Index Table PK (idxCols ++ basePK) via"
-                    + " distributedBy(bucketCount, idxPk), but"
-                    + " FlussTable.getSecondaryIndexLookuper drives Hop 1 with"
-                    + " lookupBy(idxCols) which routes through PrefixKeyLookuper. The"
-                    + " PrefixKeyLookuper validation requires lookupColumns.equals(bucketKeys),"
-                    + " so the lookuper rejects the call with 'lookup columns [b] must contain"
-                    + " all bucket keys [b, a] in order' before even hitting the wire."
-                    + " Fix requires production-source changes: (1) deriveIndexTableDescriptor"
-                    + " must distribute by idxCols only, and (2) IndexPushSender's BucketAssigner"
-                    + " must compute bucket from an idxCols-only encoding (today it bucket-hashes"
-                    + " the full encoded Index Table PK, which would land in a different bucket"
-                    + " than the lookup side once (1) is applied). P4T7's spec explicitly forbids"
-                    + " production-source edits, so this end-to-end recheck assertion is parked"
-                    + " here until the bucket-key alignment is addressed (likely a follow-up to"
-                    + " P1T8 / P2T13a). The validation test below still covers the public surface"
-                    + " of FlussTable.getSecondaryIndexLookuper.")
     void testLookupReturnsNoStalePointers() throws Exception {
         TablePath mainPath = TablePath.of(DB, "main_t_lookup");
         createMainTableWithIndex(mainPath, SecondaryIndexVisibility.ASYNC);

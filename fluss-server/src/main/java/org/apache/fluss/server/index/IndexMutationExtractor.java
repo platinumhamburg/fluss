@@ -67,10 +67,18 @@ public final class IndexMutationExtractor {
                 long partitionId);
     }
 
-    /** Maps an encoded key to its target index bucket. */
+    /**
+     * Maps a base-row mutation to its target Index Table bucket.
+     *
+     * <p>The encoded full-PK {@code key} (idxCols ++ basePK in the Index Table's PK column
+     * order) is passed for completeness, but implementations bucket on the {@code row}'s
+     * idxCols-only bytes — never on {@code key} — so the push-side bucketing aligns with
+     * {@link org.apache.fluss.client.lookup.PrefixKeyLookuper}, which routes its lookup
+     * probe by hashing only the idxCols.
+     */
     @FunctionalInterface
     public interface BucketAssigner {
-        int bucketOf(byte[] key);
+        int bucketOf(byte[] key, InternalRow row);
     }
 
     /** Per-table plan for one secondary index. */
@@ -210,7 +218,7 @@ public final class IndexMutationExtractor {
             out.add(
                     IndexMutation.delete(
                             plan.indexTableId,
-                            plan.bucketAssigner.bucketOf(oldKey),
+                            plan.bucketAssigner.bucketOf(oldKey, oldRow),
                             oldKey,
                             sourceOffset));
         }
@@ -221,7 +229,7 @@ public final class IndexMutationExtractor {
             out.add(
                     IndexMutation.upsert(
                             plan.indexTableId,
-                            plan.bucketAssigner.bucketOf(newKey),
+                            plan.bucketAssigner.bucketOf(newKey, newRow),
                             newKey,
                             newValue,
                             sourceOffset));

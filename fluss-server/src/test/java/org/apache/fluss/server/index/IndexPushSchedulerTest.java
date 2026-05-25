@@ -291,7 +291,7 @@ class IndexPushSchedulerTest {
     }
 
     private static IndexMutationExtractor.BucketAssigner fixedBucket(final int b) {
-        return key -> b;
+        return (key, row) -> b;
     }
 
     private static PutKvResponse successResponse() {

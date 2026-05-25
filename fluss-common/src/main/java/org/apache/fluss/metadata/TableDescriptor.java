@@ -256,7 +256,13 @@ public final class TableDescriptor implements Serializable {
                         .property(
                                 ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_NAME, mainTableName);
         if (bucketCount != null) {
-            b.distributedBy(bucketCount, idxPk);
+            // Bucket key is idxCols only — not the full idxPk. This is required by the
+            // prefix-lookup contract: PrefixKeyLookuper.validatePrefixLookup demands
+            // lookupColumns.equals(bucketKeys), and the lookuper is driven with
+            // lookupBy(idxCols). Bucketing by idxCols also keeps the push-side bucket
+            // assignment (which hashes idxCols-only bytes) aligned with the lookup-side
+            // routing on the same idxCols-only bytes.
+            b.distributedBy(bucketCount, new ArrayList<>(index.getColumnNames()));
         }
         return b.build();
     }

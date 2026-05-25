@@ -1229,6 +1229,14 @@ public final class Replica {
             IndexMutationExtractor.KeyEncoder keyEncoder =
                     (row, idxIdx, basePkIdx) -> underlyingKeyEncoder.encodeKey(row);
 
+            // Bucket key is idxCols only (see TableDescriptor.deriveIndexTableDescriptor:
+            // distributedBy(bucketCount, idxCols)). Push-side bucketing MUST hash the same
+            // bytes that PrefixKeyLookuper hashes on the lookup side — namely the
+            // idxCols-only CompactedKeyEncoder output — otherwise the Index Table mutation
+            // would land in a different bucket than the lookup probe.
+            CompactedKeyEncoder bucketKeyEncoder =
+                    new CompactedKeyEncoder(mainRowType, idxColumnIndices);
+
             DataType[] valueFieldTypes = new DataType[indexValueColumnIndices.length];
             InternalRow.FieldGetter[] valueFieldGetters =
                     new InternalRow.FieldGetter[indexValueColumnIndices.length];
@@ -1255,8 +1263,15 @@ public final class Replica {
                     };
 
             FlussBucketingFunction bucketingFunction = new FlussBucketingFunction();
+            // The BucketAssigner contract supplies both the encoded full-PK key (idxCols ++
+            // basePK) produced by keyEncoder and the source row. We bucket on the row's
+            // idxCols-only bytes (re-encoded here) — never on the full-PK key — so the
+            // push-side bucket matches PrefixKeyLookuper's lookup-side bucket, which hashes
+            // only the idxCols. The full-PK `key` argument is intentionally unused here.
             IndexMutationExtractor.BucketAssigner bucketAssigner =
-                    key -> bucketingFunction.bucketing(key, indexBucketCount);
+                    (key, row) ->
+                            bucketingFunction.bucketing(
+                                    bucketKeyEncoder.encodeKey(row), indexBucketCount);
 
             plans.add(
                     new IndexMutationExtractor.IndexPlan(

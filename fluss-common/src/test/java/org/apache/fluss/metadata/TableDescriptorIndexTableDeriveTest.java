@@ -138,6 +138,36 @@ class TableDescriptorIndexTableDeriveTest {
     }
 
     @Test
+    void testDerivedIndexTableBucketKeyIsIdxColsOnly() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("order_id", DataTypes.BIGINT())
+                        .column("user_id", DataTypes.BIGINT())
+                        .column("dt", DataTypes.STRING())
+                        .primaryKey("order_id", "dt")
+                        .index("idx_user", "user_id")
+                        .build();
+        TableDescriptor main =
+                TableDescriptor.builder()
+                        .schema(mainSchema)
+                        .partitionedBy("dt")
+                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_user"), "8")
+                        .build();
+
+        TableDescriptor derived =
+                TableDescriptor.deriveIndexTableDescriptor(
+                        main, 100L, "tdb.orders", "idx_user");
+
+        assertThat(derived.getTableDistribution()).isPresent();
+        assertThat(derived.getTableDistribution().get().getBucketKeys())
+                .as(
+                        "Index Table bucket key must equal idxCols only so that"
+                                + " PrefixKeyLookuper.lookupBy(idxCols) is accepted and"
+                                + " push-side bucketing aligns with the prefix lookup.")
+                .containsExactly("user_id");
+    }
+
+    @Test
     void testDataTableIsNotIndexTable() {
         Schema s =
                 Schema.newBuilder()
