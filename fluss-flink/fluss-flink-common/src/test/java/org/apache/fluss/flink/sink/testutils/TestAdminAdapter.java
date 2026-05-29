@@ -50,6 +50,8 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metadata.TableStats;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsResponse;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 
@@ -334,6 +336,18 @@ public class TestAdminAdapter implements Admin {
 
     @Override
     public CompletableFuture<ActiveKvSnapshots> listKvSnapshots(
+            long tableId, @Nullable Long partitionId) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public CompletableFuture<ListRemoteLogManifestsResponse> listRemoteLogManifests(
+            long tableId, @Nullable Long partitionId) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public CompletableFuture<ListKvSnapshotsResponse> listKvSnapshots(
             long tableId, @Nullable Long partitionId) {
         throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
     }
