@@ -1071,6 +1071,31 @@ public final class Replica {
         return logTablet.appendAsFollower(memoryLogRecords);
     }
 
+    /**
+     * Pre-write backpressure gate executed before {@link #putRecordsToLeader}. Performs the
+     * leader/ISR validation in the same lock as the actual write so that the rejection decision and
+     * the piggyback pressure measurement come from a coherent leader snapshot, then delegates to
+     * {@link KvTablet#checkBackpressure()} for the single L0 read.
+     *
+     * @return pressure in {@code [0, 1)} for piggyback throttle; throws {@link
+     *     org.apache.fluss.exception.StorageBackpressureException} if the storage engine is in the
+     *     hard-rejection zone.
+     */
+    public float checkBackpressure() {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    if (!isLeader()) {
+                        throw new NotLeaderOrFollowerException(
+                                String.format(
+                                        "Leader not local for bucket %s on tabletServer %d",
+                                        tableBucket, localTabletServerId));
+                    }
+                    KvTablet kv = this.kvTablet;
+                    return kv == null ? 0f : kv.checkBackpressure();
+                });
+    }
+
     public LogAppendInfo putRecordsToLeader(
             KvRecordBatch kvRecords,
             @Nullable int[] targetColumns,

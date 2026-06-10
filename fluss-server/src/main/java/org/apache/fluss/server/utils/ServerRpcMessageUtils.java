@@ -1155,6 +1155,12 @@ public class ServerRpcMessageUtils {
                 if (logEndOffset >= 0) {
                     putKvBucket.setLogEndOffset(logEndOffset);
                 }
+                // Tier 1 backpressure signal: only piggyback when there is actual pressure
+                // (i.e. L0 has crossed the Fluss-side proactive threshold).
+                float pressure = bucketResult.getPressure();
+                if (pressure > 0f) {
+                    putKvBucket.setPressure(pressure);
+                }
             }
             putKvRespForBucketList.add(putKvBucket);
         }

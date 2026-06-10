@@ -382,22 +382,20 @@ public class RocksDBStatistics implements AutoCloseable {
     /**
      * Get property value from RocksDB with resource guard protection.
      *
-     * @param propertyName the property name to query
+     * <p>Uses {@link RocksDB#getLongProperty(String)} to avoid the string allocation and parsing
+     * overhead of {@code getProperty(String) + Long.parseLong(...)}.
+     *
+     * @param propertyName the property name to query (must be a numeric property)
      * @return the property value as long, or 0 if not available or RocksDB is closed
      */
     private long getPropertyValue(String propertyName) {
         try (ResourceGuard.Lease lease = resourceGuard.acquireResource()) {
-            String value = db.getProperty(propertyName);
-            if (value != null && !value.isEmpty()) {
-                return Long.parseLong(value);
-            }
+            return db.getLongProperty(propertyName);
         } catch (RocksDBException e) {
             LOG.debug(
                     "Failed to get property {} from RocksDB (possibly closed or unavailable)",
                     propertyName,
                     e);
-        } catch (NumberFormatException e) {
-            LOG.debug("Failed to parse property {} value as long", propertyName, e);
         } catch (Exception e) {
             // ResourceGuard may throw exception if RocksDB is closed
             LOG.debug(
@@ -410,28 +408,24 @@ public class RocksDBStatistics implements AutoCloseable {
      * Get property value from RocksDB for a specific column family with resource guard protection.
      *
      * <p>Some RocksDB properties are column family specific and must be accessed through the column
-     * family handle.
+     * family handle. Uses {@link RocksDB#getLongProperty(ColumnFamilyHandle, String)} to avoid the
+     * string allocation and parsing overhead of {@code getProperty + Long.parseLong}.
      *
      * @param columnFamilyHandle the column family handle
-     * @param propertyName the property name to query
+     * @param propertyName the property name to query (must be a numeric property)
      * @return the property value as long, or 0 if not available or RocksDB is closed
      */
     private long getPropertyValue(ColumnFamilyHandle columnFamilyHandle, String propertyName) {
+        if (columnFamilyHandle == null) {
+            return 0L;
+        }
         try (ResourceGuard.Lease lease = resourceGuard.acquireResource()) {
-            if (columnFamilyHandle == null) {
-                return 0L;
-            }
-            String value = db.getProperty(columnFamilyHandle, propertyName);
-            if (value != null && !value.isEmpty()) {
-                return Long.parseLong(value);
-            }
+            return db.getLongProperty(columnFamilyHandle, propertyName);
         } catch (RocksDBException e) {
             LOG.debug(
                     "Failed to get property {} from RocksDB column family (possibly closed or unavailable)",
                     propertyName,
                     e);
-        } catch (NumberFormatException e) {
-            LOG.debug("Failed to parse property {} value as long", propertyName, e);
         } catch (Exception e) {
             // ResourceGuard may throw exception if RocksDB is closed
             LOG.debug(

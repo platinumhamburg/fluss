@@ -60,6 +60,13 @@ public class RocksDBKvBuilder {
     /** Path where this configured instance stores its RocksDB database. */
     private final File instanceRocksDBPath;
 
+    /**
+     * L0 file count at which Fluss starts emitting proactive piggyback backpressure. Default {@link
+     * Integer#MAX_VALUE} effectively disables proactive backpressure (Tier 1 piggyback); Tier 2
+     * hard rejection still applies via the RocksDB L0 slowdown trigger.
+     */
+    private int flussL0SlowdownTrigger = Integer.MAX_VALUE;
+
     /** The number of (re)tries for loading the RocksDB JNI library. */
     private static final int ROCKSDB_LIB_LOADING_ATTEMPTS = 3;
 
@@ -74,6 +81,16 @@ public class RocksDBKvBuilder {
         this.optionsContainer = rocksDBResourceContainer;
         this.instanceBasePath = instanceBasePath;
         this.instanceRocksDBPath = getInstanceRocksDBPath(instanceBasePath);
+    }
+
+    /**
+     * Sets the L0 file count at which Fluss starts emitting proactive Tier 1 piggyback pressure.
+     * Should be strictly less than the column family's {@code level0_slowdown_writes_trigger}.
+     * Defaults to {@link Integer#MAX_VALUE} which disables proactive backpressure entirely.
+     */
+    public RocksDBKvBuilder setFlussL0SlowdownTrigger(int flussL0SlowdownTrigger) {
+        this.flussL0SlowdownTrigger = flussL0SlowdownTrigger;
+        return this;
     }
 
     public RocksDBKv build() throws KvBuildingException {
@@ -112,7 +129,9 @@ public class RocksDBKvBuilder {
                 db,
                 rocksDBResourceGuard,
                 defaultColumnFamilyHandle,
-                optionsContainer.getStatistics());
+                optionsContainer.getStatistics(),
+                columnFamilyOptions.level0SlowdownWritesTrigger(),
+                flussL0SlowdownTrigger);
     }
 
     void prepareDirectories() throws IOException {
