@@ -200,6 +200,27 @@ public class ConfigOptions {
                             "The interval of auto partition check. "
                                     + "The default value is 10 minutes.");
 
+    public static final ConfigOption<Duration> COORDINATOR_LIFECYCLE_THROTTLER_INFLIGHT_TIMEOUT =
+            key("coordinator.lifecycle-throttler.inflight-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(3))
+                    .withDescription(
+                            "The timeout for an in-flight drop event in the coordinator's "
+                                    + "TableLifecycleThrottler. If a drop event has been admitted "
+                                    + "but the corresponding completion callback has not arrived "
+                                    + "within this timeout, the throttler abandons tracking of "
+                                    + "that drop and continues admitting the next pending drop.");
+
+    public static final ConfigOption<Duration>
+            COORDINATOR_LIFECYCLE_THROTTLER_TIMEOUT_CHECK_INTERVAL =
+                    key("coordinator.lifecycle-throttler.timeout-check-interval")
+                            .durationType()
+                            .defaultValue(Duration.ofMinutes(1))
+                            .withDescription(
+                                    "The periodic interval at which the coordinator's "
+                                            + "TableLifecycleThrottler scans in-flight drops for "
+                                            + "timeouts.");
+
     public static final ConfigOption<Boolean> LOG_TABLE_ALLOW_CREATION =
             key("allow.create.log.tables")
                     .booleanType()
