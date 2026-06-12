@@ -853,11 +853,14 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 oldTableInfo.getTableConfig().getAutoPartitionStrategy();
         AutoPartitionStrategy newAutoPartitionStrategy =
                 newTableInfo.getTableConfig().getAutoPartitionStrategy();
-        if (newAutoPartitionStrategy.isAutoPartitionEnabled()
-                && (newAutoPartitionStrategy.numToRetain() != oldAutoPartitionStrategy.numToRetain()
-                        || newAutoPartitionStrategy.numPreCreate()
-                                != oldAutoPartitionStrategy.numPreCreate())) {
-            autoPartitionManager.updateAutoPartitionTables(newTableInfo);
+        if (!Objects.equals(oldAutoPartitionStrategy, newAutoPartitionStrategy)) {
+            LOG.info(
+                    "Table {} auto partition strategy changed from {} to {}.",
+                    oldTableInfo.getTableId(),
+                    oldAutoPartitionStrategy,
+                    newAutoPartitionStrategy);
+            autoPartitionManager.handleAutoPartitionStrategyChange(
+                    newTableInfo, oldAutoPartitionStrategy, newAutoPartitionStrategy);
         }
 
         // If standby replica config changed, trigger re-election for all online buckets
