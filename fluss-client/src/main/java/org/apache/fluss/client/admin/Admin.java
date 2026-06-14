@@ -806,12 +806,8 @@ public interface Admin extends AutoCloseable {
      * @param partitionId optional partition id (null for non-partitioned tables)
      * @return per-bucket manifest paths and end offsets
      */
-    @PublicEvolving
-    default CompletableFuture<List<RemoteLogManifestInfo>> listRemoteLogManifests(
-            long tableId, @Nullable Long partitionId) {
-        throw new UnsupportedOperationException(
-                "listRemoteLogManifests is not supported by this Admin implementation");
-    }
+    CompletableFuture<List<RemoteLogManifestInfo>> listRemoteLogManifests(
+            long tableId, @Nullable Long partitionId);
 
     /**
      * List per-bucket active KV snapshot ids for a table or partition scope.
@@ -820,10 +816,5 @@ public interface Admin extends AutoCloseable {
      * @param partitionId optional partition id (null for non-partitioned tables)
      * @return per-bucket active snapshot ids grouped by bucket
      */
-    @PublicEvolving
-    default CompletableFuture<ActiveKvSnapshots> listKvSnapshots(
-            long tableId, @Nullable Long partitionId) {
-        throw new UnsupportedOperationException(
-                "listKvSnapshots is not supported by this Admin implementation");
-    }
+    CompletableFuture<ActiveKvSnapshots> listKvSnapshots(long tableId, @Nullable Long partitionId);
 }
