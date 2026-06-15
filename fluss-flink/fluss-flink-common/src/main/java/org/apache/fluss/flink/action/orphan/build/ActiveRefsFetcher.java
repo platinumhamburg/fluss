@@ -26,9 +26,8 @@ import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FsPath;
-import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
-import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
-import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.fluss.remote.RemoteLogManifest;
+import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.RetryUtils;
@@ -42,7 +41,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -67,13 +65,6 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  */
 @Internal
 public final class ActiveRefsFetcher {
-
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-
-    private static final String REMOTE_LOG_SEGMENTS_FIELD = "remote_log_segments";
-    private static final String SEGMENT_ID_FIELD = "segment_id";
-    private static final String START_OFFSET_FIELD = "start_offset";
-    private static final String END_OFFSET_FIELD = "end_offset";
 
     /**
      * Retry backoff base used by {@link RetryUtils} for per-target RPCs. With the default 3 retries
@@ -191,10 +182,9 @@ public final class ActiveRefsFetcher {
                                 partitionId,
                                 bucketId,
                                 e));
-            } catch (ManifestParseException | JsonProcessingException e) {
-                // Manifest payload is unreadable as JSON or violates the expected shape — corrupt
-                // or schema-skewed, not a transient FS hiccup. Distinct reason so operators triage
-                // separately (re-running the action will not recover).
+            } catch (ManifestParseException e) {
+                // Manifest payload is unreadable or violates the shared manifest serde schema.
+                // Distinct reason so operators triage separately from transient FS hiccups.
                 readFailures.put(
                         bucketId,
                         formatBucketReadFailureReason(
@@ -289,16 +279,20 @@ public final class ActiveRefsFetcher {
         return new BucketActiveRefs(segmentRelpaths, Collections.emptySet(), manifestPaths);
     }
 
-    private Set<String> parseLogSegmentRelativePaths(byte[] manifestBytes) throws IOException {
-        JsonNode root = OBJECT_MAPPER.readTree(manifestBytes);
-        JsonNode segmentsNode = requiredNode(root, REMOTE_LOG_SEGMENTS_FIELD);
+    private Set<String> parseLogSegmentRelativePaths(byte[] manifestBytes)
+            throws ManifestParseException {
+        RemoteLogManifest manifest;
+        try {
+            manifest = RemoteLogManifest.fromJsonBytes(manifestBytes);
+        } catch (RuntimeException e) {
+            throw new ManifestParseException("Failed to parse remote log manifest", e);
+        }
+
         Set<String> relativePaths = new HashSet<>();
-        Iterator<JsonNode> iterator = segmentsNode.elements();
-        while (iterator.hasNext()) {
-            JsonNode segmentNode = iterator.next();
-            String segmentId = requiredNode(segmentNode, SEGMENT_ID_FIELD).asText();
-            long startOffset = requiredNode(segmentNode, START_OFFSET_FIELD).asLong();
-            long endOffset = requiredNode(segmentNode, END_OFFSET_FIELD).asLong();
+        for (RemoteLogSegment segment : manifest.getRemoteLogSegmentList()) {
+            String segmentId = segment.remoteLogSegmentId().toString();
+            long startOffset = segment.remoteLogStartOffset();
+            long endOffset = segment.remoteLogEndOffset();
             String baseOffset = FlussPaths.filenamePrefixFromOffset(startOffset);
             String writerOffset = FlussPaths.filenamePrefixFromOffset(endOffset);
 
@@ -311,15 +305,6 @@ public final class ActiveRefsFetcher {
         return relativePaths;
     }
 
-    private static JsonNode requiredNode(JsonNode node, String fieldName)
-            throws ManifestParseException {
-        JsonNode field = node.get(fieldName);
-        if (field == null) {
-            throw new ManifestParseException("Missing required field: " + fieldName);
-        }
-        return field;
-    }
-
     /**
      * Thrown when a remote-log manifest payload is structurally invalid (missing required field,
      * wrong shape). Distinct from {@link IOException} so the bucket-read failure handler can route
@@ -327,8 +312,8 @@ public final class ActiveRefsFetcher {
      * bucket — same skip-this-round outcome, different operator triage.
      */
     static final class ManifestParseException extends IOException {
-        ManifestParseException(String message) {
-            super(message);
+        ManifestParseException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 

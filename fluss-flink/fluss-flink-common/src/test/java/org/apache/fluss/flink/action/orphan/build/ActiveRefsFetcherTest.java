@@ -98,11 +98,7 @@ class ActiveRefsFetcherTest {
     void fetchLogActiveRefsByBucket_abortsOnlyFailedBucket() throws Exception {
         FsPath p0 = new FsPath("oss://b/log/db/t-7/0/metadata/p0.manifest");
         FsPath p1 = new FsPath("oss://b/log/db/t-7/1/metadata/p1.manifest");
-        String manifestJson =
-                "{\"remote_log_segments\":[{"
-                        + "\"segment_id\":\"11111111-1111-1111-1111-111111111111\","
-                        + "\"start_offset\":7,"
-                        + "\"end_offset\":9}]}";
+        String manifestJson = manifestJson("11111111-1111-1111-1111-111111111111", 7L, 9L);
 
         AtomicInteger rpcCalls = new AtomicInteger(0);
         StubAdmin admin = new StubAdmin(rpcCalls);
@@ -244,11 +240,7 @@ class ActiveRefsFetcherTest {
     @Test
     void fetchLogActiveRefsByBucketWithPartitionIdRoutesCorrectly() throws Exception {
         FsPath p0 = new FsPath("oss://b/log/db/t-7/0/metadata/p0.manifest");
-        String manifestJson =
-                "{\"remote_log_segments\":[{"
-                        + "\"segment_id\":\"11111111-1111-1111-1111-111111111111\","
-                        + "\"start_offset\":7,"
-                        + "\"end_offset\":9}]}";
+        String manifestJson = manifestJson("11111111-1111-1111-1111-111111111111", 7L, 9L);
 
         AtomicInteger rpcCalls = new AtomicInteger(0);
         StubAdmin admin = new StubAdmin(rpcCalls);
@@ -303,6 +295,24 @@ class ActiveRefsFetcherTest {
     // -------------------------------------------------------------------------
     // Test fixtures
     // -------------------------------------------------------------------------
+
+    private static String manifestJson(String segmentId, long startOffset, long endOffset) {
+        return "{\"version\":1,"
+                + "\"database\":\"db\","
+                + "\"table\":\"t\","
+                + "\"table_id\":7,"
+                + "\"bucket_id\":0,"
+                + "\"remote_log_segments\":[{"
+                + "\"segment_id\":\""
+                + segmentId
+                + "\",\"start_offset\":"
+                + startOffset
+                + ",\"end_offset\":"
+                + endOffset
+                + ",\"max_timestamp\":0,"
+                + "\"size_in_bytes\":1"
+                + "}]}";
+    }
 
     /** Queues per-call responses for ListRemoteLogManifests / ListKvSnapshots and tracks calls. */
     private static final class StubAdmin implements ActiveRefsFetcher.AdminFacade {

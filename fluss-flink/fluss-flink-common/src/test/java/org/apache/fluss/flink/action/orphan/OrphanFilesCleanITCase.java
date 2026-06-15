@@ -185,13 +185,20 @@ class OrphanFilesCleanITCase {
         Path manifest = localPath(manifestPath);
         Files.createDirectories(manifest.getParent());
         String manifestContent =
-                "{\"remote_log_segments\":["
+                "{\"version\":1,"
+                        + "\"database\":\"db\","
+                        + "\"table\":\"t\","
+                        + "\"table_id\":0,"
+                        + "\"bucket_id\":0,"
+                        + "\"remote_log_segments\":["
                         + "{\"segment_id\":\""
                         + activeId1
-                        + "\",\"start_offset\":0,\"end_offset\":99},"
+                        + "\",\"start_offset\":0,\"end_offset\":99,"
+                        + "\"max_timestamp\":0,\"size_in_bytes\":1},"
                         + "{\"segment_id\":\""
                         + activeId2
-                        + "\",\"start_offset\":100,\"end_offset\":199}"
+                        + "\",\"start_offset\":100,\"end_offset\":199,"
+                        + "\"max_timestamp\":0,\"size_in_bytes\":1}"
                         + "]}";
         Files.write(manifest, manifestContent.getBytes(StandardCharsets.UTF_8));
         makeOld(manifest);
@@ -1120,13 +1127,20 @@ class OrphanFilesCleanITCase {
     }
 
     private static String manifestJson(String segmentId, long startOffset, long endOffset) {
-        return "{\"remote_log_segments\":[{"
+        return "{\"version\":1,"
+                + "\"database\":\"db\","
+                + "\"table\":\"t\","
+                + "\"table_id\":0,"
+                + "\"bucket_id\":0,"
+                + "\"remote_log_segments\":[{"
                 + "\"segment_id\":\""
                 + segmentId
                 + "\",\"start_offset\":"
                 + startOffset
                 + ",\"end_offset\":"
                 + endOffset
+                + ",\"max_timestamp\":0,"
+                + "\"size_in_bytes\":1"
                 + "}]}";
     }
 
