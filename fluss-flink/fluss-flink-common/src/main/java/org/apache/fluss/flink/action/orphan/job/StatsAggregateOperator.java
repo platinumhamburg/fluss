@@ -114,16 +114,6 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
         audit.logSummary(
                 scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed, dryRun);
 
-        LOG.info(
-                "Orphan cleanup complete: scanned={}, deleted={} (files={}, emptyDirs={}), "
-                        + "failures={}, bytesReclaimed={}",
-                finalStats.scanned(),
-                totalDeleted,
-                deleted,
-                emptyDirsRemoved,
-                finalStats.deleteFailures(),
-                finalStats.bytesReclaimed());
-
         output.collect(new StreamRecord<>(finalStats));
     }
 
