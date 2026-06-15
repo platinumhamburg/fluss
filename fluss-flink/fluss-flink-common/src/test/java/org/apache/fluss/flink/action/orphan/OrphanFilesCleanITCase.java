@@ -43,6 +43,7 @@ import org.apache.fluss.server.zk.data.ZkData.PartitionZNode;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.FlussPaths;
 
+import org.apache.flink.test.util.AbstractTestBase;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
@@ -76,7 +77,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** End-to-end tests for orphan files cleanup safety scenarios. */
-class OrphanFilesCleanITCase {
+abstract class OrphanFilesCleanITCase extends AbstractTestBase {
 
     @RegisterExtension
     static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
