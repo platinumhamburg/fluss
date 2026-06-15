@@ -31,7 +31,7 @@ public class OrphanFilesCleanActionFactory implements ActionFactory {
 
     @Override
     public String identifier() {
-        return "orphan_files_clean";
+        return "remove_orphan_files";
     }
 
     @Override
@@ -42,7 +42,7 @@ public class OrphanFilesCleanActionFactory implements ActionFactory {
 
     @Override
     public String help() {
-        return "Usage: orphan_files_clean --bootstrap-server <host:port>\n"
+        return "Usage: remove_orphan_files --bootstrap-server <host:port>\n"
                 + "  (--database <db> [--table <name>] | --all-databases)\n"
                 + "  [--older-than '<ISO-8601 with offset>']\n"
                 + "  [--delete-rate-limit-per-second 100] [--dry-run]\n"
@@ -68,7 +68,7 @@ public class OrphanFilesCleanActionFactory implements ActionFactory {
                 + "    fs.oss.accessKeySecret, fs.oss.endpoint, fs.oss.region). Repeatable.\n"
                 + "\n"
                 + "Examples:\n"
-                + "  orphan_files_clean --bootstrap-server host:9123 --all-databases\n"
+                + "  remove_orphan_files --bootstrap-server host:9123 --all-databases\n"
                 + "    --conf fs.oss.accessKeyId=XXXX --conf fs.oss.accessKeySecret=YYYY\n"
                 + "    --conf fs.oss.endpoint=oss-cn-hangzhou-internal.aliyuncs.com\n"
                 + "    --conf fs.oss.region=cn-hangzhou";

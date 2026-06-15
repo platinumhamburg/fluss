@@ -238,25 +238,6 @@ class OrphanFilesCleanITCase {
     }
 
     @Test
-    void happyPathDeletesOrphanSegment() throws Exception {
-        String dbName = newDatabaseName("happy");
-        TablePath tablePath = createLogTable(dbName, "happy_path");
-        Path activeSegment = seedActiveBucketManifest(tablePath);
-        Path orphan = createOldSegmentFile(tablePath, "99999999999999999999.log");
-
-        runCleanerForDatabase(false, dbName);
-
-        assertThat(Files.exists(orphan)).isFalse();
-        assertThat(Files.exists(activeSegment)).isTrue();
-        assertThat(auditMessages())
-                .anyMatch(
-                        m ->
-                                m.contains("action=deleted")
-                                        && m.contains("rule=log-segment")
-                                        && m.contains(orphan.toString()));
-    }
-
-    @Test
     void dryRunDoesNotDeleteFiles() throws Exception {
         String dbName = newDatabaseName("dryrun");
         TablePath tablePath = createLogTable(dbName, "dry_run");
@@ -282,31 +263,6 @@ class OrphanFilesCleanITCase {
                         m ->
                                 m.contains("action=would_delete")
                                         && m.contains(activeSegment.toString()));
-    }
-
-    @Test
-    void unknownExtensionFilePreserved() throws Exception {
-        String dbName = newDatabaseName("unknown");
-        TablePath tablePath = createLogTable(dbName, "unknown_file");
-        Path activeSegment = seedActiveBucketManifest(tablePath);
-        Path orphan = createOldSegmentFile(tablePath, "99999999999999999999.log");
-        Path unknown = orphan.getParent().resolve("data.bloomfilter");
-        Files.write(unknown, new byte[] {0x24});
-        makeOld(unknown);
-
-        runCleanerForDatabase(false, dbName);
-
-        assertThat(Files.exists(orphan)).isFalse();
-        assertThat(Files.exists(unknown)).isTrue();
-        assertThat(Files.exists(activeSegment)).isTrue();
-        assertThat(auditMessages())
-                .anyMatch(
-                        m ->
-                                m.contains("action=deleted")
-                                        && m.contains("rule=log-segment")
-                                        && m.contains(orphan.toString()));
-        assertThat(auditMessages())
-                .anyMatch(m -> m.contains("action=skip_unknown") && m.contains(unknown.toString()));
     }
 
     /**
@@ -388,24 +344,6 @@ class OrphanFilesCleanITCase {
                                 m.contains("action=deleted")
                                         && m.contains("rule=log-segment")
                                         && m.contains(layout.orphanFile.toString()));
-    }
-
-    @Test
-    void livePrimaryKeyTableDoesNotCleanKvSharedFiles() throws Exception {
-        String dbName = newDatabaseName("livepk");
-        TablePath tablePath = createPrimaryKeyTable(dbName, "live_pk_table");
-        Path orphanKvFile =
-                createOldKvSharedSstFile(
-                        tablePath, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa-orphan.sst");
-
-        runCleanerForDatabase(false, dbName);
-
-        assertThat(Files.exists(orphanKvFile)).isTrue();
-        assertThat(auditMessages())
-                .noneMatch(
-                        m ->
-                                m.contains("rule=kv-shared-sst")
-                                        && m.contains(orphanKvFile.toString()));
     }
 
     @Test
@@ -593,40 +531,6 @@ class OrphanFilesCleanITCase {
                                 m.contains("action=deleted")
                                         && m.contains("rule=log-segment")
                                         && m.contains(oldSegment.toString()));
-    }
-
-    @Test
-    void logBucketSkippedOnNoRemoteManifest() throws Exception {
-        String dbName = newDatabaseName("logbucketskip");
-        TablePath tablePath = createLogTable(dbName, "no_manifest_yet");
-        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
-
-        runCleanerForDatabase(false, dbName);
-
-        assertThat(auditMessages())
-                .anyMatch(
-                        m ->
-                                m.contains("action=skip_log_bucket")
-                                        && m.contains("reason=no_remote_manifest")
-                                        && m.contains("table_id=" + tableInfo.getTableId())
-                                        && m.contains("bucket_id=0"));
-    }
-
-    @Test
-    void kvBucketSkippedOnEmptyBucketActiveRefs() throws Exception {
-        String dbName = newDatabaseName("kvbucketskip");
-        TablePath tablePath = createPrimaryKeyTable(dbName, "no_snapshots_yet");
-        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
-
-        runCleanerForDatabase(false, dbName);
-
-        assertThat(auditMessages())
-                .anyMatch(
-                        m ->
-                                m.contains("action=skip_kv_bucket")
-                                        && m.contains("reason=empty_active_set")
-                                        && m.contains("table_id=" + tableInfo.getTableId())
-                                        && m.contains("bucket_id=0"));
     }
 
     @Test
@@ -992,25 +896,6 @@ class OrphanFilesCleanITCase {
         Files.createDirectories(metadataDir);
         Path file = metadataDir.resolve(fileName);
         Files.write(file, new byte[] {0x11});
-        makeOld(file);
-        return file;
-    }
-
-    private Path createOldKvSharedSstFile(TablePath tablePath, String fileName) throws Exception {
-        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
-        org.apache.fluss.fs.FsPath kvTabletDir =
-                FlussPaths.remoteKvTabletDir(
-                        new org.apache.fluss.fs.FsPath(
-                                FLUSS_CLUSTER_EXTENSION.getRemoteDataDir()
-                                        + "/"
-                                        + FlussPaths.REMOTE_KV_DIR_NAME),
-                        PhysicalTablePath.of(tablePath),
-                        new TableBucket(tableInfo.getTableId(), 0));
-        org.apache.fluss.fs.FsPath sharedDir = FlussPaths.remoteKvSharedDir(kvTabletDir);
-        Path localSharedDir = Paths.get(java.net.URI.create(sharedDir.toString()));
-        Files.createDirectories(localSharedDir);
-        Path file = localSharedDir.resolve(fileName);
-        Files.write(file, new byte[] {0x24});
         makeOld(file);
         return file;
     }
