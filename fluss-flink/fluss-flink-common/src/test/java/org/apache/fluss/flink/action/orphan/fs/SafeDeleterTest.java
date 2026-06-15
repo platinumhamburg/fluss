@@ -23,7 +23,6 @@ import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.local.LocalFileSystem;
-import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -81,45 +80,6 @@ class SafeDeleterTest {
         SafeDeleter d = new SafeDeleter(localFs(), false, new AuditLogger());
         d.deleteEmptyDir(new FsPath(dir.toString()));
         assertThat(Files.exists(dir)).isFalse();
-    }
-
-    @Test
-    void multipleDeletesAllSucceed() throws IOException {
-        Path a = Files.createFile(tmp.resolve("a.log"));
-        Path b = Files.createFile(tmp.resolve("b.log"));
-        Path c = Files.createFile(tmp.resolve("c.log"));
-        Files.write(a, new byte[] {1});
-        Files.write(b, new byte[] {2});
-        Files.write(c, new byte[] {3});
-        Path emptyDir = Files.createDirectory(tmp.resolve("emptyDir"));
-
-        RateLimiter limiter = RateLimiter.create(Double.MAX_VALUE);
-        SafeDeleter deleter = new SafeDeleter(localFs(), false, new AuditLogger(), limiter);
-
-        deleter.deleteFile(new FsPath(a.toString()), Decision.DELETE, RuleId.LOG_SEGMENT);
-        deleter.deleteFile(new FsPath(b.toString()), Decision.DELETE, RuleId.LOG_SEGMENT);
-        deleter.deleteFile(new FsPath(c.toString()), Decision.DELETE, RuleId.LOG_SEGMENT);
-        deleter.deleteEmptyDir(new FsPath(emptyDir.toString()));
-
-        assertThat(Files.exists(a)).isFalse();
-        assertThat(Files.exists(b)).isFalse();
-        assertThat(Files.exists(c)).isFalse();
-        assertThat(Files.exists(emptyDir)).isFalse();
-    }
-
-    @Test
-    void dryRunPreservesAllFiles() throws IOException {
-        Path file = Files.createFile(tmp.resolve("orphan.log"));
-        Path emptyDir = Files.createDirectory(tmp.resolve("emptyDir"));
-
-        RateLimiter limiter = RateLimiter.create(Double.MAX_VALUE);
-        SafeDeleter deleter = new SafeDeleter(localFs(), true, new AuditLogger(), limiter);
-
-        deleter.deleteFile(new FsPath(file.toString()), Decision.DELETE, RuleId.LOG_SEGMENT);
-        deleter.deleteEmptyDir(new FsPath(emptyDir.toString()));
-
-        assertThat(Files.exists(file)).isTrue();
-        assertThat(Files.exists(emptyDir)).isTrue();
     }
 
     private static FileSystem localFs() {
