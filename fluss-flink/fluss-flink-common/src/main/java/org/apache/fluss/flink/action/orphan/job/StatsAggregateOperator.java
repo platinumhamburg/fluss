@@ -99,7 +99,8 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
 
     @Override
     public void endInput() {
-        long emptyDirsRemoved = sweepEmptyDirs(touchedDirs);
+        AuditLogger audit = new AuditLogger();
+        long emptyDirsRemoved = sweepEmptyDirs(touchedDirs, audit);
         long totalDeleted = deleted + emptyDirsRemoved;
 
         CleanStats finalStats =
@@ -109,6 +110,9 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
                         deleteFailures,
                         bytesReclaimed,
                         new ArrayList<String>(0));
+
+        audit.logSummary(
+                scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed, dryRun);
 
         LOG.info(
                 "Orphan cleanup complete: scanned={}, deleted={} (files={}, emptyDirs={}), "
@@ -123,11 +127,10 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
         output.collect(new StreamRecord<>(finalStats));
     }
 
-    private long sweepEmptyDirs(Set<String> dirs) {
+    private long sweepEmptyDirs(Set<String> dirs, AuditLogger audit) {
         if (dirs.isEmpty()) {
             return 0L;
         }
-        AuditLogger audit = new AuditLogger();
         EmptyDirSweeper sweeper = new EmptyDirSweeper(dryRun, audit, sweepRateLimiter);
         for (String dir : dirs) {
             sweeper.registerTouched(new FsPath(dir));

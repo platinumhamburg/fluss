@@ -207,4 +207,30 @@ public final class AuditLogger {
                 resolvedRoot,
                 Instant.now());
     }
+
+    /**
+     * Final summary event emitted once at the end of a run, carrying the headline counters that
+     * operators query most often ("how many files were removed and how much space was reclaimed").
+     * Routed through the dedicated audit logger so the result is queryable from the same sink as
+     * the per-file {@code action=deleted} / {@code action=skip_*} lines.
+     */
+    public void logSummary(
+            long scanned,
+            long deletedFiles,
+            long emptyDirsRemoved,
+            long deleteFailures,
+            long bytesReclaimed,
+            boolean dryRun) {
+        AUDIT.info(
+                "action=summary scanned={} deleted_total={} deleted_files={} empty_dirs_removed={}"
+                        + " delete_failures={} bytes_reclaimed={} dry_run={} ts={}",
+                scanned,
+                deletedFiles + emptyDirsRemoved,
+                deletedFiles,
+                emptyDirsRemoved,
+                deleteFailures,
+                bytesReclaimed,
+                dryRun,
+                Instant.now());
+    }
 }
