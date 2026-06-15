@@ -23,6 +23,7 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
@@ -105,6 +106,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
         try (Connection connection = ConnectionFactory.createConnection(flussConfig);
                 Admin admin = connection.getAdmin()) {
+            // Fail fast on incompatible servers: the action jar may be deployed against an
+            // older cluster that does not implement ListRemoteLogManifests / ListKvSnapshots.
+            // Without this guard, every per-target fetch would degrade to skip_log_target /
+            // skip_kv_target audit events and the job would exit "successfully" with
+            // deleted=0, masking the incompatibility.
+            verifyServerSupportsRequiredApis(admin);
+
             AuditLogger audit = new AuditLogger();
             audit.logCutoff(config.olderThanMillis());
 
@@ -135,6 +143,56 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             normalized.add(normalizeRoot(root));
         }
         return new ArrayList<String>(normalized);
+    }
+
+    /**
+     * Probes the two RPCs this action depends on and throws if the connected server does not
+     * implement them. A sentinel {@code tableId} of {@link Long#MAX_VALUE} is used so that on a
+     * compatible server the call simply fails with a benign error (typically table-not-found),
+     * whereas an incompatible server raises {@link UnsupportedVersionException} during ApiVersions
+     * negotiation. Any non-{@code UnsupportedVersionException} outcome is treated as proof that the
+     * RPC is recognized.
+     */
+    private static void verifyServerSupportsRequiredApis(Admin admin) {
+        long sentinelTableId = Long.MAX_VALUE;
+        probeApi(
+                "ListRemoteLogManifests",
+                () -> admin.listRemoteLogManifests(sentinelTableId, null).get());
+        probeApi("ListKvSnapshots", () -> admin.listKvSnapshots(sentinelTableId, null).get());
+    }
+
+    private static void probeApi(String apiName, ThrowingProbe probe) {
+        try {
+            probe.run();
+        } catch (Throwable t) {
+            if (isUnsupportedVersion(t)) {
+                throw new UnsupportedOperationException(
+                        "Orphan files cleanup requires the Fluss server to support the "
+                                + apiName
+                                + " RPC, which the connected cluster does not. Upgrade the"
+                                + " cluster to a version that exposes this RPC, or run an"
+                                + " older orphan-files-cleanup action that targets this server.",
+                        t);
+            }
+            // Any other failure means the RPC is recognized; the call merely failed because of
+            // the sentinel target id. Compatibility is satisfied.
+        }
+    }
+
+    private static boolean isUnsupportedVersion(Throwable t) {
+        Throwable cause = t;
+        while (cause != null) {
+            if (cause instanceof UnsupportedVersionException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    @FunctionalInterface
+    private interface ThrowingProbe {
+        void run() throws Exception;
     }
 
     // -------------------------------------------------------------------------
