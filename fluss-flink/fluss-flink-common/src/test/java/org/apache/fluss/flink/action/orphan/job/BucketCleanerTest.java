@@ -107,6 +107,38 @@ class BucketCleanerTest {
         assertThat(Files.exists(segmentDir)).isTrue();
     }
 
+    @Test
+    void scansButDoesNotDeleteUnknownDotFiles(@TempDir Path tmp) throws IOException {
+        Path bucketRoot = Files.createDirectories(tmp.resolve("bucket"));
+        Path segmentDir =
+                Files.createDirectories(bucketRoot.resolve("11111111-1111-1111-1111-111111111111"));
+        Path dotFile = Files.write(segmentDir.resolve(".unknown"), new byte[] {0x42});
+        long cutoff = System.currentTimeMillis() - 1000L;
+        makeOld(dotFile, cutoff - 1000L);
+        makeOld(segmentDir, cutoff - 1000L);
+        makeOld(bucketRoot, cutoff - 1000L);
+
+        BucketCleaner cleaner =
+                new BucketCleaner(
+                        new RuleDispatcher(),
+                        new SafeDeleter(
+                                new FsPath(bucketRoot.toString()).getFileSystem(),
+                                false,
+                                new AuditLogger(),
+                                RateLimiter.create(1000.0)),
+                        new AuditLogger(),
+                        cutoff);
+
+        BucketCleaner.BucketCleanStats stats =
+                cleaner.clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
+
+        assertThat(stats.scanned).isEqualTo(1L);
+        assertThat(stats.deleted).isEqualTo(0L);
+        assertThat(stats.emptyDirsRemoved).isEqualTo(0L);
+        assertThat(Files.exists(dotFile)).isTrue();
+        assertThat(Files.exists(segmentDir)).isTrue();
+    }
+
     private static void makeOld(Path path, long timestampMillis) throws IOException {
         Files.setLastModifiedTime(path, FileTime.fromMillis(timestampMillis));
     }

@@ -197,9 +197,6 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                                     child.getModificationTime() < task.cutoffMillis()));
                     continue;
                 }
-                if (childPath.getName().startsWith(".")) {
-                    continue;
-                }
                 scanned++;
                 if (child.getModificationTime() >= task.cutoffMillis()) {
                     continue;
