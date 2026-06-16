@@ -887,6 +887,7 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
         Path file = segmentDir.resolve(fileName);
         Files.write(file, new byte[] {0x42});
         makeOld(file);
+        makeOld(segmentDir);
         return file;
     }
 
