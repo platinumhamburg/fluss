@@ -22,8 +22,6 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.cluster.ConfigEntry;
-import org.apache.fluss.fs.FileStatus;
-import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -33,7 +31,6 @@ import org.apache.fluss.metadata.TablePath;
 
 import javax.annotation.Nullable;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -181,30 +178,6 @@ public final class OrphanCleanUtils {
         return remoteDataDir.endsWith("/")
                 ? remoteDataDir.substring(0, remoteDataDir.length() - 1)
                 : remoteDataDir;
-    }
-
-    /**
-     * Lists the entries of a directory, returning {@code null} on {@link IOException} (directory
-     * does not exist or is inaccessible).
-     */
-    @Nullable
-    public static FileStatus[] listStatuses(FileSystem fs, FsPath dir) {
-        try {
-            return fs.listStatus(dir);
-        } catch (IOException e) {
-            return null;
-        }
-    }
-
-    /**
-     * Returns the {@link FileSystem} for a path if the path exists, or {@code null} otherwise.
-     *
-     * @throws IOException if resolving the filesystem itself fails
-     */
-    @Nullable
-    public static FileSystem getFileSystemIfExists(FsPath dir) throws IOException {
-        FileSystem fs = dir.getFileSystem();
-        return fs.exists(dir) ? fs : null;
     }
 
     /** Formats a bucket-scope key for audit/logging purposes. */

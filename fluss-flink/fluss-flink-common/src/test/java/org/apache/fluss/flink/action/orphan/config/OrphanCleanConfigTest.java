@@ -50,10 +50,42 @@ class OrphanCleanConfigTest {
         long olderThanHigh = afterParse - Duration.ofDays(3).toMillis();
         assertThat(config.olderThanMillis()).isBetween(olderThanLow, olderThanHigh);
         assertThat(config.dryRun()).isFalse();
-        assertThat(config.deleteRateLimitPerSecond()).isEqualTo(100L);
+        assertThat(config.remoteFsOpRateLimitPerSecond()).isEqualTo(100L);
         assertThat(config.allowDeleteManifest()).isFalse();
         assertThat(config.allowCleanOrphanTables()).isFalse();
         assertThat(config.allowCleanOrphanPartitions()).isFalse();
+    }
+
+    @Test
+    void remoteFsOpRateLimitParsed() {
+        OrphanCleanConfig cfg =
+                OrphanCleanConfig.fromParams(
+                        MultipleParameterToolAdapter.fromArgs(
+                                new String[] {
+                                    "--bootstrap-server",
+                                    "h:9123",
+                                    "--all-databases",
+                                    "--remote-fs-op-rate-limit-per-second",
+                                    "42"
+                                }));
+        assertThat(cfg.remoteFsOpRateLimitPerSecond()).isEqualTo(42L);
+    }
+
+    @Test
+    void remoteFsOpRateLimitMustBePositive() {
+        assertThatThrownBy(
+                        () ->
+                                OrphanCleanConfig.fromParams(
+                                        MultipleParameterToolAdapter.fromArgs(
+                                                new String[] {
+                                                    "--bootstrap-server",
+                                                    "h:9123",
+                                                    "--all-databases",
+                                                    "--remote-fs-op-rate-limit-per-second",
+                                                    "0"
+                                                })))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--remote-fs-op-rate-limit-per-second must be positive");
     }
 
     @Test

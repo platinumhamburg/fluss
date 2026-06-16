@@ -28,6 +28,7 @@ import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.slf4j.Logger;
@@ -53,16 +54,19 @@ public final class BucketCleaner {
     private final SafeDeleter safeDeleter;
     private final AuditLogger audit;
     private final long cutoffMillis;
+    private final RateLimiter remoteFsOpRateLimiter;
 
     public BucketCleaner(
             RuleDispatcher dispatcher,
             SafeDeleter safeDeleter,
             AuditLogger audit,
-            long cutoffMillis) {
+            long cutoffMillis,
+            RateLimiter remoteFsOpRateLimiter) {
         this.dispatcher = dispatcher;
         this.safeDeleter = safeDeleter;
         this.audit = audit;
         this.cutoffMillis = cutoffMillis;
+        this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
     }
 
     /** Cleans one bucket's log/kv subtrees using the caller-supplied active reference set. */
@@ -80,6 +84,7 @@ public final class BucketCleaner {
     private void walkAndCleanDir(FsPath root, BucketActiveRefs activeRefs, BucketCleanStats stats)
             throws IOException {
         FileSystem fs = root.getFileSystem();
+        remoteFsOpRateLimiter.acquire();
         if (!fs.exists(root)) {
             return;
         }
@@ -96,6 +101,7 @@ public final class BucketCleaner {
             }
             FileStatus[] children;
             try {
+                remoteFsOpRateLimiter.acquire();
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);

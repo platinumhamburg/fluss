@@ -55,17 +55,14 @@ public final class SafeDeleter {
     private final FileSystem fs;
     private final boolean dryRun;
     private final AuditLogger audit;
-    private final RateLimiter rateLimiter;
+    private final RateLimiter remoteFsOpRateLimiter;
 
-    public SafeDeleter(FileSystem fs, boolean dryRun, AuditLogger audit) {
-        this(fs, dryRun, audit, RateLimiter.create(100.0));
-    }
-
-    public SafeDeleter(FileSystem fs, boolean dryRun, AuditLogger audit, RateLimiter rateLimiter) {
+    public SafeDeleter(
+            FileSystem fs, boolean dryRun, AuditLogger audit, RateLimiter remoteFsOpRateLimiter) {
         this.fs = fs;
         this.dryRun = dryRun;
         this.audit = audit;
-        this.rateLimiter = rateLimiter;
+        this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
     }
 
     /**
@@ -85,7 +82,7 @@ public final class SafeDeleter {
             audit.logWouldDelete(file, ruleId);
             return true;
         }
-        rateLimiter.acquire();
+        remoteFsOpRateLimiter.acquire();
         try {
             boolean ok = fs.delete(file, false);
             audit.logDeleted(file, ruleId, ok);
@@ -114,7 +111,7 @@ public final class SafeDeleter {
             audit.logWouldDeleteDir(dir);
             return true;
         }
-        rateLimiter.acquire();
+        remoteFsOpRateLimiter.acquire();
         try {
             boolean ok = fs.delete(dir, false);
             if (ok) {
@@ -129,6 +126,7 @@ public final class SafeDeleter {
 
     private FileStatus[] listChildrenSilently(FsPath dir) {
         try {
+            remoteFsOpRateLimiter.acquire();
             return fs.listStatus(dir);
         } catch (IOException ignored) {
             return null;

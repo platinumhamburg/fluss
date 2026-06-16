@@ -75,7 +75,8 @@ public final class OrphanFilesCleanJob {
                 tasks.rebalance()
                         .process(
                                 new ScanAndCleanFunction(
-                                        config.deleteRateLimitPerSecond(), config.extraConfigs()))
+                                        config.remoteFsOpRateLimitPerSecond(),
+                                        config.extraConfigs()))
                         .returns(TypeInformation.of(new TypeHint<CleanStats>() {}))
                         .name("ScanAndClean");
         if (parallelism != null) {

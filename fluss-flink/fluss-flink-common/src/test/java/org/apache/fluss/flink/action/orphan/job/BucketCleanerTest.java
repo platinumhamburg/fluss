@@ -54,16 +54,7 @@ class BucketCleanerTest {
         makeOld(segmentDir, cutoff - 1000L);
         makeOld(bucketRoot, cutoff - 1000L);
 
-        BucketCleaner cleaner =
-                new BucketCleaner(
-                        new RuleDispatcher(),
-                        new SafeDeleter(
-                                new FsPath(bucketRoot.toString()).getFileSystem(),
-                                false,
-                                new AuditLogger(),
-                                RateLimiter.create(1000.0)),
-                        new AuditLogger(),
-                        cutoff);
+        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff);
 
         BucketCleaner.BucketCleanStats stats =
                 cleaner.clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
@@ -83,16 +74,7 @@ class BucketCleanerTest {
                 Files.createDirectories(bucketRoot.resolve("11111111-1111-1111-1111-111111111111"));
         long cutoff = System.currentTimeMillis() - 1000L;
 
-        BucketCleaner cleaner =
-                new BucketCleaner(
-                        new RuleDispatcher(),
-                        new SafeDeleter(
-                                new FsPath(bucketRoot.toString()).getFileSystem(),
-                                false,
-                                new AuditLogger(),
-                                RateLimiter.create(1000.0)),
-                        new AuditLogger(),
-                        cutoff);
+        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff);
 
         BucketCleaner.BucketCleanStats stats =
                 cleaner.clean(
@@ -118,16 +100,7 @@ class BucketCleanerTest {
         makeOld(segmentDir, cutoff - 1000L);
         makeOld(bucketRoot, cutoff - 1000L);
 
-        BucketCleaner cleaner =
-                new BucketCleaner(
-                        new RuleDispatcher(),
-                        new SafeDeleter(
-                                new FsPath(bucketRoot.toString()).getFileSystem(),
-                                false,
-                                new AuditLogger(),
-                                RateLimiter.create(1000.0)),
-                        new AuditLogger(),
-                        cutoff);
+        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff);
 
         BucketCleaner.BucketCleanStats stats =
                 cleaner.clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
@@ -141,5 +114,19 @@ class BucketCleanerTest {
 
     private static void makeOld(Path path, long timestampMillis) throws IOException {
         Files.setLastModifiedTime(path, FileTime.fromMillis(timestampMillis));
+    }
+
+    private static BucketCleaner createCleaner(Path bucketRoot, long cutoff) throws IOException {
+        RateLimiter remoteFsOpRateLimiter = RateLimiter.create(1000.0);
+        return new BucketCleaner(
+                new RuleDispatcher(),
+                new SafeDeleter(
+                        new FsPath(bucketRoot.toString()).getFileSystem(),
+                        false,
+                        new AuditLogger(),
+                        remoteFsOpRateLimiter),
+                new AuditLogger(),
+                cutoff,
+                remoteFsOpRateLimiter);
     }
 }

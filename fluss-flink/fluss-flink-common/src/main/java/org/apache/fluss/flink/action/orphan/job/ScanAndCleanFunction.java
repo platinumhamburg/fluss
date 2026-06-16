@@ -55,9 +55,9 @@ import java.util.Map;
  *       older than the cutoff, then removes old empty directories bottom-up.
  * </ul>
  *
- * <p>Each task emits a single {@link CleanStats} containing scalar counters. Delete rate is limited
- * per-subtask: {@code configuredRate / runtimeParallelism}. The serial processing within each
- * subtask guarantees no concurrent throttler access.
+ * <p>Each task emits a single {@link CleanStats} containing scalar counters. Remote filesystem
+ * operation rate is limited per-subtask: {@code configuredRate / runtimeParallelism}. The serial
+ * processing within each subtask guarantees no concurrent throttler access.
  */
 @Internal
 public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, CleanStats> {
@@ -65,14 +65,15 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(ScanAndCleanFunction.class);
 
-    private final long deleteRateLimitPerSecond;
+    private final long remoteFsOpRateLimitPerSecond;
     private final Map<String, String> extraConfigs;
 
     private transient AuditLogger audit;
-    private transient RateLimiter rateLimiter;
+    private transient RateLimiter remoteFsOpRateLimiter;
 
-    public ScanAndCleanFunction(long deleteRateLimitPerSecond, Map<String, String> extraConfigs) {
-        this.deleteRateLimitPerSecond = deleteRateLimitPerSecond;
+    public ScanAndCleanFunction(
+            long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
+        this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
         this.extraConfigs = extraConfigs;
     }
 
@@ -86,14 +87,13 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         audit = new AuditLogger();
         int parallelism = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
-        // Distribute the configured rate as base + 1 extra for the first `remainder` subtasks so
-        // that the per-subtask rates sum back to the configured aggregate. Each subtask gets at
-        // least 1/s (hard floor) — when parallelism exceeds the configured rate, the aggregate
-        // may theoretically exceed it; in practice Batch scheduling limits actual concurrency.
-        long base = deleteRateLimitPerSecond / parallelism;
-        long remainder = deleteRateLimitPerSecond % parallelism;
-        long quota = base + (subtaskIndex < remainder ? 1L : 0L);
-        rateLimiter = RateLimiter.create(Math.max(1.0, (double) quota));
+        // Distribute the configured rate as base + 1 extra for the first `remainder` subtasks.
+        // Flink does not provide a cross-JVM limiter here, so this is a best-effort job-level
+        // target. Each subtask gets at least 1/s; if parallelism exceeds the configured rate, the
+        // effective aggregate can exceed the target by that floor.
+        remoteFsOpRateLimiter =
+                RateLimiter.create(
+                        perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism, subtaskIndex));
     }
 
     @Override
@@ -127,7 +127,8 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
         SafeDeleter safeDeleter = createSafeDeleter(anyDir.getFileSystem(), task.dryRun());
         BucketCleaner cleaner =
-                new BucketCleaner(dispatcher, safeDeleter, audit, task.cutoffMillis());
+                new BucketCleaner(
+                        dispatcher, safeDeleter, audit, task.cutoffMillis(), remoteFsOpRateLimiter);
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
@@ -146,6 +147,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     private CleanStats processOrphanDirTask(OrphanDirCleanTask task) throws IOException {
         FsPath dirPath = new FsPath(task.dirPath());
         FileSystem fs = dirPath.getFileSystem();
+        remoteFsOpRateLimiter.acquire();
         if (!fs.exists(dirPath)) {
             return CleanStats.empty();
         }
@@ -159,6 +161,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         long deleteFailures = 0L;
         long bytesReclaimed = 0L;
 
+        remoteFsOpRateLimiter.acquire();
         FileStatus rootStatus = fs.getFileStatus(dirPath);
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
         stack.push(
@@ -178,6 +181,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             }
             FileStatus[] children;
             try {
+                remoteFsOpRateLimiter.acquire();
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
@@ -234,7 +238,14 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     // -------------------------------------------------------------------------
 
     private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun) {
-        return new SafeDeleter(fs, dryRun, audit, rateLimiter);
+        return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter);
+    }
+
+    private static double perSubtaskRate(long totalRate, int parallelism, int subtaskIndex) {
+        long base = totalRate / parallelism;
+        long remainder = totalRate % parallelism;
+        long quota = base + (subtaskIndex < remainder ? 1L : 0L);
+        return Math.max(1.0, (double) quota);
     }
 
     private static final class DirVisit {
