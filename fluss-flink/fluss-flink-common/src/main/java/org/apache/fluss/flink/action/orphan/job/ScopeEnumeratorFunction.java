@@ -40,6 +40,7 @@ import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
@@ -62,8 +63,6 @@ import java.util.function.Predicate;
 
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.enumerateBuckets;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.fetchClusterConfigMap;
-import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.getFileSystemIfExists;
-import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.listStatuses;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.normalizeRoot;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.physicalPath;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.remoteSubDir;
@@ -116,7 +115,9 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             AuditLogger audit = new AuditLogger();
             audit.logCutoff(config.olderThanMillis());
 
-            ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3);
+            RateLimiter remoteFsOpRateLimiter =
+                    RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
+            ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3, remoteFsOpRateLimiter);
             MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
             Map<String, String> clusterConfigMap = fetchClusterConfigMap(admin);
             String clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
@@ -129,9 +130,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 for (LiveTableScope liveTable : dbState.liveTables) {
                     emitBucketTasks(
                             liveTable, fetcher, audit, clusterRemoteDataDir, clusterRoots, out);
-                    emitOrphanPartitionDirTasks(liveTable, tracker, clusterRoots, audit, out);
+                    emitOrphanPartitionDirTasks(
+                            liveTable, tracker, clusterRoots, audit, remoteFsOpRateLimiter, out);
                 }
-                emitOrphanTableDirTasks(dbState, tracker, clusterRoots, audit, out);
+                emitOrphanTableDirTasks(
+                        dbState, tracker, clusterRoots, audit, remoteFsOpRateLimiter, out);
             }
         }
     }
@@ -443,6 +446,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             MaxKnownIdsTracker tracker,
             List<String> clusterRoots,
             AuditLogger audit,
+            RateLimiter remoteFsOpRateLimiter,
             Collector<CleanTask> out)
             throws IOException {
         if (!dbState.tableInfosComplete) {
@@ -461,6 +465,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             dirName ->
                                     OrphanDirDetector.isOrphanTable(
                                             dirName, activeTableIds, maxKnownTableId),
+                            remoteFsOpRateLimiter,
                             dir ->
                                     out.collect(
                                             new OrphanDirCleanTask(
@@ -474,6 +479,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             dirName ->
                                     OrphanDirDetector.isOrphanTable(
                                             dirName, activeTableIds, maxKnownTableId),
+                            remoteFsOpRateLimiter,
                             dir -> audit.logSkipOrphanTable(dir, "default-conservative"));
                 }
             }
@@ -485,6 +491,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             MaxKnownIdsTracker tracker,
             List<String> clusterRoots,
             AuditLogger audit,
+            RateLimiter remoteFsOpRateLimiter,
             Collector<CleanTask> out)
             throws IOException {
         if (!liveTable.partitioned || !liveTable.partitionInfosComplete) {
@@ -506,6 +513,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             dirName ->
                                     OrphanDirDetector.isOrphanPartition(
                                             dirName, activePartitionIds, maxKnownPartitionId),
+                            remoteFsOpRateLimiter,
                             dir ->
                                     out.collect(
                                             new OrphanDirCleanTask(
@@ -519,6 +527,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             dirName ->
                                     OrphanDirDetector.isOrphanPartition(
                                             dirName, activePartitionIds, maxKnownPartitionId),
+                            remoteFsOpRateLimiter,
                             dir -> audit.logSkipOrphanPartition(dir, "default-conservative"));
                 }
             }
@@ -526,13 +535,16 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     }
 
     private void forEachOrphanDirUnderParent(
-            FsPath parentDir, Predicate<String> isOrphan, Consumer<FsPath> action)
+            FsPath parentDir,
+            Predicate<String> isOrphan,
+            RateLimiter remoteFsOpRateLimiter,
+            Consumer<FsPath> action)
             throws IOException {
-        FileSystem fs = getFileSystemIfExists(parentDir);
+        FileSystem fs = getFileSystemIfExists(parentDir, remoteFsOpRateLimiter);
         if (fs == null) {
             return;
         }
-        FileStatus[] entries = listStatuses(fs, parentDir);
+        FileStatus[] entries = listStatuses(fs, parentDir, remoteFsOpRateLimiter);
         if (entries == null) {
             return;
         }
@@ -553,6 +565,26 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
     private static String classifyName(Throwable e) {
         return RpcErrorClassifier.classify(e).name();
+    }
+
+    @Nullable
+    private static FileSystem getFileSystemIfExists(FsPath dir, RateLimiter remoteFsOpRateLimiter)
+            throws IOException {
+        FileSystem fs = dir.getFileSystem();
+        remoteFsOpRateLimiter.acquire();
+        return fs.exists(dir) ? fs : null;
+    }
+
+    @Nullable
+    private static FileStatus[] listStatuses(
+            FileSystem fs, FsPath dir, RateLimiter remoteFsOpRateLimiter) {
+        try {
+            remoteFsOpRateLimiter.acquire();
+            return fs.listStatus(dir);
+        } catch (IOException e) {
+            LOG.warn("Failed to list directory: {}", dir, e);
+            return null;
+        }
     }
 
     // -------------------------------------------------------------------------

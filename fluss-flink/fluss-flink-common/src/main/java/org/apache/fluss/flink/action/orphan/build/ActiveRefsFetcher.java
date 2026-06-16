@@ -28,6 +28,7 @@ import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.remote.RemoteLogManifest;
 import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.RetryUtils;
@@ -91,13 +92,15 @@ public final class ActiveRefsFetcher {
     private final MetadataReader metadataReader;
     private final int maxRetries;
     private final long backoffMillis;
+    private final RateLimiter remoteFsOpRateLimiter;
 
-    public ActiveRefsFetcher(Admin admin, int maxRetries) {
-        this(wrap(admin), DEFAULT_METADATA_READER, maxRetries, DEFAULT_BACKOFF_MILLIS);
-    }
-
-    public ActiveRefsFetcher(Admin admin, MetadataReader metadataReader, int maxRetries) {
-        this(wrap(admin), metadataReader, maxRetries, DEFAULT_BACKOFF_MILLIS);
+    public ActiveRefsFetcher(Admin admin, int maxRetries, RateLimiter remoteFsOpRateLimiter) {
+        this(
+                wrap(admin),
+                DEFAULT_METADATA_READER,
+                maxRetries,
+                DEFAULT_BACKOFF_MILLIS,
+                remoteFsOpRateLimiter);
     }
 
     /** Test constructor: defaults backoff to 0 so unit tests don't pay retry sleep. */
@@ -109,12 +112,23 @@ public final class ActiveRefsFetcher {
     @VisibleForTesting
     ActiveRefsFetcher(
             AdminFacade admin, MetadataReader metadataReader, int maxRetries, long backoffMillis) {
+        this(admin, metadataReader, maxRetries, backoffMillis, RateLimiter.create(1000.0));
+    }
+
+    @VisibleForTesting
+    ActiveRefsFetcher(
+            AdminFacade admin,
+            MetadataReader metadataReader,
+            int maxRetries,
+            long backoffMillis,
+            RateLimiter remoteFsOpRateLimiter) {
         checkArgument(maxRetries >= 1, "maxRetries must be >= 1, got %s", maxRetries);
         checkArgument(backoffMillis >= 0L, "backoffMillis must be >= 0, got %s", backoffMillis);
         this.admin = admin;
         this.metadataReader = metadataReader;
         this.maxRetries = maxRetries;
         this.backoffMillis = backoffMillis;
+        this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
     }
 
     private static AdminFacade wrap(Admin admin) {
@@ -273,6 +287,7 @@ public final class ActiveRefsFetcher {
         for (RemoteLogManifestInfo entry : entries) {
             String path = entry.getRemoteLogManifestPath();
             manifestPaths.add(path);
+            remoteFsOpRateLimiter.acquire();
             byte[] manifestBytes = metadataReader.read(new FsPath(path));
             segmentRelpaths.addAll(parseLogSegmentRelativePaths(manifestBytes));
         }

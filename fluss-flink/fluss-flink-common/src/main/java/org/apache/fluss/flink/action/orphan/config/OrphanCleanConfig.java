@@ -51,7 +51,7 @@ public final class OrphanCleanConfig implements Serializable {
     /** Default file-level cutoff: files written before {@code now - 3d} are deletion-eligible. */
     private static final Duration DEFAULT_OLDER_THAN = Duration.ofDays(3);
 
-    private static final long DEFAULT_DELETE_RATE_LIMIT_PER_SECOND = 100L;
+    private static final long DEFAULT_REMOTE_FS_OP_RATE_LIMIT_PER_SECOND = 100L;
 
     private final String bootstrapServer;
     private final boolean allDatabases;
@@ -59,7 +59,7 @@ public final class OrphanCleanConfig implements Serializable {
     private final @Nullable String table;
     private final long olderThanMillis;
     private final boolean dryRun;
-    private final long deleteRateLimitPerSecond;
+    private final long remoteFsOpRateLimitPerSecond;
     private final @Nullable Integer parallelism;
     private final boolean allowDeleteManifest;
     private final boolean allowCleanOrphanTables;
@@ -73,7 +73,7 @@ public final class OrphanCleanConfig implements Serializable {
             @Nullable String table,
             long olderThanMillis,
             boolean dryRun,
-            long deleteRateLimitPerSecond,
+            long remoteFsOpRateLimitPerSecond,
             @Nullable Integer parallelism,
             boolean allowDeleteManifest,
             boolean allowCleanOrphanTables,
@@ -85,7 +85,7 @@ public final class OrphanCleanConfig implements Serializable {
         this.table = table;
         this.olderThanMillis = olderThanMillis;
         this.dryRun = dryRun;
-        this.deleteRateLimitPerSecond = deleteRateLimitPerSecond;
+        this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
         this.parallelism = parallelism;
         this.allowDeleteManifest = allowDeleteManifest;
         this.allowCleanOrphanTables = allowCleanOrphanTables;
@@ -118,8 +118,11 @@ public final class OrphanCleanConfig implements Serializable {
         long now = System.currentTimeMillis();
         long olderThanMillis =
                 parseCutoff("--older-than", params.get("older-than"), now, DEFAULT_OLDER_THAN);
-        long deleteRateLimitPerSecond =
-                parseDeleteRateLimit(params.get("delete-rate-limit-per-second"));
+        long remoteFsOpRateLimitPerSecond =
+                parsePositiveRateLimit(
+                        "--remote-fs-op-rate-limit-per-second",
+                        params.get("remote-fs-op-rate-limit-per-second"),
+                        DEFAULT_REMOTE_FS_OP_RATE_LIMIT_PER_SECOND);
         Integer parallelism = parseParallelism(params.get("parallelism"));
         boolean allowDeleteManifest = params.has("allow-delete-manifest");
         boolean allowCleanOrphanTables = params.has("allow-clean-orphan-tables");
@@ -132,7 +135,7 @@ public final class OrphanCleanConfig implements Serializable {
                 params.get("table"),
                 olderThanMillis,
                 params.has("dry-run"),
-                deleteRateLimitPerSecond,
+                remoteFsOpRateLimitPerSecond,
                 parallelism,
                 allowDeleteManifest,
                 allowCleanOrphanTables,
@@ -177,13 +180,14 @@ public final class OrphanCleanConfig implements Serializable {
         return parsedMillis;
     }
 
-    private static long parseDeleteRateLimit(@Nullable String value) {
+    private static long parsePositiveRateLimit(
+            String flag, @Nullable String value, long defaultValue) {
         if (StringUtils.isNullOrWhitespaceOnly(value)) {
-            return DEFAULT_DELETE_RATE_LIMIT_PER_SECOND;
+            return defaultValue;
         }
         long rate = Long.parseLong(value);
         if (rate <= 0) {
-            throw new IllegalArgumentException("--delete-rate-limit-per-second must be positive");
+            throw new IllegalArgumentException(flag + " must be positive");
         }
         return rate;
     }
@@ -251,9 +255,15 @@ public final class OrphanCleanConfig implements Serializable {
         return dryRun;
     }
 
-    /** Returns the maximum number of actual delete calls per second. */
-    public long deleteRateLimitPerSecond() {
-        return deleteRateLimitPerSecond;
+    /**
+     * Returns the best-effort job-level target rate for remote filesystem operations per second.
+     *
+     * <p>The budget is shared by remote filesystem metadata reads, manifest reads, and deletes.
+     * Scan subtasks split this value by operator parallelism because Flink does not provide a
+     * cross-JVM limiter for this action.
+     */
+    public long remoteFsOpRateLimitPerSecond() {
+        return remoteFsOpRateLimitPerSecond;
     }
 
     /** Returns the optional parallelism for the ScanAndClean stage. */

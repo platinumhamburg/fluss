@@ -23,6 +23,7 @@ import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.local.LocalFileSystem;
+import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -42,7 +43,7 @@ class SafeDeleterTest {
     @Test
     void deleteFileRespectsDryRun() throws IOException {
         Path target = Files.createFile(tmp.resolve("orphan.log"));
-        SafeDeleter d = new SafeDeleter(localFs(), true, new AuditLogger());
+        SafeDeleter d = newDeleter(localFs(), true);
         d.deleteFile(new FsPath(target.toString()), Decision.DELETE, RuleId.LOG_SEGMENT);
         assertThat(Files.exists(target)).isTrue();
     }
@@ -50,14 +51,14 @@ class SafeDeleterTest {
     @Test
     void deleteFileActuallyDeletesWhenNotDryRun() throws IOException {
         Path target = Files.createFile(tmp.resolve("orphan.log"));
-        SafeDeleter d = new SafeDeleter(localFs(), false, new AuditLogger());
+        SafeDeleter d = newDeleter(localFs(), false);
         d.deleteFile(new FsPath(target.toString()), Decision.DELETE, RuleId.LOG_SEGMENT);
         assertThat(Files.exists(target)).isFalse();
     }
 
     @Test
     void deleteFileRejectsNonDeleteDecision() {
-        SafeDeleter d = new SafeDeleter(null, false, new AuditLogger());
+        SafeDeleter d = newDeleter(null, false);
         assertThatThrownBy(
                         () ->
                                 d.deleteFile(
@@ -69,7 +70,7 @@ class SafeDeleterTest {
     void deleteEmptyDirNoOpsOnNonEmpty() throws IOException {
         Path dir = Files.createDirectory(tmp.resolve("d"));
         Files.createFile(dir.resolve("child"));
-        SafeDeleter d = new SafeDeleter(localFs(), false, new AuditLogger());
+        SafeDeleter d = newDeleter(localFs(), false);
         d.deleteEmptyDir(new FsPath(dir.toString()));
         assertThat(Files.exists(dir)).isTrue();
     }
@@ -77,9 +78,13 @@ class SafeDeleterTest {
     @Test
     void deleteEmptyDirActuallyDeletes() throws IOException {
         Path dir = Files.createDirectory(tmp.resolve("d"));
-        SafeDeleter d = new SafeDeleter(localFs(), false, new AuditLogger());
+        SafeDeleter d = newDeleter(localFs(), false);
         d.deleteEmptyDir(new FsPath(dir.toString()));
         assertThat(Files.exists(dir)).isFalse();
+    }
+
+    private static SafeDeleter newDeleter(FileSystem fs, boolean dryRun) {
+        return new SafeDeleter(fs, dryRun, new AuditLogger(), RateLimiter.create(1000.0));
     }
 
     private static FileSystem localFs() {
