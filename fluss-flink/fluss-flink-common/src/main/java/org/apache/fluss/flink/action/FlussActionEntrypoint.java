@@ -19,7 +19,7 @@ package org.apache.fluss.flink.action;
 
 import java.util.Optional;
 
-/** Main entrypoint for the Fluss Flink action jar. Delegates to {@link ActionLoader}. */
+/** Main entrypoint for Fluss Flink action jars. Delegates to {@link ActionLoader}. */
 public class FlussActionEntrypoint {
 
     public static void main(String[] args) throws Exception {

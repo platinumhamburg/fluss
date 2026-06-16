@@ -45,6 +45,10 @@ public final class ActionLoader {
             printDefaultHelp();
             return Optional.empty();
         }
+        if (isHelp(args[0])) {
+            printDefaultHelp();
+            return Optional.empty();
+        }
         String name = args[0].toLowerCase().replace('-', '_');
         ActionFactory factory =
                 findFactory(name)
@@ -55,12 +59,25 @@ public final class ActionLoader {
                                                         + args[0]
                                                         + ". Run with --help for available actions."));
         String[] remaining = Arrays.copyOfRange(args, 1, args.length);
-        MultipleParameterToolAdapter params = MultipleParameterToolAdapter.fromArgs(remaining);
-        if (params.has("help")) {
+        if (hasHelp(remaining)) {
             System.out.println(factory.help());
             return Optional.empty();
         }
+        MultipleParameterToolAdapter params = MultipleParameterToolAdapter.fromArgs(remaining);
         return factory.create(params);
+    }
+
+    private static boolean isHelp(String arg) {
+        return "--help".equals(arg) || "-h".equals(arg);
+    }
+
+    private static boolean hasHelp(String[] args) {
+        for (String arg : args) {
+            if (isHelp(arg)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Optional<ActionFactory> findFactory(String identifier) {
