@@ -83,19 +83,29 @@ public final class BucketCleaner {
         if (!fs.exists(root)) {
             return;
         }
-        Deque<FsPath> stack = new ArrayDeque<FsPath>();
-        stack.push(root);
+        Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
+        stack.push(new DirVisit(root, false, false));
         while (!stack.isEmpty()) {
-            FsPath dir = stack.pop();
+            DirVisit visit = stack.pop();
+            if (visit.postOrder) {
+                if (visit.oldEnough && safeDeleter.deleteEmptyDir(visit.dir)) {
+                    stats.deleted++;
+                    stats.emptyDirsRemoved++;
+                }
+                continue;
+            }
             FileStatus[] children;
             try {
-                children = fs.listStatus(dir);
+                children = fs.listStatus(visit.dir);
             } catch (IOException e) {
-                LOG.warn("Failed to list directory: {}", dir, e);
+                LOG.warn("Failed to list directory: {}", visit.dir, e);
                 continue;
             }
             if (children == null) {
                 continue;
+            }
+            if (!visit.dir.toString().equals(root.toString())) {
+                stack.push(new DirVisit(visit.dir, true, visit.oldEnough));
             }
             for (FileStatus child : children) {
                 FsPath childPath = child.getPath();
@@ -103,7 +113,9 @@ public final class BucketCleaner {
                     if (FlussPaths.REMOTE_KV_SNAPSHOT_SHARED_DIR.equals(childPath.getName())) {
                         continue;
                     }
-                    stack.push(childPath);
+                    stack.push(
+                            new DirVisit(
+                                    childPath, false, child.getModificationTime() < cutoffMillis));
                     continue;
                 }
                 if (childPath.getName().startsWith(".")) {
@@ -142,11 +154,24 @@ public final class BucketCleaner {
     public static final class BucketCleanStats {
         public long scanned;
         public long deleted;
+        public long emptyDirsRemoved;
         public long deleteFailures;
         public long bytesReclaimed;
 
         public static BucketCleanStats empty() {
             return new BucketCleanStats();
+        }
+    }
+
+    private static final class DirVisit {
+        private final FsPath dir;
+        private final boolean postOrder;
+        private final boolean oldEnough;
+
+        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough) {
+            this.dir = dir;
+            this.postOrder = postOrder;
+            this.oldEnough = oldEnough;
         }
     }
 }

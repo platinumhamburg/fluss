@@ -38,10 +38,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Deque;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -52,15 +49,15 @@ import java.util.Map;
  *
  * <ul>
  *   <li>{@link BucketCleanTask}: second-reads manifests from object storage to build the active
- *       reference set, then walks log/kv directories and deletes orphan files.
+ *       reference set, then walks log/kv directories and deletes orphan files and old empty child
+ *       directories.
  *   <li>{@link OrphanDirCleanTask}: recursively walks the orphan directory and deletes all files
- *       older than the cutoff.
+ *       older than the cutoff, then removes old empty directories bottom-up.
  * </ul>
  *
- * <p>Each task emits a single {@link CleanStats} containing scalar counters and the short list of
- * directories walked. Delete rate is limited per-subtask: {@code configuredRate /
- * runtimeParallelism}. The serial processing within each subtask guarantees no concurrent throttler
- * access.
+ * <p>Each task emits a single {@link CleanStats} containing scalar counters. Delete rate is limited
+ * per-subtask: {@code configuredRate / runtimeParallelism}. The serial processing within each
+ * subtask guarantees no concurrent throttler access.
  */
 @Internal
 public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, CleanStats> {
@@ -134,20 +131,12 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
-        List<String> touchedDirs = new ArrayList<String>(2);
-        if (logDir != null) {
-            touchedDirs.add(logDir.toString());
-        }
-        if (kvDir != null) {
-            touchedDirs.add(kvDir.toString());
-        }
-
         return new CleanStats(
                 bucketStats.scanned,
                 bucketStats.deleted,
+                bucketStats.emptyDirsRemoved,
                 bucketStats.deleteFailures,
-                bucketStats.bytesReclaimed,
-                touchedDirs);
+                bucketStats.bytesReclaimed);
     }
 
     // -------------------------------------------------------------------------
@@ -166,27 +155,46 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
         long scanned = 0L;
         long deleted = 0L;
+        long emptyDirsRemoved = 0L;
         long deleteFailures = 0L;
         long bytesReclaimed = 0L;
 
-        Deque<FsPath> stack = new ArrayDeque<FsPath>();
-        stack.push(dirPath);
+        FileStatus rootStatus = fs.getFileStatus(dirPath);
+        Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
+        stack.push(
+                new DirVisit(
+                        dirPath,
+                        false,
+                        rootStatus.isDir()
+                                && rootStatus.getModificationTime() < task.cutoffMillis()));
         while (!stack.isEmpty()) {
-            FsPath dir = stack.pop();
+            DirVisit visit = stack.pop();
+            if (visit.postOrder) {
+                if (visit.oldEnough && safeDeleter.deleteEmptyDir(visit.dir)) {
+                    deleted++;
+                    emptyDirsRemoved++;
+                }
+                continue;
+            }
             FileStatus[] children;
             try {
-                children = fs.listStatus(dir);
+                children = fs.listStatus(visit.dir);
             } catch (IOException e) {
-                LOG.warn("Failed to list directory: {}", dir, e);
+                LOG.warn("Failed to list directory: {}", visit.dir, e);
                 continue;
             }
             if (children == null) {
                 continue;
             }
+            stack.push(new DirVisit(visit.dir, true, visit.oldEnough));
             for (FileStatus child : children) {
                 FsPath childPath = child.getPath();
                 if (child.isDir()) {
-                    stack.push(childPath);
+                    stack.push(
+                            new DirVisit(
+                                    childPath,
+                                    false,
+                                    child.getModificationTime() < task.cutoffMillis()));
                     continue;
                 }
                 if (childPath.getName().startsWith(".")) {
@@ -221,12 +229,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             }
         }
 
-        return new CleanStats(
-                scanned,
-                deleted,
-                deleteFailures,
-                bytesReclaimed,
-                Arrays.asList(dirPath.toString()));
+        return new CleanStats(scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed);
     }
 
     // -------------------------------------------------------------------------
@@ -235,5 +238,17 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
     private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun) {
         return new SafeDeleter(fs, dryRun, audit, rateLimiter);
+    }
+
+    private static final class DirVisit {
+        private final FsPath dir;
+        private final boolean postOrder;
+        private final boolean oldEnough;
+
+        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough) {
+            this.dir = dir;
+            this.postOrder = postOrder;
+            this.oldEnough = oldEnough;
+        }
     }
 }
