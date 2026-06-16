@@ -118,9 +118,6 @@ public final class BucketCleaner {
                                     childPath, false, child.getModificationTime() < cutoffMillis));
                     continue;
                 }
-                if (childPath.getName().startsWith(".")) {
-                    continue;
-                }
                 FileMeta meta =
                         new FileMeta(childPath, child.getLen(), child.getModificationTime());
                 FileRule rule = dispatcher.dispatch(meta);
