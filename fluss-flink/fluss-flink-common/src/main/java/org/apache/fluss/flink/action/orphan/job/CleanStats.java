@@ -20,14 +20,10 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 
 import java.io.Serializable;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * Per-task cleanup statistics emitted by each {@link ScanAndCleanFunction} subtask. The scalar
- * counters are accumulated by {@link StatsAggregateOperator} via simple addition; the short {@code
- * touchedDirs} list (typically 1–2 entries per task) is inserted into a {@code HashSet} for O(1)
- * deduplication — no list concatenation or O(n²) merge is needed.
+ * counters are accumulated by {@link StatsAggregateOperator} via simple addition.
  */
 @Internal
 public final class CleanStats implements Serializable {
@@ -36,25 +32,29 @@ public final class CleanStats implements Serializable {
 
     private final long scanned;
     private final long deleted;
+    private final long emptyDirsRemoved;
     private final long deleteFailures;
     private final long bytesReclaimed;
-    private final List<String> touchedDirs;
+
+    public CleanStats(long scanned, long deleted, long deleteFailures, long bytesReclaimed) {
+        this(scanned, deleted, 0L, deleteFailures, bytesReclaimed);
+    }
 
     public CleanStats(
             long scanned,
             long deleted,
+            long emptyDirsRemoved,
             long deleteFailures,
-            long bytesReclaimed,
-            List<String> touchedDirs) {
+            long bytesReclaimed) {
         this.scanned = scanned;
         this.deleted = deleted;
+        this.emptyDirsRemoved = emptyDirsRemoved;
         this.deleteFailures = deleteFailures;
         this.bytesReclaimed = bytesReclaimed;
-        this.touchedDirs = new ArrayList<String>(touchedDirs);
     }
 
     public static CleanStats empty() {
-        return new CleanStats(0L, 0L, 0L, 0L, new ArrayList<String>(0));
+        return new CleanStats(0L, 0L, 0L, 0L);
     }
 
     public long scanned() {
@@ -65,15 +65,15 @@ public final class CleanStats implements Serializable {
         return deleted;
     }
 
+    public long emptyDirsRemoved() {
+        return emptyDirsRemoved;
+    }
+
     public long deleteFailures() {
         return deleteFailures;
     }
 
     public long bytesReclaimed() {
         return bytesReclaimed;
-    }
-
-    public List<String> touchedDirs() {
-        return touchedDirs;
     }
 }

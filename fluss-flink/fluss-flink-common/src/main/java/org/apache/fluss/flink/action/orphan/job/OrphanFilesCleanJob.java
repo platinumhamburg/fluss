@@ -37,7 +37,7 @@ import java.util.List;
  * <pre>
  * Stage 1: ScopeEnumerator (p=1)   — coordinator RPCs, emits CleanTask
  * Stage 2: ScanAndClean (p=N)      — FS scan + rate-limited delete, emits CleanStats
- * Stage 3: StatsAggregate (p=1)    — merge stats + empty-dir sweep, emits final CleanStats
+ * Stage 3: StatsAggregate (p=1)    — merge stats, emits final CleanStats
  * </pre>
  */
 @Internal
@@ -82,15 +82,12 @@ public final class OrphanFilesCleanJob {
             stats = stats.setParallelism(parallelism);
         }
 
-        // Stage 3: StatsAggregate + EmptyDirSweep (parallelism=1)
+        // Stage 3: StatsAggregate (parallelism=1)
         SingleOutputStreamOperator<CleanStats> result =
                 stats.transform(
                                 "StatsAggregate",
                                 TypeInformation.of(new TypeHint<CleanStats>() {}),
-                                new StatsAggregateOperator(
-                                        config.dryRun(),
-                                        config.extraConfigs(),
-                                        config.deleteRateLimitPerSecond()))
+                                new StatsAggregateOperator(config.dryRun()))
                         .setParallelism(1)
                         .setMaxParallelism(1);
 

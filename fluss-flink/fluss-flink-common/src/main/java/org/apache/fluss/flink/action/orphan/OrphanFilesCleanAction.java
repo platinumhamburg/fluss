@@ -34,7 +34,7 @@ import org.slf4j.LoggerFactory;
  * <ol>
  *   <li>ScopeEnumerator (p=1): coordinator RPCs to enumerate scope and emit work items.
  *   <li>ScanAndClean (p=N): parallel FS scan + rate-limited delete.
- *   <li>StatsAggregate (p=1): merge stats + empty-directory sweep.
+ *   <li>StatsAggregate (p=1): merge stats.
  * </ol>
  */
 @Internal
@@ -54,11 +54,12 @@ public class OrphanFilesCleanAction implements Action {
         CleanStats stats =
                 OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null));
         LOG.info(
-                "remove_orphan_files done: scope={} scanned={} deleted={} failures={}"
-                        + " bytesReclaimed={} dryRun={}",
+                "remove_orphan_files done: scope={} scanned={} deletedTotal={}"
+                        + " emptyDirsRemoved={} failures={} bytesReclaimed={} dryRun={}",
                 scopeDescription(),
                 stats.scanned(),
                 stats.deleted(),
+                stats.emptyDirsRemoved(),
                 stats.deleteFailures(),
                 stats.bytesReclaimed(),
                 config.dryRun());
