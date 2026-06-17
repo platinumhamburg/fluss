@@ -101,6 +101,11 @@ public class KvPreWriteBuffer implements AutoCloseable {
     // the max LSN in the buffer
     private long maxLogSequenceNumber = -1;
 
+    // Accumulated byte size of all entries waiting to be flushed (key + value bytes).
+    // Used by the write-path admission gate to cap buffer growth so that a single flush
+    // can never produce enough L0 SSTs to reach RocksDB's slowdown trigger.
+    private long pendingFlushBytes = 0;
+
     public KvPreWriteBuffer(
             KvBatchWriter kvBatchWriter, TabletServerMetricGroup serverMetricGroup) {
         this.kvBatchWriter = kvBatchWriter;
@@ -158,6 +163,8 @@ public class KvPreWriteBuffer implements AutoCloseable {
         allKvEntries.addLast(kvEntry);
         // update the max lsn
         maxLogSequenceNumber = lsn;
+        // track accumulated bytes for flush budget gating
+        pendingFlushBytes += entryBytes(key, value);
     }
 
     /**
@@ -194,6 +201,7 @@ public class KvPreWriteBuffer implements AutoCloseable {
                 break;
             }
             descIter.remove();
+            pendingFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
             boolean removed = kvEntryMap.remove(entry.getKey(), entry);
             // if the latest entry is removed, we need to rollback the previous entry to the map
             if (removed && entry.previousEntry != null) {
@@ -225,6 +233,7 @@ public class KvPreWriteBuffer implements AutoCloseable {
 
             // first remove the entry from the list
             it.remove();
+            pendingFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
 
             // then write data using write batch writer
             Value value = entry.getValue();
@@ -254,6 +263,15 @@ public class KvPreWriteBuffer implements AutoCloseable {
         }
 
         return rowCountDiff;
+    }
+
+    /** Returns the accumulated byte size of all entries waiting to be flushed. */
+    public long pendingFlushBytes() {
+        return pendingFlushBytes;
+    }
+
+    private static long entryBytes(Key key, Value value) {
+        return key.key.length + (value.value != null ? value.value.length : 0);
     }
 
     @VisibleForTesting

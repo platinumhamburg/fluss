@@ -253,6 +253,40 @@ class KvPreWriteBufferTest {
         kvPreWriteBuffer.delete(toKey(key), elementCount);
     }
 
+    @Test
+    void testPendingFlushBytesTracking() throws Exception {
+        KvPreWriteBuffer buffer =
+                new KvPreWriteBuffer(
+                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+
+        // Initially zero
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(0);
+
+        // Insert key1=value1 (4 + 6 = 10 bytes)
+        bufferInsert(buffer, "key1", "value1", 1);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(10);
+
+        // Insert key2=value22 (4 + 7 = 11 bytes)
+        bufferInsert(buffer, "key2", "value22", 2);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(21);
+
+        // Delete key3: key bytes only (4 + 0 = 4 bytes for delete with null value)
+        bufferDelete(buffer, "key3", 3);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(25);
+
+        // Flush entries with lsn < 2 (only key1): decreases by 10
+        buffer.flush(2);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(15);
+
+        // TruncateTo(3) removes entries with lsn >= 3 (key3 delete): decreases by 4
+        buffer.truncateTo(3, TruncateReason.ERROR);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(11);
+
+        // Flush remaining (key2): decreases by 11
+        buffer.flush(Long.MAX_VALUE);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(0);
+    }
+
     private static String getValue(KvPreWriteBuffer preWriteBuffer, String keyStr) {
         KvPreWriteBuffer.Key key = toKey(keyStr);
         KvPreWriteBuffer.Value value = preWriteBuffer.get(key);
