@@ -32,9 +32,9 @@ import org.slf4j.LoggerFactory;
  * OrphanFilesCleanJob}) that executes a 3-stage DAG:
  *
  * <ol>
- *   <li>ScopeEnumerator (p=1): coordinator RPCs to enumerate scope and emit work items.
+ *   <li>ScopeEnumerator (p=1): coordinator RPCs to enumerate scope and emit per-bucket work items.
  *   <li>ScanAndClean (p=N): parallel FS scan + rate-limited delete.
- *   <li>StatsAggregate (p=1): merge stats.
+ *   <li>StatsAggregate (p=1): merge per-task stats into final summary.
  * </ol>
  */
 @Internal
