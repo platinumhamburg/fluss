@@ -94,7 +94,6 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -787,47 +786,55 @@ public final class KvTablet {
     }
 
     public void flush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
-        inWriteLock(
-                kvLock,
-                () -> {
-                    // when kv manager is closed which means kv tablet is already closed,
-                    // but the tablet server may still handle fetch log request from follower
-                    // as the tablet rpc service is closed asynchronously, then update the watermark
-                    // and then flush the pre-write buffer.
+        boolean madeProgress =
+                inWriteLock(
+                        kvLock,
+                        () -> {
+                            // when kv manager is closed which means kv tablet is already closed,
+                            // but the tablet server may still handle fetch log request from
+                            // follower as the tablet rpc service is closed asynchronously, then
+                            // update the watermark and then flush the pre-write buffer.
 
-                    // In such case, if the tablet is already closed, we won't flush pre-write
-                    // buffer, just warning it.
-                    if (isClosed) {
-                        LOG.warn(
-                                "The kv tablet for {} is already closed, ignore flushing kv pre-write buffer.",
-                                tableBucket);
-                        return;
-                    }
+                            // In such case, if the tablet is already closed, we won't flush
+                            // pre-write buffer, just warning it.
+                            if (isClosed) {
+                                LOG.warn(
+                                        "The kv tablet for {} is already closed, ignore flushing kv pre-write buffer.",
+                                        tableBucket);
+                                return false;
+                            }
 
-                    // Flush-path predictive gate: skip the flush if it would push L0 to or beyond
-                    // the storage engine's slowdown trigger. The pre-write buffer is left intact;
-                    // the next flush attempt after L0 drops will succeed and HW will resume.
-                    if (rocksDBKv.wouldExceedSlowdownTriggerOnFlush()) {
-                        flushBackpressured = true;
-                        return;
-                    }
+                            // Flush-path predictive gate: skip the flush if it would push L0 to
+                            // or beyond the storage engine's slowdown trigger. The pre-write
+                            // buffer is left intact; the next flush attempt after L0 drops will
+                            // succeed and HW will resume.
+                            if (rocksDBKv.wouldExceedSlowdownTriggerOnFlush()) {
+                                flushBackpressured = true;
+                                return false;
+                            }
 
-                    try {
-                        int rowCountDiff = kvPreWriteBuffer.flush(exclusiveUpToLogOffset);
-                        if (exclusiveUpToLogOffset > flushedLogOffset) {
-                            flushedLogOffset = exclusiveUpToLogOffset;
-                        }
-                        if (rowCount != ROW_COUNT_DISABLED) {
-                            // row count is enabled, we update the row count after flush.
-                            long currentRowCount = rowCount;
-                            rowCount = currentRowCount + rowCountDiff;
-                        }
-                        flushBackpressured = false;
-                    } catch (Throwable t) {
-                        fatalErrorHandler.onFatalError(
-                                new KvStorageException("Failed to flush kv pre-write buffer."));
-                    }
-                });
+                            try {
+                                int rowCountDiff = kvPreWriteBuffer.flush(exclusiveUpToLogOffset);
+                                if (exclusiveUpToLogOffset > flushedLogOffset) {
+                                    flushedLogOffset = exclusiveUpToLogOffset;
+                                }
+                                if (rowCount != ROW_COUNT_DISABLED) {
+                                    // row count is enabled, we update the row count after flush.
+                                    long currentRowCount = rowCount;
+                                    rowCount = currentRowCount + rowCountDiff;
+                                }
+                                flushBackpressured = false;
+                                return true;
+                            } catch (Throwable t) {
+                                fatalErrorHandler.onFatalError(
+                                        new KvStorageException(
+                                                "Failed to flush kv pre-write buffer."));
+                                return false;
+                            }
+                        });
+        if (madeProgress) {
+            notifyFlushComplete();
+        }
     }
 
     public void requestFlush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
@@ -1044,13 +1051,7 @@ public final class KvTablet {
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    // Check pre-write buffer first so recently written (but not yet
-                    // flushed to RocksDB) entries are visible to lookups.
-                    List<byte[]> result = new ArrayList<>(keys.size());
-                    for (byte[] key : keys) {
-                        result.add(getFromBufferOrKv(KvPreWriteBuffer.Key.of(key)));
-                    }
-                    return result;
+                    return rocksDBKv.multiGet(keys);
                 });
     }
 
