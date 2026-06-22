@@ -18,6 +18,7 @@
 package org.apache.fluss.server.kv.prewrite;
 
 import org.apache.fluss.server.kv.KvBatchWriter;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.PreparedFlush;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.TruncateReason;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 
@@ -251,6 +252,77 @@ class KvPreWriteBufferTest {
     private static void bufferDelete(
             KvPreWriteBuffer kvPreWriteBuffer, String key, int elementCount) {
         kvPreWriteBuffer.delete(toKey(key), elementCount);
+    }
+
+    @Test
+    void testPrepareAndCompleteFlush() {
+        KvPreWriteBuffer buffer =
+                new KvPreWriteBuffer(
+                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+
+        bufferInsert(buffer, "key1", "value1", 1);
+        bufferInsert(buffer, "key2", "value2", 2);
+        bufferInsert(buffer, "key3", "value3", 3);
+
+        PreparedFlush preparedFlush = buffer.prepareFlush(3);
+
+        assertThat(preparedFlush.entries()).hasSize(2);
+        assertThat(preparedFlush.rowCountDiff()).isEqualTo(2);
+        assertThat(buffer.activeFlushBytes()).isEqualTo(10);
+        assertThat(buffer.preparedFlushBytes()).isEqualTo(20);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(30);
+        assertThat(getValue(buffer, "key1")).isEqualTo("value1");
+        assertThat(getValue(buffer, "key2")).isEqualTo("value2");
+
+        assertThat(buffer.completeFlush(preparedFlush)).isEqualTo(2);
+
+        assertThat(buffer.activeFlushBytes()).isEqualTo(10);
+        assertThat(buffer.preparedFlushBytes()).isEqualTo(0);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(10);
+        assertThat(buffer.getAllKvEntries()).hasSize(1);
+        assertThat(getValue(buffer, "key1")).isNull();
+        assertThat(getValue(buffer, "key2")).isNull();
+        assertThat(getValue(buffer, "key3")).isEqualTo("value3");
+    }
+
+    @Test
+    void testAbortPreparedFlush() {
+        KvPreWriteBuffer buffer =
+                new KvPreWriteBuffer(
+                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+
+        bufferInsert(buffer, "key1", "value1", 1);
+        bufferDelete(buffer, "key2", 2);
+
+        PreparedFlush preparedFlush = buffer.prepareFlush(3);
+        assertThat(buffer.activeFlushBytes()).isEqualTo(0);
+        assertThat(buffer.preparedFlushBytes()).isEqualTo(14);
+
+        buffer.abortFlush(preparedFlush);
+
+        assertThat(buffer.activeFlushBytes()).isEqualTo(14);
+        assertThat(buffer.preparedFlushBytes()).isEqualTo(0);
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(14);
+        assertThat(getValue(buffer, "key1")).isEqualTo("value1");
+        assertThat(getValue(buffer, "key2")).isNull();
+
+        PreparedFlush nextPreparedFlush = buffer.prepareFlush(3);
+        assertThat(nextPreparedFlush.entries()).hasSize(2);
+    }
+
+    @Test
+    void testCannotTruncatePreparedFlush() {
+        KvPreWriteBuffer buffer =
+                new KvPreWriteBuffer(
+                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+
+        bufferInsert(buffer, "key1", "value1", 1);
+        bufferInsert(buffer, "key2", "value2", 2);
+        buffer.prepareFlush(3);
+
+        assertThatThrownBy(() -> buffer.truncateTo(1, TruncateReason.ERROR))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Cannot truncate prepared pre-write entry.");
     }
 
     @Test

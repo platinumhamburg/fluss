@@ -177,11 +177,11 @@ class RocksDBKvTest {
      * the pending buffer bytes would produce enough L0 SSTs to breach the slowdown trigger.
      *
      * <p>Configuration: slowdownTrigger=6, maxWriteBufferNumber=2, writeBufferSize=1024.
-     * remainingSlots = slowdownTrigger - currentL0 - maxWriteBufferNumber.
+     * remainingSlots = slowdownTrigger - currentL0 - maxWriteBufferNumber - 1.
      *
      * <ul>
-     *   <li>L0=0 → remainingSlots=4 → budget=4096 → 4095 admitted, 4096 rejected.
-     *   <li>L0=2 → remainingSlots=2 → budget=2048 → 2047 admitted, 2048 rejected.
+     *   <li>L0=0 → remainingSlots=3 → budget=3072 → 3071 admitted, 3072 rejected.
+     *   <li>L0=2 → remainingSlots=1 → budget=1024 → 1023 admitted, 1024 rejected.
      *   <li>L0=4 → remainingSlots=0 → always rejected (L0 gate).
      * </ul>
      */
@@ -202,17 +202,17 @@ class RocksDBKvTest {
                         .setFlussL0SlowdownTrigger(2);
 
         try (RocksDBKv kv = builder.build()) {
-            // L0=0: remainingSlots = 6 - 0 - 2 = 4, budget = 4 * 1024 = 4096
+            // L0=0: remainingSlots = 6 - 0 - 2 - 1 = 3, budget = 3 * 1024 = 3072
             assertThat(kv.wouldExceedFlushBudget(0)).isFalse();
-            assertThat(kv.wouldExceedFlushBudget(4095)).isFalse();
-            assertThat(kv.wouldExceedFlushBudget(4096)).isTrue();
+            assertThat(kv.wouldExceedFlushBudget(3071)).isFalse();
+            assertThat(kv.wouldExceedFlushBudget(3072)).isTrue();
             assertThat(kv.wouldExceedFlushBudget(8192)).isTrue();
 
-            // Flush to L0=2: remainingSlots = 6 - 2 - 2 = 2, budget = 2 * 1024 = 2048
+            // Flush to L0=2: remainingSlots = 6 - 2 - 2 - 1 = 1, budget = 1024
             flushNTimes(kv, 2);
             assertThat(kv.wouldExceedFlushBudget(0)).isFalse();
-            assertThat(kv.wouldExceedFlushBudget(2047)).isFalse();
-            assertThat(kv.wouldExceedFlushBudget(2048)).isTrue();
+            assertThat(kv.wouldExceedFlushBudget(1023)).isFalse();
+            assertThat(kv.wouldExceedFlushBudget(1024)).isTrue();
 
             // Flush to L0=4: remainingSlots = 6 - 4 - 2 = 0 → L0 gate always rejects
             flushNTimes(kv, 2);

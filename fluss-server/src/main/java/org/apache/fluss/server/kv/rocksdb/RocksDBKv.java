@@ -308,7 +308,7 @@ public class RocksDBKv implements AutoCloseable {
             return false;
         }
         long l0 = currentL0FileCount();
-        long remainingSlots = (long) level0SlowdownWritesTrigger - l0 - maxPendingFlushL0Files;
+        long remainingSlots = (long) level0SlowdownWritesTrigger - l0 - maxPendingFlushL0Files - 1;
         if (remainingSlots <= 0) {
             return true;
         }

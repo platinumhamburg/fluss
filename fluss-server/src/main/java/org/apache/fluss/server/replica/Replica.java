@@ -735,7 +735,7 @@ public final class Replica {
     private void mayFlushKv(long newHighWatermark) {
         KvTablet kvTablet = this.kvTablet;
         if (kvTablet != null) {
-            kvTablet.flush(newHighWatermark, fatalErrorHandler);
+            kvTablet.requestFlush(newHighWatermark, fatalErrorHandler);
             // If the predictive flush gate rejected this flush, eagerly wake DelayedWrite
             // operations waiting on this bucket so they observe the backpressured state and
             // surface STORAGE_BACKPRESSURE_EXCEPTION to clients without waiting for the next
@@ -743,6 +743,28 @@ public final class Replica {
             if (kvTablet.isFlushBackpressured()) {
                 delayedWriteManager.checkAndComplete(new DelayedTableBucketKey(tableBucket));
             }
+        }
+    }
+
+    private void onKvFlushComplete() {
+        boolean leaderHWIncremented =
+                inWriteLock(
+                        leaderIsrUpdateLock,
+                        () -> {
+                            if (!isLeader()) {
+                                return false;
+                            }
+                            try {
+                                return maybeIncrementLeaderHW(logTablet, clock.milliseconds());
+                            } catch (IOException e) {
+                                fatalErrorHandler.onFatalError(e);
+                                return false;
+                            }
+                        });
+        if (leaderHWIncremented) {
+            tryCompleteDelayedOperations();
+        } else {
+            delayedWriteManager.checkAndComplete(new DelayedTableBucketKey(tableBucket));
         }
     }
 
@@ -842,6 +864,9 @@ public final class Replica {
                 tableBucket,
                 endTime - startTime);
 
+        if (kvTablet != null) {
+            kvTablet.setFlushCompleteListener(this::onKvFlushComplete);
+        }
         // Register RocksDB statistics now that the kv tablet is fully initialized.
         if (kvTablet != null && kvTablet.getRocksDBStatistics() != null) {
             bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
@@ -1218,17 +1243,13 @@ public final class Replica {
             }
         }
 
-        // when the watermark can be advanced, we may need to flush kv first if it's kv replica,
-        // and then update highWatermark.
-        // TODO The flushKV and updateHighWatermark need to be atomic operation. See
-        // https://github.com/apache/fluss/issues/513
-        mayFlushKv(newHighWatermark.getMessageOffset());
-
-        // Skip high-watermark propagation when the most recent flush was rejected by the
-        // predictive L0 gate. The pre-write buffer keeps the data; once L0 drops below the
-        // trigger the next flush will succeed and HW will resume advancing naturally.
         KvTablet currentKv = this.kvTablet;
-        if (currentKv != null && currentKv.isFlushBackpressured()) {
+        if (currentKv != null
+                && currentKv.getFlushedLogOffset() < newHighWatermark.getMessageOffset()) {
+            // The KV view must be flushed before the log high watermark becomes visible. The flush
+            // itself runs on the shared KV flush scheduler so this RPC worker does not execute
+            // RocksDB writes.
+            mayFlushKv(newHighWatermark.getMessageOffset());
             return false;
         }
 

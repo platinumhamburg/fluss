@@ -29,11 +29,13 @@ import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -101,10 +103,11 @@ public class KvPreWriteBuffer implements AutoCloseable {
     // the max LSN in the buffer
     private long maxLogSequenceNumber = -1;
 
-    // Accumulated byte size of all entries waiting to be flushed (key + value bytes).
-    // Used by the write-path admission gate to cap buffer growth so that a single flush
-    // can never produce enough L0 SSTs to reach RocksDB's slowdown trigger.
-    private long pendingFlushBytes = 0;
+    // Accumulated byte size of entries that are not yet prepared by an async flush.
+    private long activeFlushBytes = 0;
+
+    // Accumulated byte size of entries prepared by an async flush but not completed yet.
+    private long preparedFlushBytes = 0;
 
     public KvPreWriteBuffer(
             KvBatchWriter kvBatchWriter, TabletServerMetricGroup serverMetricGroup) {
@@ -164,7 +167,7 @@ public class KvPreWriteBuffer implements AutoCloseable {
         // update the max lsn
         maxLogSequenceNumber = lsn;
         // track accumulated bytes for flush budget gating
-        pendingFlushBytes += entryBytes(key, value);
+        activeFlushBytes += entryBytes(key, value);
     }
 
     /**
@@ -201,11 +204,21 @@ public class KvPreWriteBuffer implements AutoCloseable {
                 break;
             }
             descIter.remove();
-            pendingFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
+            if (entry.state == EntryState.PREPARED) {
+                throw new IllegalStateException(
+                        "Cannot truncate prepared pre-write entry. logSequenceNumber="
+                                + entry.getLogSequenceNumber()
+                                + ", targetLogSequenceNumber="
+                                + targetLogSequenceNumber);
+            }
+            activeFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
             boolean removed = kvEntryMap.remove(entry.getKey(), entry);
             // if the latest entry is removed, we need to rollback the previous entry to the map
-            if (removed && entry.previousEntry != null) {
-                kvEntryMap.put(entry.getKey(), entry.previousEntry);
+            if (removed) {
+                KvEntry previousEntry = previousEntryInBuffer(entry.previousEntry);
+                if (previousEntry != null) {
+                    kvEntryMap.put(entry.getKey(), previousEntry);
+                }
             }
         }
         if (!descIter.hasNext()) {
@@ -233,7 +246,8 @@ public class KvPreWriteBuffer implements AutoCloseable {
 
             // first remove the entry from the list
             it.remove();
-            pendingFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
+            activeFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
+            entry.state = EntryState.FLUSHED;
 
             // then write data using write batch writer
             Value value = entry.getValue();
@@ -267,11 +281,95 @@ public class KvPreWriteBuffer implements AutoCloseable {
 
     /** Returns the accumulated byte size of all entries waiting to be flushed. */
     public long pendingFlushBytes() {
-        return pendingFlushBytes;
+        return activeFlushBytes + preparedFlushBytes;
+    }
+
+    /** Returns the byte size of entries that have not been prepared by an async flush yet. */
+    public long activeFlushBytes() {
+        return activeFlushBytes;
+    }
+
+    /** Returns the byte size of entries prepared by an async flush but not completed yet. */
+    public long preparedFlushBytes() {
+        return preparedFlushBytes;
+    }
+
+    /**
+     * Prepares a prefix of entries for asynchronous flush without removing them from the buffer.
+     *
+     * <p>The prepared entries remain visible through {@link #get(Key)}, so foreground writes can
+     * still derive correct CDC records while the background flush writes RocksDB.
+     */
+    public PreparedFlush prepareFlush(long exclusiveUpToLogSequenceNumber) {
+        ArrayList<KvEntry> entries = new ArrayList<>();
+        int rowCountDiff = 0;
+        long preparedBytes = 0L;
+        for (KvEntry entry : allKvEntries) {
+            if (entry.getLogSequenceNumber() >= exclusiveUpToLogSequenceNumber) {
+                break;
+            }
+            if (entry.state == EntryState.PREPARED) {
+                throw new IllegalStateException(
+                        "Found an already prepared entry while preparing async flush.");
+            }
+            entry.state = EntryState.PREPARED;
+            entries.add(entry);
+            long entryBytes = entryBytes(entry.getKey(), entry.getValue());
+            preparedBytes += entryBytes;
+            activeFlushBytes -= entryBytes;
+            preparedFlushBytes += entryBytes;
+            if (entry.getChangeType() == ChangeType.INSERT) {
+                rowCountDiff += 1;
+            } else if (entry.getChangeType() == ChangeType.DELETE) {
+                rowCountDiff -= 1;
+            }
+        }
+        return new PreparedFlush(
+                exclusiveUpToLogSequenceNumber, entries, rowCountDiff, preparedBytes);
+    }
+
+    /** Completes a prepared async flush and removes flushed entries from the buffer. */
+    public int completeFlush(PreparedFlush preparedFlush) {
+        for (KvEntry entry : preparedFlush.entries) {
+            KvEntry first = allKvEntries.removeFirst();
+            if (first != entry) {
+                throw new IllegalStateException("Prepared flush entries are no longer a prefix.");
+            }
+            if (entry.state != EntryState.PREPARED) {
+                throw new IllegalStateException("Prepared flush entry is not in PREPARED state.");
+            }
+            entry.state = EntryState.FLUSHED;
+            preparedFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
+            kvEntryMap.remove(entry.getKey(), entry);
+        }
+        if (allKvEntries.isEmpty()) {
+            maxLogSequenceNumber = -1;
+        }
+        return preparedFlush.rowCountDiff;
+    }
+
+    /** Aborts a prepared async flush and makes its entries active again. */
+    public void abortFlush(PreparedFlush preparedFlush) {
+        for (KvEntry entry : preparedFlush.entries) {
+            if (entry.state == EntryState.PREPARED) {
+                entry.state = EntryState.ACTIVE;
+                long entryBytes = entryBytes(entry.getKey(), entry.getValue());
+                preparedFlushBytes -= entryBytes;
+                activeFlushBytes += entryBytes;
+            }
+        }
     }
 
     private static long entryBytes(Key key, Value value) {
         return key.key.length + (value.value != null ? value.value.length : 0);
+    }
+
+    private static KvEntry previousEntryInBuffer(@Nullable KvEntry entry) {
+        KvEntry current = entry;
+        while (current != null && current.state == EntryState.FLUSHED) {
+            current = current.previousEntry;
+        }
+        return current;
     }
 
     @VisibleForTesting
@@ -324,6 +422,8 @@ public class KvPreWriteBuffer implements AutoCloseable {
 
         // the previous mapped value in the buffer before this key-value put
         @Nullable private final KvEntry previousEntry;
+
+        private EntryState state = EntryState.ACTIVE;
 
         public static KvEntry of(ChangeType changeType, Key key, Value value, long sequenceNumber) {
             return new KvEntry(changeType, key, value, sequenceNumber, null);
@@ -403,6 +503,51 @@ public class KvPreWriteBuffer implements AutoCloseable {
                     + previousEntry
                     + '}';
         }
+    }
+
+    /** Prepared entries for an asynchronous flush. */
+    public static final class PreparedFlush {
+        private final long exclusiveUpToLogSequenceNumber;
+        private final List<KvEntry> entries;
+        private final int rowCountDiff;
+        private final long preparedBytes;
+
+        private PreparedFlush(
+                long exclusiveUpToLogSequenceNumber,
+                List<KvEntry> entries,
+                int rowCountDiff,
+                long preparedBytes) {
+            this.exclusiveUpToLogSequenceNumber = exclusiveUpToLogSequenceNumber;
+            this.entries = entries;
+            this.rowCountDiff = rowCountDiff;
+            this.preparedBytes = preparedBytes;
+        }
+
+        public long exclusiveUpToLogSequenceNumber() {
+            return exclusiveUpToLogSequenceNumber;
+        }
+
+        public List<KvEntry> entries() {
+            return entries;
+        }
+
+        public int rowCountDiff() {
+            return rowCountDiff;
+        }
+
+        public long preparedBytes() {
+            return preparedBytes;
+        }
+
+        public boolean isEmpty() {
+            return entries.isEmpty();
+        }
+    }
+
+    private enum EntryState {
+        ACTIVE,
+        PREPARED,
+        FLUSHED
     }
 
     /** A key wrapper to wrap a byte array with overriding the hashCode and equals method. */
