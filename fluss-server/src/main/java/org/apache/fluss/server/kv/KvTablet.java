@@ -94,6 +94,7 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -1043,7 +1044,13 @@ public final class KvTablet {
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    return rocksDBKv.multiGet(keys);
+                    // Check pre-write buffer first so recently written (but not yet
+                    // flushed to RocksDB) entries are visible to lookups.
+                    List<byte[]> result = new ArrayList<>(keys.size());
+                    for (byte[] key : keys) {
+                        result.add(getFromBufferOrKv(KvPreWriteBuffer.Key.of(key)));
+                    }
+                    return result;
                 });
     }
 
