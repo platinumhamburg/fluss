@@ -94,6 +94,7 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -1052,6 +1053,24 @@ public final class KvTablet {
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
                     return rocksDBKv.multiGet(keys);
+                });
+    }
+
+    /**
+     * Multi-get that checks the pre-write buffer first, falling back to RocksDB for keys not found
+     * in the buffer. Used by the re-lookup path after insert-if-not-exists, where data may not yet
+     * be flushed to RocksDB.
+     */
+    public List<byte[]> multiGetFromBufferOrKv(List<byte[]> keys) throws IOException {
+        return inReadLock(
+                kvLock,
+                () -> {
+                    rocksDBKv.checkIfRocksDBClosed();
+                    List<byte[]> results = new ArrayList<>(keys.size());
+                    for (byte[] key : keys) {
+                        results.add(getFromBufferOrKv(KvPreWriteBuffer.Key.of(key)));
+                    }
+                    return results;
                 });
     }
 

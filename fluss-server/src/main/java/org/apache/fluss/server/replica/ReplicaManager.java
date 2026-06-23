@@ -892,7 +892,8 @@ public class ReplicaManager implements ServerReconfigurable {
             }
             MissingKeysContext missingKeysContext = entry.getValue();
             List<byte[]> results =
-                    getReplicaOrException(tb).lookups(missingKeysContext.missingKeys);
+                    getReplicaOrException(tb)
+                            .lookupsIncludingBuffer(missingKeysContext.missingKeys);
             LookupResultForBucket lookupResult = lookupResultForBucketMap.get(tb);
             for (int i = 0; i < missingKeysContext.missingIndexes.size(); i++) {
                 lookupResult
