@@ -841,9 +841,11 @@ public class ReplicaManager implements ServerReconfigurable {
                 // the original key bytes are wrapped in KeyRecordBatch, then during putRecordsToKv
                 // they are decoded to rows and immediately re-encoded back to key bytes, causing
                 // redundant encode/decode overhead.
+                // Use acks=-1 so the callback fires only after async flush completes and
+                // HW advances, ensuring inserted data is visible in RocksDB for re-lookup.
                 putRecordsToKv(
                         timeoutMs,
-                        requiredAcks,
+                        -1,
                         produceEntryData,
                         schema.getPrimaryKeyIndexes(),
                         MergeMode.DEFAULT,
