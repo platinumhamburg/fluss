@@ -1391,39 +1391,6 @@ public final class Replica {
                 });
     }
 
-    /**
-     * Lookup keys from both the pre-write buffer and RocksDB. Used after insert-if-not-exists where
-     * just-written data may still reside in the buffer pending async flush.
-     */
-    public List<byte[]> lookupsIncludingBuffer(List<byte[]> keys) {
-        if (!isKvTable()) {
-            throw new NonPrimaryKeyTableException(
-                    "the primary key table not exists for " + tableBucket);
-        }
-        return inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    try {
-                        if (!isLeader()) {
-                            throw new NotLeaderOrFollowerException(
-                                    String.format(
-                                            "Leader not local for bucket %s on tabletServer %d",
-                                            tableBucket, localTabletServerId));
-                        }
-                        checkNotNull(
-                                kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return kvTablet.multiGetFromBufferOrKv(keys);
-                    } catch (IOException e) {
-                        String errorMsg =
-                                String.format(
-                                        "Failed to lookup from local kv for table bucket %s, the cause is: %s",
-                                        tableBucket, e.getMessage());
-                        LOG.error(errorMsg, e);
-                        throw new KvStorageException(errorMsg, e);
-                    }
-                });
-    }
-
     public List<byte[]> prefixLookup(byte[] prefixKey) {
         if (!isKvTable()) {
             throw new NonPrimaryKeyTableException(
