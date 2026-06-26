@@ -1,13 +1,15 @@
 ---
-title: "Primary Key Table Dynamic Bucket Design"
-sidebar_label: Dynamic Bucket Design
-sidebar_position: 1
+title: "Primary Key Table Dynamic Bucket Design (V1, superseded)"
+sidebar_label: Dynamic Bucket Design (V1)
+sidebar_position: 2
 ---
 
 # Fluss 主键表动态 Bucket 能力 — 调研与方案设计
 
+> **⚠️ 本文档已被 [V2 版本](./dynamic-bucket-rescaling-design-v2.md) 替代。** V1 保留仅供历史参考；请以 V2 为准。
+
 > **文档类型**：架构与时序逻辑设计（不含代码实现细节）  
-> **状态**：Draft / 设计讨论稿  
+> **状态**：Superseded  
 > **关联 Roadmap**：[Operational Excellence — Automated cluster rebalancing and bucket rescaling](/roadmap)
 
 ---
