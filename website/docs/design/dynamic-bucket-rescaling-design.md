@@ -376,9 +376,12 @@ Manifest 字段、Remote 路径、冷加载步骤见 [方案一 §3](./dynamic-b
 | Catalog | `rescale_buckets` procedure |
 | Lookup / Recovery | FENCED 分区拒绝；per-partition bucket 枚举 |
 
-### 11.3 并行度与桶数
+### 11.3 并行度与桶布局
 
-`parallelism >= 新桶数` 为 **建议**，非硬约束。Flink Key Group 与 Fluss 桶数为 **独立维度**；两层映射同构说明见 [方案四 §2](./dynamic-bucket/scheme-04-consistent-hashing.md#2-与-flink-key-group-的关系)。
+| 场景 | 关系 |
+|------|------|
+| **Buckload**（[方案一](./dynamic-bucket/scheme-01-offline-redistribution.md)） | Flink 为 **纯计算引擎**；并行度仅影响吞吐。冷包物化布局由 `hash(key) % N_new` 与 `keyBy(newBucketId)` 决定，与作业并发度无关 |
+| **业务 Connector** | Sink 规划期固化 `numBuckets`；layout 变更须 Savepoint 重启（见 [方案一 §7](./dynamic-bucket/scheme-01-offline-redistribution.md#7-flink-协同)） |
 
 ### 11.4 交付顺序
 

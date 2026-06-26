@@ -189,13 +189,17 @@ SUBMITTED → VALIDATING → PREPARING → FENCING
 
 ## 7. Flink 协同
 
-| 对象 | 要求 |
-|------|------|
-| **业务 Sink/Source** | rescale 前 `STOP WITH SAVEPOINT`；完成后恢复 |
-| **Buckload 作业** | 独立 Flink 集群/作业；`buckloadHeartbeat` 注册 |
-| **并行度** | `parallelism >= N_new` 为建议，非硬约束 |
+方案一涉及两类 Flink 作业，职责不同：
 
-Flink **Key Group** 与 Fluss 桶数是 **独立维度**；方案一改变的是 Fluss `hash % N`，不是 Flink subtask 映射。两层映射关系见 [方案四 §2](./scheme-04-consistent-hashing.md#2-与-flink-key-group-的关系)。
+| 对象 | 角色 | 协同要求 |
+|------|------|----------|
+| **Buckload 作业** | **纯计算引擎**（与 Lake Tiering 同构） | 独立 Flink 作业；`buckloadHeartbeat` 注册；读 fence 快照、产出 remote 冷包 |
+| **业务 Sink/Source** | 读写 Fluss 表的上下游作业 | rescale 前 `STOP WITH SAVEPOINT`；完成后恢复，以重新加载 per-partition 桶布局 |
+
+**物化布局由 Fluss 分桶函数决定，不由 Flink 并行度决定**：
+
+- Buckload 按 `hash(key) % N_new` 路由到 `newBucketId`，经 `keyBy(newBucketId)` 写出 **每新桶一份** KvSnapshot 冷包与 Bootstrap Log。作业 **并行度仅影响计算与 IO 吞吐**，不要求与 `N_new` 对齐，也不参与路由语义。
+- 业务作业侧：Fluss Flink Sink 在 **规划期固化** `numBuckets`；layout 变更后须 Savepoint 重启，否则仍按旧 N 分配写入通道。这是 Connector 元数据缓存问题，与 Buckload 作业的并发配置无关。
 
 ---
 
