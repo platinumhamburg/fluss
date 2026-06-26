@@ -16,7 +16,7 @@ sidebar_position: 1
 
 1. [背景与动机](#1-背景与动机)
 2. [当前 Fluss 架构分析](#2-当前-fluss-架构分析)
-3. [竞品调研](#3-竞品调研)
+3. [竞品调研](#3-竞品调研)（含 Paimon / Iceberg / Hudi / Kafka / StarRocks / Doris / Flink Key Group 详解）
 4. [问题定义与设计目标](#4-问题定义与设计目标)
 5. [可行方案设计](#5-可行方案设计)
 6. [湖流一体 Union Read 与 Paimon 对齐](#6-湖流一体-union-read-与-paimon-对齐)
@@ -107,49 +107,323 @@ Fluss 已有 **集群 Rebalance** 能力：在 **bucket 集合不变** 的前提
 
 ## 3. 竞品调研
 
+本章从 **Lake 存储格式**、**OLAP 引擎**、**流计算状态层** 三个维度调研 bucket / 分片动态调整能力。调研重点不是功能清单，而是各系统如何解决同一个根本矛盾：
+
+> **分片数变化** 与 **主键路由稳定性** 之间的冲突。
+
 ### 3.1 对比总览
 
-| 系统 | 分布单元 | 动态调整 | 迁移策略 | 过渡期一致性 |
-|------|----------|----------|----------|--------------|
-| **Paimon** | Bucket (LSM) | 三种模式 | Fixed：ALTER + OVERWRITE；Dynamic：索引自动扩 | 固定模式需停写 |
-| **Iceberg** | Partition transform | 元数据演化（非 PK 表） | 无自动迁移 | PK 表禁止 spec 演化 |
-| **Hudi** | Bucket → File Group | 部分（3 种引擎） | Simple 离线；CH 局部 split/merge | 分区级 rescale 需停写 |
-| **Kafka** | Partition | 仅增加 | 无数据迁移 | keyed 顺序破坏 |
-| **StarRocks** | Tablet | ALTER BUCKETS | 后台异步重分布 | 一般在线 |
-| **Doris** | Tablet | 仅新分区 | 已有分区不可变 | — |
-| **Flink State** | Key Group | Savepoint 重分布 | 状态随 Key Group 迁移 | Checkpoint 原子性 |
+| 系统 | 分布单元 | 动态调整 | 迁移策略 | 过渡期一致性 | 读行为 | 写行为 |
+|------|----------|----------|----------|--------------|--------|--------|
+| **Paimon** | Bucket (LSM) | Fixed / Dynamic / Postpone | ALTER + OVERWRITE；索引扩桶；compact 分配 | Fixed 需停写；Dynamic 单写者 | 一般继续 | Fixed overwrite 期禁写 |
+| **Iceberg** | Partition transform | Spec 演化（非 PK） | 无自动迁移，靠 rewrite | PK 表禁止演化 | 多 spec 共存可读 | 新写用新 spec |
+| **Hudi** | Bucket → File Group | 三引擎 | 离线 replace；CH 局部 split/merge | 分区级需停写；CH 声称在线 | 多数可读 | 视引擎而定 |
+| **Kafka** | Topic Partition | 仅增加 | 无迁移 | per-key 顺序破坏 | Consumer rebalance | 立即用新分区数 |
+| **StarRocks** | Tablet | ALTER BUCKETS | 后台 tablet 重分布 | 元数据事务 + 异步拷贝 | 一般继续 | 一般继续 |
+| **Doris** | Tablet | 仅新分区 | 旧分区不可变 | N/A | 不变 | 新分区用新配置 |
+| **Flink** | Key Group | Savepoint rescale | 状态句柄随 Key Group 迁移 | Checkpoint 边界原子 | 短暂停机 | 恢复后按新映射 |
 
-### 3.2 设计模式提炼
+### 3.2 Apache Paimon
 
-| 模式 | 代表 | PK 表适用性 |
-|------|------|-------------|
-| **A: 朴素 Rehash** | Kafka 扩分区 | 反模式 |
-| **B: 元数据演化** | Iceberg spec evolution | PK Upsert 禁止 |
-| **C: 离线 Overwrite** | Paimon Fixed rescale | 强正确性 |
-| **D: Key→Bucket 索引** | Paimon Dynamic | 在线扩桶，顺序依赖 |
-| **E: 一致性哈希** | Hudi CH | 在线局部迁移 |
-| **F: 存储引擎后台重分片** | StarRocks | 在线但重 |
+Paimon 是与 Fluss Lake 分层 **耦合最深** 的参照对象。其 Primary Key Table 以 **Bucket** 为最小读写单元（每个 bucket 一个 LSM 目录），与 Fluss `TableBucket` 概念直接对应。
 
-### 3.3 Flink 动态并行度（Key Group）
+#### 3.2.1 Fixed Bucket（`bucket = N > 0`）
 
-Flink 对有状态算子的扩缩容采用 **Key Group 固定分区 + Subtask 范围重分配**：
-
-| 概念 | 含义 |
+| 维度 | 说明 |
 |------|------|
-| **maxParallelism** | Key Group 总数，job 启动后不可变 |
-| **Key Group** | `keyGroup = hash(key) % maxParallelism`，映射固定 |
-| **Subtask 分配** | Key Group 以连续范围分给各 subtask |
-| **Rescaling** | 从 savepoint 恢复，重划 Key Group 范围，状态随 Key Group 迁移 |
+| **路由** | `abs(hash(bucketKey)) % N`；`bucket-key` 默认为 PK（排除分区列） |
+| **扩缩** | `ALTER TABLE SET ('bucket'='新值')` 仅改元数据；**必须** `INSERT OVERWRITE` 重组数据 |
+| **迁移** | Overwrite 作业按 **新 N** 重算 hash，将行写入新 bucket 布局 |
+| **读写** | ALTER 不影响正在运行的读写；但若布局未 overwrite，写到旧布局分区会抛错 |
+| **Flink 协同** | 官方流程：savepoint 暂停 → ALTER + OVERWRITE → 以 **新并行度 ≥ 新 bucket 数** 恢复 |
+| **per-partition** | 表级 N；可对单分区 OVERWRITE，但元数据仍是表级 bucket 配置 |
 
-**Flink Key Group ≠ 一致性哈希**：
+**对 Fluss 启示**：Fixed rescale 是 **正确性最可证明** 的路径；Fluss 离线 rescale 应与其运维流程对齐，尤其是 Write Fence + Flink savepoint 门控。
 
-| 维度 | Flink Key Group | 一致性哈希 |
-|------|-----------------|------------|
-| Key→分片映射 | 固定不变 | 随 ring 拓扑变化 |
-| 扩缩迁移单元 | 整个 Key Group 状态块 | 仅受影响 vnode 区间 |
-| 目的 | 计算状态搬迁 | 存储分片在线分裂/合并 |
+#### 3.2.2 Dynamic Bucket（`bucket = -1`，PK 表默认）
 
-**可借鉴**：两层映射（key → logicalShard 固定 + logicalShard → physicalNode 可变）、原子迁移单元、savepoint 门控、范围分配。
+| 维度 | 说明 |
+|------|------|
+| **路由** | 维护 **Key → Bucket 索引**；非纯 hash。先到的 key 占旧桶，新 key 可进新桶 |
+| **扩缩** | 桶数随 `target-row-num` 自动增长，上限 `max-buckets`；**不支持缩桶** |
+| **索引** | 不跨分区 upsert：内存 HASH 索引；跨分区 upsert：磁盘索引，启动时扫全表建索引 |
+| **约束** | **单写者**：同表/分区禁止多作业并发写，否则可能重复数据 |
+| **顺序依赖** | 同 key 的 bucket 归属取决于首次写入顺序，长期可能不均匀 |
+| **rescaling** | 可对某分区执行 `rescale` procedure 做离线重整 |
+
+**对 Fluss 启示**：若 Fluss 引入 Dynamic 模式，须接受单写者约束和索引成本；与 Fluss 双层存储（Log+KV）结合时，索引应由 **Fluss 层主导**，Paimon 侧宜用 Fixed maxBuckets 避免双索引漂移（见第 6 章）。
+
+#### 3.2.3 Postpone Bucket（`bucket = -2`）
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | 写入先进 `bucket-postpone/`（不可读）；`compact` 时再分配正式 bucket |
+| **per-partition N** | **每个分区可在首次 compact 时独立决定 bucket 数** — 最接近 Fluss per-partition 需求 |
+| **适用** | 难以预先确定 bucket 数、且各分区数据量差异大的场景 |
+| **代价** | 写入后不可立即读；依赖 compaction 周期 |
+
+**对 Fluss 启示**：Fluss 若支持「同表不同分区不同 bucket 数」且走 Lake Fixed 模式，Paimon Postpone 是重要对齐选项。
+
+---
+
+### 3.3 Apache Iceberg
+
+Iceberg 的 bucket 是 **分区变换**（`bucket(N, col)`），属于 hidden partition 字段，而非独立物理 shard 原语。
+
+#### 3.3.1 核心机制
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | 数据文件携带 `spec_id`；`bucket(N,col)` 产生伪列 `0..N-1` |
+| **演化** | `ALTER TABLE SET PARTITION SPEC (...)` 可改 transform（含改 N）— **纯元数据** |
+| **数据迁移** | **无自动迁移**；旧文件保持旧 spec，新写入用新 spec，查询引擎合并多 spec |
+| **PK + Upsert** | **禁止** 对已设 PRIMARY KEY 的表做 partition spec 演化 |
+| **读写** | Spec 演化后读写一般不停；但同一 PK 可能落在不同 bucket transform 的文件中 |
+
+#### 3.3.2 为何 PK 表禁止 Spec 演化
+
+Upsert 依赖 **稳定的行标识 → 物理文件** 路由。若 `bucket(N)` 的 N 变化且不做数据 rewrite：
+
+- 同一 PK 的新 upsert 按新 N 路由
+- 旧文件仍按旧 N 布局
+- equality delete 与文件路由冲突 → **语义破裂**
+
+因此 Iceberg 选择 **硬禁止**，而非尝试在线双读合并。
+
+**对 Fluss 启示**：「只改元数据、不搬数据」在 append 表可行，在 PK upsert 表不可行。Fluss 不能照搬 Iceberg spec evolution 作为 PK 表 rescale 方案。
+
+---
+
+### 3.4 Apache Hudi
+
+Hudi 以 **Bucket Index** 将 record key 映射到 **File Group**（分区内的一个文件组），是 PK 表分片化的直接竞品。
+
+#### 3.4.1 Simple Bucket
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | `hash(recordKey) % numBuckets`，分区内固定 |
+| **扩缩** | **不支持** 在线改 bucket 数；创建时固定 |
+| **问题** | 统一 N 易造成分区级倾斜 |
+
+#### 3.4.2 Partition-Level Bucket（RFC-89）
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | 按分区正则规则配置 **不同固定 bucket 数** |
+| **扩缩** | Spark `partition_bucket_index_manager` 离线 replace-commit |
+| **约束** | **必须停止所有写入**；支持 `dry_run` 和多版本 `hashing_config` 回滚 |
+| **读写** | 执行期停写；读不受影响分区可继续 |
+
+#### 3.4.3 Consistent Hashing Bucket（RFC-42）
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | Hash 环 + 范围映射；bucket 对应 file group |
+| **扩缩** | 按文件大小阈值 **split/merge** 桶，由 clustering 触发 |
+| **迁移范围** | 仅受影响 bucket / 文件组，非全表 shuffle |
+| **并发** | 设计目标为在线；但 compaction 与 clustering 互斥，生产常设维护窗 |
+| **限制** | 主要支持 MOR；clustering 执行依赖 Spark；与 metadata table 有兼容限制 |
+
+**对 Fluss 启示**：Hudi CH 是 **在线局部迁移** 的代表，与 Fluss 方案四（vnode 分裂）最接近；但 Fluss 额外承担 Log+KV 双写一致，复杂度高于 Hudi 单存储格式。
+
+---
+
+### 3.5 Apache Kafka
+
+Kafka 分区扩展是 **流Transport层** 的典型做法，常作为 PK 存储 rescale 的 **反例**。
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | 默认 `murmur2(key) % numPartitions` |
+| **扩缩** | 仅 **增加** 分区；不可减少 |
+| **数据迁移** | **无**；历史消息留在原分区 |
+| **扩缩后路由** | 同 key 新消息可能进 **不同分区** |
+| **顺序性** | 仅保证 **分区内** 有序；扩分区后同一 key 跨分区无序 |
+| **Consumer** | Cooperative rebalance；状态化 consumer 的本地状态 **不会** 随分区扩展自动迁移 |
+| **推荐实践** | 新 topic 双写 + 排空 + 下线旧 topic |
+
+**对 Fluss 启示**：「只改分区数、不搬数据」对 PK 表等于放弃路由一致性。Fluss 绝不可采用 Kafka 式 naive rehash。
+
+---
+
+### 3.6 StarRocks
+
+StarRocks 以 **Tablet**（分区 × bucket）为最小存储与调度单元，PK 表强制 hash 分桶。
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | `hash(bucket_cols) % num_buckets` |
+| **扩缩** | `ALTER TABLE ... DISTRIBUTED BY HASH(...) BUCKETS N` — **异步后台** tablet 重分布 |
+| **per-partition** | v3.2+ 支持对指定分区 ALTER；v3.5.8+ `DEFAULT BUCKETS` 影响新分区 |
+| **v4.1 Range 分桶** | PK 表可选自动 tablet split/merge（按大小阈值），免预设 bucket 数 |
+| **读写** | 查询和导入一般继续；ALTER 可能持续数小时 |
+| **代价** | 集群 IO 与 CPU 压力大；需监控 `SHOW ALTER TABLE` |
+
+**对 Fluss 启示**：若 Fluss 具备强存储引擎内迁移能力，StarRocks 的「后台 tablet 搬运」是在线 rescale 的工业级参考；但 Fluss 当前 Log+KV 双层 + ZK 协调，更接近 Paimon/Hudi 而非 StarRocks 内核级搬运。
+
+---
+
+### 3.7 Apache Doris
+
+| 维度 | 说明 |
+|------|------|
+| **路由** | `crc32(bucket_cols) % N` |
+| **扩缩** | **已有分区 bucket 数不可变** |
+| **新分区** | `ADD PARTITION ... BUCKETS M` 或 `MODIFY DISTRIBUTION` 改 **未来** 分区默认值 |
+| **BUCKETS AUTO** | 建表时自动估算，仅创建时生效 |
+| **迁移** | 要改变已有分区布局需 **建新表导数据** |
+
+**对 Fluss 启示**：Doris 的「旧分区不变、新分区用新 N」与 Fluss **方案五** 高度同构；适合时间分区自然衰减场景，但无法解救已过热的历史分区。
+
+---
+
+### 3.8 Apache Flink：Key Group 与动态并行度（重点展开）
+
+Flink 本身 **不是存储系统**，不管理持久化 bucket layout。但其 **Key Group** 机制是有状态流计算中 **唯一成熟的大规模「逻辑分片 rescale」实践**，与 Fluss bucket rescale 在 **问题结构** 上高度相似，值得单独深入。
+
+#### 3.8.1 为什么需要 Key Group
+
+对 `keyBy()` 之后的算子（如 `KeyedProcessFunction`、带状态的 aggregate），每条记录的状态挂在 **key** 上。扩缩容 **并行度（parallelism）** 时，若直接把 `hash(key) % newParallelism` 当作分片依据：
+
+- key 与 subtask 的映射 **整体改变**
+- 旧 subtask 本地状态 **无法** 通过简单取模关联到新 subtask
+- 必须 **全量 shuffle 状态** 或丢失
+
+因此 Flink 引入中间层 **Key Group**：把 key 空间切成固定数量的逻辑分片，rescaling 时 **搬迁 Key Group 整块状态**，而非改变 key→分片规则。
+
+#### 3.8.2 核心概念
+
+```mermaid
+graph TB
+    subgraph Layer1["第一层：Key → Key Group（job 生命周期内固定）"]
+        K1["key_a"] --> KG17["KeyGroup 17"]
+        K2["key_b"] --> KG17
+        K3["key_c"] --> KG42["KeyGroup 42"]
+    end
+
+    subgraph Layer2["第二层：Key Group → Subtask（随 parallelism 变化）"]
+        KG17 --> T0["Subtask 0"]
+        KG42 --> T1["Subtask 1"]
+    end
+```
+
+| 概念 | 定义 | 可变性 |
+|------|------|--------|
+| **Key** | 业务键（`keyBy` 字段） | — |
+| **maxParallelism** | Key Group 总数上限；默认 128，建议 2 的幂 | **Job 创建后不可变** |
+| **Key Group ID** | `hash(key) % maxParallelism` | **固定** |
+| **parallelism** | 当前运行 subtask 数 | **可变**（≤ maxParallelism） |
+| **Subtask 分配** | Key Group 以 **连续 ID 范围** 分给 subtask | 随 rescale 重划 |
+
+**数值示例**（`maxParallelism=128`，`parallelism=4`）：
+
+- 每个 subtask 负责 32 个连续 Key Group（0–31、32–63、64–95、96–127）
+- Rescale 到 `parallelism=8`：每个 subtask 负责 16 个 Key Group
+- **key_a 的 Key Group ID 不变**；只是该 Key Group 从 subtask 0 移到 subtask 0 或 1（取决于范围切分）
+
+#### 3.8.3 Rescaling 时序
+
+```mermaid
+sequenceDiagram
+    participant Op as 运维
+    participant JM as JobManager
+    participant CK as CheckpointCoordinator
+    participant Old as Old Subtasks
+    participant New as New Subtasks
+
+    Op->>JM: stop-with-savepoint / 触发 rescale
+    JM->>CK: 触发最终 checkpoint/savepoint
+    CK-->>JM: 各 subtask 状态句柄（按 KeyGroup 索引）
+    JM->>JM: 计算新 parallelism 下 KeyGroup 范围划分
+    JM->>New: 启动新 subtask，分配 KeyGroup 范围
+    New->>New: 按 KeyGroup 拉取对应状态句柄并恢复
+    New->>New: 从 checkpoint 偏移继续消费
+```
+
+**要点**：
+
+1. **停机窗口**：rescaling 需要 checkpoint/savepoint 边界，非无限在线
+2. **状态迁移单元** = Key Group 状态块，不是单 key
+3. **输入重放**：从 checkpoint 位点重放，配合 exactly-once _sink 保证端到端
+4. **maxParallelism 不可改**：改变会破坏 snapshot 中 KeyGroup 索引语义；需 State Processor API 重写
+
+#### 3.8.4 与一致性哈希、Kafka、Fluss Bucket 的对比
+
+| 维度 | Flink Key Group | 一致性哈希（Hudi CH） | Kafka 扩分区 | Fluss Fixed Bucket |
+|------|-----------------|----------------------|--------------|-------------------|
+| **逻辑分片** | Key Group（固定数量） | vnode 范围 | Partition | Bucket ID |
+| **key→逻辑分片** | `hash % maxPara` **不变** | hash 落点 **可变** | `hash % N` **随 N 变** | `hash % N` **随 N 变** |
+| **逻辑→物理映射** | 范围 → subtask **可变** | 范围 → bucket **可变** | 1:1 partition | 1:1 TabletServer |
+| **扩缩时搬什么** | 计算状态 | 持久化数据文件 | 无 | 全部 KV+Log |
+| **持久化** | 否（checkpoint 对象） | 是 | 是（日志） | 是 |
+| **在线性** | 短暂停机 | 声称在线 | 立即但不一致 | 通常需停写 |
+
+**结论：Flink Key Group 不是一致性哈希。**
+
+- **一致性哈希**：改变 ring 拓扑时，**key 的逻辑落点** 可能变化，通过局部迁移适应
+- **Flink Key Group**：**key 的逻辑落点永不变化**；仅 **逻辑分片到物理 subtask 的范围归属** 变化
+
+更准确地说，Flink 模型是：
+
+> **固定 Hash 分区（logical shard）+ 可变范围归属（physical assignment）**
+
+这与 Fluss 方案四（vnode 固定 + bucket 范围可变）在 **两层结构** 上同构，但 Fluss 还需迁移 **持久化** Log+KV，成本远高于 Flink 搬 checkpoint 文件。
+
+#### 3.8.5 Reactive Mode 与并行度自动调整
+
+Flink **Reactive Mode**（Adaptive Scheduler）可根据可用 TaskManager slot **自动增减 parallelism**：
+
+- 仍基于 **同一 maxParallelism** 下重划 Key Group 范围
+- 通过 **重启 + 最新 checkpoint** 完成，非热插拔
+- **不改变** maxParallelism，也不改变 key→KeyGroup 映射
+
+**常见误解**：Reactive Mode 不等于存储层自动扩 bucket；它只调整 **计算并行度**，与 Fluss `bucket.num` 无直接联动。
+
+#### 3.8.6 Flink × Paimon × Fluss 三角协同
+
+Paimon 官方 Fixed bucket rescale 流程 **显式要求** Flink 侧协同：
+
+| 步骤 | Paimon | Flink |
+|------|--------|-------|
+| 1 | — | `stop-with-savepoint` |
+| 2 | `ALTER TABLE SET bucket=N'` | — |
+| 3 | `INSERT OVERWRITE` 重组数据 | — |
+| 4 | — | 以 `parallelism ≥ N'` 从 savepoint 恢复 |
+
+Fluss 引入 bucket rescale 后，Flink Connector 必须文档化 **同一维护窗** 内的协同：Fluss RescaleJob（Write Fence）与 Flink savepoint **同一语义边界**。
+
+#### 3.8.7 对 Fluss 设计的可借鉴与不可照搬
+
+| 可借鉴 | 不可照搬 |
+|--------|----------|
+| 两层映射：logical shard 固定 + physical mapping 可变 | 直接改 `hash%N` 而不搬数据 |
+| 原子迁移单元（Key Group / TableBucket / vnode range） | 假设状态搬完后立即在线（Fluss 持久化更重） |
+| savepoint/checkpoint 作为一致性边界 | maxParallelism 式「预分配超大逻辑分片上限」（可作为 vnode 上限参考） |
+| Rescale 与上游消费位点协同 | 把 Flink subtask 数等同于 Fluss bucket 数（二者独立维度） |
+
+---
+
+### 3.9 设计模式横向归纳
+
+| 模式 | 代表系统 | 核心做法 | PK 表适用性 | Fluss 对应方案 |
+|------|----------|----------|-------------|----------------|
+| **A: 朴素 Rehash** | Kafka | 改 N，不搬数据 | **反模式** | 禁止 |
+| **B: 元数据演化** | Iceberg | 改 spec，旧新共存 | PK 表 **禁止** | 不适用 |
+| **C: 离线 Overwrite** | Paimon Fixed、Hudi Partition-Level | 停写 + 全量重组 | **强正确性** | 方案一 |
+| **D: Key→Bucket 索引** | Paimon Dynamic | 索引维护路由 | 在线扩桶；单写者 | 方案三 |
+| **E: 一致性哈希** | Hudi CH | 环分裂，局部迁移 | 在线；实现复杂 | 方案四 |
+| **F: 引擎后台重分片** | StarRocks | 异步 tablet 搬运 | 在线；资源重 | 长期演进 |
+| **G: 新分区新配置** | Doris、Paimon Postpone | 旧布局不变 | 渐进式 | 方案五 |
+| **H: 计算状态 Rescale** | Flink Key Group | 固定逻辑分片 + 搬状态 | 仅计算层 | Connector 协同参考 |
+
+### 3.10 竞品调研结论（指导 Fluss 选型）
+
+1. **PK 表不存在「只改元数据、零迁移」的通用解法**（Iceberg 直接禁止；Kafka 式 rehash 破坏语义）。
+2. **Lake 生态内最可落地的是 Paimon Fixed rescale 路径**（方案一），与 Fluss Union Read 兼容性最好。
+3. **per-partition 不同 bucket 数** 在 Paimon 侧靠 Postpone 或分区级 overwrite；Fluss 方案五需为此专门设计 Lake 协同。
+4. **Flink Key Group 是计算层 rescale 教科书**，其两层映射思想可指导 Fluss vnode 设计，但 Fluss 必须额外解决持久化与 Lake 双层一致。
+5. **在线 rescale** 的工业先例主要来自 Hudi CH 和 StarRocks，均伴随显著工程复杂度；Fluss 宜分阶段交付，先 Offline 后 Online。
 
 ---
 
