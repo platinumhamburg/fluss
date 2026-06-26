@@ -109,9 +109,9 @@ Sink 在 SQL 规划期固化 `numBuckets`；`ChannelComputer` 须 per-record 解
 
 **在第一个新 N 分区写入前**：业务作业 **Savepoint 重启**，刷新 BucketLayoutProvider。
 
-### 4.3 并行度
+### 4.3 并行度与业务 Sink
 
-`parallelism >= max(各活跃分区 bucketCount)` 为运维建议，非 API 硬约束。
+Fluss **物化桶布局**由 per-partition `bucketCount` 决定，与 Flink 作业并行度无关。此处「并行度」仅指 **Flink Sink 物理通道数**运维建议：若希望每个桶有独立写入通道，可令 `parallelism ≥ 当前写入涉及分区的最大 bucketCount`；**非 API 硬约束**，亦不影响 Fluss 路由。
 
 ---
 

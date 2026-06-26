@@ -114,6 +114,100 @@ Buckload 是方案一的 **推荐生产实现**，不是独立「第六种方案
 
 `notifyLoadBuckload` 推送后：下载 manifest 清单 → 安装 KV（`KvSnapshotDataDownloader`）→ 安装 LogSegment → `reportBuckloadLoadComplete`。全部新桶 LOAD 成功后才 SWITCHING。
 
+**Log-KV 对齐（I3）**：
+
+| 项 | 规则 |
+|----|------|
+| 冷 KV 语义 | fence 点各 PK **最终有效版本**（含 delete tombstone） |
+| Bootstrap Log | 从 offset=0；**至少一条** `layout_switch`；不复制旧 layout 全量 changelog |
+| HW / LEO | 安装后 LEO = Bootstrap Log 长度；HW 在 SWITCHING 前可达 LEO；禁止在 LOAD 完成前对外 Produce |
+| 在线恢复 | 切换后新写入从 Bootstrap 之后 append；KV 与 Log 由现有 merge engine 保持一致 |
+
+#### 3.1.5 fenceSpec 逻辑结构（目标设计）
+
+Coordinator 在 `FENCING` 完成时为 **每个旧桶** 冻结读上界，下发给 Buckload 与 VERIFY：
+
+```json
+{
+  "rescaleJobId": "...",
+  "tableId": 1,
+  "partitionId": 2,
+  "oldLayoutEpoch": 4,
+  "oldBucketCount": 16,
+  "newBucketCount": 32,
+  "perOldBucket": [
+    {
+      "bucketId": 0,
+      "leaderEpoch": 7,
+      "kvSnapshotId": "snap-abc",
+      "kvSnapshotOffset": 12345,
+      "logEndOffset": 67890,
+      "fencedAtMs": 1710000000000
+    }
+  ]
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `kvSnapshotId` / `kvSnapshotOffset` | 有 KV 时：以此为基线全量扫 KV，再读 log(kvSnapshotOffset → logEndOffset) |
+| `logEndOffset` | 无 KV 或仅 Log 时：bounded log 上界（**含**该 offset 之前已 commit 的记录） |
+| `leaderEpoch` | 读路径须校验 Leader，防止 fence 后 leader 漂移导致双读 |
+
+Buckload **不得**读取任一 `perOldBucket` 的 `logEndOffset` 之后数据。建议与 `TieringSplitGenerator` 共用边界语义（或抽公共 `FenceSnapshotPlanner`）。
+
+#### 3.1.6 端到端时序（Buckload 主路径）
+
+```mermaid
+sequenceDiagram
+    participant Admin as Admin / Operator
+    participant C as Coordinator
+    participant B as Buckload Flink
+    participant R as Remote Storage
+    participant TS as TabletServer
+
+    Admin->>C: rescaleBuckets(partition, N_new)
+    C->>C: VALIDATING / PREPARING
+    C->>C: FENCING（停写停读，冻结 fenceSpec）
+    C->>B: buckloadHeartbeat(assign + fenceSpec)
+    B->>B: Fluss Client 读旧桶（≤ fence）
+    B->>B: keyBy(newBucketId) merge → RocksDB
+    B->>R: kv/ + log/ staging
+    B->>R: PUT buckload-bundle.json (COMMITTED)
+    B->>C: commitBuckloadBundle
+    C->>C: VERIFYING（PK 计数 / 路由抽样）
+    C->>TS: notifyLoadBuckload(manifest)
+    TS->>R: 按 manifest 下载
+    TS->>TS: 冷安装 KV + Bootstrap Log
+    TS->>C: reportBuckloadLoadComplete
+    C->>C: SWITCHING（layoutEpoch++）
+    C->>C: CLEANING / LAKE_SYNCING?
+    C->>Admin: COMPLETED
+```
+
+#### 3.1.7 Manifest 完整示例
+
+```json
+{
+  "version": 1,
+  "status": "COMMITTED",
+  "rescaleJobId": "job-uuid",
+  "tableId": 1,
+  "partitionId": 2,
+  "newBucketId": 3,
+  "newLayoutEpoch": 5,
+  "attemptId": 1,
+  "fenceSpec": { "perOldBucket": [] },
+  "kvSnapshotHandle": { "backendId": "...", "files": [] },
+  "bootstrapLogSegments": [{ "segmentId": "...", "baseOffset": 0, "paths": {} }],
+  "effectivePkCount": 123456,
+  "checksum": "sha256:...",
+  "remoteDataDir": "s3://bucket/fluss/..."
+}
+```
+
+`effectivePkCount`：有效主键数（delete tombstone 计为「已删除」，不重复计入）。
+
 ### 3.2 集群内重放（备选，非生产默认）
 
 | 维度 | 集群内重放 |
@@ -123,6 +217,19 @@ Buckload 是方案一的 **推荐生产实现**，不是独立「第六种方案
 | 缺点 | 与在线 PutKV 争用；抖动难隔离 |
 | 状态机 | RescaleJob 用 `MIGRATING` 替代 `BUCKLOADING`+`LOADING` |
 | 建议 | 开发/极小数据/无 remote 降级；**M2 可不交付** |
+
+### 3.3 缩桶（N_new < N_old）
+
+扩桶与缩桶共用 Buckload 框架，差异在 **旧→新桶映射**：
+
+| 项 | 扩桶 | 缩桶 |
+|----|------|------|
+| 映射 | 多个旧桶 PK → 更少新桶 | 多个旧桶 PK 合并到同一 `newBucketId` |
+| Buckload | `keyBy(newBucketId)` 自然合并 | 同上；单新桶 manifest 可对应多旧桶 fence 来源 |
+| VERIFY | Σ effectivePk(旧) = Σ effectivePk(新) | 须额外校验 **无 PK 丢失**（合并后仍唯一） |
+| 风险 | 新桶数多、manifest 多 | 单桶冷包体积大、LOAD 磁盘峰值高 |
+
+缩桶 **不**支持「只改元数据不迁移」；必须走完整 FENCE → Buckload → SWITCH。
 
 ---
 
@@ -145,11 +252,24 @@ SUBMITTED → VALIDATING → PREPARING → FENCING
 ### 4.2 VERIFYING
 
 1. 各新桶 manifest 已登记，`fenceSpec` 一致  
-2. Σ rowCount(旧桶) = Σ rowCount(新桶)  
-3. 随机 PK：`hash(pk) % N_new` 与存储位置一致  
-4. checksum / 可选 TS 预检  
+2. Σ **effectivePkCount**(旧桶) = Σ **effectivePkCount**(新桶)（delete tombstone 按 merge engine 规则计入）  
+3. 随机 PK：`hash(pk) % N_new` 与 manifest 中 `newBucketId` 存储位置一致  
+4. checksum / 可选 TS 预检（冷包 round-trip）
 
-### 4.3 回滚
+### 4.3 失败模式与回滚
+
+| 阶段 | 失败场景 | 系统行为 | 操作员动作 |
+|------|----------|----------|------------|
+| FENCING | 旧桶无法冻结 | 中止 Job；保持旧 layout | 检查副本/Leader |
+| BUCKLOADING | TM 失败、remote 写中断 | 放弃 `attemptId`；不增 epoch | 重试 Job 或 `retryRescaleJob` |
+| BUCKLOADING | 部分桶 manifest 已 COMMITTED | Coordinator 仅认完整 N_new 集合 | 等待重试或 cancel |
+| VERIFYING | PK 计数不一致 | → ROLLING_BACK | 查 fenceSpec / merge 逻辑 |
+| LOADING | TS 磁盘不足 | 该桶 `reportLoadFailed`；阻塞 SWITCH | 扩容或降并发 LOAD |
+| LOADING | 重复 `notifyLoadBuckload` | **幂等**：同 `jobId+bucketId+attemptId` 重入 | 无需人工 |
+| SWITCHING | 元数据提交后 TS 未就绪 | **人工介入**；禁止自动回滚 epoch | 运维 runbook |
+| LAKE_SYNCING | Paimon overwrite 失败 | Job 停留 LAKE_SYNCING | 手动 overwrite 后 complete |
+
+### 4.4 回滚摘要
 
 | 失败点 | 动作 |
 |--------|------|
@@ -157,7 +277,7 @@ SUBMITTED → VALIDATING → PREPARING → FENCING
 | LOADING | 重试 notify 或 ROLLING_BACK |
 | SWITCHING 已提交 | 人工介入 |
 
-### 4.4 互斥
+### 4.5 互斥
 
 与 Rebalance(P)、Tiering(P)、DropPartition(P) 互斥；与 Rescale(其他分区) 可并行。
 
@@ -206,12 +326,28 @@ SUBMITTED → VALIDATING → PREPARING → FENCING
 ## 8. CDC 语义
 
 - FENCE～SWITCH：目标分区无可消费增量（或仅 fence 心跳）
-- SWITCH：Bootstrap Log 中 `layout_switch`（`oldEpoch`, `newEpoch`, `newBucketCount`）
+- SWITCH：Bootstrap Log 中 `layout_switch`，逻辑字段（**proto 待实现**）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `oldLayoutEpoch` | int | 切换前 epoch |
+| `newLayoutEpoch` | int | 切换后 epoch |
+| `oldBucketCount` | int | N_old |
+| `newBucketCount` | int | N_new |
+| `partitionId` | long? | 非分区表 null |
+| `rescaleJobId` | string | 关联 RescaleJob |
+
 - 下游须重置 per-bucket 进度；**官方 CDC 路径须纳入 M2 验收**
 
 ---
 
-## 9. 优缺点
+## 9. 失败模式索引
+
+完整表见 [§4.3](#43-失败模式与回滚)。与 [DESIGN-REVIEW](./DESIGN-REVIEW.md) P0/P1 跟踪同步更新。
+
+---
+
+## 10. 优缺点
 
 | 优点 | 缺点 |
 |------|------|
@@ -222,7 +358,7 @@ SUBMITTED → VALIDATING → PREPARING → FENCING
 
 ---
 
-## 10. 交付与验收
+## 11. 交付与验收
 
 | 里程碑 | 内容 |
 |--------|------|
@@ -231,7 +367,7 @@ SUBMITTED → VALIDATING → PREPARING → FENCING
 
 ---
 
-## 11. 与其他方案的关系
+## 12. 与其他方案的关系
 
 | 方案 | 关系 |
 |------|------|

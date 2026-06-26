@@ -10,7 +10,7 @@ sidebar_position: 1
 > **文档状态**：Architecture Specification  
 > **关联 Roadmap**：[Operational Excellence — Automated cluster rebalancing and bucket rescaling](/roadmap)
 
-各方案的 **完整规格** 见独立子文档（[§5 五方案索引](#5-五方案索引与选型)）。本文保留跨方案不变量、总体架构、湖流一体约束与交付里程碑；**Buckload、RescaleJob 状态机、单方案读写语义** 等细节下沉至对应子文档。
+各方案的 **完整规格** 见独立子文档（[§5 五方案索引](#5-五方案索引与选型)）。**Challenger 评审报告**见 [DESIGN-REVIEW](./dynamic-bucket/DESIGN-REVIEW.md)。本文保留跨方案不变量、总体架构、湖流一体约束与交付里程碑；**Buckload、RescaleJob 状态机、单方案读写语义** 等细节下沉至对应子文档。
 
 ---
 
@@ -421,7 +421,9 @@ Manifest 字段、Remote 路径、冷加载步骤见 [方案一 §3](./dynamic-b
 
 ## 13. 行业参考
 
-主键表扩缩的核心矛盾：**分片数变化** vs **路由稳定性**。Paimon Fixed overwrite、[方案五](./dynamic-bucket/scheme-05-progressive-partition-bucket.md) 式新分区新 N、Kafka 式 rehash（禁止）、Flink Key Group（计算层参考，见 [方案四](./dynamic-bucket/scheme-04-consistent-hashing.md)）等结论与 Fluss 选型一致：离线迁移保正确性，在线模式高复杂度。
+主键表扩缩的核心矛盾：**分片数变化** vs **路由稳定性**。结构化竞品矩阵与评审发现见 **[DESIGN-REVIEW §4](./dynamic-bucket/DESIGN-REVIEW.md#4-竞品矩阵补主文档-13)**。
+
+Fluss 选型结论：离线迁移保正确性（[方案一](./dynamic-bucket/scheme-01-offline-redistribution.md)）；新分区渐进（[方案五](./dynamic-bucket/scheme-05-progressive-partition-bucket.md)）；Kafka 式只增不重 hash **禁止**；Flink Key Group 仅作为 [方案四](./dynamic-bucket/scheme-04-consistent-hashing.md) vnode 路由的 **类比参考**，与 Buckload / 业务 Sink 物化布局无关。
 
 ---
 
@@ -459,6 +461,7 @@ Fluss 主键表动态分桶的默认路径是：**[方案五](./dynamic-bucket/s
 - [方案三：动态索引](./dynamic-bucket/scheme-03-dynamic-index.md)
 - [方案四：一致性哈希](./dynamic-bucket/scheme-04-consistent-hashing.md)
 - [方案五：新分区新桶数](./dynamic-bucket/scheme-05-progressive-partition-bucket.md)
+- [设计评审报告（Challenger）](./dynamic-bucket/DESIGN-REVIEW.md)
 - [Fluss Bucketing](/table-design/data-distribution/bucketing.md)
 - [Fluss Primary Key Table](/table-design/table-types/pk-table.md)
 - [Fluss Remote Storage](/maintenance/tiered-storage/remote-storage.md)
