@@ -28,7 +28,6 @@ import org.apache.fluss.utils.MurmurHashUtils;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -224,59 +223,6 @@ public class KvPreWriteBuffer implements AutoCloseable {
         if (!descIter.hasNext()) {
             maxLogSequenceNumber = -1;
         }
-    }
-
-    /**
-     * To flush the key-value pairs whose sequence number is less than the given sequence number.
-     *
-     * @param exclusiveUpToLogSequenceNumber the exclusive upper bound of the log sequence number to
-     *     be flushed
-     * @return the row count difference of the kv entries in the buffer after flushing.
-     */
-    public int flush(long exclusiveUpToLogSequenceNumber) throws IOException {
-        int rowCountDiff = 0;
-        int flushedCount = 0;
-        for (Iterator<KvEntry> it = allKvEntries.iterator(); it.hasNext(); ) {
-            KvEntry entry = it.next();
-            // if find one entry whose sequence number is greater than the given sequence number,
-            // break the loop
-            if (entry.getLogSequenceNumber() >= exclusiveUpToLogSequenceNumber) {
-                break;
-            }
-
-            // first remove the entry from the list
-            it.remove();
-            activeFlushBytes -= entryBytes(entry.getKey(), entry.getValue());
-            entry.state = EntryState.FLUSHED;
-
-            // then write data using write batch writer
-            Value value = entry.getValue();
-            if (value.value != null) {
-                flushedCount += 1;
-                kvBatchWriter.put(entry.getKey().key, value.value);
-            } else {
-                flushedCount += 1;
-                kvBatchWriter.delete(entry.getKey().key);
-            }
-
-            // for update_after, we don't change the row count
-            if (entry.getChangeType() == ChangeType.INSERT) {
-                rowCountDiff += 1;
-            } else if (entry.getChangeType() == ChangeType.DELETE) {
-                rowCountDiff -= 1;
-            }
-
-            // if the kv entry to be flushed is equal to the one in the kvEntryMap, we
-            // can remove it from the map. Although it's not a must to remove from the map,
-            // we remove it to reduce the memory usage
-            kvEntryMap.remove(entry.getKey(), entry);
-        }
-        // flush to underlying kv tablet
-        if (flushedCount > 0) {
-            kvBatchWriter.flush();
-        }
-
-        return rowCountDiff;
     }
 
     /** Returns the accumulated byte size of all entries waiting to be flushed. */

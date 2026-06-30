@@ -31,6 +31,7 @@ import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnsupportedVersionException;
@@ -1371,7 +1372,16 @@ public class ReplicaManager implements ServerReconfigurable {
                 tableMetrics.incLogBytesIn(appendInfo.validBytes());
                 tableMetrics.incLogMessageIn(appendInfo.numMessages());
             } catch (Exception e) {
-                if (isUnexpectedException(e)) {
+                if (e instanceof StorageBackpressureException) {
+                    // Fluss application-layer write rejection (L0 headroom or flush budget
+                    // exceeded). This is a designed backpressure signal, not a server failure.
+                    // Increment the backpressure rejection counter; do NOT increment
+                    // failedPutKvRequests or log at ERROR level.
+                    if (tableMetrics != null) {
+                        tableMetrics.incKvBackpressureRejectedRequests();
+                    }
+                    LOG.debug("Write rejected by KV backpressure for table bucket {}", tb);
+                } else if (isUnexpectedException(e)) {
                     LOG.error("Error put records to local kv on replica {}", tb, e);
                     // NOTE: Failed put requests metric is not incremented for known exceptions
                     // since it is supposed to indicate un-expected failure of a server in
@@ -1615,7 +1625,8 @@ public class ReplicaManager implements ServerReconfigurable {
     private boolean isUnexpectedException(Exception e) {
         return !(e instanceof UnknownTableOrBucketException
                 || e instanceof NotLeaderOrFollowerException
-                || e instanceof LogOffsetOutOfRangeException);
+                || e instanceof LogOffsetOutOfRangeException
+                || e instanceof StorageBackpressureException);
     }
 
     /**

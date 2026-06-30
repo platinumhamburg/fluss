@@ -26,8 +26,6 @@ import org.junit.jupiter.api.Test;
 
 import javax.annotation.Nonnull;
 
-import java.io.IOException;
-
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -84,7 +82,7 @@ class KvPreWriteBufferTest {
 
         // +key0, +key1, +key2, -key2
         // then flush up to offset 1;
-        buffer.flush(1);
+        flushBuffer(buffer, 1);
 
         // check the all entries in the buffer is 3
         assertThat(buffer.getAllKvEntries().size()).isEqualTo(3);
@@ -104,7 +102,7 @@ class KvPreWriteBufferTest {
         assertThat(getValue(buffer, "key2")).isEqualTo("value21");
 
         // flush all;
-        buffer.flush(elementCount + 1);
+        flushBuffer(buffer, elementCount + 1);
 
         // check write buffer, entry count in the buffer should be 0
         assertThat(buffer.getAllKvEntries().size()).isEqualTo(0);
@@ -125,7 +123,7 @@ class KvPreWriteBufferTest {
         assertThat(getValue(buffer, "key2")).isEqualTo("value22");
 
         // flush all
-        buffer.flush(elementCount + 1);
+        flushBuffer(buffer, elementCount + 1);
 
         // check write buffer, entry count in the buffer should be 0
         assertThat(buffer.getAllKvEntries().size()).isEqualTo(0);
@@ -194,7 +192,7 @@ class KvPreWriteBufferTest {
     }
 
     @Test
-    void testRowCount() throws IOException {
+    void testRowCount() {
         KvPreWriteBuffer buffer =
                 new KvPreWriteBuffer(
                         new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
@@ -204,19 +202,19 @@ class KvPreWriteBufferTest {
         for (int i = 0; i < 10; i++) {
             bufferInsert(buffer, "key" + i, "value" + i, elementCount++);
         }
-        assertThat(buffer.flush(Long.MAX_VALUE)).isEqualTo(10);
+        assertThat(flushBuffer(buffer, Long.MAX_VALUE)).isEqualTo(10);
 
         // delete some keys
         for (int i = 0; i < 5; i++) {
             bufferDelete(buffer, "key" + i, elementCount++);
         }
-        assertThat(buffer.flush(Long.MAX_VALUE)).isEqualTo(-5);
+        assertThat(flushBuffer(buffer, Long.MAX_VALUE)).isEqualTo(-5);
 
         // put some keys again
         for (int i = 8; i < 9; i++) {
             bufferUpdate(buffer, "key" + i, "value" + i, elementCount++);
         }
-        assertThat(buffer.flush(Long.MAX_VALUE)).isEqualTo(0);
+        assertThat(flushBuffer(buffer, Long.MAX_VALUE)).isEqualTo(0);
 
         // put some keys again
         for (int i = 10; i < 20; i++) {
@@ -236,7 +234,7 @@ class KvPreWriteBufferTest {
 
         // truncate to 5
         buffer.truncateTo(checkpoint, TruncateReason.ERROR);
-        assertThat(buffer.flush(Long.MAX_VALUE)).isEqualTo(7);
+        assertThat(flushBuffer(buffer, Long.MAX_VALUE)).isEqualTo(7);
     }
 
     private static void bufferInsert(
@@ -326,7 +324,7 @@ class KvPreWriteBufferTest {
     }
 
     @Test
-    void testPendingFlushBytesTracking() throws Exception {
+    void testPendingFlushBytesTracking() {
         KvPreWriteBuffer buffer =
                 new KvPreWriteBuffer(
                         new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
@@ -347,7 +345,7 @@ class KvPreWriteBufferTest {
         assertThat(buffer.pendingFlushBytes()).isEqualTo(25);
 
         // Flush entries with lsn < 2 (only key1): decreases by 10
-        buffer.flush(2);
+        flushBuffer(buffer, 2);
         assertThat(buffer.pendingFlushBytes()).isEqualTo(15);
 
         // TruncateTo(3) removes entries with lsn >= 3 (key3 delete): decreases by 4
@@ -355,7 +353,7 @@ class KvPreWriteBufferTest {
         assertThat(buffer.pendingFlushBytes()).isEqualTo(11);
 
         // Flush remaining (key2): decreases by 11
-        buffer.flush(Long.MAX_VALUE);
+        flushBuffer(buffer, Long.MAX_VALUE);
         assertThat(buffer.pendingFlushBytes()).isEqualTo(0);
     }
 
@@ -372,6 +370,16 @@ class KvPreWriteBufferTest {
 
     private static KvPreWriteBuffer.Key toKey(String str) {
         return KvPreWriteBuffer.Key.of(str.getBytes());
+    }
+
+    /**
+     * Flushes the buffer using the production two-phase path: prepareFlush + completeFlush.
+     *
+     * @return the row count difference reported by completeFlush.
+     */
+    private static int flushBuffer(KvPreWriteBuffer buffer, long exclusiveUpToLsn) {
+        PreparedFlush prepared = buffer.prepareFlush(exclusiveUpToLsn);
+        return buffer.completeFlush(prepared);
     }
 
     /** A {@link KvBatchWriter} for test purpose without doing anything. */

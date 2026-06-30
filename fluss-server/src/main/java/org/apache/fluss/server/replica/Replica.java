@@ -736,13 +736,6 @@ public final class Replica {
         KvTablet kvTablet = this.kvTablet;
         if (kvTablet != null) {
             kvTablet.requestFlush(newHighWatermark, fatalErrorHandler);
-            // If the predictive flush gate rejected this flush, eagerly wake DelayedWrite
-            // operations waiting on this bucket so they observe the backpressured state and
-            // surface STORAGE_BACKPRESSURE_EXCEPTION to clients without waiting for the next
-            // ack-driven tryComplete.
-            if (kvTablet.isFlushBackpressured()) {
-                delayedWriteManager.checkAndComplete(new DelayedTableBucketKey(tableBucket));
-            }
         }
     }
 
@@ -1553,16 +1546,6 @@ public final class Replica {
      */
     public Tuple2<Boolean, Errors> checkEnoughReplicasReachOffset(long requiredOffset) {
         if (isLeader()) {
-            // If the predictive flush gate has rejected the most recent flush, fail fast with a
-            // backpressure error so the client can throttle before the storage engine stalls.
-            // Pending data stays in the pre-write buffer; the client retries after backoff.
-            KvTablet kv = this.kvTablet;
-            if (kv != null && kv.isFlushBackpressured()) {
-                bucketMetricGroup.recordKvBackpressureLevel(1f);
-                bucketMetricGroup.getTableMetricGroup().incKvBackpressureRejectedRequests();
-                return Tuple2.of(false, Errors.STORAGE_BACKPRESSURE_EXCEPTION);
-            }
-
             // Keep the current immutable replica list reference.
             List<Integer> curMaximalIsr = isrState.maximalIsr();
             if (LOG.isTraceEnabled()) {

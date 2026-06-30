@@ -157,8 +157,6 @@ public final class KvTablet {
     @GuardedBy("kvLock")
     private long requestedFlushOffset = 0;
 
-    private volatile boolean flushBackpressured = false;
-
     private volatile @Nullable Runnable flushCompleteListener;
 
     private volatile @Nullable FatalErrorHandler asyncFatalErrorHandler;
@@ -785,56 +783,45 @@ public final class KvTablet {
         }
     }
 
+    /**
+     * Synchronously flushes the pre-write buffer up to the given offset. This method delegates to
+     * {@link #requestFlush(long, FatalErrorHandler)} and blocks until the async flush scheduler
+     * completes the flush. Intended for test use only; production code should use {@link
+     * #requestFlush} which is non-blocking.
+     */
+    @VisibleForTesting
     public void flush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
-        boolean madeProgress =
-                inWriteLock(
-                        kvLock,
-                        () -> {
-                            // when kv manager is closed which means kv tablet is already closed,
-                            // but the tablet server may still handle fetch log request from
-                            // follower as the tablet rpc service is closed asynchronously, then
-                            // update the watermark and then flush the pre-write buffer.
-
-                            // In such case, if the tablet is already closed, we won't flush
-                            // pre-write buffer, just warning it.
-                            if (isClosed) {
-                                LOG.warn(
-                                        "The kv tablet for {} is already closed, ignore flushing kv pre-write buffer.",
-                                        tableBucket);
-                                return false;
-                            }
-
-                            // Flush-path predictive gate: skip the flush if it would push L0 to
-                            // or beyond the storage engine's slowdown trigger. The pre-write
-                            // buffer is left intact; the next flush attempt after L0 drops will
-                            // succeed and HW will resume.
-                            if (rocksDBKv.wouldExceedSlowdownTriggerOnFlush()) {
-                                flushBackpressured = true;
-                                return false;
-                            }
-
-                            try {
-                                int rowCountDiff = kvPreWriteBuffer.flush(exclusiveUpToLogOffset);
-                                if (exclusiveUpToLogOffset > flushedLogOffset) {
-                                    flushedLogOffset = exclusiveUpToLogOffset;
-                                }
-                                if (rowCount != ROW_COUNT_DISABLED) {
-                                    // row count is enabled, we update the row count after flush.
-                                    long currentRowCount = rowCount;
-                                    rowCount = currentRowCount + rowCountDiff;
-                                }
-                                flushBackpressured = false;
-                                return true;
-                            } catch (Throwable t) {
-                                fatalErrorHandler.onFatalError(
-                                        new KvStorageException(
-                                                "Failed to flush kv pre-write buffer."));
-                                return false;
-                            }
-                        });
-        if (madeProgress) {
-            notifyFlushComplete();
+        // Tests often pass Long.MAX_VALUE to mean "flush everything". Resolve it to
+        // the actual local log end offset to avoid poisoning flushedLogOffset with
+        // Long.MAX_VALUE, which would cause all subsequent flushes to be silently
+        // skipped by the async path's offset check in requestFlushInternal.
+        final long effectiveFlushOffset =
+                exclusiveUpToLogOffset == Long.MAX_VALUE
+                        ? logTablet.localLogEndOffset()
+                        : exclusiveUpToLogOffset;
+        // Check if already flushed or closed before requesting
+        boolean skipFlush =
+                inReadLock(kvLock, () -> isClosed || effectiveFlushOffset <= flushedLogOffset);
+        if (skipFlush) {
+            return;
         }
+        requestFlush(effectiveFlushOffset, fatalErrorHandler);
+        // Poll until the flush scheduler finishes processing this tablet (IDLE = done,
+        // L0_BLOCKED = backpressured, either way the scheduler has completed its attempt).
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (System.currentTimeMillis() < deadline) {
+            FlushState state = inReadLock(kvLock, () -> flushState);
+            if (state == FlushState.IDLE || state == FlushState.L0_BLOCKED) {
+                return;
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        throw new RuntimeException("Flush did not complete within 30 seconds for " + tableBucket);
     }
 
     public void requestFlush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
@@ -912,7 +899,7 @@ public final class KvTablet {
             }
             failScheduledFlush(t);
         } finally {
-            if (madeProgress || isFlushBackpressured()) {
+            if (madeProgress) {
                 notifyFlushComplete();
             }
         }
@@ -933,12 +920,10 @@ public final class KvTablet {
                     }
                     if (rocksDBKv.wouldExceedSlowdownTriggerOnFlush()) {
                         flushState = FlushState.L0_BLOCKED;
-                        flushBackpressured = true;
                         kvFlushScheduler.retryLater(this);
                         return null;
                     }
                     flushState = FlushState.RUNNING;
-                    flushBackpressured = false;
                     PreparedFlush preparedFlush = kvPreWriteBuffer.prepareFlush(targetOffset);
                     if (preparedFlush.isEmpty()) {
                         flushedLogOffset = targetOffset;
@@ -974,7 +959,6 @@ public final class KvTablet {
                         if (rowCount != ROW_COUNT_DISABLED) {
                             rowCount += rowCountDiff;
                         }
-                        flushBackpressured = false;
                     }
                     if (requestedFlushOffset > flushedLogOffset && !isClosed) {
                         flushState = FlushState.RUNNING;
@@ -1215,15 +1199,6 @@ public final class KvTablet {
      */
     public float currentPressure() {
         return rocksDBKv.currentPressure();
-    }
-
-    /**
-     * Returns whether the most recent flush attempt was skipped by the predictive L0 gate. While
-     * {@code true}, the pre-write buffer holds unflushed data and the high watermark must not
-     * advance.
-     */
-    public boolean isFlushBackpressured() {
-        return flushBackpressured;
     }
 
     private enum FlushState {
