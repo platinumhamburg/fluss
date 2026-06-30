@@ -23,6 +23,8 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.DisconnectException;
+import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
@@ -41,6 +43,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
@@ -102,6 +105,12 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
         Configuration flussConfig = new Configuration();
         flussConfig.setString(ConfigOptions.BOOTSTRAP_SERVERS.key(), config.bootstrapServer());
+        // Pass through client-related extra configs (e.g. security/auth).
+        for (Map.Entry<String, String> entry : config.extraConfigs().entrySet()) {
+            if (entry.getKey().startsWith("client.")) {
+                flussConfig.setString(entry.getKey(), entry.getValue());
+            }
+        }
 
         try (Connection connection = ConnectionFactory.createConnection(flussConfig);
                 Admin admin = connection.getAdmin()) {
@@ -177,9 +186,29 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 + " older orphan-files-cleanup action that targets this server.",
                         t);
             }
+            if (isConnectionFailure(t)) {
+                throw new IllegalStateException(
+                        "Failed to connect to Fluss cluster while probing "
+                                + apiName
+                                + " RPC. The bootstrap server may be unreachable.",
+                        t);
+            }
             // Any other failure means the RPC is recognized; the call merely failed because of
             // the sentinel target id. Compatibility is satisfied.
         }
+    }
+
+    private static boolean isConnectionFailure(Throwable t) {
+        Throwable cause = ExceptionUtils.stripExecutionException(t);
+        while (cause != null) {
+            if (cause instanceof NetworkException
+                    || cause instanceof DisconnectException
+                    || cause instanceof IOException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
     }
 
     private static boolean isUnsupportedVersion(Throwable t) {
@@ -235,7 +264,10 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 return admin.listDatabases().get();
             } catch (Exception e) {
                 audit.logSkipDb("*", classifyName(e));
-                return Collections.emptyList();
+                throw new IllegalStateException(
+                        "Failed to list databases from Fluss cluster. "
+                                + "The coordinator server may be unreachable.",
+                        e);
             }
         }
         String databaseName = config.database().get();
@@ -245,7 +277,12 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             }
         } catch (Exception e) {
             audit.logSkipDb(databaseName, classifyName(e));
-            return Collections.emptyList();
+            throw new IllegalStateException(
+                    "Failed to check existence of database '"
+                            + databaseName
+                            + "'. "
+                            + "The coordinator server may be unreachable.",
+                    e);
         }
         audit.logSkipDb(databaseName, RpcErrorClassifier.Category.NOT_FOUND.name());
         return Collections.emptyList();
