@@ -109,6 +109,18 @@ class LogSegmentRuleTest {
         assertThat(decision).isEqualTo(Decision.DELETE);
     }
 
+    @Test
+    void deleteWriterSnapshotWhenOrphan() {
+        FileMeta file =
+                file(
+                        "/log/db/t-1/0/" + SEGMENT_ID + "/00000000000000000100.writer_snapshot",
+                        NOW - 2 * DAY_MS);
+
+        Decision decision = rule.evaluate(file, BucketActiveRefs.empty(), CUTOFF_MS);
+
+        assertThat(decision).isEqualTo(Decision.DELETE);
+    }
+
     private static FileMeta file(String path, long modificationTime) {
         return new FileMeta(new FsPath(path), 100L, modificationTime);
     }

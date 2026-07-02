@@ -153,7 +153,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         }
 
         SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun());
-        RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest(), true);
+        RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
 
         long scanned = 0L;
         long deleted = 0L;

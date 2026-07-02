@@ -29,9 +29,10 @@ import java.util.regex.Pattern;
 /**
  * Rule for log-segment files under a remote log bucket.
  *
- * <p>{@code .writer_snapshot} files are only eligible for deletion in orphan-directory mode. In
- * active-bucket mode the engine's own TTL cleanup handles them; the orphan tool conservatively
- * keeps them to avoid any risk of racing a concurrent write.
+ * <p>Each segment UUID directory contains four files ({@code .log}, {@code .index}, {@code
+ * .timeindex}, {@code .writer_snapshot}) that form an atomic unit. They are uploaded together by
+ * tiering and referenced together by manifests. If the segment is not in any active manifest and
+ * the file modification time is older than the cutoff, all four files are eligible for deletion.
  */
 @Internal
 public final class LogSegmentRule implements FileRule {
@@ -44,15 +45,7 @@ public final class LogSegmentRule implements FileRule {
     private static final Set<String> KNOWN_SUFFIXES =
             new HashSet<String>(Arrays.asList(".log", ".index", ".timeindex", ".writer_snapshot"));
 
-    private final boolean orphanDirMode;
-
-    public LogSegmentRule() {
-        this(false);
-    }
-
-    public LogSegmentRule(boolean orphanDirMode) {
-        this.orphanDirMode = orphanDirMode;
-    }
+    public LogSegmentRule() {}
 
     @Override
     public RuleId id() {
@@ -69,10 +62,6 @@ public final class LogSegmentRule implements FileRule {
 
         String relativePath = parent.getName() + "/" + path.getName();
         if (activeRefs.logSegmentRelativePaths().contains(relativePath)) {
-            return Decision.KEEP_ACTIVE;
-        }
-
-        if (path.getName().endsWith(FlussPaths.WRITER_SNAPSHOT_FILE_SUFFIX) && !orphanDirMode) {
             return Decision.KEEP_ACTIVE;
         }
 

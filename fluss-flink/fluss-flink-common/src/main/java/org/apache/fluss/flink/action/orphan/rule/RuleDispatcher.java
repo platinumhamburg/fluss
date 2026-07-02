@@ -45,15 +45,11 @@ public final class RuleDispatcher {
     private final FileRule kvSharedSstRule = new KvSharedSstRule();
 
     public RuleDispatcher() {
-        this(false, false);
+        this(false);
     }
 
     public RuleDispatcher(boolean allowDeleteManifest) {
-        this(allowDeleteManifest, false);
-    }
-
-    public RuleDispatcher(boolean allowDeleteManifest, boolean orphanDirMode) {
-        this.logSegmentRule = new LogSegmentRule(orphanDirMode);
+        this.logSegmentRule = new LogSegmentRule();
         this.logManifestRule = new LogManifestRule(allowDeleteManifest);
     }
 
