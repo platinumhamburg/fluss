@@ -958,6 +958,42 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     }
 
     @Test
+    void optInCleansOrphanPartitionDirUnderUnknownDatabase() throws Exception {
+        PartitionedTableLayout seed =
+                createPartitionedLogTable(newDatabaseName("orphanpartseed"), "seed_table", "ps");
+        long orphanTableId = seed.tableId;
+        long orphanPartitionId = seed.partitionInfo.getPartitionId();
+        admin.dropTable(seed.tablePath, false).get();
+
+        PartitionedTableLayout anchor =
+                createPartitionedLogTable(newDatabaseName("orphanpartanchor"), "live_anchor", "pa");
+        assertThat(anchor.tableId).isGreaterThanOrEqualTo(orphanTableId);
+        assertThat(anchor.partitionInfo.getPartitionId()).isGreaterThanOrEqualTo(orphanPartitionId);
+
+        String unknownDbName = newDatabaseName("unknownpartdb");
+        TablePath orphanTablePath = TablePath.of(unknownDbName, "ghost_table");
+        OrphanPartitionLayout orphan =
+                createOldOrphanPartitionLayout(
+                        remoteDataRoot(),
+                        orphanTablePath,
+                        orphanTableId,
+                        "ghost",
+                        orphanPartitionId,
+                        "99999999999999999999.log");
+
+        runCleanerForAllDatabases(false, "--allow-clean-orphan-partitions");
+
+        assertThat(Files.exists(orphan.orphanFile)).isFalse();
+        assertThat(Files.exists(orphan.partitionDir)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        m ->
+                                m.contains("action=deleted")
+                                        && m.contains("rule=log-segment")
+                                        && m.contains(orphan.orphanFile.toString()));
+    }
+
+    @Test
     void emptyDirsSweptAfterOrphanFileDeletion() throws Exception {
         String dbName = newDatabaseName("emptydir");
         TablePath tablePath = createLogTable(dbName, "emptydir_table");
