@@ -493,6 +493,32 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     }
 
     @Test
+    void optInCleansOrphanTableDirUnderUnknownDatabase() throws Exception {
+        long orphanTableId = allocateDroppedTableId(newDatabaseName("unknowndbseed"), "seed_table");
+        createLogTable(newDatabaseName("unknowndbanchor"), "live_anchor");
+
+        String unknownDbName = newDatabaseName("unknowndb");
+        OrphanTableLayout layout =
+                createOldOrphanTableLayout(
+                        remoteDataRoot(),
+                        unknownDbName,
+                        orphanTableId,
+                        "ghost_table",
+                        "99999999999999999999.log");
+
+        runCleanerForAllDatabases(false, "--allow-clean-orphan-tables");
+
+        assertThat(Files.exists(layout.orphanFile)).isFalse();
+        assertThat(Files.exists(layout.tableDir)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        m ->
+                                m.contains("action=deleted")
+                                        && m.contains("rule=log-segment")
+                                        && m.contains(layout.orphanFile.toString()));
+    }
+
+    @Test
     void pkOrphanTableRetainsSharedSstEvenWithOptIn() throws Exception {
         String dbName = newDatabaseName("orphankv");
         long tableId = allocateDroppedPrimaryKeyTableId(dbName, "seed_pk_table");
