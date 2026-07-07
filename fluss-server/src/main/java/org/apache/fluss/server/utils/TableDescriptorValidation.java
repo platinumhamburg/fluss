@@ -40,6 +40,7 @@ import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.AutoPartitionStrategy;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.StringUtils;
 
 import javax.annotation.Nullable;
@@ -58,6 +59,8 @@ import static org.apache.fluss.config.FlussConfigUtils.TABLE_OPTIONS;
 import static org.apache.fluss.config.FlussConfigUtils.isAlterableTableOption;
 import static org.apache.fluss.config.FlussConfigUtils.isTableStorageConfig;
 import static org.apache.fluss.config.StatisticsConfigUtils.validateStatisticsConfig;
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.metadata.TableDescriptor.BUCKET_COLUMN_NAME;
 import static org.apache.fluss.metadata.TableDescriptor.CHANGE_TYPE_COLUMN;
 import static org.apache.fluss.metadata.TableDescriptor.COMMIT_TIMESTAMP_COLUMN;
@@ -141,6 +144,7 @@ public class TableDescriptorValidation {
         checkPrimaryKey(tableDescriptor);
         // check individual options
         checkReplicationFactor(tableConf);
+        checkKvFormatVersion(tableDescriptor, tableConf);
         checkLogFormat(tableConf, hasPrimaryKey);
         checkArrowCompression(tableConf);
         checkMergeEngine(tableConf, hasPrimaryKey, schema);
@@ -308,6 +312,43 @@ public class TableDescriptorValidation {
                             "'%s' must be greater than 0.",
                             ConfigOptions.TABLE_REPLICATION_FACTOR.key()));
         }
+    }
+
+    private static void checkKvFormatVersion(
+            TableDescriptor tableDescriptor, Configuration tableConf) {
+        Optional<Integer> kvFormatVersion =
+                tableConf.getOptional(ConfigOptions.TABLE_KV_FORMAT_VERSION);
+        if (!kvFormatVersion.isPresent()) {
+            return;
+        }
+
+        int version = kvFormatVersion.get();
+        if (version > CURRENT_KV_FORMAT_VERSION) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "Unsupported kv format version %d. The maximum supported version is %d.",
+                            version, CURRENT_KV_FORMAT_VERSION));
+        }
+        if (version < KV_FORMAT_VERSION_3) {
+            return;
+        }
+        if (isPartitionedIndexTable(tableDescriptor)) {
+            return;
+        }
+        throw new InvalidConfigException(
+                "kv format version 3 is reserved for system-managed partitioned secondary index tables.");
+    }
+
+    private static boolean isPartitionedIndexTable(TableDescriptor tableDescriptor) {
+        return tableDescriptor.isIndexTable()
+                && tableDescriptor
+                        .getProperties()
+                        .containsKey(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key())
+                && tableDescriptor
+                        .getSchema()
+                        .getRowType()
+                        .getFieldNames()
+                        .contains(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
     }
 
     private static void checkLogFormat(Configuration tableConf, boolean hasPrimaryKey) {

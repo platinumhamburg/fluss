@@ -1544,11 +1544,13 @@ public class ConfigOptions {
                                     + "Uses datalake's encoder (e.g., Paimon/Iceberg) for both primary key and bucket key encoding. "
                                     + "This may not support prefix lookup properly because some datalake encoders (like Paimon) "
                                     + "don't guarantee that encoded bucket key bytes are a prefix of encoded primary key bytes. "
-                                    + "(2) Version 2 (current): New tables use Fluss's default encoder for primary key encoding "
+                                    + "(2) Version 2: Ordinary primary-key tables use Fluss's default encoder for primary key encoding "
                                     + "when bucket key differs from primary key, which ensures proper prefix lookup support. "
                                     + "When bucket key equals primary key (default bucket key), it still uses datalake's encoder "
                                     + "for optimization (encoded bytes can be reused for bucket calculation). "
-                                    + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation.");
+                                    + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation. "
+                                    + "(3) Version 3: Uses the same v2-compatible key encoding and adds a tagged value layout. "
+                                    + "It is reserved for system-managed partitioned secondary index tables.");
 
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")

@@ -20,9 +20,11 @@ package org.apache.fluss.client.admin;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.InvalidAlterTableException;
+import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TableAlreadyExistException;
+import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
@@ -51,6 +53,33 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
 
     private static final String DB = "test_db_admin_idx";
+
+    @Test
+    void testRejectsExplicitVersionThreeForUserPrimaryKeyTable() throws Exception {
+        TablePath tablePath = TablePath.of(DB, "test_explicit_v3_pk_table");
+        admin.createDatabase(DB, DatabaseDescriptor.EMPTY, true).get();
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .column("name", DataTypes.STRING())
+                                        .primaryKey("id")
+                                        .build())
+                        .distributedBy(3, "id")
+                        .property(
+                                ConfigOptions.TABLE_KV_FORMAT_VERSION,
+                                ConfigOptions.KV_FORMAT_VERSION_3)
+                        .build();
+
+        assertThatThrownBy(() -> admin.createTable(tablePath, descriptor, false).get())
+                .cause()
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("kv format version 3")
+                .hasMessageContaining("partitioned secondary index tables");
+        assertThat(admin.tableExists(tablePath).get()).isFalse();
+    }
 
     @Test
     void testCreateTableWithGlobalSecondaryIndex() throws Exception {

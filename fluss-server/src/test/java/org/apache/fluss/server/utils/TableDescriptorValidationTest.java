@@ -24,6 +24,7 @@ import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
@@ -259,6 +260,55 @@ class TableDescriptorValidationTest {
                 .isInstanceOf(InvalidTableException.class)
                 .hasMessageContaining("secondary indexes")
                 .hasMessageContaining("primary key");
+    }
+
+    @Test
+    void testRejectsVersionThreeForDataTable() {
+        TableDescriptor descriptor =
+                descriptorBuilder(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("user_id", DataTypes.BIGINT())
+                                        .primaryKey("id")
+                                        .build())
+                        .property(
+                                ConfigOptions.TABLE_KV_FORMAT_VERSION,
+                                ConfigOptions.KV_FORMAT_VERSION_3)
+                        .build();
+
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptorValidation.validateTableDescriptor(
+                                        descriptor, MAX_BUCKET_NUM, null))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("kv format version 3")
+                .hasMessageContaining("partitioned secondary index tables");
+    }
+
+    @Test
+    void testAcceptsVersionThreeForPartitionedIndexTable() {
+        TableDescriptor mainDescriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("user_id", DataTypes.BIGINT())
+                                        .column("dt", DataTypes.STRING())
+                                        .primaryKey("id", "dt")
+                                        .index(INDEX_NAME, "user_id")
+                                        .build())
+                        .partitionedBy("dt")
+                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "1")
+                        .build();
+        TableDescriptor indexDescriptor =
+                IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.orders", INDEX_NAME)
+                        .withReplicationFactor(1);
+
+        assertThatCode(
+                        () ->
+                                TableDescriptorValidation.validateTableDescriptor(
+                                        indexDescriptor, MAX_BUCKET_NUM, null))
+                .doesNotThrowAnyException();
     }
 
     // ---------------------------------------------------------------------------------------------

@@ -93,7 +93,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newAlterTableRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newCreateDatabaseRequest;
@@ -276,7 +276,8 @@ class TableManagerITCase {
         assertThatThrownBy(() -> adminGateway.dropTable(newDropTableRequest(db1, tb1, false)).get())
                 .cause()
                 .isInstanceOf(TableNotExistException.class)
-                .hasMessageContaining(String.format("Table %s does not exist.", tablePath));
+                .hasMessageContaining(tablePath.toString())
+                .hasMessageContaining("does not exist");
 
         // drop a not exist table with ignore if not exists shouldn't throw exception
         adminGateway.dropTable(newDropTableRequest(db1, tb1, true)).get();
@@ -295,7 +296,7 @@ class TableManagerITCase {
         Map<String, String> properties = new HashMap<>(gottenTable.getProperties());
         properties.put(
                 ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+                String.valueOf(KV_FORMAT_VERSION_2));
         assertThat(gottenTable)
                 .isEqualTo(tableDescriptor.withProperties(properties).withReplicationFactor(1));
 
@@ -493,7 +494,7 @@ class TableManagerITCase {
         Map<String, String> properties = new HashMap<>(tableDescriptor.getProperties());
         properties.put(
                 ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+                String.valueOf(KV_FORMAT_VERSION_2));
         tableDescriptor = tableDescriptor.withProperties(properties);
 
         assertThat(TableDescriptor.fromJsonBytes(tableMetadata.getTableJson()))
