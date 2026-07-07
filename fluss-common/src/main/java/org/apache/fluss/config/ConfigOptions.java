@@ -23,9 +23,11 @@ import org.apache.fluss.compression.ArrowCompressionType;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
+import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.utils.ArrayUtils;
 
 import java.lang.reflect.Field;
@@ -56,7 +58,8 @@ public class ConfigOptions {
     public static final String DEFAULT_LISTENER_NAME = "FLUSS";
 
     public static final int KV_FORMAT_VERSION_2 = 2;
-    public static final int CURRENT_KV_FORMAT_VERSION = KV_FORMAT_VERSION_2;
+    public static final int KV_FORMAT_VERSION_3 = 3;
+    public static final int CURRENT_KV_FORMAT_VERSION = KV_FORMAT_VERSION_3;
 
     @Internal
     public static final String[] PARENT_FIRST_LOGGING_PATTERNS =
@@ -836,6 +839,83 @@ public class ConfigOptions {
                     .defaultValue(Duration.ofSeconds(1))
                     .withDescription("The amount of time to sleep when fetch bucket error occurs.")
                     .withFallbackKeys("log.replica.fetch-backoff-interval");
+
+    public static final ConfigOption<Integer> INDEX_REPLICATION_READER_NUMBER =
+            key("index.replication.reader-number")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "Number of reader worker threads in the server-global index replicator "
+                                    + "pool. Each leader-side index replicator is assigned to a "
+                                    + "worker by bucket hash; increasing this value raises the "
+                                    + "degree of parallelism for WAL reading and index derivation.");
+
+    public static final ConfigOption<Integer> INDEX_REPLICATION_SENDER_NUMBER =
+            key("index.replication.sender-number")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "Number of sender worker threads that dispatch derived index batches to "
+                                    + "target Index Table leaders. Each target index bucket is owned "
+                                    + "by a single sender worker, giving per-bucket in-order "
+                                    + "delivery.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_WINDOW_BYTES =
+            key("index.replication.max-window-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("256kb"))
+                    .withDescription(
+                            "Maximum number of WAL bytes an index replicator reads per window. "
+                                    + "Window boundaries are aligned to WAL record-batch boundaries, "
+                                    + "so a restarted replicator replays the exact same window "
+                                    + "trajectory from its pushed offset.");
+
+    public static final ConfigOption<Duration> INDEX_REPLICATION_BACKOFF_INTERVAL =
+            key("index.replication.backoff-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(50))
+                    .withDescription(
+                            "The amount of time an idle index replication worker (reader or sender) "
+                                    + "sleeps before re-checking for work when none is available.");
+
+    public static final ConfigOption<Duration> INDEX_REPLICATION_RETRY_BACKOFF =
+            key("index.replication.retry-backoff")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(100))
+                    .withDescription(
+                            "The base backoff applied before retrying a failed index batch send. "
+                                    + "The effective delay grows exponentially with the number of "
+                                    + "attempts, capped by 'index.replication.retry-max-backoff'. A "
+                                    + "failed batch is not eligible for re-send until this delay "
+                                    + "elapses, preventing busy-retry against an unhealthy target.");
+
+    public static final ConfigOption<Duration> INDEX_REPLICATION_RETRY_MAX_BACKOFF =
+            key("index.replication.retry-max-backoff")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(10))
+                    .withDescription(
+                            "The upper bound on the exponential retry backoff for a failed index "
+                                    + "batch send.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_PENDING_BYTES =
+            key("index.replication.max-pending-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("64mb"))
+                    .withDescription(
+                            "Maximum total bytes of pending (un-acknowledged) index batches buffered "
+                                    + "in the server-global index accumulator. When this limit is "
+                                    + "reached the read layer stops polling new WAL windows, applying "
+                                    + "back-pressure so derivation cannot outrun the send layer.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_REQUEST_BYTES =
+            key("index.replication.max-request-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("1mb"))
+                    .withDescription(
+                            "Maximum total encoded bytes packed into a single PutKv request when the "
+                                    + "sender consolidates multiple index batches for one target "
+                                    + "leader. Batches exceeding this bound are split across multiple "
+                                    + "requests.");
 
     public static final ConfigOption<MemorySize> LOG_REPLICA_FETCH_MAX_BYTES =
             key("log.replica.fetch.max-bytes")
@@ -1674,6 +1754,56 @@ public class ConfigOptions {
                                     + "Note: enabling column statistics requires the V1 batch format. "
                                     + "Downstream consumers must be upgraded to Fluss v1.0+ before enabling this option, "
                                     + "as older versions cannot parse the extended batch format.");
+
+    // ------------------------------------------------------------------------
+    //  Table Type & Secondary Index Definition Configs
+    //  (per-index, namespaced: secondary-index.<name>.{columns,bucket.num})
+    //  (visibility: index.visibility)
+    //  (index table metadata: table.index-meta.*)
+    // ------------------------------------------------------------------------
+
+    public static final ConfigOption<TableType> TABLE_TYPE =
+            key("table.type")
+                    .enumType(TableType.class)
+                    .defaultValue(TableType.DATA_TABLE)
+                    .withDescription(
+                            "Table type identifying whether this table is a user-facing DATA_TABLE "
+                                    + "or an internal INDEX_TABLE managed by Fluss for global secondary "
+                                    + "indexes. INDEX_TABLE is system-set and must not be configured by users.");
+
+    public static final ConfigOption<IndexVisibility> INDEX_VISIBILITY =
+            key("index.visibility")
+                    .enumType(IndexVisibility.class)
+                    .defaultValue(IndexVisibility.SYNC)
+                    .withDescription(
+                            "Visibility semantics for writes to a table that owns indexes. "
+                                    + "'sync' (default) blocks PutKv ack until all index mutations are "
+                                    + "applied. 'async' acks once the data WAL is committed and lets "
+                                    + "index mutations land asynchronously.");
+
+    public static final ConfigOption<Long> TABLE_INDEX_META_MAIN_TABLE_ID =
+            key("table.index-meta.main-table-id")
+                    .longType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The table id of the main table that this index table belongs to. "
+                                    + "Set automatically by the system when creating index tables; "
+                                    + "users must not modify it. Used to look up the main table during "
+                                    + "index push and lookup paths.");
+
+    public static final String SECONDARY_INDEX_PREFIX = "secondary-index.";
+    public static final String SECONDARY_INDEX_COLUMNS_SUFFIX = ".columns";
+    public static final String SECONDARY_INDEX_BUCKET_NUM_SUFFIX = ".bucket.num";
+
+    /** Builds the per-index columns config key: {@code secondary-index.<name>.columns}. */
+    public static String secondaryIndexColumnsKey(String indexName) {
+        return SECONDARY_INDEX_PREFIX + indexName + SECONDARY_INDEX_COLUMNS_SUFFIX;
+    }
+
+    /** Builds the per-index bucket-num config key: {@code secondary-index.<name>.bucket.num}. */
+    public static String secondaryIndexBucketNumKey(String indexName) {
+        return SECONDARY_INDEX_PREFIX + indexName + SECONDARY_INDEX_BUCKET_NUM_SUFFIX;
+    }
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv

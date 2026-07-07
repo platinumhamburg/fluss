@@ -137,7 +137,15 @@ class KvTabletTest {
     }
 
     @AfterEach
-    void afterEach() {
+    void afterEach() throws Exception {
+        if (kvTablet != null) {
+            kvTablet.close();
+            kvTablet = null;
+        }
+        if (logTablet != null) {
+            logTablet.close();
+            logTablet = null;
+        }
         if (executor != null) {
             executor.shutdown();
         }
@@ -216,7 +224,9 @@ class KvTabletTest {
                 schemaGetter,
                 tableConf.getChangelogImage(),
                 KvManager.getDefaultRateLimiter(),
-                autoIncrementManager);
+                autoIncrementManager,
+                null,
+                null);
     }
 
     @Test

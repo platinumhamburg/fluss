@@ -205,6 +205,9 @@ message UpdateMetadataRequest {
   repeated PbTableMetadata table_metadata = 3;
   repeated PbPartitionMetadata partition_metadata = 4;
   optional int32 coordinator_epoch = 5;
+  // Per-main-table partition tombstones propagated from the Coordinator (P3T6).
+  // Each entry replaces the cached tombstone for the given table_id on the receiver.
+  repeated PbPartitionTombstone partition_tombstones = 6;
 }
 
 message UpdateMetadataResponse {
@@ -832,6 +835,17 @@ message PbBucketMetadata {
   repeated int32 replica_id = 3 [packed = true];
   // TODO: Add isr here.
   optional int32 leader_epoch = 4;
+}
+
+// Per-main-table partition tombstone snapshot propagated via UpdateMetadataRequest.
+// Encodes the blacklist of dropped partitions for a partitioned source table:
+// a partitionId is tombstoned iff partitionId <= floor || explicit_set contains it.
+// The version is monotonic per table_id; receivers may use it to avoid stale overwrites.
+message PbPartitionTombstone {
+  required int64 table_id = 1;
+  required int64 floor = 2;
+  repeated int64 explicit_set = 3 [packed = true];
+  required int64 version = 4;
 }
 
 message PbProduceLogReqForBucket {

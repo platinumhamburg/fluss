@@ -51,6 +51,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.config.FlussConfigUtils.TABLE_OPTIONS;
@@ -82,6 +83,14 @@ public class TableDescriptorValidation {
     private static final List<DataTypeRoot> KEY_UNSUPPORTED_TYPES =
             Arrays.asList(DataTypeRoot.ARRAY, DataTypeRoot.MAP, DataTypeRoot.ROW);
 
+    /**
+     * Mirrors {@code Schema.Index.INDEX_NAME_PATTERN} so that namespaced {@code
+     * secondary-index.<name>.*} properties reject any index-name segment that the {@link
+     * Schema.Index} constructor would itself reject (letters, digits, underscores only, no double
+     * underscores).
+     */
+    private static final Pattern SECONDARY_INDEX_NAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]+$");
+
     /** Validate table descriptor to create is valid and contain all necessary information. */
     public static void validateTableDescriptor(
             TableDescriptor tableDescriptor,
@@ -94,6 +103,20 @@ public class TableDescriptorValidation {
         // check properties should only contain table.* options,
         // and this cluster know it, and value is valid
         for (String key : tableConf.keySet()) {
+
+            // index.visibility is a standalone config key outside the table.* namespace.
+            if (key.equals(ConfigOptions.INDEX_VISIBILITY.key())) {
+                validateOptionValue(tableConf, ConfigOptions.INDEX_VISIBILITY);
+                continue;
+            }
+
+            // The secondary-index.* namespace contains dynamic per-index keys
+            // (secondary-index.<name>.{columns,bucket.num}); handle the whole namespace here so
+            // the static TABLE_OPTIONS contract (table.* keys only) is preserved.
+            if (key.startsWith(ConfigOptions.SECONDARY_INDEX_PREFIX)) {
+                validateSecondaryIndexProperty(key, tableConf);
+                continue;
+            }
 
             if (!TABLE_OPTIONS.containsKey(key)) {
                 if (isTableStorageConfig(key)) {
@@ -125,6 +148,8 @@ public class TableDescriptorValidation {
         checkTieredLog(tableConf);
         checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema.getRowType());
         checkSystemColumns(schema.getRowType());
+        checkSecondaryIndexes(schema);
+        checkSecondaryIndexChangelogImage(schema, tableConf);
         validateStatisticsConfig(tableDescriptor);
         checkTableLakeFormatMatchesCluster(tableConf, clusterDataLakeFormat);
     }
@@ -523,5 +548,135 @@ public class TableDescriptorValidation {
                             "Invalid value for config '%s'. Reason: %s",
                             option.key(), t.getMessage()));
         }
+    }
+
+    private static void checkSecondaryIndexChangelogImage(Schema schema, ReadableConfig tableConf) {
+        if (schema.getIndexes().isEmpty()) {
+            return;
+        }
+        ChangelogImage changelogImage = tableConf.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
+        if (changelogImage != ChangelogImage.FULL) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Tables with secondary indexes require '%s' = '%s' "
+                                    + "(pre-image is needed for index mutation extraction). "
+                                    + "Current value: '%s'.",
+                            ConfigOptions.TABLE_CHANGELOG_IMAGE.key(),
+                            ChangelogImage.FULL,
+                            changelogImage));
+        }
+    }
+
+    private static void checkSecondaryIndexes(Schema schema) {
+        Set<String> indexNames = new LinkedHashSet<>();
+        for (Schema.Index index : schema.getIndexes()) {
+            String indexName = index.getIndexName();
+            if (!indexNames.add(indexName)) {
+                throw new InvalidTableException(
+                        String.format("Duplicate index name '%s'.", indexName));
+            }
+
+            Set<String> indexColumns = new LinkedHashSet<>();
+            for (String columnName : index.getColumnNames()) {
+                if (!indexColumns.add(columnName)) {
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Index '%s' contains duplicate column '%s'.",
+                                    indexName, columnName));
+                }
+
+                int columnIndex = schema.getRowType().getFieldIndex(columnName);
+                if (columnIndex < 0) {
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Index '%s' references unknown column '%s'.",
+                                    indexName, columnName));
+                }
+
+                DataType columnType = schema.getRowType().getTypeAt(columnIndex);
+                if (KEY_UNSUPPORTED_TYPES.contains(columnType.getTypeRoot())) {
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Index '%s' column '%s' has unsupported type %s.",
+                                    indexName, columnName, columnType));
+                }
+            }
+        }
+    }
+
+    /**
+     * Validates a property whose key begins with {@link ConfigOptions#SECONDARY_INDEX_PREFIX}.
+     *
+     * <p>Two cases are accepted:
+     *
+     * <ul>
+     *   <li>{@code secondary-index.<idxName>.columns} — dynamic, stringly-typed per-index list;
+     *       only the index-name segment is validated, the value is left to downstream parsers.
+     *   <li>{@code secondary-index.<idxName>.bucket.num} — dynamic, stringly-typed per-index
+     *       integer; same as above.
+     * </ul>
+     *
+     * <p>Any other {@code secondary-index.*} key is rejected with a clear message so users see the
+     * supported suffix list rather than the generic "not a Fluss table property" hint.
+     */
+    private static void validateSecondaryIndexProperty(String key, Configuration tableConf) {
+        if (isPerIndexSecondaryIndexProperty(key)) {
+            String indexName = extractSecondaryIndexName(key);
+            if (indexName.isEmpty()) {
+                throw new InvalidConfigException(
+                        String.format(
+                                "Invalid secondary-index property '%s': the index-name segment is empty.",
+                                key));
+            }
+            if (indexName.contains("__")) {
+                throw new InvalidConfigException(
+                        String.format(
+                                "Invalid secondary-index property '%s': index name '%s' must not contain double underscores '__'.",
+                                key, indexName));
+            }
+            if (!SECONDARY_INDEX_NAME_PATTERN.matcher(indexName).matches()) {
+                throw new InvalidConfigException(
+                        String.format(
+                                "Invalid secondary-index property '%s': index name '%s' may only contain letters, digits, and underscores.",
+                                key, indexName));
+            }
+            return;
+        }
+        throw new InvalidConfigException(
+                String.format(
+                        "Unknown secondary-index sub-property '%s'. Supported per-index suffixes: '%s', '%s'.",
+                        key,
+                        ConfigOptions.SECONDARY_INDEX_COLUMNS_SUFFIX,
+                        ConfigOptions.SECONDARY_INDEX_BUCKET_NUM_SUFFIX));
+    }
+
+    private static boolean isPerIndexSecondaryIndexProperty(String key) {
+        if (!key.startsWith(ConfigOptions.SECONDARY_INDEX_PREFIX)) {
+            return false;
+        }
+        return key.endsWith(ConfigOptions.SECONDARY_INDEX_COLUMNS_SUFFIX)
+                || key.endsWith(ConfigOptions.SECONDARY_INDEX_BUCKET_NUM_SUFFIX);
+    }
+
+    /**
+     * Strips the {@code secondary-index.} prefix and the recognized suffix from {@code key} and
+     * returns the index-name segment in between. Returns an empty string if the key does not match
+     * either suffix; callers are expected to gate this with {@link
+     * #isPerIndexSecondaryIndexProperty}.
+     */
+    private static String extractSecondaryIndexName(String key) {
+        if (!key.startsWith(ConfigOptions.SECONDARY_INDEX_PREFIX)) {
+            return "";
+        }
+        String body = key.substring(ConfigOptions.SECONDARY_INDEX_PREFIX.length());
+        if (body.endsWith(ConfigOptions.SECONDARY_INDEX_COLUMNS_SUFFIX)) {
+            return body.substring(
+                    0, body.length() - ConfigOptions.SECONDARY_INDEX_COLUMNS_SUFFIX.length());
+        }
+        if (body.endsWith(ConfigOptions.SECONDARY_INDEX_BUCKET_NUM_SUFFIX)) {
+            return body.substring(
+                    0, body.length() - ConfigOptions.SECONDARY_INDEX_BUCKET_NUM_SUFFIX.length());
+        }
+        return "";
     }
 }

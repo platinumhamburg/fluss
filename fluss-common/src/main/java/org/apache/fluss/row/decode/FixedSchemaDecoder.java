@@ -26,7 +26,9 @@ import org.apache.fluss.row.ProjectedRow;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.utils.SchemaUtil;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.row.encode.ValueEncoder.SCHEMA_ID_LENGTH;
+import static org.apache.fluss.row.encode.ValueEncoder.TAG_LENGTH;
 
 /**
  * A decoder that deserializes raw byte arrays of {@link ValueRecord} with dynamic or
@@ -48,24 +50,36 @@ public class FixedSchemaDecoder {
     /** Indicates whether there is no projection between source schema and target schema. */
     private final boolean noProjection;
 
-    public FixedSchemaDecoder(KvFormat kvFormat, Schema sourceSchema, Schema targetSchema) {
+    /** The byte offset where the BinaryRow data begins within the encoded value. */
+    private final int rowOffset;
+
+    public FixedSchemaDecoder(
+            KvFormat kvFormat, Schema sourceSchema, Schema targetSchema, int kvFormatVersion) {
         this.rowDecoder =
                 RowDecoder.create(
                         kvFormat, sourceSchema.getRowType().getChildren().toArray(new DataType[0]));
         this.fieldIdMapping = SchemaUtil.getIndexMapping(sourceSchema, targetSchema);
         this.noProjection = false;
+        this.rowOffset = computeRowOffset(kvFormatVersion);
     }
 
     /**
      * Creates a FixedSchemaDecoder without projection, i.e., the source schema is the same as the
      * target schema.
      */
-    public FixedSchemaDecoder(KvFormat kvFormat, Schema schema) {
+    public FixedSchemaDecoder(KvFormat kvFormat, Schema schema, int kvFormatVersion) {
         this.rowDecoder =
                 RowDecoder.create(
                         kvFormat, schema.getRowType().getChildren().toArray(new DataType[0]));
         this.fieldIdMapping = null;
         this.noProjection = true;
+        this.rowOffset = computeRowOffset(kvFormatVersion);
+    }
+
+    private static int computeRowOffset(int kvFormatVersion) {
+        return kvFormatVersion >= KV_FORMAT_VERSION_3
+                ? SCHEMA_ID_LENGTH + TAG_LENGTH
+                : SCHEMA_ID_LENGTH;
     }
 
     /**
@@ -87,9 +101,10 @@ public class FixedSchemaDecoder {
 
     /**
      * Decode the value memory segment (in {@link ValueRecord} format) to {@link InternalRow} that
-     * adheres to the fixed {@code targetSchema}.
+     * adheres to the fixed {@code targetSchema}. Automatically skips the schemaId (and tag for v3)
+     * header based on the kvFormatVersion provided at construction time.
      */
     public InternalRow decode(MemorySegment valueSegment) {
-        return decode(valueSegment, SCHEMA_ID_LENGTH, valueSegment.size() - SCHEMA_ID_LENGTH);
+        return decode(valueSegment, rowOffset, valueSegment.size() - rowOffset);
     }
 }

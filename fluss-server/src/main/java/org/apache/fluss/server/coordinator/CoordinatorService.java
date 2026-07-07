@@ -36,6 +36,7 @@ import org.apache.fluss.exception.LakeTableAlreadyExistException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
@@ -43,6 +44,7 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.committer.TieringStats;
 import org.apache.fluss.lake.lakestorage.LakeCatalog;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseChange;
 import org.apache.fluss.metadata.DatabaseDescriptor;
@@ -50,6 +52,7 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -158,6 +161,7 @@ import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.DatabasePropertyChanges;
 import org.apache.fluss.server.entity.LakeTieringTableInfo;
 import org.apache.fluss.server.entity.TablePropertyChanges;
+import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
@@ -172,6 +176,7 @@ import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 import org.apache.fluss.utils.json.TableBucketOffsets;
 
@@ -183,6 +188,7 @@ import javax.annotation.Nullable;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -458,6 +464,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         // apply system defaults if the config is not set
         tableDescriptor = applySystemDefaults(tableDescriptor, lakeCatalogContainer);
 
+        // Tables with secondary indexes require FULL changelog image so the WAL-driven
+        // index replication pipeline can derive old index keys from UPDATE_BEFORE records.
+        if (!tableDescriptor.getSchema().getIndexes().isEmpty()) {
+            tableDescriptor = tableDescriptor.withChangelogImage(ChangelogImage.FULL);
+        }
+
         // validate table descriptor before creating table in lake or fluss metadata,
         // to avoid orphaned lake tables when validation fails
         metadataManager.validateTableDescriptor(tableDescriptor);
@@ -494,10 +506,106 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         // then create table;
-        metadataManager.createTable(
-                tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+        long mainTableId =
+                metadataManager.createTable(
+                        tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+
+        // auto-derive Index Tables for any indexes declared on the main table's schema; this is
+        // synchronous so that the Coordinator returns success only when both the main table and
+        // every Index Table are persisted in ZK. If any Index Table fails to persist, roll back the
+        // partial state (the already-created Index Tables and the main table this request created)
+        // so CREATE TABLE is atomic: the caller never observes a main table that declares indexes
+        // but lacks complete backing Index Tables, and a default retry (ignoreIfExists=false) is
+        // not blocked by a half-created main table.
+        List<TablePath> createdIndexTablePaths = new ArrayList<>();
+        try {
+            autoDeriveIndexTables(tablePath, tableDescriptor, mainTableId, createdIndexTablePaths);
+        } catch (RuntimeException e) {
+            rollbackPartialTableCreation(tablePath, createdIndexTablePaths, mainTableId);
+            throw e;
+        }
 
         return CompletableFuture.completedFuture(new CreateTableResponse());
+    }
+
+    /**
+     * Undoes a partially completed CREATE TABLE after {@link #autoDeriveIndexTables} fails. Drops
+     * every Index Table created by this request and, only when this request actually created the
+     * main table ({@code createdMainTableId != -1}), drops the main table too. Cleanup failures are
+     * logged rather than thrown so the original creation error is the one surfaced to the caller.
+     */
+    private void rollbackPartialTableCreation(
+            TablePath mainTablePath,
+            List<TablePath> createdIndexTablePaths,
+            long createdMainTableId) {
+        for (TablePath indexPath : createdIndexTablePaths) {
+            try {
+                metadataManager.dropTable(indexPath, /* ignoreIfNotExists= */ true);
+            } catch (RuntimeException cleanupError) {
+                LOG.warn(
+                        "Failed to clean up derived Index Table {} while rolling back CREATE TABLE for {}",
+                        indexPath,
+                        mainTablePath,
+                        cleanupError);
+            }
+        }
+        // Only drop the main table if this request created it. When ignoreIfExists=true matched a
+        // pre-existing main table (createdMainTableId == -1), leave that table intact.
+        if (createdMainTableId != -1L) {
+            try {
+                metadataManager.dropTable(mainTablePath, /* ignoreIfNotExists= */ true);
+            } catch (RuntimeException cleanupError) {
+                LOG.warn(
+                        "Failed to drop main table while rolling back CREATE TABLE for {}",
+                        mainTablePath,
+                        cleanupError);
+            }
+        }
+    }
+
+    private void autoDeriveIndexTables(
+            TablePath mainTablePath,
+            TableDescriptor mainDescriptor,
+            long createdMainTableId,
+            List<TablePath> createdIndexTablePaths) {
+        if (mainDescriptor.getSchema().getIndexes().isEmpty() || createdMainTableId == -1L) {
+            return;
+        }
+        int mainReplicationFactor = mainDescriptor.getReplicationFactor();
+        String mainTableName = mainTablePath.getDatabaseName() + "." + mainTablePath.getTableName();
+        List<Schema.Index> indexes = mainDescriptor.getSchema().getIndexes();
+        for (Schema.Index index : indexes) {
+            TableDescriptor indexDescriptor =
+                    IndexTableDescriptorFactory.derive(
+                            mainDescriptor,
+                            createdMainTableId,
+                            mainTableName,
+                            index.getIndexName());
+            // Ensure the replication factor is set: the index table descriptor factory does not
+            // propagate it, but generateAssignment requires it.
+            if (!indexDescriptor
+                    .getProperties()
+                    .containsKey(ConfigOptions.TABLE_REPLICATION_FACTOR.key())) {
+                indexDescriptor = indexDescriptor.withReplicationFactor(mainReplicationFactor);
+            }
+            TablePath indexTablePath =
+                    TablePath.of(
+                            mainTablePath.getDatabaseName(),
+                            IndexTableUtils.indexTableName(
+                                    mainTablePath.getTableName(), index.getIndexName()));
+            TableAssignment indexAssignment = null;
+            if (!indexDescriptor.isPartitioned()) {
+                //noinspection OptionalGetWithoutIsPresent
+                int indexBucketCount =
+                        indexDescriptor.getTableDistribution().get().getBucketCount().get();
+                int indexReplicaFactor = indexDescriptor.getReplicationFactor();
+                TabletServerInfo[] servers = metadataCache.getLiveServers();
+                indexAssignment = generateAssignment(indexBucketCount, indexReplicaFactor, servers);
+            }
+            metadataManager.createTable(
+                    indexTablePath, indexDescriptor, indexAssignment, /* ignoreIfExists= */ false);
+            createdIndexTablePaths.add(indexTablePath);
+        }
     }
 
     @Override
@@ -669,8 +777,50 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         authorizeTable(OperationType.DROP, tablePath);
 
         DropTableResponse response = new DropTableResponse();
+        // cascade-drop derived Index Tables BEFORE the main table so any in-flight push from a
+        // leader of the main table cannot land on an Index Table whose main has already been
+        // unregistered. Each Index Table is dropped with ignoreIfNotExists=true so a retried
+        // DROP TABLE after a partial failure is recoverable. The main-table drop honors the
+        // user-facing ignoreIfNotExists flag from the request.
+        cascadeDropIndexTables(tablePath);
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
         return CompletableFuture.completedFuture(response);
+    }
+
+    private void cascadeDropIndexTables(TablePath mainTablePath) {
+        List<TablePath> indexPaths;
+        try {
+            TableInfo mainInfo = metadataManager.getTable(mainTablePath);
+            indexPaths = indexTablePathsFor(mainTablePath, mainInfo.getSchema());
+        } catch (TableNotExistException e) {
+            // main table missing: nothing to cascade. The subsequent dropTable call will surface
+            // the appropriate error or no-op according to the request's ignoreIfNotExists flag.
+            return;
+        }
+        for (TablePath indexPath : indexPaths) {
+            metadataManager.dropTable(indexPath, /* ignoreIfNotExists= */ true);
+        }
+    }
+
+    /**
+     * Returns the set of Index Table paths derived from {@code mainPath} for every index declared
+     * in {@code schema}. Returns an empty list when the schema has no indexes.
+     */
+    @VisibleForTesting
+    static List<TablePath> indexTablePathsFor(TablePath mainPath, Schema schema) {
+        List<Schema.Index> indexes = schema.getIndexes();
+        if (indexes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<TablePath> result = new ArrayList<>(indexes.size());
+        for (Schema.Index index : indexes) {
+            result.add(
+                    TablePath.of(
+                            mainPath.getDatabaseName(),
+                            IndexTableUtils.indexTableName(
+                                    mainPath.getTableName(), index.getIndexName())));
+        }
+        return result;
     }
 
     @Override
@@ -1241,6 +1391,16 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
      */
     private void validateTableCreationPermission(
             TableDescriptor tableDescriptor, TablePath tablePath) {
+        if (tableDescriptor.isIndexTable()
+                || tableDescriptor
+                        .getProperties()
+                        .containsKey(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key())) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Table %s cannot be created as an internal secondary index table.",
+                            tablePath));
+        }
+
         boolean hasPrimaryKey = tableDescriptor.hasPrimaryKey();
 
         if (hasPrimaryKey) {

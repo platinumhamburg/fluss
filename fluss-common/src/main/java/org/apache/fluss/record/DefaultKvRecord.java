@@ -23,6 +23,7 @@ import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.OutputView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.compacted.CompactedRow;
 import org.apache.fluss.row.compacted.CompactedRowWriter;
 import org.apache.fluss.row.decode.RowDecoder;
@@ -186,6 +187,11 @@ public class DefaultKvRecord implements KvRecord {
         } else if (internalRow instanceof CompactedRow) {
             CompactedRow compactedRow = (CompactedRow) internalRow;
             CompactedRowWriter.serializeCompactedRow(compactedRow, outputView);
+        } else if (internalRow instanceof AlignedRow) {
+            AlignedRow alignedRow = (AlignedRow) internalRow;
+            byte[] bytes = new byte[alignedRow.getSizeInBytes()];
+            alignedRow.copyTo(bytes, 0);
+            outputView.write(bytes, 0, bytes.length);
         } else {
             throw new IllegalArgumentException(
                     "No such internal row serializer for: "

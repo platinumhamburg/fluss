@@ -379,7 +379,9 @@ final class KvManagerTest {
                 KvFormat.COMPACTED,
                 schemaGetter,
                 new TableConfig(new Configuration()),
-                DEFAULT_COMPRESSION);
+                DEFAULT_COMPRESSION,
+                null,
+                null);
     }
 
     private byte[] valueOf(KvRecord kvRecord) {

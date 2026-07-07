@@ -231,6 +231,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                         snapshotResult.getKvSnapshotHandle(),
                         tabletState.getFlushedLogOffset(),
                         tabletState.getRowCount(),
+                        tabletState.getIndexPushedOffset(),
                         tabletState.getAutoIncIDRanges());
         try {
             // commit the completed snapshot
@@ -286,7 +287,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             logOffsetOfLatestSnapshot = flushedLogOffset;
             snapshotSize = snapshotResult.getSnapshotSize();
             // update LogTablet to notify the lowest offset that should be retained
-            updateMinRetainOffset.accept(flushedLogOffset);
+            updateMinRetainOffset.accept(snapshotResult.getTabletState().getMinRetainLogOffset());
         } finally {
             // notify the snapshot complete (must run last to preserve the ordering contract above,
             // and run in finally to guarantee internal SST bookkeeping is always cleaned up).

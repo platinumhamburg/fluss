@@ -67,6 +67,7 @@ public class KvRecoverHelper {
     private final KvFormat kvFormat;
     private final LogFormat logFormat;
     private final RemoteLogFetcher remoteLogFetcher;
+    private final ValueEncoder valueEncoder;
 
     // will be initialized when first encounter a log record during recovering from log
     private Integer currentSchemaId;
@@ -88,7 +89,8 @@ public class KvRecoverHelper {
             KvFormat kvFormat,
             LogFormat logFormat,
             SchemaGetter schemaGetter,
-            RemoteLogFetcher remoteLogFetcher) {
+            RemoteLogFetcher remoteLogFetcher,
+            ValueEncoder valueEncoder) {
         this.kvTablet = kvTablet;
         this.logTablet = logTablet;
         this.recoverPointOffset = recoverPointOffset;
@@ -99,6 +101,7 @@ public class KvRecoverHelper {
         this.logFormat = logFormat;
         this.schemaGetter = schemaGetter;
         this.remoteLogFetcher = remoteLogFetcher;
+        this.valueEncoder = valueEncoder;
     }
 
     public void recover() throws Exception {
@@ -268,7 +271,10 @@ public class KvRecoverHelper {
                         // the log row format may not compatible with kv row format,
                         // e.g, arrow vs. compacted, thus needs a conversion here.
                         BinaryRow row = toKvRow(logRow);
-                        value = ValueEncoder.encodeValue(currentSchemaId.shortValue(), row);
+                        value =
+                                valueEncoder
+                                        .createValue(currentSchemaId.shortValue(), row)
+                                        .encodeValue();
                     }
                     resumeRecordConsumer.accept(
                             new KeyValueAndLogOffset(

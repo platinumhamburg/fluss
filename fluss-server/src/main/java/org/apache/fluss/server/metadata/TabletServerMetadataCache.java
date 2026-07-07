@@ -20,6 +20,7 @@ package org.apache.fluss.server.metadata;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -39,6 +40,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.locks.Lock;
@@ -112,6 +114,10 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
         return serverMetadataSnapshot.getTablePath(tableId);
     }
 
+    public OptionalLong getTableId(TablePath tablePath) {
+        return serverMetadataSnapshot.getTableId(tablePath);
+    }
+
     public Optional<PhysicalTablePath> getPhysicalTablePath(long partitionId) {
         return serverMetadataSnapshot.getPhysicalTablePath(partitionId);
     }
@@ -175,6 +181,46 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
 
     public boolean contains(TableBucket tableBucket) {
         return serverMetadataSnapshot.contains(tableBucket);
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<Long, PartitionTombstone>
+            partitionTombstones = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public PartitionTombstone getPartitionTombstone(long mainTableId) {
+        return partitionTombstones.getOrDefault(mainTableId, PartitionTombstone.EMPTY);
+    }
+
+    public OptionalInt getBucketLeader(long tableId, int bucketId) {
+        Map<Integer, BucketMetadata> buckets =
+                serverMetadataSnapshot.getBucketMetadataForTable(tableId);
+        if (buckets == null) {
+            return OptionalInt.empty();
+        }
+        BucketMetadata bm = buckets.get(bucketId);
+        if (bm == null) {
+            return OptionalInt.empty();
+        }
+        return bm.getLeaderId();
+    }
+
+    public void updatePartitionTombstone(long mainTableId, PartitionTombstone tombstone) {
+        partitionTombstones.compute(
+                mainTableId,
+                (ignored, current) -> {
+                    if (current != null
+                            && tombstone != null
+                            && tombstone.getVersion() < current.getVersion()) {
+                        return current;
+                    }
+                    // Remove only when the payload is structurally equivalent to the initial state
+                    // (PartitionTombstone.EMPTY, version == 0). A version-bearing-but-empty payload
+                    // (e.g. (-1, {}, v=N)) is a legitimate propagation entry and must be preserved
+                    // so that monotonic version bookkeeping is not lost.
+                    if (tombstone == null || PartitionTombstone.EMPTY.equals(tombstone)) {
+                        return null;
+                    }
+                    return tombstone;
+                });
     }
 
     public void updateClusterMetadata(ClusterMetadata clusterMetadata) {
@@ -287,6 +333,18 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                     partitionIdByPath,
                                     bucketMetadataMapForTables,
                                     bucketMetadataMapForPartitions);
+
+                    // 5. apply partition tombstones (partial update). Delegated to
+                    // updatePartitionTombstone so the remove-on-EMPTY semantics is shared
+                    // with the direct-write entry point used by tests.
+                    Map<Long, PartitionTombstone> incomingTombstones =
+                            clusterMetadata.getPartitionTombstones();
+                    if (incomingTombstones != null && !incomingTombstones.isEmpty()) {
+                        for (Map.Entry<Long, PartitionTombstone> e :
+                                incomingTombstones.entrySet()) {
+                            updatePartitionTombstone(e.getKey(), e.getValue());
+                        }
+                    }
                 });
     }
 

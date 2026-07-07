@@ -57,6 +57,8 @@ public interface RowEncoder extends AutoCloseable {
             return new CompactedRowEncoder(fieldDataTypes);
         } else if (kvFormat == KvFormat.INDEXED) {
             return new IndexedRowEncoder(fieldDataTypes);
+        } else if (kvFormat == KvFormat.ALIGNED) {
+            return new AlignedRowEncoder(fieldDataTypes);
         } else {
             throw new IllegalArgumentException("Unsupported kv format: " + kvFormat);
         }

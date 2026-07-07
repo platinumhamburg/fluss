@@ -46,6 +46,7 @@ import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
 import org.apache.fluss.row.encode.ValueDecoder;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
@@ -79,6 +80,8 @@ import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
 
+import org.rocksdb.AbstractCompactionFilter;
+import org.rocksdb.AbstractCompactionFilterFactory;
 import org.rocksdb.RateLimiter;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksIterator;
@@ -98,6 +101,7 @@ import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.ToLongFunction;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
@@ -135,6 +139,19 @@ public final class KvTablet {
 
     private final SchemaGetter schemaGetter;
 
+    /**
+     * Optional function to extract the tag value from a row for v3 value encoding. When non-null,
+     * values are encoded in v3 format: [schemaId(2)][tag(8)][BinaryRow]. For partition TTL on Index
+     * Tables, this extracts the partitionId from the row.
+     */
+    @Nullable private final ToLongFunction<BinaryRow> tagExtractor;
+
+    /** The KV format version of this table (determines value layout). */
+    private final int kvFormatVersion;
+
+    /** Version-aware encoder that encapsulates format version and tag extraction. */
+    private final ValueEncoder valueEncoder;
+
     // the changelog image mode for this tablet
     private final ChangelogImage changelogImage;
 
@@ -169,7 +186,8 @@ public final class KvTablet {
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
             @Nullable RocksDBStatistics rocksDBStatistics,
-            AutoIncrementManager autoIncrementManager) {
+            AutoIncrementManager autoIncrementManager,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
@@ -193,6 +211,9 @@ public final class KvTablet {
         this.autoIncrementManager = autoIncrementManager;
         // disable row count for WAL image mode.
         this.rowCount = changelogImage == ChangelogImage.WAL ? ROW_COUNT_DISABLED : 0L;
+        this.tagExtractor = tagExtractor;
+        this.kvFormatVersion = tagExtractor != null ? 3 : 2;
+        this.valueEncoder = ValueEncoder.forVersion(kvFormatVersion, tagExtractor);
     }
 
     public static KvTablet create(
@@ -210,9 +231,14 @@ public final class KvTablet {
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
             RateLimiter sharedRateLimiter,
-            AutoIncrementManager autoIncrementManager)
+            AutoIncrementManager autoIncrementManager,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor)
             throws IOException {
-        RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter);
+        RocksDBKv kv =
+                buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter, compactionFilterFactory);
 
         // Create RocksDB statistics accessor (will be registered to TableMetricGroup by Replica)
         // Pass ResourceGuard to ensure thread-safe access during concurrent close operations
@@ -243,13 +269,18 @@ public final class KvTablet {
                 schemaGetter,
                 changelogImage,
                 rocksDBStatistics,
-                autoIncrementManager);
+                autoIncrementManager,
+                tagExtractor);
     }
 
     private static RocksDBKv buildRocksDBKv(
-            Configuration configuration, File kvDir, RateLimiter sharedRateLimiter)
+            Configuration configuration,
+            File kvDir,
+            RateLimiter sharedRateLimiter,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory)
             throws IOException {
-        // Enable statistics to support RocksDB statistics collection
         RocksDBResourceContainer rocksDBResourceContainer =
                 new RocksDBResourceContainer(configuration, kvDir, true, sharedRateLimiter);
         RocksDBKvBuilder rocksDBKvBuilder =
@@ -257,6 +288,9 @@ public final class KvTablet {
                         kvDir,
                         rocksDBResourceContainer,
                         rocksDBResourceContainer.getColumnOptions());
+        if (compactionFilterFactory != null) {
+            rocksDBKvBuilder.setCompactionFilterFactory(compactionFilterFactory);
+        }
         return rocksDBKvBuilder.build();
     }
 
@@ -266,6 +300,16 @@ public final class KvTablet {
 
     public TablePath getTablePath() {
         return physicalPath.getTablePath();
+    }
+
+    /** Returns the version-aware ValueEncoder bound to this tablet's format version. */
+    public ValueEncoder getValueEncoder() {
+        return valueEncoder;
+    }
+
+    /** Returns the KV format version of this tablet (e.g. 2 or 3). */
+    public int getKvFormatVersion() {
+        return kvFormatVersion;
     }
 
     public long getAutoIncrementCacheSize() {
@@ -301,6 +345,20 @@ public final class KvTablet {
 
     void setRowCount(long rowCount) {
         this.rowCount = rowCount;
+    }
+
+    /**
+     * Installs a value filter used by Index Table replicas to skip entries whose source partition
+     * has been tombstoned. The filter is evaluated during point-lookup and prefix-scan paths.
+     *
+     * @param filter returns {@code true} when the value should be dropped
+     */
+    private static final java.util.function.Predicate<byte[]> NO_OP_VALUE_FILTER = v -> false;
+
+    private volatile java.util.function.Predicate<byte[]> valueFilter = NO_OP_VALUE_FILTER;
+
+    public void setValueFilter(@Nullable java.util.function.Predicate<byte[]> filter) {
+        this.valueFilter = filter == null ? NO_OP_VALUE_FILTER : filter;
     }
 
     // row_count is volatile, so it's safe to read without lock
@@ -478,13 +536,18 @@ public final class KvTablet {
         // TODO: reuse the read context and decoder
         KvRecordBatch.ReadContext readContext =
                 KvRecordReadContext.createReadContext(kvFormat, schemaGetter);
-        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
+        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat, kvFormatVersion);
 
         for (KvRecord kvRecord : kvRecords.records(readContext)) {
             byte[] keyBytes = BytesUtils.toArray(kvRecord.getKey());
             KvPreWriteBuffer.Key key = KvPreWriteBuffer.Key.of(keyBytes);
             BinaryRow row = kvRecord.getRow();
-            BinaryValue currentValue = row == null ? null : new BinaryValue(schemaIdOfNewData, row);
+            BinaryValue currentValue;
+            if (row == null) {
+                currentValue = null;
+            } else {
+                currentValue = valueEncoder.createValue(schemaIdOfNewData, row);
+            }
 
             if (currentValue == null) {
                 logOffset =
@@ -539,11 +602,15 @@ public final class KvTablet {
         BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
         BinaryValue newValue = currentMerger.delete(oldValue);
 
-        // if newValue is null, it means the row should be deleted
         if (newValue == null) {
-            return applyDelete(key, oldValue, walBuilder, latestSchemaRow, logOffset);
+            long newOffset = applyDelete(key, oldValue, walBuilder, latestSchemaRow, logOffset);
+
+            return newOffset;
         } else {
-            return applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+            long newOffset =
+                    applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+
+            return newOffset;
         }
     }
 
@@ -557,7 +624,18 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
-        // Optimization: IN WAL mode，when using DefaultRowMerger (full update, not partial update)
+        java.util.function.Predicate<byte[]> filter = this.valueFilter;
+        if (filter != NO_OP_VALUE_FILTER) {
+            // The filter contract takes the encoded value bytes (schemaId + row), matching the
+            // format produced by BinaryValue#encodeValue and consumed by the read/compaction
+            // filter paths. Feeding raw row bytes here would shift the column offsets by
+            // SCHEMA_ID_LENGTH and silently misread filter inputs.
+            byte[] encodedValueBytes = currentValue.encodeValue();
+            if (filter.test(encodedValueBytes)) {
+                return logOffset;
+            }
+        }
+        // Optimization: IN WAL mode, when using DefaultRowMerger (full update, not partial update)
         // and there is no auto-increment column, we can skip fetching old value for better
         // performance since the result always reflects the new value. In this case, both INSERT and
         // UPDATE will produce UPDATE_AFTER.
@@ -570,24 +648,28 @@ public final class KvTablet {
         byte[] oldValueBytes = getFromBufferOrKv(key);
         if (oldValueBytes == null) {
             BinaryValue valueToInsert = currentMerger.merge(null, currentValue);
-            return applyInsert(
-                    key,
-                    valueToInsert,
-                    walBuilder,
-                    latestSchemaRow,
-                    logOffset,
-                    autoIncrementUpdater);
+            long newOffset =
+                    applyInsert(
+                            key,
+                            valueToInsert,
+                            walBuilder,
+                            latestSchemaRow,
+                            logOffset,
+                            autoIncrementUpdater);
+
+            return newOffset;
         }
 
         BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
         BinaryValue newValue = currentMerger.merge(oldValue, currentValue);
 
         if (newValue == oldValue) {
-            // no actual change, skip this record
             return logOffset;
         }
 
-        return applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+        long newOffset =
+                applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+        return newOffset;
     }
 
     private long applyDelete(
@@ -624,15 +706,15 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
-        if (changelogImage == ChangelogImage.WAL) {
-            walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset);
-            return logOffset + 1;
-        } else {
+        if (changelogImage.hasUpdateBefore()) {
             walBuilder.append(ChangeType.UPDATE_BEFORE, latestSchemaRow.replaceRow(oldValue.row));
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
             kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset + 1);
             return logOffset + 2;
+        } else {
+            walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
+            kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset);
+            return logOffset + 1;
         }
     }
 

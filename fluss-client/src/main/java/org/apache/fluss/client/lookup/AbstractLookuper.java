@@ -37,6 +37,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** Abstract lookuper implementation for common methods. */
@@ -50,6 +51,8 @@ abstract class AbstractLookuper implements Lookuper {
     protected final short targetSchemaId;
 
     private final SchemaGetter schemaGetter;
+
+    private final int kvFormatVersion;
 
     /**
      * Cache for row decoders for different schema ids. Use CopyOnWriteMap for fast access, as it is
@@ -67,12 +70,16 @@ abstract class AbstractLookuper implements Lookuper {
         this.lookupClient = lookupClient;
         this.targetSchemaId = (short) tableInfo.getSchemaId();
         this.schemaGetter = schemaGetter;
+        this.kvFormatVersion =
+                tableInfo.getTableConfig().getKvFormatVersion().orElse(KV_FORMAT_VERSION_2);
         this.decoders = new CopyOnWriteMap<>();
         // initialize the decoder for the same schema
         this.decoders.put(
                 targetSchemaId,
                 new FixedSchemaDecoder(
-                        tableInfo.getTableConfig().getKvFormat(), tableInfo.getSchema()));
+                        tableInfo.getTableConfig().getKvFormat(),
+                        tableInfo.getSchema(),
+                        kvFormatVersion));
     }
 
     protected void handleLookupResponse(
@@ -170,7 +177,8 @@ abstract class AbstractLookuper implements Lookuper {
                                 return new FixedSchemaDecoder(
                                         tableInfo.getTableConfig().getKvFormat(),
                                         sourceSchema,
-                                        tableInfo.getSchema());
+                                        tableInfo.getSchema(),
+                                        kvFormatVersion);
                             });
             InternalRow row = decoder.decode(value);
             rowList.add(row);

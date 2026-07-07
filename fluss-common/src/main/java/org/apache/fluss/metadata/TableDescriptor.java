@@ -152,6 +152,44 @@ public final class TableDescriptor implements Serializable {
         return schema;
     }
 
+    /**
+     * Returns the configured {@link KvFormat} for this table, falling back to the default value of
+     * {@link ConfigOptions#TABLE_KV_FORMAT} when not explicitly set.
+     */
+    public KvFormat getKvFormat() {
+        String v = properties.get(ConfigOptions.TABLE_KV_FORMAT.key());
+        return v == null ? ConfigOptions.TABLE_KV_FORMAT.defaultValue() : KvFormat.fromString(v);
+    }
+
+    /**
+     * Returns the configured {@link LogFormat} for this table, falling back to the default value of
+     * {@link ConfigOptions#TABLE_LOG_FORMAT} when not explicitly set.
+     */
+    public LogFormat getLogFormat() {
+        String v = properties.get(ConfigOptions.TABLE_LOG_FORMAT.key());
+        return v == null ? ConfigOptions.TABLE_LOG_FORMAT.defaultValue() : LogFormat.fromString(v);
+    }
+
+    /**
+     * Returns the configured {@link ChangelogImage} for this table, falling back to the default
+     * value of {@link ConfigOptions#TABLE_CHANGELOG_IMAGE} when not explicitly set.
+     */
+    public ChangelogImage getChangelogImage() {
+        String v = properties.get(ConfigOptions.TABLE_CHANGELOG_IMAGE.key());
+        return v == null
+                ? ConfigOptions.TABLE_CHANGELOG_IMAGE.defaultValue()
+                : ChangelogImage.fromString(v);
+    }
+
+    /**
+     * Returns {@code true} when this descriptor is for a system-managed Index Table (i.e. {@link
+     * ConfigOptions#TABLE_TYPE} is {@link TableType#INDEX_TABLE}).
+     */
+    public boolean isIndexTable() {
+        String v = properties.get(ConfigOptions.TABLE_TYPE.key());
+        return v != null && TableType.INDEX_TABLE.name().equals(v.toUpperCase());
+    }
+
     /** Returns the bucket key of the table, empty if no bucket key is set. */
     public List<String> getBucketKeys() {
         return this.getTableDistribution()
@@ -264,6 +302,13 @@ public final class TableDescriptor implements Serializable {
      * Returns a new TableDescriptor instance that is a copy of this TableDescriptor with a new
      * replication factor property.
      */
+    /** Returns a copy of this descriptor with the given changelog image mode. */
+    public TableDescriptor withChangelogImage(ChangelogImage image) {
+        Map<String, String> newProperties = new HashMap<>(properties);
+        newProperties.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), image.toString());
+        return withProperties(newProperties);
+    }
+
     public TableDescriptor withReplicationFactor(int newReplicationFactor) {
         Map<String, String> newProperties = new HashMap<>(properties);
         newProperties.put(
@@ -529,6 +574,12 @@ public final class TableDescriptor implements Serializable {
         /** Sets the kv format of the table. */
         public Builder kvFormat(KvFormat kvFormat) {
             property(ConfigOptions.TABLE_KV_FORMAT, kvFormat);
+            return this;
+        }
+
+        /** Sets the changelog image mode of the table. */
+        public Builder changelogImage(ChangelogImage image) {
+            property(ConfigOptions.TABLE_CHANGELOG_IMAGE, image);
             return this;
         }
 

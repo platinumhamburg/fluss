@@ -131,6 +131,17 @@ public class MetricNames {
     public static final String FAILED_PREFIX_LOOKUP_REQUESTS_RATE =
             "failedPrefixLookupRequestsPerSecond";
 
+    // for index push
+    public static final String INDEX_PUSH_REQUESTS_RATE = "indexPushRequestsPerSecond";
+    public static final String INDEX_PUSH_ERRORS_RATE = "indexPushErrorsPerSecond";
+    public static final String INDEX_PUSH_LATENCY_MS = "indexPushLatencyMs";
+    public static final String PARTITION_TOMBSTONE_APPLY_DROPS_RATE =
+            "partitionTombstoneApplyDropsPerSecond";
+    public static final String INDEX_PUSHED_OFFSET_LAG = "indexPushedOffsetLag";
+    public static final String INDEX_PUSH_PENDING_BYTES = "indexPushPendingBytes";
+    public static final String INDEX_PUSH_IN_FLIGHT_REQUESTS = "indexPushInFlightRequests";
+    public static final String INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS = "indexPushOldestInFlightAgeMs";
+
     // for replica
     public static final String UNDER_REPLICATED = "underReplicated";
     public static final String UNDER_MIN_ISR = "underMinIsr";

@@ -34,6 +34,7 @@ import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.TooManyScannersException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -56,6 +57,8 @@ import org.apache.fluss.rpc.util.PredicateMessageUtils;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.index.IndexReplicator;
+import org.apache.fluss.server.index.ReplicaIndexController;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
@@ -74,6 +77,7 @@ import org.apache.fluss.server.kv.snapshot.KvTabletSnapshotTarget;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.kv.snapshot.RocksIncrementalSnapshot;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
+import org.apache.fluss.server.kv.snapshot.TabletState;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.FetchParams;
@@ -88,7 +92,6 @@ import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
-import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
@@ -169,7 +172,7 @@ public final class Replica {
     private final CloseableRegistry closeableRegistry;
 
     private final IntSupplier minInSyncReplicasSupplier;
-    private final ServerMetadataCache metadataCache;
+    private final TabletServerMetadataCache metadataCache;
     private final FatalErrorHandler fatalErrorHandler;
     private final BucketMetricGroup bucketMetricGroup;
 
@@ -222,6 +225,25 @@ public final class Replica {
      */
     private final ScannerManager scannerManager;
 
+    // ------- index management
+    private final ReplicaIndexController indexManager;
+
+    /**
+     * Whether PutKv acks on this replica must block until the secondary-index mutations they
+     * generate are applied (index.visibility=SYNC). Only true for main tables that own at least one
+     * secondary index and are configured for SYNC visibility; false for ASYNC tables, index tables
+     * and tables without indexes.
+     */
+    private final boolean syncIndexVisibility;
+
+    /**
+     * Monotonically advancing index-pushed-offset, tracking how far the WAL-driven index
+     * replication pipeline has progressed. Persisted in snapshots and restored on leader startup,
+     * following the same pattern as {@code rowCount}. Advanced by {@link IndexReplicator} after
+     * each poll window.
+     */
+    private volatile long indexPushedOffset = -1L;
+
     // ------- metrics
     private Counter isrShrinks;
     private Counter isrExpands;
@@ -249,7 +271,10 @@ public final class Replica {
             TableInfo tableInfo,
             Clock clock,
             RemoteLogManager remoteLogManager,
-            ScannerManager scannerManager)
+            ScannerManager scannerManager,
+            @Nullable org.apache.fluss.server.index.IndexReplicatorPool indexReplicatorPool,
+            @Nullable org.apache.fluss.server.index.IndexAccumulator indexAccumulator,
+            TabletServerMetricGroup serverMetricGroup)
             throws Exception {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
@@ -283,6 +308,18 @@ public final class Replica {
         this.clock = clock;
         this.remoteLogManager = remoteLogManager;
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
+        this.indexManager =
+                new ReplicaIndexController(
+                        tableInfo,
+                        tableBucket,
+                        metadataCache,
+                        indexReplicatorPool,
+                        indexAccumulator,
+                        serverMetricGroup);
+        this.syncIndexVisibility =
+                !tableInfo.getSchema().getIndexes().isEmpty()
+                        && tableInfo.getProperties().get(ConfigOptions.INDEX_VISIBILITY)
+                                == IndexVisibility.SYNC;
         registerMetrics();
     }
 
@@ -533,6 +570,7 @@ public final class Replica {
 
     /** Delete the replica including drop the kv and log. */
     public void delete() {
+        indexManager.close();
         // need to hold the lock to prevent appendLog, putKv from hitting I/O exceptions due
         // to log/kv being deleted
         inWriteLock(
@@ -571,12 +609,21 @@ public final class Replica {
         }
 
         if (isKvTable()) {
+            // Prepare index-table tombstone state before opening RocksDB. Compaction filters are
+            // attached during KvTablet creation and cannot be installed afterward.
+            indexManager.prepareForLeader();
             // if it's become new leader, we must
             // first destroy the old kv tablet
             // if exist. Otherwise, it'll use still the old kv tablet which will cause data loss
             dropKv();
             // now, we can create a new kv tablet
             createKv();
+            indexManager.onLeaderKvReady(
+                    logTablet,
+                    schemaGetter,
+                    kvTablet,
+                    this::advanceIndexPushedOffset,
+                    indexPushedOffset);
         }
     }
 
@@ -606,6 +653,8 @@ public final class Replica {
     }
 
     private void onBecomeNewFollower(int standbyReplica) {
+        indexManager.onBecomeFollower();
+
         if (isKvTable()) {
             boolean isNowStandby = (standbyReplica == localTabletServerId);
             boolean wasLeader = isLeader();
@@ -684,6 +733,19 @@ public final class Replica {
                 tieredLogLocalSegments);
     }
 
+    /**
+     * Wraps the base {@link TabletState} from {@link KvTablet} with the {@code indexPushedOffset}
+     * watermark, so it is captured in the snapshot alongside flushed log offset and row count.
+     */
+    private TabletState augmentTabletState(TabletState base) {
+        long offset = indexPushedOffset;
+        return new TabletState(
+                base.getFlushedLogOffset(),
+                base.getRowCount(),
+                offset >= 0 ? offset : null,
+                base.getAutoIncIDRanges());
+    }
+
     private void createKv() {
         try {
             // create a closeable registry for the closable related to kv
@@ -739,6 +801,56 @@ public final class Replica {
         }
     }
 
+    // ---- Index management delegation ----
+
+    public ReplicaIndexController getIndexManager() {
+        return indexManager;
+    }
+
+    public void advanceIndexPushedOffset(long newOffset) {
+        if (newOffset > indexPushedOffset) {
+            indexPushedOffset = newOffset;
+            // Wake any PutKv acks parked on this bucket waiting for the index-pushed-offset to
+            // reach their write offset (index.visibility=SYNC). Fired only on a real advance, on
+            // the IndexReplicator read-pool worker thread; checkAndComplete is thread-safe.
+            delayedWriteManager.checkAndComplete(new DelayedTableBucketKey(tableBucket));
+        }
+    }
+
+    /**
+     * Returns {@code true} when PutKv acks on this replica must wait for secondary-index mutations
+     * to be applied before returning (index.visibility=SYNC).
+     */
+    public boolean requiresSyncIndexVisibility() {
+        return syncIndexVisibility;
+    }
+
+    public long getIndexPushedOffset() {
+        return indexPushedOffset;
+    }
+
+    public void seedIndexPushedOffsetOnLoad(long offset) {
+        if (offset > indexPushedOffset) {
+            indexPushedOffset = offset;
+        }
+    }
+
+    @VisibleForTesting
+    public IndexReplicator getIndexReplicator() {
+        return indexManager.getIndexReplicator();
+    }
+
+    @VisibleForTesting
+    public boolean isIndexReplicatorInitDeferred() {
+        return indexManager.isDeferred();
+    }
+
+    @VisibleForTesting
+    public void retryMaybeStartIndexReplicator() {
+        indexManager.retryStart(
+                logTablet, schemaGetter, this::advanceIndexPushedOffset, indexPushedOffset);
+    }
+
     /**
      * Init kv tablet from snapshot if any or just from log.
      *
@@ -784,11 +896,20 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet = kvManager.loadKv(tabletDir, schemaGetter);
+                kvTablet =
+                        kvManager.loadKv(
+                                tabletDir,
+                                schemaGetter,
+                                indexManager.createCompactionFilterFactory(),
+                                indexManager.createTagExtractor());
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
                 rowCount = completedSnapshot.getRowCount();
+                Long snapshotIndexOffset = completedSnapshot.getIndexPushedOffset();
+                if (snapshotIndexOffset != null) {
+                    seedIndexPushedOffsetOnLoad(snapshotIndexOffset);
+                }
                 // currently, we only support one auto-increment column.
                 autoIncIDRange = completedSnapshot.getFirstAutoIncIDRange();
             } else {
@@ -807,7 +928,9 @@ public final class Replica {
                                 tableConfig.getKvFormat(),
                                 schemaGetter,
                                 tableConfig,
-                                arrowCompressionInfo);
+                                arrowCompressionInfo,
+                                indexManager.createCompactionFilterFactory(),
+                                indexManager.createTagExtractor());
 
                 // we don't support rowCount
                 rowCount = tableConfig.getChangelogImage() == ChangelogImage.WAL ? null : 0L;
@@ -819,7 +942,10 @@ public final class Replica {
                 autoIncIDRange = null;
             }
 
-            logTablet.updateMinRetainOffset(restoreStartOffset);
+            logTablet.updateMinRetainOffset(
+                    optCompletedSnapshot
+                            .map(CompletedSnapshot::getMinRetainLogOffset)
+                            .orElse(restoreStartOffset));
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
         } catch (Exception e) {
             throw new KvStorageException(
@@ -916,7 +1042,8 @@ public final class Replica {
                                 tableConfig.getKvFormat(),
                                 tableConfig.getLogFormat(),
                                 schemaGetter,
-                                remoteLogFetcher);
+                                remoteLogFetcher,
+                                kvTablet.getValueEncoder());
                 kvRecoverHelper.recover();
             } finally {
                 remoteLogFetcher.close();
@@ -1001,7 +1128,7 @@ public final class Replica {
                             snapshotContext.getAsyncOperationsThreadPool(),
                             closeableRegistryForKv,
                             snapshotIDCounter,
-                            kvTablet::getTabletState,
+                            () -> augmentTabletState(kvTablet.getTabletState()),
                             logTablet::updateMinRetainOffset,
                             bucketLeaderEpochSupplier,
                             coordinatorEpochSupplier,
@@ -1197,6 +1324,7 @@ public final class Replica {
                     oldWatermark.get(),
                     newHighWatermark,
                     tableBucket);
+            indexManager.onHighWatermarkAdvanced();
             return true;
         } else {
             return false;
@@ -1345,7 +1473,8 @@ public final class Replica {
                         }
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return kvTablet.prefixLookup(prefixKey);
+                        return indexManager.filterTombstonedEntries(
+                                kvTablet.prefixLookup(prefixKey));
                     } catch (IOException e) {
                         String errorMsg =
                                 String.format(

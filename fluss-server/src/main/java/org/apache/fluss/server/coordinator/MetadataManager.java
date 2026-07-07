@@ -433,6 +433,7 @@ public class MetadataManager {
 
             // validate the table column changes
             if (!schemaChanges.isEmpty()) {
+                validateIndexedTableSchemaEvolution(table);
                 Schema newSchema =
                         SchemaUpdate.applySchemaChanges(table.getSchema(), schemaChanges);
                 LakeCatalog.Context lakeCatalogContext =
@@ -465,6 +466,17 @@ public class MetadataManager {
             } else {
                 throw new FlussRuntimeException("Failed to alter table schema: " + tablePath, e);
             }
+        }
+    }
+
+    private static void validateIndexedTableSchemaEvolution(TableInfo table) {
+        if (table.isIndexTable()) {
+            throw new InvalidAlterTableException(
+                    "Schema evolution is not supported for internal secondary index tables.");
+        }
+        if (!table.getSchema().getIndexes().isEmpty()) {
+            throw new InvalidAlterTableException(
+                    "Schema evolution is not supported for tables with secondary indexes.");
         }
     }
 

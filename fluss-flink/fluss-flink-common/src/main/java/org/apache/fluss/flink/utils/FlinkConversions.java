@@ -63,6 +63,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.table.factories.FactoryUtil.CONNECTOR;
@@ -239,6 +241,8 @@ public class FlinkConversions {
                 customProperties, resolvedSchema.getColumns());
         CatalogPropertiesUtils.serializeWatermarkSpecs(
                 customProperties, catalogBaseTable.getResolvedSchema().getWatermarkSpecs());
+
+        parseSecondaryIndexes(flinkTableConf, schemBuilder);
 
         Schema schema = schemBuilder.build();
 
@@ -703,6 +707,29 @@ public class FlinkConversions {
 
         // Add comment if present
         column.getComment().ifPresent(schemaBuilder::withComment);
+    }
+
+    /**
+     * Parses secondary index configuration from Flink table options into schema builder index
+     * declarations. Only keys matching {@code secondary-index.<name>.columns} are processed; other
+     * per-index keys (e.g. {@code .bucket.num}, {@code .visibility}) are ignored.
+     */
+    private static void parseSecondaryIndexes(Configuration options, Schema.Builder schemaBuilder) {
+        Pattern pattern = Pattern.compile("secondary-index\\.([A-Za-z0-9_]+)\\.columns");
+        for (Map.Entry<String, String> entry : options.toMap().entrySet()) {
+            Matcher matcher = pattern.matcher(entry.getKey());
+            if (matcher.matches()) {
+                String indexName = matcher.group(1);
+                List<String> columns =
+                        Arrays.stream(entry.getValue().split(","))
+                                .map(String::trim)
+                                .filter(col -> !col.isEmpty())
+                                .collect(Collectors.toList());
+                if (!columns.isEmpty()) {
+                    schemaBuilder.index(indexName, columns);
+                }
+            }
+        }
     }
 
     private static Map<String, String> extractCustomProperties(

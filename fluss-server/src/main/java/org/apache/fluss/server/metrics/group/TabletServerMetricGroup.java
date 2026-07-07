@@ -34,6 +34,8 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntSupplier;
+import java.util.function.LongSupplier;
 
 /** The metric group for tablet server. */
 public class TabletServerMetricGroup extends AbstractMetricGroup {
@@ -74,6 +76,12 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter isrShrinks;
     private final Counter isrExpands;
     private final Counter failedIsrUpdates;
+
+    // aggregated index push metrics
+    private final Counter indexPushRequests;
+    private final Counter indexPushErrors;
+    private final Histogram indexPushLatencyHistogram;
+    private final Counter partitionTombstoneApplyDrops;
 
     public TabletServerMetricGroup(
             MetricRegistry registry, String clusterId, String rack, String hostname, int serverId) {
@@ -133,6 +141,18 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(MetricNames.ISR_SHRINKS_RATE, new MeterView(isrShrinks));
         failedIsrUpdates = new SimpleCounter();
         meter(MetricNames.FAILED_ISR_UPDATES_RATE, new MeterView(failedIsrUpdates));
+
+        // index push metrics
+        indexPushRequests = new ThreadSafeSimpleCounter();
+        meter(MetricNames.INDEX_PUSH_REQUESTS_RATE, new MeterView(indexPushRequests));
+        indexPushErrors = new ThreadSafeSimpleCounter();
+        meter(MetricNames.INDEX_PUSH_ERRORS_RATE, new MeterView(indexPushErrors));
+        indexPushLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.INDEX_PUSH_LATENCY_MS, indexPushLatencyHistogram);
+        partitionTombstoneApplyDrops = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.PARTITION_TOMBSTONE_APPLY_DROPS_RATE,
+                new MeterView(partitionTombstoneApplyDrops));
 
         // Register server-level RocksDB aggregated metrics
         registerServerRocksDBMetrics();
@@ -237,6 +257,33 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Counter failedIsrUpdates() {
         return failedIsrUpdates;
+    }
+
+    public Counter indexPushRequests() {
+        return indexPushRequests;
+    }
+
+    public Counter indexPushErrors() {
+        return indexPushErrors;
+    }
+
+    public Histogram indexPushLatencyHistogram() {
+        return indexPushLatencyHistogram;
+    }
+
+    public Counter partitionTombstoneApplyDrops() {
+        return partitionTombstoneApplyDrops;
+    }
+
+    public void registerIndexPushGauges(
+            LongSupplier pendingBytesSupplier,
+            IntSupplier inFlightRequestsSupplier,
+            LongSupplier oldestInFlightAgeMsSupplier) {
+        gauge(MetricNames.INDEX_PUSH_PENDING_BYTES, pendingBytesSupplier::getAsLong);
+        gauge(MetricNames.INDEX_PUSH_IN_FLIGHT_REQUESTS, inFlightRequestsSupplier::getAsInt);
+        gauge(
+                MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS,
+                oldestInFlightAgeMsSupplier::getAsLong);
     }
 
     // ------------------------------------------------------------------------

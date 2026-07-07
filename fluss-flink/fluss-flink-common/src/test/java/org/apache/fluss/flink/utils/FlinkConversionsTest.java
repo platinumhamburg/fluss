@@ -220,7 +220,7 @@ public class FlinkConversionsTest {
         String expectFlussTableString =
                 "TableDescriptor{schema=Schema{columns=[order_id STRING NOT NULL, item ROW<`item_id` STRING, `item_price` STRING, `item_details` ROW<`category` STRING, `specifications` STRING>>, orig_ts TIMESTAMP(6)], "
                         + "primaryKey=CONSTRAINT PK_order_id PRIMARY KEY (order_id), "
-                        + "autoIncrementColumnNames=[], highestFieldId=7}, comment='test comment', partitionKeys=[], "
+                        + "autoIncrementColumnNames=[], indexes=[], highestFieldId=7}, comment='test comment', partitionKeys=[], "
                         + "tableDistribution={bucketKeys=[order_id] bucketCount=null}, "
                         + "properties={}, "
                         + "customProperties={"
@@ -425,7 +425,7 @@ public class FlinkConversionsTest {
         String expectFlussTableString =
                 "TableDescriptor{schema=Schema{columns=[order_id STRING NOT NULL, orig_ts TIMESTAMP(6)], "
                         + "primaryKey=CONSTRAINT PK_order_id PRIMARY KEY (order_id), "
-                        + "autoIncrementColumnNames=[], highestFieldId=1}, comment='test comment', partitionKeys=[], "
+                        + "autoIncrementColumnNames=[], indexes=[], highestFieldId=1}, comment='test comment', partitionKeys=[], "
                         + "tableDistribution={bucketKeys=[order_id] bucketCount=null}, "
                         + "properties={}, "
                         + "customProperties={materialized-table.definition-query=select order_id, orig_ts from t, "
@@ -518,6 +518,152 @@ public class FlinkConversionsTest {
 
         // Verify aggregation functions are preserved
         assertThat(convertedFlinkTable.getOptions()).containsAllEntriesOf(options);
+    }
+
+    @Test
+    void testParseSecondaryIndexSingleColumn() {
+        Map<String, String> options = new HashMap<>();
+        options.put("secondary-index.idx_email.columns", "email");
+        options.put("connector", "fluss");
+        options.put("bootstrap.servers", "localhost:9092");
+
+        Schema flinkSchema =
+                Schema.newBuilder()
+                        .column("id", org.apache.flink.table.api.DataTypes.INT())
+                        .column("email", org.apache.flink.table.api.DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        CatalogTable catalogTable =
+                CatalogTable.of(flinkSchema, null, Collections.emptyList(), options);
+        ResolvedCatalogTable resolvedCatalogTable =
+                new ResolvedCatalogTable(
+                        catalogTable,
+                        new TestSchemaResolver().resolve(catalogTable.getUnresolvedSchema()));
+
+        TableDescriptor descriptor = FlinkConversions.toFlussTable(resolvedCatalogTable);
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName())
+                .isEqualTo("idx_email");
+        assertThat(descriptor.getSchema().getIndexes().get(0).getColumnNames())
+                .containsExactly("email");
+    }
+
+    @Test
+    void testParseSecondaryIndexMultiColumn() {
+        Map<String, String> options = new HashMap<>();
+        options.put("secondary-index.idx_name_age.columns", "name,age");
+        options.put("connector", "fluss");
+        options.put("bootstrap.servers", "localhost:9092");
+
+        Schema flinkSchema =
+                Schema.newBuilder()
+                        .column("id", org.apache.flink.table.api.DataTypes.INT())
+                        .column("name", org.apache.flink.table.api.DataTypes.STRING())
+                        .column("age", org.apache.flink.table.api.DataTypes.INT())
+                        .primaryKey("id")
+                        .build();
+
+        CatalogTable catalogTable =
+                CatalogTable.of(flinkSchema, null, Collections.emptyList(), options);
+        ResolvedCatalogTable resolvedCatalogTable =
+                new ResolvedCatalogTable(
+                        catalogTable,
+                        new TestSchemaResolver().resolve(catalogTable.getUnresolvedSchema()));
+
+        TableDescriptor descriptor = FlinkConversions.toFlussTable(resolvedCatalogTable);
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName())
+                .isEqualTo("idx_name_age");
+        assertThat(descriptor.getSchema().getIndexes().get(0).getColumnNames())
+                .containsExactly("name", "age");
+    }
+
+    @Test
+    void testParseMultipleSecondaryIndexes() {
+        Map<String, String> options = new HashMap<>();
+        options.put("secondary-index.idx_email.columns", "email");
+        options.put("secondary-index.idx_name.columns", "name");
+        options.put("connector", "fluss");
+        options.put("bootstrap.servers", "localhost:9092");
+
+        Schema flinkSchema =
+                Schema.newBuilder()
+                        .column("id", org.apache.flink.table.api.DataTypes.INT())
+                        .column("email", org.apache.flink.table.api.DataTypes.STRING())
+                        .column("name", org.apache.flink.table.api.DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        CatalogTable catalogTable =
+                CatalogTable.of(flinkSchema, null, Collections.emptyList(), options);
+        ResolvedCatalogTable resolvedCatalogTable =
+                new ResolvedCatalogTable(
+                        catalogTable,
+                        new TestSchemaResolver().resolve(catalogTable.getUnresolvedSchema()));
+
+        TableDescriptor descriptor = FlinkConversions.toFlussTable(resolvedCatalogTable);
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(2);
+    }
+
+    @Test
+    void testNoSecondaryIndexProperties() {
+        Map<String, String> options = new HashMap<>();
+        options.put("connector", "fluss");
+        options.put("bootstrap.servers", "localhost:9092");
+
+        Schema flinkSchema =
+                Schema.newBuilder()
+                        .column("id", org.apache.flink.table.api.DataTypes.INT())
+                        .column("email", org.apache.flink.table.api.DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        CatalogTable catalogTable =
+                CatalogTable.of(flinkSchema, null, Collections.emptyList(), options);
+        ResolvedCatalogTable resolvedCatalogTable =
+                new ResolvedCatalogTable(
+                        catalogTable,
+                        new TestSchemaResolver().resolve(catalogTable.getUnresolvedSchema()));
+
+        TableDescriptor descriptor = FlinkConversions.toFlussTable(resolvedCatalogTable);
+
+        assertThat(descriptor.getSchema().getIndexes()).isEmpty();
+    }
+
+    @Test
+    void testIgnoresNonColumnSecondaryIndexProperties() {
+        Map<String, String> options = new HashMap<>();
+        options.put("secondary-index.idx_email.columns", "email");
+        options.put("secondary-index.idx_email.bucket.num", "4");
+        options.put("index.visibility", "sync");
+        options.put("connector", "fluss");
+        options.put("bootstrap.servers", "localhost:9092");
+
+        Schema flinkSchema =
+                Schema.newBuilder()
+                        .column("id", org.apache.flink.table.api.DataTypes.INT())
+                        .column("email", org.apache.flink.table.api.DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        CatalogTable catalogTable =
+                CatalogTable.of(flinkSchema, null, Collections.emptyList(), options);
+        ResolvedCatalogTable resolvedCatalogTable =
+                new ResolvedCatalogTable(
+                        catalogTable,
+                        new TestSchemaResolver().resolve(catalogTable.getUnresolvedSchema()));
+
+        TableDescriptor descriptor = FlinkConversions.toFlussTable(resolvedCatalogTable);
+
+        assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
+        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName())
+                .isEqualTo("idx_email");
+        assertThat(descriptor.getSchema().getIndexes().get(0).getColumnNames())
+                .containsExactly("email");
     }
 
     /** Test refresh handler for testing purpose. */

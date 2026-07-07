@@ -45,6 +45,8 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
+
 /** API for configuring and creating {@link LogScanner} and {@link BatchScanner}. */
 public class TableScan implements Scan {
     private final FlussConnection conn;
@@ -211,6 +213,7 @@ public class TableScan implements Scan {
                 projectedColumns,
                 scannerTmpDir,
                 tableInfo.getTableConfig().getKvFormat(),
+                tableInfo.getTableConfig().getKvFormatVersion().orElse(KV_FORMAT_VERSION_2),
                 conn.getOrCreateRemoteFileDownloader());
     }
 

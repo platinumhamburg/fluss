@@ -22,6 +22,7 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.lookup.Lookup;
 import org.apache.fluss.client.lookup.LookupType;
 import org.apache.fluss.client.lookup.Lookuper;
+import org.apache.fluss.client.table.FlussTable;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.TableNotExistException;
@@ -30,6 +31,7 @@ import org.apache.fluss.flink.source.lookup.LookupNormalizer.RemainingFilter;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.flink.utils.FlussRowToFlinkRowConverter;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
@@ -47,6 +49,7 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.IntStream;
@@ -69,7 +72,6 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     private transient Connection connection;
     private transient Table table;
     private transient Lookuper lookuper;
-    private transient FlinkAsFlussRow lookupRow;
 
     public FlinkAsyncLookupFunction(
             Configuration flussConfig,
@@ -91,7 +93,6 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
         LOG.info("start open ...");
         connection = ConnectionFactory.createConnection(flussConfig);
         table = connection.getTable(tablePath);
-        lookupRow = new FlinkAsFlussRow();
 
         final RowType outputRowType;
         if (projection == null) {
@@ -108,15 +109,25 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
         flussRowToFlinkRowConverter =
                 new FlussRowToFlinkRowConverter(FlinkConversions.toFlussRowType(outputRowType));
 
-        Lookup lookup = table.newLookup();
-        if (lookupNormalizer.getLookupType() == LookupType.PREFIX_LOOKUP) {
+        if (lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP) {
             int[] lookupKeyIndexes = lookupNormalizer.getLookupKeyIndexes();
             RowType lookupKeyRowType = FlinkUtils.projectRowType(flinkRowType, lookupKeyIndexes);
-            lookup = lookup.lookupBy(lookupKeyRowType.getFieldNames());
-        } else if (insertIfNotExists) {
-            lookup = lookup.enableInsertIfNotExists();
+            List<String> lookupColumns = lookupKeyRowType.getFieldNames();
+            String indexName =
+                    findMatchingIndexName(table.getTableInfo().getSchema(), lookupColumns);
+            lookuper = ((FlussTable) table).getSecondaryIndexLookuper(indexName);
+        } else {
+            Lookup lookup = table.newLookup();
+            if (lookupNormalizer.getLookupType() == LookupType.PREFIX_LOOKUP) {
+                int[] lookupKeyIndexes = lookupNormalizer.getLookupKeyIndexes();
+                RowType lookupKeyRowType =
+                        FlinkUtils.projectRowType(flinkRowType, lookupKeyIndexes);
+                lookup = lookup.lookupBy(lookupKeyRowType.getFieldNames());
+            } else if (insertIfNotExists) {
+                lookup = lookup.enableInsertIfNotExists();
+            }
+            lookuper = lookup.createLookuper();
         }
-        lookuper = lookup.createLookuper();
 
         LOG.info("end open.");
     }
@@ -130,7 +141,10 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     public CompletableFuture<Collection<RowData>> asyncLookup(RowData keyRow) {
         RowData normalizedKeyRow = lookupNormalizer.normalizeLookupKey(keyRow);
         RemainingFilter remainingFilter = lookupNormalizer.createRemainingFilter(keyRow);
-        InternalRow flussKeyRow = lookupRow.replace(normalizedKeyRow);
+        // Must create a per-call FlinkAsFlussRow — SecondaryIndexLookuper captures the lookupKey
+        // reference in its thenCompose lambda and re-reads it in idxColsMatch after hop2 completes.
+        // Reusing a single shared instance would let later calls overwrite earlier calls' key data.
+        InternalRow flussKeyRow = new FlinkAsFlussRow(normalizedKeyRow);
 
         // the retry mechanism is now handled by the underlying LookupClient layer,
         // we can't call lookuper.lookup() in whenComplete callback as lookuper is not thread-safe.
@@ -189,6 +203,17 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
         }
         // should not reuse objects for async operations
         return ProjectedRow.from(projection).replaceRow(row);
+    }
+
+    private static String findMatchingIndexName(Schema schema, List<String> lookupColumns) {
+        HashSet<String> lookupSet = new HashSet<>(lookupColumns);
+        for (Schema.Index index : schema.getIndexes()) {
+            if (lookupSet.equals(new HashSet<>(index.getColumnNames()))) {
+                return index.getIndexName();
+            }
+        }
+        throw new IllegalStateException(
+                "No secondary index found matching lookup columns: " + lookupColumns);
     }
 
     @Override

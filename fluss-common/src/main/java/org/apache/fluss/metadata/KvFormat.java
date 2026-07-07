@@ -35,18 +35,25 @@ public enum KvFormat {
      * The kv record batches are stored in {@link IndexedRow} format. It is more efficient for read
      * partial columns from snapshot as it won't need to deserialize the whole row.
      */
-    INDEXED;
+    INDEXED,
 
     /**
-     * Creates a {@link LogFormat} from the given string. The string must be either 'arrow' or
-     * 'indexed'.
+     * The kv record batches are stored in {@link org.apache.fluss.row.aligned.AlignedRow} format.
+     * Each field occupies a fixed 8-byte slot, enabling O(1) random column access without full
+     * deserialization. Used by partitioned Index Tables so that native CompactionFilters (Rust) can
+     * read arbitrary columns.
      */
+    ALIGNED;
+
+    /** Creates a {@link KvFormat} from the given string. */
     public static KvFormat fromString(String format) {
         switch (format.toUpperCase()) {
             case "COMPACTED":
                 return COMPACTED;
             case "INDEXED":
                 return INDEXED;
+            case "ALIGNED":
+                return ALIGNED;
             default:
                 throw new IllegalArgumentException("Unsupported kv format: " + format);
         }

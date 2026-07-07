@@ -76,6 +76,7 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
 
     SnapshotFilesReader(
             KvFormat kvFormat,
+            int kvFormatVersion,
             Path rocksDbPath,
             @Nullable int[] projectedFields,
             int targetSchemaId,
@@ -85,7 +86,7 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
         this.targetSchemaId = targetSchemaId;
         this.targetSchema = targetSchema;
         this.schemaGetter = schemaGetter;
-        this.valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
+        this.valueDecoder = new ValueDecoder(schemaGetter, kvFormat, kvFormatVersion);
         this.projectedFields = projectedFields;
         closeableRegistry = new CloseableRegistry();
         try {
