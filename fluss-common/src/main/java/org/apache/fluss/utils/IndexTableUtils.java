@@ -18,6 +18,7 @@
 package org.apache.fluss.utils;
 
 import java.util.Collections;
+import java.util.Optional;
 import java.util.Set;
 
 /** Utility constants and helpers shared by the Global Secondary Index Table layer. */
@@ -53,5 +54,14 @@ public final class IndexTableUtils {
     /** Builds the Index Table name from a main table name and an index name. */
     public static String indexTableName(String mainTableName, String indexName) {
         return mainTableName + INDEX_TABLE_NAME_SEPARATOR + indexName;
+    }
+
+    /** Extracts the main table name from a composed Index Table name. */
+    public static Optional<String> mainTableNameFromIndexTableName(String indexTableName) {
+        int pos = indexTableName.lastIndexOf(INDEX_TABLE_NAME_SEPARATOR);
+        if (pos <= 0 || pos + INDEX_TABLE_NAME_SEPARATOR.length() >= indexTableName.length()) {
+            return Optional.empty();
+        }
+        return Optional.of(indexTableName.substring(0, pos));
     }
 }

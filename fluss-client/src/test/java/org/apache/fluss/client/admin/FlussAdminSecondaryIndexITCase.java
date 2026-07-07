@@ -312,6 +312,70 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testUserCannotDropLiveInternalSecondaryIndexTableDirectly() throws Exception {
+        TablePath mainPath = TablePath.of(DB, "test_direct_drop_live_index_rejected");
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index("idx_name", "name")
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "id")
+                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
+                        .build();
+
+        createTable(mainPath, descriptor, true);
+        assertThat(admin.tableExists(indexPath).get()).isTrue();
+
+        assertThatThrownBy(() -> admin.dropTable(indexPath, false).get())
+                .cause()
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining("internal secondary index table")
+                .hasMessageContaining("owning main table");
+
+        assertThat(admin.tableExists(mainPath).get()).isTrue();
+        assertThat(admin.tableExists(indexPath).get()).isTrue();
+    }
+
+    @Test
+    void testUserCanDropOrphanInternalSecondaryIndexTable() throws Exception {
+        TablePath mainPath = TablePath.of(DB, "test_direct_drop_orphan_index_allowed");
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index("idx_name", "name")
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "id")
+                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
+                        .build();
+
+        createTable(mainPath, descriptor, true);
+        assertThat(admin.tableExists(indexPath).get()).isTrue();
+
+        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().deleteTable(mainPath);
+        assertThat(admin.tableExists(mainPath).get()).isFalse();
+        assertThat(admin.tableExists(indexPath).get()).isTrue();
+
+        admin.dropTable(indexPath, false).get();
+        assertThat(admin.tableExists(indexPath).get()).isFalse();
+    }
+
+    @Test
     void testDropTableWithIndexIgnoreIfNotExists() throws Exception {
         // Ensure the database exists so the drop goes through to table-level check
         admin.createDatabase(DB, org.apache.fluss.metadata.DatabaseDescriptor.EMPTY, true).get();

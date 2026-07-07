@@ -194,6 +194,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -773,6 +774,11 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         authorizeTable(OperationType.DROP, tablePath);
 
         DropTableResponse response = new DropTableResponse();
+        TableInfo tableInfo = getTableInfoForDrop(tablePath, request.isIgnoreIfNotExists());
+        if (tableInfo == null) {
+            return CompletableFuture.completedFuture(response);
+        }
+        validateDropTablePermission(tablePath, tableInfo);
         // cascade-drop derived Index Tables BEFORE the main table so any in-flight push from a
         // leader of the main table cannot land on an Index Table whose main has already been
         // unregistered. Each Index Table is dropped with ignoreIfNotExists=true so a retried
@@ -781,6 +787,47 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         cascadeDropIndexTables(tablePath);
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
         return CompletableFuture.completedFuture(response);
+    }
+
+    @Nullable
+    private TableInfo getTableInfoForDrop(TablePath tablePath, boolean ignoreIfNotExists) {
+        try {
+            return metadataManager.getTable(tablePath);
+        } catch (TableNotExistException e) {
+            if (ignoreIfNotExists) {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    private void validateDropTablePermission(TablePath tablePath, TableInfo tableInfo) {
+        if (!tableInfo.isIndexTable()) {
+            return;
+        }
+        if (owningMainTableExists(tablePath, tableInfo)) {
+            throw new InvalidTableException(
+                    String.format(
+                            "internal secondary index table %s cannot be dropped directly while its owning main table exists. Drop the main table instead, or drop this index table only after it becomes orphaned.",
+                            tablePath));
+        }
+    }
+
+    private boolean owningMainTableExists(TablePath indexTablePath, TableInfo indexTableInfo) {
+        Optional<String> mainTableName =
+                IndexTableUtils.mainTableNameFromIndexTableName(indexTablePath.getTableName());
+        if (!mainTableName.isPresent()) {
+            return false;
+        }
+        TablePath mainTablePath =
+                TablePath.of(indexTablePath.getDatabaseName(), mainTableName.get());
+        try {
+            TableInfo mainInfo = metadataManager.getTable(mainTablePath);
+            OptionalLong mainTableId = indexTableInfo.getMainTableId();
+            return mainTableId.isPresent() && mainInfo.getTableId() == mainTableId.getAsLong();
+        } catch (TableNotExistException e) {
+            return false;
+        }
     }
 
     private void cascadeDropIndexTables(TablePath mainTablePath) {

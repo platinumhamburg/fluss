@@ -19,6 +19,8 @@ package org.apache.fluss.utils;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Optional;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class IndexTableUtilsTest {
@@ -42,5 +44,16 @@ class IndexTableUtilsTest {
     void testIndexTableNameComposes() {
         assertThat(IndexTableUtils.indexTableName("orders", "idx_user"))
                 .isEqualTo("orders__idx_user");
+    }
+
+    @Test
+    void testMainTableNameFromIndexTableNameUsesLastSeparator() {
+        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("orders__idx_user"))
+                .isEqualTo(Optional.of("orders"));
+        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("tenant__orders__idx_user"))
+                .isEqualTo(Optional.of("tenant__orders"));
+        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("orders")).isEmpty();
+        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("__idx_user")).isEmpty();
+        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("orders__")).isEmpty();
     }
 }
