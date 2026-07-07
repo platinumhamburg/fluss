@@ -82,6 +82,34 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testRejectsUnsupportedLowKvFormatVersionsForUserPrimaryKeyTable() throws Exception {
+        admin.createDatabase(DB, DatabaseDescriptor.EMPTY, true).get();
+
+        for (int version : new int[] {0, -1}) {
+            TablePath tablePath = TablePath.of(DB, "test_explicit_low_kv_version_" + version);
+            TableDescriptor descriptor =
+                    TableDescriptor.builder()
+                            .schema(
+                                    Schema.newBuilder()
+                                            .column("id", DataTypes.INT())
+                                            .column("name", DataTypes.STRING())
+                                            .primaryKey("id")
+                                            .build())
+                            .distributedBy(3, "id")
+                            .property(ConfigOptions.TABLE_KV_FORMAT_VERSION, version)
+                            .build();
+
+            assertThatThrownBy(() -> admin.createTable(tablePath, descriptor, false).get())
+                    .as("kv format version %s should be rejected", version)
+                    .cause()
+                    .isInstanceOf(InvalidConfigException.class)
+                    .hasMessageContaining("Unsupported kv format version " + version)
+                    .hasMessageContaining("minimum supported version is 1");
+            assertThat(admin.tableExists(tablePath).get()).isFalse();
+        }
+    }
+
+    @Test
     void testCreateTableWithGlobalSecondaryIndex() throws Exception {
         TablePath tablePath = TablePath.of(DB, "test_table_with_index");
 

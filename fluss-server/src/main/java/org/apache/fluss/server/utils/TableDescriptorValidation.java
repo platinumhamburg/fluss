@@ -323,6 +323,12 @@ public class TableDescriptorValidation {
         }
 
         int version = kvFormatVersion.get();
+        if (version < 1) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "Unsupported kv format version %d. The minimum supported version is 1.",
+                            version));
+        }
         if (version > CURRENT_KV_FORMAT_VERSION) {
             throw new InvalidConfigException(
                     String.format(

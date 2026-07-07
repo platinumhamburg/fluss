@@ -286,6 +286,30 @@ class TableDescriptorValidationTest {
     }
 
     @Test
+    void testRejectsUnsupportedLowKvFormatVersions() {
+        for (int version : new int[] {0, -1}) {
+            TableDescriptor descriptor =
+                    descriptorBuilder(
+                                    Schema.newBuilder()
+                                            .column("id", DataTypes.BIGINT())
+                                            .column("user_id", DataTypes.BIGINT())
+                                            .primaryKey("id")
+                                            .build())
+                            .property(ConfigOptions.TABLE_KV_FORMAT_VERSION, version)
+                            .build();
+
+            assertThatThrownBy(
+                            () ->
+                                    TableDescriptorValidation.validateTableDescriptor(
+                                            descriptor, MAX_BUCKET_NUM, null))
+                    .as("kv format version %s should be rejected", version)
+                    .isInstanceOf(InvalidConfigException.class)
+                    .hasMessageContaining("Unsupported kv format version " + version)
+                    .hasMessageContaining("minimum supported version is 1");
+        }
+    }
+
+    @Test
     void testAcceptsVersionThreeForPartitionedIndexTable() {
         TableDescriptor mainDescriptor =
                 TableDescriptor.builder()
