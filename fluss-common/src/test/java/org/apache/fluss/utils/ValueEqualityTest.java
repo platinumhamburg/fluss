@@ -34,7 +34,8 @@ class ValueEqualityTest {
 
     @Test
     void testNonByteArraysUseObjectEquality() {
-        assertThat(ValueEquality.contentEquals("alice", "alice")).isTrue();
+        assertThat(ValueEquality.contentEquals(new String("alice"), new String("alice")))
+                .isTrue();
         assertThat(ValueEquality.contentEquals("alice", "bob")).isFalse();
         assertThat(ValueEquality.contentEquals(null, null)).isTrue();
         assertThat(ValueEquality.contentEquals(null, "alice")).isFalse();

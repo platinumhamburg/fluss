@@ -44,12 +44,6 @@
             <version>${project.version}</version>
         </dependency>
 
-        <dependency>
-            <groupId>org.apache.fluss</groupId>
-            <artifactId>fluss-common</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-
         <!-- Flink dependency -->
         <dependency>
             <groupId>org.apache.flink</groupId>
