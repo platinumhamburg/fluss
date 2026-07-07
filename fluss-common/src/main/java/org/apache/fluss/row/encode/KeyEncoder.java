@@ -29,6 +29,9 @@ import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Optional;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
+
 /** An interface for encoding key of row into bytes. */
 public interface KeyEncoder {
 
@@ -47,12 +50,13 @@ public interface KeyEncoder {
      * continue to use the original encoding method (lake's encoder for lake tables) to ensure data
      * compatibility.
      *
-     * <p><b>New Tables (kvFormatVersion = 2):</b> For new tables, we cannot always use the lake's
-     * encoder because some lake encoders (e.g., Paimon) don't support prefix lookup. Prefix lookup
-     * requires the bucket key bytes encoded as a prefix of the primary key bytes encoded, which
-     * Paimon's encoding format does not guarantee. To solve this, new tables use Fluss's own {@link
-     * CompactedKeyEncoder} which ensures the bucket key bytes encoded is always a prefix of the
-     * primary key bytes encoded.
+     * <p><b>New Tables (kvFormatVersion = 2 or 3):</b> For new tables, we cannot always use the
+     * lake's encoder because some lake encoders (e.g., Paimon) don't support prefix lookup. Prefix
+     * lookup requires the bucket key bytes encoded as a prefix of the primary key bytes encoded,
+     * which Paimon's encoding format does not guarantee. To solve this, new tables use Fluss's own
+     * {@link CompactedKeyEncoder} which ensures the bucket key bytes encoded is always a prefix of
+     * the primary key bytes encoded. Kv format version 3 changes the value layout only; key encoding
+     * remains compatible with version 2.
      *
      * <p><b>Optimization for Default Bucket Key:</b> Prefix lookup is only needed when the bucket
      * key is a subset of the primary key. If {@code isDefaultBucketKey} is true (bucket key equals
@@ -79,7 +83,7 @@ public interface KeyEncoder {
         if (kvFormatVersion == 1) {
             return of(rowType, keyFields, dataLakeFormat);
         }
-        if (kvFormatVersion == 2) {
+        if (kvFormatVersion == KV_FORMAT_VERSION_2 || kvFormatVersion == KV_FORMAT_VERSION_3) {
             if (isDefaultBucketKey) {
                 return of(rowType, keyFields, dataLakeFormat);
             } else {
