@@ -19,6 +19,7 @@ package org.apache.fluss.flink.source.lookup;
 
 import org.apache.fluss.client.lookup.LookupType;
 import org.apache.fluss.utils.ArrayUtils;
+import org.apache.fluss.utils.ValueEquality;
 
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.GenericRowData;
@@ -34,7 +35,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Objects;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
@@ -161,7 +161,7 @@ public class LookupNormalizer implements Serializable {
 
         public boolean fieldMatches(RowData result) {
             Object fieldValue = resultFieldGetter.getFieldOrNull(result);
-            return Objects.equals(expectedValue, fieldValue);
+            return ValueEquality.contentEquals(expectedValue, fieldValue);
         }
     }
 

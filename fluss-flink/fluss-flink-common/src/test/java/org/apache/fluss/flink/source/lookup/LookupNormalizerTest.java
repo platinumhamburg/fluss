@@ -26,6 +26,7 @@ import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.VarCharType;
+import org.apache.flink.table.types.logical.VarBinaryType;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -373,6 +374,41 @@ class LookupNormalizerTest {
         nonNullAgeResult.setField(2, StringData.fromString("a@x.com"));
         nonNullAgeResult.setField(3, 25);
         assertThat(filter.isMatch(nonNullAgeResult)).isFalse();
+    }
+
+    @Test
+    void testRemainingFilterComparesBytesByContent() {
+        RowType schema =
+                new RowType(
+                        Arrays.asList(
+                                new RowType.RowField("id", new IntType()),
+                                new RowType.RowField("name", new VarCharType(200)),
+                                new RowType.RowField("payload", new VarBinaryType(20))));
+        int[][] lookupKeyIndexes = new int[][] {{1}, {2}};
+        int[][] secondaryIndexes = new int[][] {{1}};
+
+        LookupNormalizer normalizer =
+                LookupNormalizer.validateAndCreateLookupNormalizer(
+                        lookupKeyIndexes,
+                        new int[] {0},
+                        new int[] {0},
+                        new int[] {},
+                        schema,
+                        null,
+                        secondaryIndexes);
+
+        GenericRowData lookupKeyRow = new GenericRowData(2);
+        lookupKeyRow.setField(0, StringData.fromString("alice"));
+        lookupKeyRow.setField(1, new byte[] {1, 2, 3});
+        LookupNormalizer.RemainingFilter filter = normalizer.createRemainingFilter(lookupKeyRow);
+        assertThat(filter).isNotNull();
+
+        GenericRowData result = new GenericRowData(3);
+        result.setField(0, 1);
+        result.setField(1, StringData.fromString("alice"));
+        result.setField(2, new byte[] {1, 2, 3});
+
+        assertThat(filter.isMatch(result)).isTrue();
     }
 
     @Test

@@ -19,13 +19,13 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.utils.ValueEquality;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
@@ -44,9 +44,10 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *
  * <p>Recheck: after Hop 2 returns, every surviving main row is re-validated against the user's
  * original {@code lookupKey}. Index columns are extracted from both sides using positional {@link
- * InternalRow.FieldGetter}s and compared via {@link Objects#equals}. Any row whose current {@code
- * idxCols} disagree with the lookup key is discarded as a stale index pointer (covers both the
- * async-visibility window and the natural lag during partition-tombstone cleanup).
+ * InternalRow.FieldGetter}s and compared via {@link ValueEquality#contentEquals(Object, Object)}.
+ * Any row whose current {@code idxCols} disagree with the lookup key is discarded as a stale
+ * index pointer (covers both the async-visibility window and the natural lag during
+ * partition-tombstone cleanup).
  */
 @Internal
 @NotThreadSafe
@@ -125,7 +126,7 @@ public final class SecondaryIndexLookuper implements Lookuper {
         for (int i = 0; i < idxColumnGettersInLookupKey.length; i++) {
             Object expected = idxColumnGettersInLookupKey[i].getFieldOrNull(lookupKey);
             Object actual = idxColumnGettersInMainRow[i].getFieldOrNull(mainRow);
-            if (!Objects.equals(expected, actual)) {
+            if (!ValueEquality.contentEquals(expected, actual)) {
                 return false;
             }
         }

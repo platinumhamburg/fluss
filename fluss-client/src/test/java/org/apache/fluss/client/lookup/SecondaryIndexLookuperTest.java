@@ -334,6 +334,49 @@ class SecondaryIndexLookuperTest {
     }
 
     @Test
+    void testRecheckComparesByteArrayIndexColumnsByContent() throws Exception {
+        byte[] lookupBytes = new byte[] {1, 2, 3};
+        byte[] mainBytes = new byte[] {1, 2, 3};
+
+        GenericRow lookupKey = new GenericRow(1);
+        lookupKey.setField(0, lookupBytes);
+        GenericRow indexRow = new GenericRow(2);
+        indexRow.setField(0, lookupBytes);
+        indexRow.setField(1, 10L);
+        GenericRow mainRow = new GenericRow(2);
+        mainRow.setField(0, mainBytes);
+        mainRow.setField(1, 10L);
+
+        StubLookuper indexLookuper =
+                new StubLookuper(
+                        key ->
+                                CompletableFuture.completedFuture(
+                                        new LookupResult(Collections.singletonList(indexRow))));
+        StubLookuper mainLookuper =
+                new StubLookuper(
+                        key ->
+                                CompletableFuture.completedFuture(
+                                        new LookupResult(Collections.singletonList(mainRow))));
+
+        SecondaryIndexLookuper lookuper =
+                new SecondaryIndexLookuper(
+                        indexLookuper,
+                        mainLookuper,
+                        new int[] {0},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        index -> {
+                            GenericRow pk = new GenericRow(1);
+                            pk.setField(0, index.getLong(1));
+                            return pk;
+                        });
+
+        LookupResult result = lookuper.lookup(lookupKey).get();
+
+        assertThat(result.getRowList()).containsExactly(mainRow);
+    }
+
+    @Test
     void testRecheckHandlesNullableIdxColCorrectly() throws Exception {
         // Lookup key idxCol is null. Hop 2 returns two rows:
         //   - mainRow1: idxCol=null -> matches via Objects.equals -> keep.

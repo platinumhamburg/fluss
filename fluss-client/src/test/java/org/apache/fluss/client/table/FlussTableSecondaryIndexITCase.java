@@ -780,6 +780,45 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testSecondaryIndexLookupOnBytesColumn() throws Exception {
+        TablePath tablePath = TablePath.of(DB, "test_bytes_sec_idx_lookup");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("payload", DataTypes.BYTES())
+                        .primaryKey("id")
+                        .index("idx_payload", "payload")
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "id")
+                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_payload"), "1")
+                        .build();
+        createTable(tablePath, descriptor, true);
+
+        byte[] writtenPayload = new byte[] {1, 2, 3};
+        byte[] lookupPayload = new byte[] {1, 2, 3};
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            upsertWriter.upsert(row(1, writtenPayload));
+            upsertWriter.flush();
+
+            Lookuper lookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_payload");
+            waitUntil(
+                    () -> !lookuper.lookup(row(lookupPayload)).get().getRowList().isEmpty(),
+                    INDEX_VISIBILITY_TIMEOUT,
+                    "wait for idx_payload bytes entry");
+
+            LookupResult result = lookuper.lookup(row(lookupPayload)).get();
+            assertThat(result.getRowList()).hasSize(1);
+            InternalRow row = result.getRowList().get(0);
+            assertThat(row.getInt(0)).isEqualTo(1);
+            assertThat(row.getBytes(1)).containsExactly(1, 2, 3);
+        }
+    }
+
+    @Test
     void testSparseIndexUpdateToNull() throws Exception {
         TablePath tablePath = TablePath.of(DB, "test_sparse_update_null");
 
