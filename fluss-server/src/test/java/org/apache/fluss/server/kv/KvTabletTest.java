@@ -250,47 +250,53 @@ class KvTabletTest {
     void testKvFormatVersionThreeRequiresTagExtractor() throws Exception {
         Schema schema = DATA1_SCHEMA_PK;
         PhysicalTablePath tablePath = PhysicalTablePath.of(TablePath.of("testDb", "v3_no_tag"));
+        File invalidKvTabletDir = new File(tmpKvDir, "v3-no-tag");
         schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
         logTablet = createLogTablet(tempLogDir, 0L, tablePath);
         Map<String, String> tableConfig = new HashMap<>();
         tableConfig.put(
                 ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_3));
 
+        assertThat(invalidKvTabletDir).doesNotExist();
         assertThatThrownBy(
                         () ->
                                 createKvTablet(
                                         tablePath,
                                         logTablet.getTableBucket(),
                                         logTablet,
-                                        tmpKvDir,
+                                        invalidKvTabletDir,
                                         schemaGetter,
                                         tableConfig))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("tagExtractor");
+        assertThat(invalidKvTabletDir).doesNotExist();
     }
 
     @Test
     void testKvFormatVersionTwoRejectsTagExtractor() throws Exception {
         Schema schema = DATA1_SCHEMA_PK;
         PhysicalTablePath tablePath = PhysicalTablePath.of(TablePath.of("testDb", "v2_with_tag"));
+        File invalidKvTabletDir = new File(tmpKvDir, "v2-with-tag");
         schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
         logTablet = createLogTablet(tempLogDir, 0L, tablePath);
         Map<String, String> tableConfig = new HashMap<>();
         tableConfig.put(
                 ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_2));
 
+        assertThat(invalidKvTabletDir).doesNotExist();
         assertThatThrownBy(
                         () ->
                                 createKvTablet(
                                         tablePath,
                                         logTablet.getTableBucket(),
                                         logTablet,
-                                        tmpKvDir,
+                                        invalidKvTabletDir,
                                         schemaGetter,
                                         tableConfig,
                                         row -> 1L))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("tagExtractor");
+        assertThat(invalidKvTabletDir).doesNotExist();
     }
 
     @Test

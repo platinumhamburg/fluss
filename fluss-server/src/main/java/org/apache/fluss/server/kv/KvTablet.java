@@ -252,6 +252,7 @@ public final class KvTablet {
                             compactionFilterFactory,
             @Nullable ToLongFunction<BinaryRow> tagExtractor)
             throws IOException {
+        validateValueFormatVersion(kvFormatVersion, tagExtractor);
         RocksDBKv kv =
                 buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter, compactionFilterFactory);
 
