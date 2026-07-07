@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
@@ -133,6 +134,7 @@ class CompactionFilterITCase {
                         DEFAULT_COMPRESSION,
                         schemaGetter,
                         tableConf.getChangelogImage(),
+                        tableConf.getKvFormatVersion().orElse(ConfigOptions.KV_FORMAT_VERSION_2),
                         KvManager.getDefaultRateLimiter(),
                         autoIncrementManager,
                         filterFactory,

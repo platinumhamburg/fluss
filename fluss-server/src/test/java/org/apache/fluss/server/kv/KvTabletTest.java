@@ -93,10 +93,13 @@ import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
@@ -200,13 +203,26 @@ class KvTabletTest {
             SchemaGetter schemaGetter,
             Map<String, String> tableConfig)
             throws Exception {
+        return createKvTablet(
+                tablePath, tableBucket, logTablet, tmpKvDir, schemaGetter, tableConfig, null);
+    }
+
+    private KvTablet createKvTablet(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File tmpKvDir,
+            SchemaGetter schemaGetter,
+            Map<String, String> tableConfig,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor)
+            throws Exception {
         TableConfig tableConf = new TableConfig(Configuration.fromMap(tableConfig));
         RowMerger rowMerger = RowMerger.create(tableConf, KvFormat.COMPACTED, schemaGetter);
         AutoIncrementManager autoIncrementManager =
                 new AutoIncrementManager(
                         schemaGetter,
                         tablePath.getTablePath(),
-                        new TableConfig(new Configuration()),
+                        tableConf,
                         new TestingSequenceGeneratorFactory());
 
         return KvTablet.create(
@@ -223,10 +239,58 @@ class KvTabletTest {
                 DEFAULT_COMPRESSION,
                 schemaGetter,
                 tableConf.getChangelogImage(),
+                tableConf.getKvFormatVersion().orElse(KV_FORMAT_VERSION_2),
                 KvManager.getDefaultRateLimiter(),
                 autoIncrementManager,
                 null,
-                null);
+                tagExtractor);
+    }
+
+    @Test
+    void testKvFormatVersionThreeRequiresTagExtractor() throws Exception {
+        Schema schema = DATA1_SCHEMA_PK;
+        PhysicalTablePath tablePath = PhysicalTablePath.of(TablePath.of("testDb", "v3_no_tag"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, tablePath);
+        Map<String, String> tableConfig = new HashMap<>();
+        tableConfig.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_3));
+
+        assertThatThrownBy(
+                        () ->
+                                createKvTablet(
+                                        tablePath,
+                                        logTablet.getTableBucket(),
+                                        logTablet,
+                                        tmpKvDir,
+                                        schemaGetter,
+                                        tableConfig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tagExtractor");
+    }
+
+    @Test
+    void testKvFormatVersionTwoRejectsTagExtractor() throws Exception {
+        Schema schema = DATA1_SCHEMA_PK;
+        PhysicalTablePath tablePath = PhysicalTablePath.of(TablePath.of("testDb", "v2_with_tag"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, tablePath);
+        Map<String, String> tableConfig = new HashMap<>();
+        tableConfig.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_2));
+
+        assertThatThrownBy(
+                        () ->
+                                createKvTablet(
+                                        tablePath,
+                                        logTablet.getTableBucket(),
+                                        logTablet,
+                                        tmpKvDir,
+                                        schemaGetter,
+                                        tableConfig,
+                                        row -> 1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tagExtractor");
     }
 
     @Test

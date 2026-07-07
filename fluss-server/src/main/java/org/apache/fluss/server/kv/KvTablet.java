@@ -185,9 +185,11 @@ public final class KvTablet {
             ArrowCompressionInfo arrowCompressionInfo,
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
+            int kvFormatVersion,
             @Nullable RocksDBStatistics rocksDBStatistics,
             AutoIncrementManager autoIncrementManager,
             @Nullable ToLongFunction<BinaryRow> tagExtractor) {
+        validateValueFormatVersion(kvFormatVersion, tagExtractor);
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
@@ -212,8 +214,20 @@ public final class KvTablet {
         // disable row count for WAL image mode.
         this.rowCount = changelogImage == ChangelogImage.WAL ? ROW_COUNT_DISABLED : 0L;
         this.tagExtractor = tagExtractor;
-        this.kvFormatVersion = tagExtractor != null ? 3 : 2;
+        this.kvFormatVersion = kvFormatVersion;
         this.valueEncoder = ValueEncoder.forVersion(kvFormatVersion, tagExtractor);
+    }
+
+    private static void validateValueFormatVersion(
+            int kvFormatVersion, @Nullable ToLongFunction<BinaryRow> tagExtractor) {
+        if (kvFormatVersion >= ConfigOptions.KV_FORMAT_VERSION_3 && tagExtractor == null) {
+            throw new IllegalArgumentException(
+                    "tagExtractor must be non-null for kvFormatVersion >= 3");
+        }
+        if (kvFormatVersion < ConfigOptions.KV_FORMAT_VERSION_3 && tagExtractor != null) {
+            throw new IllegalArgumentException(
+                    "tagExtractor must be null for kvFormatVersion < 3");
+        }
     }
 
     public static KvTablet create(
@@ -230,6 +244,7 @@ public final class KvTablet {
             ArrowCompressionInfo arrowCompressionInfo,
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
+            int kvFormatVersion,
             RateLimiter sharedRateLimiter,
             AutoIncrementManager autoIncrementManager,
             @Nullable
@@ -268,6 +283,7 @@ public final class KvTablet {
                 arrowCompressionInfo,
                 schemaGetter,
                 changelogImage,
+                kvFormatVersion,
                 rocksDBStatistics,
                 autoIncrementManager,
                 tagExtractor);

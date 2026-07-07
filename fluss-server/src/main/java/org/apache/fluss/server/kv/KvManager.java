@@ -284,6 +284,9 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     arrowCompressionInfo,
                                     schemaGetter,
                                     tableConfig.getChangelogImage(),
+                                    tableConfig
+                                            .getKvFormatVersion()
+                                            .orElse(ConfigOptions.KV_FORMAT_VERSION_2),
                                     sharedRocksDBRateLimiter,
                                     autoIncrementManager,
                                     compactionFilterFactory,
@@ -411,6 +414,9 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         tableConfig.getArrowCompressionInfo(),
                         schemaGetter,
                         tableConfig.getChangelogImage(),
+                        tableConfig
+                                .getKvFormatVersion()
+                                .orElse(ConfigOptions.KV_FORMAT_VERSION_2),
                         sharedRocksDBRateLimiter,
                         autoIncrementManager,
                         compactionFilterFactory,
