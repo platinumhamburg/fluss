@@ -111,7 +111,12 @@ public final class IndexTableDescriptorFactory {
                         .logFormat(LogFormat.COMPACTED)
                         .changelogImage(ChangelogImage.WAL)
                         .property(ConfigOptions.TABLE_TYPE, TableType.INDEX_TABLE)
-                        .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, mainTableId);
+                        .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, mainTableId)
+                        .property(
+                                ConfigOptions.TABLE_KV_FORMAT_VERSION,
+                                partitioned
+                                        ? ConfigOptions.KV_FORMAT_VERSION_3
+                                        : ConfigOptions.KV_FORMAT_VERSION_2);
         if (bucketCount != null) {
             // Bucket key is idxCols only, matching prefix lookup routing and push-side bucketing.
             b.distributedBy(bucketCount, new ArrayList<>(index.getColumnNames()));

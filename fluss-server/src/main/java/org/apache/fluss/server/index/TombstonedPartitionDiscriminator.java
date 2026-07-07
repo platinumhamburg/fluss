@@ -18,6 +18,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
@@ -89,7 +90,10 @@ final class TombstonedPartitionDiscriminator {
         }
         // Defensive guard: partitioned index tables MUST use v3 format to carry the tag.
         int kvFormatVersion =
-                tableInfo.getTableConfig().getKvFormatVersion().orElse(KV_FORMAT_VERSION_3);
+                tableInfo
+                        .getTableConfig()
+                        .getKvFormatVersion()
+                        .orElse(ConfigOptions.KV_FORMAT_VERSION_2);
         checkArgument(
                 kvFormatVersion >= KV_FORMAT_VERSION_3,
                 "Partitioned Index Table must use kvFormatVersion >= 3, but got %s",

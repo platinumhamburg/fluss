@@ -81,6 +81,8 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
         // Verify main table
         TableInfo mainTableInfo = admin.getTableInfo(tablePath).get();
         assertThat(mainTableInfo.getSchemaId()).isEqualTo(1);
+        assertThat(mainTableInfo.getTableConfig().getKvFormatVersion())
+                .hasValue(ConfigOptions.KV_FORMAT_VERSION_2);
         assertThat(mainTableInfo.toTableDescriptor().getSchema().getIndexes()).hasSize(2);
 
         // Verify index tables (V2 naming: mainTable__indexName)
@@ -94,6 +96,8 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
 
         assertThat(admin.tableExists(nameIndexTablePath).get()).isTrue();
         TableInfo nameIndexInfo = admin.getTableInfo(nameIndexTablePath).get();
+        assertThat(nameIndexInfo.getTableConfig().getKvFormatVersion())
+                .hasValue(ConfigOptions.KV_FORMAT_VERSION_2);
         assertThat(nameIndexInfo.toTableDescriptor().getSchema().getPrimaryKeyColumnNames())
                 .containsExactly("name", "id");
         assertThat(
@@ -153,6 +157,8 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         IndexTableUtils.indexTableName("test_partitioned_with_index", "name_idx"));
         assertThat(admin.tableExists(nameIndexTablePath).get()).isTrue();
         TableInfo indexInfo = admin.getTableInfo(nameIndexTablePath).get();
+        assertThat(indexInfo.getTableConfig().getKvFormatVersion())
+                .hasValue(ConfigOptions.KV_FORMAT_VERSION_3);
         assertThat(indexInfo.toTableDescriptor().isPartitioned()).isFalse();
 
         // V2: partitioned index table has __partition_id system column

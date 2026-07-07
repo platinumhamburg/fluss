@@ -746,19 +746,15 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             Integer formatVersion =
                     Configuration.fromMap(newProperties).get(ConfigOptions.TABLE_KV_FORMAT_VERSION);
             if (formatVersion == null) {
-                // set current kv format version for default
                 newProperties.put(
                         ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                        String.valueOf(CURRENT_KV_FORMAT_VERSION));
+                        String.valueOf(ConfigOptions.KV_FORMAT_VERSION_2));
                 newDescriptor = newDescriptor.withProperties(newProperties);
-            } else {
-                if (formatVersion > CURRENT_KV_FORMAT_VERSION) {
-                    throw new InvalidConfigException(
-                            String.format(
-                                    "Unsupported kv format version %d. "
-                                            + "The maximum supported version is %d.",
-                                    formatVersion, CURRENT_KV_FORMAT_VERSION));
-                }
+            } else if (formatVersion > CURRENT_KV_FORMAT_VERSION) {
+                throw new InvalidConfigException(
+                        String.format(
+                                "Unsupported kv format version %d. The maximum supported version is %d.",
+                                formatVersion, CURRENT_KV_FORMAT_VERSION));
             }
         }
 

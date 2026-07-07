@@ -101,6 +101,44 @@ class IndexTableDescriptorFactoryTest {
     }
 
     @Test
+    void testDeriveSetsKvFormatVersionByPartitioning() {
+        Schema nonPartitionedSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("u", DataTypes.BIGINT())
+                        .primaryKey("id")
+                        .index("idx_u", "u")
+                        .build();
+        TableDescriptor nonPartitioned =
+                TableDescriptor.builder().schema(nonPartitionedSchema).build();
+        TableDescriptor nonPartitionedIndex =
+                IndexTableDescriptorFactory.derive(nonPartitioned, 1L, "db.t", "idx_u");
+
+        assertThat(nonPartitionedIndex.getProperties())
+                .containsEntry(
+                        ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                        String.valueOf(ConfigOptions.KV_FORMAT_VERSION_2));
+
+        Schema partitionedSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("u", DataTypes.BIGINT())
+                        .column("dt", DataTypes.STRING())
+                        .primaryKey("id", "dt")
+                        .index("idx_u", "u")
+                        .build();
+        TableDescriptor partitioned =
+                TableDescriptor.builder().schema(partitionedSchema).partitionedBy("dt").build();
+        TableDescriptor partitionedIndex =
+                IndexTableDescriptorFactory.derive(partitioned, 2L, "db.pt", "idx_u");
+
+        assertThat(partitionedIndex.getProperties())
+                .containsEntry(
+                        ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                        String.valueOf(ConfigOptions.KV_FORMAT_VERSION_3));
+    }
+
+    @Test
     void testDeriveUsesInheritedBucketCountWhenNotOverridden() {
         Schema mainSchema =
                 Schema.newBuilder()
