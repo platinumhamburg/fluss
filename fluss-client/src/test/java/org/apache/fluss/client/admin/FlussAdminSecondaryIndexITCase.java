@@ -232,6 +232,38 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testCreateNonPkTableWithSecondaryIndexFailsBeforeMetadataSideEffects() throws Exception {
+        TablePath tablePath = TablePath.of(DB, "test_non_pk_index_rejected");
+        TablePath indexPath =
+                TablePath.of(
+                        DB,
+                        IndexTableUtils.indexTableName(tablePath.getTableName(), "idx_name"));
+        admin.createDatabase(DB, org.apache.fluss.metadata.DatabaseDescriptor.EMPTY, true).get();
+
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .index("idx_name", "name")
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "id")
+                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
+                        .build();
+
+        assertThatThrownBy(() -> admin.createTable(tablePath, descriptor, false).get())
+                .cause()
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining("secondary indexes")
+                .hasMessageContaining("primary key");
+
+        assertThat(admin.tableExists(tablePath).get()).isFalse();
+        assertThat(admin.tableExists(indexPath).get()).isFalse();
+    }
+
+    @Test
     void testDropTableWithGlobalSecondaryIndexAutoDeletesIndexTables() throws Exception {
         TablePath tablePath = TablePath.of(DB, "test_table_to_drop_with_index");
 

@@ -242,6 +242,25 @@ class TableDescriptorValidationTest {
                 .hasMessageContaining("unsupported type");
     }
 
+    @Test
+    void testRejectsSecondaryIndexOnTableWithoutPrimaryKey() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("user_id", DataTypes.BIGINT())
+                        .index("idx_user", "user_id")
+                        .build();
+        TableDescriptor descriptor = descriptorBuilder(schema).build();
+
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptorValidation.validateTableDescriptor(
+                                        descriptor, MAX_BUCKET_NUM, null))
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining("secondary indexes")
+                .hasMessageContaining("primary key");
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------
@@ -267,9 +286,11 @@ class TableDescriptorValidationTest {
     }
 
     private static TableDescriptor.Builder descriptorBuilder(Schema schema) {
+        String distributionColumn =
+                schema.getPrimaryKey().map(pk -> pk.getColumnNames().get(0)).orElse("id");
         return TableDescriptor.builder()
                 .schema(schema)
-                .distributedBy(1, schema.getPrimaryKeyColumnNames().get(0))
+                .distributedBy(1, distributionColumn)
                 .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 1);
     }
 }

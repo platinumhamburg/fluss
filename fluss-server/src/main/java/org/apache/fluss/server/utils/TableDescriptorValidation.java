@@ -568,6 +568,11 @@ public class TableDescriptorValidation {
     }
 
     private static void checkSecondaryIndexes(Schema schema) {
+        if (!schema.getIndexes().isEmpty() && schema.getPrimaryKey().isEmpty()) {
+            throw new InvalidTableException(
+                    "Tables with secondary indexes must define a primary key.");
+        }
+
         Set<String> indexNames = new LinkedHashSet<>();
         for (Schema.Index index : schema.getIndexes()) {
             String indexName = index.getIndexName();
