@@ -27,6 +27,7 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.KeyFormatVersion;
 import org.apache.fluss.row.decode.KeyDecoder;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.types.DataType;
@@ -38,6 +39,7 @@ import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
@@ -62,7 +64,8 @@ public class KeyRecordBatch implements KvRecordBatch {
     public static KeyRecordBatch create(List<byte[]> keyBytes, TableInfo tableInfo) {
         TableConfig tableConfig = tableInfo.getTableConfig();
         KvFormat kvFormat = tableConfig.getKvFormat();
-        short kvFormatVersion = tableConfig.getKvFormatVersion().orElse(1).shortValue();
+        short kvFormatVersion =
+                (short) KeyFormatVersion.resolve(tableConfig.getKvFormatVersion());
         short schemaId = (short) tableInfo.getSchemaId();
         boolean defaultBucketKey = tableInfo.isDefaultBucketKey();
         return new KeyRecordBatch(
@@ -76,7 +79,13 @@ public class KeyRecordBatch implements KvRecordBatch {
 
     @VisibleForTesting
     KeyRecordBatch(List<byte[]> keyBytes, KvFormat kvFormat, short schemaId) {
-        this(keyBytes, kvFormat, (short) 1, schemaId, true, null);
+        this(
+                keyBytes,
+                kvFormat,
+                (short) KeyFormatVersion.resolve(Optional.empty()),
+                schemaId,
+                true,
+                null);
     }
 
     /**
@@ -94,7 +103,7 @@ public class KeyRecordBatch implements KvRecordBatch {
         this.keyBytes = keyBytes;
         this.schemaId = schemaId;
         this.kvFormat = kvFormat;
-        this.kvFormatVersion = kvFormatVersion;
+        this.kvFormatVersion = (short) KeyFormatVersion.resolve(kvFormatVersion);
         this.defaultBucketKey = defaultBucketKey;
         this.lakeFormat = lakeFormat;
     }

@@ -20,6 +20,7 @@ package org.apache.fluss.row.encode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
@@ -57,9 +58,55 @@ class KeyEncoderTest {
                 .isEqualTo(versionTwoEncoder.encodeKey(row("Alice", 1L)));
     }
 
+    @Test
+    void testMissingKvFormatVersionDefaultsToVersionTwoKeyEncoding() {
+        DataType[] dataTypes = new DataType[] {DataTypes.STRING(), DataTypes.BIGINT()};
+        String[] fieldNames = new String[] {"name", "id"};
+        RowType rowType = RowType.of(dataTypes, fieldNames);
+
+        KeyEncoder versionTwoEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        rowType,
+                        Collections.singletonList("name"),
+                        paimonTableConfigWithKvFormatVersion(ConfigOptions.KV_FORMAT_VERSION_2),
+                        false);
+        KeyEncoder missingVersionEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        rowType,
+                        Collections.singletonList("name"),
+                        paimonTableConfigWithoutKvFormatVersion(),
+                        false);
+        KeyEncoder versionOneEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        rowType,
+                        Collections.singletonList("name"),
+                        paimonTableConfigWithKvFormatVersion(1),
+                        false);
+
+        byte[] lookupKey = missingVersionEncoder.encodeKey(row("Alice", 1L));
+        assertThat(lookupKey).isEqualTo(versionTwoEncoder.encodeKey(row("Alice", 1L)));
+        assertThat(lookupKey).isNotEqualTo(versionOneEncoder.encodeKey(row("Alice", 1L)));
+    }
+
     private static TableConfig tableConfigWithKvFormatVersion(int kvFormatVersion) {
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.TABLE_KV_FORMAT_VERSION, kvFormatVersion);
         return new TableConfig(conf);
+    }
+
+    private static TableConfig paimonTableConfigWithKvFormatVersion(int kvFormatVersion) {
+        Configuration conf = paimonConfiguration();
+        conf.set(ConfigOptions.TABLE_KV_FORMAT_VERSION, kvFormatVersion);
+        return new TableConfig(conf);
+    }
+
+    private static TableConfig paimonTableConfigWithoutKvFormatVersion() {
+        return new TableConfig(paimonConfiguration());
+    }
+
+    private static Configuration paimonConfiguration() {
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON);
+        return conf;
     }
 }

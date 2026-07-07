@@ -20,6 +20,7 @@ package org.apache.fluss.row.encode;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.KeyFormatVersion;
 import org.apache.fluss.row.encode.iceberg.IcebergKeyEncoder;
 import org.apache.fluss.row.encode.paimon.PaimonKeyEncoder;
 import org.apache.fluss.types.RowType;
@@ -27,10 +28,8 @@ import org.apache.fluss.types.RowType;
 import javax.annotation.Nullable;
 
 import java.util.List;
-import java.util.Optional;
 
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
-import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 
 /** An interface for encoding key of row into bytes. */
 public interface KeyEncoder {
@@ -45,10 +44,9 @@ public interface KeyEncoder {
     /**
      * Creates a primary key encoder for the given table configuration.
      *
-     * <p><b>Backward Compatibility for legacy table (kvFormatVersion = 1):</b> For tables created
-     * before the introduction of kv format version (legacy tables without kvFormatVersion), we
-     * continue to use the original encoding method (lake's encoder for lake tables) to ensure data
-     * compatibility.
+     * <p><b>Backward Compatibility for legacy table (kvFormatVersion = 1):</b> For tables explicitly
+     * marked as version 1, we continue to use the original encoding method (lake's encoder for lake
+     * tables) to ensure data compatibility.
      *
      * <p><b>New Tables (kvFormatVersion = 2 or 3):</b> For new tables, we cannot always use the
      * lake's encoder because some lake encoders (e.g., Paimon) don't support prefix lookup. Prefix
@@ -77,13 +75,12 @@ public interface KeyEncoder {
             List<String> keyFields,
             TableConfig tableConfig,
             boolean isDefaultBucketKey) {
-        Optional<Integer> optKvFormatVersion = tableConfig.getKvFormatVersion();
         DataLakeFormat dataLakeFormat = tableConfig.getDataLakeFormat().orElse(null);
-        int kvFormatVersion = optKvFormatVersion.orElse(1);
+        int kvFormatVersion = KeyFormatVersion.resolve(tableConfig.getKvFormatVersion());
         if (kvFormatVersion == 1) {
             return of(rowType, keyFields, dataLakeFormat);
         }
-        if (kvFormatVersion == KV_FORMAT_VERSION_2 || kvFormatVersion == KV_FORMAT_VERSION_3) {
+        if (kvFormatVersion == KV_FORMAT_VERSION_2) {
             if (isDefaultBucketKey) {
                 return of(rowType, keyFields, dataLakeFormat);
             } else {
