@@ -247,7 +247,6 @@ class TableDescriptorValidationTest {
     void testRejectsSecondaryIndexOnTableWithoutPrimaryKey() {
         Schema schema =
                 Schema.newBuilder()
-                        .column("id", DataTypes.BIGINT())
                         .column("user_id", DataTypes.BIGINT())
                         .index("idx_user", "user_id")
                         .build();
@@ -361,7 +360,9 @@ class TableDescriptorValidationTest {
 
     private static TableDescriptor.Builder descriptorBuilder(Schema schema) {
         String distributionColumn =
-                schema.getPrimaryKey().map(pk -> pk.getColumnNames().get(0)).orElse("id");
+                schema.getPrimaryKey()
+                        .map(pk -> pk.getColumnNames().get(0))
+                        .orElse(schema.getRowType().getFieldNames().get(0));
         return TableDescriptor.builder()
                 .schema(schema)
                 .distributedBy(1, distributionColumn)
