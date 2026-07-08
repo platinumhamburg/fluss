@@ -72,9 +72,9 @@ public final class PartitionTombstoneAdvancer {
      * Returns a new {@link PartitionTombstone} reflecting the drop of {@code partitionId}.
      *
      * <p>When {@code alivePartitionIdsAfterDrop} is present, {@code floor} is advanced only to a
-     * value below every alive partition id. When the set is empty, every known dropped id is safe to
-     * fold into the floor. When the snapshot is unavailable, the update falls back to a conservative
-     * explicit-set append.
+     * value below every alive partition id. When the set is empty, every known dropped id is safe
+     * to fold into the floor. When the snapshot is unavailable, the update falls back to a
+     * conservative explicit-set append.
      */
     public static PartitionTombstone dropPartition(
             PartitionTombstone before,
@@ -116,7 +116,9 @@ public final class PartitionTombstoneAdvancer {
         return new PartitionTombstone(newFloor, explicit, before.getVersion() + 1);
     }
 
-    /** Validates that a newly allocated source partition id is not covered by the tombstone floor. */
+    /**
+     * Validates that a newly allocated source partition id is not covered by the tombstone floor.
+     */
     public static void validateNewPartitionId(PartitionTombstone tombstone, long partitionId) {
         checkArgument(
                 partitionId > tombstone.getFloor(),

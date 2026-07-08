@@ -173,7 +173,8 @@ class PartitionTTLGoldenPathITCase {
             FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(new TableBucket(indexTableId, i));
         }
 
-        // ---- Phase 2: Write synthetic entries to the index table with different partition IDs ----
+        // ---- Phase 2: Write synthetic entries to the index table with different partition IDs
+        // ----
         // These simulate what IndexReplicator would push. The Index Table's KvTablet encodes them
         // in v3 format with the __partition_id as the tag via its installed tagExtractor.
         byte[] keyP0 = encodeIndexKey("alpha", 1);
@@ -306,7 +307,8 @@ class PartitionTTLGoldenPathITCase {
         // Partitioned Index Table schema: [b STRING, a INT, p STRING, __partition_id BIGINT]
         byte[] valueBytes = encodeAlignedValueWithPartitionId(partitionId);
         KvRecordBatch batch = synthesizeIndexBatch(key, valueBytes);
-        int leaderId = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(indexTableId, bucket));
+        int leaderId =
+                FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(indexTableId, bucket));
         FLUSS_CLUSTER_EXTENSION
                 .newTabletServerClientForNode(leaderId)
                 .putKv(newPutKvRequest(indexTableId, bucket, 1, batch))

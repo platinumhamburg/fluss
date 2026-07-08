@@ -19,6 +19,8 @@ package org.apache.fluss.server.zk;
 
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.zk.data.BucketAssignment;
+import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 
 import org.junit.jupiter.api.AfterAll;
@@ -96,5 +98,31 @@ class ZooKeeperClientPartitionTombstoneTest {
                 tp, new PartitionTombstone(5L, Collections.emptySet(), 1L));
         zkClient.deletePartitionTombstone(tp);
         assertThat(zkClient.getPartitionTombstone(tp)).isEqualTo(PartitionTombstone.EMPTY);
+    }
+
+    @Test
+    void testDeletePartitionAndSetTombstoneAreAtomicMetadataUpdate() throws Exception {
+        TablePath tp = TablePath.of("db", "indexed_main");
+        String partitionName = "p=2026";
+        long tableId = 11L;
+        long partitionId = 22L;
+        PartitionAssignment assignment =
+                new PartitionAssignment(
+                        tableId, Collections.singletonMap(0, BucketAssignment.of(0)));
+        zkClient.registerPartitionAssignmentAndMetadata(
+                partitionId,
+                partitionName,
+                assignment,
+                zkClient.getDefaultRemoteDataDir(),
+                tp,
+                tableId);
+
+        PartitionTombstone updated =
+                new PartitionTombstone(partitionId, Collections.emptySet(), 1L);
+        zkClient.deletePartitionAndSetTombstone(tp, partitionName, updated);
+
+        assertThat(zkClient.getPartition(tp, partitionName)).isEmpty();
+        assertThat(zkClient.getPartitionAssignment(partitionId)).contains(assignment);
+        assertThat(zkClient.getPartitionTombstone(tp)).isEqualTo(updated);
     }
 }

@@ -225,8 +225,7 @@ public final class KvTablet {
                     "tagExtractor must be non-null for kvFormatVersion >= 3");
         }
         if (kvFormatVersion < ConfigOptions.KV_FORMAT_VERSION_3 && tagExtractor != null) {
-            throw new IllegalArgumentException(
-                    "tagExtractor must be null for kvFormatVersion < 3");
+            throw new IllegalArgumentException("tagExtractor must be null for kvFormatVersion < 3");
         }
     }
 

@@ -38,9 +38,9 @@ import java.util.function.Supplier;
  * state via the supplied {@link Supplier} and passes tag offset, floor, and explicit set to the
  * native filter via JNI.
  *
- * <p>The tag is written at a fixed offset in the v3 value format
- * ({@code [schemaId(2)][tag(8)][BinaryRow]}), so the filter only needs the tag offset — no schema
- * metadata is required.
+ * <p>The tag is written at a fixed offset in the v3 value format ({@code
+ * [schemaId(2)][tag(8)][BinaryRow]}), so the filter only needs the tag offset — no schema metadata
+ * is required.
  *
  * <p>Thread-safety: RocksDB may call {@link #createCompactionFilter(Context)} from any compaction
  * thread. The supplier must be thread-safe.

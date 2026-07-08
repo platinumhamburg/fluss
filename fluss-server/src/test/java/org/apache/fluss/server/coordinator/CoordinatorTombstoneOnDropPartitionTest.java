@@ -17,12 +17,21 @@
 
 package org.apache.fluss.server.coordinator;
 
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.PartitionTombstone;
+import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
+import org.apache.fluss.server.zk.data.BucketAssignment;
+import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
+import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -198,7 +207,50 @@ class CoordinatorTombstoneOnDropPartitionTest {
         assertThat(zkClient.getPartitionTombstone(tpB)).isEqualTo(afterB);
     }
 
+    @Test
+    void testMetadataDropPartitionForIndexedTablePersistsTombstoneAtomically() throws Exception {
+        MetadataManager metadataManager = newMetadataManager();
+        TablePath tablePath = TablePath.of("db", "indexed_partitioned");
+        metadataManager.createDatabase(
+                tablePath.getDatabaseName(), DatabaseDescriptor.EMPTY, false);
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .column("region", DataTypes.STRING())
+                                        .column("dt", DataTypes.STRING())
+                                        .primaryKey("id", "dt")
+                                        .index("idx_region", "region")
+                                        .build())
+                        .distributedBy(1, "id")
+                        .partitionedBy("dt")
+                        .build();
+        long tableId = metadataManager.createTable(tablePath, descriptor, null, false);
+        PartitionAssignment assignment =
+                new PartitionAssignment(
+                        tableId, Collections.singletonMap(0, BucketAssignment.of(0)));
+        ResolvedPartitionSpec partition = ResolvedPartitionSpec.fromPartitionValue("dt", "2026");
+        metadataManager.createPartition(tablePath, tableId, assignment, partition, false);
+        PartitionRegistration registration =
+                zkClient.getPartition(tablePath, partition.getPartitionName()).get();
+
+        metadataManager.dropPartition(tablePath, partition, false);
+
+        assertThat(zkClient.getPartition(tablePath, partition.getPartitionName())).isEmpty();
+        assertThat(zkClient.getPartitionAssignment(registration.getPartitionId()))
+                .contains(assignment);
+        PartitionTombstone tombstone = zkClient.getPartitionTombstone(tablePath);
+        assertThat(tombstone.isTombstoned(registration.getPartitionId())).isTrue();
+        assertThat(tombstone.getVersion()).isEqualTo(1L);
+    }
+
     private static Set<Long> asSet(long... values) {
         return LongStream.of(values).boxed().collect(Collectors.toSet());
+    }
+
+    private static MetadataManager newMetadataManager() {
+        Configuration conf = new Configuration();
+        return new MetadataManager(zkClient, conf, new LakeCatalogDynamicLoader(conf, null, true));
     }
 }

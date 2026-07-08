@@ -60,6 +60,7 @@ import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 import org.apache.fluss.utils.function.RunnableWithException;
 import org.apache.fluss.utils.function.ThrowingRunnable;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,6 +83,7 @@ import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAl
 public class MetadataManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(MetadataManager.class);
+    private static final int PARTITION_TOMBSTONE_CAS_RETRY_LIMIT = 3;
 
     private final ZooKeeperClient zookeeperClient;
     private final int maxPartitionNum;
@@ -932,13 +934,78 @@ public class MetadataManager {
         }
 
         try {
-            zookeeperClient.deletePartition(tablePath, partitionName);
+            if (hasSecondaryIndexes(tablePath)) {
+                dropPartitionAndPersistTombstone(
+                        tablePath, partitionName, optionalPartitionRegistration.get());
+            } else {
+                zookeeperClient.deletePartition(tablePath, partitionName);
+            }
         } catch (Exception e) {
-            LOG.error(
-                    "Fail to delete partition '{}' from zookeeper for table {}.",
-                    partitionName,
-                    tablePath,
+            throw new FlussRuntimeException(
+                    String.format(
+                            "Fail to delete partition '%s' from zookeeper for table %s.",
+                            partitionName, tablePath),
                     e);
+        }
+    }
+
+    private boolean hasSecondaryIndexes(TablePath tablePath) {
+        return !getLatestSchema(tablePath).getSchema().getIndexes().isEmpty();
+    }
+
+    private void dropPartitionAndPersistTombstone(
+            TablePath tablePath, String partitionName, PartitionRegistration partitionRegistration)
+            throws Exception {
+        long partitionId = partitionRegistration.getPartitionId();
+        Exception lastConflict = null;
+        for (int attempt = 0; attempt < PARTITION_TOMBSTONE_CAS_RETRY_LIMIT; attempt++) {
+            Tuple2<PartitionTombstone, Optional<Integer>> current =
+                    zookeeperClient.getPartitionTombstoneWithVersion(tablePath);
+            Set<Long> alivePartitionIdsAfterDrop =
+                    loadAlivePartitionIdsAfterDrop(tablePath, partitionId);
+            PartitionTombstone updated =
+                    PartitionTombstoneAdvancer.dropPartition(
+                            current.f0, partitionId, alivePartitionIdsAfterDrop);
+            try {
+                zookeeperClient.deletePartitionAndSetTombstone(
+                        tablePath, partitionName, updated, current.f1);
+                return;
+            } catch (KeeperException.BadVersionException | KeeperException.NodeExistsException e) {
+                lastConflict = e;
+                LOG.warn(
+                        "Retrying atomic partition drop for table {} partition {} after tombstone version conflict.",
+                        tablePath,
+                        partitionName,
+                        e);
+            }
+        }
+        throw new FlussRuntimeException(
+                String.format(
+                        "Failed to atomically drop partition '%s' for table %s after %s retries.",
+                        partitionName, tablePath, PARTITION_TOMBSTONE_CAS_RETRY_LIMIT),
+                lastConflict);
+    }
+
+    @Nullable
+    private Set<Long> loadAlivePartitionIdsAfterDrop(TablePath tablePath, long droppedPartitionId) {
+        try {
+            Set<Long> alivePartitionIds = new HashSet<>();
+            for (PartitionRegistration registration :
+                    zookeeperClient.getPartitionRegistrations(tablePath).values()) {
+                long partitionId = registration.getPartitionId();
+                if (partitionId != droppedPartitionId) {
+                    alivePartitionIds.add(partitionId);
+                }
+            }
+            return alivePartitionIds;
+        } catch (Exception e) {
+            LOG.warn(
+                    "Failed to load alive partition ids for table {} while dropping partition {}, "
+                            + "falling back to conservative tombstone advancement.",
+                    tablePath,
+                    droppedPartitionId,
+                    e);
+            return null;
         }
     }
 

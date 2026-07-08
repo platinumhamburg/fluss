@@ -60,16 +60,16 @@ import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * End-to-end test for the {@link FloorSetCompactionFilterFactory} (backed by
- * {@code FloorSetCompactionFilter} from the RocksDB fork).
+ * End-to-end test for the {@link FloorSetCompactionFilterFactory} (backed by {@code
+ * FloorSetCompactionFilter} from the RocksDB fork).
  *
- * <p>Creates a KvTablet with a {@link FloorSetCompactionFilterFactory} installed, writes
- * raw key-value pairs with v3 value format (schemaId + tag) directly to RocksDB, flushes to SST,
- * updates the tombstone state, triggers manual compaction, and verifies that entries for
- * tombstoned partitions are physically removed while entries for live partitions survive.
+ * <p>Creates a KvTablet with a {@link FloorSetCompactionFilterFactory} installed, writes raw
+ * key-value pairs with v3 value format (schemaId + tag) directly to RocksDB, flushes to SST,
+ * updates the tombstone state, triggers manual compaction, and verifies that entries for tombstoned
+ * partitions are physically removed while entries for live partitions survive.
  *
- * <p>The full pipeline tested: Java → JNI (tagOffset + floor + explicitSet) → C++
- * {@code FloorSetCompactionFilter} → RocksDB compaction.
+ * <p>The full pipeline tested: Java → JNI (tagOffset + floor + explicitSet) → C++ {@code
+ * FloorSetCompactionFilter} → RocksDB compaction.
  */
 class CompactionFilterITCase {
 
@@ -211,11 +211,17 @@ class CompactionFilterITCase {
         // payload can be anything - the compaction filter only cares about the tag
         byte[] dummyPayload = new byte[] {0x00, 0x00, 0x00, 0x00};
         byte[] result =
-                new byte[ValueEncoder.SCHEMA_ID_LENGTH + ValueEncoder.TAG_LENGTH + dummyPayload.length];
+                new byte
+                        [ValueEncoder.SCHEMA_ID_LENGTH
+                                + ValueEncoder.TAG_LENGTH
+                                + dummyPayload.length];
         UnsafeUtils.putShort(result, 0, schemaId);
         UnsafeUtils.putLong(result, ValueEncoder.TAG_OFFSET, partitionId);
         System.arraycopy(
-                dummyPayload, 0, result, ValueEncoder.SCHEMA_ID_LENGTH + ValueEncoder.TAG_LENGTH,
+                dummyPayload,
+                0,
+                result,
+                ValueEncoder.SCHEMA_ID_LENGTH + ValueEncoder.TAG_LENGTH,
                 dummyPayload.length);
         return result;
     }

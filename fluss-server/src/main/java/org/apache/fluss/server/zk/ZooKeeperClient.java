@@ -1065,6 +1065,50 @@ public class ZooKeeperClient implements AutoCloseable {
         zkClient.delete().forPath(path);
     }
 
+    /**
+     * Deletes a partition metadata node and persists the table's partition tombstone in one ZK
+     * transaction.
+     *
+     * <p>This keeps the source-of-truth partition metadata and the index cleanup tombstone
+     * consistent: a partition cannot become non-active without the corresponding tombstone being
+     * durable for secondary-index filtering.
+     */
+    public void deletePartitionAndSetTombstone(
+            TablePath tablePath, String partitionName, PartitionTombstone tombstone)
+            throws Exception {
+        Tuple2<PartitionTombstone, Optional<Integer>> current =
+                getPartitionTombstoneWithVersion(tablePath);
+        deletePartitionAndSetTombstone(tablePath, partitionName, tombstone, current.f1);
+    }
+
+    /**
+     * Deletes a partition metadata node and persists the table's partition tombstone in one ZK
+     * transaction, using the provided tombstone znode version as an optimistic concurrency check.
+     */
+    public void deletePartitionAndSetTombstone(
+            TablePath tablePath,
+            String partitionName,
+            PartitionTombstone tombstone,
+            Optional<Integer> expectedTombstoneVersion)
+            throws Exception {
+        String partitionPath = PartitionZNode.path(tablePath, partitionName);
+        String tombstonePath = PartitionTombstoneZNode.path(tablePath);
+        byte[] tombstoneBytes = PartitionTombstoneBinarySerde.serialize(tombstone);
+
+        List<CuratorOp> ops = new ArrayList<>(2);
+        ops.add(zkOp.deleteOp(partitionPath));
+        if (expectedTombstoneVersion.isPresent()) {
+            ops.add(
+                    zkClient.transactionOp()
+                            .setData()
+                            .withVersion(expectedTombstoneVersion.get())
+                            .forPath(tombstonePath, tombstoneBytes));
+        } else {
+            ops.add(zkOp.createOp(tombstonePath, tombstoneBytes, CreateMode.PERSISTENT));
+        }
+        zkClient.transaction().forOperations(ops);
+    }
+
     // --------------------------------------------------------------------------------------------
     // Partition Tombstone (per main table)
     // --------------------------------------------------------------------------------------------
@@ -1078,14 +1122,25 @@ public class ZooKeeperClient implements AutoCloseable {
         String path = PartitionTombstoneZNode.path(tablePath);
         Optional<byte[]> data = getOrEmpty(path);
         if (data.isPresent()) {
-            byte[] bytes = data.get();
-            if (bytes.length > 0 && bytes[0] == '{') {
-                // Legacy JSON format - next write will migrate to binary
-                return JsonSerdeUtils.readValue(bytes, PartitionTombstoneJsonSerde.INSTANCE);
-            }
-            return PartitionTombstoneBinarySerde.deserialize(bytes);
+            return decodePartitionTombstone(data.get());
         }
         return PartitionTombstone.EMPTY;
+    }
+
+    /**
+     * Reads the {@link PartitionTombstone} and the backing znode version. A missing znode is
+     * returned as {@code (PartitionTombstone.EMPTY, Optional.empty())}.
+     */
+    public Tuple2<PartitionTombstone, Optional<Integer>> getPartitionTombstoneWithVersion(
+            TablePath tablePath) throws Exception {
+        String path = PartitionTombstoneZNode.path(tablePath);
+        try {
+            Stat stat = new Stat();
+            byte[] bytes = zkClient.getData().storingStatIn(stat).forPath(path);
+            return Tuple2.of(decodePartitionTombstone(bytes), Optional.of(stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Tuple2.of(PartitionTombstone.EMPTY, Optional.empty());
+        }
     }
 
     /**
@@ -1108,6 +1163,14 @@ public class ZooKeeperClient implements AutoCloseable {
                 zkClient.setData().withVersion(freshStat.getVersion()).forPath(path, bytes);
             }
         }
+    }
+
+    private static PartitionTombstone decodePartitionTombstone(byte[] bytes) {
+        if (bytes.length > 0 && bytes[0] == '{') {
+            // Legacy JSON format - next write will migrate to binary.
+            return JsonSerdeUtils.readValue(bytes, PartitionTombstoneJsonSerde.INSTANCE);
+        }
+        return PartitionTombstoneBinarySerde.deserialize(bytes);
     }
 
     /** Deletes the {@link PartitionTombstone} znode for the given main table, if it exists. */

@@ -83,17 +83,13 @@ class TombstonedPartitionDiscriminatorTest {
     private static TableInfo partitionedIndexTableInfo(Integer kvFormatVersion) {
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(
-                        partitionedMainTableDescriptor(),
-                        1001L,
-                        "test_db.orders",
-                        "idx_user");
+                        partitionedMainTableDescriptor(), 1001L, "test_db.orders", "idx_user");
         Map<String, String> properties = new HashMap<>(indexDescriptor.getProperties());
         if (kvFormatVersion == null) {
             properties.remove(ConfigOptions.TABLE_KV_FORMAT_VERSION.key());
         } else {
             properties.put(
-                    ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                    String.valueOf(kvFormatVersion));
+                    ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(kvFormatVersion));
         }
 
         return TableInfo.of(

@@ -895,8 +895,41 @@ public class CoordinatorEventProcessor implements EventProcessor {
         TablePartition tablePartition =
                 new TablePartition(tableId, dropPartitionEvent.getPartitionId());
 
-        // If this is a primary key table partition, drop the kv snapshot store.
         TableInfo dropTableInfo = coordinatorContext.getTableInfoById(tableId);
+        // For main tables that declare secondary indexes, read the already-persisted
+        // PartitionTombstone and ship it to live TabletServers in the same UpdateMetadataRequest.
+        // If this event came from a legacy/direct ZK partition delete that did not atomically
+        // persist the tombstone, fall back to advancing it before any in-memory destructive cleanup
+        // below. Skipping this for non-indexed tables avoids creating tombstone state we have no
+        // consumer for.
+        Map<Long, PartitionTombstone> partitionTombstones = Collections.emptyMap();
+        if (!dropTableInfo.getSchema().getIndexes().isEmpty()) {
+            try {
+                PartitionTombstone updated =
+                        zooKeeperClient.getPartitionTombstone(dropTableInfo.getTablePath());
+                if (!updated.isTombstoned(dropPartitionEvent.getPartitionId())) {
+                    Set<Long> alivePartitionIdsAfterDrop =
+                            loadAlivePartitionIdsForSafeFloor(
+                                    dropTableInfo, dropPartitionEvent.getPartitionId());
+                    updated =
+                            PartitionTombstoneAdvancer.advanceAndPersist(
+                                    zooKeeperClient,
+                                    dropTableInfo.getTablePath(),
+                                    dropPartitionEvent.getPartitionId(),
+                                    alivePartitionIdsAfterDrop);
+                }
+                partitionTombstones = Collections.singletonMap(tableId, updated);
+            } catch (Exception e) {
+                throw new FlussRuntimeException(
+                        "Failed to advance PartitionTombstone for table "
+                                + dropTableInfo.getTablePath()
+                                + " on drop of partition "
+                                + dropPartitionEvent.getPartitionId(),
+                        e);
+            }
+        }
+
+        // If this is a primary key table partition, drop the kv snapshot store.
         if (dropTableInfo.hasPrimaryKey()) {
             Set<TableBucket> deleteTableBuckets =
                     coordinatorContext.getAllBucketsForPartition(
@@ -908,33 +941,6 @@ public class CoordinatorEventProcessor implements EventProcessor {
         coordinatorContext.queuePartitionDeletion(Collections.singleton(tablePartition));
         tableManager.onDeletePartition(tableId, dropPartitionEvent.getPartitionId());
         autoPartitionManager.removePartition(tableId, dropPartitionEvent.getPartitionName());
-
-        // For main tables that declare secondary indexes, advance the per-table PartitionTombstone
-        // in ZK and ship the new value to live TabletServers in the same UpdateMetadataRequest.
-        // Skipping the advance for non-indexed tables avoids creating tombstone state we have no
-        // consumer for.
-        Map<Long, PartitionTombstone> partitionTombstones = Collections.emptyMap();
-        if (!dropTableInfo.getSchema().getIndexes().isEmpty()) {
-            try {
-                Set<Long> alivePartitionIdsAfterDrop =
-                        loadAlivePartitionIdsForSafeFloor(
-                                dropTableInfo, dropPartitionEvent.getPartitionId());
-                PartitionTombstone updated =
-                        PartitionTombstoneAdvancer.advanceAndPersist(
-                                zooKeeperClient,
-                                dropTableInfo.getTablePath(),
-                                dropPartitionEvent.getPartitionId(),
-                                alivePartitionIdsAfterDrop);
-                partitionTombstones = Collections.singletonMap(tableId, updated);
-            } catch (Exception e) {
-                throw new FlussRuntimeException(
-                        "Failed to advance PartitionTombstone for table "
-                                + dropTableInfo.getTablePath()
-                                + " on drop of partition "
-                                + dropPartitionEvent.getPartitionId(),
-                        e);
-            }
-        }
 
         // send update metadata request.
         updateTabletServerMetadataCache(

@@ -93,8 +93,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newAlterTableRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newCreateDatabaseRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newCreateTableRequest;
@@ -295,8 +295,7 @@ class TableManagerITCase {
         TableDescriptor gottenTable = TableDescriptor.fromJsonBytes(response.getTableJson());
         Map<String, String> properties = new HashMap<>(gottenTable.getProperties());
         properties.put(
-                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(KV_FORMAT_VERSION_2));
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_2));
         assertThat(gottenTable)
                 .isEqualTo(tableDescriptor.withProperties(properties).withReplicationFactor(1));
 
@@ -493,8 +492,7 @@ class TableManagerITCase {
 
         Map<String, String> properties = new HashMap<>(tableDescriptor.getProperties());
         properties.put(
-                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(KV_FORMAT_VERSION_2));
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_2));
         tableDescriptor = tableDescriptor.withProperties(properties);
 
         assertThat(TableDescriptor.fromJsonBytes(tableMetadata.getTableJson()))

@@ -107,7 +107,9 @@ class PartitionTombstoneAdvancerTest {
         PartitionTombstone before = new PartitionTombstone(0L, Collections.emptySet(), 1L);
 
         assertThatThrownBy(
-                        () -> PartitionTombstoneAdvancer.dropPartition(before, 20L, asSet(20L, 30L)))
+                        () ->
+                                PartitionTombstoneAdvancer.dropPartition(
+                                        before, 20L, asSet(20L, 30L)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("must not remain in alive partition ids");
     }
@@ -133,7 +135,9 @@ class PartitionTombstoneAdvancerTest {
         PartitionTombstone tombstone =
                 new PartitionTombstone(
                         -1L,
-                        LongStream.range(0L, PartitionTombstoneAdvancer.EXPLICIT_SET_WARNING_THRESHOLD)
+                        LongStream.range(
+                                        0L,
+                                        PartitionTombstoneAdvancer.EXPLICIT_SET_WARNING_THRESHOLD)
                                 .boxed()
                                 .collect(Collectors.toSet()),
                         1L);

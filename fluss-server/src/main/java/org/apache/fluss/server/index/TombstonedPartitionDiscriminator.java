@@ -62,9 +62,7 @@ final class TombstonedPartitionDiscriminator {
     private final TabletServerMetadataCache metadataCache;
 
     private TombstonedPartitionDiscriminator(
-            long mainTableId,
-            int partitionIdPosition,
-            TabletServerMetadataCache metadataCache) {
+            long mainTableId, int partitionIdPosition, TabletServerMetadataCache metadataCache) {
         this.mainTableId = mainTableId;
         this.partitionIdPosition = partitionIdPosition;
         this.metadataCache = metadataCache;
