@@ -32,8 +32,8 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * compaction filter use this to drop entries whose source partition no longer exists.
  *
  * <p>Encoded as: {@code partitionId} is tombstoned iff {@code partitionId <= floor ||
- * explicitSet.contains(partitionId)}. The floor advances monotonically as the Coordinator absorbs
- * consecutive entries from {@code explicitSet}.
+ * explicitSet.contains(partitionId)}. The floor advances monotonically as an alive-partition
+ * watermark: no alive source partition may have {@code partitionId <= floor}.
  *
  * <p>Stale views (TabletServer-side cache lag) are subsets of the authoritative state, so the
  * cleanup is fail-open: at worst we keep more rows than strictly necessary, never erase rows that

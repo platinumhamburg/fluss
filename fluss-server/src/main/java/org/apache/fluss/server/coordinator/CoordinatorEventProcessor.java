@@ -113,6 +113,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ServerTags;
@@ -915,11 +916,15 @@ public class CoordinatorEventProcessor implements EventProcessor {
         Map<Long, PartitionTombstone> partitionTombstones = Collections.emptyMap();
         if (!dropTableInfo.getSchema().getIndexes().isEmpty()) {
             try {
+                Set<Long> alivePartitionIdsAfterDrop =
+                        loadAlivePartitionIdsForSafeFloor(
+                                dropTableInfo, dropPartitionEvent.getPartitionId());
                 PartitionTombstone updated =
                         PartitionTombstoneAdvancer.advanceAndPersist(
                                 zooKeeperClient,
                                 dropTableInfo.getTablePath(),
-                                dropPartitionEvent.getPartitionId());
+                                dropPartitionEvent.getPartitionId(),
+                                alivePartitionIdsAfterDrop);
                 partitionTombstones = Collections.singletonMap(tableId, updated);
             } catch (Exception e) {
                 throw new FlussRuntimeException(
@@ -942,6 +947,24 @@ public class CoordinatorEventProcessor implements EventProcessor {
         // remove partition metrics.
         coordinatorMetricGroup.removeTablePartitionMetricsGroup(
                 dropTableInfo.getTablePath(), tableId, tablePartition.getPartitionId());
+    }
+
+    @Nullable
+    private Set<Long> loadAlivePartitionIdsForSafeFloor(
+            TableInfo tableInfo, long droppedPartitionId) {
+        try {
+            return metadataManager.listPartitions(tableInfo.getTablePath()).values().stream()
+                    .map(PartitionRegistration::getPartitionId)
+                    .collect(Collectors.toSet());
+        } catch (Exception e) {
+            LOG.warn(
+                    "Failed to load alive partition ids for table {} after dropping partition {}, "
+                            + "falling back to conservative tombstone advancement.",
+                    tableInfo.getTablePath(),
+                    droppedPartitionId,
+                    e);
+            return null;
+        }
     }
 
     private void processDeleteReplicaResponseReceived(

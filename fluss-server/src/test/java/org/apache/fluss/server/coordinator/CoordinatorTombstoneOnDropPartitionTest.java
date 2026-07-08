@@ -30,14 +30,19 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.util.Collections;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Unit-level coverage for the read-advance-persist helper used by the Coordinator's {@code
- * processDropPartition} (Plan 3 Task 7). The Coordinator wiring (calling this helper for indexed
- * main tables and shipping the new tombstone via {@code UpdateMetadataRequest}) is verified by
- * inspection; this test exercises the helper against a real ZooKeeper to guarantee persistence,
- * version-bumping and floor compaction across successive drops.
+ * processDropPartition}. The Coordinator wiring (calling this helper for indexed main tables and
+ * shipping the new tombstone via {@code UpdateMetadataRequest}) is verified by inspection; this
+ * test exercises the helper against a real ZooKeeper to guarantee persistence, version-bumping,
+ * conservative fallback, and safe-floor compaction when an alive-partition snapshot is available.
  */
 class CoordinatorTombstoneOnDropPartitionTest {
 
@@ -94,29 +99,73 @@ class CoordinatorTombstoneOnDropPartitionTest {
     }
 
     @Test
-    void testContiguousDropsCompactIntoFloor() throws Exception {
+    void testLegacyDropsDoNotAdvanceFloorWithoutAliveSnapshot() throws Exception {
         TablePath tp = TablePath.of("db", "main");
-        // Drop 0 first: floor should advance to 0 immediately because (-1)+1==0.
         PartitionTombstone afterZero =
                 PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 0L);
-        assertThat(afterZero.getFloor()).isEqualTo(0L);
-        assertThat(afterZero.getExplicitSet()).isEmpty();
+        assertThat(afterZero.getFloor()).isEqualTo(-1L);
+        assertThat(afterZero.getExplicitSet()).containsExactly(0L);
         assertThat(afterZero.getVersion()).isEqualTo(1L);
 
-        // Then drop 2 (non-contiguous): stays in explicit set.
         PartitionTombstone afterTwo =
                 PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 2L);
-        assertThat(afterTwo.getFloor()).isEqualTo(0L);
-        assertThat(afterTwo.getExplicitSet()).containsExactly(2L);
+        assertThat(afterTwo.getFloor()).isEqualTo(-1L);
+        assertThat(afterTwo.getExplicitSet()).containsExactlyInAnyOrder(0L, 2L);
         assertThat(afterTwo.getVersion()).isEqualTo(2L);
 
-        // Drop 1 closes the gap: floor compacts through 1 and 2.
         PartitionTombstone afterOne =
                 PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 1L);
-        assertThat(afterOne.getFloor()).isEqualTo(2L);
-        assertThat(afterOne.getExplicitSet()).isEmpty();
+        assertThat(afterOne.getFloor()).isEqualTo(-1L);
+        assertThat(afterOne.getExplicitSet()).containsExactlyInAnyOrder(0L, 1L, 2L);
         assertThat(afterOne.getVersion()).isEqualTo(3L);
         assertThat(zkClient.getPartitionTombstone(tp)).isEqualTo(afterOne);
+    }
+
+    @Test
+    void testAdvanceAndPersistUsesAliveSnapshotToCompressSparseDroppedIds() throws Exception {
+        TablePath tablePath = TablePath.of("default", "tombstone_safe_floor_sparse");
+        zkClient.setOrCreatePartitionTombstone(
+                tablePath, new PartitionTombstone(0L, asSet(2L, 10L), 3L));
+
+        PartitionTombstone updated =
+                PartitionTombstoneAdvancer.advanceAndPersist(
+                        zkClient, tablePath, 100L, asSet(101L, 300L));
+
+        assertThat(updated.getFloor()).isEqualTo(100L);
+        assertThat(updated.getExplicitSet()).isEmpty();
+        assertThat(updated.getVersion()).isEqualTo(4L);
+        assertThat(zkClient.getPartitionTombstone(tablePath)).isEqualTo(updated);
+    }
+
+    @Test
+    void testAdvanceAndPersistKeepsHighSparseDropExplicit() throws Exception {
+        TablePath tablePath = TablePath.of("default", "tombstone_safe_floor_high_sparse");
+        zkClient.setOrCreatePartitionTombstone(tablePath, PartitionTombstone.EMPTY);
+
+        PartitionTombstone updated =
+                PartitionTombstoneAdvancer.advanceAndPersist(
+                        zkClient, tablePath, 100L, asSet(10L, 200L));
+
+        assertThat(updated.getFloor()).isEqualTo(9L);
+        assertThat(updated.getExplicitSet()).containsExactly(100L);
+        assertThat(updated.getVersion()).isEqualTo(1L);
+        assertThat(zkClient.getPartitionTombstone(tablePath)).isEqualTo(updated);
+    }
+
+    @Test
+    void testAdvanceAndPersistFoldsEverythingWhenNoAlivePartitionRemains() throws Exception {
+        TablePath tablePath = TablePath.of("default", "tombstone_safe_floor_empty_alive");
+        zkClient.setOrCreatePartitionTombstone(
+                tablePath, new PartitionTombstone(0L, asSet(2L, 50L), 3L));
+
+        PartitionTombstone updated =
+                PartitionTombstoneAdvancer.advanceAndPersist(
+                        zkClient, tablePath, 100L, Collections.emptySet());
+
+        assertThat(updated.getFloor()).isEqualTo(100L);
+        assertThat(updated.getExplicitSet()).isEmpty();
+        assertThat(updated.getVersion()).isEqualTo(4L);
+        assertThat(zkClient.getPartitionTombstone(tablePath)).isEqualTo(updated);
     }
 
     @Test
@@ -128,8 +177,8 @@ class CoordinatorTombstoneOnDropPartitionTest {
         PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 0L);
         PartitionTombstone afterRedrop =
                 PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 0L);
-        assertThat(afterRedrop.getFloor()).isEqualTo(0L);
-        assertThat(afterRedrop.getExplicitSet()).isEmpty();
+        assertThat(afterRedrop.getFloor()).isEqualTo(-1L);
+        assertThat(afterRedrop.getExplicitSet()).containsExactly(0L);
         assertThat(afterRedrop.getVersion()).isEqualTo(2L);
         assertThat(zkClient.getPartitionTombstone(tp)).isEqualTo(afterRedrop);
     }
@@ -147,5 +196,9 @@ class CoordinatorTombstoneOnDropPartitionTest {
         // Persistence is per-table: each znode keeps its own state.
         assertThat(zkClient.getPartitionTombstone(tpA)).isEqualTo(afterA);
         assertThat(zkClient.getPartitionTombstone(tpB)).isEqualTo(afterB);
+    }
+
+    private static Set<Long> asSet(long... values) {
+        return LongStream.of(values).boxed().collect(Collectors.toSet());
     }
 }

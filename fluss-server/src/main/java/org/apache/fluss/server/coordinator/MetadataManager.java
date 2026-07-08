@@ -39,6 +39,7 @@ import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
 import org.apache.fluss.metadata.DatabaseSummary;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
@@ -873,6 +874,7 @@ public class MetadataManager {
 
         try {
             long partitionId = zookeeperClient.getPartitionIdAndIncrement();
+            validatePartitionIdAboveTombstoneFloor(tablePath, partitionId);
             // register partition assignments and partition metadata to zk in transaction
             zookeeperClient.registerPartitionAssignmentAndMetadata(
                     partitionId,
@@ -895,6 +897,20 @@ public class MetadataManager {
                     String.format(
                             "Register partition to zookeeper failed to create partition %s for table [%s]",
                             partitionName, tablePath),
+                    e);
+        }
+    }
+
+    private void validatePartitionIdAboveTombstoneFloor(TablePath tablePath, long partitionId) {
+        try {
+            PartitionTombstone tombstone = zookeeperClient.getPartitionTombstone(tablePath);
+            PartitionTombstoneAdvancer.validateNewPartitionId(tombstone, partitionId);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to validate partition id against tombstone floor for table "
+                            + tablePath,
                     e);
         }
     }

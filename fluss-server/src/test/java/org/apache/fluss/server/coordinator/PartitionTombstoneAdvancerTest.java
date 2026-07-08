@@ -21,67 +21,134 @@ import org.apache.fluss.metadata.PartitionTombstone;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.Arrays;
-import java.util.HashSet;
+import java.util.Collections;
 import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link PartitionTombstoneAdvancer}. */
 class PartitionTombstoneAdvancerTest {
 
     @Test
-    void testDropPartitionAddsToExplicitSetAndIncrementsVersion() {
-        PartitionTombstone before = PartitionTombstone.EMPTY;
-        PartitionTombstone after = PartitionTombstoneAdvancer.dropPartition(before, 5L);
-        assertThat(after.getFloor()).isEqualTo(-1L);
-        assertThat(after.getExplicitSet()).containsExactly(5L);
-        assertThat(after.getVersion()).isEqualTo(1L);
+    void testSparseAlivePartitionsAdvanceFloorToBeforeMinimumAlive() {
+        PartitionTombstone before = new PartitionTombstone(0L, asSet(2L, 10L), 3L);
+
+        PartitionTombstone after =
+                PartitionTombstoneAdvancer.dropPartition(before, 100L, asSet(101L, 300L));
+
+        assertThat(after.getFloor()).isEqualTo(100L);
+        assertThat(after.getExplicitSet()).isEmpty();
+        assertThat(after.getVersion()).isEqualTo(4L);
+        assertThat(after.isTombstoned(2L)).isTrue();
+        assertThat(after.isTombstoned(100L)).isTrue();
+        assertThat(after.isTombstoned(101L)).isFalse();
     }
 
     @Test
-    void testDropContiguousAdvancesFloor() {
-        PartitionTombstone t0 = PartitionTombstone.EMPTY;
-        PartitionTombstone t1 = PartitionTombstoneAdvancer.dropPartition(t0, 0L);
-        // 0 is contiguous with floor (-1), so floor advances to 0.
-        assertThat(t1.getFloor()).isEqualTo(0L);
-        assertThat(t1.getExplicitSet()).isEmpty();
+    void testSparseHighDropAboveMinimumAliveStaysExplicit() {
+        PartitionTombstone before = new PartitionTombstone(0L, Collections.emptySet(), 1L);
 
-        PartitionTombstone t2 = PartitionTombstoneAdvancer.dropPartition(t1, 1L);
-        assertThat(t2.getFloor()).isEqualTo(1L);
-        assertThat(t2.getExplicitSet()).isEmpty();
+        PartitionTombstone after =
+                PartitionTombstoneAdvancer.dropPartition(before, 100L, asSet(10L, 200L));
+
+        assertThat(after.getFloor()).isEqualTo(9L);
+        assertThat(after.getExplicitSet()).containsExactly(100L);
+        assertThat(after.isTombstoned(9L)).isTrue();
+        assertThat(after.isTombstoned(10L)).isFalse();
+        assertThat(after.isTombstoned(100L)).isTrue();
     }
 
     @Test
-    void testDropOutOfOrderAbsorbsBelowOnFloorAdvance() {
-        PartitionTombstone t0 = PartitionTombstone.EMPTY;
-        PartitionTombstone t1 = PartitionTombstoneAdvancer.dropPartition(t0, 2L); // {2}
-        PartitionTombstone t2 = PartitionTombstoneAdvancer.dropPartition(t1, 0L); // floor=0, {2}
-        PartitionTombstone t3 = PartitionTombstoneAdvancer.dropPartition(t2, 1L); // floor=2, {}
+    void testEmptyAliveSetFoldsKnownDroppedIdsIntoFloor() {
+        PartitionTombstone before = new PartitionTombstone(0L, asSet(2L, 50L), 7L);
 
-        assertThat(t3.getFloor()).isEqualTo(2L);
-        assertThat(t3.getExplicitSet()).isEmpty();
-        assertThat(t3.getVersion()).isEqualTo(3L);
+        PartitionTombstone after =
+                PartitionTombstoneAdvancer.dropPartition(before, 100L, Collections.emptySet());
+
+        assertThat(after.getFloor()).isEqualTo(100L);
+        assertThat(after.getExplicitSet()).isEmpty();
+    }
+
+    @Test
+    void testConservativeDropWithoutAliveSnapshotOnlyAddsExplicit() {
+        PartitionTombstone before = new PartitionTombstone(0L, Collections.emptySet(), 1L);
+
+        PartitionTombstone after = PartitionTombstoneAdvancer.dropPartition(before, 100L);
+
+        assertThat(after.getFloor()).isEqualTo(0L);
+        assertThat(after.getExplicitSet()).containsExactly(100L);
     }
 
     @Test
     void testDropAlreadyTombstonedIsNoOpExceptVersionBump() {
-        Set<Long> empty = new HashSet<>();
-        PartitionTombstone before = new PartitionTombstone(5L, empty, 10L);
+        PartitionTombstone before = new PartitionTombstone(5L, Collections.emptySet(), 10L);
+
         PartitionTombstone after = PartitionTombstoneAdvancer.dropPartition(before, 3L);
+
         assertThat(after.getFloor()).isEqualTo(5L);
         assertThat(after.getExplicitSet()).isEmpty();
         assertThat(after.getVersion()).isEqualTo(11L);
     }
 
     @Test
-    void testDropContiguousChainAdvancesFloorMultipleTimes() {
-        Set<Long> existing = new HashSet<>(Arrays.asList(1L, 2L, 3L));
-        PartitionTombstone before = new PartitionTombstone(-1L, existing, 5L);
-        PartitionTombstone after = PartitionTombstoneAdvancer.dropPartition(before, 0L);
-        // dropping 0: explicit becomes {0,1,2,3}, then floor advances 0→1→2→3, explicit becomes {}.
-        assertThat(after.getFloor()).isEqualTo(3L);
-        assertThat(after.getExplicitSet()).isEmpty();
-        assertThat(after.getVersion()).isEqualTo(6L);
+    void testAlivePartitionAtOrBelowExistingFloorIsRejected() {
+        PartitionTombstone before = new PartitionTombstone(10L, Collections.emptySet(), 1L);
+
+        assertThatThrownBy(() -> PartitionTombstoneAdvancer.dropPartition(before, 20L, asSet(10L)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must be greater than tombstone floor");
+    }
+
+    @Test
+    void testDroppedPartitionStillAliveIsRejected() {
+        PartitionTombstone before = new PartitionTombstone(0L, Collections.emptySet(), 1L);
+
+        assertThatThrownBy(
+                        () -> PartitionTombstoneAdvancer.dropPartition(before, 20L, asSet(20L, 30L)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not remain in alive partition ids");
+    }
+
+    @Test
+    void testValidateNewPartitionIdRejectsPartitionAtFloor() {
+        PartitionTombstone tombstone = new PartitionTombstone(100L, Collections.emptySet(), 1L);
+
+        assertThatThrownBy(() -> PartitionTombstoneAdvancer.validateNewPartitionId(tombstone, 100L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must be greater than tombstone floor");
+    }
+
+    @Test
+    void testValidateNewPartitionIdAcceptsPartitionAboveFloor() {
+        PartitionTombstone tombstone = new PartitionTombstone(100L, Collections.emptySet(), 1L);
+
+        PartitionTombstoneAdvancer.validateNewPartitionId(tombstone, 101L);
+    }
+
+    @Test
+    void testShouldWarnWhenExplicitSetReachesThreshold() {
+        PartitionTombstone tombstone =
+                new PartitionTombstone(
+                        -1L,
+                        LongStream.range(0L, PartitionTombstoneAdvancer.EXPLICIT_SET_WARNING_THRESHOLD)
+                                .boxed()
+                                .collect(Collectors.toSet()),
+                        1L);
+
+        assertThat(PartitionTombstoneAdvancer.shouldWarnForLargeTombstone(tombstone)).isTrue();
+    }
+
+    @Test
+    void testShouldNotWarnForSmallTombstone() {
+        PartitionTombstone tombstone = new PartitionTombstone(10L, asSet(20L, 30L), 1L);
+
+        assertThat(PartitionTombstoneAdvancer.shouldWarnForLargeTombstone(tombstone)).isFalse();
+    }
+
+    private static Set<Long> asSet(long... values) {
+        return LongStream.of(values).boxed().collect(Collectors.toSet());
     }
 }
