@@ -44,6 +44,7 @@ import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
@@ -84,6 +85,7 @@ import org.junit.jupiter.api.Test;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -239,7 +241,7 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
 
     @Test
     void testHistoricalInsertUpdateAndDelete() throws Exception {
-        TableInfo tableInfo = registerHistoricalTableAndBecomeLeader();
+        TableInfo tableInfo = registerHistoricalTableAndBecomeLeader(true);
         Replica replica = replicaManager.getReplicaOrException(TABLE_BUCKET);
         KvTablet kvTablet = replica.getKvTablet();
         assertThat(kvTablet).isNotNull();
@@ -377,7 +379,8 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
             BinaryValue lookedUpValue =
                     new ValueDecoder(
                                     schemaGetter(tableInfo),
-                                    tableInfo.getTableConfig().getKvFormat())
+                                    tableInfo.getTableConfig().getKvFormat(),
+                                    lookupResult.getKvValueLayout(0))
                             .decodeValue(lookupResult.lookupValues().get(0));
             assertThat(lookedUpValue.row.getString(3)).isEqualTo(BinaryString.fromString("v2"));
 
@@ -790,8 +793,18 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
         return registerHistoricalTableAndBecomeLeader(ChangelogImage.FULL);
     }
 
+    private TableInfo registerHistoricalTableAndBecomeLeader(boolean rowTtlEnabled)
+            throws Exception {
+        return registerHistoricalTableAndBecomeLeader(ChangelogImage.FULL, rowTtlEnabled);
+    }
+
     private TableInfo registerHistoricalTableAndBecomeLeader(ChangelogImage changelogImage)
             throws Exception {
+        return registerHistoricalTableAndBecomeLeader(changelogImage, false);
+    }
+
+    private TableInfo registerHistoricalTableAndBecomeLeader(
+            ChangelogImage changelogImage, boolean rowTtlEnabled) throws Exception {
         replicaManager.getDiskUsageMonitor().update(0.10);
         Schema schema =
                 Schema.newBuilder()
@@ -801,7 +814,7 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
                         .column("value", DataTypes.STRING())
                         .primaryKey("id", "region", "dt")
                         .build();
-        TableDescriptor descriptor =
+        TableDescriptor.Builder descriptorBuilder =
                 TableDescriptor.builder()
                         .schema(schema)
                         .distributedBy(1, "id")
@@ -819,8 +832,15 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
                         .property(ConfigOptions.TABLE_CHANGELOG_IMAGE, changelogImage)
                         .property(
                                 ConfigOptions.TABLE_KV_FORMAT_VERSION,
-                                ConfigOptions.KV_FORMAT_VERSION_2)
-                        .build();
+                                ConfigOptions.KV_FORMAT_VERSION_2);
+        if (rowTtlEnabled) {
+            descriptorBuilder
+                    .property(ConfigOptions.TABLE_KV_TTL, Duration.ofDays(1))
+                    .property(
+                            ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION,
+                            KvValueLayout.TAGGED.version());
+        }
+        TableDescriptor descriptor = descriptorBuilder.build();
         TableInfo tableInfo =
                 TableInfo.of(TABLE_PATH, TABLE_ID, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
         zkClient.registerTable(
@@ -933,7 +953,10 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
         KvStateLookupResult result = kvTablet.lookupHistoricalLocal(originalPartition, primaryKey);
         assertThat(result.isPresent()).isTrue();
         BinaryValue value =
-                new ValueDecoder(schemaGetter(tableInfo), tableInfo.getTableConfig().getKvFormat())
+                new ValueDecoder(
+                                schemaGetter(tableInfo),
+                                tableInfo.getTableConfig().getKvFormat(),
+                                KvValueLayout.fromTableConfig(tableInfo.getTableConfig()))
                         .decodeValue(result.value());
         assertThatRow(value.row).withSchema(tableInfo.getRowType()).isEqualTo(expectedRow);
     }

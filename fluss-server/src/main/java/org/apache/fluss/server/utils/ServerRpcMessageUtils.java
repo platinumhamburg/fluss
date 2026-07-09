@@ -54,6 +54,7 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
 import org.apache.fluss.rpc.entity.ListOffsetsResultForBucket;
@@ -1355,10 +1356,16 @@ public class ServerRpcMessageUtils {
                 lookupRespForBucket.setError(
                         bucketResult.getErrorCode(), bucketResult.getErrorMessage());
             } else {
-                for (byte[] value : bucketResult.lookupValues()) {
+                List<byte[]> values = bucketResult.lookupValues();
+                for (int i = 0; i < values.size(); i++) {
+                    byte[] value = values.get(i);
                     PbValue pbValue = lookupRespForBucket.addValue();
                     if (value != null) {
-                        pbValue.setValues(value);
+                        KvValueLayout kvValueLayout = bucketResult.getKvValueLayout(i);
+                        pbValue.setValues(
+                                value,
+                                kvValueLayout.valueBodyOffset(),
+                                kvValueLayout.valueBodyLength(value.length));
                     }
                 }
             }
@@ -1390,10 +1397,14 @@ public class ServerRpcMessageUtils {
                 respForBucket.setError(bucketResult.getErrorCode(), bucketResult.getErrorMessage());
             } else {
                 List<PbValueList> keyResultList = new ArrayList<>();
+                int valueBodyOffset = bucketResult.getKvValueLayout().valueBodyOffset();
                 for (List<byte[]> res : bucketResult.prefixLookupValues()) {
                     PbValueList pbValueList = new PbValueList();
                     for (byte[] bytes : res) {
-                        pbValueList.addValue(bytes);
+                        pbValueList.addValue(
+                                bytes,
+                                valueBodyOffset,
+                                bucketResult.getKvValueLayout().valueBodyLength(bytes.length));
                     }
                     keyResultList.add(pbValueList);
                 }

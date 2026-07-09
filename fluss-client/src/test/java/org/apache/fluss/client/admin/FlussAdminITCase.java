@@ -118,9 +118,12 @@ import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
+import static org.apache.fluss.config.ConfigOptions.TABLE_KV_FORMAT_VERSION;
+import static org.apache.fluss.config.ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION;
 import static org.apache.fluss.metadata.DataLakeFormat.PAIMON;
 import static org.apache.fluss.record.TestData.DATA1_PARTITIONED_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
+import static org.apache.fluss.row.encode.KvValueLayout.PLAIN;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.InternalRowAssert.assertThatRow;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
@@ -296,9 +299,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         TableDescriptor tableDescriptor =
                 DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
         Map<String, String> options = new HashMap<>(tableDescriptor.getProperties());
-        options.put(
-                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        options.put(TABLE_KV_FORMAT_VERSION.key(), String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        options.put(TABLE_KV_VALUE_LAYOUT_VERSION.key(), String.valueOf(PLAIN.version()));
         options.put(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "true");
         assertThat(tableInfo.toTableDescriptor())
                 .isEqualTo(tableDescriptor.withProperties(options));
@@ -326,9 +328,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         TableDescriptor expected =
                 DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
         options = new HashMap<>(expected.getProperties());
-        options.put(
-                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        options.put(TABLE_KV_FORMAT_VERSION.key(), String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        options.put(TABLE_KV_VALUE_LAYOUT_VERSION.key(), String.valueOf(PLAIN.version()));
         options.put(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "true");
         assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected.withProperties(options));
         assertThat(schemaInfo2).isEqualTo(schemaInfo);
@@ -1062,9 +1063,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
             TableDescriptor expected =
                     DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
             Map<String, String> options = new HashMap<>(expected.getProperties());
-            options.put(
-                    ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                    String.valueOf(CURRENT_KV_FORMAT_VERSION));
+            options.put(TABLE_KV_FORMAT_VERSION.key(), String.valueOf(CURRENT_KV_FORMAT_VERSION));
+            options.put(TABLE_KV_VALUE_LAYOUT_VERSION.key(), String.valueOf(PLAIN.version()));
             options.put(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "true");
             assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected.withProperties(options));
         }

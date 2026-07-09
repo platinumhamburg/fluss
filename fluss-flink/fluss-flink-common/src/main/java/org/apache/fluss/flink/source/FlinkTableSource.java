@@ -748,7 +748,7 @@ public class FlinkTableSource
             List<int[]> groupingSets,
             List<AggregateExpression> aggregateExpressions,
             DataType dataType) {
-        // Only supports 'select count(*)/count(1) from source' for log table now.
+        // Only supports global count when an exact row count is available.
         if (streaming
                 || aggregateExpressions.size() != 1
                 || groupingSets.size() > 1
@@ -756,7 +756,8 @@ public class FlinkTableSource
                 // The count pushdown feature is not supported when the data lake is enabled.
                 // Otherwise, it'll cause miss count data in lake. But In the future, we can push
                 // down count into lake.
-                || isDataLakeEnabled) {
+                || isDataLakeEnabled
+                || (hasPrimaryKey() && tableConfig.getKvTTL().isPresent())) {
             return false;
         }
 

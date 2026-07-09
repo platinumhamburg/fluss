@@ -19,7 +19,10 @@ package org.apache.fluss.server.utils;
 
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
+import org.apache.fluss.rpc.messages.LookupResponse;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -40,6 +43,25 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link ServerRpcMessageUtils}. */
 class ServerRpcMessageUtilsTest {
+
+    @Test
+    void testLookupResponseSupportsMixedValueLayouts() {
+        byte[] plainValue = new byte[] {1, 0, 11, 12};
+        byte[] taggedValue = new byte[] {0, 0, 0, 0, 0, 0, 0, 7, 1, 0, 21, 22};
+        LookupResultForBucket result =
+                new LookupResultForBucket(
+                        new TableBucket(1L, 0),
+                        Arrays.asList(plainValue, taggedValue),
+                        Arrays.asList(KvValueLayout.PLAIN, KvValueLayout.TAGGED),
+                        "dt=2025-01-01");
+
+        LookupResponse response =
+                ServerRpcMessageUtils.makeLookupResponse(Collections.singletonList(result));
+
+        assertThat(response.getBucketsRespAt(0).getValuesList())
+                .extracting(value -> value.getValues())
+                .containsExactly(new byte[] {1, 0, 11, 12}, new byte[] {1, 0, 21, 22});
+    }
 
     @Test
     void testHistoricalPutKvRequestAndResponsePreserveOriginalPartitions() throws Exception {

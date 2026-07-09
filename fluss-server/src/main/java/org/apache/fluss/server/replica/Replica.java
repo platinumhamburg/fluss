@@ -858,7 +858,8 @@ public final class Replica {
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
-                rowCount = completedSnapshot.getRowCount();
+                rowCount =
+                        supportsExactRowCount(tableConfig) ? completedSnapshot.getRowCount() : null;
                 // currently, we only support one auto-increment column.
                 autoIncIDRange = completedSnapshot.getFirstAutoIncIDRange();
             } else {
@@ -880,10 +881,10 @@ public final class Replica {
                                 arrowCompressionInfo,
                                 this::onKvFlushComplete);
 
-                // we don't support rowCount
                 rowCount =
                         isHistoricalPartition()
                                         || tableConfig.getChangelogImage() == ChangelogImage.WAL
+                                        || tableConfig.getKvTTL().isPresent()
                                 ? null
                                 : 0L;
                 // TODO: it is possible that this is a recovered kv tablet without kv snapshot but
@@ -1673,10 +1674,14 @@ public final class Replica {
                         checkNotNull(
                                 kvTablet,
                                 "KvTablet for the replica to limit scan shouldn't be null.");
-                        List<byte[]> bytes = kvTablet.limitScan(limit);
+                        List<byte[]> values = kvTablet.limitScan(limit);
                         DefaultValueRecordBatch.Builder builder = DefaultValueRecordBatch.builder();
-                        for (byte[] key : bytes) {
-                            builder.append(key);
+                        int valueBodyOffset = kvTablet.getKvValueLayout().valueBodyOffset();
+                        for (byte[] value : values) {
+                            builder.append(
+                                    value,
+                                    valueBodyOffset,
+                                    kvTablet.getKvValueLayout().valueBodyLength(value.length));
                         }
                         return builder.build();
                     } catch (IOException e) {
@@ -1819,6 +1824,11 @@ public final class Replica {
                         return logTablet.getRowCount();
                     }
                 });
+    }
+
+    private static boolean supportsExactRowCount(TableConfig tableConfig) {
+        return tableConfig.getChangelogImage() != ChangelogImage.WAL
+                && !tableConfig.getKvTTL().isPresent();
     }
 
     public long getOffset(RemoteLogManager remoteLogManager, ListOffsetsParam listOffsetsParam)

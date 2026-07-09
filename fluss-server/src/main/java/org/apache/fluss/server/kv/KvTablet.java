@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.StorageBackpressureException;
@@ -34,6 +35,9 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
+import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.row.encode.ValueDecoder;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
@@ -59,7 +63,11 @@ import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.clock.SystemClock;
 
+import org.rocksdb.AbstractCompactionFilter;
+import org.rocksdb.AbstractCompactionFilterFactory;
 import org.rocksdb.RateLimiter;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksIterator;
@@ -73,10 +81,13 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
 import java.io.IOException;
+import java.time.Duration;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -133,6 +144,10 @@ public final class KvTablet {
 
     // A lock that guards all modifications to the kv.
     private final ReadWriteLock kvLock = new ReentrantReadWriteLock();
+    private final KvValueLayout kvValueLayout;
+    private final ValueEncoder valueEncoder;
+    @Nullable private final RowTtlTimestampProvider rowTtlTimestampProvider;
+    private final boolean rowTtlEnabled;
     private final AutoIncrementManager autoIncrementManager;
 
     // RocksDB statistics accessor for this tablet
@@ -178,11 +193,17 @@ public final class KvTablet {
             ArrowCompressionInfo arrowCompressionInfo,
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
+            KvValueLayout kvValueLayout,
+            ValueEncoder valueEncoder,
+            ValueDecoder valueDecoder,
             @Nullable RocksDBStatistics rocksDBStatistics,
             KvFlushScheduler kvFlushScheduler,
             boolean closeFlushScheduler,
             @Nullable Runnable flushCompleteListener,
-            AutoIncrementManager autoIncrementManager) {
+            AutoIncrementManager autoIncrementManager,
+            @Nullable RowTtlTimestampProvider rowTtlTimestampProvider,
+            Clock clock,
+            boolean rowTtlEnabled) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.historicalPartition =
@@ -197,6 +218,10 @@ public final class KvTablet {
         this.kvPreWriteBuffer = new KvPreWriteBuffer(serverMetricGroup);
         this.kvStateAccessor =
                 new KvStateAccessor(kvPreWriteBuffer, rocksDBKv, historicalPartition);
+        this.kvValueLayout = kvValueLayout;
+        this.valueEncoder = valueEncoder;
+        this.rowTtlTimestampProvider = rowTtlTimestampProvider;
+        this.rowTtlEnabled = rowTtlEnabled;
         this.kvWriteProcessor =
                 new KvWriteProcessor(
                         tableBucket,
@@ -208,7 +233,11 @@ public final class KvTablet {
                         arrowCompressionInfo,
                         schemaGetter,
                         changelogImage,
-                        autoIncrementManager);
+                        autoIncrementManager,
+                        valueEncoder,
+                        valueDecoder,
+                        rowTtlTimestampProvider,
+                        clock);
         this.rocksDBStatistics = rocksDBStatistics;
         this.autoIncrementManager = autoIncrementManager;
         this.flushCompleteListener = flushCompleteListener;
@@ -216,7 +245,7 @@ public final class KvTablet {
         // Historical state only contains the WAL tail that has not been tiered to lake, so it
         // cannot maintain a table-level row count.
         this.rowCount =
-                historicalPartition || changelogImage == ChangelogImage.WAL
+                historicalPartition || changelogImage == ChangelogImage.WAL || rowTtlEnabled
                         ? ROW_COUNT_DISABLED
                         : 0L;
     }
@@ -265,7 +294,9 @@ public final class KvTablet {
                 new KvFlushScheduler(serverConf),
                 true,
                 null,
-                autoIncrementManager);
+                autoIncrementManager,
+                SystemClock.getInstance(),
+                new TableConfig(new Configuration()));
     }
 
     public static KvTablet create(
@@ -285,7 +316,9 @@ public final class KvTablet {
             RateLimiter sharedRateLimiter,
             KvFlushScheduler kvFlushScheduler,
             @Nullable Runnable flushCompleteListener,
-            AutoIncrementManager autoIncrementManager)
+            AutoIncrementManager autoIncrementManager,
+            Clock clock,
+            TableConfig tableConfig)
             throws IOException {
         return create(
                 tablePath,
@@ -305,7 +338,9 @@ public final class KvTablet {
                 kvFlushScheduler,
                 false,
                 flushCompleteListener,
-                autoIncrementManager);
+                autoIncrementManager,
+                clock,
+                tableConfig);
     }
 
     private static KvTablet create(
@@ -326,9 +361,33 @@ public final class KvTablet {
             KvFlushScheduler kvFlushScheduler,
             boolean closeFlushScheduler,
             @Nullable Runnable flushCompleteListener,
-            AutoIncrementManager autoIncrementManager)
+            AutoIncrementManager autoIncrementManager,
+            Clock clock,
+            TableConfig tableConfig)
             throws IOException {
-        RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter);
+        checkNotNull(tableConfig, "tableConfig must not be null.");
+        Optional<Duration> rowTtl = tableConfig.getKvTTL();
+        KvValueLayout kvValueLayout = KvValueLayout.fromTableConfig(tableConfig);
+        @Nullable
+        RowTtlTimestampProvider rowTtlTimestampProvider =
+                kvValueLayout.hasValueTag()
+                        ? RowTtlTimestampProvider.create(
+                                tableConfig, schemaGetter, ZoneId.systemDefault())
+                        : null;
+        ValueEncoder valueEncoder =
+                rowTtlTimestampProvider == null
+                        ? ValueEncoder.forLayout(kvValueLayout)
+                        : ValueEncoder.forLayout(kvValueLayout, rowTtlTimestampProvider);
+        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat, kvValueLayout);
+        @Nullable
+        AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                compactionFilterFactory =
+                        rowTtl.isPresent()
+                                ? RowTtlCompactionFilterFactory.create(
+                                        kvValueLayout, rowTtl.get(), clock)
+                                : null;
+        RocksDBKv kv =
+                buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter, compactionFilterFactory);
 
         // Create RocksDB statistics accessor (will be registered to TableMetricGroup by Replica)
         // Pass ResourceGuard to ensure thread-safe access during concurrent close operations
@@ -357,28 +416,107 @@ public final class KvTablet {
                 arrowCompressionInfo,
                 schemaGetter,
                 changelogImage,
+                kvValueLayout,
+                valueEncoder,
+                valueDecoder,
                 rocksDBStatistics,
                 kvFlushScheduler,
                 closeFlushScheduler,
                 flushCompleteListener,
-                autoIncrementManager);
+                autoIncrementManager,
+                rowTtlTimestampProvider,
+                clock,
+                rowTtl.isPresent());
+    }
+
+    public static KvTablet create(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File kvTabletDir,
+            Configuration serverConf,
+            TabletServerMetricGroup serverMetricGroup,
+            BufferAllocator arrowBufferAllocator,
+            MemorySegmentPool memorySegmentPool,
+            KvFormat kvFormat,
+            RowMerger rowMerger,
+            ArrowCompressionInfo arrowCompressionInfo,
+            SchemaGetter schemaGetter,
+            ChangelogImage changelogImage,
+            RateLimiter sharedRateLimiter,
+            AutoIncrementManager autoIncrementManager,
+            Clock clock,
+            TableConfig tableConfig)
+            throws IOException {
+        return create(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvTabletDir,
+                serverConf,
+                serverMetricGroup,
+                arrowBufferAllocator,
+                memorySegmentPool,
+                kvFormat,
+                rowMerger,
+                arrowCompressionInfo,
+                schemaGetter,
+                changelogImage,
+                sharedRateLimiter,
+                new KvFlushScheduler(serverConf),
+                true,
+                null,
+                autoIncrementManager,
+                clock,
+                tableConfig);
     }
 
     private static RocksDBKv buildRocksDBKv(
-            Configuration configuration, File kvDir, RateLimiter sharedRateLimiter)
+            Configuration configuration,
+            File kvDir,
+            RateLimiter sharedRateLimiter,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory)
             throws IOException {
-        // Enable statistics to support RocksDB statistics collection
-        RocksDBResourceContainer rocksDBResourceContainer =
-                new RocksDBResourceContainer(configuration, kvDir, true, sharedRateLimiter);
-        RocksDBKvBuilder rocksDBKvBuilder =
-                new RocksDBKvBuilder(
-                                kvDir,
-                                rocksDBResourceContainer,
-                                rocksDBResourceContainer.getColumnOptions())
-                        .setFlussL0SlowdownTrigger(
-                                configuration.get(
-                                        ConfigOptions.KV_BACKPRESSURE_L0_SLOWDOWN_TRIGGER));
-        return rocksDBKvBuilder.build();
+        @Nullable RocksDBResourceContainer rocksDBResourceContainer = null;
+        boolean resourcesOwnedByBuilder = false;
+        try {
+            rocksDBResourceContainer =
+                    new RocksDBResourceContainer(configuration, kvDir, true, sharedRateLimiter);
+            RocksDBKvBuilder rocksDBKvBuilder =
+                    new RocksDBKvBuilder(
+                                    kvDir,
+                                    rocksDBResourceContainer,
+                                    rocksDBResourceContainer.getColumnOptions())
+                            .setFlussL0SlowdownTrigger(
+                                    configuration.get(
+                                            ConfigOptions.KV_BACKPRESSURE_L0_SLOWDOWN_TRIGGER));
+            if (compactionFilterFactory != null) {
+                rocksDBKvBuilder.setCompactionFilterFactory(compactionFilterFactory);
+            }
+            resourcesOwnedByBuilder = true;
+            return rocksDBKvBuilder.build();
+        } finally {
+            if (!resourcesOwnedByBuilder) {
+                IOUtils.closeQuietly(rocksDBResourceContainer);
+                IOUtils.closeQuietly(compactionFilterFactory);
+            }
+        }
+    }
+
+    ValueEncoder getValueEncoder() {
+        return valueEncoder;
+    }
+
+    @Nullable
+    RowTtlTimestampProvider getRowTtlTimestampProvider() {
+        return rowTtlTimestampProvider;
+    }
+
+    /** Returns the physical value layout used by this tablet. */
+    public KvValueLayout getKvValueLayout() {
+        return kvValueLayout;
     }
 
     public TableBucket getTableBucket() {
@@ -426,16 +564,24 @@ public final class KvTablet {
     }
 
     void setRowCount(long rowCount) {
-        this.rowCount = rowCount;
+        if (this.rowCount != ROW_COUNT_DISABLED) {
+            this.rowCount = rowCount;
+        }
     }
 
     // row_count is volatile, so it's safe to read without lock
     public long getRowCount() {
         if (rowCount == ROW_COUNT_DISABLED) {
+            if (rowTtlEnabled) {
+                throw new InvalidTableException(
+                        String.format(
+                                "Row count is disabled for this table '%s' because row TTL cleanup does not maintain exact row count.",
+                                getTablePath()));
+            }
             throw new InvalidTableException(
                     String.format(
                             "Row count is disabled for this table '%s'. This usually happens when the table is"
-                                    + "created before v0.9 or the changelog image is set to WAL, "
+                                    + " created before v0.9 or the changelog image is set to WAL, "
                                     + "as maintaining row count in WAL mode is costly and not necessary for most use cases. "
                                     + "If you want to enable row count, please set changelog image to FULL.",
                             getTablePath()));
@@ -1044,7 +1190,8 @@ public final class KvTablet {
                                         lease,
                                         limit,
                                         capturedLogOffset,
-                                        initialAccessTimeMs);
+                                        initialAccessTimeMs,
+                                        kvValueLayout);
                         success = true;
                         return new OpenScanResult(context, capturedLogOffset);
                     } finally {

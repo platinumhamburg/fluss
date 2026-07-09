@@ -38,7 +38,9 @@ import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueDecoder;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementUpdater;
@@ -56,6 +58,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.ByteArrayWrapper;
 import org.apache.fluss.utils.BytesUtils;
+import org.apache.fluss.utils.clock.Clock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -105,6 +108,11 @@ public final class KvWriteProcessor {
     // the changelog image mode for this tablet
     private final ChangelogImage changelogImage;
     private final AutoIncrementManager autoIncrementManager;
+    private final ValueEncoder valueEncoder;
+    private final ValueDecoder valueDecoder;
+    private final ValueDecoder lakeValueDecoder;
+    @Nullable private final RowTtlTimestampProvider rowTtlTimestampProvider;
+    private final Clock clock;
 
     /** Creates a KV write processor. */
     public KvWriteProcessor(
@@ -117,7 +125,11 @@ public final class KvWriteProcessor {
             ArrowCompressionInfo arrowCompressionInfo,
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
-            AutoIncrementManager autoIncrementManager) {
+            AutoIncrementManager autoIncrementManager,
+            ValueEncoder valueEncoder,
+            ValueDecoder valueDecoder,
+            @Nullable RowTtlTimestampProvider rowTtlTimestampProvider,
+            Clock clock) {
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
         this.arrowWriterProvider = arrowWriterProvider;
@@ -132,6 +144,11 @@ public final class KvWriteProcessor {
         this.schemaGetter = schemaGetter;
         this.changelogImage = changelogImage;
         this.autoIncrementManager = autoIncrementManager;
+        this.valueEncoder = valueEncoder;
+        this.valueDecoder = valueDecoder;
+        this.lakeValueDecoder = new ValueDecoder(schemaGetter, kvFormat, KvValueLayout.PLAIN);
+        this.rowTtlTimestampProvider = rowTtlTimestampProvider;
+        this.clock = clock;
     }
 
     /** Processes a KV batch against the supplied state and appends its WAL. */
@@ -155,6 +172,9 @@ public final class KvWriteProcessor {
         long logEndOffsetOfPrevBatch = logTablet.localLogEndOffset();
 
         try {
+            if (rowTtlTimestampProvider != null) {
+                rowTtlTimestampProvider.prepareForBatch(clock.milliseconds());
+            }
             processKvRecords(
                     kvRecords,
                     kvRecords.schemaId(),
@@ -297,10 +317,9 @@ public final class KvWriteProcessor {
             throws Exception {
         long logOffset = startLogOffset;
 
-        // TODO: reuse the read context and decoder
+        // TODO: reuse the read context
         KvRecordBatch.ReadContext readContext =
                 KvRecordReadContext.createReadContext(kvFormat, schemaGetter);
-        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
 
         for (KvRecord kvRecord : kvRecords.records(readContext)) {
             byte[] keyBytes = BytesUtils.toArray(kvRecord.getKey());
@@ -313,7 +332,6 @@ public final class KvWriteProcessor {
                         processDeletion(
                                 key,
                                 currentMerger,
-                                valueDecoder,
                                 walBuilder,
                                 latestSchemaRow,
                                 logOffset,
@@ -327,7 +345,6 @@ public final class KvWriteProcessor {
                                 currentValue,
                                 currentMerger,
                                 autoIncrementUpdater,
-                                valueDecoder,
                                 walBuilder,
                                 latestSchemaRow,
                                 logOffset,
@@ -341,7 +358,6 @@ public final class KvWriteProcessor {
     private long processDeletion(
             KvPreWriteBuffer.Key key,
             RowMerger currentMerger,
-            ValueDecoder valueDecoder,
             WalBuilder walBuilder,
             PaddingRow latestSchemaRow,
             long logOffset,
@@ -353,15 +369,14 @@ public final class KvWriteProcessor {
             return logOffset;
         }
 
-        byte[] oldValueBytes = getFromState(key, primaryKey, stateAccessor, memoizedLakeLookup);
-        if (oldValueBytes == null) {
+        BinaryValue oldValue = getPreviousValue(key, primaryKey, stateAccessor, memoizedLakeLookup);
+        if (oldValue == null) {
             LOG.debug(
                     "The specific key can't be found in kv tablet although the kv record is for deletion, "
                             + "ignore it directly as it doesn't exist in the kv tablet yet.");
             return logOffset;
         }
 
-        BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
         BinaryValue newValue = currentMerger.delete(oldValue);
 
         // if newValue is null, it means the row should be deleted
@@ -379,7 +394,6 @@ public final class KvWriteProcessor {
             BinaryValue currentValue,
             RowMerger currentMerger,
             AutoIncrementUpdater autoIncrementUpdater,
-            ValueDecoder valueDecoder,
             WalBuilder walBuilder,
             PaddingRow latestSchemaRow,
             long logOffset,
@@ -392,8 +406,8 @@ public final class KvWriteProcessor {
                     key, null, currentValue, walBuilder, latestSchemaRow, logOffset, stateAccessor);
         }
 
-        byte[] oldValueBytes = getFromState(key, primaryKey, stateAccessor, memoizedLakeLookup);
-        if (oldValueBytes == null) {
+        BinaryValue oldValue = getPreviousValue(key, primaryKey, stateAccessor, memoizedLakeLookup);
+        if (oldValue == null) {
             BinaryValue valueToInsert = currentMerger.merge(null, currentValue);
             return applyInsert(
                     key,
@@ -405,7 +419,6 @@ public final class KvWriteProcessor {
                     stateAccessor);
         }
 
-        BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
         BinaryValue newValue = currentMerger.merge(oldValue, currentValue);
 
         if (newValue == oldValue) {
@@ -441,7 +454,7 @@ public final class KvWriteProcessor {
             throws Exception {
         BinaryValue newValue = autoIncrementUpdater.updateAutoIncrementColumns(currentValue);
         walBuilder.append(ChangeType.INSERT, latestSchemaRow.replaceRow(newValue.row));
-        stateAccessor.insert(key, newValue.encodeValue(), logOffset);
+        stateAccessor.insert(key, valueEncoder.encodeValue(newValue), logOffset);
         return logOffset + 1;
     }
 
@@ -456,12 +469,12 @@ public final class KvWriteProcessor {
             throws Exception {
         if (changelogImage == ChangelogImage.WAL) {
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            stateAccessor.update(key, newValue.encodeValue(), logOffset);
+            stateAccessor.update(key, valueEncoder.encodeValue(newValue), logOffset);
             return logOffset + 1;
         } else {
             walBuilder.append(ChangeType.UPDATE_BEFORE, latestSchemaRow.replaceRow(oldValue.row));
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            stateAccessor.update(key, newValue.encodeValue(), logOffset + 1);
+            stateAccessor.update(key, valueEncoder.encodeValue(newValue), logOffset + 1);
             return logOffset + 2;
         }
     }
@@ -477,7 +490,7 @@ public final class KvWriteProcessor {
      *     partition namespace; used by the lake lookup
      * @return the previous value, or null if the key is absent or locally marked as deleted
      */
-    private byte[] getFromState(
+    private BinaryValue getPreviousValue(
             KvPreWriteBuffer.Key localStateKey,
             byte[] primaryKey,
             KvStateAccessor stateAccessor,
@@ -486,9 +499,12 @@ public final class KvWriteProcessor {
         KvStateLookupResult localResult = stateAccessor.lookup(localStateKey);
         if (localResult.status() != KvStateLookupResult.Status.NOT_FOUND
                 || memoizedLakeLookup == null) {
-            return localResult.value();
+            return localResult.value() == null
+                    ? null
+                    : valueDecoder.decodeValue(localResult.value());
         }
-        return memoizedLakeLookup.lookup(primaryKey);
+        byte[] lakeValue = memoizedLakeLookup.lookup(primaryKey);
+        return lakeValue == null ? null : lakeValueDecoder.decodeValue(lakeValue);
     }
 
     private boolean canSkipOldValueLookup(

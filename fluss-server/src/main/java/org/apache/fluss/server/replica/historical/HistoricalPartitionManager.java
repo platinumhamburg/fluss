@@ -28,6 +28,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.plugin.PluginManager;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.protocol.ApiError;
@@ -110,7 +111,6 @@ public final class HistoricalPartitionManager implements AutoCloseable {
                     () ->
                             new LookupResultForBucket(
                                     tableBucket,
-                                    null,
                                     lookupData.originalPartitionName(),
                                     ApiError.fromThrowable(
                                             new HistoricalPartitionThrottledException(
@@ -123,7 +123,6 @@ public final class HistoricalPartitionManager implements AutoCloseable {
             return CompletableFuture.completedFuture(
                     new LookupResultForBucket(
                             tableBucket,
-                            null,
                             lookupData.originalPartitionName(),
                             ApiError.fromThrowable(e)));
         }
@@ -335,19 +334,25 @@ public final class HistoricalPartitionManager implements AutoCloseable {
 
             Iterator<byte[]> lakeValueIterator = lakeValues.iterator();
             List<byte[]> values = new ArrayList<>(localResults.size());
+            List<KvValueLayout> valueLayouts = new ArrayList<>(localResults.size());
+            KvValueLayout localValueLayout =
+                    KvValueLayout.fromTableConfig(tableInfo.getTableConfig());
             for (KvStateLookupResult localResult : localResults) {
                 // Consume one lake value for each NOT_FOUND result; local values and tombstones
                 // keep their original positions without advancing the lake iterator.
-                values.add(
-                        localResult.status() == Status.NOT_FOUND
-                                ? lakeValueIterator.next()
-                                : localResult.value());
+                if (localResult.status() == Status.NOT_FOUND) {
+                    values.add(lakeValueIterator.next());
+                    valueLayouts.add(KvValueLayout.PLAIN);
+                } else {
+                    values.add(localResult.value());
+                    valueLayouts.add(localValueLayout);
+                }
             }
             return new LookupResultForBucket(
-                    tableBucket, values, originalPartitionName, ApiError.NONE);
+                    tableBucket, values, valueLayouts, originalPartitionName);
         } catch (Exception e) {
             return new LookupResultForBucket(
-                    tableBucket, null, originalPartitionName, ApiError.fromThrowable(e));
+                    tableBucket, originalPartitionName, ApiError.fromThrowable(e));
         }
     }
 }
