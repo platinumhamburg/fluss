@@ -18,8 +18,11 @@
 package org.apache.fluss.rpc.entity;
 
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.protocol.ApiError;
+
+import javax.annotation.Nullable;
 
 import java.util.List;
 
@@ -27,22 +30,34 @@ import java.util.List;
 public class PrefixLookupResultForBucket extends ResultForBucket {
 
     private final List<List<byte[]>> values;
+    @Nullable private final KvValueLayout kvValueLayout;
 
-    public PrefixLookupResultForBucket(TableBucket tableBucket, List<List<byte[]>> values) {
-        this(tableBucket, values, ApiError.NONE);
+    public PrefixLookupResultForBucket(
+            TableBucket tableBucket, List<List<byte[]>> values, KvValueLayout kvValueLayout) {
+        this(tableBucket, values, kvValueLayout, ApiError.NONE);
     }
 
     public PrefixLookupResultForBucket(TableBucket tableBucket, ApiError error) {
-        this(tableBucket, null, error);
+        this(tableBucket, null, null, error);
     }
 
     private PrefixLookupResultForBucket(
-            TableBucket tableBucket, List<List<byte[]>> values, ApiError error) {
+            TableBucket tableBucket,
+            List<List<byte[]>> values,
+            @Nullable KvValueLayout kvValueLayout,
+            ApiError error) {
         super(tableBucket, error);
         this.values = values;
+        this.kvValueLayout = kvValueLayout;
     }
 
     public List<List<byte[]>> prefixLookupValues() {
         return values;
+    }
+
+    /** Returns the storage layout for a successful prefix lookup result. */
+    @Nullable
+    public KvValueLayout getKvValueLayout() {
+        return kvValueLayout;
     }
 }

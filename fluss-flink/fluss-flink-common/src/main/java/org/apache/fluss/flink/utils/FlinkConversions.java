@@ -128,7 +128,6 @@ public class FlinkConversions {
 
         // put fluss table properties into flink options, to make the properties visible to users
         convertFlussTablePropertiesToFlinkOptions(tableInfo.getProperties().toMap(), newOptions);
-
         org.apache.flink.table.api.Schema.Builder schemaBuilder =
                 org.apache.flink.table.api.Schema.newBuilder();
         if (tableInfo.hasPrimaryKey()) {

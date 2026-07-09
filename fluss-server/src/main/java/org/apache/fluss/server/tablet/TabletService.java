@@ -28,6 +28,7 @@ import org.apache.fluss.exception.UnknownScannerIdException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
@@ -615,9 +616,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                                 bucketReq.getBucketId());
                 Long limit = bucketReq.hasLimit() ? bucketReq.getLimit() : null;
 
-                OpenScanResult openResult =
-                        scannerManager.createScanner(
-                                replicaManager.getReplicaOrException(tableBucket), limit);
+                Replica replica = replicaManager.getReplicaOrException(tableBucket);
+                OpenScanResult openResult = scannerManager.createScanner(replica, limit);
                 isNewScan = true;
                 initialLogOffset = openResult.getLogOffset();
 
@@ -689,8 +689,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
 
             // Catch a leadership flip ahead of the eventual closeScannersForBucket callback so
             // the client can redirect rather than consume a stale snapshot.
+            Replica replica = replicaManager.getReplicaOrException(context.getTableBucket());
             if (!request.hasBucketScanReq()) {
-                Replica replica = replicaManager.getReplicaOrException(context.getTableBucket());
                 if (!replica.isLeader()) {
                     throw new NotLeaderOrFollowerException(
                             String.format(
@@ -710,7 +710,11 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             boolean appendedAny = false;
             while (context.isValid()
                     && (!appendedAny || builder.sizeInBytes() < effectiveBatchSize)) {
-                builder.append(context.currentValue());
+                byte[] value = context.currentValue();
+                builder.append(
+                        value,
+                        context.getKvValueLayout().valueBodyOffset(),
+                        context.getKvValueLayout().valueBodyLength(value.length));
                 context.advance();
                 appendedAny = true;
             }
@@ -793,6 +797,19 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             }
             authorizeTable(operationType, tablePath);
         }
+    }
+
+    @Override
+    protected TableInfo getTableInfo(long tableId) {
+        TablePath tablePath = metadataCache.getTablePath(tableId).orElse(null);
+        if (tablePath == null) {
+            throw new UnknownTableOrBucketException(
+                    String.format(
+                            "This server %s does not know this table ID %s. This may happen when the table "
+                                    + "metadata cache in the server is not updated yet.",
+                            serviceName, tableId));
+        }
+        return metadataManager.getTable(tablePath);
     }
 
     private void authorizeAnyTable(OperationType operationType, List<TablePath> tablePaths) {

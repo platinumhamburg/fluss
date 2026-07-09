@@ -23,6 +23,7 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeChecks;
 import org.apache.fluss.types.DataTypes;
@@ -360,6 +361,46 @@ public class FlinkConversionsTest {
     }
 
     @Test
+    void testKvValueLayoutVersionIsExposed() {
+        Map<String, String> properties = new HashMap<>();
+        properties.put(ConfigOptions.TABLE_KV_FORMAT.key(), "compacted");
+        properties.put(
+                ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
+                String.valueOf(KvValueLayout.TAGGED.version()));
+
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .primaryKey("id")
+                                        .build())
+                        .distributedBy(1, "id")
+                        .properties(properties)
+                        .customProperty("client.custom-option", "custom-value")
+                        .build();
+        long currentMillis = System.currentTimeMillis();
+        TableInfo tableInfo =
+                TableInfo.of(
+                        TablePath.of("db", "table"),
+                        1L,
+                        1,
+                        descriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        currentMillis,
+                        currentMillis);
+
+        CatalogTable flinkTable = (CatalogTable) FlinkConversions.toFlinkTable(tableInfo);
+
+        assertThat(flinkTable.getOptions())
+                .containsEntry(ConfigOptions.TABLE_KV_FORMAT.key(), "compacted")
+                .containsEntry("client.custom-option", "custom-value")
+                .containsEntry(
+                        ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
+                        String.valueOf(KvValueLayout.TAGGED.version()));
+    }
+
+    @Test
     void testOptionConversions() {
         ConfigOption<?> flinkOption = FlinkConversions.toFlinkOption(ConfigOptions.TABLE_KV_FORMAT);
         assertThat(flinkOption)
@@ -400,6 +441,15 @@ public class FlinkConversionsTest {
                                 .withDescription(
                                         ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE
                                                 .description()));
+
+        flinkOption = FlinkConversions.toFlinkOption(ConfigOptions.TABLE_KV_TTL);
+        assertThat(flinkOption)
+                .isEqualTo(
+                        org.apache.flink.configuration.ConfigOptions.key(
+                                        ConfigOptions.TABLE_KV_TTL.key())
+                                .stringType()
+                                .noDefaultValue()
+                                .withDescription(ConfigOptions.TABLE_KV_TTL.description()));
     }
 
     @Test

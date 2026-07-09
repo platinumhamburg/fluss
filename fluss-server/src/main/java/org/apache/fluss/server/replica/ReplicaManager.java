@@ -55,6 +55,7 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
@@ -965,7 +966,6 @@ public class ReplicaManager implements ServerReconfigurable {
                 result.add(
                         new LookupResultForBucket(
                                 data.tableBucket(),
-                                null,
                                 data.originalPartitionName(),
                                 ApiError.fromThrowable(e)));
                 if (remainingLookups.decrementAndGet() == 0) {
@@ -980,7 +980,6 @@ public class ReplicaManager implements ServerReconfigurable {
                                         ? bucketResult
                                         : new LookupResultForBucket(
                                                 data.tableBucket(),
-                                                null,
                                                 data.originalPartitionName(),
                                                 ApiError.fromThrowable(error));
                         if (completedResult.failed()
@@ -1019,7 +1018,12 @@ public class ReplicaManager implements ServerReconfigurable {
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalLookupRequests().inc();
                 lookupResultForBucketMap.put(
-                        tb, new LookupResultForBucket(tb, replica.lookups(entry.getValue())));
+                        tb,
+                        new LookupResultForBucket(
+                                tb,
+                                replica.lookups(entry.getValue()),
+                                KvValueLayout.fromTableConfig(
+                                        replica.getTableInfo().getTableConfig())));
             } catch (Exception e) {
                 if (isUnexpectedException(e)) {
                     LOG.error("Error lookup from local kv on replica {}", tb, e);
@@ -1151,7 +1155,13 @@ public class ReplicaManager implements ServerReconfigurable {
                     List<byte[]> resultForPerKey = replica.prefixLookup(prefixKey);
                     resultForBucket.add(resultForPerKey);
                 }
-                result.put(tb, new PrefixLookupResultForBucket(tb, resultForBucket));
+                result.put(
+                        tb,
+                        new PrefixLookupResultForBucket(
+                                tb,
+                                resultForBucket,
+                                KvValueLayout.fromTableConfig(
+                                        replica.getTableInfo().getTableConfig())));
             } catch (Exception e) {
                 if (isUnexpectedException(e)) {
                     LOG.error("Error processing prefix lookup operation on replica {}", tb, e);
@@ -2559,26 +2569,25 @@ public class ReplicaManager implements ServerReconfigurable {
         checkpointHighWatermarks();
     }
 
-    private void validateClientVersionForPkTable(int apiVersion, TableInfo tableInfo) {
-        if (apiVersion > 0) {
+    /** Validates whether a client API version can access this primary-key table. */
+    public static void validateClientVersionForPkTable(int apiVersion, TableInfo tableInfo) {
+        if (apiVersion >= 1) {
             return;
         }
 
-        // in the old version
         TableConfig tableConfig = tableInfo.getTableConfig();
-        // is with datalake format
-        if (tableConfig.getDataLakeFormat().isPresent()) {
-            Optional<Integer> kvFormatVersion = tableConfig.getKvFormatVersion();
-            if (kvFormatVersion.isPresent()
-                    && kvFormatVersion.get() == KV_FORMAT_VERSION_2
-                    && !tableInfo.isDefaultBucketKey()) {
-                throw new UnsupportedVersionException(
-                        String.format(
-                                "Client API version %d is not supported for table '%s'. "
-                                        + "This table uses new key encoding strategy (kv format version %d). "
-                                        + "Please upgrade your Fluss client to a newer version.",
-                                apiVersion, tableInfo.getTablePath(), kvFormatVersion.get()));
-            }
+        Optional<Integer> kvFormatVersion = tableConfig.getKvFormatVersion();
+        if (apiVersion < 1
+                && tableConfig.getDataLakeFormat().isPresent()
+                && kvFormatVersion.isPresent()
+                && kvFormatVersion.get() == KV_FORMAT_VERSION_2
+                && !tableInfo.isDefaultBucketKey()) {
+            throw new UnsupportedVersionException(
+                    String.format(
+                            "Client API version %d is not supported for table '%s'. "
+                                    + "This table uses new key encoding strategy (kv format version %d). "
+                                    + "Please upgrade your Fluss client to a newer version.",
+                            apiVersion, tableInfo.getTablePath(), kvFormatVersion.get()));
         }
     }
 

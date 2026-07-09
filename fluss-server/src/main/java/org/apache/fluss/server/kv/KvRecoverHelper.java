@@ -23,6 +23,7 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -80,6 +81,8 @@ public class KvRecoverHelper {
 
     private KeyEncoder keyEncoder;
     private RowEncoder rowEncoder;
+    private final ValueEncoder valueEncoder;
+    @Nullable private final RowTtlTimestampProvider rowTtlTimestampProvider;
     private final SchemaGetter schemaGetter;
 
     private InternalRow.FieldGetter[] currentFieldGetters;
@@ -106,6 +109,8 @@ public class KvRecoverHelper {
         this.kvFormat = kvFormat;
         this.logFormat = logFormat;
         this.schemaGetter = schemaGetter;
+        this.valueEncoder = kvTablet.getValueEncoder();
+        this.rowTtlTimestampProvider = kvTablet.getRowTtlTimestampProvider();
         this.remoteLogFetcher = remoteLogFetcher;
         this.historicalPartition = historicalPartition;
     }
@@ -267,6 +272,9 @@ public class KvRecoverHelper {
             AutoIncIDRangeUpdater autoIncIdRangeUpdater,
             ThrowingConsumer<KeyValueAndLogOffset, Exception> resumeRecordConsumer)
             throws Exception {
+        if (rowTtlTimestampProvider != null) {
+            rowTtlTimestampProvider.prepareForBatch(logRecordBatch.commitTimestamp());
+        }
         try (CloseableIterator<LogRecord> logRecordIter = logRecordBatch.records(readContext)) {
             while (logRecordIter.hasNext()) {
                 LogRecord logRecord = logRecordIter.next();
@@ -288,7 +296,9 @@ public class KvRecoverHelper {
                         // the log row format may not compatible with kv row format,
                         // e.g, arrow vs. compacted, thus needs a conversion here.
                         BinaryRow row = toKvRow(logRow);
-                        value = ValueEncoder.encodeValue(currentSchemaId.shortValue(), row);
+                        value =
+                                valueEncoder.encodeValue(
+                                        new BinaryValue(currentSchemaId.shortValue(), row));
                     }
                     resumeRecordConsumer.accept(
                             new KeyValueAndLogOffset(

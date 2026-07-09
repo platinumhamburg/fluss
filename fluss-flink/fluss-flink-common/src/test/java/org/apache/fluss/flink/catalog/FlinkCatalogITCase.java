@@ -32,6 +32,7 @@ import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.testutils.common.MultiVersionTest;
 
@@ -758,6 +759,9 @@ abstract class FlinkCatalogITCase {
             expectedTableProperties.put("table.replication.factor", "1");
             expectedTableProperties.put(
                     "table.kv.format-version", String.valueOf(CURRENT_KV_FORMAT_VERSION));
+            expectedTableProperties.put(
+                    ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
+                    String.valueOf(KvValueLayout.PLAIN.version()));
             expectedTableProperties.put("table.kv.standby-replica.enabled", "true");
             assertThat(tableInfo.getProperties().toMap()).isEqualTo(expectedTableProperties);
 

@@ -1746,6 +1746,16 @@ public class ConfigOptions {
                                     + "for optimization (encoded bytes can be reused for bucket calculation). "
                                     + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation.");
 
+    /** The version of the physical KV value layout. */
+    public static final ConfigOption<Integer> TABLE_KV_VALUE_LAYOUT_VERSION =
+            key("table.kv.value-layout-version")
+                    .intType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The version of the physical KV value layout in RocksDB. "
+                                    + "The coordinator sets this option during table creation. "
+                                    + "Tables created before this option was introduced use the plain layout.");
+
     public static final ConfigOption<Boolean> TABLE_KV_STANDBY_REPLICA_ENABLED =
             key("table.kv.standby-replica.enabled")
                     .booleanType()
@@ -1756,6 +1766,28 @@ public class ConfigOptions {
                                     + "Automatically set to true by the coordinator during table creation for new PK tables. "
                                     + "Tables created before this option was introduced are treated as disabled. "
                                     + "Can be dynamically enabled via ALTER TABLE.");
+
+    public static final ConfigOption<Duration> TABLE_KV_TTL =
+            key("table.kv.ttl")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The best-effort row-level TTL for primary key data. "
+                                    + "The changelog retention of a primary key table is controlled separately by 'table.log.ttl'. "
+                                    + "If not set, row-level TTL is disabled. "
+                                    + "The duration must be at least 1 millisecond. "
+                                    + "Expired rows may remain visible until RocksDB compaction removes them.");
+
+    public static final ConfigOption<String> TABLE_KV_TTL_TIME_COLUMN =
+            key("table.kv.ttl.time-column")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The event-time column for row-level TTL. "
+                                    + "If not set, row-level TTL uses processing time. "
+                                    + "If set, the column must be BIGINT epoch milliseconds, TIMESTAMP, or TIMESTAMP_LTZ. "
+                                    + "TIMESTAMP values are interpreted in the TabletServer's system time zone. "
+                                    + "Rows with null event-time values do not expire through TTL.");
 
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")
