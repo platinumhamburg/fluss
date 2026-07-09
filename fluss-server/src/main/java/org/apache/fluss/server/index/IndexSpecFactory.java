@@ -161,6 +161,8 @@ public final class IndexSpecFactory {
                 };
 
         return new IndexSpec(
+                index.getIndexName(),
+                index.getVisibility(),
                 indexTableId,
                 indexSchemaId,
                 indexKvFormat,

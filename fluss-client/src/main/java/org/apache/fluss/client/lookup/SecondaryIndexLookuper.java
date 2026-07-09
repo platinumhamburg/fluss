@@ -18,10 +18,14 @@
 package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.utils.ValueEquality;
 
-import javax.annotation.concurrent.NotThreadSafe;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -50,8 +54,11 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * partition-tombstone cleanup).
  */
 @Internal
-@NotThreadSafe
+@ThreadSafe
 public final class SecondaryIndexLookuper implements Lookuper {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SecondaryIndexLookuper.class);
+    private static final int LOW_SELECTIVITY_WARN_CANDIDATE_THRESHOLD = 1024;
 
     private final Lookuper indexTablePrefixLookuper;
     private final Lookuper mainTablePointLookuper;
@@ -89,13 +96,21 @@ public final class SecondaryIndexLookuper implements Lookuper {
 
     @Override
     public CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
+        Object[] expectedIdxValues = snapshotLookupKey(lookupKey);
         return indexTablePrefixLookuper
                 .lookup(lookupKey)
-                .thenCompose(hop1Result -> doHop2(hop1Result, lookupKey));
+                .thenCompose(hop1Result -> doHop2(hop1Result, expectedIdxValues));
     }
 
-    private CompletableFuture<LookupResult> doHop2(LookupResult hop1Result, InternalRow lookupKey) {
+    private CompletableFuture<LookupResult> doHop2(
+            LookupResult hop1Result, Object[] expectedIdxValues) {
         List<InternalRow> candidateIndexRows = hop1Result.getRowList();
+        if (candidateIndexRows.size() >= LOW_SELECTIVITY_WARN_CANDIDATE_THRESHOLD) {
+            LOG.warn(
+                    "Secondary index lookup produced {} Hop1 candidate rows, reaching the low-selectivity warning threshold {}. This may indicate a low-selectivity secondary index or stale index entries; Hop2 will still process all candidates.",
+                    candidateIndexRows.size(),
+                    LOW_SELECTIVITY_WARN_CANDIDATE_THRESHOLD);
+        }
         if (candidateIndexRows.isEmpty()) {
             return CompletableFuture.completedFuture(
                     new LookupResult(Collections.<InternalRow>emptyList()));
@@ -113,7 +128,7 @@ public final class SecondaryIndexLookuper implements Lookuper {
                             for (CompletableFuture<LookupResult> f : mainFutures) {
                                 LookupResult r = f.join();
                                 for (InternalRow mainRow : r.getRowList()) {
-                                    if (idxColsMatch(lookupKey, mainRow)) {
+                                    if (idxColsMatch(expectedIdxValues, mainRow)) {
                                         aggregated.add(mainRow);
                                     }
                                 }
@@ -122,14 +137,33 @@ public final class SecondaryIndexLookuper implements Lookuper {
                         });
     }
 
-    private boolean idxColsMatch(InternalRow lookupKey, InternalRow mainRow) {
+    private Object[] snapshotLookupKey(InternalRow lookupKey) {
+        Object[] expectedIdxValues = new Object[idxColumnGettersInLookupKey.length];
         for (int i = 0; i < idxColumnGettersInLookupKey.length; i++) {
-            Object expected = idxColumnGettersInLookupKey[i].getFieldOrNull(lookupKey);
+            expectedIdxValues[i] =
+                    copyRecheckValue(idxColumnGettersInLookupKey[i].getFieldOrNull(lookupKey));
+        }
+        return expectedIdxValues;
+    }
+
+    private boolean idxColsMatch(Object[] expectedIdxValues, InternalRow mainRow) {
+        for (int i = 0; i < expectedIdxValues.length; i++) {
+            Object expected = expectedIdxValues[i];
             Object actual = idxColumnGettersInMainRow[i].getFieldOrNull(mainRow);
             if (!ValueEquality.contentEquals(expected, actual)) {
                 return false;
             }
         }
         return true;
+    }
+
+    private static Object copyRecheckValue(Object value) {
+        if (value instanceof byte[]) {
+            return ((byte[]) value).clone();
+        }
+        if (value instanceof BinaryString) {
+            return ((BinaryString) value).copy();
+        }
+        return value;
     }
 }

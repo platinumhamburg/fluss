@@ -19,14 +19,18 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
@@ -38,12 +42,14 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -97,13 +103,17 @@ class IndexPushFailoverITCase {
                         .column("a", DataTypes.INT())
                         .column("b", DataTypes.STRING())
                         .primaryKey("a")
-                        .index(INDEX_NAME, "b")
+                        .index(
+                                INDEX_NAME,
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
                 TableDescriptor.builder()
                         .schema(schema)
                         .distributedBy(3, "a")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "3")
                         .build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
@@ -151,17 +161,25 @@ class IndexPushFailoverITCase {
                 TIMEOUT,
                 "wait for first index entry");
 
-        // Wait for a KV snapshot to persist the indexPushedOffset via TabletState.
-        // The snapshot interval is set to 1s, so wait a bit for it to complete.
-        Thread.sleep(3000);
-
-        // Capture the pushed offset that the KV snapshot just persisted. With SYNC visibility the
-        // offset is stable after the first batch, so this reads exactly the checkpointed value. A
-        // correct failover must restore *exactly* this value on the new leader.
-        long offsetBefore = mainReplica.getIndexPushedOffset();
+        // Capture the pushed offset after the first SYNC index entry is visible, then wait until a
+        // completed KV snapshot has persisted the same value via TabletState. A correct failover
+        // must restore *exactly* this value on the new leader.
+        long offsetBefore =
+                waitValue(
+                        () -> {
+                            long offset = mainReplica.getSyncIndexPushedOffset();
+                            return offset > 0L ? Optional.of(offset) : Optional.empty();
+                        },
+                        TIMEOUT,
+                        "wait for sync index pushed offset before failover");
         assertThat(offsetBefore)
                 .as("sync write must have advanced the pushed offset before failover")
                 .isGreaterThan(0L);
+        CompletedSnapshot persistedSnapshot =
+                waitForSnapshotPersistingIndexPushedOffset(mainBucket, offsetBefore);
+        assertThat(persistedSnapshot.getIndexPushedOffset())
+                .as("snapshot must persist the exact indexPushedOffset used for failover restore")
+                .isEqualTo(offsetBefore);
 
         // Kill the original leader
         FLUSS_CLUSTER_EXTENSION.stopTabletServer(originalLeader);
@@ -187,7 +205,7 @@ class IndexPushFailoverITCase {
         // The new leader must restore the *exact* checkpointed offset. isEqualTo (not >= 0) is
         // what makes a broken restore path fail: a reset-to-0 bug would replay from the WAL head,
         // a skip-ahead bug would drop un-pushed records — both are caught by exact equality.
-        assertThat(newMainReplica.getIndexPushedOffset())
+        assertThat(newMainReplica.getSyncIndexPushedOffset())
                 .as("new leader must restore the exact checkpointed indexPushedOffset")
                 .isEqualTo(offsetBefore);
 
@@ -244,13 +262,17 @@ class IndexPushFailoverITCase {
                         .column("a", DataTypes.INT())
                         .column("b", DataTypes.STRING())
                         .primaryKey("a")
-                        .index(INDEX_NAME, "b")
+                        .index(
+                                INDEX_NAME,
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
                 TableDescriptor.builder()
                         .schema(schema)
                         .distributedBy(3, "a")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "3")
                         .build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
@@ -277,7 +299,7 @@ class IndexPushFailoverITCase {
 
         // Nothing has been written to the main table yet, so the pushed offset is still its
         // initial sentinel (-1 = nothing pushed).
-        assertThat(mainReplica.getIndexPushedOffset())
+        assertThat(mainReplica.getSyncIndexPushedOffset())
                 .as("pushed offset must be the -1 sentinel before any main-table write")
                 .isEqualTo(-1L);
 
@@ -346,7 +368,7 @@ class IndexPushFailoverITCase {
         // proving the entry appeared because the push pipeline completed, not via any unrelated
         // path. (Combined with the pre-write -1 assertion this cannot be vacuously true.)
         waitUntil(
-                () -> mainReplica.getIndexPushedOffset() >= 0L,
+                () -> mainReplica.getSyncIndexPushedOffset() >= 0L,
                 TIMEOUT,
                 "pushed offset must advance after the retried push completes");
 
@@ -373,5 +395,30 @@ class IndexPushFailoverITCase {
         row.setField(0, fromString(bValue));
         byte[] bucketKey = bucketKeyEncoder.encodeKey(row);
         return new org.apache.fluss.bucketing.FlussBucketingFunction().bucketing(bucketKey, 3);
+    }
+
+    private static CompletedSnapshot waitForSnapshotPersistingIndexPushedOffset(
+            TableBucket tableBucket, long expectedOffset) {
+        return waitValue(
+                () -> {
+                    Optional<BucketSnapshot> latest =
+                            FLUSS_CLUSTER_EXTENSION
+                                    .getZooKeeperClient()
+                                    .getTableBucketLatestSnapshot(tableBucket);
+                    if (!latest.isPresent()) {
+                        return Optional.empty();
+                    }
+                    CompletedSnapshot completedSnapshot =
+                            latest.get()
+                                    .toCompletedSnapshotHandle()
+                                    .retrieveCompleteSnapshot();
+                    Long snapshotOffset = completedSnapshot.getIndexPushedOffset();
+                    if (snapshotOffset != null && snapshotOffset == expectedOffset) {
+                        return Optional.of(completedSnapshot);
+                    }
+                    return Optional.empty();
+                },
+                TIMEOUT,
+                "wait for KV snapshot to persist indexPushedOffset " + expectedOffset);
     }
 }

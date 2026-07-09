@@ -18,6 +18,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
@@ -39,6 +40,8 @@ public final class IndexSpec {
     }
 
     private final long indexTableId;
+    private final String indexName;
+    private final IndexVisibility visibility;
     private final int indexSchemaId;
     private final KvFormat indexKvFormat;
     private final int[] idxColumnIndices;
@@ -47,6 +50,8 @@ public final class IndexSpec {
     private final ToIntFunction<InternalRow> bucketAssigner;
 
     public IndexSpec(
+            String indexName,
+            IndexVisibility visibility,
             long indexTableId,
             int indexSchemaId,
             KvFormat indexKvFormat,
@@ -54,6 +59,8 @@ public final class IndexSpec {
             KeyEncoder keyEncoder,
             ValueEncoder valueEncoder,
             ToIntFunction<InternalRow> bucketAssigner) {
+        this.indexName = checkNotNull(indexName, "indexName");
+        this.visibility = checkNotNull(visibility, "visibility");
         this.indexTableId = indexTableId;
         this.indexSchemaId = indexSchemaId;
         this.indexKvFormat = indexKvFormat;
@@ -66,6 +73,18 @@ public final class IndexSpec {
 
     public long getIndexTableId() {
         return indexTableId;
+    }
+
+    public String getIndexName() {
+        return indexName;
+    }
+
+    public IndexVisibility getVisibility() {
+        return visibility;
+    }
+
+    public boolean isSync() {
+        return visibility == IndexVisibility.SYNC;
     }
 
     public int getIndexSchemaId() {

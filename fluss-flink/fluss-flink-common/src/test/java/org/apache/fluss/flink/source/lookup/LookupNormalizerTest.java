@@ -412,6 +412,44 @@ class LookupNormalizerTest {
     }
 
     @Test
+    void testRemainingFilterSnapshotsMutableExpectedBytes() {
+        RowType schema =
+                new RowType(
+                        Arrays.asList(
+                                new RowType.RowField("id", new IntType()),
+                                new RowType.RowField("name", new VarCharType(200)),
+                                new RowType.RowField("payload", new VarBinaryType(20))));
+        int[][] lookupKeyIndexes = new int[][] {{1}, {2}};
+        int[][] secondaryIndexes = new int[][] {{1}};
+
+        LookupNormalizer normalizer =
+                LookupNormalizer.validateAndCreateLookupNormalizer(
+                        lookupKeyIndexes,
+                        new int[] {0},
+                        new int[] {0},
+                        new int[] {},
+                        schema,
+                        null,
+                        secondaryIndexes);
+
+        byte[] lookupPayload = new byte[] {1, 2, 3};
+        GenericRowData lookupKeyRow = new GenericRowData(2);
+        lookupKeyRow.setField(0, StringData.fromString("alice"));
+        lookupKeyRow.setField(1, lookupPayload);
+        LookupNormalizer.RemainingFilter filter = normalizer.createRemainingFilter(lookupKeyRow);
+        assertThat(filter).isNotNull();
+
+        lookupPayload[0] = 9;
+
+        GenericRowData result = new GenericRowData(3);
+        result.setField(0, 1);
+        result.setField(1, StringData.fromString("alice"));
+        result.setField(2, new byte[] {1, 2, 3});
+
+        assertThat(filter.isMatch(result)).isTrue();
+    }
+
+    @Test
     void testExactMatchProducesNoRemainingFilter() {
         // When lookup keys exactly match the index (no superset), no remaining filter
         int[][] lookupKeyIndexes = new int[][] {{1}}; // name

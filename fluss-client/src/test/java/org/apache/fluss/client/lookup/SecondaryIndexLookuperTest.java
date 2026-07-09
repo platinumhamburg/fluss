@@ -20,13 +20,24 @@ package org.apache.fluss.client.lookup;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.LoggerContext;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.Configuration;
+import org.apache.logging.log4j.core.config.LoggerConfig;
+import org.apache.logging.log4j.core.config.Property;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -377,6 +388,49 @@ class SecondaryIndexLookuperTest {
     }
 
     @Test
+    void testRecheckUsesLookupKeySnapshotAcrossAsyncBoundary() throws Exception {
+        byte[] lookupBytes = new byte[] {1, 2, 3};
+        byte[] mainBytes = new byte[] {1, 2, 3};
+
+        GenericRow lookupKey = new GenericRow(1);
+        lookupKey.setField(0, lookupBytes);
+        GenericRow indexRow = new GenericRow(2);
+        indexRow.setField(0, lookupBytes);
+        indexRow.setField(1, 10L);
+        GenericRow mainRow = new GenericRow(2);
+        mainRow.setField(0, mainBytes);
+        mainRow.setField(1, 10L);
+
+        CompletableFuture<LookupResult> hop1Future = new CompletableFuture<>();
+        StubLookuper indexLookuper = new StubLookuper(key -> hop1Future);
+        StubLookuper mainLookuper =
+                new StubLookuper(
+                        key ->
+                                CompletableFuture.completedFuture(
+                                        new LookupResult(Collections.singletonList(mainRow))));
+
+        SecondaryIndexLookuper lookuper =
+                new SecondaryIndexLookuper(
+                        indexLookuper,
+                        mainLookuper,
+                        new int[] {0},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        index -> {
+                            GenericRow pk = new GenericRow(1);
+                            pk.setField(0, index.getLong(1));
+                            return pk;
+                        });
+
+        CompletableFuture<LookupResult> resultFuture = lookuper.lookup(lookupKey);
+        lookupBytes[0] = 9;
+        lookupKey.setField(0, lookupBytes);
+        hop1Future.complete(new LookupResult(Collections.singletonList(indexRow)));
+
+        assertThat(resultFuture.get().getRowList()).containsExactly(mainRow);
+    }
+
+    @Test
     void testRecheckHandlesNullableIdxColCorrectly() throws Exception {
         // Lookup key idxCol is null. Hop 2 returns two rows:
         //   - mainRow1: idxCol=null -> matches via Objects.equals -> keep.
@@ -435,6 +489,74 @@ class SecondaryIndexLookuperTest {
         LookupResult result = lookuper.lookup(lookupKey).get();
 
         assertThat(result.getRowList()).containsExactly(mainRow1);
+    }
+
+    @Test
+    void testWarnsWhenHop1CandidateCountReachesLowSelectivityThreshold() throws Exception {
+        int candidateCount = 1024;
+        List<InternalRow> indexRows = new ArrayList<>(candidateCount);
+        for (int i = 0; i < candidateCount; i++) {
+            GenericRow indexRow = new GenericRow(1);
+            indexRow.setField(0, i);
+            indexRows.add(indexRow);
+        }
+
+        StubLookuper indexLookuper =
+                new StubLookuper(
+                        key -> CompletableFuture.completedFuture(new LookupResult(indexRows)));
+        AtomicInteger mainLookupCount = new AtomicInteger();
+        StubLookuper mainLookuper =
+                new StubLookuper(
+                        key -> {
+                            mainLookupCount.incrementAndGet();
+                            return CompletableFuture.completedFuture(
+                                    new LookupResult(Collections.<InternalRow>emptyList()));
+                        });
+
+        SecondaryIndexLookuper lookuper =
+                new SecondaryIndexLookuper(
+                        indexLookuper,
+                        mainLookuper,
+                        new int[] {0},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        indexRow -> indexRow);
+
+        List<LogEvent> events = new ArrayList<>();
+        AbstractAppender appender =
+                new AbstractAppender(
+                        "secondary-index-lookuper-test", null, null, false, Property.EMPTY_ARRAY) {
+                    @Override
+                    public void append(LogEvent event) {
+                        events.add(event.toImmutable());
+                    }
+                };
+        appender.start();
+        LoggerContext loggerContext = (LoggerContext) LogManager.getContext(false);
+        Configuration configuration = loggerContext.getConfiguration();
+        String loggerName = SecondaryIndexLookuper.class.getName();
+        LoggerConfig loggerConfig = new LoggerConfig(loggerName, Level.WARN, false);
+        loggerConfig.addAppender(appender, Level.WARN, null);
+        configuration.addLogger(loggerName, loggerConfig);
+        loggerContext.updateLoggers();
+        try {
+            LookupResult result = lookuper.lookup(new GenericRow(1)).get();
+
+            assertThat(result.getRowList()).isEmpty();
+            assertThat(mainLookupCount).hasValue(candidateCount);
+            assertThat(events)
+                    .anySatisfy(
+                            event -> {
+                                assertThat(event.getLevel()).isEqualTo(Level.WARN);
+                                assertThat(event.getMessage().getFormattedMessage())
+                                        .contains("low-selectivity")
+                                        .contains(String.valueOf(candidateCount));
+                            });
+        } finally {
+            configuration.removeLogger(loggerName);
+            loggerContext.updateLoggers();
+            appender.stop();
+        }
     }
 
     private static final class StubLookuper implements Lookuper {

@@ -599,6 +599,19 @@ public final class Schema implements Serializable {
          * contain letters, digits, and underscores.
          */
         public Builder index(String indexName, IndexType indexType, List<String> columnNames) {
+            return index(indexName, indexType, columnNames, IndexVisibility.SYNC, null);
+        }
+
+        /**
+         * Declares an index of the given type for a set of given columns. Index names can only
+         * contain letters, digits, and underscores.
+         */
+        public Builder index(
+                String indexName,
+                IndexType indexType,
+                List<String> columnNames,
+                IndexVisibility visibility,
+                @Nullable Integer bucketCount) {
             checkArgument(
                     columnNames != null && !columnNames.isEmpty(),
                     "Index constraint must be defined for at least a single column.");
@@ -622,7 +635,7 @@ public final class Schema implements Serializable {
                     "Index '%s' contains duplicate columns.",
                     indexName);
             checkNotNull(indexType, "Index type must not be null.");
-            indexes.add(new Index(indexName, indexType, columnNames));
+            indexes.add(new Index(indexName, indexType, columnNames, visibility, bucketCount));
             return this;
         }
 
@@ -837,8 +850,19 @@ public final class Schema implements Serializable {
         private final String indexName;
         private final IndexType indexType;
         private final List<String> columnNames;
+        private final IndexVisibility visibility;
+        private final @Nullable Integer bucketCount;
 
         public Index(String indexName, IndexType indexType, List<String> columnNames) {
+            this(indexName, indexType, columnNames, IndexVisibility.SYNC, null);
+        }
+
+        public Index(
+                String indexName,
+                IndexType indexType,
+                List<String> columnNames,
+                IndexVisibility visibility,
+                @Nullable Integer bucketCount) {
             checkArgument(
                     !StringUtils.isNullOrWhitespaceOnly(indexName),
                     "Index name must not be null or empty.");
@@ -854,9 +878,15 @@ public final class Schema implements Serializable {
             checkArgument(
                     columnNames != null && !columnNames.isEmpty(),
                     "Index must reference at least one column.");
+            checkNotNull(visibility, "Index visibility must not be null.");
+            if (bucketCount != null) {
+                checkArgument(bucketCount > 0, "Index bucket count must be positive.");
+            }
             this.indexName = indexName;
             this.indexType = indexType;
             this.columnNames = Collections.unmodifiableList(new ArrayList<>(columnNames));
+            this.visibility = visibility;
+            this.bucketCount = bucketCount;
         }
 
         public Index(String indexName, List<String> columnNames) {
@@ -875,6 +905,14 @@ public final class Schema implements Serializable {
             return columnNames;
         }
 
+        public IndexVisibility getVisibility() {
+            return visibility;
+        }
+
+        public Optional<Integer> getBucketCount() {
+            return Optional.ofNullable(bucketCount);
+        }
+
         @Override
         public boolean equals(Object o) {
             if (this == o) {
@@ -886,12 +924,14 @@ public final class Schema implements Serializable {
             Index other = (Index) o;
             return indexName.equals(other.indexName)
                     && indexType == other.indexType
-                    && columnNames.equals(other.columnNames);
+                    && columnNames.equals(other.columnNames)
+                    && visibility == other.visibility
+                    && Objects.equals(bucketCount, other.bucketCount);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(indexName, indexType, columnNames);
+            return Objects.hash(indexName, indexType, columnNames, visibility, bucketCount);
         }
 
         @Override
@@ -902,6 +942,10 @@ public final class Schema implements Serializable {
                     + indexType
                     + ", columns="
                     + columnNames
+                    + ", visibility="
+                    + visibility
+                    + ", bucketCount="
+                    + bucketCount
                     + "}";
         }
     }

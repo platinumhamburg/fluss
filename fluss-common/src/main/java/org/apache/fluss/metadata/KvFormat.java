@@ -40,8 +40,8 @@ public enum KvFormat {
     /**
      * The kv record batches are stored in {@link org.apache.fluss.row.aligned.AlignedRow} format.
      * Each field occupies a fixed 8-byte slot, enabling O(1) random column access without full
-     * deserialization. Used by partitioned Index Tables so that native CompactionFilters (Rust) can
-     * read arbitrary columns.
+     * deserialization. Used by partitioned Index Tables so the RocksDB native compaction filter and
+     * query-time tombstone filter can read the source partition id at a stable offset.
      */
     ALIGNED;
 

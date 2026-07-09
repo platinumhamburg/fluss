@@ -30,7 +30,7 @@ import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
-import javax.annotation.concurrent.NotThreadSafe;
+import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
@@ -39,7 +39,7 @@ import static org.apache.fluss.client.utils.ClientUtils.getPartitionId;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** An implementation of {@link Lookuper} that lookups by primary key. */
-@NotThreadSafe
+@ThreadSafe
 class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
 
     private final KeyEncoder primaryKeyEncoder;

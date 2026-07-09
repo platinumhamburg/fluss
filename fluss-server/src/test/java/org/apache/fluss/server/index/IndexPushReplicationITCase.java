@@ -23,6 +23,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
@@ -76,8 +77,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>{@link #testUpdateRewritesIndexEntry()} — UPDATE on the indexed column produces a DELETE on
  *       the old composite key and an UPSERT on the new composite key.
  *   <li>{@link #testDeleteRemovesIndexEntry()} — DELETE on the main table removes the index entry.
- *   <li>{@link #testAsyncVisibilityEventuallyVisible()} — with {@code index.visibility=ASYNC} the
- *       PutKv ack does not wait for the push, but the index entry is eventually visible.
+ *   <li>{@link #testAsyncVisibilityEventuallyVisible()} — with async {@code Schema.Index}
+ *       visibility the PutKv ack does not wait for the push, but the index entry is eventually
+ *       visible.
  *   <li>{@link #testDroppedPartitionEntriesAreFilteredFromIndex()} — with a partition tombstone
  *       injected into the TabletServer's metadata cache, an Index Table PutKv whose value carries
  *       the tombstoned partitionId is silently dropped by the apply-path filter.
@@ -154,10 +156,10 @@ class IndexPushReplicationITCase {
                 .as("under SYNC visibility the index entry must be visible right after the ack")
                 .isNotNull();
 
-        // The sync push completed before the ack, so the pushed offset must have advanced to the
-        // write log end offset. A single row at log offset 0 advances indexPushedOffset to 1.
-        assertThat(f.mainLeaderReplica.getIndexPushedOffset())
-                .as("indexPushedOffset must equal the write log end offset after a sync write")
+        // The sync push completed before the ack, so the sync pushed offset must have advanced to
+        // the write log end offset. A single row at log offset 0 advances it to 1.
+        assertThat(f.mainLeaderReplica.getSyncIndexPushedOffset())
+                .as("sync index pushed offset must equal the write log end offset after a sync write")
                 .isEqualTo(1L);
     }
 
@@ -222,8 +224,8 @@ class IndexPushReplicationITCase {
     }
 
     /**
-     * Scenario #4 (FIP V2 §2.6, async visibility): with {@code secondary-index.visibility=ASYNC}
-     * the PutKv ack returns BEFORE the index push completes; the entry is only eventually visible.
+     * Scenario #4 (FIP V2 §2.6, async visibility): with async {@code Schema.Index} visibility the
+     * PutKv ack returns BEFORE the index push completes; the entry is only eventually visible.
      * We don't assert immediate invisibility (would be flaky on fast machines / single-process
      * self-RPC) — the contract under test is "eventual visibility under ASYNC".
      */
@@ -442,14 +444,18 @@ class IndexPushReplicationITCase {
                         .column("b", DataTypes.STRING())
                         .column("p", DataTypes.STRING())
                         .primaryKey("a", "p")
-                        .index(INDEX_NAME, "b")
+                        .index(
+                                INDEX_NAME,
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
                 TableDescriptor.builder()
                         .schema(partitionedSchema)
                         .distributedBy(3, "a")
                         .partitionedBy("p")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "3")
                         .build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
@@ -514,26 +520,25 @@ class IndexPushReplicationITCase {
                 desc);
     }
 
-    private static Schema buildMainSchema() {
+    private static Schema buildMainSchema(@Nullable IndexVisibility visibility) {
         return Schema.newBuilder()
                 .column("a", DataTypes.INT())
                 .column("b", DataTypes.STRING())
                 .primaryKey("a")
-                .index(INDEX_NAME, "b")
+                .index(
+                        INDEX_NAME,
+                        IndexType.SECONDARY,
+                        Collections.singletonList("b"),
+                        visibility == null ? IndexVisibility.SYNC : visibility,
+                        3)
                 .build();
     }
 
     private static TableDescriptor buildMainTableDescriptor(@Nullable IndexVisibility visibility) {
-        TableDescriptor.Builder b =
-                TableDescriptor.builder()
-                        .schema(buildMainSchema())
-                        .distributedBy(3, "a")
-                        // Match the Index Table's bucket count so resolveIndexBucketCount agrees.
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "3");
-        if (visibility != null) {
-            b.property(ConfigOptions.INDEX_VISIBILITY, visibility);
-        }
-        return b.build();
+        return TableDescriptor.builder()
+                .schema(buildMainSchema(visibility))
+                .distributedBy(3, "a")
+                .build();
     }
 
     /**

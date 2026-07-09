@@ -23,7 +23,6 @@ import org.apache.fluss.compression.ArrowCompressionType;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
-import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
@@ -1759,9 +1758,7 @@ public class ConfigOptions {
                                     + "as older versions cannot parse the extended batch format.");
 
     // ------------------------------------------------------------------------
-    //  Table Type & Secondary Index Definition Configs
-    //  (per-index, namespaced: secondary-index.<name>.{columns,bucket.num})
-    //  (visibility: index.visibility)
+    //  Table Type & Index Table Metadata Configs
     //  (index table metadata: table.index-meta.*)
     // ------------------------------------------------------------------------
 
@@ -1774,16 +1771,6 @@ public class ConfigOptions {
                                     + "or an internal INDEX_TABLE managed by Fluss for global secondary "
                                     + "indexes. INDEX_TABLE is system-set and must not be configured by users.");
 
-    public static final ConfigOption<IndexVisibility> INDEX_VISIBILITY =
-            key("index.visibility")
-                    .enumType(IndexVisibility.class)
-                    .defaultValue(IndexVisibility.SYNC)
-                    .withDescription(
-                            "Visibility semantics for writes to a table that owns indexes. "
-                                    + "'sync' (default) blocks PutKv ack until all index mutations are "
-                                    + "applied. 'async' acks once the data WAL is committed and lets "
-                                    + "index mutations land asynchronously.");
-
     public static final ConfigOption<Long> TABLE_INDEX_META_MAIN_TABLE_ID =
             key("table.index-meta.main-table-id")
                     .longType()
@@ -1793,20 +1780,6 @@ public class ConfigOptions {
                                     + "Set automatically by the system when creating index tables; "
                                     + "users must not modify it. Used to look up the main table during "
                                     + "index push and lookup paths.");
-
-    public static final String SECONDARY_INDEX_PREFIX = "secondary-index.";
-    public static final String SECONDARY_INDEX_COLUMNS_SUFFIX = ".columns";
-    public static final String SECONDARY_INDEX_BUCKET_NUM_SUFFIX = ".bucket.num";
-
-    /** Builds the per-index columns config key: {@code secondary-index.<name>.columns}. */
-    public static String secondaryIndexColumnsKey(String indexName) {
-        return SECONDARY_INDEX_PREFIX + indexName + SECONDARY_INDEX_COLUMNS_SUFFIX;
-    }
-
-    /** Builds the per-index bucket-num config key: {@code secondary-index.<name>.bucket.num}. */
-    public static String secondaryIndexBucketNumKey(String indexName) {
-        return SECONDARY_INDEX_PREFIX + indexName + SECONDARY_INDEX_BUCKET_NUM_SUFFIX;
-    }
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv

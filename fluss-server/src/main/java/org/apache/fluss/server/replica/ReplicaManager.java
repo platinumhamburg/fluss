@@ -1670,7 +1670,7 @@ public class ReplicaManager implements ServerReconfigurable {
             Map<TableBucket, T> writeResults,
             Consumer<List<T>> responseCallback) {
         // Build the per-bucket status first so we can decide whether any bucket needs the PutKv ack
-        // gated on its index-pushed-offset (index.visibility=SYNC). A SYNC bucket forces a delayed
+        // gated on its sync index-pushed-offset. A SYNC index forces a delayed
         // write even when requiredAcks != -1, because its ack must wait for the index push, not
         // just
         // for ISR replication.
@@ -2135,8 +2135,8 @@ public class ReplicaManager implements ServerReconfigurable {
                         .retryStart(
                                 replica.getLogTablet(),
                                 replica.getSchemaGetter(),
-                                replica::advanceIndexPushedOffset,
-                                replica.getIndexPushedOffset());
+                                replica::advanceIndexProgress,
+                                replica.getAllIndexPushedOffset());
             }
         }
     }

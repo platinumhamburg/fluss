@@ -26,10 +26,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * A deterministic replication window produced by a single {@link IndexReplicator#poll()} cycle.
  *
  * <p>The offset is a property of the window, not of any individual {@link IndexBatch}. A window
- * covers the half-open WAL offset range {@code [windowStart, windowEndOffset)} (aligned to {@code
- * LogRecordBatch} boundaries) and fans out into {@code remaining} index write batches across one or
- * more target index buckets. Only when every one of those batches has been acknowledged does the
- * window advance the owning replicator's pushed offset to {@link #windowEndOffset}.
+ * covers the half-open WAL offset range {@code [windowStart, windowEndOffset)} for exactly one
+ * secondary index and fans out into {@code remaining} index write batches across one or more target
+ * index buckets. Only when every one of those batches has been acknowledged does the window advance
+ * that index's pushed offset to {@link #windowEndOffset}.
  *
  * <p>Because window boundaries are derived deterministically from the WAL batch layout plus a fixed
  * maximum window size, a replicator restarting from its pushed offset replays the exact same window
@@ -38,6 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Internal
 final class IndexWindow {
 
+    private final String indexName;
     private final long windowEndOffset;
     private final AtomicInteger remaining;
     private final IndexReplicator owner;
@@ -45,10 +46,15 @@ final class IndexWindow {
     /** One-shot guard so the owning replicator's pushed offset is advanced at most once. */
     private final AtomicBoolean completed = new AtomicBoolean(false);
 
-    IndexWindow(long windowEndOffset, int batchCount, IndexReplicator owner) {
+    IndexWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
+        this.indexName = indexName;
         this.windowEndOffset = windowEndOffset;
         this.remaining = new AtomicInteger(batchCount);
         this.owner = owner;
+    }
+
+    String indexName() {
+        return indexName;
     }
 
     long windowEndOffset() {
@@ -68,7 +74,7 @@ final class IndexWindow {
      */
     void onBatchAcked() {
         if (remaining.decrementAndGet() == 0 && completed.compareAndSet(false, true)) {
-            owner.onWindowComplete(windowEndOffset);
+            owner.onWindowComplete(indexName, windowEndOffset);
         }
     }
 }

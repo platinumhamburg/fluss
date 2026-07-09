@@ -19,6 +19,8 @@ package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -161,34 +163,34 @@ final class ReplicaTest extends ReplicaTestBase {
      * push scheduler field is assigned (so that re-submitted records land on a live pipeline). For
      * a non-indexed table (this fixture), the hook is unreachable because the scheduler is never
      * built — verify the leader path still completes cleanly, the scheduler stays {@code null}, and
-     * a seeded {@code indexPushedOffset} is preserved across the promotion (i.e. the recovery code
-     * path produced no side effect on the watermark).
+     * a seeded index pushed offset is preserved across the promotion (i.e. the recovery code path
+     * produced no side effect on the watermark).
      */
     @Test
     void testRecoverIndexPushFromWalIsInvokedAfterSchedulerStarts() throws Exception {
         Replica kvReplica =
                 makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
 
-        // Seed a non-trivial indexPushedOffset to simulate a checkpoint-loaded value. The
+        // Seed a non-trivial index pushed offset to simulate a checkpoint-loaded value. The
         // recovery hook (if it were active) would compare this against HW; for a non-indexed
         // table the hook is never reached, so the seed must survive the promotion verbatim.
         kvReplica.seedIndexPushedOffsetOnLoad(5L);
-        assertThat(kvReplica.getIndexPushedOffset()).isEqualTo(5L);
+        assertThat(kvReplica.getSyncIndexPushedOffset()).isEqualTo(5L);
 
         makeKvReplicaAsLeader(kvReplica);
 
         assertThat(kvReplica.getIndexReplicator())
                 .as("Non-indexed table must not construct an IndexReplicator.")
                 .isNull();
-        assertThat(kvReplica.getIndexPushedOffset())
-                .as("Recovery hook must not mutate the seeded indexPushedOffset.")
+        assertThat(kvReplica.getSyncIndexPushedOffset())
+                .as("Recovery hook must not mutate the seeded sync index pushed offset.")
                 .isEqualTo(5L);
 
         // Demote → re-promote: recovery hook must still be safe to invoke on each promotion.
         makeKvReplicaAsFollower(kvReplica, INITIAL_LEADER_EPOCH + 1);
         makeKvReplicaAsLeader(kvReplica, INITIAL_LEADER_EPOCH + 2);
         assertThat(kvReplica.getIndexReplicator()).isNull();
-        assertThat(kvReplica.getIndexPushedOffset()).isEqualTo(5L);
+        assertThat(kvReplica.getSyncIndexPushedOffset()).isEqualTo(5L);
     }
 
     /**
@@ -244,6 +246,20 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(f.replica.isIndexReplicatorInitDeferred())
                 .as("deferred flag must be cleared after a successful retry")
                 .isFalse();
+    }
+
+    @Test
+    void testIndexProgressSplitsSyncAckWatermarkFromAllIndexFloor() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+
+        f.replica.advanceIndexProgress(100L, 40L);
+
+        assertThat(f.replica.requiresSyncIndexVisibility()).isTrue();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(100L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(40L);
+        assertThat(f.replica.getSyncIndexPushedOffset())
+                .as("sync ack watermark remains independent from the all-index replay floor")
+                .isEqualTo(100L);
     }
 
     @Test
@@ -1094,13 +1110,17 @@ final class ReplicaTest extends ReplicaTestBase {
                         .column("a", DataTypes.INT())
                         .column("b", DataTypes.STRING())
                         .primaryKey("a")
-                        .index(indexName, "b")
+                        .index(
+                                indexName,
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
         TableDescriptor mainDescriptor =
                 TableDescriptor.builder()
                         .schema(mainSchema)
                         .distributedBy(1, "a")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(indexName), "1")
                         .build();
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(

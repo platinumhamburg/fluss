@@ -22,7 +22,7 @@ import org.apache.fluss.annotation.PublicEvolving;
 /**
  * Visibility semantics for writes to a table that owns global indexes.
  *
- * <p>Configured via {@code index.visibility} on the data table.
+ * <p>Stored per index in {@link Schema.Index} metadata.
  *
  * @since 0.10
  */

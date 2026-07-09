@@ -229,20 +229,20 @@ public final class Replica {
     private final ReplicaIndexController indexManager;
 
     /**
-     * Whether PutKv acks on this replica must block until the secondary-index mutations they
-     * generate are applied (index.visibility=SYNC). Only true for main tables that own at least one
-     * secondary index and are configured for SYNC visibility; false for ASYNC tables, index tables
-     * and tables without indexes.
+     * Whether PutKv acks on this replica must block until the SYNC secondary-index mutations they
+     * generate are applied. False for ASYNC-only tables, index tables and tables without indexes.
      */
-    private final boolean syncIndexVisibility;
+    private final boolean hasSyncIndexes;
 
     /**
-     * Monotonically advancing index-pushed-offset, tracking how far the WAL-driven index
-     * replication pipeline has progressed. Persisted in snapshots and restored on leader startup,
-     * following the same pattern as {@code rowCount}. Advanced by {@link IndexReplicator} after
-     * each poll window.
+     * Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements.
      */
-    private volatile long indexPushedOffset = -1L;
+    private volatile long syncIndexPushedOffset = -1L;
+
+    /**
+     * Conservative all-index replay floor, persisted in snapshots and restored on leader startup.
+     */
+    private volatile long allIndexPushedOffset = -1L;
 
     // ------- metrics
     private Counter isrShrinks;
@@ -316,10 +316,9 @@ public final class Replica {
                         indexReplicatorPool,
                         indexAccumulator,
                         serverMetricGroup);
-        this.syncIndexVisibility =
-                !tableInfo.getSchema().getIndexes().isEmpty()
-                        && tableInfo.getProperties().get(ConfigOptions.INDEX_VISIBILITY)
-                                == IndexVisibility.SYNC;
+        this.hasSyncIndexes =
+                tableInfo.getSchema().getIndexes().stream()
+                        .anyMatch(index -> index.getVisibility() == IndexVisibility.SYNC);
         registerMetrics();
     }
 
@@ -622,8 +621,8 @@ public final class Replica {
                     logTablet,
                     schemaGetter,
                     kvTablet,
-                    this::advanceIndexPushedOffset,
-                    indexPushedOffset);
+                    this::advanceIndexProgress,
+                    allIndexPushedOffset);
         }
     }
 
@@ -734,11 +733,11 @@ public final class Replica {
     }
 
     /**
-     * Wraps the base {@link TabletState} from {@link KvTablet} with the {@code indexPushedOffset}
-     * watermark, so it is captured in the snapshot alongside flushed log offset and row count.
+     * Wraps the base {@link TabletState} from {@link KvTablet} with the conservative all-index
+     * replay floor, so it is captured in the snapshot alongside flushed log offset and row count.
      */
     private TabletState augmentTabletState(TabletState base) {
-        long offset = indexPushedOffset;
+        long offset = allIndexPushedOffset;
         return new TabletState(
                 base.getFlushedLogOffset(),
                 base.getRowCount(),
@@ -807,31 +806,45 @@ public final class Replica {
         return indexManager;
     }
 
-    public void advanceIndexPushedOffset(long newOffset) {
-        if (newOffset > indexPushedOffset) {
-            indexPushedOffset = newOffset;
-            // Wake any PutKv acks parked on this bucket waiting for the index-pushed-offset to
-            // reach their write offset (index.visibility=SYNC). Fired only on a real advance, on
-            // the IndexReplicator read-pool worker thread; checkAndComplete is thread-safe.
+    public void advanceIndexProgress(long syncIndexOffset, long allIndexOffset) {
+        boolean syncAdvanced = false;
+        if (syncIndexOffset > syncIndexPushedOffset) {
+            syncIndexPushedOffset = syncIndexOffset;
+            syncAdvanced = true;
+        }
+        if (allIndexOffset > allIndexPushedOffset) {
+            allIndexPushedOffset = allIndexOffset;
+        }
+        if (syncAdvanced) {
+            // Wake any PutKv acks parked on this bucket waiting for the sync index-pushed-offset to
+            // reach their write offset. Fired only on a real sync advance, on the IndexReplicator
+            // read-pool worker thread; checkAndComplete is thread-safe.
             delayedWriteManager.checkAndComplete(new DelayedTableBucketKey(tableBucket));
         }
     }
 
     /**
      * Returns {@code true} when PutKv acks on this replica must wait for secondary-index mutations
-     * to be applied before returning (index.visibility=SYNC).
+     * to be applied before returning ({@link Schema.Index#getVisibility()} is SYNC).
      */
     public boolean requiresSyncIndexVisibility() {
-        return syncIndexVisibility;
+        return hasSyncIndexes;
     }
 
-    public long getIndexPushedOffset() {
-        return indexPushedOffset;
+    public long getSyncIndexPushedOffset() {
+        return syncIndexPushedOffset;
+    }
+
+    public long getAllIndexPushedOffset() {
+        return allIndexPushedOffset;
     }
 
     public void seedIndexPushedOffsetOnLoad(long offset) {
-        if (offset > indexPushedOffset) {
-            indexPushedOffset = offset;
+        if (offset > syncIndexPushedOffset) {
+            syncIndexPushedOffset = offset;
+        }
+        if (offset > allIndexPushedOffset) {
+            allIndexPushedOffset = offset;
         }
     }
 
@@ -848,7 +861,7 @@ public final class Replica {
     @VisibleForTesting
     public void retryMaybeStartIndexReplicator() {
         indexManager.retryStart(
-                logTablet, schemaGetter, this::advanceIndexPushedOffset, indexPushedOffset);
+                logTablet, schemaGetter, this::advanceIndexProgress, allIndexPushedOffset);
     }
 
     /**

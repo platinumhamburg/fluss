@@ -42,8 +42,10 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -53,11 +55,10 @@ import java.util.Map;
  * intermediate heap objects ({@code IndexMutation}) are created — derivation writes directly to
  * per-target-bucket {@link KvRecordBatchBuilder}s.
  *
- * <p>Strict single-window serialization: a replicator has at most one {@link IndexWindow} in flight
- * at a time. {@link #poll()} reads the next deterministic window only after the previous window's
- * batches have all been acknowledged, at which point {@link #onWindowComplete(long)} advances the
- * pushed offset. This decouples offset advancement from derivation and guarantees at-least-once
- * delivery: a send failure re-enqueues the batch without advancing the offset.
+ * <p>Each secondary index has its own pushed offset and at most one {@link IndexWindow} in flight.
+ * {@link #poll()} reads the next deterministic window for every index that is currently ready. This
+ * lets SYNC indexes keep advancing even when an ASYNC index is retrying an older window, while the
+ * all-index watermark remains conservative for snapshot/recovery floors.
  *
  * <p>Driven by {@link #poll()} calls from an {@code IndexReplicatorPool} read worker.
  */
@@ -68,32 +69,27 @@ public final class IndexReplicator implements AutoCloseable {
 
     private static final int PAGE_SIZE = 4096;
 
+    /** Receives sync and all-index progress after an index window advances. */
+    @FunctionalInterface
+    public interface IndexProgressListener {
+        /** Called with the current sync ack watermark and conservative all-index replay floor. */
+        void onProgress(long syncIndexPushedOffset, long allIndexPushedOffset);
+    }
+
     private final LogTablet logTablet;
-    private final List<IndexSpec> indexSpecs;
+    private final List<IndexProgressState> indexStates;
+    private final Map<String, IndexProgressState> indexStatesByName;
     private final IndexAccumulator accumulator;
     private final LogRecordReadContext readContext;
-    private final java.util.function.LongConsumer onOffsetAdvanced;
+    private final IndexProgressListener onProgress;
     private final int maxWindowBytes;
 
-    private volatile long indexPushedOffset;
+    /** Progress used only by empty test owners; production replicators always have index states. */
+    private volatile long emptyIndexPushedOffset;
     private volatile boolean closed;
-
-    /**
-     * The single in-flight window, or {@code null} if no window is currently being replicated.
-     * Enforces strict single-window serialization: a new window is read only after the previous
-     * window's batches have all been acknowledged.
-     */
-    @Nullable private volatile IndexWindow inFlightWindow;
 
     /** Signal fired to wake the owning read-pool worker so it polls again promptly. */
     @Nullable private volatile Runnable wakeupSignal;
-
-    /**
-     * Carries the already-derived old index keys from an unmatched {@link
-     * ChangeType#UPDATE_BEFORE}. Holding encoded keys instead of the source row avoids depending on
-     * record-batch row lifetimes when a {@code -U/+U} pair spans a batch or fetch window.
-     */
-    @Nullable private PendingUpdateBefore pendingUpdateBefore;
 
     public IndexReplicator(
             LogTablet logTablet,
@@ -102,15 +98,24 @@ public final class IndexReplicator implements AutoCloseable {
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
-            java.util.function.LongConsumer onOffsetAdvanced) {
+            IndexProgressListener onProgress) {
         this.logTablet = logTablet;
-        this.indexSpecs = indexSpecs;
+        this.indexStates = new ArrayList<>(indexSpecs.size());
+        this.indexStatesByName = new LinkedHashMap<>();
+        for (IndexSpec indexSpec : indexSpecs) {
+            IndexProgressState state = new IndexProgressState(indexSpec, initialOffset);
+            if (indexStatesByName.put(indexSpec.getIndexName(), state) != null) {
+                throw new IllegalArgumentException(
+                        "Duplicate secondary index name: " + indexSpec.getIndexName());
+            }
+            indexStates.add(state);
+        }
         this.accumulator = accumulator;
         this.readContext = readContext;
-        this.indexPushedOffset = initialOffset;
+        this.emptyIndexPushedOffset = initialOffset;
         this.maxWindowBytes = maxWindowBytes;
         this.closed = false;
-        this.onOffsetAdvanced = onOffsetAdvanced;
+        this.onProgress = onProgress;
     }
 
     /** Sets the wake-up signal used to nudge the read-pool worker after a window completes. */
@@ -121,14 +126,14 @@ public final class IndexReplicator implements AutoCloseable {
     /**
      * Poll the WAL for one window. Strict single-window serialization: if a window is already in
      * flight, returns immediately without reading. Otherwise reads one deterministic window
-     * starting at {@code indexPushedOffset}, derives index batches, and stages them in the {@link
-     * IndexAccumulator}. The pushed offset is advanced only when every batch of the window is
-     * acknowledged (see {@link #onWindowComplete(long)}), preserving at-least-once delivery.
+     * starting at each index's pushed offset, derives index batches, and stages them in the {@link
+     * IndexAccumulator}. Each index's pushed offset is advanced only when every batch of that
+     * index's window is acknowledged, preserving at-least-once delivery.
      *
      * @return {@code true} if a window was read (work was done), {@code false} otherwise
      */
     public boolean poll() {
-        if (closed || inFlightWindow != null) {
+        if (closed) {
             return false;
         }
 
@@ -138,23 +143,31 @@ public final class IndexReplicator implements AutoCloseable {
             return false;
         }
 
-        if (indexPushedOffset < 0) {
-            indexPushedOffset = logTablet.logStartOffset();
-        }
-
-        long readOffset = nextReadOffset();
         long hw = logTablet.getHighWatermark();
-        if (readOffset >= hw) {
-            return false;
+        boolean polled = false;
+        for (IndexProgressState state : indexStates) {
+            if (closed || accumulator.isFull()) {
+                break;
+            }
+            if (state.inFlightWindow != null) {
+                continue;
+            }
+            if (state.pushedOffset < 0) {
+                state.pushedOffset = logTablet.logStartOffset();
+            }
+            long readOffset = nextReadOffset(state);
+            if (readOffset >= hw) {
+                continue;
+            }
+            polled |= pollOneWindow(state, readOffset);
         }
-
-        return pollOneWindow(readOffset);
+        return polled;
     }
 
     /**
      * Read and process a single window of WAL records. Returns {@code true} if a window was read.
      */
-    private boolean pollOneWindow(long readOffset) {
+    private boolean pollOneWindow(IndexProgressState state, long readOffset) {
         FetchDataInfo fetchData;
         try {
             fetchData =
@@ -166,14 +179,14 @@ public final class IndexReplicator implements AutoCloseable {
 
         LogRecords records = fetchData.getRecords();
         Map<TableBucket, BucketBatchBuilder> builders = new HashMap<>();
-        long lastProcessedOffset = indexPushedOffset;
+        long lastProcessedOffset = state.pushedOffset;
 
         boolean stoppedAtUnmatchedUpdateBefore = false;
         for (LogRecordBatch batch : records.batches()) {
             try (CloseableIterator<LogRecord> iter = batch.records(readContext)) {
                 while (iter.hasNext()) {
                     LogRecord record = iter.next();
-                    long processedOffset = deriveAndAppend(record, builders);
+                    long processedOffset = deriveAndAppend(state, record, builders);
                     if (processedOffset < 0) {
                         stoppedAtUnmatchedUpdateBefore = true;
                         break;
@@ -187,7 +200,7 @@ public final class IndexReplicator implements AutoCloseable {
         }
 
         // No records advanced: nothing to do this cycle.
-        if (lastProcessedOffset <= indexPushedOffset) {
+        if (lastProcessedOffset <= state.pushedOffset) {
             return false;
         }
 
@@ -212,49 +225,61 @@ public final class IndexReplicator implements AutoCloseable {
         }
 
         // A window that derives no index mutations is trivially complete: advance immediately so
-        // the
-        // pushed offset does not stall behind index-irrelevant WAL records.
+        // the pushed offset does not stall behind index-irrelevant WAL records.
         if (encoded.isEmpty()) {
-            advanceOnEmptyWindow(lastProcessedOffset);
+            advanceOnEmptyWindow(state, lastProcessedOffset);
             return true;
         }
 
         // Stage the window: create it first so each batch can reference it, then publish batches to
-        // the accumulator. inFlightWindow is set before publishing to enforce single-window serial.
-        IndexWindow window = new IndexWindow(lastProcessedOffset, encoded.size(), this);
-        this.inFlightWindow = window;
+        // the accumulator. The per-index in-flight window is set before publishing to enforce one
+        // outstanding window per index.
+        IndexWindow window =
+                new IndexWindow(state.spec.getIndexName(), lastProcessedOffset, encoded.size(), this);
+        state.inFlightWindow = window;
         for (Map.Entry<TableBucket, BytesView> entry : encoded.entrySet()) {
             accumulator.append(new IndexBatch(entry.getKey(), entry.getValue(), window));
         }
         return true;
     }
 
-    private void advanceOnEmptyWindow(long windowEndOffset) {
-        if (windowEndOffset > indexPushedOffset) {
-            indexPushedOffset = windowEndOffset;
-            onOffsetAdvanced.accept(windowEndOffset);
+    private void advanceOnEmptyWindow(IndexProgressState state, long windowEndOffset) {
+        if (advanceIndexState(state, windowEndOffset)) {
+            notifyProgress();
         }
     }
 
     @VisibleForTesting
     long nextReadOffset() {
-        if (pendingUpdateBefore == null) {
-            return indexPushedOffset;
+        if (indexStates.isEmpty()) {
+            return emptyIndexPushedOffset;
         }
-        return pendingUpdateBefore.offset + 1;
+        return nextReadOffset(indexStates.get(0));
+    }
+
+    private long nextReadOffset(IndexProgressState state) {
+        if (state.pendingUpdateBefore == null) {
+            return state.pushedOffset;
+        }
+        return state.pendingUpdateBefore.offset + 1;
     }
 
     /**
-     * Called by {@link IndexWindow} when all of its batches have been acknowledged. Advances the
-     * pushed offset to the window end, clears the in-flight window, notifies the owning replica,
-     * and wakes the read-pool worker so it can poll the next window.
+     * Called by {@link IndexWindow} when all of its batches have been acknowledged. Advances that
+     * index's pushed offset to the window end, clears the per-index in-flight window, notifies the
+     * owning replica, and wakes the read-pool worker so it can poll the next ready window.
      */
-    void onWindowComplete(long windowEndOffset) {
-        if (windowEndOffset > indexPushedOffset) {
-            indexPushedOffset = windowEndOffset;
+    void onWindowComplete(String indexName, long windowEndOffset) {
+        IndexProgressState state = indexStatesByName.get(indexName);
+        if (state == null) {
+            if (indexStates.isEmpty() && windowEndOffset > emptyIndexPushedOffset) {
+                emptyIndexPushedOffset = windowEndOffset;
+            }
+        } else {
+            advanceIndexState(state, windowEndOffset);
+            state.inFlightWindow = null;
         }
-        this.inFlightWindow = null;
-        onOffsetAdvanced.accept(windowEndOffset);
+        notifyProgress();
         Runnable signal = this.wakeupSignal;
         if (signal != null) {
             signal.run();
@@ -263,21 +288,33 @@ public final class IndexReplicator implements AutoCloseable {
 
     @VisibleForTesting
     long deriveAndAppend(LogRecord record, Map<TableBucket, BucketBatchBuilder> builders) {
+        if (indexStates.isEmpty()) {
+            return record.logOffset() + 1;
+        }
+        return deriveAndAppend(indexStates.get(0), record, builders);
+    }
+
+    private long deriveAndAppend(
+            IndexProgressState state,
+            LogRecord record,
+            Map<TableBucket, BucketBatchBuilder> builders) {
         ChangeType changeType = record.getChangeType();
         InternalRow row = record.getRow();
         long offset = record.logOffset();
 
-        if (pendingUpdateBefore != null) {
-            if (changeType == ChangeType.UPDATE_BEFORE && pendingUpdateBefore.offset == offset) {
-                pendingUpdateBefore = PendingUpdateBefore.from(offset, row, indexSpecs);
+        if (state.pendingUpdateBefore != null) {
+            if (changeType == ChangeType.UPDATE_BEFORE
+                    && state.pendingUpdateBefore.offset == offset) {
+                state.pendingUpdateBefore = PendingUpdateBefore.from(offset, state.spec, row);
                 return offset;
             }
-            if (changeType != ChangeType.UPDATE_AFTER || offset != pendingUpdateBefore.offset + 1) {
+            if (changeType != ChangeType.UPDATE_AFTER
+                    || offset != state.pendingUpdateBefore.offset + 1) {
                 LOG.warn(
                         "Index replication found UPDATE_BEFORE at offset {} not followed by "
                                 + "adjacent UPDATE_AFTER before offset {}; stop this window to "
                                 + "avoid advancing past an incomplete update pair",
-                        pendingUpdateBefore.offset,
+                        state.pendingUpdateBefore.offset,
                         offset);
                 return -1L;
             }
@@ -285,57 +322,32 @@ public final class IndexReplicator implements AutoCloseable {
 
         switch (changeType) {
             case INSERT:
-                appendForRow(null, row, builders);
-                clearPendingUpdateBefore();
+                appendOneSpec(state.spec, (InternalRow) null, row, builders);
+                clearPendingUpdateBefore(state);
                 return offset + 1;
             case UPDATE_BEFORE:
-                pendingUpdateBefore = PendingUpdateBefore.from(offset, row, indexSpecs);
+                state.pendingUpdateBefore = PendingUpdateBefore.from(offset, state.spec, row);
                 return offset;
             case UPDATE_AFTER:
-                if (pendingUpdateBefore == null) {
-                    appendForRow(null, row, builders);
+                if (state.pendingUpdateBefore == null) {
+                    appendOneSpec(state.spec, (InternalRow) null, row, builders);
                 } else {
-                    appendForPendingUpdate(pendingUpdateBefore, row, builders);
+                    appendOneSpec(state.spec, state.pendingUpdateBefore.oldEntry, row, builders);
                 }
-                clearPendingUpdateBefore();
+                clearPendingUpdateBefore(state);
                 return offset + 1;
             case DELETE:
-                appendForRow(row, null, builders);
-                clearPendingUpdateBefore();
+                appendOneSpec(state.spec, row, null, builders);
+                clearPendingUpdateBefore(state);
                 return offset + 1;
             default:
-                clearPendingUpdateBefore();
+                clearPendingUpdateBefore(state);
                 return offset + 1;
         }
     }
 
-    private void clearPendingUpdateBefore() {
-        pendingUpdateBefore = null;
-    }
-
-    private int appendForRow(
-            @Nullable InternalRow oldRow,
-            @Nullable InternalRow newRow,
-            Map<TableBucket, BucketBatchBuilder> builders) {
-        if (oldRow == null && newRow == null) {
-            return 0;
-        }
-        int count = 0;
-        for (IndexSpec spec : indexSpecs) {
-            count += appendOneSpec(spec, oldRow, newRow, builders);
-        }
-        return count;
-    }
-
-    private int appendForPendingUpdate(
-            PendingUpdateBefore pending,
-            InternalRow newRow,
-            Map<TableBucket, BucketBatchBuilder> builders) {
-        int count = 0;
-        for (int i = 0; i < indexSpecs.size(); i++) {
-            count += appendOneSpec(indexSpecs.get(i), pending.oldEntries[i], newRow, builders);
-        }
-        return count;
+    private void clearPendingUpdateBefore(IndexProgressState state) {
+        state.pendingUpdateBefore = null;
     }
 
     @VisibleForTesting
@@ -391,14 +403,42 @@ public final class IndexReplicator implements AutoCloseable {
                                 (short) spec.getIndexSchemaId(), spec.getIndexKvFormat()));
     }
 
-    public long getIndexPushedOffset() {
-        return indexPushedOffset;
+    public long getSyncIndexPushedOffset() {
+        long min = Long.MAX_VALUE;
+        boolean hasSyncIndex = false;
+        for (IndexProgressState state : indexStates) {
+            if (state.spec.isSync()) {
+                hasSyncIndex = true;
+                min = Math.min(min, state.pushedOffset);
+            }
+        }
+        if (hasSyncIndex) {
+            return min;
+        }
+        return indexStates.isEmpty() ? emptyIndexPushedOffset : Long.MAX_VALUE;
     }
 
-    public void advanceIndexPushedOffset(long newOffset) {
-        if (newOffset > indexPushedOffset) {
-            indexPushedOffset = newOffset;
+    public long getAllIndexPushedOffset() {
+        if (indexStates.isEmpty()) {
+            return emptyIndexPushedOffset;
         }
+        long min = Long.MAX_VALUE;
+        for (IndexProgressState state : indexStates) {
+            min = Math.min(min, state.pushedOffset);
+        }
+        return min;
+    }
+
+    private boolean advanceIndexState(IndexProgressState state, long newOffset) {
+        if (newOffset > state.pushedOffset) {
+            state.pushedOffset = newOffset;
+            return true;
+        }
+        return false;
+    }
+
+    private void notifyProgress() {
+        onProgress.onProgress(getSyncIndexPushedOffset(), getAllIndexPushedOffset());
     }
 
     @Override
@@ -410,22 +450,29 @@ public final class IndexReplicator implements AutoCloseable {
         return closed;
     }
 
+    private static final class IndexProgressState {
+        private final IndexSpec spec;
+        private volatile long pushedOffset;
+        @Nullable private volatile IndexWindow inFlightWindow;
+        @Nullable private PendingUpdateBefore pendingUpdateBefore;
+
+        private IndexProgressState(IndexSpec spec, long initialOffset) {
+            this.spec = spec;
+            this.pushedOffset = initialOffset;
+        }
+    }
+
     private static final class PendingUpdateBefore {
         private final long offset;
-        private final OldIndexEntry[] oldEntries;
+        private final OldIndexEntry oldEntry;
 
-        private PendingUpdateBefore(long offset, OldIndexEntry[] oldEntries) {
+        private PendingUpdateBefore(long offset, OldIndexEntry oldEntry) {
             this.offset = offset;
-            this.oldEntries = oldEntries;
+            this.oldEntry = oldEntry;
         }
 
-        private static PendingUpdateBefore from(
-                long offset, InternalRow row, List<IndexSpec> indexSpecs) {
-            OldIndexEntry[] oldEntries = new OldIndexEntry[indexSpecs.size()];
-            for (int i = 0; i < indexSpecs.size(); i++) {
-                oldEntries[i] = OldIndexEntry.from(indexSpecs.get(i), row);
-            }
-            return new PendingUpdateBefore(offset, oldEntries);
+        private static PendingUpdateBefore from(long offset, IndexSpec indexSpec, InternalRow row) {
+            return new PendingUpdateBefore(offset, OldIndexEntry.from(indexSpec, row));
         }
     }
 

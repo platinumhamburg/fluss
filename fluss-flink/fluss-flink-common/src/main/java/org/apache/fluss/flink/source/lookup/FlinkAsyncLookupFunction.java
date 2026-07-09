@@ -141,13 +141,11 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     public CompletableFuture<Collection<RowData>> asyncLookup(RowData keyRow) {
         RowData normalizedKeyRow = lookupNormalizer.normalizeLookupKey(keyRow);
         RemainingFilter remainingFilter = lookupNormalizer.createRemainingFilter(keyRow);
-        // Must create a per-call FlinkAsFlussRow — SecondaryIndexLookuper captures the lookupKey
-        // reference in its thenCompose lambda and re-reads it in idxColsMatch after hop2 completes.
-        // Reusing a single shared instance would let later calls overwrite earlier calls' key data.
+        // Bind a wrapper to this call. Multiple async lookups can be in flight at the same time, so a
+        // shared mutable wrapper would let a later call overwrite an earlier call's key data.
         InternalRow flussKeyRow = new FlinkAsFlussRow(normalizedKeyRow);
 
-        // the retry mechanism is now handled by the underlying LookupClient layer,
-        // we can't call lookuper.lookup() in whenComplete callback as lookuper is not thread-safe.
+        // the retry mechanism is now handled by the underlying LookupClient layer.
         CompletableFuture<Collection<RowData>> future = new CompletableFuture<>();
         lookuper.lookup(flussKeyRow)
                 .whenComplete(

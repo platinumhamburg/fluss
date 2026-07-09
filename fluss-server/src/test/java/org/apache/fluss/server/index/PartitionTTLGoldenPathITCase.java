@@ -22,6 +22,8 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.Schema;
@@ -120,14 +122,18 @@ class PartitionTTLGoldenPathITCase {
                         .column("b", DataTypes.STRING())
                         .column("p", DataTypes.STRING())
                         .primaryKey("a", "p")
-                        .index(INDEX_NAME, "b")
+                        .index(
+                                INDEX_NAME,
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
                 TableDescriptor.builder()
                         .schema(partitionedSchema)
                         .distributedBy(3, "a")
                         .partitionedBy("p")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "3")
                         .build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);

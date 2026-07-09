@@ -18,6 +18,8 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -109,14 +111,18 @@ class TombstonedPartitionDiscriminatorTest {
                         .column("user_id", DataTypes.BIGINT())
                         .column("dt", DataTypes.STRING())
                         .primaryKey("order_id", "dt")
-                        .index("idx_user", "user_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                java.util.Collections.singletonList("user_id"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
 
         return TableDescriptor.builder()
                 .schema(schema)
                 .partitionedBy("dt")
                 .distributedBy(1, "order_id")
-                .property(ConfigOptions.secondaryIndexBucketNumKey("idx_user"), "1")
                 .build();
     }
 }

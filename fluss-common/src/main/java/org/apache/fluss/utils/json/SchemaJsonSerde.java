@@ -19,6 +19,7 @@ package org.apache.fluss.utils.json;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
@@ -44,6 +45,8 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
     private static final String INDEX_NAME = "name";
     private static final String INDEX_COLUMNS_NAME = "columns";
     private static final String INDEX_TYPE_NAME = "type";
+    private static final String INDEX_VISIBILITY_NAME = "visibility";
+    private static final String INDEX_BUCKET_NUM_NAME = "bucket_num";
     private static final int VERSION = 1;
 
     @Override
@@ -84,6 +87,10 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
                 generator.writeStartObject();
                 generator.writeStringField(INDEX_NAME, index.getIndexName());
                 generator.writeStringField(INDEX_TYPE_NAME, index.getIndexType().name());
+                generator.writeStringField(INDEX_VISIBILITY_NAME, index.getVisibility().name());
+                if (index.getBucketCount().isPresent()) {
+                    generator.writeNumberField(INDEX_BUCKET_NUM_NAME, index.getBucketCount().get());
+                }
                 generator.writeArrayFieldStart(INDEX_COLUMNS_NAME);
                 for (String columnName : index.getColumnNames()) {
                     generator.writeString(columnName);
@@ -139,7 +146,15 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
                 while (indexColumnJsons.hasNext()) {
                     columnNames.add(indexColumnJsons.next().asText());
                 }
-                builder.index(indexName, indexType, columnNames);
+                IndexVisibility visibility = IndexVisibility.SYNC;
+                if (indexNode.has(INDEX_VISIBILITY_NAME)) {
+                    visibility = IndexVisibility.valueOf(indexNode.get(INDEX_VISIBILITY_NAME).asText());
+                }
+                Integer bucketCount = null;
+                if (indexNode.has(INDEX_BUCKET_NUM_NAME)) {
+                    bucketCount = indexNode.get(INDEX_BUCKET_NUM_NAME).asInt();
+                }
+                builder.index(indexName, indexType, columnNames, visibility, bucketCount);
             }
         }
 

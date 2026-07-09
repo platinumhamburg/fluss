@@ -19,6 +19,7 @@ package org.apache.fluss.flink.utils;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.flink.catalog.TestSchemaResolver;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -635,10 +636,11 @@ public class FlinkConversionsTest {
     }
 
     @Test
-    void testIgnoresNonColumnSecondaryIndexProperties() {
+    void testSecondaryIndexOptionsBecomeIndexMetadata() {
         Map<String, String> options = new HashMap<>();
         options.put("secondary-index.idx_email.columns", "email");
         options.put("secondary-index.idx_email.bucket.num", "4");
+        options.put("secondary-index.idx_email.visibility", "async");
         options.put("index.visibility", "sync");
         options.put("connector", "fluss");
         options.put("bootstrap.servers", "localhost:9092");
@@ -660,10 +662,24 @@ public class FlinkConversionsTest {
         TableDescriptor descriptor = FlinkConversions.toFlussTable(resolvedCatalogTable);
 
         assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
-        assertThat(descriptor.getSchema().getIndexes().get(0).getIndexName())
-                .isEqualTo("idx_email");
-        assertThat(descriptor.getSchema().getIndexes().get(0).getColumnNames())
-                .containsExactly("email");
+        org.apache.fluss.metadata.Schema.Index index =
+                descriptor.getSchema().getIndexes().get(0);
+        assertThat(index.getIndexName()).isEqualTo("idx_email");
+        assertThat(index.getColumnNames()).containsExactly("email");
+        assertThat(index.getVisibility()).isEqualTo(IndexVisibility.ASYNC);
+        assertThat(index.getBucketCount()).hasValue(4);
+        assertThat(descriptor.getProperties())
+                .doesNotContainKeys(
+                        "index.visibility",
+                        "secondary-index.idx_email.columns",
+                        "secondary-index.idx_email.visibility",
+                        "secondary-index.idx_email.bucket.num");
+        assertThat(descriptor.getCustomProperties())
+                .doesNotContainKeys(
+                        "index.visibility",
+                        "secondary-index.idx_email.columns",
+                        "secondary-index.idx_email.visibility",
+                        "secondary-index.idx_email.bucket.num");
     }
 
     /** Test refresh handler for testing purpose. */

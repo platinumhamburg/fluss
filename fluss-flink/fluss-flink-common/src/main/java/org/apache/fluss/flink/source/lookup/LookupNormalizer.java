@@ -25,6 +25,7 @@ import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.RowData.FieldGetter;
+import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 
@@ -126,10 +127,20 @@ public class LookupNormalizer implements Serializable {
         for (int i = 0; i < conditionFieldGetters.length; i++) {
             fieldConditions[i] =
                     new FieldCondition(
-                            conditionFieldGetters[i].getFieldOrNull(lookupKey),
+                            copyConditionValue(conditionFieldGetters[i].getFieldOrNull(lookupKey)),
                             resultFieldGetters[i]);
         }
         return new RemainingFilter(fieldConditions);
+    }
+
+    private static Object copyConditionValue(Object value) {
+        if (value instanceof byte[]) {
+            return ((byte[]) value).clone();
+        }
+        if (value instanceof StringData) {
+            return StringData.fromString(value.toString());
+        }
+        return value;
     }
 
     /** A filter to check if the lookup result matches the remaining conditions. */

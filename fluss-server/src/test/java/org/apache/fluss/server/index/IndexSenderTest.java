@@ -32,6 +32,7 @@ import org.apache.fluss.utils.MapUtils;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.OptionalInt;
@@ -40,6 +41,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Unit tests for {@link IndexSender} per-bucket in-flight muting and at-least-once retry. */
@@ -105,18 +107,14 @@ public class IndexSenderTest {
 
     private static IndexReplicator owner(IndexAccumulator accumulator) {
         return new IndexReplicator(
-                null, Collections.emptyList(), accumulator, null, 0L, 1024, off -> {});
+                null, Collections.emptyList(), accumulator, null, 0L, 1024, (sync, all) -> {});
     }
 
-    private static void await(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5_000L;
-        while (System.currentTimeMillis() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(10L);
-        }
-        throw new AssertionError("Condition was not met within timeout");
+    private static void await(BooleanSupplier condition) {
+        waitUntil(
+                condition::getAsBoolean,
+                Duration.ofSeconds(5),
+                "Condition was not met within timeout");
     }
 
     @Test
@@ -125,7 +123,7 @@ public class IndexSenderTest {
         RecordingGateway gateway = new RecordingGateway();
         TableBucket bucket = new TableBucket(90L, 0);
         IndexReplicator owner = owner(accumulator);
-        accumulator.append(batch(bucket, new IndexWindow(10L, 1, owner)));
+        accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
 
         IndexSender sender =
                 new IndexSender(
@@ -138,7 +136,7 @@ public class IndexSenderTest {
         try {
             await(() -> gateway.pending.size() == 1);
             gateway.pending.get(0).complete(ackResponse(0));
-            await(() -> owner.getIndexPushedOffset() == 10L);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
         } finally {
             sender.close();
         }
@@ -159,12 +157,15 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(100L, 0);
             IndexReplicator owner = owner(accumulator);
-            accumulator.append(batch(bucket, new IndexWindow(10L, 1, owner)));
-            accumulator.append(batch(bucket, new IndexWindow(20L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 20L, 1, owner)));
 
             // Only the first batch is dispatched; the bucket is muted until its ack.
             await(() -> gateway.pending.size() == 1);
-            Thread.sleep(50L);
+            assertThat(sender.inFlightRequestCount()).isEqualTo(1);
+            assertThat(accumulator.hasPending(bucket))
+                    .as("second batch must stay queued while the first is in flight")
+                    .isTrue();
             assertThat(gateway.pending.size())
                     .as("second batch must not be sent while the first is in flight")
                     .isEqualTo(1);
@@ -172,11 +173,11 @@ public class IndexSenderTest {
             // Ack the first send -> bucket unmuted -> second batch dispatched.
             gateway.pending.get(0).complete(ackResponse(0));
             await(() -> gateway.pending.size() == 2);
-            assertThat(owner.getIndexPushedOffset()).isEqualTo(10L);
+            assertThat(owner.getSyncIndexPushedOffset()).isEqualTo(10L);
 
             // Ack the second send -> the second window advances the pushed offset.
             gateway.pending.get(1).complete(ackResponse(0));
-            await(() -> owner.getIndexPushedOffset() == 20L);
+            await(() -> owner.getSyncIndexPushedOffset() == 20L);
         } finally {
             sender.close();
         }
@@ -199,17 +200,17 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(200L, 0);
             IndexReplicator owner = owner(accumulator);
-            accumulator.append(batch(bucket, new IndexWindow(10L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
 
             // Failure re-enqueues for retry: more than one send attempt is observed.
             await(() -> gateway.pending.size() >= 2);
-            assertThat(owner.getIndexPushedOffset())
+            assertThat(owner.getSyncIndexPushedOffset())
                     .as("offset must not advance while sends keep failing")
                     .isEqualTo(0L);
 
             // Recover: the next attempt auto-succeeds and the offset finally advances.
             gateway.failNext = false;
-            await(() -> owner.getIndexPushedOffset() == 10L);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
         } finally {
             sender.close();
         }
@@ -234,24 +235,27 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(250L, 0);
             IndexReplicator owner = owner(accumulator);
-            accumulator.append(batch(bucket, new IndexWindow(10L, 1, owner)));
-            accumulator.append(batch(bucket, new IndexWindow(20L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 20L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             gateway.pending.get(0).completeExceptionally(new RuntimeException("first failed"));
 
             await(() -> gateway.pending.size() == 2);
-            Thread.sleep(50L);
+            assertThat(sender.inFlightRequestCount()).isEqualTo(1);
+            assertThat(accumulator.hasPending(bucket))
+                    .as("later batch must stay queued while the failed head is being retried")
+                    .isTrue();
             assertThat(gateway.pending.size())
                     .as("later batch must not be sent while the failed head is being retried")
                     .isEqualTo(2);
 
             gateway.pending.get(1).complete(ackResponse(0));
-            await(() -> owner.getIndexPushedOffset() == 10L);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
             await(() -> gateway.pending.size() == 3);
 
             gateway.pending.get(2).complete(ackResponse(0));
-            await(() -> owner.getIndexPushedOffset() == 20L);
+            await(() -> owner.getSyncIndexPushedOffset() == 20L);
         } finally {
             sender.close();
         }
@@ -275,7 +279,7 @@ public class IndexSenderTest {
             IndexReplicator owner = owner(accumulator);
             // One window spanning two index buckets of the same table; it completes only once both
             // buckets are acked.
-            IndexWindow window = new IndexWindow(10L, 2, owner);
+            IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
             accumulator.append(batch(new TableBucket(300L, 0), window));
             accumulator.append(batch(new TableBucket(300L, 1), window));
 
@@ -283,14 +287,13 @@ public class IndexSenderTest {
             // even though bucket 0 was acked. A buggy "RPC-ok == whole-batch-acked" sender would
             // wrongly advance the offset here.
             await(() -> gateway.pending.size() >= 3);
-            Thread.sleep(50L);
-            assertThat(owner.getIndexPushedOffset())
+            assertThat(owner.getSyncIndexPushedOffset())
                     .as("a per-bucket failure must not advance the pushed offset")
                     .isEqualTo(0L);
 
             // Recover bucket 1: the window now completes and the offset advances to the window end.
             gateway.failBuckets.clear();
-            await(() -> owner.getIndexPushedOffset() == 10L);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
         } finally {
             sender.close();
         }
@@ -315,7 +318,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(400L, 0);
             IndexReplicator owner = owner(accumulator);
-            accumulator.append(batch(bucket, new IndexWindow(10L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             assertThat(sender.inFlightRequestCount()).isEqualTo(1);
@@ -323,12 +326,12 @@ public class IndexSenderTest {
             // The first future is never completed by the gateway. The sender-side timeout must
             // unmute and retry the bucket instead of leaving the window stuck forever.
             await(() -> gateway.pending.size() >= 2);
-            assertThat(owner.getIndexPushedOffset())
+            assertThat(owner.getSyncIndexPushedOffset())
                     .as("timeout must not ack or advance the window")
                     .isEqualTo(0L);
 
             gateway.pending.get(1).complete(ackResponse(0));
-            await(() -> owner.getIndexPushedOffset() == 10L);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
             await(() -> sender.inFlightRequestCount() == 0);
         } finally {
             sender.close();
@@ -350,7 +353,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(500L, 0);
             IndexReplicator owner = owner(accumulator);
-            accumulator.append(batch(bucket, new IndexWindow(10L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             assertThat(accumulator.pendingBytes()).isEqualTo(3L);
@@ -359,7 +362,7 @@ public class IndexSenderTest {
             gateway.pending.get(0).complete(ackResponse(0));
 
             await(() -> sender.inFlightRequestCount() == 0);
-            assertThat(owner.getIndexPushedOffset())
+            assertThat(owner.getSyncIndexPushedOffset())
                     .as("a closed owner must not be advanced by a late ack")
                     .isEqualTo(0L);
             assertThat(accumulator.pendingBytes()).isZero();
@@ -384,7 +387,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(600L, 0);
             IndexReplicator owner = owner(accumulator);
-            accumulator.append(batch(bucket, new IndexWindow(10L, 1, owner)));
+            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             assertThat(accumulator.pendingBytes()).isEqualTo(3L);
@@ -393,7 +396,6 @@ public class IndexSenderTest {
             gateway.pending.get(0).completeExceptionally(new RuntimeException("late failure"));
 
             await(() -> sender.inFlightRequestCount() == 0);
-            Thread.sleep(50L);
             assertThat(gateway.pending)
                     .as("closed-owner batch must not be re-enqueued for retry")
                     .hasSize(1);

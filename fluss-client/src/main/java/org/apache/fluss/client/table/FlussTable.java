@@ -112,13 +112,12 @@ public class FlussTable implements Table {
      *       candidate {@code (idxCols, basePK)} rows.
      *   <li>Hop 2: point-get the main table for each candidate {@code basePK}. Rows that have been
      *       deleted upstream are dropped (empty main lookup result).
-     *   <li>Recheck: re-evaluate the index columns of every surviving main row against the original
-     *       lookup key; rows that no longer match are discarded as stale index pointers.
+     *   <li>Recheck: re-evaluate the index columns of every surviving main row against the lookup
+     *       key values captured at lookup entry; rows that no longer match are discarded as stale
+     *       index pointers.
      * </ul>
      *
-     * <p>The returned lookuper is {@link javax.annotation.concurrent.NotThreadSafe}; callers should
-     * obtain a separate instance per concurrent caller (mirroring the contract of {@link
-     * Lookup#createLookuper()}).
+     * <p>The returned lookuper can be reused by concurrent callers.
      *
      * @param indexName the name of the secondary index as declared via {@code Schema.Builder.index}
      * @return a {@link SecondaryIndexLookuper} wired against this table and its Index Table

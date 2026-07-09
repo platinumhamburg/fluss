@@ -32,8 +32,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * End-to-end Foundation integration test for FIP V2.
  *
- * <p>Validates that Schema.index DDL + namespaced properties + TableInfo back-link accessors
- * compose into a coherent Index Table foundation.
+ * <p>Validates that Schema.index metadata + TableInfo back-link accessors compose into a coherent
+ * Index Table foundation.
  */
 class IndexTableFoundationITCase {
 
@@ -45,16 +45,15 @@ class IndexTableFoundationITCase {
                         .column("user_id", DataTypes.BIGINT())
                         .column("dt", DataTypes.STRING())
                         .primaryKey("order_id", "dt")
-                        .index("idx_user", "user_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                Arrays.asList("user_id"),
+                                IndexVisibility.SYNC,
+                                8)
                         .build();
 
-        TableDescriptor main =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .partitionedBy("dt")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_user"), "8")
-                        .property(ConfigOptions.INDEX_VISIBILITY, IndexVisibility.SYNC)
-                        .build();
+        TableDescriptor main = TableDescriptor.builder().schema(schema).partitionedBy("dt").build();
 
         Schema indexSchema =
                 Schema.newBuilder()
@@ -80,6 +79,9 @@ class IndexTableFoundationITCase {
                         .build();
 
         assertThat(derived.isIndexTable()).isTrue();
+        assertThat(main.getSchema().getIndexes().get(0).getVisibility())
+                .isEqualTo(IndexVisibility.SYNC);
+        assertThat(main.getSchema().getIndexes().get(0).getBucketCount()).hasValue(8);
         assertThat(derived.getKvFormat()).isEqualTo(KvFormat.ALIGNED);
         assertThat(derived.getLogFormat()).isEqualTo(LogFormat.COMPACTED);
         assertThat(derived.getChangelogImage()).isEqualTo(ChangelogImage.WAL);

@@ -19,6 +19,8 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
@@ -27,6 +29,8 @@ import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.IndexTableUtils;
 
 import org.junit.jupiter.api.Test;
+
+import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -42,14 +46,19 @@ class IndexTableDescriptorFactoryTest {
                         .column("user_id", DataTypes.BIGINT())
                         .column("dt", DataTypes.STRING())
                         .primaryKey("order_id", "dt")
-                        .index("idx_user", "user_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("user_id"),
+                                IndexVisibility.SYNC,
+                                16)
                         .build();
 
         TableDescriptor mainDescriptor =
                 TableDescriptor.builder()
                         .schema(mainSchema)
                         .partitionedBy("dt")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_user"), "16")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
                         .build();
 
         TableDescriptor derived =
@@ -69,6 +78,8 @@ class IndexTableDescriptorFactoryTest {
         assertThat(derived.isIndexTable()).isTrue();
         assertThat(derived.getProperties())
                 .containsEntry(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key(), "1234");
+        assertThat(derived.getProperties())
+                .doesNotContainKey(ConfigOptions.TABLE_DATALAKE_ENABLED.key());
 
         Schema dSchema = derived.getSchema();
         assertThat(dSchema.getPrimaryKey()).isPresent();
@@ -176,13 +187,17 @@ class IndexTableDescriptorFactoryTest {
                         .column("user_id", DataTypes.BIGINT())
                         .column("dt", DataTypes.STRING())
                         .primaryKey("order_id", "dt")
-                        .index("idx_user", "user_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("user_id"),
+                                IndexVisibility.SYNC,
+                                8)
                         .build();
         TableDescriptor main =
                 TableDescriptor.builder()
                         .schema(mainSchema)
                         .partitionedBy("dt")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_user"), "8")
                         .build();
 
         TableDescriptor derived =

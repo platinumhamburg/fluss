@@ -33,7 +33,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class IndexAccumulatorTest {
 
     private static IndexBatch batch(TableBucket targetBucket) {
-        return batch(targetBucket, new IndexWindow(1L, 1, replicator(new IndexAccumulator())));
+        return batch(
+                targetBucket, new IndexWindow("idx", 1L, 1, replicator(new IndexAccumulator())));
     }
 
     private static IndexBatch batch(TableBucket targetBucket, IndexWindow window) {
@@ -44,7 +45,7 @@ public class IndexAccumulatorTest {
 
     private static IndexReplicator replicator(IndexAccumulator accumulator) {
         return new IndexReplicator(
-                null, Collections.emptyList(), accumulator, null, 0L, 1024, off -> {});
+                null, Collections.emptyList(), accumulator, null, 0L, 1024, (sync, all) -> {});
     }
 
     @Test
@@ -112,10 +113,10 @@ public class IndexAccumulatorTest {
         // replicator, not per index table, otherwise it would wrongly drop a sibling bucket's
         // still-deliverable batches.
         TableBucket shared = new TableBucket(500L, 0);
-        accumulator.append(batch(shared, new IndexWindow(1L, 1, ownerA)));
-        accumulator.append(batch(shared, new IndexWindow(2L, 1, ownerB)));
+        accumulator.append(batch(shared, new IndexWindow("idx", 1L, 1, ownerA)));
+        accumulator.append(batch(shared, new IndexWindow("idx", 2L, 1, ownerB)));
         TableBucket otherBucket = new TableBucket(500L, 1);
-        accumulator.append(batch(otherBucket, new IndexWindow(3L, 1, ownerA)));
+        accumulator.append(batch(otherBucket, new IndexWindow("idx", 3L, 1, ownerA)));
 
         int dropped = accumulator.dropForReplicator(ownerA);
 

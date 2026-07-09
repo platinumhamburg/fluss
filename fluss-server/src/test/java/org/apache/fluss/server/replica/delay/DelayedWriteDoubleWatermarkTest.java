@@ -72,8 +72,8 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
         assertThat(delayedWrite.tryComplete()).isFalse();
         assertThat(callbackResult.get()).isNull();
 
-        // Advance index offset to the requirement: tryComplete must now succeed.
-        replica.advanceIndexPushedOffset(7L);
+        // Advance sync index offset to the requirement: tryComplete must now succeed.
+        replica.advanceIndexProgress(7L, 7L);
         assertThat(delayedWrite.tryComplete()).isTrue();
         assertThat(callbackResult.get()).hasSize(1);
         assertThat(callbackResult.get().get(0).getErrorCode()).isEqualTo(Errors.NONE.code());
@@ -97,7 +97,7 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
 
         // HW satisfied, index offset still at the sentinel (-1L): stall.
         replica.getLogTablet().updateHighWatermark(REQUIRED_HW);
-        assertThat(replica.getIndexPushedOffset()).isEqualTo(-1L);
+        assertThat(replica.getSyncIndexPushedOffset()).isEqualTo(-1L);
         assertThat(delayedWrite.tryComplete()).isFalse();
         assertThat(callbackResult.get()).isNull();
 
@@ -124,7 +124,7 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
                         callbackResult::set);
 
         // Legacy single-watermark behavior: completing on HW alone, no index check.
-        assertThat(replica.getIndexPushedOffset()).isEqualTo(-1L);
+        assertThat(replica.getSyncIndexPushedOffset()).isEqualTo(-1L);
         replica.getLogTablet().updateHighWatermark(REQUIRED_HW);
         assertThat(delayedWrite.tryComplete()).isTrue();
         assertThat(callbackResult.get()).hasSize(1);
@@ -149,12 +149,12 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
 
         // HW satisfied; index offset still lagging.
         replica.getLogTablet().updateHighWatermark(REQUIRED_HW);
-        replica.advanceIndexPushedOffset(8L);
+        replica.advanceIndexProgress(8L, 8L);
         assertThat(delayedWrite.tryComplete()).isFalse();
         assertThat(callbackResult.get()).isNull();
 
         // Advance index offset to required value; second tryComplete must succeed.
-        replica.advanceIndexPushedOffset(9L);
+        replica.advanceIndexProgress(9L, 9L);
         assertThat(delayedWrite.tryComplete()).isTrue();
         assertThat(callbackResult.get()).hasSize(1);
     }
@@ -186,7 +186,7 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
 
         // Replica lookup throws -> error path -> completes immediately despite index lag.
         // Note: replica is irrelevant here, so index-offset state cannot have advanced.
-        assertThat(replica.getIndexPushedOffset()).isEqualTo(-1L);
+        assertThat(replica.getSyncIndexPushedOffset()).isEqualTo(-1L);
         assertThat(delayedWrite.tryComplete()).isTrue();
         assertThat(callbackResult.get()).hasSize(1);
         assertThat(callbackResult.get().get(0).getErrorCode()).isNotEqualTo(Errors.NONE.code());

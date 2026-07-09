@@ -22,15 +22,28 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.utils.json.JsonSerdeTestBase;
 
+import org.junit.jupiter.api.Test;
+
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde}. */
 class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot> {
 
     protected CompletedSnapshotJsonSerdeTest() {
         super(CompletedSnapshotJsonSerde.INSTANCE);
+    }
+
+    @Test
+    void testTabletStateRetainsAllIndexReplayFloor() {
+        TabletState state =
+                new TabletState(
+                        100L, 10L, 40L, Collections.<AutoIncIDRange>emptyList());
+
+        assertThat(state.getMinRetainLogOffset()).isEqualTo(40L);
     }
 
     @Override

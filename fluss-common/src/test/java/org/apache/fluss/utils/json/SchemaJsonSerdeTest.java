@@ -18,6 +18,8 @@
 package org.apache.fluss.utils.json;
 
 import org.apache.fluss.metadata.AggFunctions;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.types.DataTypes;
 
@@ -196,6 +198,53 @@ public class SchemaJsonSerdeTest extends JsonSerdeTestBase<Schema> {
         Schema decoded = JsonSerdeUtils.readValue(bytes, SchemaJsonSerde.INSTANCE);
 
         assertThat(decoded.getIndexes()).isEqualTo(original.getIndexes());
+    }
+
+    @Test
+    void testIndexJsonSerdePreservesVisibilityAndBucketCount() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("email", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("email"),
+                                IndexVisibility.ASYNC,
+                                7)
+                        .build();
+
+        byte[] json = JsonSerdeUtils.writeValueAsBytes(schema, SchemaJsonSerde.INSTANCE);
+        Schema restored = JsonSerdeUtils.readValue(json, SchemaJsonSerde.INSTANCE);
+
+        Schema.Index index = restored.getIndexes().get(0);
+        assertThat(index.getIndexName()).isEqualTo("idx_email");
+        assertThat(index.getColumnNames()).containsExactly("email");
+        assertThat(index.getVisibility()).isEqualTo(IndexVisibility.ASYNC);
+        assertThat(index.getBucketCount()).hasValue(7);
+    }
+
+    @Test
+    void testLegacyIndexJsonDefaultsToSyncVisibilityAndNoBucketCount() {
+        String json =
+                "{"
+                        + "\"version\":1,"
+                        + "\"columns\":[{\"name\":\"id\",\"data_type\":{\"type\":\"INTEGER\"},\"id\":0},"
+                        + "{\"name\":\"email\",\"data_type\":{\"type\":\"STRING\"},\"id\":1}],"
+                        + "\"primary_key\":[\"id\"],"
+                        + "\"indexes\":[{\"name\":\"idx_email\",\"type\":\"SECONDARY\","
+                        + "\"columns\":[\"email\"]}],"
+                        + "\"highest_field_id\":1"
+                        + "}";
+
+        Schema restored =
+                JsonSerdeUtils.readValue(
+                        json.getBytes(StandardCharsets.UTF_8), SchemaJsonSerde.INSTANCE);
+
+        Schema.Index index = restored.getIndexes().get(0);
+        assertThat(index.getVisibility()).isEqualTo(IndexVisibility.SYNC);
+        assertThat(index.getBucketCount()).isEmpty();
     }
 
     @Test

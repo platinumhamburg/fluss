@@ -25,6 +25,8 @@ import org.apache.fluss.flink.adapter.CatalogTableAdapter;
 import org.apache.fluss.flink.catalog.FlinkCatalogFactory;
 import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
@@ -60,9 +62,11 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -91,6 +95,15 @@ import static org.apache.fluss.utils.PropertiesUtils.excludeByPrefix;
 
 /** Utils for conversion between Flink and Fluss. */
 public class FlinkConversions {
+
+    private static final String SECONDARY_INDEX_PREFIX = "secondary-index.";
+    private static final String SECONDARY_INDEX_COLUMNS_SUFFIX = ".columns";
+    private static final String SECONDARY_INDEX_VISIBILITY_SUFFIX = ".visibility";
+    private static final String SECONDARY_INDEX_BUCKET_NUM_SUFFIX = ".bucket.num";
+    private static final String TABLE_LEVEL_INDEX_VISIBILITY = "index.visibility";
+    private static final Pattern SECONDARY_INDEX_OPTION_PATTERN =
+            Pattern.compile(
+                    "secondary-index\\.([A-Za-z0-9_]+)(\\.columns|\\.visibility|\\.bucket\\.num)");
 
     private FlinkConversions() {}
 
@@ -711,23 +724,49 @@ public class FlinkConversions {
 
     /**
      * Parses secondary index configuration from Flink table options into schema builder index
-     * declarations. Only keys matching {@code secondary-index.<name>.columns} are processed; other
-     * per-index keys (e.g. {@code .bucket.num}, {@code .visibility}) are ignored.
+     * declarations.
      */
     private static void parseSecondaryIndexes(Configuration options, Schema.Builder schemaBuilder) {
-        Pattern pattern = Pattern.compile("secondary-index\\.([A-Za-z0-9_]+)\\.columns");
+        Map<String, SecondaryIndexOptions> byName = new TreeMap<>();
         for (Map.Entry<String, String> entry : options.toMap().entrySet()) {
-            Matcher matcher = pattern.matcher(entry.getKey());
-            if (matcher.matches()) {
-                String indexName = matcher.group(1);
-                List<String> columns =
-                        Arrays.stream(entry.getValue().split(","))
+            Matcher matcher = SECONDARY_INDEX_OPTION_PATTERN.matcher(entry.getKey());
+            if (!matcher.matches()) {
+                continue;
+            }
+            byName.computeIfAbsent(matcher.group(1), ignored -> new SecondaryIndexOptions())
+                    .set(matcher.group(2), entry.getValue());
+        }
+
+        byName.forEach(
+                (indexName, indexOptions) -> {
+                    if (!indexOptions.columns.isEmpty()) {
+                        schemaBuilder.index(
+                                indexName,
+                                IndexType.SECONDARY,
+                                indexOptions.columns,
+                                indexOptions.visibility,
+                                indexOptions.bucketCount);
+                    }
+                });
+    }
+
+    private static final class SecondaryIndexOptions {
+        private List<String> columns = Collections.emptyList();
+        private IndexVisibility visibility = IndexVisibility.SYNC;
+        private @Nullable Integer bucketCount;
+
+        private void set(String suffix, String value) {
+            if (SECONDARY_INDEX_COLUMNS_SUFFIX.equals(suffix)) {
+                columns =
+                        Arrays.stream(value.split(","))
                                 .map(String::trim)
                                 .filter(col -> !col.isEmpty())
                                 .collect(Collectors.toList());
-                if (!columns.isEmpty()) {
-                    schemaBuilder.index(indexName, columns);
-                }
+            } else if (SECONDARY_INDEX_VISIBILITY_SUFFIX.equals(suffix)) {
+                visibility =
+                        IndexVisibility.valueOf(value.trim().toUpperCase(Locale.ROOT));
+            } else if (SECONDARY_INDEX_BUCKET_NUM_SUFFIX.equals(suffix)) {
+                bucketCount = Integer.parseInt(value.trim());
             }
         }
     }
@@ -740,6 +779,12 @@ public class FlinkConversions {
         // properties.
         customProperties.remove(BUCKET_KEY.key());
         customProperties.remove(BUCKET_NUMBER.key());
+        customProperties
+                .keySet()
+                .removeIf(
+                        key ->
+                                key.equals(TABLE_LEVEL_INDEX_VISIBILITY)
+                                        || key.startsWith(SECONDARY_INDEX_PREFIX));
         return customProperties;
     }
 }

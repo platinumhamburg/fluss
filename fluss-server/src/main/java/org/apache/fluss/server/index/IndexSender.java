@@ -430,7 +430,7 @@ public final class IndexSender implements AutoCloseable {
      * Completes a chunk against the per-bucket outcomes carried in the PutKv response. A bucket is
      * acked only when the response reports no error for it; a bucket that reports an error (or is
      * absent from the response) is re-enqueued for retry. This keeps a failed index mutation from
-     * advancing its window's pushed offset, so index.visibility=SYNC never releases a main-table
+     * advancing its window's pushed offset, so SYNC visibility never releases a main-table
      * write whose index push has not actually landed.
      */
     private void completeByResponse(List<IndexBatch> batches, PutKvResponse response) {

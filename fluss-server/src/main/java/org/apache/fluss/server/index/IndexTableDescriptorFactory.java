@@ -89,20 +89,16 @@ public final class IndexTableDescriptorFactory {
         List<String> idxPk = new ArrayList<>(seen);
         Schema derivedSchema = Schema.newBuilder().fromColumns(columns).primaryKey(idxPk).build();
 
-        String bucketProp =
-                mainDescriptor
-                        .getProperties()
-                        .get(ConfigOptions.secondaryIndexBucketNumKey(indexName));
-        Integer bucketCount;
-        if (bucketProp != null) {
-            bucketCount = Integer.parseInt(bucketProp);
-        } else {
-            bucketCount =
-                    mainDescriptor
-                            .getTableDistribution()
-                            .flatMap(TableDescriptor.TableDistribution::getBucketCount)
-                            .orElse(null);
-        }
+        Integer bucketCount =
+                index.getBucketCount()
+                        .orElseGet(
+                                () ->
+                                        mainDescriptor
+                                                .getTableDistribution()
+                                                .flatMap(
+                                                        TableDescriptor.TableDistribution
+                                                                ::getBucketCount)
+                                                .orElse(null));
 
         TableDescriptor.Builder b =
                 TableDescriptor.builder()

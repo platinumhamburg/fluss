@@ -143,18 +143,18 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
                     delayedBucketStatus.setAcksPending(false);
                     delayedBucketStatus.setDelayedError(errors);
                 } else if (result.f0) {
-                    // HW satisfied; additionally gate on the index-pushed-offset watermark when
-                    // a requirement is configured (replica is non-null here because no exception
-                    // was thrown above).
+                    // HW satisfied; additionally gate on the sync index-pushed-offset watermark
+                    // when a requirement is configured (replica is non-null here because no
+                    // exception was thrown above).
                     long requiredIndexOffset = delayedBucketStatus.getRequiredIndexOffset();
                     boolean indexOk =
                             requiredIndexOffset == DelayedBucketStatus.NO_INDEX_OFFSET_REQUIRED
-                                    || replica.getIndexPushedOffset() >= requiredIndexOffset;
+                                    || replica.getSyncIndexPushedOffset() >= requiredIndexOffset;
                     if (indexOk) {
                         delayedBucketStatus.setAcksPending(false);
                         delayedBucketStatus.setDelayedError(errors);
                     }
-                    // else: keep pending; wait for index-pushed-offset to advance.
+                    // else: keep pending; wait for sync index-pushed-offset to advance.
                 }
 
                 if (delayedBucketStatus.isAcksPending()) {

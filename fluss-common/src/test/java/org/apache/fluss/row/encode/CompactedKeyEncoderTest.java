@@ -34,6 +34,11 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
 import static org.apache.fluss.row.TestInternalRowGenerator.createAllRowType;
@@ -135,6 +140,40 @@ class CompactedKeyEncoderTest {
     }
 
     @Test
+    void testEncodeKeyCanBeCalledConcurrently() throws Exception {
+        final RowType rowType = RowType.of(DataTypes.INT(), DataTypes.INT());
+        final CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(rowType);
+        CountDownLatch firstEncodeReady = new CountDownLatch(1);
+        CountDownLatch secondEncodeDone = new CountDownLatch(1);
+        InternalRow blockedRow =
+                new BlockingSecondFieldRow(row(1, 2), firstEncodeReady, secondEncodeDone);
+        InternalRow interferingRow = row(3, 4);
+
+        ExecutorService executorService = Executors.newFixedThreadPool(2);
+        try {
+            Future<byte[]> blockedEncode =
+                    executorService.submit(() -> keyEncoder.encodeKey(blockedRow));
+            assertThat(firstEncodeReady.await(10, TimeUnit.SECONDS)).isTrue();
+
+            Future<byte[]> interferingEncode =
+                    executorService.submit(
+                            () -> {
+                                try {
+                                    return keyEncoder.encodeKey(interferingRow);
+                                } finally {
+                                    secondEncodeDone.countDown();
+                                }
+                            });
+
+            assertThat(interferingEncode.get(10, TimeUnit.SECONDS)).isEqualTo(new byte[] {3, 4});
+            assertThat(blockedEncode.get(10, TimeUnit.SECONDS)).isEqualTo(new byte[] {1, 2});
+        } finally {
+            secondEncodeDone.countDown();
+            executorService.shutdownNow();
+        }
+    }
+
+    @Test
     void testGetKeyForAllTypes() throws Exception {
         // just test the InternalRowKeyGetter can handle all datatypes as primary key
         RowType rowType = createAllRowType();
@@ -178,5 +217,125 @@ class CompactedKeyEncoderTest {
         GenericRow genericRow = new GenericRow(dataTypes.length);
         compactedRowDeserializer.deserialize(compactedRowReader, genericRow);
         return genericRow;
+    }
+
+    private static final class BlockingSecondFieldRow implements InternalRow {
+
+        private final InternalRow delegate;
+        private final CountDownLatch firstEncodeReady;
+        private final CountDownLatch secondEncodeDone;
+
+        private BlockingSecondFieldRow(
+                InternalRow delegate,
+                CountDownLatch firstEncodeReady,
+                CountDownLatch secondEncodeDone) {
+            this.delegate = delegate;
+            this.firstEncodeReady = firstEncodeReady;
+            this.secondEncodeDone = secondEncodeDone;
+        }
+
+        @Override
+        public int getFieldCount() {
+            return delegate.getFieldCount();
+        }
+
+        @Override
+        public boolean isNullAt(int pos) {
+            return delegate.isNullAt(pos);
+        }
+
+        @Override
+        public boolean getBoolean(int pos) {
+            return delegate.getBoolean(pos);
+        }
+
+        @Override
+        public byte getByte(int pos) {
+            return delegate.getByte(pos);
+        }
+
+        @Override
+        public short getShort(int pos) {
+            return delegate.getShort(pos);
+        }
+
+        @Override
+        public int getInt(int pos) {
+            if (pos == 1) {
+                firstEncodeReady.countDown();
+                try {
+                    assertThat(secondEncodeDone.await(10, TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+            }
+            return delegate.getInt(pos);
+        }
+
+        @Override
+        public long getLong(int pos) {
+            return delegate.getLong(pos);
+        }
+
+        @Override
+        public float getFloat(int pos) {
+            return delegate.getFloat(pos);
+        }
+
+        @Override
+        public double getDouble(int pos) {
+            return delegate.getDouble(pos);
+        }
+
+        @Override
+        public BinaryString getChar(int pos, int length) {
+            return delegate.getChar(pos, length);
+        }
+
+        @Override
+        public BinaryString getString(int pos) {
+            return delegate.getString(pos);
+        }
+
+        @Override
+        public org.apache.fluss.row.Decimal getDecimal(int pos, int precision, int scale) {
+            return delegate.getDecimal(pos, precision, scale);
+        }
+
+        @Override
+        public org.apache.fluss.row.TimestampNtz getTimestampNtz(int pos, int precision) {
+            return delegate.getTimestampNtz(pos, precision);
+        }
+
+        @Override
+        public org.apache.fluss.row.TimestampLtz getTimestampLtz(int pos, int precision) {
+            return delegate.getTimestampLtz(pos, precision);
+        }
+
+        @Override
+        public byte[] getBinary(int pos, int length) {
+            return delegate.getBinary(pos, length);
+        }
+
+        @Override
+        public byte[] getBytes(int pos) {
+            return delegate.getBytes(pos);
+        }
+
+        @Override
+        public org.apache.fluss.row.InternalArray getArray(int pos) {
+            return delegate.getArray(pos);
+        }
+
+        @Override
+        public org.apache.fluss.row.InternalMap getMap(int pos) {
+            return delegate.getMap(pos);
+        }
+
+        @Override
+        public InternalRow getRow(int pos, int numFields) {
+            return delegate.getRow(pos, numFields);
+        }
     }
 }

@@ -18,6 +18,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
@@ -54,7 +55,13 @@ public class IndexReplicatorAppendTest {
 
     private static IndexReplicator newReplicator() {
         return new IndexReplicator(
-                null, Collections.emptyList(), new IndexAccumulator(), null, 0L, 1024, off -> {});
+                null,
+                Collections.emptyList(),
+                new IndexAccumulator(),
+                null,
+                0L,
+                1024,
+                (sync, all) -> {});
     }
 
     /**
@@ -80,6 +87,8 @@ public class IndexReplicatorAppendTest {
         ToIntFunction<InternalRow> bucketAssigner = r -> 0;
 
         return new IndexSpec(
+                "idx",
+                IndexVisibility.SYNC,
                 INDEX_TABLE_ID,
                 1,
                 KvFormat.COMPACTED,
@@ -146,7 +155,7 @@ public class IndexReplicatorAppendTest {
                         null,
                         0L,
                         1024,
-                        off -> {});
+                        (sync, all) -> {});
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
 
         long beforeResult =
@@ -174,7 +183,7 @@ public class IndexReplicatorAppendTest {
                         null,
                         5L,
                         1024,
-                        off -> {});
+                        (sync, all) -> {});
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
 
         long beforeResult =
@@ -182,7 +191,7 @@ public class IndexReplicatorAppendTest {
                         record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)), builders);
 
         assertThat(beforeResult).isEqualTo(5L);
-        assertThat(replicator.getIndexPushedOffset()).isEqualTo(5L);
+        assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(5L);
         assertThat(replicator.nextReadOffset())
                 .as("the next poll must continue after the pending UPDATE_BEFORE")
                 .isEqualTo(6L);
@@ -198,7 +207,7 @@ public class IndexReplicatorAppendTest {
                         null,
                         0L,
                         1024,
-                        off -> {});
+                        (sync, all) -> {});
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
 
         long beforeResult =
@@ -225,7 +234,7 @@ public class IndexReplicatorAppendTest {
                         null,
                         0L,
                         1024,
-                        off -> {});
+                        (sync, all) -> {});
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
 
         long beforeResult =

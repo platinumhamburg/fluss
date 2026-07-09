@@ -43,7 +43,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.LongConsumer;
 import java.util.function.ToLongFunction;
 
 /**
@@ -135,14 +134,14 @@ public final class ReplicaIndexController {
      *
      * @param logTablet the log tablet of the leader replica
      * @param schemaGetter the schema getter for the table
-     * @param onOffsetAdvanced callback fired after each window completes with the new index offset;
-     *     typically wired to {@code Replica::advanceIndexPushedOffset}
+     * @param onProgress callback fired after each window completes with sync/all index progress;
+     *     typically wired to {@code Replica::advanceIndexProgress}
      * @param initialOffset the seeded index offset (from snapshot restore), or {@code -1L}
      */
     public void onBecomeLeader(
             LogTablet logTablet,
             SchemaGetter schemaGetter,
-            LongConsumer onOffsetAdvanced,
+            IndexReplicator.IndexProgressListener onProgress,
             long initialOffset) {
         prepareForLeader();
 
@@ -153,7 +152,7 @@ public final class ReplicaIndexController {
         }
 
         maybeStartIndexReplicator(
-                logTablet, schemaGetter, indexes, onOffsetAdvanced, initialOffset);
+                logTablet, schemaGetter, indexes, onProgress, initialOffset);
     }
 
     /**
@@ -165,9 +164,9 @@ public final class ReplicaIndexController {
             LogTablet logTablet,
             SchemaGetter schemaGetter,
             KvTablet kvTablet,
-            LongConsumer onOffsetAdvanced,
+            IndexReplicator.IndexProgressListener onProgress,
             long initialOffset) {
-        onBecomeLeader(logTablet, schemaGetter, onOffsetAdvanced, initialOffset);
+        onBecomeLeader(logTablet, schemaGetter, onProgress, initialOffset);
         installValueFilter(kvTablet);
     }
 
@@ -184,7 +183,7 @@ public final class ReplicaIndexController {
     public void retryStart(
             LogTablet logTablet,
             SchemaGetter schemaGetter,
-            LongConsumer onOffsetAdvanced,
+            IndexReplicator.IndexProgressListener onProgress,
             long initialOffset) {
         if (state.get() != State.DEFERRED) {
             return;
@@ -194,7 +193,7 @@ public final class ReplicaIndexController {
             return;
         }
         maybeStartIndexReplicator(
-                logTablet, schemaGetter, indexes, onOffsetAdvanced, initialOffset);
+                logTablet, schemaGetter, indexes, onProgress, initialOffset);
     }
 
     /** Called when the replica is being deleted. */
@@ -221,13 +220,16 @@ public final class ReplicaIndexController {
     // Index-pushed-offset
     // ------------------------------------------------------------------------------------
 
-    /**
-     * Returns the current index-pushed-offset from the running {@link IndexReplicator}, or {@code
-     * -1L} if no replicator is active.
-     */
-    public long getIndexPushedOffset() {
+    /** Returns the current sync index-pushed-offset, or {@code -1L} if no replicator is active. */
+    public long getSyncIndexPushedOffset() {
         IndexReplicator r = this.indexReplicator;
-        return r != null ? r.getIndexPushedOffset() : -1L;
+        return r != null ? r.getSyncIndexPushedOffset() : -1L;
+    }
+
+    /** Returns the conservative all-index replay floor, or {@code -1L} if no replicator is active. */
+    public long getAllIndexPushedOffset() {
+        IndexReplicator r = this.indexReplicator;
+        return r != null ? r.getAllIndexPushedOffset() : -1L;
     }
 
     // ------------------------------------------------------------------------------------
@@ -335,7 +337,7 @@ public final class ReplicaIndexController {
             LogTablet logTablet,
             SchemaGetter schemaGetter,
             List<Schema.Index> indexes,
-            LongConsumer onOffsetAdvanced,
+            IndexReplicator.IndexProgressListener onProgress,
             long initialOffset) {
         if (replicatorPool == null || accumulator == null) {
             return;
@@ -372,7 +374,7 @@ public final class ReplicaIndexController {
                         readContext,
                         initialOffset,
                         replicatorPool.maxWindowBytes(),
-                        onOffsetAdvanced);
+                        onProgress);
         this.indexReplicator = replicator;
         state.set(State.RUNNING);
         // Register with the read pool; the pool worker will catch up on any WAL entries already

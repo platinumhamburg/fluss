@@ -21,6 +21,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -29,21 +30,14 @@ import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
+
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Unit tests for {@link TableDescriptorValidation#validateTableDescriptor} focused on Plan 1's
- * namespaced {@code secondary-index.<name>.{columns,bucket.num}} table properties and the
- * standalone {@code index.visibility} option.
- *
- * <p>The validator was originally a strict allow-list: every property key had to live in the static
- * {@code TABLE_OPTIONS} map. The per-index keys are dynamic (one entry per index declared via
- * {@link Schema.Builder#index}), so they have no static {@link
- * org.apache.fluss.config.ConfigOption} backing them and therefore cannot be in {@code
- * TABLE_OPTIONS}. These tests pin down the namespace handling: per-index suffixes are accepted,
- * {@code index.visibility} still parses, and unknown suffixes (or invalid index names) are rejected
- * with a clear error.
+ * Unit tests for {@link TableDescriptorValidation#validateTableDescriptor} focused on secondary
+ * index table descriptor validation.
  */
 class TableDescriptorValidationTest {
 
@@ -51,58 +45,24 @@ class TableDescriptorValidationTest {
     private static final String INDEX_NAME = "idx_user";
 
     @Test
-    void testValidateAcceptsSecondaryIndexColumnsProperty() {
+    void testRejectsTableLevelIndexVisibility() {
         TableDescriptor descriptor =
-                baseDescriptorBuilder()
-                        .property(ConfigOptions.secondaryIndexColumnsKey(INDEX_NAME), "user_id")
-                        .build();
+                baseDescriptorBuilder().property("index.visibility", "async").build();
 
-        assertThatCode(
+        assertThatThrownBy(
                         () ->
                                 TableDescriptorValidation.validateTableDescriptor(
                                         descriptor, MAX_BUCKET_NUM, null))
-                .doesNotThrowAnyException();
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("index.visibility")
+                .hasMessageContaining("secondary-index.<index-name>.visibility");
     }
 
     @Test
-    void testValidateAcceptsSecondaryIndexBucketNumProperty() {
+    void testRejectsLegacySecondaryIndexProperties() {
         TableDescriptor descriptor =
                 baseDescriptorBuilder()
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "8")
-                        .build();
-
-        assertThatCode(
-                        () ->
-                                TableDescriptorValidation.validateTableDescriptor(
-                                        descriptor, MAX_BUCKET_NUM, null))
-                .doesNotThrowAnyException();
-    }
-
-    /**
-     * {@code index.visibility} is a standalone {@link org.apache.fluss.config.ConfigOption} outside
-     * the {@code table.*} namespace; this test guards against regressions that reject it.
-     */
-    @Test
-    void testValidateAcceptsIndexVisibilityProperty() {
-        TableDescriptor descriptor =
-                baseDescriptorBuilder()
-                        .property(ConfigOptions.INDEX_VISIBILITY, IndexVisibility.SYNC)
-                        .build();
-
-        assertThatCode(
-                        () ->
-                                TableDescriptorValidation.validateTableDescriptor(
-                                        descriptor, MAX_BUCKET_NUM, null))
-                .doesNotThrowAnyException();
-    }
-
-    @Test
-    void testValidateRejectsUnknownSecondaryIndexSuffix() {
-        TableDescriptor descriptor =
-                baseDescriptorBuilder()
-                        .property(
-                                ConfigOptions.SECONDARY_INDEX_PREFIX + INDEX_NAME + ".weird",
-                                "anything")
+                        .property("secondary-index." + INDEX_NAME + ".bucket.num", "8")
                         .build();
 
         assertThatThrownBy(
@@ -110,39 +70,8 @@ class TableDescriptorValidationTest {
                                 TableDescriptorValidation.validateTableDescriptor(
                                         descriptor, MAX_BUCKET_NUM, null))
                 .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("Unknown secondary-index sub-property")
-                .hasMessageContaining(".columns")
-                .hasMessageContaining(".bucket.num");
-    }
-
-    @Test
-    void testValidateRejectsSecondaryIndexNameWithDoubleUnderscore() {
-        TableDescriptor descriptor =
-                baseDescriptorBuilder()
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("bad__name"), "1")
-                        .build();
-
-        assertThatThrownBy(
-                        () ->
-                                TableDescriptorValidation.validateTableDescriptor(
-                                        descriptor, MAX_BUCKET_NUM, null))
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("double underscores");
-    }
-
-    @Test
-    void testValidateRejectsSecondaryIndexNameWithIllegalCharacter() {
-        TableDescriptor descriptor =
-                baseDescriptorBuilder()
-                        .property(ConfigOptions.secondaryIndexColumnsKey("bad-name"), "user_id")
-                        .build();
-
-        assertThatThrownBy(
-                        () ->
-                                TableDescriptorValidation.validateTableDescriptor(
-                                        descriptor, MAX_BUCKET_NUM, null))
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("letters, digits, and underscores");
+                .hasMessageContaining("Secondary index options")
+                .hasMessageContaining("Schema.Index");
     }
 
     /**
@@ -318,10 +247,15 @@ class TableDescriptorValidationTest {
                                         .column("user_id", DataTypes.BIGINT())
                                         .column("dt", DataTypes.STRING())
                                         .primaryKey("id", "dt")
-                                        .index(INDEX_NAME, "user_id")
+                                        .index(
+                                                INDEX_NAME,
+                                                IndexType.SECONDARY,
+                                                Collections.singletonList("user_id"),
+                                                IndexVisibility.SYNC,
+                                                1)
                                         .build())
                         .partitionedBy("dt")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "1")
+                        .distributedBy(1, "id")
                         .build();
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.orders", INDEX_NAME)

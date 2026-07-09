@@ -27,6 +27,7 @@ import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 
@@ -394,16 +395,21 @@ abstract class FlinkSecondaryIndexLookupITCase extends AbstractTestBase {
     }
 
     @Test
-    void testTableWithSecondaryIndexIsAccessibleViaCatalog() throws Exception {
+    void testMixedVisibilitySecondaryIndexesAreStoredInTableMetadata() throws Exception {
         tEnv.executeSql(
                 "CREATE TABLE dim_catalog_check ("
                         + " id INT NOT NULL,"
                         + " name STRING,"
+                        + " email STRING,"
                         + " PRIMARY KEY (id) NOT ENFORCED"
                         + ") WITH ("
                         + " 'bucket.num' = '3',"
-                        + " 'secondary-index.idx_name.columns' = 'name',"
-                        + " 'secondary-index.idx_name.bucket.num' = '3'"
+                        + " 'secondary-index.idx_sync.columns' = 'name',"
+                        + " 'secondary-index.idx_sync.visibility' = 'sync',"
+                        + " 'secondary-index.idx_sync.bucket.num' = '2',"
+                        + " 'secondary-index.idx_async.columns' = 'email',"
+                        + " 'secondary-index.idx_async.visibility' = 'async',"
+                        + " 'secondary-index.idx_async.bucket.num' = '5'"
                         + ")");
 
         // The catalog should expose secondary index columns in the schema indexes
@@ -414,12 +420,21 @@ abstract class FlinkSecondaryIndexLookupITCase extends AbstractTestBase {
                                 .getTable(new ObjectPath(DEFAULT_DB, "dim_catalog_check"));
         assertThat(catalogTable).isNotNull();
 
-        // wrapWithIndexes adds PK + secondary index to the schema's indexes
-        // The index list should include 'name' columns from the secondary index
-        Schema schema = catalogTable.getUnresolvedSchema();
-        List<Schema.UnresolvedWatermarkSpec> watermarks = schema.getWatermarkSpecs();
-        // Just verify the table is accessible and the schema is correct
-        assertThat(schema.getColumns()).hasSize(2);
+        assertThat(catalogTable.getUnresolvedSchema().getColumns()).hasSize(3);
+
+        try (Table table = conn.getTable(TablePath.of(DEFAULT_DB, "dim_catalog_check"))) {
+            List<org.apache.fluss.metadata.Schema.Index> indexes =
+                    table.getTableInfo().getSchema().getIndexes();
+            org.apache.fluss.metadata.Schema.Index syncIndex = findIndex(indexes, "idx_sync");
+            org.apache.fluss.metadata.Schema.Index asyncIndex = findIndex(indexes, "idx_async");
+
+            assertThat(syncIndex.getColumnNames()).containsExactly("name");
+            assertThat(syncIndex.getVisibility()).isEqualTo(IndexVisibility.SYNC);
+            assertThat(syncIndex.getBucketCount()).hasValue(2);
+            assertThat(asyncIndex.getColumnNames()).containsExactly("email");
+            assertThat(asyncIndex.getVisibility()).isEqualTo(IndexVisibility.ASYNC);
+            assertThat(asyncIndex.getBucketCount()).hasValue(5);
+        }
     }
 
     @Test
@@ -499,6 +514,14 @@ abstract class FlinkSecondaryIndexLookupITCase extends AbstractTestBase {
     // --------------------------------------------------------------------------------------------
     // Helpers
     // --------------------------------------------------------------------------------------------
+
+    private static org.apache.fluss.metadata.Schema.Index findIndex(
+            List<org.apache.fluss.metadata.Schema.Index> indexes, String indexName) {
+        return indexes.stream()
+                .filter(index -> index.getIndexName().equals(indexName))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("Missing secondary index " + indexName));
+    }
 
     private void registerSourceTable(String viewName, String[] joinColumns) {
         List<Row> srcData = Arrays.asList(Row.of("alice"), Row.of("bob"));
