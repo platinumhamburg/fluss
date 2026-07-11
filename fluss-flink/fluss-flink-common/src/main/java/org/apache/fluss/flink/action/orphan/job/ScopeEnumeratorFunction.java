@@ -828,15 +828,15 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     tableDir.getName(), activeTableIds, maxKnownTableId)) {
                 continue;
             }
+            ScopeIdentity orphanScope =
+                    ScopeIdentity.orphanTable(dbDir.getName(), tableDir.getName(), null);
             if (config.allowCleanOrphanTables()) {
-                out.collect(
-                        orphanDirCleanTask(
-                                ScopeIdentity.orphanTable(
-                                        dbDir.getName(), tableDir.getName(), null),
-                                tableDir));
+                out.collect(orphanDirCleanTask(orphanScope, tableDir));
                 planStats.orphanDirTask();
+                tablePlans.task(orphanScope);
             } else {
                 audit.logSkipOrphanTable(tableDir, "default-conservative");
+                tablePlans.skip(orphanScope, SkipReasonCode.CONSERVATIVE_MODE_DISABLED);
                 emitOrphanPartitionDirTasksUnderUnknownTable(
                         tableDir,
                         activePartitionIds,
@@ -869,14 +869,12 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 dirName, activePartitionIds, maxKnownPartitionId),
                 remoteFsOpRateLimiter,
                 dir -> {
-                    out.collect(
-                            orphanDirCleanTask(
-                                    ScopeIdentity.orphanTable(
-                                            tableDir.getParent().getName(),
-                                            tableDir.getName(),
-                                            null),
-                                    dir));
+                    ScopeIdentity orphanScope =
+                            ScopeIdentity.orphanTable(
+                                    tableDir.getParent().getName(), tableDir.getName(), null);
+                    out.collect(orphanDirCleanTask(orphanScope, dir));
                     planStats.orphanDirTask();
+                    tablePlans.task(orphanScope);
                 },
                 planStats);
     }
