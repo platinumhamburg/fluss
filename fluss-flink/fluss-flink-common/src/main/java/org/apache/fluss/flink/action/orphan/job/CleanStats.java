@@ -178,20 +178,32 @@ public final class CleanStats implements Serializable {
             this.scope = scope;
         }
 
+        public Builder scanned(CleanupObjectType type, long files) {
+            return add(type, new CleanupCounters(files, 0L, 0L, 0L, 0L, 0L, 0L, 0L));
+        }
+
         public Builder planned(CleanupObjectType type, long files, long bytes) {
-            CleanupCounters delta = new CleanupCounters(0L, files, 0L, bytes, 0L, 0L, 0L, 0L);
-            counters = counters.add(delta);
-            byObjectType.put(
-                    type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
-            return this;
+            return add(type, new CleanupCounters(0L, files, 0L, bytes, 0L, 0L, 0L, 0L));
         }
 
         public Builder deleted(CleanupObjectType type, long files, long bytes) {
-            CleanupCounters delta = new CleanupCounters(0L, 0L, 0L, 0L, files, 0L, 0L, bytes);
-            counters = counters.add(delta);
-            byObjectType.put(
-                    type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
-            return this;
+            return add(type, new CleanupCounters(0L, 0L, 0L, 0L, files, 0L, 0L, bytes));
+        }
+
+        public Builder deleteFailed(CleanupObjectType type, long files) {
+            return add(type, new CleanupCounters(0L, 0L, 0L, 0L, 0L, 0L, files, 0L));
+        }
+
+        public Builder plannedDirectory(long dirs) {
+            return add(
+                    CleanupObjectType.DIRECTORY,
+                    new CleanupCounters(0L, 0L, dirs, 0L, 0L, 0L, 0L, 0L));
+        }
+
+        public Builder removedDirectory(long dirs) {
+            return add(
+                    CleanupObjectType.DIRECTORY,
+                    new CleanupCounters(0L, 0L, 0L, 0L, 0L, dirs, 0L, 0L));
         }
 
         public Builder skipped(SkipReasonCode reason, long count) {
@@ -201,6 +213,13 @@ public final class CleanStats implements Serializable {
 
         public CleanStats build() {
             return new CleanStats(scope, counters, byObjectType, bySkipReason);
+        }
+
+        private Builder add(CleanupObjectType type, CleanupCounters delta) {
+            counters = counters.add(delta);
+            byObjectType.put(
+                    type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
+            return this;
         }
     }
 }
