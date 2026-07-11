@@ -1553,6 +1553,16 @@ public class ConfigOptions {
                                     + "(3) Version 3: Uses the same v2-compatible key encoding and adds a tagged value layout. "
                                     + "It is reserved for system-managed partitioned secondary index tables.");
 
+    public static final ConfigOption<Integer> TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION =
+            key("table.kv.idempotence-protocol-version")
+                    .intType()
+                    .defaultValue(0)
+                    .withDescription(
+                            "The immutable KV idempotence protocol version. Version 0 is the "
+                                    + "compact writer-id protocol and is the default. Version 1 "
+                                    + "is the fenced WriterKey protocol reserved for system-managed "
+                                    + "Index Tables.");
+
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")
                     .booleanType()

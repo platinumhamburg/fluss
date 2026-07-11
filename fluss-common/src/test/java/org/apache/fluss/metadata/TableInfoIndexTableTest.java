@@ -22,12 +22,33 @@ import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
+import java.util.Map;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link TableInfo#isIndexTable()} and main-table back-link accessors. */
 class TableInfoIndexTableTest {
+
+    @Test
+    void testMissingKvIdempotenceProtocolDefaultsToV0() {
+        TableInfo tableInfo = createPrimaryKeyTableInfo(Collections.emptyMap());
+
+        assertThat(tableInfo.getKvIdempotenceProtocol())
+                .isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
+    }
+
+    @Test
+    void testExplicitProtocolV1IsResolved() {
+        TableInfo tableInfo =
+                createPrimaryKeyTableInfo(
+                        Collections.singletonMap(
+                                ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "1"));
+
+        assertThat(tableInfo.getKvIdempotenceProtocol())
+                .isEqualTo(KvIdempotenceProtocol.V1_FENCED);
+    }
 
     @Test
     void testIndexTableInfoReportsBackLinkToMainTable() {
@@ -70,5 +91,21 @@ class TableInfoIndexTableTest {
 
         assertThat(info.isIndexTable()).isFalse();
         assertThat(info.getMainTableId()).isEmpty();
+    }
+
+    private static TableInfo createPrimaryKeyTableInfo(Map<String, String> properties) {
+        TableDescriptor.Builder descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .primaryKey("id")
+                                        .build())
+                        .distributedBy(1, "id");
+        properties.forEach(descriptor::property);
+
+        long now = System.currentTimeMillis();
+        return TableInfo.of(
+                TablePath.of("db", "t"), 1L, 1, descriptor.build(), null, now, now);
     }
 }

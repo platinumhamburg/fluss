@@ -134,6 +134,33 @@ class TableDescriptorValidationTest {
     }
 
     @Test
+    void testProtocolPropertyRejectedForLogTable() {
+        TableDescriptor logTable =
+                logTableDescriptorWithProperty(
+                        ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "0");
+
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptorValidation.validateTableDescriptor(
+                                        logTable, MAX_BUCKET_NUM, null))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("only supported for primary key tables");
+    }
+
+    @Test
+    void testProtocolV1RejectedForUserDataTable() {
+        TableDescriptor dataTable = primaryKeyDataTableWithProtocol(1);
+
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptorValidation.validateTableDescriptor(
+                                        dataTable, MAX_BUCKET_NUM, null))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(
+                        "protocol version 1 is reserved for system-managed Index Tables");
+    }
+
+    @Test
     void testRejectsSecondaryIndexOnUnknownColumn() {
         Schema schema =
                 Schema.newBuilder()
@@ -301,5 +328,24 @@ class TableDescriptorValidationTest {
                 .schema(schema)
                 .distributedBy(1, distributionColumn)
                 .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 1);
+    }
+
+    private static TableDescriptor logTableDescriptorWithProperty(String key, String value) {
+        return TableDescriptor.builder()
+                .schema(Schema.newBuilder().column("id", DataTypes.BIGINT()).build())
+                .distributedBy(1, "id")
+                .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 1)
+                .property(key, value)
+                .build();
+    }
+
+    private static TableDescriptor primaryKeyDataTableWithProtocol(int version) {
+        return descriptorBuilder(
+                        Schema.newBuilder()
+                                .column("id", DataTypes.BIGINT())
+                                .primaryKey("id")
+                                .build())
+                .property(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION, version)
+                .build();
     }
 }

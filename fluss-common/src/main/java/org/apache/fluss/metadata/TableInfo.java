@@ -351,6 +351,12 @@ public final class TableInfo {
         return tableConfig;
     }
 
+    /** Returns the immutable KV idempotence protocol selected for this table. */
+    public KvIdempotenceProtocol getKvIdempotenceProtocol() {
+        return KvIdempotenceProtocol.forVersion(
+                properties.get(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION));
+    }
+
     /**
      * Returns the custom properties of the table.
      *

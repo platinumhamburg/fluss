@@ -31,6 +31,7 @@ import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
@@ -130,6 +131,27 @@ public class TableDescriptorValidation {
             }
             ConfigOption<?> option = TABLE_OPTIONS.get(key);
             validateOptionValue(tableConf, option);
+        }
+
+        boolean protocolExplicitlySet =
+                tableDescriptor
+                        .getProperties()
+                        .containsKey(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key());
+        if (!hasPrimaryKey && protocolExplicitlySet) {
+            throw new InvalidConfigException(
+                    "table.kv.idempotence-protocol-version is only supported for primary key tables");
+        }
+        KvIdempotenceProtocol protocol;
+        try {
+            protocol =
+                    KvIdempotenceProtocol.forVersion(
+                            tableConf.get(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION));
+        } catch (IllegalArgumentException e) {
+            throw new InvalidConfigException(e.getMessage());
+        }
+        if (protocol == KvIdempotenceProtocol.V1_FENCED && !tableDescriptor.isIndexTable()) {
+            throw new InvalidConfigException(
+                    "KV idempotence protocol version 1 is reserved for system-managed Index Tables");
         }
 
         // check distribution
