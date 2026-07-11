@@ -243,6 +243,13 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                 .noneMatch(m -> m.contains("action=deleted") && m.contains(activeFile1.toString()));
         assertThat(auditMessages())
                 .noneMatch(m -> m.contains("action=deleted") && m.contains(activeFile2.toString()));
+        assertThat(summaryMessage())
+                .contains(
+                        "planned_files=2",
+                        "planned_bytes=2",
+                        "deleted_files=2",
+                        "bytes_reclaimed=2",
+                        "dry_run=false");
     }
 
     @Test
@@ -279,6 +286,22 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                         m ->
                                 m.contains("action=skip_log_bucket")
                                         && m.contains("reason=no_remote_manifest"));
+        assertThat(summaryMessage())
+                .contains(
+                        "planned_files=1",
+                        "planned_bytes=1",
+                        "deleted_files=0",
+                        "bytes_reclaimed=0",
+                        "dry_run=true");
+    }
+
+    private String summaryMessage() {
+        List<String> summaries =
+                auditMessages().stream()
+                        .filter(message -> message.contains("action=summary"))
+                        .collect(java.util.stream.Collectors.toList());
+        assertThat(summaries).hasSize(1);
+        return summaries.get(0);
     }
 
     /**
