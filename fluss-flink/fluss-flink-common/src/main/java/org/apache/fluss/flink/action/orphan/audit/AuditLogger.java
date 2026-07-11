@@ -155,6 +155,45 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Identifies the table target before any remote manifest can block scope enumeration. */
+    public void logScopeTargetStart(
+            String runId, String database, String table, long tableId, Long partitionId) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scope action=scope_target_start"
+                        + " database={} table={} table_id={} partition_id={} ts={}",
+                runId,
+                database,
+                table,
+                tableId,
+                partitionId,
+                Instant.now());
+    }
+
+    /** Records successful return from all active-reference lookups for one table target. */
+    public void logScopeTargetComplete(
+            String runId,
+            String database,
+            String table,
+            long tableId,
+            Long partitionId,
+            String logStatus,
+            String kvStatus,
+            long durationMillis) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scope action=scope_target_complete"
+                        + " database={} table={} table_id={} partition_id={}"
+                        + " log_status={} kv_status={} duration_ms={} ts={}",
+                runId,
+                database,
+                table,
+                tableId,
+                partitionId,
+                logStatus,
+                kvStatus,
+                durationMillis,
+                Instant.now());
+    }
+
     public void logScanStart(
             String runId,
             boolean dryRun,
