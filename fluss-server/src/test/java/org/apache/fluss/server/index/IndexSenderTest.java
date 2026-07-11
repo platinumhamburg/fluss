@@ -75,7 +75,8 @@ public class IndexSenderTest {
     private enum LifecyclePoint {
         PUT_KV_INVOCATION,
         PUT_KV_COMPLETION,
-        PROGRESS_CALLBACK
+        PROGRESS_CALLBACK,
+        BATCH_REQUEUE
     }
 
     private static final class BlockingLifecycleHooks implements IndexSender.LifecycleHooks {
@@ -101,6 +102,11 @@ public class IndexSenderTest {
         @Override
         public void beforeProgressCallback() {
             blockAt(LifecyclePoint.PROGRESS_CALLBACK);
+        }
+
+        @Override
+        public void beforeBatchRequeue() {
+            blockAt(LifecyclePoint.BATCH_REQUEUE);
         }
 
         private void blockAt(LifecyclePoint candidate) {
@@ -356,6 +362,7 @@ public class IndexSenderTest {
 
             assertThat(progress.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(closeReturned).isTrue();
+            await(sender::isClosedForTesting);
             assertThat(gateway.requests).hasSize(1);
             assertThat(owner.getSyncIndexPushedOffset()).isEqualTo(10L);
             assertThat(accumulator.pendingBytes()).isZero();
@@ -393,7 +400,7 @@ public class IndexSenderTest {
             Future<?> completion = executor.submit(() -> completePutKv(gateway, 0, true));
             hooks.awaitReached();
             Future<?> close = executor.submit(sender::close);
-            await(sender::isClosedForTesting);
+            await(sender::isClosingForTesting);
             assertThat(close.isDone()).isFalse();
 
             hooks.release();
@@ -401,6 +408,102 @@ public class IndexSenderTest {
             close.get(5, TimeUnit.SECONDS);
             assertThat(callbackCloseReturned).isTrue();
             assertThat(owner.getSyncIndexPushedOffset()).isEqualTo(10L);
+            assertClosedAndDrained(sender, accumulator);
+        } finally {
+            hooks.release();
+            sender.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void normalCloseWaitsForTrueClosedAfterReentrantCloseReturns() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        AtomicReference<IndexSender> senderRef = new AtomicReference<>();
+        CountDownLatch reentrantCloseReturned = new CountDownLatch(1);
+        CountDownLatch releaseCallback = new CountDownLatch(1);
+        IndexReplicator owner =
+                owner(
+                        accumulator,
+                        (sync, all) -> {
+                            senderRef.get().close();
+                            reentrantCloseReturned.countDown();
+                            awaitLatch(releaseCallback);
+                        });
+        IndexSender sender =
+                sender(
+                        accumulator,
+                        ignored -> gateway,
+                        ignored -> 1,
+                        IndexSender.LifecycleHooks.NO_OP);
+        senderRef.set(sender);
+        ExecutorService executor = Executors.newCachedThreadPool();
+        try {
+            accumulator.append(
+                    batch(
+                            new TableBucket(35L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            await(() -> gateway.pending.size() == 1);
+            Future<?> completion = executor.submit(() -> completePutKv(gateway, 0, true));
+            assertThat(reentrantCloseReturned.await(5, TimeUnit.SECONDS)).isTrue();
+
+            CountDownLatch normalCloseStarted = new CountDownLatch(1);
+            CountDownLatch normalCloseReturned = new CountDownLatch(1);
+            Future<?> normalClose =
+                    executor.submit(
+                            () -> {
+                                normalCloseStarted.countDown();
+                                sender.close();
+                                normalCloseReturned.countDown();
+                            });
+            assertThat(normalCloseStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(normalCloseReturned.await(100, TimeUnit.MILLISECONDS)).isFalse();
+            assertThat(sender.isClosingForTesting()).isTrue();
+            assertThat(sender.isClosedForTesting()).isFalse();
+
+            releaseCallback.countDown();
+            completion.get(5, TimeUnit.SECONDS);
+            normalClose.get(5, TimeUnit.SECONDS);
+            assertThat(normalCloseReturned.getCount()).isZero();
+            assertClosedAndDrained(sender, accumulator);
+        } finally {
+            releaseCallback.countDown();
+            sender.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void closeDrainsBatchWhoseAdmittedFailureActionRequeuesAfterClosingStarts()
+            throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        BlockingLifecycleHooks hooks =
+                new BlockingLifecycleHooks(LifecyclePoint.BATCH_REQUEUE);
+        IndexSender sender = sender(accumulator, ignored -> gateway, ignored -> 1, hooks);
+        ExecutorService executor = Executors.newCachedThreadPool();
+        IndexBatch claimed =
+                batch(
+                        new TableBucket(34L, 0),
+                        new IndexWindow("idx", 10L, 1, owner(accumulator)));
+        try {
+            accumulator.append(claimed);
+            await(() -> gateway.pending.size() == 1);
+            Future<?> failure = executor.submit(() -> completePutKv(gateway, 0, false));
+            hooks.awaitReached();
+
+            Future<?> close = executor.submit(sender::close);
+            await(sender::isClosingForTesting);
+            assertThat(close.isDone()).isFalse();
+
+            hooks.release();
+            failure.get(5, TimeUnit.SECONDS);
+            close.get(5, TimeUnit.SECONDS);
+            assertThat(gateway.requests).hasSize(1);
+            assertThat(accumulator.hasUnsent()).isFalse();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(claimed.markReleased()).isFalse();
             assertClosedAndDrained(sender, accumulator);
         } finally {
             hooks.release();
@@ -431,7 +534,7 @@ public class IndexSenderTest {
         try {
             await(() -> gateway.apiVersionsCalls == 1);
             Future<?> close = lifecycleExecutor.submit(sender::close);
-            await(sender::isClosedForTesting);
+            await(sender::isClosingForTesting);
             assertThat(close.isDone()).isFalse();
 
             gateway.completeApiVersions(success);
@@ -470,7 +573,7 @@ public class IndexSenderTest {
                     lifecycleExecutor.submit(() -> gateway.completeApiVersions(true));
             hooks.awaitReached();
             Future<?> close = lifecycleExecutor.submit(sender::close);
-            await(sender::isClosedForTesting);
+            await(sender::isClosingForTesting);
             assertThat(close.isDone()).isFalse();
 
             hooks.release();
@@ -510,7 +613,7 @@ public class IndexSenderTest {
                             () -> completePutKv(gateway, 0, success));
             hooks.awaitReached();
             Future<?> close = lifecycleExecutor.submit(sender::close);
-            await(sender::isClosedForTesting);
+            await(sender::isClosingForTesting);
             assertThat(close.isDone()).isFalse();
 
             hooks.release();
@@ -797,6 +900,7 @@ public class IndexSenderTest {
 
     private static void assertClosedAndDrained(
             IndexSender sender, IndexAccumulator accumulator) {
+        assertThat(sender.isClosedForTesting()).isTrue();
         assertThat(sender.inFlightRequestCount()).isZero();
         assertThat(sender.outstandingAsyncOperationCount()).isZero();
         assertThat(accumulator.pendingBytes()).isZero();
@@ -808,6 +912,15 @@ public class IndexSenderTest {
                 condition::getAsBoolean,
                 Duration.ofSeconds(5),
                 "Condition was not met within timeout");
+    }
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
     }
 
     @Test

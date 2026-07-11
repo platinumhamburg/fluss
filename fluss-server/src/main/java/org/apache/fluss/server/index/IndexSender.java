@@ -44,9 +44,11 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
@@ -80,6 +82,13 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 @ThreadSafe
 public final class IndexSender implements AutoCloseable {
 
+    @VisibleForTesting
+    enum LifecyclePhase {
+        OPEN,
+        CLOSING,
+        CLOSED
+    }
+
     /** Resolves the leader server ID for a given Index Table bucket. */
     @FunctionalInterface
     public interface LeaderResolver {
@@ -95,6 +104,8 @@ public final class IndexSender implements AutoCloseable {
         default void beforePutKvCompletion() {}
 
         default void beforeProgressCallback() {}
+
+        default void beforeBatchRequeue() {}
     }
 
     private static final Logger LOG = LoggerFactory.getLogger(IndexSender.class);
@@ -133,13 +144,13 @@ public final class IndexSender implements AutoCloseable {
     private final Condition lifecycleDrained = lifecycleLock.newCondition();
     private final Map<Integer, TargetContext> targetsByServer = new HashMap<>();
     private final Set<Integer> creatingTargets = new HashSet<>();
+    private final Set<IndexBatch> ownedBatches =
+            Collections.newSetFromMap(new IdentityHashMap<>());
     private final ThreadLocal<Integer> activeExternalCallbackDepth =
             ThreadLocal.withInitial(() -> 0);
-    private final ThreadLocal<Integer> activeAsyncOperationDepth =
-            ThreadLocal.withInitial(() -> 0);
     private final LifecycleHooks lifecycleHooks;
-    private volatile boolean closed;
-    private boolean closeComplete;
+    private volatile LifecyclePhase lifecyclePhase = LifecyclePhase.OPEN;
+    @Nullable private Thread lifecycleFinisher;
     private int activeAccountingOperations;
     private int outstandingAsyncOperations;
     private long nextTargetGeneration;
@@ -267,7 +278,7 @@ public final class IndexSender implements AutoCloseable {
     }
 
     private void enqueueReadyBucket(TableBucket bucket) {
-        if (closed) {
+        if (lifecyclePhase != LifecyclePhase.OPEN) {
             return;
         }
         workers[ownerOf(bucket)].enqueueReadyBucket(bucket);
@@ -280,85 +291,144 @@ public final class IndexSender implements AutoCloseable {
     @Override
     public void close() {
         LOG.info("IndexSender closing");
-        boolean interrupted = false;
-        int excludedCallbackOperations =
-                activeExternalCallbackDepth.get() > 0 ? activeAsyncOperationDepth.get() : 0;
+        boolean cannotWaitForSelf =
+                activeExternalCallbackDepth.get() > 0 || isSenderWorker(Thread.currentThread());
+        boolean finish = false;
         lifecycleLock.lock();
         try {
-            if (closed) {
-                // A callback may race a close already waiting for this operation. Its sender
-                // ownership and pending-byte accounting were completed before callback admission,
-                // so returning here breaks the wait cycle without allowing later external work.
-                if (excludedCallbackOperations > 0) {
-                    return;
-                }
-                while (!closeComplete) {
-                    try {
-                        lifecycleDrained.await();
-                    } catch (InterruptedException e) {
-                        interrupted = true;
-                    }
-                }
+            if (lifecyclePhase == LifecyclePhase.CLOSED) {
                 return;
             }
-            while (activeAccountingOperations > 0) {
-                try {
-                    lifecycleDrained.await();
-                } catch (InterruptedException e) {
-                    interrupted = true;
-                }
+            if (lifecyclePhase == LifecyclePhase.OPEN) {
+                lifecyclePhase = LifecyclePhase.CLOSING;
+                nextTargetGeneration++;
+                targetsByServer.clear();
+                creatingTargets.clear();
             }
-            closed = true;
-            nextTargetGeneration++;
-            targetsByServer.clear();
-            creatingTargets.clear();
+            if (!cannotWaitForSelf && lifecycleFinisher == null) {
+                lifecycleFinisher = Thread.currentThread();
+                finish = true;
+            }
         } finally {
             lifecycleLock.unlock();
         }
+        requestWorkerShutdown();
+        if (cannotWaitForSelf) {
+            return;
+        }
+        if (finish) {
+            finishClose();
+        }
+        awaitClosed();
+    }
+
+    private void requestWorkerShutdown() {
         for (SenderWorker worker : workers) {
             worker.initiateShutdown();
-        }
-        for (SenderWorker worker : workers) {
             worker.wakeup();
-            if (worker == Thread.currentThread()) {
-                continue;
-            }
-            try {
-                worker.awaitShutdown();
-            } catch (InterruptedException e) {
-                interrupted = true;
+        }
+    }
+
+    private void finishClose() {
+        boolean interrupted = false;
+        for (SenderWorker worker : workers) {
+            boolean shutdownComplete = false;
+            while (!shutdownComplete) {
+                try {
+                    worker.awaitShutdown();
+                    shutdownComplete = true;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
             }
         }
 
+        List<IndexBatch> batchesToRelease;
         lifecycleLock.lock();
-        List<BatchAction> closeActions;
         try {
-            while (outstandingAsyncOperations > excludedCallbackOperations) {
+            while (outstandingAsyncOperations > 0 || activeAccountingOperations > 0) {
                 try {
                     lifecycleDrained.await();
                 } catch (InterruptedException e) {
                     interrupted = true;
                 }
             }
-            closeActions = new ArrayList<>();
-            for (IndexBatch batch : new ArrayList<>(inFlightBatches.values())) {
-                addOwnedBatchActionLocked(closeActions, batch, BatchDisposition.RELEASE);
+            batchesToRelease = new ArrayList<>(ownedBatches);
+            ownedBatches.clear();
+            for (IndexBatch batch : batchesToRelease) {
+                TableBucket bucket = batch.targetBucket();
+                inFlightBatches.remove(bucket, batch);
+                inFlightSinceMs.remove(bucket);
             }
-            beginAccountingLocked(closeActions);
         } finally {
             lifecycleLock.unlock();
         }
-        runAccounting(closeActions);
+        for (IndexBatch batch : batchesToRelease) {
+            accumulator.remove(batch);
+            accumulator.release(batch);
+        }
 
         lifecycleLock.lock();
         try {
-            closeComplete = true;
+            lifecyclePhase = LifecyclePhase.CLOSED;
+            lifecycleFinisher = null;
             lifecycleDrained.signalAll();
         } finally {
             lifecycleLock.unlock();
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    private void awaitClosed() {
+        boolean interrupted = false;
+        lifecycleLock.lock();
+        try {
+            while (lifecyclePhase != LifecyclePhase.CLOSED) {
+                try {
+                    lifecycleDrained.await();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            lifecycleLock.unlock();
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private boolean isSenderWorker(Thread thread) {
+        for (SenderWorker worker : workers) {
+            if (worker == thread) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void tryFinishClose(boolean workerExited) {
+        if (!workerExited && isSenderWorker(Thread.currentThread())) {
+            return;
+        }
+        boolean finish = false;
+        lifecycleLock.lock();
+        try {
+            if (lifecyclePhase == LifecyclePhase.CLOSING
+                    && lifecycleFinisher == null
+                    && outstandingAsyncOperations == 0
+                    && activeAccountingOperations == 0) {
+                lifecycleFinisher = Thread.currentThread();
+                finish = true;
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+        if (finish) {
+            requestWorkerShutdown();
+            finishClose();
         }
     }
 
@@ -408,6 +478,12 @@ public final class IndexSender implements AutoCloseable {
         }
 
         @Override
+        public void run() {
+            super.run();
+            tryFinishClose(true);
+        }
+
+        @Override
         public void doWork() {
             boolean didWork = drainAndSend();
             if (!didWork) {
@@ -425,7 +501,7 @@ public final class IndexSender implements AutoCloseable {
 
         /** Claims at most one batch per owned, non-muted bucket and dispatches them. */
         private boolean drainAndSend() {
-            if (closed) {
+            if (lifecyclePhase != LifecyclePhase.OPEN) {
                 return false;
             }
             long now = System.currentTimeMillis();
@@ -435,7 +511,7 @@ public final class IndexSender implements AutoCloseable {
             while ((bucket = pollReadyBucket()) != null) {
                 lifecycleLock.lock();
                 try {
-                    if (closed) {
+                    if (lifecyclePhase != LifecyclePhase.OPEN) {
                         break;
                     }
                     if (ownerOf(bucket) != workerId || inFlightSinceMs.containsKey(bucket)) {
@@ -450,6 +526,7 @@ public final class IndexSender implements AutoCloseable {
                     }
                     inFlightSinceMs.put(bucket, now);
                     inFlightBatches.put(bucket, batch);
+                    ownedBatches.add(batch);
                     claimed.add(batch);
                 } finally {
                     lifecycleLock.unlock();
@@ -502,7 +579,7 @@ public final class IndexSender implements AutoCloseable {
             List<BatchAction> actions = new ArrayList<>();
             lifecycleLock.lock();
             try {
-                if (closed) {
+                if (lifecyclePhase != LifecyclePhase.OPEN) {
                     addOwnedBatchActionsLocked(actions, batches, BatchDisposition.RELEASE);
                 } else {
                     target = targetsByServer.get(serverId);
@@ -554,7 +631,7 @@ public final class IndexSender implements AutoCloseable {
             lifecycleLock.lock();
             try {
                 creatingTargets.remove(serverId);
-                if (closed) {
+                if (lifecyclePhase != LifecyclePhase.OPEN) {
                     addOwnedBatchActionsLocked(actions, batches, BatchDisposition.RELEASE);
                 } else if (failure != null || gateway == null || !leadersCurrent) {
                     addOwnedBatchActionsLocked(actions, batches, BatchDisposition.REQUEUE);
@@ -609,7 +686,6 @@ public final class IndexSender implements AutoCloseable {
             boolean dispatch = false;
             boolean leadersCurrent = leadersMatch(target.serverId, batches);
             List<BatchAction> actions = new ArrayList<>();
-            enterAsyncOperation();
             try {
                 lifecycleLock.lock();
                 try {
@@ -651,11 +727,7 @@ public final class IndexSender implements AutoCloseable {
                     dispatchIfCurrent(target, batches);
                 }
             } finally {
-                try {
-                    completeAsyncOperation();
-                } finally {
-                    exitAsyncOperation();
-                }
+                completeAsyncOperation();
             }
         }
 
@@ -734,7 +806,6 @@ public final class IndexSender implements AutoCloseable {
                 @Nullable Throwable error) {
             boolean leadersCurrent = leadersMatch(target.serverId, chunk);
             List<BatchAction> actions = new ArrayList<>();
-            enterAsyncOperation();
             lifecycleLock.lock();
             try {
                 if (!targetIsCurrentLocked(target) || !leadersCurrent) {
@@ -758,11 +829,7 @@ public final class IndexSender implements AutoCloseable {
             try {
                 runAccountingAndCallbacks(actions);
             } finally {
-                try {
-                    completeAsyncOperation();
-                } finally {
-                    exitAsyncOperation();
-                }
+                completeAsyncOperation();
             }
         }
     }
@@ -784,7 +851,8 @@ public final class IndexSender implements AutoCloseable {
     }
 
     private boolean targetIsCurrentLocked(TargetContext target) {
-        return !closed && targetsByServer.get(target.serverId) == target;
+        return lifecyclePhase == LifecyclePhase.OPEN
+                && targetsByServer.get(target.serverId) == target;
     }
 
     private void invalidateTargetLocked(TargetContext target) {
@@ -794,7 +862,7 @@ public final class IndexSender implements AutoCloseable {
     }
 
     private void registerAsyncOperationLocked() {
-        if (closed) {
+        if (lifecyclePhase != LifecyclePhase.OPEN) {
             throw new IllegalStateException("Cannot register an async operation after close");
         }
         outstandingAsyncOperations++;
@@ -807,20 +875,13 @@ public final class IndexSender implements AutoCloseable {
         } finally {
             lifecycleLock.unlock();
         }
+        tryFinishClose(false);
     }
 
     private void completeAsyncOperationLocked() {
         if (--outstandingAsyncOperations == 0) {
             lifecycleDrained.signalAll();
         }
-    }
-
-    private void enterAsyncOperation() {
-        activeAsyncOperationDepth.set(activeAsyncOperationDepth.get() + 1);
-    }
-
-    private void exitAsyncOperation() {
-        activeAsyncOperationDepth.set(activeAsyncOperationDepth.get() - 1);
     }
 
     private static boolean supportsPutKvV2(@Nullable ApiVersionsResponse response) {
@@ -942,7 +1003,9 @@ public final class IndexSender implements AutoCloseable {
         addOwnedBatchActionLocked(
                 actions,
                 batch,
-                closed ? BatchDisposition.RELEASE : BatchDisposition.REQUEUE);
+                lifecyclePhase == LifecyclePhase.OPEN
+                        ? BatchDisposition.REQUEUE
+                        : BatchDisposition.RELEASE);
     }
 
     private void addOwnedBatchActionsLocked(
@@ -962,10 +1025,13 @@ public final class IndexSender implements AutoCloseable {
         }
         inFlightSinceMs.remove(bucket);
         BatchDisposition disposition = requestedDisposition;
-        if (closed || batch.ownerClosed()) {
+        if (lifecyclePhase != LifecyclePhase.OPEN || batch.ownerClosed()) {
             disposition = BatchDisposition.RELEASE;
         } else if (disposition == BatchDisposition.ACK && !batch.markAcked()) {
             disposition = BatchDisposition.RELEASE;
+        }
+        if (disposition != BatchDisposition.REQUEUE) {
+            ownedBatches.remove(batch);
         }
         actions.add(new BatchAction(batch, disposition));
     }
@@ -985,6 +1051,7 @@ public final class IndexSender implements AutoCloseable {
             for (BatchAction action : actions) {
                 if (action.disposition == BatchDisposition.REQUEUE) {
                     IndexBatch batch = action.batch;
+                    lifecycleHooks.beforeBatchRequeue();
                     // Publish the retry deadline before putting the batch back in its queue.
                     batch.setReadyAtMs(
                             System.currentTimeMillis()
@@ -1008,6 +1075,7 @@ public final class IndexSender implements AutoCloseable {
             } finally {
                 lifecycleLock.unlock();
             }
+            tryFinishClose(false);
         }
     }
 
@@ -1019,7 +1087,7 @@ public final class IndexSender implements AutoCloseable {
             }
             lifecycleLock.lock();
             try {
-                if (closed || action.batch.ownerClosed()) {
+                if (lifecyclePhase != LifecyclePhase.OPEN || action.batch.ownerClosed()) {
                     continue;
                 }
             } finally {
@@ -1068,7 +1136,12 @@ public final class IndexSender implements AutoCloseable {
 
     @VisibleForTesting
     boolean isClosedForTesting() {
-        return closed;
+        return lifecyclePhase == LifecyclePhase.CLOSED;
+    }
+
+    @VisibleForTesting
+    boolean isClosingForTesting() {
+        return lifecyclePhase == LifecyclePhase.CLOSING;
     }
 
     @VisibleForTesting

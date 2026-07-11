@@ -102,6 +102,24 @@ public class IndexAccumulatorTest {
     }
 
     @Test
+    void removeExactQueuedBatchDoesNotRemoveSibling() {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        TableBucket bucket = new TableBucket(3L, 0);
+        IndexBatch first = batch(bucket);
+        IndexBatch second = batch(bucket);
+        accumulator.append(first);
+        accumulator.append(second);
+
+        assertThat(accumulator.remove(first)).isTrue();
+        accumulator.release(first);
+        assertThat(accumulator.pollFirst(bucket)).isSameAs(second);
+        accumulator.release(second);
+        assertThat(accumulator.remove(first)).isFalse();
+        assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(accumulator.pendingBytes()).isZero();
+    }
+
+    @Test
     void pollFirstOnUnknownBucketReturnsNull() {
         IndexAccumulator accumulator = new IndexAccumulator();
         assertThat(accumulator.pollFirst(new TableBucket(9L, 9))).isNull();

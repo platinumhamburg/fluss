@@ -193,6 +193,24 @@ public final class IndexAccumulator {
         }
     }
 
+    /** Remove the exact batch from its target queue without changing pending-byte accounting. */
+    public boolean remove(IndexBatch batch) {
+        Deque<IndexBatch> deque = batches.get(batch.targetBucket());
+        if (deque == null) {
+            return false;
+        }
+        synchronized (deque) {
+            Iterator<IndexBatch> iterator = deque.iterator();
+            while (iterator.hasNext()) {
+                if (iterator.next() == batch) {
+                    iterator.remove();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /** Release pending-byte accounting for a batch that reached a terminal state. */
     public void release(IndexBatch batch) {
         if (batch.markReleased()) {
