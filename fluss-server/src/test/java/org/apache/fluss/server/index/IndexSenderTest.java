@@ -43,6 +43,8 @@ import org.apache.fluss.utils.MapUtils;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
@@ -50,16 +52,70 @@ import java.util.Collections;
 import java.util.List;
 import java.util.OptionalInt;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Unit tests for {@link IndexSender} per-bucket in-flight muting and at-least-once retry. */
 public class IndexSenderTest {
+
+    private enum LifecyclePoint {
+        PUT_KV_INVOCATION,
+        PUT_KV_COMPLETION
+    }
+
+    private static final class BlockingLifecycleHooks implements IndexSender.LifecycleHooks {
+        private final LifecyclePoint point;
+        private final CountDownLatch reached = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final AtomicBoolean blocked = new AtomicBoolean();
+
+        private BlockingLifecycleHooks(LifecyclePoint point) {
+            this.point = point;
+        }
+
+        @Override
+        public void beforePutKvInvocation() {
+            blockAt(LifecyclePoint.PUT_KV_INVOCATION);
+        }
+
+        @Override
+        public void beforePutKvCompletion() {
+            blockAt(LifecyclePoint.PUT_KV_COMPLETION);
+        }
+
+        private void blockAt(LifecyclePoint candidate) {
+            if (candidate != point || !blocked.compareAndSet(false, true)) {
+                return;
+            }
+            reached.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+
+        private void awaitReached() throws InterruptedException {
+            assertThat(reached.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+
+        private void release() {
+            release.countDown();
+        }
+    }
 
     /** Gateway that records every {@code putKv} call and lets the test control completion. */
     private static final class RecordingGateway extends TestTabletServerGateway {
@@ -156,14 +212,212 @@ public class IndexSenderTest {
                         1,
                         5L);
 
-        await(() -> gateway.apiVersionsCalls == 1);
-        sender.close();
-        gateway.completeApiVersions(success);
+        ExecutorService lifecycleExecutor = Executors.newCachedThreadPool();
+        try {
+            await(() -> gateway.apiVersionsCalls == 1);
+            Future<?> close = lifecycleExecutor.submit(sender::close);
+            await(sender::isClosedForTesting);
+            assertThat(close.isDone()).isFalse();
 
-        assertThat(gateway.requests).isEmpty();
-        assertThat(sender.inFlightRequestCount()).isZero();
-        assertThat(accumulator.pendingBytes()).isZero();
-        assertThat(accumulator.hasUnsent()).isFalse();
+            gateway.completeApiVersions(success);
+            close.get(5, TimeUnit.SECONDS);
+
+            assertThat(gateway.requests).isEmpty();
+            assertThat(sender.inFlightRequestCount()).isZero();
+            assertThat(sender.outstandingAsyncOperationCount()).isZero();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            gateway.completeApiVersions(success);
+            sender.close();
+            lifecycleExecutor.shutdownNow();
+        }
+    }
+
+    @Test
+    void closeLinearizesBeforePutKvInvocationAndWaitsForProbeCleanup() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.pendingApiVersions = new CompletableFuture<>();
+        BlockingLifecycleHooks hooks =
+                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
+        IndexSender sender = sender(accumulator, ignored -> gateway, ignored -> 1, hooks);
+        ExecutorService lifecycleExecutor = Executors.newCachedThreadPool();
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(
+                            new TableBucket(44L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            await(() -> gateway.apiVersionsCalls == 1);
+
+            Future<?> probeCompletion =
+                    lifecycleExecutor.submit(() -> gateway.completeApiVersions(true));
+            hooks.awaitReached();
+            Future<?> close = lifecycleExecutor.submit(sender::close);
+            await(sender::isClosedForTesting);
+            assertThat(close.isDone()).isFalse();
+
+            hooks.release();
+            probeCompletion.get(5, TimeUnit.SECONDS);
+            close.get(5, TimeUnit.SECONDS);
+
+            assertThat(gateway.requests).isEmpty();
+            assertThat(owner.getSyncIndexPushedOffset()).isZero();
+            assertClosedAndDrained(sender, accumulator);
+        } finally {
+            hooks.release();
+            gateway.completeApiVersions(true);
+            sender.close();
+            lifecycleExecutor.shutdownNow();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void closeWaitsForLatePutKvCallbackAndFencesItsSideEffects(boolean success) throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        BlockingLifecycleHooks hooks =
+                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_COMPLETION);
+        IndexSender sender = sender(accumulator, ignored -> gateway, ignored -> 1, hooks);
+        ExecutorService lifecycleExecutor = Executors.newCachedThreadPool();
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(
+                            new TableBucket(45L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            await(() -> gateway.pending.size() == 1);
+
+            Future<?> requestCompletion =
+                    lifecycleExecutor.submit(
+                            () -> completePutKv(gateway, 0, success));
+            hooks.awaitReached();
+            Future<?> close = lifecycleExecutor.submit(sender::close);
+            await(sender::isClosedForTesting);
+            assertThat(close.isDone()).isFalse();
+
+            hooks.release();
+            requestCompletion.get(5, TimeUnit.SECONDS);
+            close.get(5, TimeUnit.SECONDS);
+
+            assertThat(gateway.requests).hasSize(1);
+            assertThat(owner.getSyncIndexPushedOffset()).isZero();
+            assertClosedAndDrained(sender, accumulator);
+        } finally {
+            hooks.release();
+            if (!gateway.pending.isEmpty()) {
+                completePutKv(gateway, 0, success);
+            }
+            sender.close();
+            lifecycleExecutor.shutdownNow();
+        }
+    }
+
+    @ParameterizedTest(name = "gatewayReplacement={0}")
+    @ValueSource(booleans = {false, true})
+    void targetReplacementBeforePutKvInvocationRetriesWithoutSendingToOldTarget(
+            boolean gatewayReplacement) throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway first = new RecordingGateway();
+        RecordingGateway second = new RecordingGateway();
+        second.autoCompleteSuccess = true;
+        AtomicInteger leader = new AtomicInteger(1);
+        RecordingGateway[] current = {first};
+        BlockingLifecycleHooks hooks =
+                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
+        IndexSender sender =
+                sender(
+                        accumulator,
+                        serverId -> serverId == 1 ? current[0] : second,
+                        ignored -> leader.get(),
+                        hooks);
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(
+                            new TableBucket(47L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            hooks.awaitReached();
+            if (gatewayReplacement) {
+                current[0] = second;
+            } else {
+                leader.set(2);
+            }
+            hooks.release();
+
+            await(() -> second.requests.size() == 1);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+            assertThat(first.requests).isEmpty();
+            assertThat(second.requests).hasSize(1);
+            assertThat(sender.outstandingAsyncOperationCount()).isZero();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            hooks.release();
+            sender.close();
+        }
+    }
+
+    @ParameterizedTest(name = "gatewayReplacement={0}, success={1}")
+    @MethodSource("requestReplacementCases")
+    void targetReplacementFencesLatePutKvCompletionAndRetriesExactlyOnce(
+            boolean gatewayReplacement, boolean success) throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway first = new RecordingGateway();
+        RecordingGateway second = new RecordingGateway();
+        second.autoCompleteSuccess = true;
+        AtomicInteger leader = new AtomicInteger(1);
+        RecordingGateway[] current = {first};
+        BlockingLifecycleHooks hooks =
+                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_COMPLETION);
+        IndexSender sender =
+                sender(
+                        accumulator,
+                        serverId -> serverId == 1 ? current[0] : second,
+                        ignored -> leader.get(),
+                        hooks);
+        ExecutorService completionExecutor = Executors.newSingleThreadExecutor();
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(
+                            new TableBucket(46L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            await(() -> first.pending.size() == 1);
+
+            Future<?> completion =
+                    completionExecutor.submit(() -> completePutKv(first, 0, success));
+            hooks.awaitReached();
+            if (gatewayReplacement) {
+                current[0] = second;
+            } else {
+                leader.set(2);
+            }
+            hooks.release();
+            completion.get(5, TimeUnit.SECONDS);
+
+            await(() -> second.requests.size() == 1);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+            assertThat(first.requests).hasSize(1);
+            assertThat(second.requests).hasSize(1);
+            assertThat(sender.outstandingAsyncOperationCount()).isZero();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            hooks.release();
+            sender.close();
+            completionExecutor.shutdownNow();
+        }
+    }
+
+    private static Stream<Arguments> requestReplacementCases() {
+        return Stream.of(
+                Arguments.of(false, false),
+                Arguments.of(false, true),
+                Arguments.of(true, false),
+                Arguments.of(true, true));
     }
 
     @ParameterizedTest
@@ -378,6 +632,42 @@ public class IndexSenderTest {
     private static IndexReplicator owner(IndexAccumulator accumulator) {
         return new IndexReplicator(
                 null, Collections.emptyList(), accumulator, null, 0L, 1024, (sync, all) -> {});
+    }
+
+    private static IndexSender sender(
+            IndexAccumulator accumulator,
+            java.util.function.Function<Integer, RecordingGateway> gatewayFactory,
+            java.util.function.IntUnaryOperator leader,
+            IndexSender.LifecycleHooks hooks) {
+        return new IndexSender(
+                accumulator,
+                (tableId, bucket) -> OptionalInt.of(leader.applyAsInt(bucket)),
+                gatewayFactory::apply,
+                TestingMetricGroups.TABLET_SERVER_METRICS,
+                1,
+                5L,
+                1L,
+                1L,
+                1024L * 1024L,
+                5_000L,
+                hooks);
+    }
+
+    private static void completePutKv(RecordingGateway gateway, int requestIndex, boolean success) {
+        CompletableFuture<PutKvResponse> future = gateway.pending.get(requestIndex);
+        if (success) {
+            future.complete(gateway.responseFor(gateway.requests.get(requestIndex)));
+        } else {
+            future.completeExceptionally(new RuntimeException("injected request failure"));
+        }
+    }
+
+    private static void assertClosedAndDrained(
+            IndexSender sender, IndexAccumulator accumulator) {
+        assertThat(sender.inFlightRequestCount()).isZero();
+        assertThat(sender.outstandingAsyncOperationCount()).isZero();
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
     }
 
     private static void await(BooleanSupplier condition) {

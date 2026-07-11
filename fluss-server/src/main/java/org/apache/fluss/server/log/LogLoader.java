@@ -19,6 +19,7 @@ package org.apache.fluss.server.log;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.InvalidOffsetException;
 import org.apache.fluss.exception.LogSegmentOffsetOverflowException;
@@ -57,6 +58,7 @@ final class LogLoader {
     private final LogFormat logFormat;
     private final WriterStateManager writerStateManager;
     private final boolean isCleanShutdown;
+    private final List<LogSegment> segmentsWithInvalidIndex = new ArrayList<>();
 
     public LogLoader(
             File logTabletDir,
@@ -89,12 +91,13 @@ final class LogLoader {
         logSegments.close();
         logSegments.clear();
         loadSegmentFiles();
+        validateWalProtocol();
+        recoverInvalidIndexes();
         long newRecoveryPoint;
         long nextOffset;
         Tuple2<Long, Long> result = recoverLog();
         newRecoveryPoint = result.f0;
         nextOffset = result.f1;
-        validateWalProtocol();
 
         // Any segment loading or recovery code must not use writerStateManager, so that we can
         // build the full state here from scratch.
@@ -129,26 +132,29 @@ final class LogLoader {
     private void validateWalProtocol() throws IOException {
         int expectedProtocol = writerStateManager.protocol().version();
         for (LogSegment segment : logSegments.values()) {
-            FetchDataInfo data =
-                    segment.read(
-                            segment.getBaseOffset(),
-                            Integer.MAX_VALUE,
-                            segment.getSizeInBytes(),
-                            false);
-            if (data == null) {
-                continue;
-            }
-            for (LogRecordBatch batch : data.getRecords().batches()) {
-                if (batch.idempotenceProtocolVersion() != expectedProtocol) {
-                    throw new CorruptRecordException(
-                            String.format(
-                                    "Target WAL magic v%s does not match table protocol V%s while recovering %s",
-                                    batch.magic(),
-                                    expectedProtocol,
-                                    logSegments.getTableBucket()));
+            try {
+                for (LogRecordBatch batch : segment.getFileLogRecords().batches()) {
+                    if (batch.idempotenceProtocolVersion() != expectedProtocol) {
+                        throw new CorruptRecordException(
+                                String.format(
+                                        "Target WAL magic v%s does not match table protocol V%s while recovering %s",
+                                        batch.magic(),
+                                        expectedProtocol,
+                                        logSegments.getTableBucket()));
+                    }
                 }
+            } catch (CorruptMessageException ignored) {
+                // Recovery owns malformed or incomplete tails. Every complete batch before the
+                // tail has already been checked, and recovery truncates everything after it.
             }
         }
+    }
+
+    private void recoverInvalidIndexes() throws IOException {
+        for (LogSegment segment : segmentsWithInvalidIndex) {
+            recoverSegment(segment);
+        }
+        segmentsWithInvalidIndex.clear();
     }
 
     /**
@@ -342,7 +348,7 @@ final class LogLoader {
                                         segment.getFileLogRecords().file().getAbsoluteFile(),
                                         logSegments.getTableBucket());
                             }
-                            recoverSegment(segment);
+                            segmentsWithInvalidIndex.add(segment);
                         }
                         logSegments.add(segment);
                     }

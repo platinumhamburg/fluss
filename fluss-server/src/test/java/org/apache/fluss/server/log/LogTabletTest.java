@@ -54,15 +54,18 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.ScheduledFuture;
 
 import static org.apache.fluss.record.TestData.DATA1;
@@ -637,6 +640,42 @@ final class LogTabletTest extends LogTestBase {
                 .isInstanceOf(CorruptRecordException.class);
     }
 
+    @ParameterizedTest(name = "corruptSnapshot={0}")
+    @ValueSource(booleans = {false, true})
+    void testUncleanRecoveryValidatesWalBeforeReadingOrWritingSnapshots(boolean corruptSnapshot)
+            throws Exception {
+        File recoveryDir =
+                LogTestUtils.makeRandomLogTabletDir(
+                        tempDir,
+                        DATA1_TABLE_PATH.getDatabaseName(),
+                        DATA1_TABLE_ID,
+                        DATA1_TABLE_PATH.getTableName());
+        LogTablet source =
+                createProtocolLogTablet(
+                        recoveryDir, KvIdempotenceProtocol.V0_COMPACT, true);
+        source.appendAsLeader(protocolRecords(KvIdempotenceProtocol.V0_COMPACT));
+        source.writerStateManager().takeSnapshot();
+        source.close();
+
+        if (corruptSnapshot) {
+            for (File snapshot : writerSnapshotFiles(recoveryDir)) {
+                Files.write(snapshot.toPath(), "not-json".getBytes());
+            }
+        }
+        Map<String, String> snapshotsBeforeRecovery = snapshotContents(recoveryDir);
+
+        assertThatThrownBy(
+                        () ->
+                                createProtocolLogTablet(
+                                        recoveryDir,
+                                        KvIdempotenceProtocol.V1_FENCED,
+                                        false))
+                .isInstanceOf(CorruptRecordException.class)
+                .hasMessageContaining("Target WAL magic")
+                .hasMessageContaining("table protocol V1");
+        assertThat(snapshotContents(recoveryDir)).isEqualTo(snapshotsBeforeRecovery);
+    }
+
     private LogTablet createFencedLogTablet() throws Exception {
         File fencedDir =
                 LogTestUtils.makeRandomLogTabletDir(
@@ -672,6 +711,12 @@ final class LogTabletTest extends LogTestBase {
 
     private LogTablet createProtocolLogTablet(
             File protocolDir, KvIdempotenceProtocol protocol) throws Exception {
+        return createProtocolLogTablet(protocolDir, protocol, true);
+    }
+
+    private LogTablet createProtocolLogTablet(
+            File protocolDir, KvIdempotenceProtocol protocol, boolean isCleanShutdown)
+            throws Exception {
         return LogTablet.create(
                 tempDir,
                 PhysicalTablePath.of(DATA1_TABLE_PATH),
@@ -684,8 +729,25 @@ final class LogTabletTest extends LogTestBase {
                 1,
                 true,
                 SystemClock.getInstance(),
-                true,
+                isCleanShutdown,
                 protocol);
+    }
+
+    private static List<File> writerSnapshotFiles(File directory) {
+        File[] files =
+                directory.listFiles(
+                        file -> file.getName().endsWith(".writer_snapshot"));
+        return files == null ? Collections.emptyList() : Arrays.asList(files);
+    }
+
+    private static Map<String, String> snapshotContents(File directory) throws IOException {
+        Map<String, String> contents = new TreeMap<>();
+        for (File snapshot : writerSnapshotFiles(directory)) {
+            contents.put(
+                    snapshot.getName(),
+                    Base64.getEncoder().encodeToString(Files.readAllBytes(snapshot.toPath())));
+        }
+        return contents;
     }
 
     private static MemoryLogRecords protocolRecords(KvIdempotenceProtocol protocol)
