@@ -19,10 +19,17 @@ package org.apache.fluss.record;
 
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.SchemaNotExistException;
+import org.apache.fluss.exception.CorruptMessageException;
+import org.apache.fluss.memory.ManagedPagedOutputView;
+import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.arrow.ArrowWriter;
+import org.apache.fluss.row.arrow.ArrowWriterPool;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
 
@@ -47,12 +54,16 @@ import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESS
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
+import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.V1_RECORD_BATCH_HEADER_SIZE;
+import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordReadContext.createArrowReadContext;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
+import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
@@ -411,6 +422,116 @@ class FileLogProjectionTest {
                     .isInstanceOf(EOFException.class)
                     .hasMessageContaining(
                             "Expected to read 48 bytes, but reached end of file after reading 47 bytes.");
+        }
+
+        ByteBuffer v3HeaderBuffer = ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE);
+        try (FileLogRecords fileLogRecords =
+                createFileWithLogHeader(
+                        LOG_MAGIC_VALUE_V2, LogRecordBatchFormat.V2_RECORD_BATCH_HEADER_SIZE)) {
+            FileLogProjection.readLogHeaderFullyOrFail(
+                    fileLogRecords.channel(), v3HeaderBuffer, 0);
+            assertThat(v3HeaderBuffer.position())
+                    .isEqualTo(LogRecordBatchFormat.V2_RECORD_BATCH_HEADER_SIZE);
+        }
+
+        v3HeaderBuffer.rewind();
+        try (FileLogRecords fileLogRecords =
+                createFileWithLogHeader(LOG_MAGIC_VALUE_V3, V3_RECORD_BATCH_HEADER_SIZE)) {
+            FileLogProjection.readLogHeaderFullyOrFail(
+                    fileLogRecords.channel(), v3HeaderBuffer, 0);
+            assertThat(v3HeaderBuffer.hasRemaining()).isFalse();
+        }
+
+        v3HeaderBuffer.rewind();
+        try (FileLogRecords fileLogRecords =
+                createFileWithLogHeader(
+                        LOG_MAGIC_VALUE_V3, V3_RECORD_BATCH_HEADER_SIZE - 1)) {
+            assertThatThrownBy(
+                            () ->
+                                    FileLogProjection.readLogHeaderFullyOrFail(
+                                            fileLogRecords.channel(), v3HeaderBuffer, 0))
+                    .isInstanceOf(EOFException.class)
+                    .hasMessageContaining("Expected to read 68 bytes")
+                    .hasMessageContaining("after reading 67 bytes");
+        }
+    }
+
+    @Test
+    void testV3WriterKeyAndLongSequenceSurviveProjection() throws Exception {
+        WriterKey writerKey = new WriterKey(17L, Long.MIN_VALUE | 3L);
+        long sequence = (long) Integer.MAX_VALUE + 17L;
+        MemoryLogRecords records;
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                ArrowWriterPool writerPool = new ArrowWriterPool(allocator)) {
+            ArrowWriter writer =
+                    writerPool.getOrCreateWriter(
+                            1L,
+                            DEFAULT_SCHEMA_ID,
+                            1024,
+                            TestData.DATA1_ROW_TYPE,
+                            DEFAULT_COMPRESSION);
+            MemoryLogRecordsArrowBuilder builder =
+                    MemoryLogRecordsArrowBuilder.fencedBuilder(
+                            DEFAULT_SCHEMA_ID,
+                            writer,
+                            new ManagedPagedOutputView(new TestingMemorySegmentPool(1024)),
+                            false,
+                            null);
+            builder.append(ChangeType.APPEND_ONLY, row(new Object[] {1, "a"}));
+            builder.setFencedWriterState(writerKey, sequence);
+            builder.close();
+            records = MemoryLogRecords.pointToBytesView(builder.build());
+        }
+
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, "v3-projection.log"))) {
+            fileLogRecords.append(records);
+            fileLogRecords.flush();
+            FileLogProjection projection = new FileLogProjection(new ProjectionPushdownCache());
+            projection.setCurrentProjection(
+                    1L, testingSchemaGetter, DEFAULT_COMPRESSION, new int[] {0});
+
+            LogRecordBatch projectedBatch =
+                    projection
+                            .project(
+                                    fileLogRecords.channel(),
+                                    0,
+                                    fileLogRecords.sizeInBytes(),
+                                    Integer.MAX_VALUE)
+                            .batches()
+                            .iterator()
+                            .next();
+            assertThat(projectedBatch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+            assertThat(projectedBatch.idempotenceProtocolVersion()).isEqualTo(1);
+            assertThat(projectedBatch.fencedWriterKey()).isEqualTo(writerKey);
+            assertThat(projectedBatch.fencedSequence()).isEqualTo(sequence);
+        }
+    }
+
+    @Test
+    void testProjectionRejectsV3DeclaredSizeSmallerThanFixedHeader() throws Exception {
+        ByteBuffer corruptHeader =
+                ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+        corruptHeader.putInt(
+                LENGTH_OFFSET,
+                V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1);
+        corruptHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, "undersized-v3-projection.log"))) {
+            fileLogRecords.channel().write(corruptHeader);
+            fileLogRecords.flush();
+            FileLogProjection projection = new FileLogProjection(new ProjectionPushdownCache());
+
+            assertThatThrownBy(
+                            () ->
+                                    projection.project(
+                                            fileLogRecords.channel(),
+                                            0,
+                                            (int) fileLogRecords.channel().size(),
+                                            Integer.MAX_VALUE))
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining("v3")
+                    .hasMessageContaining("smaller");
         }
     }
 

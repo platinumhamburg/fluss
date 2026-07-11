@@ -23,9 +23,12 @@ import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.memory.LazyMemorySegmentPool;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
@@ -44,6 +47,7 @@ import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESS
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.testutils.DataTestUtils.assertLogRecordsEqualsWithRowKind;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -148,6 +152,48 @@ class ArrowWalBuilderTest {
             memorySegment.put(50, (byte) 4);
         }
         assertThat(logRecords.batches().iterator().next().isValid()).isFalse();
+    }
+
+    @Test
+    void testFencedWriterStateRoundTripsThroughEveryWalBuilder() throws Exception {
+        WriterKey writerKey = new WriterKey(17L, Long.MIN_VALUE | 3L);
+        long sequence = (long) Integer.MAX_VALUE + 17L;
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+
+        WalBuilder arrowBuilder =
+                ArrowWalBuilder.fencedBuilder(
+                        DEFAULT_SCHEMA_ID,
+                        arrowWriterProvider.getOrCreateWriter(
+                                tableBucket.getTableId(),
+                                DEFAULT_SCHEMA_ID,
+                                1024,
+                                DATA1_ROW_TYPE,
+                                DEFAULT_COMPRESSION),
+                        new TestingMemorySegmentPool(1024));
+        assertFencedBatch(arrowBuilder, writerKey, sequence);
+
+        WalBuilder compactedBuilder =
+                CompactedWalBuilder.fencedBuilder(
+                        DEFAULT_SCHEMA_ID,
+                        DATA1_ROW_TYPE,
+                        new TestingMemorySegmentPool(1024));
+        assertFencedBatch(compactedBuilder, writerKey, sequence);
+
+        WalBuilder indexBuilder =
+                IndexWalBuilder.fencedBuilder(
+                        DEFAULT_SCHEMA_ID, new TestingMemorySegmentPool(1024));
+        assertFencedBatch(indexBuilder, writerKey, sequence);
+    }
+
+    private static void assertFencedBatch(
+            WalBuilder builder, WriterKey writerKey, long sequence) throws Exception {
+        builder.setFencedWriterState(writerKey, sequence);
+        LogRecordBatch batch = builder.build().batches().iterator().next();
+        assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+        assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
+        assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
+        assertThat(batch.fencedSequence()).isEqualTo(sequence);
+        builder.deallocate();
     }
 
     private WalBuilder createWalBuilder(

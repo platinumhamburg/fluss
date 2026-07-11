@@ -50,6 +50,7 @@ public class LogRecordBatchFormat {
     private static final int LAST_OFFSET_DELTA_LENGTH = 4;
     private static final int WRITE_CLIENT_ID_LENGTH = 8;
     private static final int BATCH_SEQUENCE_LENGTH = 4;
+    private static final int FENCED_SEQUENCE_LENGTH = 8;
     private static final int RECORDS_COUNT_LENGTH = 4;
 
     public static final int BASE_OFFSET_OFFSET = 0;
@@ -146,6 +147,31 @@ public class LogRecordBatchFormat {
 
     // V2 record batch header size (fixed part, without statistics data)
     public static final int V2_RECORD_BATCH_HEADER_SIZE = V2_STATISTICS_DATA_OFFSET;
+
+    // ----------------------------------------------------------------------------------------
+    // Format of Magic Version: V3
+    // ----------------------------------------------------------------------------------------
+
+    /**
+     * Target WAL format for idempotence protocol V1. V3 shares the V2 prefix through
+     * LastOffsetDelta, then stores an opaque WriterKey and a 64-bit fenced sequence.
+     */
+    public static final byte LOG_MAGIC_VALUE_V3 = 3;
+
+    private static final int V3_WRITER_KEY_HIGH_OFFSET =
+            V2_LAST_OFFSET_DELTA_OFFSET + LAST_OFFSET_DELTA_LENGTH;
+    private static final int V3_WRITER_KEY_LOW_OFFSET =
+            V3_WRITER_KEY_HIGH_OFFSET + WRITE_CLIENT_ID_LENGTH;
+    private static final int V3_FENCED_SEQUENCE_OFFSET =
+            V3_WRITER_KEY_LOW_OFFSET + WRITE_CLIENT_ID_LENGTH;
+    private static final int V3_RECORDS_COUNT_OFFSET =
+            V3_FENCED_SEQUENCE_OFFSET + FENCED_SEQUENCE_LENGTH;
+    private static final int V3_STATISTICS_LENGTH_OFFSET =
+            V3_RECORDS_COUNT_OFFSET + RECORDS_COUNT_LENGTH;
+    private static final int V3_STATISTICS_DATA_OFFSET =
+            V3_STATISTICS_LENGTH_OFFSET + STATISTICS_LENGTH_LENGTH;
+
+    public static final int V3_RECORD_BATCH_HEADER_SIZE = V3_STATISTICS_DATA_OFFSET;
 
     // ----------------------------------------------------------------------------------------
     // Format of Magic Version: V1
@@ -277,6 +303,7 @@ public class LogRecordBatchFormat {
             case LOG_MAGIC_VALUE_V1:
                 throw new UnsupportedOperationException("Leader epoch is not supported in V0/V1");
             case LOG_MAGIC_VALUE_V2:
+            case LOG_MAGIC_VALUE_V3:
                 return V2_LEADER_EPOCH_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
@@ -290,6 +317,7 @@ public class LogRecordBatchFormat {
             case LOG_MAGIC_VALUE_V1:
                 return V1_CRC_OFFSET;
             case LOG_MAGIC_VALUE_V2:
+            case LOG_MAGIC_VALUE_V3:
                 return V2_CRC_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
@@ -303,6 +331,7 @@ public class LogRecordBatchFormat {
             case LOG_MAGIC_VALUE_V1:
                 return V1_SCHEMA_ID_OFFSET;
             case LOG_MAGIC_VALUE_V2:
+            case LOG_MAGIC_VALUE_V3:
                 return V2_SCHEMA_ID_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
@@ -316,6 +345,7 @@ public class LogRecordBatchFormat {
             case LOG_MAGIC_VALUE_V1:
                 return V1_ATTRIBUTES_OFFSET;
             case LOG_MAGIC_VALUE_V2:
+            case LOG_MAGIC_VALUE_V3:
                 return V2_ATTRIBUTES_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
@@ -329,6 +359,7 @@ public class LogRecordBatchFormat {
             case LOG_MAGIC_VALUE_V1:
                 return V1_LAST_OFFSET_DELTA_OFFSET;
             case LOG_MAGIC_VALUE_V2:
+            case LOG_MAGIC_VALUE_V3:
                 return V2_LAST_OFFSET_DELTA_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
@@ -343,6 +374,9 @@ public class LogRecordBatchFormat {
                 return V1_WRITE_CLIENT_ID_OFFSET;
             case LOG_MAGIC_VALUE_V2:
                 return V2_WRITE_CLIENT_ID_OFFSET;
+            case LOG_MAGIC_VALUE_V3:
+                throw new UnsupportedOperationException(
+                        "Writer id is not supported in magic version " + magic);
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
@@ -356,6 +390,9 @@ public class LogRecordBatchFormat {
                 return V1_BATCH_SEQUENCE_OFFSET;
             case LOG_MAGIC_VALUE_V2:
                 return V2_BATCH_SEQUENCE_OFFSET;
+            case LOG_MAGIC_VALUE_V3:
+                throw new UnsupportedOperationException(
+                        "Compact batch sequence is not supported in magic version " + magic);
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
@@ -369,6 +406,8 @@ public class LogRecordBatchFormat {
                 return V1_RECORDS_COUNT_OFFSET;
             case LOG_MAGIC_VALUE_V2:
                 return V2_RECORDS_COUNT_OFFSET;
+            case LOG_MAGIC_VALUE_V3:
+                return V3_RECORDS_COUNT_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
@@ -382,6 +421,8 @@ public class LogRecordBatchFormat {
                 return V1_RECORD_BATCH_HEADER_SIZE;
             case LOG_MAGIC_VALUE_V2:
                 return V2_RECORD_BATCH_HEADER_SIZE;
+            case LOG_MAGIC_VALUE_V3:
+                return V3_RECORD_BATCH_HEADER_SIZE;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
@@ -400,6 +441,8 @@ public class LogRecordBatchFormat {
                 return V1_STATISTICS_LENGTH_OFFSET;
             case LOG_MAGIC_VALUE_V2:
                 return V2_STATISTICS_LENGTH_OFFSET;
+            case LOG_MAGIC_VALUE_V3:
+                return V3_STATISTICS_LENGTH_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
@@ -418,6 +461,8 @@ public class LogRecordBatchFormat {
                 return V1_STATISTICS_DATA_OFFSET;
             case LOG_MAGIC_VALUE_V2:
                 return V2_STATISTICS_DATA_OFFSET;
+            case LOG_MAGIC_VALUE_V3:
+                return V3_STATISTICS_DATA_OFFSET;
             default:
                 throw new IllegalArgumentException("Unsupported magic value " + magic);
         }
@@ -441,5 +486,29 @@ public class LogRecordBatchFormat {
         // Set StatisticsLength to 0 (no statistics)
         headerBuffer.position(statisticsLengthOffset(magic));
         headerBuffer.putInt(0);
+    }
+
+    public static int writerKeyHighOffset(byte magic) {
+        if (magic != LOG_MAGIC_VALUE_V3) {
+            throw new UnsupportedOperationException(
+                    "Fenced writer key is not supported in magic version " + magic);
+        }
+        return V3_WRITER_KEY_HIGH_OFFSET;
+    }
+
+    public static int writerKeyLowOffset(byte magic) {
+        if (magic != LOG_MAGIC_VALUE_V3) {
+            throw new UnsupportedOperationException(
+                    "Fenced writer key is not supported in magic version " + magic);
+        }
+        return V3_WRITER_KEY_LOW_OFFSET;
+    }
+
+    public static int fencedSequenceOffset(byte magic) {
+        if (magic != LOG_MAGIC_VALUE_V3) {
+            throw new UnsupportedOperationException(
+                    "Fenced sequence is not supported in magic version " + magic);
+        }
+        return V3_FENCED_SEQUENCE_OFFSET;
     }
 }

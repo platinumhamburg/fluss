@@ -22,6 +22,7 @@ import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.MemoryLogRecordsCompactedBuilder;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.InternalRow.FieldGetter;
@@ -45,16 +46,34 @@ public class CompactedWalBuilder implements WalBuilder {
 
     public CompactedWalBuilder(int schemaId, RowType rowType, MemorySegmentPool memorySegmentPool)
             throws IOException {
+        this(schemaId, rowType, memorySegmentPool, false);
+    }
+
+    private CompactedWalBuilder(
+            int schemaId,
+            RowType rowType,
+            MemorySegmentPool memorySegmentPool,
+            boolean fenced)
+            throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         // unlimited write size as we don't know the WAL size in advance
         this.recordsBuilder =
-                MemoryLogRecordsCompactedBuilder.builder(
-                        schemaId, Integer.MAX_VALUE, outputView, /*appendOnly*/ false);
+                fenced
+                        ? MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                                schemaId, Integer.MAX_VALUE, outputView, false)
+                        : MemoryLogRecordsCompactedBuilder.builder(
+                                schemaId, Integer.MAX_VALUE, outputView, /*appendOnly*/ false);
         DataType[] fieldTypes = rowType.getChildren().toArray(new DataType[0]);
         this.rowEncoder = new CompactedRowEncoder(fieldTypes);
         this.fieldGetters = InternalRow.createFieldGetters(rowType);
         this.fieldCount = rowType.getFieldCount();
+    }
+
+    public static CompactedWalBuilder fencedBuilder(
+            int schemaId, RowType rowType, MemorySegmentPool memorySegmentPool)
+            throws IOException {
+        return new CompactedWalBuilder(schemaId, rowType, memorySegmentPool, true);
     }
 
     @Override
@@ -83,6 +102,11 @@ public class CompactedWalBuilder implements WalBuilder {
     @Override
     public void setWriterState(long writerId, int batchSequence) {
         recordsBuilder.setWriterState(writerId, batchSequence);
+    }
+
+    @Override
+    public void setFencedWriterState(WriterKey writerKey, long sequence) {
+        recordsBuilder.setFencedWriterState(writerKey, sequence);
     }
 
     @Override

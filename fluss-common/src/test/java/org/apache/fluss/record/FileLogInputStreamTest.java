@@ -17,6 +17,8 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.exception.CorruptMessageException;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.utils.CloseableIterator;
 
@@ -26,22 +28,103 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Collections;
 import java.util.Optional;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
+import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.record.TestData.TEST_SCHEMA_GETTER;
 import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link FileLogInputStream}. */
 public class FileLogInputStreamTest extends LogTestBase {
     private @TempDir File tempDir;
+
+    @Test
+    void testV3WriterKeyAndLongSequenceSurviveFileRoundTrip() throws Exception {
+        WriterKey writerKey = new WriterKey(17L, Long.MIN_VALUE | 3L);
+        long sequence = (long) Integer.MAX_VALUE + 17L;
+        MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.fencedBuilder(
+                        DEFAULT_SCHEMA_ID,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        false);
+        builder.setFencedWriterState(writerKey, sequence);
+        MemoryLogRecords records = MemoryLogRecords.pointToBytesView(builder.build());
+
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, "v3-round-trip.log"))) {
+            fileLogRecords.append(records);
+            fileLogRecords.flush();
+
+            LogRecordBatch batch =
+                    new FileLogInputStream(fileLogRecords, 0, fileLogRecords.sizeInBytes())
+                            .nextBatch();
+            assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+            assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
+            assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
+            assertThat(batch.fencedSequence()).isEqualTo(sequence);
+        }
+    }
+
+    @Test
+    void testRejectsV3DeclaredSizeSmallerThanFixedHeader() throws Exception {
+        ByteBuffer corruptHeader =
+                ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+        corruptHeader.putInt(
+                LENGTH_OFFSET,
+                V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1);
+        corruptHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
+
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, "undersized-v3.log"))) {
+            fileLogRecords.channel().write(corruptHeader);
+            fileLogRecords.flush();
+            FileLogInputStream input =
+                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
+
+            assertThatThrownBy(input::nextBatch)
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining("v3")
+                    .hasMessageContaining("smaller");
+        }
+    }
+
+    @Test
+    void testRejectsPhysicallyUndersizedV3Header() throws Exception {
+        ByteBuffer corruptHeader =
+                ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE - 1)
+                        .order(ByteOrder.LITTLE_ENDIAN);
+        corruptHeader.putInt(
+                LENGTH_OFFSET, V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD);
+        corruptHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
+
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, "truncated-v3.log"))) {
+            fileLogRecords.channel().write(corruptHeader);
+            fileLogRecords.flush();
+            FileLogInputStream input =
+                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
+
+            assertThatThrownBy(input::nextBatch)
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining("v3")
+                    .hasMessageContaining("fixed header");
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1})

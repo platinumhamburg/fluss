@@ -29,6 +29,7 @@ import java.io.IOException;
 import static org.apache.fluss.record.LogRecordBatchFormat.BASE_OFFSET_LENGTH;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
@@ -37,6 +38,8 @@ import static org.apache.fluss.record.LogRecordBatchFormat.lastOffsetDeltaOffset
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Abstract base builder for row-based MemoryLogRecords builders sharing common logic. */
 public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
@@ -54,6 +57,8 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
     private BytesView builtBuffer = null;
     private long writerId;
     private int batchSequence;
+    private WriterKey writerKey;
+    private long fencedSequence;
     private int currentRecordNumber;
     private int sizeInBytes;
     private volatile boolean isClosed;
@@ -78,6 +83,7 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
         this.firstSegment = pagedOutputView.getCurrentSegment();
         this.writerId = NO_WRITER_ID;
         this.batchSequence = NO_BATCH_SEQUENCE;
+        this.fencedSequence = -1L;
         this.currentRecordNumber = 0;
         this.isClosed = false;
 
@@ -130,6 +136,9 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
         if (builtBuffer != null) {
             return builtBuffer;
         }
+        checkState(
+                magic != LOG_MAGIC_VALUE_V3 || writerKey != null,
+                "A writer key is required before building a magic v3 WAL batch");
         writeBatchHeader();
         builtBuffer =
                 MultiBytesView.builder()
@@ -139,11 +148,24 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
     }
 
     public void setWriterState(long writerId, int batchBaseSequence) {
+        checkState(
+                magic != LOG_MAGIC_VALUE_V3,
+                "Compact writer state does not support WAL magic v3");
         this.writerId = writerId;
         this.batchSequence = batchBaseSequence;
     }
 
+    public void setFencedWriterState(WriterKey writerKey, long sequence) {
+        checkState(magic == LOG_MAGIC_VALUE_V3, "Fenced writer state requires WAL magic v3");
+        checkArgument(sequence >= 0L, "fenced sequence must be non-negative");
+        this.writerKey = checkNotNull(writerKey);
+        this.fencedSequence = sequence;
+    }
+
     public void resetWriterState(long writerId, int batchSequence) {
+        checkState(
+                magic != LOG_MAGIC_VALUE_V3,
+                "Compact writer state does not support WAL magic v3");
         // trigger to rewrite batch header
         this.builtBuffer = null;
         this.writerId = writerId;
@@ -215,9 +237,19 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
             // the field 'lastOffsetDelta' in DefaultLogRecordBatch.
             outputView.writeInt(0);
         }
-        outputView.writeLong(writerId);
-        outputView.writeInt(batchSequence);
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            outputView.writeLong(writerKey.high());
+            outputView.writeLong(writerKey.low());
+            outputView.writeLong(fencedSequence);
+        } else {
+            outputView.writeLong(writerId);
+            outputView.writeInt(batchSequence);
+        }
         outputView.writeInt(currentRecordNumber);
+
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            outputView.writeInt(0);
+        }
 
         // Update crc.
         long crc = Crc32C.compute(pagedOutputView.getWrittenSegments(), schemaIdOffset(magic));

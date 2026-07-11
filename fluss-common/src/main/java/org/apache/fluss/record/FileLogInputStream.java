@@ -17,6 +17,7 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.types.RowType;
@@ -38,6 +39,8 @@ import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAG
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
+import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
@@ -75,12 +78,28 @@ public class FileLogInputStream
         logHeaderBuffer.rewind();
         long offset = logHeaderBuffer.getLong(BASE_OFFSET_OFFSET);
         int length = logHeaderBuffer.getInt(LENGTH_OFFSET);
+        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
+
+        if (magic == LOG_MAGIC_VALUE_V3 && position > end - V3_RECORD_BATCH_HEADER_SIZE) {
+            throw new CorruptMessageException(
+                    "Magic v3 record batch is corrupt: only "
+                            + (end - position)
+                            + " bytes remain for fixed header "
+                            + V3_RECORD_BATCH_HEADER_SIZE);
+        }
 
         if (position > end - LOG_OVERHEAD - length) {
             return null;
         }
 
-        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
+        if (magic == LOG_MAGIC_VALUE_V3
+                && length < V3_RECORD_BATCH_HEADER_SIZE - LOG_OVERHEAD) {
+            throw new CorruptMessageException(
+                    "Magic v3 record batch is corrupt: declared size "
+                            + ((long) LOG_OVERHEAD + length)
+                            + " is smaller than fixed header "
+                            + V3_RECORD_BATCH_HEADER_SIZE);
+        }
         FileChannelLogRecordBatch batch =
                 new FileChannelLogRecordBatch(offset, magic, fileRecords, position, length);
 
@@ -157,6 +176,16 @@ public class FileLogInputStream
         @Override
         public int batchSequence() {
             return loadBatchHeader().batchSequence();
+        }
+
+        @Override
+        public WriterKey fencedWriterKey() {
+            return loadBatchHeader().fencedWriterKey();
+        }
+
+        @Override
+        public long fencedSequence() {
+            return loadBatchHeader().fencedSequence();
         }
 
         @Override

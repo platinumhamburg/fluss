@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv.wal;
 
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.InternalRow;
 
 /** The interface to build write-ahead-log batch ({@link MemoryLogRecords}) for kv store. */
@@ -29,6 +30,8 @@ public interface WalBuilder {
     MemoryLogRecords build() throws Exception;
 
     void setWriterState(long writerId, int batchSequence);
+
+    void setFencedWriterState(WriterKey writerKey, long sequence);
 
     void deallocate();
 }

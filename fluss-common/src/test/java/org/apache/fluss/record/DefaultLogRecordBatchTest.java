@@ -28,6 +28,7 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
 
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
@@ -36,11 +37,142 @@ import java.util.List;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link DefaultLogRecordBatch}. */
 public class DefaultLogRecordBatchTest extends LogTestBase {
+
+    private static final WriterKey FENCED_WRITER_KEY =
+            new WriterKey(17L, Long.MIN_VALUE | 3L);
+    private static final long FENCED_SEQUENCE = (long) Integer.MAX_VALUE + 17L;
+
+    @ParameterizedTest
+    @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1, LOG_MAGIC_VALUE_V2})
+    void testExistingWriterAccessorsRemainCompact(byte magic) throws Exception {
+        LogRecordBatch batch = buildOrdinaryBatch(magic, 7L, Integer.MAX_VALUE);
+        assertThat(batch.writerId()).isEqualTo(7L);
+        assertThat(batch.batchSequence()).isEqualTo(Integer.MAX_VALUE);
+        assertThat(batch.idempotenceProtocolVersion()).isZero();
+        assertThatThrownBy(batch::fencedWriterKey)
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::fencedSequence)
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void testV0AndV2HeadersRemainByteExact() throws Exception {
+        assertThat(batchBytes(buildOrdinaryRecords(LOG_MAGIC_VALUE_V0, 7L, Integer.MAX_VALUE)))
+                .isEqualTo(
+                        parseHex(
+                                "000000000000000024000000000000000000000000ec1d59fa010000000000000700000000000000ffffff7f00000000"));
+        assertThat(batchBytes(buildOrdinaryRecords(LOG_MAGIC_VALUE_V2, 7L, Integer.MAX_VALUE)))
+                .isEqualTo(
+                        parseHex(
+                                "00000000000000002c000000020000000000000000ffffffffadc5a64e010000000000000700000000000000ffffff7f0000000000000000"));
+    }
+
+    @Test
+    void testV3WriterKeyAndLongSequenceSurviveMemoryRoundTrip() throws Exception {
+        MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.fencedBuilder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        false);
+        builder.setFencedWriterState(FENCED_WRITER_KEY, FENCED_SEQUENCE);
+
+        LogRecordBatch batch =
+                MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
+        assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+        assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
+        assertThat(batch.fencedWriterKey()).isEqualTo(FENCED_WRITER_KEY);
+        assertThat(batch.fencedSequence()).isEqualTo(FENCED_SEQUENCE);
+        assertThatThrownBy(batch::writerId).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::batchSequence)
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void testV3RequiresWriterKeyAndAcceptsLongMaxSequence() throws Exception {
+        MemoryLogRecordsCompactedBuilder missingKeyBuilder =
+                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        false);
+        assertThatThrownBy(missingKeyBuilder::build)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("writer key");
+
+        MemoryLogRecordsCompactedBuilder maxSequenceBuilder =
+                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        false);
+        maxSequenceBuilder.setFencedWriterState(FENCED_WRITER_KEY, Long.MAX_VALUE);
+        LogRecordBatch batch =
+                MemoryLogRecords.pointToBytesView(maxSequenceBuilder.build())
+                        .batches()
+                        .iterator()
+                        .next();
+        assertThat(batch.fencedSequence()).isEqualTo(Long.MAX_VALUE);
+        assertThatThrownBy(
+                        () ->
+                                maxSequenceBuilder.setFencedWriterState(
+                                        FENCED_WRITER_KEY, -1L))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testExistingBuilderFactoryCannotCreateV3() throws Exception {
+        MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.builder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        false);
+        LogRecordBatch batch =
+                MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
+        assertThat(batch.magic()).isLessThan(LOG_MAGIC_VALUE_V3);
+        assertThat(LogRecordBatch.CURRENT_LOG_MAGIC_VALUE).isEqualTo(LOG_MAGIC_VALUE_V0);
+    }
+
+    private LogRecordBatch buildOrdinaryBatch(byte magic, long writerId, int sequence)
+            throws Exception {
+        return buildOrdinaryRecords(magic, writerId, sequence).batches().iterator().next();
+    }
+
+    private MemoryLogRecords buildOrdinaryRecords(byte magic, long writerId, int sequence)
+            throws Exception {
+        MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.builder(
+                        0L,
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        magic,
+                        new UnmanagedPagedOutputView(100));
+        builder.setWriterState(writerId, sequence);
+        return MemoryLogRecords.pointToBytesView(builder.build());
+    }
+
+    private static byte[] batchBytes(MemoryLogRecords records) {
+        byte[] bytes = new byte[records.sizeInBytes()];
+        records.getMemorySegment().get(records.getPosition(), bytes, 0, bytes.length);
+        return bytes;
+    }
+
+    private static byte[] parseHex(String hex) {
+        byte[] bytes = new byte[hex.length() / 2];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+    }
 
     @ParameterizedTest
     @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1})

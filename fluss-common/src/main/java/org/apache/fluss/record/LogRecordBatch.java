@@ -31,6 +31,9 @@ import java.util.Iterator;
 import java.util.Optional;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
 
 /**
@@ -113,6 +116,20 @@ public interface LogRecordBatch {
      */
     byte magic();
 
+    /** Returns the idempotence protocol encoded by this target WAL batch. */
+    default int idempotenceProtocolVersion() {
+        switch (magic()) {
+            case LOG_MAGIC_VALUE_V0:
+            case LOG_MAGIC_VALUE_V1:
+            case LOG_MAGIC_VALUE_V2:
+                return 0;
+            case LOG_MAGIC_VALUE_V3:
+                return 1;
+            default:
+                throw new IllegalArgumentException("Unsupported magic value " + magic());
+        }
+    }
+
     /**
      * Get commit timestamp of this record batch. Commit timestamp means the timestamp when the
      * batch is appended to the log segment in server.
@@ -140,6 +157,18 @@ public interface LogRecordBatch {
      * @return batch base sequence
      */
     int batchSequence();
+
+    /** Get the opaque writer key for a protocol V1 target WAL batch. */
+    default WriterKey fencedWriterKey() {
+        throw new UnsupportedOperationException(
+                "Fenced writer key is not supported for magic v" + magic());
+    }
+
+    /** Get the 64-bit sequence fence for a protocol V1 target WAL batch. */
+    default long fencedSequence() {
+        throw new UnsupportedOperationException(
+                "Fenced sequence is not supported for magic v" + magic());
+    }
 
     /**
      * Get leader epoch of this bucket for this log record batch.
