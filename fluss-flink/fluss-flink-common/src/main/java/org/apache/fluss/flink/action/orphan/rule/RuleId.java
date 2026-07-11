@@ -18,20 +18,27 @@
 package org.apache.fluss.flink.action.orphan.rule;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 
 /** Enumeration of all file-level rule identifiers used in orphan cleanup audit logs. */
 @Internal
 public enum RuleId {
-    LOG_SEGMENT("log-segment"),
-    LOG_MANIFEST("log-manifest"),
-    KV_SNAPSHOT_FILE("kv-snapshot-file"),
-    KV_SHARED_SST("kv-shared-sst"),
-    UNKNOWN("unknown");
+    LOG_SEGMENT("log-segment", CleanupObjectType.LOG_SEGMENT),
+    LOG_MANIFEST("log-manifest", CleanupObjectType.LOG_MANIFEST),
+    KV_SNAPSHOT_FILE("kv-snapshot-file", CleanupObjectType.KV_SNAPSHOT_FILE),
+    KV_SHARED_SST("kv-shared-sst", CleanupObjectType.KV_SHARED_SST),
+    UNKNOWN("unknown", CleanupObjectType.UNKNOWN);
 
     private final String auditTag;
+    private final CleanupObjectType objectType;
 
-    RuleId(String auditTag) {
+    RuleId(String auditTag, CleanupObjectType objectType) {
         this.auditTag = auditTag;
+        this.objectType = objectType;
+    }
+
+    public CleanupObjectType objectType() {
+        return objectType;
     }
 
     @Override

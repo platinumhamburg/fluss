@@ -154,7 +154,7 @@ public final class BucketCleaner {
                     case DELETE:
                         stats.plannedFiles++;
                         stats.plannedBytes += meta.size();
-                        if (safeDeleter.deleteFile(meta.path(), decision, rule.id())) {
+                        if (safeDeleter.deleteFile(meta, decision, rule.id())) {
                             if (!dryRun) {
                                 stats.deletedFiles++;
                                 stats.bytesReclaimed += meta.size();

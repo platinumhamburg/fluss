@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
@@ -68,14 +69,16 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
     private final long remoteFsOpRateLimitPerSecond;
     private final Map<String, String> extraConfigs;
+    private final String runId;
 
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
 
     public ScanAndCleanFunction(
-            long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
+            long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs, String runId) {
         this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
         this.extraConfigs = extraConfigs;
+        this.runId = runId;
     }
 
     @Override
@@ -126,7 +129,8 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         task.kvActiveSnapDirs(),
                         task.logActiveManifestPaths());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
-        SafeDeleter safeDeleter = createSafeDeleter(anyDir.getFileSystem(), task.dryRun());
+        SafeDeleter safeDeleter =
+                createSafeDeleter(anyDir.getFileSystem(), task.dryRun(), task.scope());
         BucketCleaner cleaner =
                 new BucketCleaner(
                         dispatcher,
@@ -165,7 +169,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             return CleanStats.empty(task.scope());
         }
 
-        SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun());
+        SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun(), task.scope());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
 
         long scannedFiles = 0L;
@@ -247,7 +251,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                     case DELETE:
                         plannedFiles++;
                         plannedBytes += meta.size();
-                        if (safeDeleter.deleteFile(meta.path(), decision, rule.id())) {
+                        if (safeDeleter.deleteFile(meta, decision, rule.id())) {
                             if (!task.dryRun()) {
                                 deletedFiles++;
                                 bytesReclaimed += meta.size();
@@ -289,8 +293,8 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     // Helpers
     // -------------------------------------------------------------------------
 
-    private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun) {
-        return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter);
+    private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun, ScopeIdentity scope) {
+        return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter, runId, scope);
     }
 
     private static double perSubtaskRate(long totalRate, int parallelism, int subtaskIndex) {

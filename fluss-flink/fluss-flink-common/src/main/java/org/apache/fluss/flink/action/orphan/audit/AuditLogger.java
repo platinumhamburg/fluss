@@ -22,6 +22,7 @@ import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.job.CleanStats;
 import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
+import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
 
@@ -217,6 +218,90 @@ public final class AuditLogger {
 
     public void logWouldDelete(FsPath path, RuleId ruleId) {
         AUDIT.info("action=would_delete rule={} path={} ts={}", ruleId, path, Instant.now());
+    }
+
+    public void logWouldDelete(String runId, FileMeta file, RuleId ruleId, ScopeIdentity scope) {
+        logObjectAction(
+                "would_delete",
+                runId,
+                file,
+                ruleId,
+                scope,
+                "older_than_cutoff",
+                "planned",
+                true,
+                false,
+                false);
+    }
+
+    public void logDeleted(String runId, FileMeta file, RuleId ruleId, ScopeIdentity scope) {
+        logObjectAction(
+                "deleted",
+                runId,
+                file,
+                ruleId,
+                scope,
+                "older_than_cutoff",
+                "success",
+                false,
+                false,
+                false);
+    }
+
+    public void logDeleteFailed(
+            String runId,
+            FileMeta file,
+            RuleId ruleId,
+            ScopeIdentity scope,
+            String reasonCode,
+            boolean retryable) {
+        logObjectAction(
+                "delete_failed",
+                runId,
+                file,
+                ruleId,
+                scope,
+                reasonCode,
+                "failed",
+                false,
+                retryable,
+                true);
+    }
+
+    private void logObjectAction(
+            String action,
+            String runId,
+            FileMeta file,
+            RuleId ruleId,
+            ScopeIdentity scope,
+            String reasonCode,
+            String result,
+            boolean dryRun,
+            boolean retryable,
+            boolean actionRequired) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scan action={} object_type={} path={}"
+                        + " size_bytes={} mtime_ms={} rule={} reason_code={} result={}"
+                        + " database={} table={} table_id={} partition_id={} bucket_id={}"
+                        + " dry_run={} retryable={} action_required={} ts={}",
+                runId,
+                action,
+                ruleId.objectType().name().toLowerCase(Locale.ROOT),
+                file.path(),
+                file.size(),
+                file.modificationTime(),
+                ruleId,
+                reasonCode,
+                result,
+                scope.database(),
+                scope.table(),
+                scope.tableId(),
+                scope.partitionId(),
+                scope.bucketId(),
+                dryRun,
+                retryable,
+                actionRequired,
+                Instant.now());
     }
 
     public void logDirDeleted(FsPath dir) {
