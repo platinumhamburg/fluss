@@ -122,6 +122,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             verifyServerSupportsRequiredApis(admin);
 
             AuditLogger audit = new AuditLogger();
+            ScopePlanStats planStats = new ScopePlanStats();
+            audit.logRunStart(config);
             audit.logCutoff(config.olderThanMillis());
 
             RateLimiter remoteFsOpRateLimiter =
@@ -133,18 +135,38 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             List<String> clusterRoots =
                     normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
 
-            Map<String, DbScanState> dbStates = enumerateActiveScope(admin, audit, tracker);
+            Map<String, DbScanState> dbStates =
+                    enumerateActiveScope(admin, audit, tracker, planStats);
 
             for (DbScanState dbState : dbStates.values()) {
                 for (LiveTableScope liveTable : dbState.liveTables) {
                     emitBucketTasks(
-                            liveTable, fetcher, audit, clusterRemoteDataDir, clusterRoots, out);
+                            liveTable,
+                            fetcher,
+                            audit,
+                            clusterRemoteDataDir,
+                            clusterRoots,
+                            planStats,
+                            out);
                     emitOrphanPartitionDirTasks(
-                            liveTable, tracker, clusterRoots, audit, remoteFsOpRateLimiter, out);
+                            liveTable,
+                            tracker,
+                            clusterRoots,
+                            audit,
+                            remoteFsOpRateLimiter,
+                            planStats,
+                            out);
                 }
                 emitOrphanTableDirTasks(
-                        dbState, tracker, clusterRoots, audit, remoteFsOpRateLimiter, out);
+                        dbState,
+                        tracker,
+                        clusterRoots,
+                        audit,
+                        remoteFsOpRateLimiter,
+                        planStats,
+                        out);
             }
+            audit.logScopePlan(planStats);
         }
     }
 
@@ -232,15 +254,16 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     // -------------------------------------------------------------------------
 
     private Map<String, DbScanState> enumerateActiveScope(
-            Admin admin, AuditLogger audit, MaxKnownIdsTracker tracker) {
-        List<String> dbs = resolveDatabasesToScan(admin, audit);
+            Admin admin, AuditLogger audit, MaxKnownIdsTracker tracker, ScopePlanStats planStats) {
+        List<String> dbs = resolveDatabasesToScan(admin, audit, planStats);
         Map<String, DbScanState> result = new LinkedHashMap<String, DbScanState>();
         for (String dbName : dbs) {
+            planStats.database();
             DbScanState dbState = new DbScanState(dbName);
             result.put(dbName, dbState);
             if (config.table().isPresent()) {
                 dbState.tableInfosComplete = false;
-                resolveTable(admin, audit, tracker, dbState, config.table().get(), true);
+                resolveTable(admin, audit, tracker, dbState, config.table().get(), true, planStats);
                 continue;
             }
             List<String> tableNames;
@@ -248,22 +271,25 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 tableNames = admin.listTables(dbName).get();
             } catch (Exception e) {
                 audit.logSkipDb(dbName, classifyName(e));
+                planStats.metadataFailure();
                 dbState.tableInfosComplete = false;
                 continue;
             }
             for (String tableName : tableNames) {
-                resolveTable(admin, audit, tracker, dbState, tableName, false);
+                resolveTable(admin, audit, tracker, dbState, tableName, false, planStats);
             }
         }
         return result;
     }
 
-    private List<String> resolveDatabasesToScan(Admin admin, AuditLogger audit) {
+    private List<String> resolveDatabasesToScan(
+            Admin admin, AuditLogger audit, ScopePlanStats planStats) {
         if (config.allDatabases()) {
             try {
                 return admin.listDatabases().get();
             } catch (Exception e) {
                 audit.logSkipDb("*", classifyName(e));
+                planStats.metadataFailure();
                 throw new IllegalStateException(
                         "Failed to list databases from Fluss cluster. "
                                 + "The coordinator server may be unreachable.",
@@ -277,6 +303,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             }
         } catch (Exception e) {
             audit.logSkipDb(databaseName, classifyName(e));
+            planStats.metadataFailure();
             throw new IllegalStateException(
                     "Failed to check existence of database '"
                             + databaseName
@@ -294,7 +321,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             MaxKnownIdsTracker tracker,
             DbScanState dbState,
             String tableName,
-            boolean explicitTableTarget) {
+            boolean explicitTableTarget,
+            ScopePlanStats planStats) {
         TablePath tablePath = TablePath.of(dbState.dbName, tableName);
         TableInfo tableInfo;
         try {
@@ -303,6 +331,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             RpcErrorClassifier.Category category = RpcErrorClassifier.classify(e);
             if (category != RpcErrorClassifier.Category.NOT_FOUND || explicitTableTarget) {
                 audit.logSkipTable(dbState.dbName, tableName, category.name());
+                planStats.metadataFailure();
                 dbState.tableInfosComplete = false;
             }
             return;
@@ -312,6 +341,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
         LiveTableScope liveTable = new LiveTableScope(dbState.dbName, tableName, tableInfo);
         dbState.liveTables.add(liveTable);
+        planStats.table();
         if (!tableInfo.isPartitioned()) {
             return;
         }
@@ -327,9 +357,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 liveTable.partitions.add(partition);
                 liveTable.activePartitionIds.add(partition.getPartitionId());
                 tracker.observePartitionId(partition.getPartitionId());
+                planStats.partition();
             }
         } catch (Exception e) {
             audit.logSkipPartitionList(dbState.dbName, tableName, classifyName(e));
+            planStats.metadataFailure();
             liveTable.partitionInfosComplete = false;
         }
     }
@@ -344,6 +376,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             AuditLogger audit,
             @Nullable String clusterRemoteDataDir,
             List<String> clusterRoots,
+            ScopePlanStats planStats,
             Collector<CleanTask> out) {
         if (liveTable.partitioned && !liveTable.partitionInfosComplete) {
             return;
@@ -360,6 +393,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     audit,
                     clusterRemoteDataDir,
                     clusterRoots,
+                    planStats,
                     out);
         }
     }
@@ -371,6 +405,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             AuditLogger audit,
             @Nullable String clusterRemoteDataDir,
             List<String> clusterRoots,
+            ScopePlanStats planStats,
             Collector<CleanTask> out) {
         Long partitionId = partitionInfo == null ? null : partitionInfo.getPartitionId();
 
@@ -381,6 +416,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         // cluster's configured remote data directories.
         if (!clusterRoots.contains(normalizeRoot(remoteDataDir))) {
             audit.logSkipBucketOutOfScope(liveTable.tableId, partitionId, remoteDataDir);
+            planStats.skippedOutOfScopeRoot();
             return;
         }
 
@@ -388,6 +424,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 fetcher.fetchLogActiveRefsByBucket(liveTable.tableId, partitionId);
         if (!logResult.listOk()) {
             audit.logSkipLogTarget(liveTable.tableId, partitionId, logResult.listFailureReason());
+            planStats.metadataFailure();
         }
 
         Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
@@ -400,6 +437,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 kvTargetOk = true;
             } else {
                 audit.logSkipKvTarget(liveTable.tableId, partitionId, kvResult.listFailureReason());
+                planStats.metadataFailure();
             }
         }
 
@@ -407,6 +445,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         FsPath remoteKvDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_KV_DIR_NAME);
 
         for (TableBucket tableBucket : enumerateBuckets(liveTable.tableInfo, partitionInfo)) {
+            planStats.discoveredBucket();
             int bucketId = tableBucket.getBucket();
 
             String logTabletDir = null;
@@ -433,10 +472,10 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 OrphanCleanUtils.bucketScopeKey(
                                         liveTable.tableId, partitionId, bucketId),
                                 logResult.readFailureReason(bucketId));
+                        planStats.metadataFailure();
                         break;
                     case NOT_LISTED:
-                        audit.logSkipLogBucket(
-                                liveTable.tableId, partitionId, bucketId, "no_remote_manifest");
+                        planStats.skippedNoRemoteManifest();
                         break;
                     default:
                         break;
@@ -454,7 +493,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 .toString();
                 kvActiveSnaps = kvActiveByBucket.get(bucketId);
             } else if (kvTargetOk) {
-                audit.logSkipKvBucket(liveTable.tableId, partitionId, bucketId, "empty_active_set");
+                planStats.skippedEmptyKvActiveSet();
             }
 
             if (logTabletDir == null && kvTabletDir == null) {
@@ -471,6 +510,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             config.olderThanMillis(),
                             config.dryRun(),
                             config.allowDeleteManifest()));
+            planStats.bucketTask();
         }
     }
 
@@ -484,6 +524,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             List<String> clusterRoots,
             AuditLogger audit,
             RateLimiter remoteFsOpRateLimiter,
+            ScopePlanStats planStats,
             Collector<CleanTask> out)
             throws IOException {
         if (!dbState.tableInfosComplete) {
@@ -503,13 +544,16 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                     OrphanDirDetector.isOrphanTable(
                                             dirName, activeTableIds, maxKnownTableId),
                             remoteFsOpRateLimiter,
-                            dir ->
-                                    out.collect(
-                                            new OrphanDirCleanTask(
-                                                    dir.toString(),
-                                                    config.olderThanMillis(),
-                                                    config.dryRun(),
-                                                    config.allowDeleteManifest())));
+                            dir -> {
+                                out.collect(
+                                        new OrphanDirCleanTask(
+                                                dir.toString(),
+                                                config.olderThanMillis(),
+                                                config.dryRun(),
+                                                config.allowDeleteManifest()));
+                                planStats.orphanDirTask();
+                            },
+                            planStats);
                 } else {
                     forEachOrphanDirUnderParent(
                             dbDir,
@@ -517,7 +561,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                     OrphanDirDetector.isOrphanTable(
                                             dirName, activeTableIds, maxKnownTableId),
                             remoteFsOpRateLimiter,
-                            dir -> audit.logSkipOrphanTable(dir, "default-conservative"));
+                            dir -> audit.logSkipOrphanTable(dir, "default-conservative"),
+                            planStats);
                 }
             }
         }
@@ -529,6 +574,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             List<String> clusterRoots,
             AuditLogger audit,
             RateLimiter remoteFsOpRateLimiter,
+            ScopePlanStats planStats,
             Collector<CleanTask> out)
             throws IOException {
         if (!liveTable.partitioned || !liveTable.partitionInfosComplete) {
@@ -551,13 +597,16 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                     OrphanDirDetector.isOrphanPartition(
                                             dirName, activePartitionIds, maxKnownPartitionId),
                             remoteFsOpRateLimiter,
-                            dir ->
-                                    out.collect(
-                                            new OrphanDirCleanTask(
-                                                    dir.toString(),
-                                                    config.olderThanMillis(),
-                                                    config.dryRun(),
-                                                    config.allowDeleteManifest())));
+                            dir -> {
+                                out.collect(
+                                        new OrphanDirCleanTask(
+                                                dir.toString(),
+                                                config.olderThanMillis(),
+                                                config.dryRun(),
+                                                config.allowDeleteManifest()));
+                                planStats.orphanDirTask();
+                            },
+                            planStats);
                 } else {
                     forEachOrphanDirUnderParent(
                             tableDir,
@@ -565,7 +614,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                     OrphanDirDetector.isOrphanPartition(
                                             dirName, activePartitionIds, maxKnownPartitionId),
                             remoteFsOpRateLimiter,
-                            dir -> audit.logSkipOrphanPartition(dir, "default-conservative"));
+                            dir -> audit.logSkipOrphanPartition(dir, "default-conservative"),
+                            planStats);
                 }
             }
         }
@@ -575,7 +625,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             FsPath parentDir,
             Predicate<String> isOrphan,
             RateLimiter remoteFsOpRateLimiter,
-            Consumer<FsPath> action)
+            Consumer<FsPath> action,
+            ScopePlanStats planStats)
             throws IOException {
         FileSystem fs = getFileSystemIfExists(parentDir, remoteFsOpRateLimiter);
         if (fs == null) {
@@ -583,6 +634,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         }
         FileStatus[] entries = listStatuses(fs, parentDir, remoteFsOpRateLimiter);
         if (entries == null) {
+            planStats.metadataFailure();
             return;
         }
         for (FileStatus entry : entries) {

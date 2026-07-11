@@ -271,6 +271,14 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                         m ->
                                 m.contains("action=would_delete")
                                         && m.contains(activeSegment.toString()));
+        assertThat(auditMessages().stream().filter(m -> m.contains("action=run_start"))).hasSize(1);
+        assertThat(auditMessages().stream().filter(m -> m.contains("action=scope_plan")))
+                .hasSize(1);
+        assertThat(auditMessages())
+                .noneMatch(
+                        m ->
+                                m.contains("action=skip_log_bucket")
+                                        && m.contains("reason=no_remote_manifest"));
     }
 
     /**
