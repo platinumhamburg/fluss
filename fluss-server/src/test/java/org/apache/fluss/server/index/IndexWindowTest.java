@@ -19,6 +19,10 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.row.BinaryRow;
+import org.apache.fluss.row.encode.RowEncoder;
+import org.apache.fluss.types.DataType;
+import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
@@ -61,6 +65,8 @@ public class IndexWindowTest {
     }
 
     private static IndexSpec spec(String indexName, IndexVisibility visibility) {
+        RowEncoder rowEncoder =
+                RowEncoder.create(KvFormat.COMPACTED, new DataType[] {DataTypes.BIGINT()});
         return new IndexSpec(
                 indexName,
                 visibility,
@@ -68,9 +74,12 @@ public class IndexWindowTest {
                 1,
                 KvFormat.COMPACTED,
                 new int[] {0},
-                row -> new byte[] {1},
-                row -> null,
-                row -> 0);
+                row -> {
+                    rowEncoder.startNewRow();
+                    rowEncoder.encodeField(0, row.getLong(0));
+                    BinaryRow value = rowEncoder.finishRow();
+                    return new IndexSpec.IndexEntry(new byte[] {1}, value, 0);
+                });
     }
 
     @Test

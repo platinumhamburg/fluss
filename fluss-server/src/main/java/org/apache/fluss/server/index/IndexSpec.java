@@ -22,9 +22,6 @@ import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.encode.KeyEncoder;
-
-import java.util.function.ToIntFunction;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -33,17 +30,20 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 @Internal
 public final class IndexSpec {
 
-    /** Encodes one complete physical Index Table entry from a base row. */
+    /**
+     * Encodes one complete physical Index Table entry from a base row. Encoders may reuse storage
+     * for entry values between calls, but each returned key and target bucket must remain stable.
+     */
     @FunctionalInterface
     public interface EntryEncoder {
         IndexEntry encode(InternalRow row);
     }
 
-    @FunctionalInterface
-    interface ValueEncoder {
-        BinaryRow encode(InternalRow row, long sourceOffset, boolean deleted);
-    }
-
+    /**
+     * One encoded physical Index Table entry. The key and target bucket remain stable. The value
+     * may be backed by a reusable row encoder and is valid only until the next {@link
+     * IndexSpec#encodeEntry(InternalRow)} call on the same spec.
+     */
     static final class IndexEntry {
         private final byte[] key;
         private final BinaryRow value;
@@ -59,6 +59,7 @@ public final class IndexSpec {
             return key;
         }
 
+        /** Returns the encoder-backed value, which must be consumed before the next encode call. */
         BinaryRow value() {
             return value;
         }
@@ -92,30 +93,6 @@ public final class IndexSpec {
         this.idxColumnIndices = checkNotNull(idxColumnIndices, "idxColumnIndices").clone();
         checkArgument(idxColumnIndices.length > 0, "idxColumnIndices must not be empty.");
         this.entryEncoder = checkNotNull(entryEncoder, "entryEncoder");
-    }
-
-    IndexSpec(
-            String indexName,
-            IndexVisibility visibility,
-            long indexTableId,
-            int indexSchemaId,
-            KvFormat indexKvFormat,
-            int[] idxColumnIndices,
-            KeyEncoder keyEncoder,
-            ValueEncoder valueEncoder,
-            ToIntFunction<InternalRow> bucketAssigner) {
-        this(
-                indexName,
-                visibility,
-                indexTableId,
-                indexSchemaId,
-                indexKvFormat,
-                idxColumnIndices,
-                row ->
-                        new IndexEntry(
-                                keyEncoder.encodeKey(row),
-                                valueEncoder.encode(row, 0L, false),
-                                bucketAssigner.applyAsInt(row)));
     }
 
     public long getIndexTableId() {

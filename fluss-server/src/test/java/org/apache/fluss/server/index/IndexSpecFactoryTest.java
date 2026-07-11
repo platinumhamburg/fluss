@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
@@ -46,6 +47,8 @@ import static org.assertj.core.api.Assertions.tuple;
 
 /** Tests for {@link IndexSpecFactory}. */
 class IndexSpecFactoryTest {
+
+    private static final int TARGET_BUCKET_COUNT = 7;
 
     @Test
     void testBuildIndexSpecsPreservesPerIndexVisibility() {
@@ -105,7 +108,12 @@ class IndexSpecFactoryTest {
                         .column("idx", DataTypes.BIGINT())
                         .column("payload", DataTypes.BIGINT())
                         .primaryKey("base_id")
-                        .index("idx_value", "idx")
+                        .index(
+                                "idx_value",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("idx"),
+                                IndexVisibility.SYNC,
+                                TARGET_BUCKET_COUNT)
                         .build();
         TableDescriptor mainDescriptor =
                 TableDescriptor.builder().schema(mainSchema).distributedBy(1, "base_id").build();
@@ -121,23 +129,28 @@ class IndexSpecFactoryTest {
                 IndexSpecFactory.buildIndexSpecs(
                                 mainInfo, new TableBucket(mainInfo.getTableId(), 0), metadataCache)
                         .get(0);
-        GenericRow sourceRow = GenericRow.of(7L, 41L, 999L);
+        GenericRow sourceRow = GenericRow.of(8L, 41L, 999L);
         IndexSpec.IndexEntry entry = spec.encodeEntry(sourceRow);
-        GenericRow physicalRow = GenericRow.of(41L, 7L);
+        GenericRow physicalRow = GenericRow.of(41L, 8L);
+        RowType sourceRowType =
+                RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT(), DataTypes.BIGINT());
+        RowType physicalRowType = RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT());
         byte[] expectedKey =
-                new CompactedKeyEncoder(
-                                RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT()),
-                                new int[] {0, 1})
-                        .encodeKey(physicalRow);
+                new CompactedKeyEncoder(physicalRowType, new int[] {0, 1}).encodeKey(physicalRow);
+        int expectedBucket = bucketFor(sourceRowType, new int[] {1}, sourceRow);
+        int fullPhysicalKeyBucket = bucketFor(physicalRowType, new int[] {0, 1}, physicalRow);
 
         assertThat(entry.key()).containsExactly(expectedKey);
         assertThat(entry.value().getFieldCount()).isEqualTo(2);
         assertThat(entry.value().getLong(0)).isEqualTo(41L);
-        assertThat(entry.value().getLong(1)).isEqualTo(7L);
-        assertThat(entry.targetBucket()).isBetween(0, 2);
-        assertThat(spec.encodeEntry(GenericRow.of(8L, 41L, 1000L)).targetBucket())
-                .as("bucket hash uses index columns only")
-                .isEqualTo(entry.targetBucket());
+        assertThat(entry.value().getLong(1)).isEqualTo(8L);
+        assertThat(entry.targetBucket()).isEqualTo(expectedBucket);
+        assertThat(fullPhysicalKeyBucket)
+                .as("the chosen row distinguishes index-only routing from physical-PK routing")
+                .isNotEqualTo(expectedBucket);
+        assertThat(spec.encodeEntry(GenericRow.of(9L, 41L, 1000L)).targetBucket())
+                .as("base primary key does not affect the exact index-only target bucket")
+                .isEqualTo(expectedBucket);
     }
 
     @Test
@@ -149,7 +162,12 @@ class IndexSpecFactoryTest {
                         .column("base_id", DataTypes.BIGINT())
                         .column("payload", DataTypes.BIGINT())
                         .primaryKey("partition_key", "base_id")
-                        .index("idx_value", "idx")
+                        .index(
+                                "idx_value",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("idx"),
+                                IndexVisibility.SYNC,
+                                TARGET_BUCKET_COUNT)
                         .build();
         TableDescriptor mainDescriptor =
                 TableDescriptor.builder()
@@ -165,23 +183,38 @@ class IndexSpecFactoryTest {
                 2,
                 IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.records", "idx_value"));
 
-        IndexSpec spec =
+        IndexSpec partition123Spec =
                 IndexSpecFactory.buildIndexSpecs(
                                 mainInfo,
                                 new TableBucket(mainInfo.getTableId(), 123L, 0),
                                 metadataCache)
                         .get(0);
-        IndexSpec.IndexEntry entry = spec.encodeEntry(GenericRow.of(41L, 5L, 7L, 999L));
+        IndexSpec partition456Spec =
+                IndexSpecFactory.buildIndexSpecs(
+                                mainInfo,
+                                new TableBucket(mainInfo.getTableId(), 456L, 0),
+                                metadataCache)
+                        .get(0);
+        GenericRow sourceRow = GenericRow.of(41L, 5L, 7L, 999L);
+        IndexSpec.IndexEntry entry = partition123Spec.encodeEntry(sourceRow);
         GenericRow physicalRow = GenericRow.of(41L, 5L, 7L, 123L);
+        RowType sourceRowType =
+                RowType.of(
+                        DataTypes.BIGINT(),
+                        DataTypes.BIGINT(),
+                        DataTypes.BIGINT(),
+                        DataTypes.BIGINT());
+        RowType physicalRowType =
+                RowType.of(
+                        DataTypes.BIGINT(),
+                        DataTypes.BIGINT(),
+                        DataTypes.BIGINT(),
+                        DataTypes.BIGINT());
         byte[] expectedKey =
-                new CompactedKeyEncoder(
-                                RowType.of(
-                                        DataTypes.BIGINT(),
-                                        DataTypes.BIGINT(),
-                                        DataTypes.BIGINT(),
-                                        DataTypes.BIGINT()),
-                                new int[] {0, 1, 2, 3})
+                new CompactedKeyEncoder(physicalRowType, new int[] {0, 1, 2, 3})
                         .encodeKey(physicalRow);
+        int expectedBucket = bucketFor(sourceRowType, new int[] {0}, sourceRow);
+        int fullPhysicalKeyBucket = bucketFor(physicalRowType, new int[] {0, 1, 2, 3}, physicalRow);
 
         assertThat(entry.key()).containsExactly(expectedKey);
         assertThat(entry.value().getFieldCount()).isEqualTo(4);
@@ -189,12 +222,26 @@ class IndexSpecFactoryTest {
         assertThat(entry.value().getLong(1)).isEqualTo(5L);
         assertThat(entry.value().getLong(2)).isEqualTo(7L);
         assertThat(entry.value().getLong(3)).isEqualTo(123L);
-        assertThat(entry.targetBucket()).isBetween(0, 2);
-        IndexSpec.IndexEntry differentBaseKey = spec.encodeEntry(GenericRow.of(41L, 6L, 8L, 1000L));
+        assertThat(entry.targetBucket()).isEqualTo(expectedBucket);
+        assertThat(fullPhysicalKeyBucket)
+                .as("the chosen row distinguishes index-only routing from physical-PK routing")
+                .isNotEqualTo(expectedBucket);
+        IndexSpec.IndexEntry differentBaseKey =
+                partition123Spec.encodeEntry(GenericRow.of(41L, 6L, 8L, 1000L));
         assertThat(differentBaseKey.key()).isNotEqualTo(entry.key());
         assertThat(differentBaseKey.targetBucket())
-                .as("bucket hash excludes base primary key and partition id")
-                .isEqualTo(entry.targetBucket());
+                .as("base primary-key columns do not affect the exact target bucket")
+                .isEqualTo(expectedBucket);
+        IndexSpec.IndexEntry differentPartition = partition456Spec.encodeEntry(sourceRow);
+        assertThat(differentPartition.key()).isNotEqualTo(expectedKey);
+        assertThat(differentPartition.targetBucket())
+                .as("the partition discriminator does not affect the exact target bucket")
+                .isEqualTo(expectedBucket);
+    }
+
+    private static int bucketFor(RowType rowType, int[] columnIndices, GenericRow row) {
+        byte[] encodedColumns = new CompactedKeyEncoder(rowType, columnIndices).encodeKey(row);
+        return FlussBucketingFunction.bucketForRowKey(encodedColumns, TARGET_BUCKET_COUNT);
     }
 
     private static TableInfo tableInfo(

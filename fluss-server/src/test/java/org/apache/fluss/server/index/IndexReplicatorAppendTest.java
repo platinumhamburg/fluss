@@ -40,10 +40,13 @@ import org.apache.fluss.types.RowType;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -103,7 +106,8 @@ public class IndexReplicatorAppendTest {
                     valueRowEncoder.encodeField(0, row.getLong(1)); // idx
                     valueRowEncoder.encodeField(1, row.getLong(0)); // pk
                     BinaryRow value = valueRowEncoder.finishRow();
-                    return new IndexSpec.IndexEntry(keyEncoder.encodeKey(value), value, 0);
+                    return new IndexSpec.IndexEntry(
+                            keyEncoder.encodeKey(value), value, (int) (row.getLong(1) % 2));
                 };
 
         return new IndexSpec(
@@ -170,6 +174,35 @@ public class IndexReplicatorAppendTest {
                 .isNull();
         assertThat(records.get(1).getRow()).isNotNull();
         assertThat(records.get(0).getKey()).isNotEqualTo(records.get(1).getKey());
+    }
+
+    @Test
+    void reusableEncoderKeepsOldDeleteRoutingAndWritesExactNewValue() {
+        IndexReplicator replicator = newReplicator();
+        IndexSpec spec = spec();
+        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
+
+        int mutations =
+                replicator.appendOneSpec(spec, row(1L, 10L, 100L), row(2L, 11L, 200L), builders);
+
+        assertThat(mutations).isEqualTo(2);
+        assertThat(builders)
+                .containsOnlyKeys(
+                        new TableBucket(INDEX_TABLE_ID, 0), new TableBucket(INDEX_TABLE_ID, 1));
+
+        KvRecord delete = onlyRecords(builders.get(new TableBucket(INDEX_TABLE_ID, 0))).get(0);
+        byte[] expectedOldKey =
+                new CompactedKeyEncoder(
+                                RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT()),
+                                new int[] {0, 1})
+                        .encodeKey(GenericRow.of(10L, 1L));
+        assertThat(delete.getKey()).isEqualTo(ByteBuffer.wrap(expectedOldKey));
+        assertThat(delete.getRow()).isNull();
+
+        KvRecord upsert = onlyRecords(builders.get(new TableBucket(INDEX_TABLE_ID, 1))).get(0);
+        assertThat(upsert.getRow()).isNotNull();
+        assertThat(upsert.getRow().getLong(0)).isEqualTo(11L);
+        assertThat(upsert.getRow().getLong(1)).isEqualTo(2L);
     }
 
     @Test
@@ -327,11 +360,10 @@ public class IndexReplicatorAppendTest {
         KvRecord delete = onlyRecords(builders.values().iterator().next()).get(0);
         assertThat(delete.getRow()).isNull();
         assertThat(delete.getKey())
-                .isEqualTo(java.nio.ByteBuffer.wrap(spec().encodeEntry(row(1L, 10L, 100L)).key()));
+                .isEqualTo(ByteBuffer.wrap(spec().encodeEntry(row(1L, 10L, 100L)).key()));
     }
 
-    private static java.util.List<KvRecord> onlyRecords(
-            IndexReplicator.BucketBatchBuilder builder) {
+    private static List<KvRecord> onlyRecords(IndexReplicator.BucketBatchBuilder builder) {
         try {
             builder.builder.setWriterState(new WriterKey(0L, 0L), 0L);
             BytesView bytes = builder.builder.build();
@@ -345,7 +377,7 @@ public class IndexReplicatorAppendTest {
                                             KvFormat.COMPACTED,
                                             new TestingSchemaGetter(INDEX_SCHEMA_ID, INDEX_SCHEMA)))
                             .iterator();
-            java.util.List<KvRecord> records = new java.util.ArrayList<>();
+            List<KvRecord> records = new ArrayList<>();
             iter.forEachRemaining(records::add);
             return records;
         } catch (Exception e) {

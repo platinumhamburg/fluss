@@ -1494,7 +1494,7 @@ public final class Replica {
                         }
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return indexManager.filterLookupEntries(kvTablet.multiGet(keys));
+                        return kvTablet.multiGet(keys);
                     } catch (IOException e) {
                         String errorMsg =
                                 String.format(

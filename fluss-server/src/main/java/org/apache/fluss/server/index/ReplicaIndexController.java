@@ -285,10 +285,6 @@ public final class ReplicaIndexController {
                 d.mainTableId());
     }
 
-    public List<byte[]> filterLookupEntries(List<byte[]> rawResults) {
-        return rawResults;
-    }
-
     /**
      * Filters prefix-lookup results for an Index Table, removing rows whose source partition is
      * tombstoned. Returns the input list unchanged if no filter applies.

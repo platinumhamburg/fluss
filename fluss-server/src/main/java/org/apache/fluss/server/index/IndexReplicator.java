@@ -376,14 +376,13 @@ public final class IndexReplicator implements AutoCloseable {
 
         IndexSpec.IndexEntry newEntry = newHasIdx ? spec.encodeEntry(newRow) : null;
         boolean keysDiffer =
-                oldEntry.entry != null
-                        && (newEntry == null
-                                || !Arrays.equals(oldEntry.entry.key(), newEntry.key()));
+                oldEntry.key != null
+                        && (newEntry == null || !Arrays.equals(oldEntry.key, newEntry.key()));
 
         int count = 0;
         if (oldHasIdx && keysDiffer) {
-            TableBucket tb = new TableBucket(spec.getIndexTableId(), oldEntry.entry.targetBucket());
-            getBuilder(tb, spec, builders).appendDelete(oldEntry.entry.key());
+            TableBucket tb = new TableBucket(spec.getIndexTableId(), oldEntry.targetBucket);
+            getBuilder(tb, spec, builders).appendDelete(oldEntry.key);
             count++;
         }
         if (newEntry != null && (!oldHasIdx || keysDiffer)) {
@@ -480,23 +479,26 @@ public final class IndexReplicator implements AutoCloseable {
 
     private static final class OldIndexEntry {
         private final boolean hasIndexColumns;
-        @Nullable private final IndexSpec.IndexEntry entry;
+        @Nullable private final byte[] key;
+        private final int targetBucket;
 
-        private OldIndexEntry(boolean hasIndexColumns, @Nullable IndexSpec.IndexEntry entry) {
+        private OldIndexEntry(boolean hasIndexColumns, @Nullable byte[] key, int targetBucket) {
             this.hasIndexColumns = hasIndexColumns;
-            this.entry = entry;
+            this.key = key;
+            this.targetBucket = targetBucket;
         }
 
         private static OldIndexEntry from(IndexSpec spec, InternalRow row) {
             if (!spec.hasIndexColumns(row)) {
-                return new OldIndexEntry(false, null);
+                return new OldIndexEntry(false, null, -1);
             }
-            return new OldIndexEntry(true, spec.encodeEntry(row));
+            IndexSpec.IndexEntry entry = spec.encodeEntry(row);
+            return new OldIndexEntry(true, entry.key(), entry.targetBucket());
         }
 
         private static OldIndexEntry fromNullable(IndexSpec spec, @Nullable InternalRow row) {
             if (row == null) {
-                return new OldIndexEntry(false, null);
+                return new OldIndexEntry(false, null, -1);
             }
             return from(spec, row);
         }
