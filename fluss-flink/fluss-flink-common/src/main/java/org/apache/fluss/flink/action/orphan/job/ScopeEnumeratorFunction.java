@@ -65,6 +65,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
@@ -468,6 +469,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             return;
         }
 
+        audit.logScopeTargetStart(
+                runId,
+                liveTable.tablePath.getDatabaseName(),
+                liveTable.tablePath.getTableName(),
+                liveTable.tableId,
+                partitionId);
+        long targetStartNanos = System.nanoTime();
         LogActiveRefsFetchResult logResult =
                 fetcher.fetchLogActiveRefsByBucket(liveTable.tableId, partitionId);
         if (!logResult.listOk()) {
@@ -478,18 +486,30 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
         Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
         boolean kvTargetOk = false;
+        String kvStatus = "not_applicable";
         if (liveTable.tableInfo.hasPrimaryKey()) {
             KvActiveRefsFetchResult kvResult =
                     fetcher.fetchKvActiveSnapDirs(liveTable.tableId, partitionId);
             if (kvResult.listOk()) {
                 kvActiveByBucket = kvResult.activeSnapDirsByBucket();
                 kvTargetOk = true;
+                kvStatus = "ok";
             } else {
+                kvStatus = "failed";
                 audit.logSkipKvTarget(liveTable.tableId, partitionId, kvResult.listFailureReason());
                 planStats.metadataFailure();
                 tablePlans.metadataFailure(liveTable.scope());
             }
         }
+        audit.logScopeTargetComplete(
+                runId,
+                liveTable.tablePath.getDatabaseName(),
+                liveTable.tablePath.getTableName(),
+                liveTable.tableId,
+                partitionId,
+                logResult.listOk() ? "ok" : "failed",
+                kvStatus,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - targetStartNanos));
 
         FsPath remoteLogDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_LOG_DIR_NAME);
         FsPath remoteKvDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_KV_DIR_NAME);
