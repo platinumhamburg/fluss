@@ -32,6 +32,9 @@ public interface KvRecordBatch {
     /** The "magic" values. */
     byte KV_MAGIC_VALUE_V0 = 0;
 
+    /** The fenced idempotence protocol magic value. */
+    byte KV_MAGIC_VALUE_V1 = 1;
+
     /** The current "magic" value. */
     byte CURRENT_KV_MAGIC_VALUE = KV_MAGIC_VALUE_V0;
 
@@ -82,6 +85,21 @@ public interface KvRecordBatch {
      * @return batch base sequence
      */
     int batchSequence();
+
+    /** Returns the idempotence protocol version represented by this batch. */
+    default int idempotenceProtocolVersion() {
+        return 0;
+    }
+
+    /** Returns the opaque V1 writer key. */
+    default WriterKey fencedWriterKey() {
+        throw new UnsupportedOperationException("V0 batch has no fenced WriterKey");
+    }
+
+    /** Returns the V1 fenced sequence. */
+    default long fencedSequence() {
+        throw new UnsupportedOperationException("V0 batch has no fenced sequence");
+    }
 
     /**
      * Get the size in bytes of this batch, including the size of the record and the batch overhead.
