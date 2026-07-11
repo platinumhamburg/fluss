@@ -55,7 +55,10 @@ public final class OrphanFilesCleanJob {
      * @return the final cleanup statistics
      */
     public static CleanStats execute(
-            StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism)
+            StreamExecutionEnvironment env,
+            OrphanCleanConfig config,
+            Integer parallelism,
+            String runId)
             throws Exception {
         env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
@@ -64,7 +67,7 @@ public final class OrphanFilesCleanJob {
                 env.fromCollection(Collections.singletonList(1), TypeInformation.of(Integer.class));
 
         SingleOutputStreamOperator<CleanTask> tasks =
-                trigger.process(new ScopeEnumeratorFunction(config))
+                trigger.process(new ScopeEnumeratorFunction(config, runId))
                         .returns(TypeInformation.of(new TypeHint<CleanTask>() {}))
                         .setParallelism(1)
                         .setMaxParallelism(1)
@@ -83,9 +86,20 @@ public final class OrphanFilesCleanJob {
             stats = stats.setParallelism(parallelism);
         }
 
+        int scanParallelism = stats.getParallelism();
+        SingleOutputStreamOperator<CleanStats> statsWithProgress =
+                stats.forward()
+                        .transform(
+                                "ScanProgress",
+                                TypeInformation.of(new TypeHint<CleanStats>() {}),
+                                new ScanProgressOperator(
+                                        runId, config.dryRun(), config.progressLogInterval()))
+                        .setParallelism(scanParallelism);
+
         // Stage 3: StatsAggregate (parallelism=1)
         SingleOutputStreamOperator<CleanStats> result =
-                stats.transform(
+                statsWithProgress
+                        .transform(
                                 "StatsAggregate",
                                 TypeInformation.of(new TypeHint<CleanStats>() {}),
                                 new StatsAggregateOperator(config.dryRun(), config.postRunWait()))

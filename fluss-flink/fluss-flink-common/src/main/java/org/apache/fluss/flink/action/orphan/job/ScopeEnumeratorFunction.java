@@ -93,9 +93,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     };
 
     private final OrphanCleanConfig config;
+    private final String runId;
 
-    public ScopeEnumeratorFunction(OrphanCleanConfig config) {
+    public ScopeEnumeratorFunction(OrphanCleanConfig config, String runId) {
         this.config = config;
+        this.runId = runId;
     }
 
     @Override
@@ -125,8 +127,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
             AuditLogger audit = new AuditLogger();
             ScopePlanStats planStats = new ScopePlanStats();
-            audit.logRunStart(config);
-            audit.logCutoff(config.olderThanMillis());
+            audit.logRunStart(runId, config);
+            audit.logCutoff(runId, config.olderThanMillis());
 
             RateLimiter remoteFsOpRateLimiter =
                     RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
@@ -182,7 +184,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     remoteFsOpRateLimiter,
                     planStats,
                     out);
-            audit.logScopePlan(planStats);
+            audit.logScopePlan(runId, planStats);
         }
     }
 
