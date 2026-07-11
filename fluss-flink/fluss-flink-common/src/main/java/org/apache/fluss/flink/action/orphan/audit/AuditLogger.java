@@ -319,6 +319,107 @@ public final class AuditLogger {
         AUDIT.info("action=would_delete_dir path={} ts={}", dir, Instant.now());
     }
 
+    public void logWouldDeleteDirectory(
+            String runId, FsPath dir, long modificationTime, ScopeIdentity scope, boolean dryRun) {
+        logDirectoryAction(
+                runId,
+                "would_delete",
+                dir,
+                modificationTime,
+                scope,
+                "empty_and_older_than_cutoff",
+                "planned",
+                dryRun,
+                false,
+                false);
+    }
+
+    public void logDeletedDirectory(
+            String runId, FsPath dir, long modificationTime, ScopeIdentity scope, boolean dryRun) {
+        logDirectoryAction(
+                runId,
+                "deleted",
+                dir,
+                modificationTime,
+                scope,
+                "empty_and_older_than_cutoff",
+                "deleted",
+                dryRun,
+                false,
+                false);
+    }
+
+    public void logSkippedDirectory(
+            String runId,
+            FsPath dir,
+            long modificationTime,
+            ScopeIdentity scope,
+            String reasonCode,
+            boolean dryRun,
+            boolean retryable,
+            boolean actionRequired) {
+        logDirectoryAction(
+                runId,
+                "skip_directory",
+                dir,
+                modificationTime,
+                scope,
+                reasonCode,
+                "skipped",
+                dryRun,
+                retryable,
+                actionRequired);
+    }
+
+    public void logDirectoryDeleteFailed(
+            String runId,
+            FsPath dir,
+            long modificationTime,
+            ScopeIdentity scope,
+            String reasonCode,
+            boolean dryRun,
+            boolean retryable) {
+        logDirectoryAction(
+                runId,
+                "delete_failed",
+                dir,
+                modificationTime,
+                scope,
+                reasonCode,
+                "failed",
+                dryRun,
+                retryable,
+                true);
+    }
+
+    private static void logDirectoryAction(
+            String runId,
+            String action,
+            FsPath dir,
+            long modificationTime,
+            ScopeIdentity scope,
+            String reasonCode,
+            String result,
+            boolean dryRun,
+            boolean retryable,
+            boolean actionRequired) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scan action={} object_type=directory"
+                        + " path={} size_bytes=0 mtime_ms={} rule=empty-directory reason_code={}"
+                        + " result={} {} dry_run={} retryable={} action_required={} ts={}",
+                runId,
+                action,
+                dir,
+                modificationTime,
+                reasonCode,
+                result,
+                objectScopeFields(scope),
+                dryRun,
+                retryable,
+                actionRequired,
+                Instant.now());
+    }
+
     public void logSkipUnknown(FsPath path, RuleId ruleId) {
         AUDIT.warn("action=skip_unknown rule={} path={} ts={}", ruleId, path, Instant.now());
     }
@@ -679,6 +780,14 @@ public final class AuditLogger {
                 + scope.table()
                 + " table_id="
                 + nullable(scope.tableId());
+    }
+
+    private static String objectScopeFields(ScopeIdentity scope) {
+        return scopeFields(scope)
+                + " partition_id="
+                + nullable(scope.partitionId())
+                + " bucket_id="
+                + nullable(scope.bucketId());
     }
 
     private static String nullable(Object value) {

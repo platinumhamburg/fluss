@@ -128,24 +128,70 @@ public final class SafeDeleter {
      *     directory" counter when this returns {@code false}.
      */
     public boolean deleteEmptyDir(FsPath dir) {
+        return deleteEmptyDir(dir, -1L);
+    }
+
+    public boolean deleteEmptyDir(FsPath dir, long modificationTime) {
+        return deleteEmptyDirDetailed(dir, modificationTime).successful();
+    }
+
+    public DirectoryDeleteResult deleteEmptyDirDetailed(FsPath dir, long modificationTime) {
         FileStatus[] children = listChildrenSilently(dir);
-        if (children == null || children.length > 0) {
-            return false;
+        if (children == null) {
+            audit.logSkippedDirectory(
+                    runId,
+                    dir,
+                    modificationTime,
+                    scope,
+                    "directory_list_failed",
+                    dryRun,
+                    true,
+                    true);
+            return DirectoryDeleteResult.LIST_FAILED;
+        }
+        if (children.length > 0) {
+            audit.logSkippedDirectory(
+                    runId,
+                    dir,
+                    modificationTime,
+                    scope,
+                    "directory_not_empty",
+                    dryRun,
+                    false,
+                    false);
+            return DirectoryDeleteResult.NOT_EMPTY;
         }
         if (dryRun) {
-            audit.logWouldDeleteDir(dir);
-            return true;
+            audit.logWouldDeleteDirectory(runId, dir, modificationTime, scope, true);
+            return DirectoryDeleteResult.SUCCESS;
         }
         remoteFsOpRateLimiter.acquire();
         try {
             boolean ok = fs.delete(dir, false);
             if (ok) {
-                audit.logDirDeleted(dir);
+                audit.logDeletedDirectory(runId, dir, modificationTime, scope, false);
+                return DirectoryDeleteResult.SUCCESS;
             }
-            return ok;
+            audit.logDirectoryDeleteFailed(
+                    runId, dir, modificationTime, scope, "filesystem_returned_false", false, true);
+            return DirectoryDeleteResult.DELETE_FAILED;
         } catch (IOException e) {
             LOG.warn("Failed to delete empty directory: {}", dir, e);
-            return false;
+            audit.logDirectoryDeleteFailed(
+                    runId, dir, modificationTime, scope, "io_error", false, true);
+            return DirectoryDeleteResult.DELETE_FAILED;
+        }
+    }
+
+    /** Result of the final empty-directory recheck and non-recursive delete attempt. */
+    public enum DirectoryDeleteResult {
+        SUCCESS,
+        NOT_EMPTY,
+        LIST_FAILED,
+        DELETE_FAILED;
+
+        public boolean successful() {
+            return this == SUCCESS;
         }
     }
 

@@ -184,6 +184,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         false,
                         rootStatus.isDir()
                                 && rootStatus.getModificationTime() < task.cutoffMillis(),
+                        rootStatus.getModificationTime(),
                         null));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
@@ -191,10 +192,29 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
                     stats.plannedDirectory(1L);
-                    if (task.dryRun()) {
-                        audit.logWouldDeleteDir(visit.dir);
-                    } else if (safeDeleter.deleteEmptyDir(visit.dir)) {
-                        stats.removedDirectory(1L);
+                    SafeDeleter.DirectoryDeleteResult result =
+                            safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
+                    switch (result) {
+                        case SUCCESS:
+                            if (!task.dryRun()) {
+                                stats.removedDirectory(1L);
+                            }
+                            break;
+                        case NOT_EMPTY:
+                            stats.skipped(SkipReasonCode.DIRECTORY_NOT_EMPTY, 1L);
+                            visit.markParentRemaining();
+                            break;
+                        case LIST_FAILED:
+                            stats.skipped(SkipReasonCode.DIRECTORY_LIST_FAILED, 1L);
+                            visit.markParentRemaining();
+                            break;
+                        case DELETE_FAILED:
+                            stats.deleteFailed(CleanupObjectType.DIRECTORY, 1L);
+                            visit.markParentRemaining();
+                            break;
+                        default:
+                            visit.markParentRemaining();
+                            break;
                     }
                 } else if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
@@ -229,6 +249,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                                     childPath,
                                     false,
                                     child.getModificationTime() < task.cutoffMillis(),
+                                    child.getModificationTime(),
                                     visit));
                     continue;
                 }
@@ -298,14 +319,27 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         private final FsPath dir;
         private boolean postOrder;
         private final boolean oldEnough;
+        private final long modificationTime;
         private final DirVisit parent;
         private boolean hasRemainingChild;
 
-        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough, DirVisit parent) {
+        private DirVisit(
+                FsPath dir,
+                boolean postOrder,
+                boolean oldEnough,
+                long modificationTime,
+                DirVisit parent) {
             this.dir = dir;
             this.postOrder = postOrder;
             this.oldEnough = oldEnough;
+            this.modificationTime = modificationTime;
             this.parent = parent;
+        }
+
+        private void markParentRemaining() {
+            if (parent != null) {
+                parent.hasRemainingChild = true;
+            }
         }
     }
 }
