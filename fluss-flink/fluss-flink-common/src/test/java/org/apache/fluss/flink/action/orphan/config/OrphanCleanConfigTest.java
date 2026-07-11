@@ -54,6 +54,27 @@ class OrphanCleanConfigTest {
         assertThat(config.allowDeleteManifest()).isFalse();
         assertThat(config.allowCleanOrphanTables()).isFalse();
         assertThat(config.allowCleanOrphanPartitions()).isFalse();
+        assertThat(config.postRunWait()).isEqualTo(Duration.ZERO);
+    }
+
+    @Test
+    void parsesPostRunWait() {
+        assertThat(config("--all-databases", "--post-run-wait", "10m").postRunWait())
+                .isEqualTo(Duration.ofMinutes(10));
+    }
+
+    @Test
+    void rejectsNegativePostRunWait() {
+        assertThatThrownBy(() -> config("--all-databases", "--post-run-wait", "-1s"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--post-run-wait must be between 0ms and 1h");
+    }
+
+    @Test
+    void rejectsPostRunWaitAboveOneHour() {
+        assertThatThrownBy(() -> config("--all-databases", "--post-run-wait", "61m"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--post-run-wait must be between 0ms and 1h");
     }
 
     @Test
@@ -249,5 +270,13 @@ class OrphanCleanConfigTest {
                                                 })))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("key=value");
+    }
+
+    private static OrphanCleanConfig config(String... args) {
+        String[] fullArgs = new String[args.length + 2];
+        fullArgs[0] = "--bootstrap-server";
+        fullArgs[1] = "h:9123";
+        System.arraycopy(args, 0, fullArgs, 2, args.length);
+        return OrphanCleanConfig.fromParams(MultipleParameterToolAdapter.fromArgs(fullArgs));
     }
 }
