@@ -23,9 +23,14 @@ import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
+import org.apache.fluss.rpc.messages.ApiVersionsRequest;
+import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.messages.PbApiVersion;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.rpc.protocol.ApiKeys;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.tablet.TestTabletServerGateway;
 import org.apache.fluss.utils.MapUtils;
@@ -50,10 +55,13 @@ public class IndexSenderTest {
     /** Gateway that records every {@code putKv} call and lets the test control completion. */
     private static final class RecordingGateway extends TestTabletServerGateway {
         private final List<CompletableFuture<PutKvResponse>> pending = new CopyOnWriteArrayList<>();
+        private final List<PutKvRequest> requests = new CopyOnWriteArrayList<>();
         private final Set<Integer> failBuckets =
                 Collections.newSetFromMap(MapUtils.newConcurrentMap());
         private volatile boolean failNext;
         private volatile boolean autoCompleteSuccess;
+        private volatile short putKvMaxVersion = 2;
+        private volatile int apiVersionsCalls;
 
         RecordingGateway() {
             super(false, Collections.emptySet());
@@ -61,6 +69,7 @@ public class IndexSenderTest {
 
         @Override
         public CompletableFuture<PutKvResponse> putKv(PutKvRequest request) {
+            requests.add(request);
             CompletableFuture<PutKvResponse> future = new CompletableFuture<>();
             pending.add(future);
             if (failNext) {
@@ -69,6 +78,19 @@ public class IndexSenderTest {
                 future.complete(responseFor(request));
             }
             return future;
+        }
+
+        @Override
+        public CompletableFuture<ApiVersionsResponse> apiVersions(ApiVersionsRequest request) {
+            apiVersionsCalls++;
+            ApiVersionsResponse response = new ApiVersionsResponse();
+            response.addAllApiVersions(
+                    Collections.singletonList(
+                            new PbApiVersion()
+                                    .setApiKey(ApiKeys.PUT_KV.id)
+                                    .setMinVersion(0)
+                                    .setMaxVersion(putKvMaxVersion)));
+            return CompletableFuture.completedFuture(response);
         }
 
         /**
@@ -87,6 +109,90 @@ public class IndexSenderTest {
                 }
             }
             return response;
+        }
+    }
+
+    @Test
+    void gatesExactV1BytesOnConcreteGatewayCapabilityWithoutFallback() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.putKvMaxVersion = 1;
+        gateway.autoCompleteSuccess = true;
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, bucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        10L,
+                        10L,
+                        1024L * 1024L,
+                        5_000L);
+        try {
+            TableBucket bucket = new TableBucket(42L, 0);
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+
+            await(() -> gateway.apiVersionsCalls == 1);
+            assertThat(gateway.requests).isEmpty();
+
+            gateway.putKvMaxVersion = 2;
+            await(() -> gateway.apiVersionsCalls >= 2);
+            await(() -> gateway.requests.size() == 1);
+
+            PutKvRequest request = gateway.requests.get(0);
+            assertThat(request.getAcks()).isEqualTo(-1);
+            assertThat(request.getAggMode()).isEqualTo(MergeMode.OVERWRITE.getProtoValue());
+            org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf records =
+                    request.getBucketsReqsList().get(0).getRecordsSlice();
+            byte[] sent = new byte[records.readableBytes()];
+            records.getBytes(records.readerIndex(), sent);
+            assertThat(sent).containsExactly(1, 2, 3);
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void gatewayReplacementInvalidatesPositiveCapability() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway first = new RecordingGateway();
+        first.autoCompleteSuccess = true;
+        RecordingGateway second = new RecordingGateway();
+        second.putKvMaxVersion = 1;
+        second.autoCompleteSuccess = true;
+        RecordingGateway[] current = {first};
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, bucket) -> OptionalInt.of(1),
+                        serverId -> current[0],
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        10L,
+                        10L,
+                        1024L * 1024L,
+                        5_000L);
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(
+                            new TableBucket(43L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            await(() -> first.requests.size() == 1);
+
+            current[0] = second;
+            accumulator.append(
+                    batch(
+                            new TableBucket(43L, 1),
+                            new IndexWindow("idx", 20L, 1, owner)));
+            await(() -> second.apiVersionsCalls == 1);
+            assertThat(second.requests).isEmpty();
+        } finally {
+            sender.close();
         }
     }
 

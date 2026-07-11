@@ -24,8 +24,10 @@ import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -35,8 +37,10 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.FileLogProjection;
+import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -47,6 +51,7 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.record.TestData;
 import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.ValueEncoder;
@@ -59,7 +64,9 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
+import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.log.FetchIsolation;
+import org.apache.fluss.server.log.FencedWriterAppendInfo;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.LogTestUtils;
@@ -114,6 +121,12 @@ import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Fail.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** Test for {@link KvTablet}. */
 class KvTabletTest {
@@ -161,9 +174,19 @@ class KvTabletTest {
 
     private void initLogTabletAndKvTablet(
             TablePath tablePath, Schema schema, Map<String, String> tableConfig) throws Exception {
+        initLogTabletAndKvTablet(
+                tablePath, schema, tableConfig, KvIdempotenceProtocol.V0_COMPACT);
+    }
+
+    private void initLogTabletAndKvTablet(
+            TablePath tablePath,
+            Schema schema,
+            Map<String, String> tableConfig,
+            KvIdempotenceProtocol protocol)
+            throws Exception {
         PhysicalTablePath physicalTablePath = PhysicalTablePath.of(tablePath);
         schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
-        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath, protocol);
         TableBucket tableBucket = logTablet.getTableBucket();
         kvTablet =
                 createKvTablet(
@@ -176,6 +199,16 @@ class KvTabletTest {
     }
 
     private LogTablet createLogTablet(File tempLogDir, long tableId, PhysicalTablePath tablePath)
+            throws Exception {
+        return createLogTablet(
+                tempLogDir, tableId, tablePath, KvIdempotenceProtocol.V0_COMPACT);
+    }
+
+    private LogTablet createLogTablet(
+            File tempLogDir,
+            long tableId,
+            PhysicalTablePath tablePath,
+            KvIdempotenceProtocol protocol)
             throws Exception {
         File logTabletDir =
                 LogTestUtils.makeRandomLogTabletDir(
@@ -192,7 +225,8 @@ class KvTabletTest {
                 1,
                 true,
                 SystemClock.getInstance(),
-                true);
+                true,
+                protocol);
     }
 
     private KvTablet createKvTablet(
@@ -1370,6 +1404,98 @@ class KvTabletTest {
         KvRecordBatch kvRecordBatch2 = kvRecordBatchFactory.ofRecords(kvData1, writeId, 1);
         kvTablet.putAsLeader(kvRecordBatch2, null);
         assertThat(kvTablet.getKvPreWriteBuffer().getMaxLSN()).isEqualTo(9);
+    }
+
+    @Test
+    void testStaleV1BatchDoesNotDecodeOrAppend() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "stale_v1"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.V1_FENCED);
+        WriterKey writerKey = new WriterKey(9L, Long.MIN_VALUE | 3L);
+        FencedWriterAppendInfo accepted =
+                logTablet.writerStateManager().prepareFencedUpdate(writerKey);
+        accepted.append(500L, 17L, 1234L);
+        logTablet.writerStateManager().updateFenced(accepted);
+        long logEndOffset = logTablet.localLogEndOffset();
+
+        KvRecordBatch malformed = mock(KvRecordBatch.class);
+        when(malformed.idempotenceProtocolVersion()).thenReturn(1);
+        when(malformed.schemaId()).thenReturn(schemaId);
+        when(malformed.fencedWriterKey()).thenReturn(writerKey);
+        when(malformed.fencedSequence()).thenReturn(100L);
+        doThrow(new AssertionError("stale payload must not be decoded"))
+                .when(malformed)
+                .records(any());
+
+        LogAppendInfo result =
+                kvTablet.putAsLeader(
+                        malformed,
+                        null,
+                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
+
+        assertThat(result.duplicated()).isTrue();
+        assertThat(result.lastOffset()).isEqualTo(17L);
+        assertThat(result.maxTimestamp()).isEqualTo(1234L);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(logEndOffset);
+        verify(malformed, never()).records(any());
+    }
+
+    @Test
+    void testLogLockRevalidationTurnsFreshV1PrecheckStale() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "race_v1"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.V1_FENCED);
+        WriterKey writerKey = new WriterKey(9L, 3L);
+        KvRecordBatch older = emptyFencedBatch(writerKey, 100L);
+        CompactedWalBuilder newerBuilder =
+                CompactedWalBuilder.fencedBuilder(
+                        schemaId,
+                        DATA1_SCHEMA_PK.getRowType(),
+                        new TestingMemorySegmentPool(1024));
+        newerBuilder.setFencedWriterState(writerKey, 200L);
+        MemoryLogRecords newer = newerBuilder.build();
+        kvTablet.setAfterFencedPrecheck(
+                () -> {
+                    try {
+                        logTablet.appendAsLeader(newer);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+        LogAppendInfo result =
+                kvTablet.putAsLeader(
+                        older,
+                        null,
+                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
+        newerBuilder.deallocate();
+
+        assertThat(result.duplicated()).isTrue();
+        assertThat(result.lastOffset()).isZero();
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(1L);
+        assertThat(
+                        logTablet.writerStateManager()
+                                .lastFencedEntry(writerKey)
+                                .orElseThrow(AssertionError::new)
+                                .lastSequence())
+                .isEqualTo(200L);
+    }
+
+    private static KvRecordBatch emptyFencedBatch(WriterKey writerKey, long sequence)
+            throws Exception {
+        FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        schemaId,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED);
+        builder.setWriterState(writerKey, sequence);
+        return KvRecordBatchReader.pointToByteBuffer(
+                builder.build().getByteBuf().nioBuffer());
     }
 
     @Test

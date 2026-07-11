@@ -25,6 +25,7 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.SchemaNotExistException;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -272,6 +273,25 @@ public final class LogManager extends TabletManagerBase {
             int tieredLogLocalSegments,
             boolean isChangelog)
             throws Exception {
+        return getOrCreateLog(
+                dataDir,
+                tablePath,
+                tableBucket,
+                logFormat,
+                tieredLogLocalSegments,
+                isChangelog,
+                KvIdempotenceProtocol.V0_COMPACT);
+    }
+
+    public LogTablet getOrCreateLog(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            boolean isChangelog,
+            KvIdempotenceProtocol protocol)
+            throws Exception {
         return inLock(
                 logCreationOrDeletionLock,
                 () -> {
@@ -294,7 +314,8 @@ public final class LogManager extends TabletManagerBase {
                                     tieredLogLocalSegments,
                                     isChangelog,
                                     clock,
-                                    true);
+                                    true,
+                                    protocol);
                     currentLogs.put(tableBucket, logTablet);
 
                     LOG.info(
@@ -386,6 +407,10 @@ public final class LogManager extends TabletManagerBase {
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TablePath tablePath = physicalTablePath.getTablePath();
         TableInfo tableInfo = getTableInfo(zkClient, tablePath);
+        KvIdempotenceProtocol protocol =
+                tableInfo.hasPrimaryKey()
+                        ? tableInfo.getKvIdempotenceProtocol()
+                        : KvIdempotenceProtocol.V0_COMPACT;
         LogTablet logTablet =
                 LogTablet.create(
                         dataDir,
@@ -399,7 +424,8 @@ public final class LogManager extends TabletManagerBase {
                         tableInfo.getTableConfig().getTieredLogLocalSegments(),
                         tableInfo.hasPrimaryKey(),
                         clock,
-                        isCleanShutdown);
+                        isCleanShutdown,
+                        protocol);
         logTablet.updateIsDataLakeEnabled(tableInfo.getTableConfig().isDataLakeEnabled());
 
         if (currentLogs.containsKey(tableBucket)) {

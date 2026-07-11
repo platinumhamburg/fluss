@@ -262,7 +262,8 @@ final class LogLoader {
                 new WriterStateManager(
                         logSegments.getTableBucket(),
                         logTabletDir,
-                        this.writerStateManager.writerExpirationMs());
+                        this.writerStateManager.writerExpirationMs(),
+                        this.writerStateManager.protocol());
         // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
         // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
         // there may be cases where logStartOffset is not updated. As a result, logStartOffset is

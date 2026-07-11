@@ -27,6 +27,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.config.cluster.ColumnPositionType;
 import org.apache.fluss.config.cluster.ConfigEntry;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
 import org.apache.fluss.lake.committer.LakeCommitResult;
@@ -43,11 +44,11 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.BytesViewLogRecords;
-import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.FileChannelChunk;
 import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
@@ -233,6 +234,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * request/response.
  */
 public class ServerRpcMessageUtils {
+    private static final int KV_BATCH_MAGIC_OFFSET = Integer.BYTES;
 
     private static final Logger LOG = LoggerFactory.getLogger(ServerRpcMessageUtils.class);
 
@@ -1141,12 +1143,21 @@ public class ServerRpcMessageUtils {
         return fetchLogResponse;
     }
 
-    public static Map<TableBucket, KvRecordBatch> getPutKvData(PutKvRequest putKvRequest) {
+    public static Map<TableBucket, KvRecordBatch> getPutKvData(
+            PutKvRequest putKvRequest, short apiVersion) {
         long tableId = putKvRequest.getTableId();
         Map<TableBucket, KvRecordBatch> produceEntryData = new HashMap<>();
         for (PbPutKvReqForBucket putKvReqForBucket : putKvRequest.getBucketsReqsList()) {
             ByteBuffer recordsBuffer = toByteBuffer(putKvReqForBucket.getRecordsSlice());
-            DefaultKvRecordBatch kvRecords = DefaultKvRecordBatch.pointToByteBuffer(recordsBuffer);
+            if (recordsBuffer.remaining() >= KV_BATCH_MAGIC_OFFSET + 1
+                    && recordsBuffer.get(
+                                    recordsBuffer.position() + KV_BATCH_MAGIC_OFFSET)
+                            == KvRecordBatch.KV_MAGIC_VALUE_V1
+                    && apiVersion < 2) {
+                throw new UnsupportedVersionException(
+                        "KV idempotence protocol V1 requires PutKv API v2");
+            }
+            KvRecordBatch kvRecords = KvRecordBatchReader.pointToByteBuffer(recordsBuffer);
             TableBucket tb =
                     new TableBucket(
                             tableId,

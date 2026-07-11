@@ -32,10 +32,12 @@ import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.TooManyScannersException;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -1230,6 +1232,24 @@ public final class Replica {
                     KvTablet kv = this.kvTablet;
                     checkNotNull(
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
+                    KvIdempotenceProtocol tableProtocol = tableInfo.getKvIdempotenceProtocol();
+                    if (kvRecords.idempotenceProtocolVersion() != tableProtocol.version()) {
+                        throw new UnsupportedVersionException(
+                                String.format(
+                                        "KV batch protocol V%s does not match table protocol V%s",
+                                        kvRecords.idempotenceProtocolVersion(),
+                                        tableProtocol.version()));
+                    }
+                    if (tableProtocol == KvIdempotenceProtocol.V1_FENCED) {
+                        if (mergeMode != MergeMode.OVERWRITE) {
+                            throw new InvalidTableException(
+                                    "KV idempotence protocol V1 requires OVERWRITE merge mode");
+                        }
+                        if (requiredAcks != -1) {
+                            throw new InvalidTableException(
+                                    "KV idempotence protocol V1 requires acks=-1");
+                        }
+                    }
                     LogAppendInfo logAppendInfo;
                     try {
                         logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
@@ -2304,7 +2324,10 @@ public final class Replica {
                         tableBucket,
                         tableConfig.getLogFormat(),
                         tableConfig.getTieredLogLocalSegments(),
-                        isKvTable());
+                        isKvTable(),
+                        isKvTable()
+                                ? tableInfo.getKvIdempotenceProtocol()
+                                : KvIdempotenceProtocol.V0_COMPACT);
         // update high watermark.
         Optional<Long> watermarkOpt = lazyHighWatermarkCheckpoint.fetch(tableBucket);
         long watermark =

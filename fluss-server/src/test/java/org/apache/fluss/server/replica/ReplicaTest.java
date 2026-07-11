@@ -18,9 +18,13 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.exception.UnsupportedVersionException;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -31,12 +35,15 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexTableDescriptorFactory;
@@ -87,6 +94,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA2;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
@@ -111,6 +119,84 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 final class ReplicaTest extends ReplicaTestBase {
     // TODO add more tests refer to kafka's PartitionTest.
     // TODO add more tests to cover partition table
+
+    @Test
+    void testPutKvTableProtocolContract() throws Exception {
+        Replica v0 =
+                makeKvReplica(
+                        DATA1_PHYSICAL_TABLE_PATH_PK,
+                        new TableBucket(DATA1_TABLE_ID_PK, 1));
+        makeKvReplicaAsLeader(v0);
+        KvRecordTestUtils.KvRecordBatchFactory v0Factory =
+                KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
+        KvRecordBatch compact = v0Factory.ofRecords(Collections.emptyList(), 11L, 0);
+        KvRecordBatch fenced = emptyFencedBatch(new WriterKey(9L, 3L), 1L);
+
+        v0.putRecordsToLeader(compact, null, MergeMode.DEFAULT, 0);
+        assertThatThrownBy(
+                        () ->
+                                v0.putRecordsToLeader(
+                                        fenced, null, MergeMode.OVERWRITE, -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+
+        TablePath v1Path = TablePath.of("test_db", "protocol_v1");
+        long v1TableId = 991L;
+        TableDescriptor v1Descriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(3)
+                        .property(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION, 1)
+                        .build();
+        zkClient.registerTable(
+                v1Path,
+                TableRegistration.newTable(
+                        v1TableId, DEFAULT_REMOTE_DATA_DIR, v1Descriptor));
+        zkClient.registerFirstSchema(v1Path, DATA1_SCHEMA_PK);
+        long now = System.currentTimeMillis();
+        TableInfo v1Info =
+                TableInfo.of(
+                        v1Path,
+                        v1TableId,
+                        DEFAULT_SCHEMA_ID,
+                        v1Descriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+        TableBucket v1Bucket = new TableBucket(v1TableId, 0);
+        Replica v1 =
+                makeKvReplica(PhysicalTablePath.of(v1Path), v1Bucket, v1Info);
+        makeLeaderReplica(v1, v1Path, v1Bucket, INITIAL_LEADER_EPOCH);
+
+        assertThatThrownBy(
+                        () ->
+                                v1.putRecordsToLeader(
+                                        compact, null, MergeMode.OVERWRITE, -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThatThrownBy(
+                        () ->
+                                v1.putRecordsToLeader(
+                                        fenced, null, MergeMode.DEFAULT, -1))
+                .isInstanceOf(InvalidTableException.class);
+        assertThatThrownBy(
+                        () ->
+                                v1.putRecordsToLeader(
+                                        fenced, null, MergeMode.OVERWRITE, 0))
+                .isInstanceOf(InvalidTableException.class);
+        v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1);
+    }
+
+    private static KvRecordBatch emptyFencedBatch(WriterKey writerKey, long sequence)
+            throws Exception {
+        FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        DEFAULT_SCHEMA_ID,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED);
+        builder.setWriterState(writerKey, sequence);
+        return KvRecordBatchReader.pointToByteBuffer(
+                builder.build().getByteBuf().nioBuffer());
+    }
 
     @Test
     void testMakeLeader() throws Exception {

@@ -22,10 +22,14 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.ApiVersionsRequest;
+import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.messages.PbApiVersion;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
+import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.utils.MapUtils;
@@ -111,6 +115,9 @@ public final class IndexSender implements AutoCloseable {
 
     /** Buckets with an in-flight request; value is the request send timestamp in millis. */
     private final ConcurrentMap<TableBucket, Long> inFlightSinceMs = MapUtils.newConcurrentMap();
+    private final ConcurrentMap<TableBucket, Integer> resolvedLeaders = MapUtils.newConcurrentMap();
+    private final Object capabilityLock = new Object();
+    private final Map<Integer, CapabilityEntry> capabilitiesByServer = new HashMap<>();
 
     public IndexSender(
             IndexAccumulator accumulator,
@@ -324,7 +331,14 @@ public final class IndexSender implements AutoCloseable {
                 OptionalInt leaderOpt =
                         leaderResolver.resolveLeader(tb.getTableId(), tb.getBucket());
                 if (leaderOpt.isPresent()) {
-                    byServer.computeIfAbsent(leaderOpt.getAsInt(), k -> new ArrayList<>())
+                    int leader = leaderOpt.getAsInt();
+                    Integer previous = resolvedLeaders.put(tb, leader);
+                    if (previous != null && previous != leader) {
+                        synchronized (capabilityLock) {
+                            capabilitiesByServer.remove(previous);
+                        }
+                    }
+                    byServer.computeIfAbsent(leader, k -> new ArrayList<>())
                             .add(batch);
                 } else {
                     // Leader not resolvable yet: re-enqueue with backoff and unmute for later
@@ -354,6 +368,95 @@ public final class IndexSender implements AutoCloseable {
                 reEnqueueAll(batches);
                 return;
             }
+
+            long now = System.currentTimeMillis();
+            boolean useCachedCapability = false;
+            boolean waitForRetry = false;
+            synchronized (capabilityLock) {
+                CapabilityEntry cached = capabilitiesByServer.get(serverId);
+                if (cached != null && cached.gateway == gateway) {
+                    if (cached.compatible) {
+                        useCachedCapability = true;
+                    } else if (cached.queryInFlight || now < cached.retryAtMs) {
+                        waitForRetry = true;
+                    }
+                }
+                if (!useCachedCapability && !waitForRetry) {
+                    capabilitiesByServer.put(
+                            serverId, new CapabilityEntry(gateway, false, true, Long.MAX_VALUE));
+                }
+            }
+            if (useCachedCapability) {
+                sendCapableBatches(gateway, batches);
+                return;
+            }
+            if (waitForRetry) {
+                reEnqueueAll(batches);
+                return;
+            }
+
+            CompletableFuture<ApiVersionsResponse> capabilityFuture;
+            try {
+                capabilityFuture =
+                        gateway.apiVersions(
+                                new ApiVersionsRequest()
+                                        .setClientSoftwareName("fluss-index-replicator")
+                                        .setClientSoftwareVersion("2"));
+            } catch (Throwable t) {
+                completeCapabilityQuery(serverId, gateway, batches, null, t);
+                return;
+            }
+            FutureUtils.orTimeout(
+                            capabilityFuture,
+                            requestTimeoutMs,
+                            TimeUnit.MILLISECONDS,
+                            "Index push ApiVersions timed out for serverId=" + serverId)
+                    .whenComplete(
+                            (response, error) ->
+                                    completeCapabilityQuery(
+                                            serverId, gateway, batches, response, error));
+        }
+
+        private void completeCapabilityQuery(
+                int serverId,
+                TabletServerGateway gateway,
+                List<IndexBatch> batches,
+                @Nullable ApiVersionsResponse response,
+                @Nullable Throwable error) {
+            boolean compatible = error == null && supportsPutKvV2(response);
+            long retryAtMs =
+                    compatible
+                            ? Long.MAX_VALUE
+                            : System.currentTimeMillis()
+                                    + retryDelayMs(batches.get(0).attempts() + 1);
+            boolean invalidated;
+            synchronized (capabilityLock) {
+                CapabilityEntry current = capabilitiesByServer.get(serverId);
+                invalidated = current == null || current.gateway != gateway;
+                if (!invalidated) {
+                    capabilitiesByServer.put(
+                            serverId,
+                            new CapabilityEntry(gateway, compatible, false, retryAtMs));
+                }
+            }
+            if (invalidated) {
+                reEnqueueAll(batches);
+                return;
+            }
+            if (compatible) {
+                sendCapableBatches(gateway, batches);
+            } else {
+                metrics.indexPushErrors().inc();
+                LOG.warn(
+                        "Target server {} does not currently advertise PutKv API v2",
+                        serverId,
+                        error);
+                reEnqueueAll(batches);
+            }
+        }
+
+        private void sendCapableBatches(
+                TabletServerGateway gateway, List<IndexBatch> batches) {
 
             // Group by tableId for consolidated multi-bucket requests.
             Map<Long, List<IndexBatch>> byTable = new HashMap<>();
@@ -399,6 +502,36 @@ public final class IndexSender implements AutoCloseable {
                 metrics.indexPushErrors().inc();
                 reEnqueueAll(chunk);
             }
+        }
+    }
+
+    private static boolean supportsPutKvV2(@Nullable ApiVersionsResponse response) {
+        if (response == null) {
+            return false;
+        }
+        for (PbApiVersion version : response.getApiVersionsList()) {
+            if (version.getApiKey() == ApiKeys.PUT_KV.id && version.getMaxVersion() >= 2) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static final class CapabilityEntry {
+        private final TabletServerGateway gateway;
+        private final boolean compatible;
+        private final boolean queryInFlight;
+        private final long retryAtMs;
+
+        private CapabilityEntry(
+                TabletServerGateway gateway,
+                boolean compatible,
+                boolean queryInFlight,
+                long retryAtMs) {
+            this.gateway = gateway;
+            this.compatible = compatible;
+            this.queryInFlight = queryInFlight;
+            this.retryAtMs = retryAtMs;
         }
     }
 
@@ -520,7 +653,7 @@ public final class IndexSender implements AutoCloseable {
                         .setTableId(tableId)
                         .setAcks(DEFAULT_ACKS)
                         .setTimeoutMs((int) requestTimeoutMs);
-        req.setAggMode(MergeMode.DEFAULT.getProtoValue());
+        req.setAggMode(MergeMode.OVERWRITE.getProtoValue());
         for (IndexBatch batch : batches) {
             BytesView encoded = batch.encoded();
             PbPutKvReqForBucket pb =

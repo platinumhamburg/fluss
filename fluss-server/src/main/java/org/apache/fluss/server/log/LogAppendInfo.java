@@ -22,6 +22,21 @@ package org.apache.fluss.server.log;
  */
 public final class LogAppendInfo {
 
+    /** Creates a successful no-op result dominated by an already appended inclusive WAL offset. */
+    public static LogAppendInfo duplicatedAt(long targetWalOffset, long timestamp) {
+        LogAppendInfo info =
+                new LogAppendInfo(
+                        targetWalOffset,
+                        targetWalOffset,
+                        timestamp,
+                        targetWalOffset,
+                        0,
+                        0,
+                        true);
+        info.setDuplicated(true);
+        return info;
+    }
+
     /** The number of validated records. */
     private final int shallowCount;
 

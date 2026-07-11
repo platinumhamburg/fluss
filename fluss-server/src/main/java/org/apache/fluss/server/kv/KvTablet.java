@@ -70,6 +70,7 @@ import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.kv.wal.IndexWalBuilder;
 import org.apache.fluss.server.kv.wal.WalBuilder;
 import org.apache.fluss.server.log.LogAppendInfo;
+import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
@@ -98,6 +99,7 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -120,6 +122,7 @@ public final class KvTablet {
     private final MemorySegmentPool memorySegmentPool;
 
     private final File kvTabletDir;
+    @Nullable private volatile Runnable afterFencedPrecheck;
     private final long writeBatchSize;
     private final RocksDBKv rocksDBKv;
     private final KvPreWriteBuffer kvPreWriteBuffer;
@@ -455,6 +458,21 @@ public final class KvTablet {
                     short latestSchemaId = (short) schemaInfo.getSchemaId();
                     validateSchemaId(kvRecords.schemaId(), latestSchemaId);
 
+                    if (kvRecords.idempotenceProtocolVersion() == 1) {
+                        Optional<FencedWriterStateEntry> stale =
+                                logTablet.findStaleFencedBatch(
+                                        kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
+                        if (stale.isPresent()) {
+                            FencedWriterStateEntry entry = stale.get();
+                            return LogAppendInfo.duplicatedAt(
+                                    entry.dominatingTargetWalOffset(), entry.lastTimestamp());
+                        }
+                        Runnable hook = afterFencedPrecheck;
+                        if (hook != null) {
+                            hook.run();
+                        }
+                    }
+
                     AutoIncrementUpdater currentAutoIncrementUpdater =
                             autoIncrementManager.getUpdaterForSchema(kvFormat, latestSchemaId);
 
@@ -474,8 +492,16 @@ public final class KvTablet {
                                             targetColumns, latestSchemaId, latestSchema);
 
                     RowType latestRowType = latestSchema.getRowType();
-                    WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType);
-                    walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
+                    boolean fenced = kvRecords.idempotenceProtocolVersion() == 1;
+                    WalBuilder walBuilder =
+                            createWalBuilder(latestSchemaId, latestRowType, fenced);
+                    if (fenced) {
+                        walBuilder.setFencedWriterState(
+                                kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
+                    } else {
+                        walBuilder.setWriterState(
+                                kvRecords.writerId(), kvRecords.batchSequence());
+                    }
                     // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
                     // only has fewer ending columns than latest schema, so we pad nulls to
                     // the end of the BinaryRow to get the latest schema row.
@@ -526,6 +552,11 @@ public final class KvTablet {
                         walBuilder.deallocate();
                     }
                 });
+    }
+
+    @VisibleForTesting
+    void setAfterFencedPrecheck(@Nullable Runnable afterFencedPrecheck) {
+        this.afterFencedPrecheck = afterFencedPrecheck;
     }
 
     private void validateSchemaId(short schemaIdOfNewData, short latestSchemaId) {
@@ -734,7 +765,8 @@ public final class KvTablet {
         }
     }
 
-    private WalBuilder createWalBuilder(int schemaId, RowType rowType) throws Exception {
+    private WalBuilder createWalBuilder(int schemaId, RowType rowType, boolean fenced)
+            throws Exception {
         switch (logFormat) {
             case INDEXED:
                 if (kvFormat == KvFormat.COMPACTED) {
@@ -745,21 +777,33 @@ public final class KvTablet {
                     throw new IllegalArgumentException(
                             "Primary Key Table with COMPACTED kv format doesn't support INDEXED cdc log format.");
                 }
-                return new IndexWalBuilder(schemaId, memorySegmentPool);
+                return fenced
+                        ? IndexWalBuilder.fencedBuilder(schemaId, memorySegmentPool)
+                        : new IndexWalBuilder(schemaId, memorySegmentPool);
             case COMPACTED:
-                return new CompactedWalBuilder(schemaId, rowType, memorySegmentPool);
+                return fenced
+                        ? CompactedWalBuilder.fencedBuilder(schemaId, rowType, memorySegmentPool)
+                        : new CompactedWalBuilder(schemaId, rowType, memorySegmentPool);
             case ARROW:
-                return new ArrowWalBuilder(
-                        schemaId,
-                        arrowWriterProvider.getOrCreateWriter(
-                                tableBucket.getTableId(),
+                return fenced
+                        ? ArrowWalBuilder.fencedBuilder(
                                 schemaId,
-                                // we don't limit size of the arrow batch, because all the
-                                // changelogs should be in a single batch
-                                Integer.MAX_VALUE,
-                                rowType,
-                                arrowCompressionInfo),
-                        memorySegmentPool);
+                                arrowWriterProvider.getOrCreateWriter(
+                                        tableBucket.getTableId(),
+                                        schemaId,
+                                        Integer.MAX_VALUE,
+                                        rowType,
+                                        arrowCompressionInfo),
+                                memorySegmentPool)
+                        : new ArrowWalBuilder(
+                                schemaId,
+                                arrowWriterProvider.getOrCreateWriter(
+                                        tableBucket.getTableId(),
+                                        schemaId,
+                                        Integer.MAX_VALUE,
+                                        rowType,
+                                        arrowCompressionInfo),
+                                memorySegmentPool);
             default:
                 throw new IllegalArgumentException("Unsupported log format: " + logFormat);
         }

@@ -27,6 +27,7 @@ import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -38,6 +39,7 @@ import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -302,6 +304,14 @@ public final class LogTablet {
         return writerStateManager;
     }
 
+    /** Finds a committed V1 fence that dominates the supplied sequence. */
+    public Optional<FencedWriterStateEntry> findStaleFencedBatch(
+            WriterKey writerKey, long sequence) {
+        synchronized (lock) {
+            return writerStateManager.findStaleFencedBatch(writerKey, sequence);
+        }
+    }
+
     public static LogTablet create(
             File dataDir,
             PhysicalTablePath tablePath,
@@ -316,6 +326,37 @@ public final class LogTablet {
             Clock clock,
             boolean isCleanShutdown)
             throws Exception {
+        return create(
+                dataDir,
+                tablePath,
+                tabletDir,
+                conf,
+                serverMetricGroup,
+                recoveryPoint,
+                scheduler,
+                logFormat,
+                tieredLogLocalSegments,
+                isChangelog,
+                clock,
+                isCleanShutdown,
+                KvIdempotenceProtocol.V0_COMPACT);
+    }
+
+    public static LogTablet create(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            File tabletDir,
+            Configuration conf,
+            TabletServerMetricGroup serverMetricGroup,
+            long recoveryPoint,
+            Scheduler scheduler,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            boolean isChangelog,
+            Clock clock,
+            boolean isCleanShutdown,
+            KvIdempotenceProtocol protocol)
+            throws Exception {
         // create the log directory if it doesn't exist
         Files.createDirectories(tabletDir.toPath());
 
@@ -327,7 +368,8 @@ public final class LogTablet {
                 new WriterStateManager(
                         tableBucket,
                         tabletDir,
-                        (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis());
+                        (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis(),
+                        protocol);
 
         LoadedLogOffsets offsets =
                 new LogLoader(
@@ -737,71 +779,101 @@ public final class LogTablet {
                 }
             }
 
-            // maybe roll the log if this segment is full.
-            maybeRoll(validRecords.sizeInBytes(), appendInfo);
-
-            // now that we have valid records, offsets assigned, we need to validate the idempotent
-            // state of the writers and collect some metadata.
-            Either<WriterStateEntry.BatchMetadata, Collection<WriterAppendInfo>> validateResult =
-                    analyzeAndValidateWriterState(validRecords, appendAsLeader);
-
-            if (validateResult.isLeft()) {
-                // have duplicated batch metadata, skip the append and update append info.
-                WriterStateEntry.BatchMetadata duplicatedBatch = validateResult.left();
-                long startOffset = duplicatedBatch.firstOffset();
-                if (appendAsLeader) {
-                    appendInfo.setFirstOffset(startOffset);
-                    appendInfo.setLastOffset(duplicatedBatch.lastOffset);
-                    appendInfo.setMaxTimestamp(duplicatedBatch.timestamp);
-                    appendInfo.setStartOffsetOfMaxTimestamp(startOffset);
-                    appendInfo.setDuplicated(true);
+            validateWalProtocol(validRecords);
+            Collection<WriterAppendInfo> updatedWriters = Collections.emptyList();
+            Collection<FencedWriterAppendInfo> updatedFencedWriters = Collections.emptyList();
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT) {
+                // Preserve the compact protocol's existing roll-before-duplicate-check behavior.
+                maybeRoll(validRecords.sizeInBytes(), appendInfo);
+                Either<WriterStateEntry.BatchMetadata, Collection<WriterAppendInfo>>
+                        validateResult =
+                                analyzeAndValidateWriterState(validRecords, appendAsLeader);
+                if (validateResult.isRight()) {
+                    updatedWriters = validateResult.right();
                 } else {
-                    String errorMsg =
-                            String.format(
-                                    "Found duplicated batch for table bucket %s, duplicated offset is %s, "
-                                            + "writer id is %s and batch sequence is: %s",
-                                    getTableBucket(),
-                                    duplicatedBatch.lastOffset,
-                                    duplicatedBatch.writerId,
-                                    duplicatedBatch.batchSequence);
-                    LOG.error(errorMsg);
-                    throw new DuplicateSequenceException(errorMsg);
+                    // have duplicated batch metadata, skip the append and update append info.
+                    WriterStateEntry.BatchMetadata duplicatedBatch = validateResult.left();
+                    long startOffset = duplicatedBatch.firstOffset();
+                    if (appendAsLeader) {
+                        appendInfo.setFirstOffset(startOffset);
+                        appendInfo.setLastOffset(duplicatedBatch.lastOffset);
+                        appendInfo.setMaxTimestamp(duplicatedBatch.timestamp);
+                        appendInfo.setStartOffsetOfMaxTimestamp(startOffset);
+                        appendInfo.setDuplicated(true);
+                    } else {
+                        String errorMsg =
+                                String.format(
+                                        "Found duplicated batch for table bucket %s, duplicated offset is %s, "
+                                                + "writer id is %s and batch sequence is: %s",
+                                        getTableBucket(),
+                                        duplicatedBatch.lastOffset,
+                                        duplicatedBatch.writerId,
+                                        duplicatedBatch.batchSequence);
+                        LOG.error(errorMsg);
+                        throw new DuplicateSequenceException(errorMsg);
+                    }
+                    return appendInfo;
                 }
             } else {
-                // Append the records, and increment the local log end offset immediately after
-                // append because write to the transaction index below may fail, and we want to
-                // ensure that the offsets of future appends still grow monotonically.
-                localLog.append(
-                        appendInfo.lastOffset(),
-                        appendInfo.maxTimestamp(),
-                        appendInfo.startOffsetOfMaxTimestamp(),
-                        validRecords);
-                updateHighWatermarkWithLogEndOffset();
-
-                // update the writer state.
-                Collection<WriterAppendInfo> updatedWriters = validateResult.right();
-                updatedWriters.forEach(writerStateManager::update);
-
-                // always update the last writer id map offset so that the snapshot reflects
-                // the current offset even if there isn't any idempotent data being written.
-                writerStateManager.updateMapEndOffset(appendInfo.lastOffset() + 1);
-
-                // todo update the first unstable offset (which is used to compute lso)
-
-                LOG.trace(
-                        "Appended message set with last offset: {}, first offset {}, next offset: {} "
-                                + "and messages {} for bucket {}",
-                        appendInfo.lastOffset(),
-                        appendInfo.firstOffset(),
-                        localLog.getLocalLogEndOffset(),
-                        validRecords,
-                        getTableBucket());
-
-                if (localLog.unflushedMessages() >= logFlushIntervalMessages) {
-                    flush(false);
+                Either<FencedWriterStateEntry, Collection<FencedWriterAppendInfo>> validateResult =
+                        analyzeAndValidateFencedWriterState(validRecords);
+                if (validateResult.isLeft()) {
+                    FencedWriterStateEntry dominating = validateResult.left();
+                    if (appendAsLeader) {
+                        return LogAppendInfo.duplicatedAt(
+                                dominating.dominatingTargetWalOffset(),
+                                dominating.lastTimestamp());
+                    }
+                    throw new DuplicateSequenceException(
+                            String.format(
+                                    "Found stale fenced batch for table bucket %s, writer key %s and sequence %s",
+                                    getTableBucket(),
+                                    dominating.writerKey(),
+                                    dominating.lastSequence()));
                 }
+                updatedFencedWriters = validateResult.right();
+                // A stale V1 batch returned above without rolling or otherwise mutating the WAL.
+                maybeRoll(validRecords.sizeInBytes(), appendInfo);
+            }
+
+            // Publish WriterState only after the corresponding WAL append succeeds.
+            localLog.append(
+                    appendInfo.lastOffset(),
+                    appendInfo.maxTimestamp(),
+                    appendInfo.startOffsetOfMaxTimestamp(),
+                    validRecords);
+            updateHighWatermarkWithLogEndOffset();
+            updatedWriters.forEach(writerStateManager::update);
+            updatedFencedWriters.forEach(writerStateManager::updateFenced);
+            writerStateManager.updateMapEndOffset(appendInfo.lastOffset() + 1);
+
+            // todo update the first unstable offset (which is used to compute lso)
+
+            LOG.trace(
+                    "Appended message set with last offset: {}, first offset {}, next offset: {} "
+                            + "and messages {} for bucket {}",
+                    appendInfo.lastOffset(),
+                    appendInfo.firstOffset(),
+                    localLog.getLocalLogEndOffset(),
+                    validRecords,
+                    getTableBucket());
+
+            if (localLog.unflushedMessages() >= logFlushIntervalMessages) {
+                flush(false);
             }
             return appendInfo;
+        }
+    }
+
+    private void validateWalProtocol(MemoryLogRecords records) {
+        int expected = writerStateManager.protocol().version();
+        for (LogRecordBatch batch : records.batches()) {
+            if (batch.idempotenceProtocolVersion() != expected) {
+                throw new CorruptRecordException(
+                        String.format(
+                                "Target WAL magic v%s does not match table protocol V%s for %s",
+                                batch.magic(), expected, getTableBucket()));
+            }
         }
     }
 
@@ -1136,6 +1208,29 @@ public final class LogTablet {
         return Either.right(updatedWriters.values());
     }
 
+    private Either<FencedWriterStateEntry, Collection<FencedWriterAppendInfo>>
+            analyzeAndValidateFencedWriterState(MemoryLogRecords records) {
+        List<FencedWriterAppendInfo> updates = new ArrayList<>();
+        Map<WriterKey, FencedWriterStateEntry> staged = new HashMap<>();
+        for (LogRecordBatch batch : records.batches()) {
+            WriterKey writerKey = batch.fencedWriterKey();
+            FencedWriterStateEntry current =
+                    staged.containsKey(writerKey)
+                            ? staged.get(writerKey)
+                            : writerStateManager.lastFencedEntry(writerKey).orElse(null);
+            if (current != null && batch.fencedSequence() <= current.lastSequence()) {
+                return Either.left(current);
+            }
+            FencedWriterAppendInfo update =
+                    new FencedWriterAppendInfo(writerKey, getTableBucket(), current);
+            update.append(
+                    batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
+            updates.add(update);
+            staged.put(writerKey, update.updatedEntry());
+        }
+        return Either.right(updates);
+    }
+
     @VisibleForTesting
     public void removeExpiredWriter(long currentTimeMs) {
         synchronized (lock) {
@@ -1264,7 +1359,9 @@ public final class LogTablet {
         // snapshot at the log end offset (see below). The next time the log is reloaded, we will
         // load writer state using this snapshot (or later snapshots). Otherwise, if there is
         // no snapshot file, then we have to rebuild writer state from the first segment.
-        if (!writerStateManager.latestSnapshotOffset().isPresent() && reloadFromCleanShutdown) {
+        if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT
+                && !writerStateManager.latestSnapshotOffset().isPresent()
+                && reloadFromCleanShutdown) {
             // To avoid an expensive scan through all the segments, we take empty snapshots from
             // the start of the last two segments and the last offset. This should avoid the full
             // scan in the case that the log needs truncation.
@@ -1341,13 +1438,40 @@ public final class LogTablet {
 
     private static void loadWritersFromRecords(
             WriterStateManager writerStateManager, LogRecords records) {
-        Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
-        for (LogRecordBatch batch : records.batches()) {
-            if (batch.hasWriterId()) {
-                updateWriterAppendInfo(writerStateManager, batch, loadedWriters, false);
+        if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT) {
+            Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
+            for (LogRecordBatch batch : records.batches()) {
+                if (batch.idempotenceProtocolVersion() != 0) {
+                    throw new CorruptRecordException(
+                            "Fenced target WAL found while recovering a V0 table");
+                }
+                if (batch.hasWriterId()) {
+                    updateWriterAppendInfo(writerStateManager, batch, loadedWriters, false);
+                }
+            }
+            loadedWriters.values().forEach(writerStateManager::update);
+        } else {
+            for (LogRecordBatch batch : records.batches()) {
+                if (batch.idempotenceProtocolVersion() != 1) {
+                    throw new CorruptRecordException(
+                            "Compact target WAL found while recovering a V1 table");
+                }
+                Optional<FencedWriterStateEntry> stale =
+                        writerStateManager.findStaleFencedBatch(
+                                batch.fencedWriterKey(), batch.fencedSequence());
+                if (stale.isPresent()) {
+                    throw new CorruptRecordException(
+                            "Non-increasing fenced sequence found while recovering target WAL");
+                }
+                FencedWriterAppendInfo update =
+                        writerStateManager.prepareFencedUpdate(batch.fencedWriterKey());
+                update.append(
+                        batch.fencedSequence(),
+                        batch.lastLogOffset(),
+                        batch.commitTimestamp());
+                writerStateManager.updateFenced(update);
             }
         }
-        loadedWriters.values().forEach(writerStateManager::update);
     }
 
     public static void deleteWriterSnapshots(
