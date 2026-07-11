@@ -19,8 +19,11 @@ package org.apache.fluss.server.log;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -32,6 +35,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -54,6 +58,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test for {@link WriterStateManager}. */
 public class WriterStateManagerTest {
 
+    private static final byte[] V0_SNAPSHOT_FIXTURE =
+            ("{\"version\":1,\"writer_id_entries\":[{\"writer_id\":5,"
+                            + "\"last_batch_sequence\":0,\"last_batch_base_offset\":8,"
+                            + "\"offset_delta\":0,\"last_batch_timestamp\":9}]}")
+                    .getBytes(StandardCharsets.UTF_8);
+
     private @TempDir File tempDir;
     private final long writerId = 1L;
     private File logDir;
@@ -72,6 +82,169 @@ public class WriterStateManagerTest {
                         tableBucket,
                         logDir,
                         (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis());
+    }
+
+    @Test
+    void testThreeArgumentConstructorRemainsV0Compact() {
+        append(stateManager, 5L, 0, 8L, false, 9L);
+
+        assertThat(stateManager.protocol()).isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
+        assertThat(stateManager.activeWriters()).containsOnlyKeys(5L);
+        assertThat(stateManager.writerIdCount()).isEqualTo(1);
+    }
+
+    @Test
+    void testV0SnapshotMatchesLiteralBaseFixture() throws Exception {
+        append(stateManager, 5L, 0, 8L, false, 9L);
+        stateManager.takeSnapshot();
+
+        assertThat(Files.readAllBytes(writerSnapshotFile(logDir, 9L).toPath()))
+                .isEqualTo(V0_SNAPSHOT_FIXTURE);
+    }
+
+    @Test
+    void testV1SparseSequenceUsesLatestFenceOnly() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey key = new WriterKey(4L, 5L);
+
+        appendFenced(manager, key, 100L, 10L, 1L);
+        appendFenced(manager, key, 500L, 20L, 2L);
+        appendFenced(manager, key, (long) Integer.MAX_VALUE + 1L, 30L, 3L);
+
+        FencedWriterStateEntry entry =
+                manager.lastFencedEntry(key).orElseThrow(AssertionError::new);
+        assertThat(entry.lastSequence()).isEqualTo((long) Integer.MAX_VALUE + 1L);
+        assertThat(entry.dominatingTargetWalOffset()).isEqualTo(30L);
+        assertThat(manager.findStaleFencedBatch(key, 500L)).contains(entry);
+        assertThat(manager.findStaleFencedBatch(key, entry.lastSequence())).contains(entry);
+        assertThat(manager.findStaleFencedBatch(key, entry.lastSequence() + 1L)).isEmpty();
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+    }
+
+    @Test
+    void testV1PreparedUpdateIsOneShotAndPublishesOnlyOnUpdate() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey key = new WriterKey(4L, 5L);
+        FencedWriterAppendInfo appendInfo = manager.prepareFencedUpdate(key);
+        FencedWriterAppendInfo superseded = manager.prepareFencedUpdate(key);
+
+        appendInfo.append(100L, 10L, 1L);
+        superseded.append(101L, 11L, 2L);
+        assertThat(manager.lastFencedEntry(key)).isEmpty();
+        assertThatThrownBy(() -> appendInfo.append(101L, 11L, 2L))
+                .isInstanceOf(IllegalStateException.class);
+
+        manager.updateFenced(appendInfo);
+        assertThat(manager.lastFencedEntry(key)).contains(appendInfo.updatedEntry());
+        assertThatThrownBy(() -> manager.updateFenced(superseded))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> manager.updateFenced(manager.prepareFencedUpdate(key)))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void testV1RejectsEqualLowerAndNegativeFreshUpdates() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey key = new WriterKey(4L, 5L);
+        appendFenced(manager, key, 100L, 10L, 1L);
+
+        assertThatThrownBy(() -> manager.prepareFencedUpdate(key).append(100L, 11L, 2L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> manager.prepareFencedUpdate(key).append(99L, 11L, 2L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(
+                        () ->
+                                manager.prepareFencedUpdate(new WriterKey(6L, 7L))
+                                        .append(-1L, 11L, 2L))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testV1WriterDoesNotExpireAndCanBeExplicitlyRetired() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey retained = new WriterKey(4L, 5L);
+        WriterKey retired = new WriterKey(6L, 7L);
+        appendFenced(manager, retained, 100L, 10L, 1L);
+        appendFenced(manager, retired, 200L, 20L, 2L);
+
+        manager.removeExpiredWriters(Long.MAX_VALUE);
+        assertThat(manager.writerIdCount()).isEqualTo(2);
+
+        manager.removeFencedWriters(retired::equals);
+        assertThat(manager.lastFencedEntry(retained)).isPresent();
+        assertThat(manager.lastFencedEntry(retired)).isEmpty();
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+        assertThat(manager.isEmpty()).isFalse();
+        manager.removeFencedWriters(key -> true);
+        assertThat(manager.isEmpty()).isTrue();
+    }
+
+    @Test
+    void testProtocolSpecificApisFailFastAcrossProtocols() throws Exception {
+        WriterStateManager fenced = fencedManager();
+        WriterKey key = new WriterKey(4L, 5L);
+
+        assertThatThrownBy(() -> stateManager.lastFencedEntry(key))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.findStaleFencedBatch(key, 0L))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.prepareFencedUpdate(key))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.removeFencedWriters(ignored -> true))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.updateFenced(fenced.prepareFencedUpdate(key)))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThatThrownBy(() -> fenced.lastEntry(1L)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(fenced::activeWriters).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> fenced.prepareUpdate(1L))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> fenced.update(stateManager.prepareUpdate(1L)))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> fenced.loadWriterEntry(WriterStateEntry.empty(1L)))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void testV1SnapshotRoundTripPreservesFullKeyAndLongValues() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey key = new WriterKey(Long.MAX_VALUE, Long.MIN_VALUE | 3L);
+        appendFenced(manager, key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L);
+        manager.updateMapEndOffset(31L);
+        manager.takeSnapshot();
+
+        WriterStateManager recovered = fencedManager();
+        recovered.truncateAndReload(0L, 31L, Long.MAX_VALUE);
+
+        assertThat(recovered.lastFencedEntry(key))
+                .contains(
+                        new FencedWriterStateEntry(
+                                key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L));
+    }
+
+    @Test
+    void testProtocolSnapshotMismatchIsRejected() throws Exception {
+        Files.write(writerSnapshotFile(logDir, 1L).toPath(), v2SnapshotBytes());
+        stateManager.reloadSnapshots();
+        stateManager.truncateAndReload(0L, 1L, Long.MAX_VALUE);
+        assertThat(writerSnapshotFile(logDir, 1L)).doesNotExist();
+
+        Files.write(writerSnapshotFile(logDir, 2L).toPath(), V0_SNAPSHOT_FIXTURE);
+        WriterStateManager fenced = fencedManager();
+        assertThatThrownBy(() -> fenced.truncateAndReload(0L, 2L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class);
+        assertThat(writerSnapshotFile(logDir, 2L)).exists();
+    }
+
+    @Test
+    void testV1CorruptSnapshotIsPropagatedWithoutFallback() throws Exception {
+        File snapshot = writerSnapshotFile(logDir, 1L);
+        Files.write(snapshot.toPath(), "{\"version\":2}".getBytes(StandardCharsets.UTF_8));
+        WriterStateManager fenced = fencedManager();
+
+        assertThatThrownBy(() -> fenced.truncateAndReload(0L, 1L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class);
+        assertThat(snapshot).exists();
     }
 
     @Test
@@ -525,6 +698,32 @@ public class WriterStateManagerTest {
                 lastTimestamp);
         stateManager.update(appendInfo);
         stateManager.updateMapEndOffset(offset + 1);
+    }
+
+    private WriterStateManager fencedManager() throws IOException {
+        return new WriterStateManager(
+                tableBucket,
+                logDir,
+                (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis(),
+                KvIdempotenceProtocol.V1_FENCED);
+    }
+
+    private static void appendFenced(
+            WriterStateManager manager,
+            WriterKey writerKey,
+            long sequence,
+            long targetWalOffset,
+            long timestamp) {
+        FencedWriterAppendInfo appendInfo = manager.prepareFencedUpdate(writerKey);
+        appendInfo.append(sequence, targetWalOffset, timestamp);
+        manager.updateFenced(appendInfo);
+    }
+
+    private static byte[] v2SnapshotBytes() {
+        return ("{\"version\":2,\"kv_idempotence_protocol_version\":1,\"writer_entries\":[{"
+                        + "\"writer_key_high\":4,\"writer_key_low\":5,\"last_sequence\":100,"
+                        + "\"last_target_wal_offset\":10,\"last_timestamp\":1}]}")
+                .getBytes(StandardCharsets.UTF_8);
     }
 
     private Set<Long> currentSnapshotOffsets() {

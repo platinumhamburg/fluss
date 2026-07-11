@@ -20,8 +20,10 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.UnknownWriterIdException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.fluss.utils.json.JsonDeserializer;
@@ -31,11 +33,11 @@ import org.apache.fluss.utils.json.JsonSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -53,6 +55,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -81,10 +84,12 @@ public class WriterStateManager {
 
     private final TableBucket tableBucket;
     private final int writerExpirationMs;
-    private final Map<Long, WriterStateEntry> writers = new HashMap<>();
+    private final KvIdempotenceProtocol protocol;
+    @Nullable private final Map<Long, WriterStateEntry> writers;
+    @Nullable private final Map<WriterKey, FencedWriterStateEntry> fencedWriters;
 
     private final File logTabletDir;
-    /** The same as writers#size, but for lock-free access. */
+    /** The selected protocol map size, available without acquiring the manager's owning lock. */
     private volatile int writerIdCount = 0;
 
     private ConcurrentSkipListMap<Long, SnapshotFile> snapshots;
@@ -93,10 +98,26 @@ public class WriterStateManager {
 
     public WriterStateManager(TableBucket tableBucket, File logTabletDir, int writerExpirationMs)
             throws IOException {
+        this(tableBucket, logTabletDir, writerExpirationMs, KvIdempotenceProtocol.V0_COMPACT);
+    }
+
+    public WriterStateManager(
+            TableBucket tableBucket,
+            File logTabletDir,
+            int writerExpirationMs,
+            KvIdempotenceProtocol protocol)
+            throws IOException {
         this.tableBucket = tableBucket;
         this.writerExpirationMs = writerExpirationMs;
         this.logTabletDir = logTabletDir;
+        this.protocol = Objects.requireNonNull(protocol, "protocol");
+        this.writers = protocol == KvIdempotenceProtocol.V0_COMPACT ? new HashMap<>() : null;
+        this.fencedWriters = protocol == KvIdempotenceProtocol.V1_FENCED ? new HashMap<>() : null;
         this.snapshots = loadSnapshots();
+    }
+
+    public KvIdempotenceProtocol protocol() {
+        return protocol;
     }
 
     public int writerExpirationMs() {
@@ -118,19 +139,26 @@ public class WriterStateManager {
 
     /** Get the last written entry for the given writer id. */
     public Optional<WriterStateEntry> lastEntry(long writerId) {
+        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
         return Optional.ofNullable(writers.get(writerId));
     }
 
     /** Get a copy of the active writers. */
     public Map<Long, WriterStateEntry> activeWriters() {
+        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
         return Collections.unmodifiableMap(writers);
     }
 
     public boolean isEmpty() {
-        return writers.isEmpty();
+        return protocol == KvIdempotenceProtocol.V0_COMPACT
+                ? writers.isEmpty()
+                : fencedWriters.isEmpty();
     }
 
     public void removeExpiredWriters(long currentTimeMs) {
+        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
+            return;
+        }
         List<Long> keys =
                 writers.entrySet().stream()
                         .filter(entry -> isWriterExpired(currentTimeMs, entry.getValue()))
@@ -198,11 +226,15 @@ public class WriterStateManager {
             SnapshotFile snapshotFile =
                     new SnapshotFile(writerSnapshotFile(logTabletDir, lastMapOffset));
             long start = System.currentTimeMillis();
-            writeSnapshot(snapshotFile.file(), writers);
+            if (protocol == KvIdempotenceProtocol.V0_COMPACT) {
+                writeSnapshot(snapshotFile.file(), writers);
+            } else {
+                writeFencedSnapshot(snapshotFile.file(), fencedWriters);
+            }
             LOG.info(
                     "Wrote writer snapshot at offset {} with {} producer ids for table bucket {} in {} ms.",
                     lastMapOffset,
-                    writers.size(),
+                    writerIdCount,
                     tableBucket,
                     System.currentTimeMillis() - start);
 
@@ -229,6 +261,7 @@ public class WriterStateManager {
     }
 
     public WriterAppendInfo prepareUpdate(long writerId) {
+        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
         WriterStateEntry currentEntry =
                 lastEntry(writerId).orElse(WriterStateEntry.empty(writerId));
         return new WriterAppendInfo(writerId, tableBucket, currentEntry);
@@ -236,6 +269,7 @@ public class WriterStateManager {
 
     /** Update the mapping with the given append information. */
     public void update(WriterAppendInfo appendInfo) {
+        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
         long writerId = appendInfo.writerId();
         if (writerId == NO_WRITER_ID) {
             throw new IllegalArgumentException(
@@ -254,6 +288,55 @@ public class WriterStateManager {
         } else {
             addWriterId(writerId, updatedEntry);
         }
+    }
+
+    /** Get the latest accepted V1 fence for the opaque writer key. */
+    public Optional<FencedWriterStateEntry> lastFencedEntry(WriterKey writerKey) {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        return Optional.ofNullable(fencedWriters.get(writerKey));
+    }
+
+    /** Return the state which dominates a stale V1 sequence, if one exists. */
+    public Optional<FencedWriterStateEntry> findStaleFencedBatch(
+            WriterKey writerKey, long sequence) {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        if (sequence < 0L) {
+            throw new IllegalArgumentException("sequence must be non-negative");
+        }
+        return lastFencedEntry(writerKey).filter(entry -> sequence <= entry.lastSequence());
+    }
+
+    /** Prepare a V1 update without mutating the published state. */
+    public FencedWriterAppendInfo prepareFencedUpdate(WriterKey writerKey) {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        return new FencedWriterAppendInfo(writerKey, tableBucket, fencedWriters.get(writerKey));
+    }
+
+    /** Publish a prepared V1 update after the corresponding target WAL append succeeds. */
+    public void updateFenced(FencedWriterAppendInfo appendInfo) {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        Objects.requireNonNull(appendInfo, "appendInfo");
+        if (!tableBucket.equals(appendInfo.tableBucket())) {
+            throw new IllegalArgumentException(
+                    "Fenced writer update belongs to a different table bucket");
+        }
+        Optional<FencedWriterStateEntry> current =
+                Optional.ofNullable(fencedWriters.get(appendInfo.writerKey()));
+        if (!current.equals(appendInfo.currentEntry())) {
+            throw new IllegalStateException(
+                    "Fenced writer state changed after the update was prepared");
+        }
+        FencedWriterStateEntry updatedEntry = appendInfo.takeUpdatedEntryForPublish();
+        fencedWriters.put(appendInfo.writerKey(), updatedEntry);
+        writerIdCount = fencedWriters.size();
+    }
+
+    /** Explicitly retire V1 writer keys matching the predicate. */
+    public void removeFencedWriters(Predicate<WriterKey> predicate) {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        Objects.requireNonNull(predicate, "predicate");
+        fencedWriters.keySet().removeIf(predicate);
+        writerIdCount = fencedWriters.size();
     }
 
     /**
@@ -310,6 +393,21 @@ public class WriterStateManager {
     }
 
     private void loadFromSnapshot(long logStartOffset, long currentTime) throws IOException {
+        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
+            Optional<SnapshotFile> latestSnapshotFileOptional = latestSnapshotFile();
+            if (latestSnapshotFileOptional.isPresent()) {
+                SnapshotFile snapshot = latestSnapshotFileOptional.get();
+                LOG.info("Loading fenced writer state from snapshot file '{}'", snapshot);
+                readFencedSnapshot(snapshot.file()).forEach(this::loadFencedWriterEntry);
+                lastSnapOffset = snapshot.offset;
+                lastMapOffset = lastSnapOffset;
+            } else {
+                lastSnapOffset = logStartOffset;
+                lastMapOffset = logStartOffset;
+            }
+            return;
+        }
+
         while (true) {
             Optional<SnapshotFile> latestSnapshotFileOptional = latestSnapshotFile();
             if (latestSnapshotFileOptional.isPresent()) {
@@ -362,7 +460,11 @@ public class WriterStateManager {
     }
 
     private void clearWriterIds() {
-        writers.clear();
+        if (protocol == KvIdempotenceProtocol.V0_COMPACT) {
+            writers.clear();
+        } else {
+            fencedWriters.clear();
+        }
         writerIdCount = 0;
     }
 
@@ -416,8 +518,19 @@ public class WriterStateManager {
 
     @VisibleForTesting
     public void loadWriterEntry(WriterStateEntry entry) {
+        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
         long writerId = entry.writerId();
         addWriterId(writerId, entry);
+    }
+
+    private void loadFencedWriterEntry(FencedWriterStateEntry entry) {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        FencedWriterStateEntry previous = fencedWriters.put(entry.writerKey(), entry);
+        if (previous != null) {
+            throw new CorruptSnapshotException(
+                    "Duplicate fenced writer key in snapshot: " + entry.writerKey());
+        }
+        writerIdCount = fencedWriters.size();
     }
 
     private boolean isWriterExpired(long currentTimeMs, WriterStateEntry writerStateEntry) {
@@ -425,7 +538,17 @@ public class WriterStateManager {
     }
 
     public boolean isWriterInBatchExpired(long currentTimeMs, LogRecordBatch recordBatch) {
+        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
         return currentTimeMs - recordBatch.commitTimestamp() > writerExpirationMs;
+    }
+
+    private void requireProtocol(KvIdempotenceProtocol requiredProtocol) {
+        if (protocol != requiredProtocol) {
+            throw new IllegalStateException(
+                    String.format(
+                            "WriterState API requires protocol %s, but manager uses %s",
+                            requiredProtocol, protocol));
+        }
     }
 
     private static List<WriterStateEntry> readSnapshot(File file) {
@@ -447,7 +570,25 @@ public class WriterStateManager {
                                                     snapshotEntry.lastBatchOffsetDelta,
                                                     snapshotEntry.lastBatchTimestamp))));
             return writerIdEntries;
-        } catch (IOException | UncheckedIOException e) {
+        } catch (IOException | RuntimeException e) {
+            throw new CorruptSnapshotException("Failed to read snapshot file " + file, e);
+        }
+    }
+
+    private static List<FencedWriterStateEntry> readFencedSnapshot(File file) {
+        try {
+            byte[] json = Files.readAllBytes(file.toPath());
+            FencedWriterSnapshotMap snapshotMap = FencedWriterSnapshotMap.fromJsonBytes(json);
+            return snapshotMap.snapshotEntries.stream()
+                    .map(
+                            entry ->
+                                    new FencedWriterStateEntry(
+                                            entry.writerKey,
+                                            entry.lastSequence,
+                                            entry.lastTargetWalOffset,
+                                            entry.lastTimestamp))
+                    .collect(Collectors.toList());
+        } catch (RuntimeException | IOException e) {
             throw new CorruptSnapshotException("Failed to read snapshot file " + file, e);
         }
     }
@@ -465,6 +606,31 @@ public class WriterStateManager {
                                         writerStateEntry.lastOffsetDelta(),
                                         writerStateEntry.lastBatchTimestamp())));
         byte[] jsonBytes = new WriterSnapshotMap(snapshotEntries).toJsonBytes();
+
+        ByteBuffer buffer = ByteBuffer.allocate(jsonBytes.length);
+        buffer.put(jsonBytes);
+        buffer.flip();
+
+        try (FileChannel fileChannel =
+                FileChannel.open(
+                        file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            fileChannel.write(buffer);
+            fileChannel.force(true);
+        }
+    }
+
+    private static void writeFencedSnapshot(
+            File file, Map<WriterKey, FencedWriterStateEntry> entries) throws IOException {
+        List<FencedWriterSnapshotEntry> snapshotEntries = new ArrayList<>();
+        entries.forEach(
+                (writerKey, entry) ->
+                        snapshotEntries.add(
+                                new FencedWriterSnapshotEntry(
+                                        writerKey,
+                                        entry.lastSequence(),
+                                        entry.dominatingTargetWalOffset(),
+                                        entry.lastTimestamp())));
+        byte[] jsonBytes = new FencedWriterSnapshotMap(snapshotEntries).toJsonBytes();
 
         ByteBuffer buffer = ByteBuffer.allocate(jsonBytes.length);
         buffer.put(jsonBytes);
@@ -519,6 +685,11 @@ public class WriterStateManager {
 
         @Override
         public WriterSnapshotMap deserialize(JsonNode node) {
+            JsonNode versionNode = node.get(VERSION_KEY);
+            if (versionNode != null && versionNode.asInt() != WRITER_ID_SNAPSHOT_VERSION) {
+                throw new IllegalArgumentException(
+                        "Unsupported V0 writer snapshot version " + versionNode);
+            }
             Iterator<JsonNode> entriesJson = node.get(WRITER_ID_ENTRIES_FILED).elements();
             List<WriterSnapshotEntry> snapshotEntries = new ArrayList<>();
             while (entriesJson.hasNext()) {
@@ -538,6 +709,179 @@ public class WriterStateManager {
             }
 
             return new WriterSnapshotMap(snapshotEntries);
+        }
+    }
+
+    /** V1 fenced writer snapshot map json serde. */
+    public static class FencedWriterSnapshotMapJsonSerde
+            implements JsonSerializer<FencedWriterSnapshotMap>,
+                    JsonDeserializer<FencedWriterSnapshotMap> {
+        public static final FencedWriterSnapshotMapJsonSerde INSTANCE =
+                new FencedWriterSnapshotMapJsonSerde();
+
+        private static final String VERSION_KEY = "version";
+        private static final String PROTOCOL_VERSION_KEY = "kv_idempotence_protocol_version";
+        private static final String WRITER_ENTRIES_FIELD = "writer_entries";
+        private static final String WRITER_KEY_HIGH_FIELD = "writer_key_high";
+        private static final String WRITER_KEY_LOW_FIELD = "writer_key_low";
+        private static final String LAST_SEQUENCE_FIELD = "last_sequence";
+        private static final String LAST_TARGET_WAL_OFFSET_FIELD = "last_target_wal_offset";
+        private static final String LAST_TIMESTAMP_FIELD = "last_timestamp";
+        private static final int SNAPSHOT_VERSION = 2;
+
+        @Override
+        public void serialize(FencedWriterSnapshotMap snapshotMap, JsonGenerator generator)
+                throws IOException {
+            generator.writeStartObject();
+            generator.writeNumberField(VERSION_KEY, SNAPSHOT_VERSION);
+            generator.writeNumberField(
+                    PROTOCOL_VERSION_KEY, KvIdempotenceProtocol.V1_FENCED.version());
+            generator.writeArrayFieldStart(WRITER_ENTRIES_FIELD);
+            for (FencedWriterSnapshotEntry entry : snapshotMap.snapshotEntries) {
+                generator.writeStartObject();
+                generator.writeNumberField(WRITER_KEY_HIGH_FIELD, entry.writerKey.high());
+                generator.writeNumberField(WRITER_KEY_LOW_FIELD, entry.writerKey.low());
+                generator.writeNumberField(LAST_SEQUENCE_FIELD, entry.lastSequence);
+                generator.writeNumberField(LAST_TARGET_WAL_OFFSET_FIELD, entry.lastTargetWalOffset);
+                generator.writeNumberField(LAST_TIMESTAMP_FIELD, entry.lastTimestamp);
+                generator.writeEndObject();
+            }
+            generator.writeEndArray();
+            generator.writeEndObject();
+        }
+
+        @Override
+        public FencedWriterSnapshotMap deserialize(JsonNode node) {
+            requireExactValue(node, VERSION_KEY, SNAPSHOT_VERSION);
+            requireExactValue(
+                    node, PROTOCOL_VERSION_KEY, KvIdempotenceProtocol.V1_FENCED.version());
+
+            JsonNode entriesNode = node.get(WRITER_ENTRIES_FIELD);
+            if (entriesNode == null || !entriesNode.isArray()) {
+                throw new IllegalArgumentException(
+                        "Missing or malformed field " + WRITER_ENTRIES_FIELD);
+            }
+
+            List<FencedWriterSnapshotEntry> entries = new ArrayList<>();
+            HashSet<WriterKey> writerKeys = new HashSet<>();
+            Iterator<JsonNode> entriesJson = entriesNode.elements();
+            while (entriesJson.hasNext()) {
+                JsonNode entryJson = entriesJson.next();
+                if (!entryJson.isObject()) {
+                    throw new IllegalArgumentException("Malformed fenced writer snapshot entry");
+                }
+                WriterKey writerKey =
+                        new WriterKey(
+                                requireLong(entryJson, WRITER_KEY_HIGH_FIELD),
+                                requireLong(entryJson, WRITER_KEY_LOW_FIELD));
+                long lastSequence = requireLong(entryJson, LAST_SEQUENCE_FIELD);
+                if (lastSequence < 0L) {
+                    throw new IllegalArgumentException("last_sequence must be non-negative");
+                }
+                long lastTargetWalOffset = requireLong(entryJson, LAST_TARGET_WAL_OFFSET_FIELD);
+                long lastTimestamp = requireLong(entryJson, LAST_TIMESTAMP_FIELD);
+                if (!writerKeys.add(writerKey)) {
+                    throw new IllegalArgumentException(
+                            "Duplicate WriterKey in fenced writer snapshot");
+                }
+                entries.add(
+                        new FencedWriterSnapshotEntry(
+                                writerKey, lastSequence, lastTargetWalOffset, lastTimestamp));
+            }
+            return new FencedWriterSnapshotMap(entries);
+        }
+
+        private static void requireExactValue(JsonNode node, String field, long expected) {
+            long actual = requireLong(node, field);
+            if (actual != expected) {
+                throw new IllegalArgumentException(
+                        String.format("Unsupported %s %s; expected %s", field, actual, expected));
+            }
+        }
+
+        private static long requireLong(JsonNode node, String field) {
+            JsonNode value = node.get(field);
+            if (value == null || !value.isIntegralNumber() || !value.canConvertToLong()) {
+                throw new IllegalArgumentException("Missing or malformed field " + field);
+            }
+            return value.longValue();
+        }
+    }
+
+    /** Serialized V1 fenced writer entry. */
+    public static class FencedWriterSnapshotEntry {
+        public final WriterKey writerKey;
+        public final long lastSequence;
+        public final long lastTargetWalOffset;
+        public final long lastTimestamp;
+
+        public FencedWriterSnapshotEntry(
+                WriterKey writerKey,
+                long lastSequence,
+                long lastTargetWalOffset,
+                long lastTimestamp) {
+            this.writerKey = Objects.requireNonNull(writerKey, "writerKey");
+            if (lastSequence < 0L) {
+                throw new IllegalArgumentException("lastSequence must be non-negative");
+            }
+            this.lastSequence = lastSequence;
+            this.lastTargetWalOffset = lastTargetWalOffset;
+            this.lastTimestamp = lastTimestamp;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof FencedWriterSnapshotEntry)) {
+                return false;
+            }
+            FencedWriterSnapshotEntry that = (FencedWriterSnapshotEntry) other;
+            return lastSequence == that.lastSequence
+                    && lastTargetWalOffset == that.lastTargetWalOffset
+                    && lastTimestamp == that.lastTimestamp
+                    && writerKey.equals(that.writerKey);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(writerKey, lastSequence, lastTargetWalOffset, lastTimestamp);
+        }
+    }
+
+    /** Serialized V1 fenced writer map. */
+    public static class FencedWriterSnapshotMap {
+        private final List<FencedWriterSnapshotEntry> snapshotEntries;
+
+        public FencedWriterSnapshotMap(List<FencedWriterSnapshotEntry> snapshotEntries) {
+            this.snapshotEntries = new ArrayList<>(snapshotEntries);
+        }
+
+        private static FencedWriterSnapshotMap fromJsonBytes(byte[] json) {
+            return JsonSerdeUtils.readValue(json, FencedWriterSnapshotMapJsonSerde.INSTANCE);
+        }
+
+        private byte[] toJsonBytes() {
+            return JsonSerdeUtils.writeValueAsBytes(
+                    this, FencedWriterSnapshotMapJsonSerde.INSTANCE);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof FencedWriterSnapshotMap)) {
+                return false;
+            }
+            FencedWriterSnapshotMap that = (FencedWriterSnapshotMap) other;
+            return snapshotEntries.equals(that.snapshotEntries);
+        }
+
+        @Override
+        public int hashCode() {
+            return snapshotEntries.hashCode();
         }
     }
 
