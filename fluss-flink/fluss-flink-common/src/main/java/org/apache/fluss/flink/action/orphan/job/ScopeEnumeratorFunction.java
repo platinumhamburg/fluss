@@ -101,6 +101,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     private final String runId;
     private transient TablePlanTracker tablePlans;
     private transient ScopeProgressTracker scopeProgress;
+    private transient ScopeHeartbeat scopeHeartbeat;
 
     public ScopeEnumeratorFunction(OrphanCleanConfig config, String runId) {
         this.config = config;
@@ -141,36 +142,66 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     new ScopeProgressTracker(
                             config.progressLogInterval(),
                             (phase, stats) -> audit.logScopeProgress(runId, phase, stats));
-
-            RateLimiter remoteFsOpRateLimiter =
-                    RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
-            ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3, remoteFsOpRateLimiter);
-            MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
-            audit.logScopePhase(runId, "cluster_metadata");
-            Map<String, String> clusterConfigMap = fetchClusterConfigMap(admin);
-            String clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
-            List<String> clusterRoots =
-                    normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
-
-            audit.logScopePhase(runId, "active_metadata");
-            Map<String, DbScanState> dbStates =
-                    enumerateActiveScope(admin, audit, tracker, planStats);
-            Set<Long> activeTableIds = collectActiveTableIds(dbStates);
-            Set<Long> activePartitionIds = collectActivePartitionIds(dbStates);
-
-            audit.logScopePhase(runId, "task_planning");
-            for (DbScanState dbState : dbStates.values()) {
-                for (LiveTableScope liveTable : dbState.liveTables) {
-                    emitBucketTasks(
-                            liveTable,
-                            fetcher,
-                            audit,
-                            clusterRemoteDataDir,
-                            clusterRoots,
+            scopeHeartbeat =
+                    new ScopeHeartbeat(
+                            config.progressLogInterval(),
                             planStats,
-                            out);
-                    emitOrphanPartitionDirTasks(
-                            liveTable,
+                            snapshot ->
+                                    audit.logScopeHeartbeat(
+                                            runId,
+                                            snapshot.phase(),
+                                            snapshot.completedTargets(),
+                                            snapshot.totalTargets(),
+                                            snapshot.database(),
+                                            snapshot.table(),
+                                            snapshot.tableId(),
+                                            snapshot.partitionId(),
+                                            snapshot.targetElapsedMillis(),
+                                            snapshot.stats()));
+
+            try {
+                RateLimiter remoteFsOpRateLimiter =
+                        RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
+                ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3, remoteFsOpRateLimiter);
+                MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
+                scopeHeartbeat.phase("cluster_metadata");
+                audit.logScopePhase(runId, "cluster_metadata");
+                Map<String, String> clusterConfigMap = fetchClusterConfigMap(admin);
+                String clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
+                List<String> clusterRoots =
+                        normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
+
+                scopeHeartbeat.phase("active_metadata");
+                audit.logScopePhase(runId, "active_metadata");
+                Map<String, DbScanState> dbStates =
+                        enumerateActiveScope(admin, audit, tracker, planStats);
+                Set<Long> activeTableIds = collectActiveTableIds(dbStates);
+                Set<Long> activePartitionIds = collectActivePartitionIds(dbStates);
+
+                scopeHeartbeat.totalTargets(countBucketTargets(dbStates));
+                scopeHeartbeat.phase("task_planning");
+                audit.logScopePhase(runId, "task_planning");
+                for (DbScanState dbState : dbStates.values()) {
+                    for (LiveTableScope liveTable : dbState.liveTables) {
+                        emitBucketTasks(
+                                liveTable,
+                                fetcher,
+                                audit,
+                                clusterRemoteDataDir,
+                                clusterRoots,
+                                planStats,
+                                out);
+                        emitOrphanPartitionDirTasks(
+                                liveTable,
+                                tracker,
+                                clusterRoots,
+                                audit,
+                                remoteFsOpRateLimiter,
+                                planStats,
+                                out);
+                    }
+                    emitOrphanTableDirTasks(
+                            dbState,
                             tracker,
                             clusterRoots,
                             audit,
@@ -178,32 +209,40 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             planStats,
                             out);
                 }
-                emitOrphanTableDirTasks(
-                        dbState,
+                emitOrphanDirTasksUnderUnknownDatabases(
+                        dbStates.keySet(),
+                        activeTableIds,
+                        activeTableIdsComplete(dbStates),
+                        activePartitionIds,
+                        activePartitionIdsComplete(dbStates),
                         tracker,
                         clusterRoots,
                         audit,
                         remoteFsOpRateLimiter,
                         planStats,
                         out);
-            }
-            emitOrphanDirTasksUnderUnknownDatabases(
-                    dbStates.keySet(),
-                    activeTableIds,
-                    activeTableIdsComplete(dbStates),
-                    activePartitionIds,
-                    activePartitionIdsComplete(dbStates),
-                    tracker,
-                    clusterRoots,
-                    audit,
-                    remoteFsOpRateLimiter,
-                    planStats,
-                    out);
-            audit.logScopePlan(runId, planStats);
-            for (TablePlanStats tablePlan : tablePlans.snapshots()) {
-                ctx.output(TABLE_PLAN_STATS, tablePlan);
+                audit.logScopePlan(runId, planStats);
+                for (TablePlanStats tablePlan : tablePlans.snapshots()) {
+                    ctx.output(TABLE_PLAN_STATS, tablePlan);
+                }
+            } finally {
+                scopeHeartbeat.close();
             }
         }
+    }
+
+    private static long countBucketTargets(Map<String, DbScanState> dbStates) {
+        long targets = 0L;
+        for (DbScanState dbState : dbStates.values()) {
+            for (LiveTableScope liveTable : dbState.liveTables) {
+                if (!liveTable.partitioned) {
+                    targets++;
+                } else if (liveTable.partitionInfosComplete) {
+                    targets += liveTable.partitions.size();
+                }
+            }
+        }
+        return targets;
     }
 
     /** Normalizes each root in the list and returns a deduplicated ordered list. */
@@ -466,9 +505,15 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             audit.logSkipBucketOutOfScope(liveTable.tableId, partitionId, remoteDataDir);
             planStats.skippedOutOfScopeRoot();
             tablePlans.skip(liveTable.scope(), SkipReasonCode.OUT_OF_SCOPE_ROOT);
+            scopeHeartbeat.targetComplete();
             return;
         }
 
+        scopeHeartbeat.targetStart(
+                liveTable.tablePath.getDatabaseName(),
+                liveTable.tablePath.getTableName(),
+                liveTable.tableId,
+                partitionId);
         audit.logScopeTargetStart(
                 runId,
                 liveTable.tablePath.getDatabaseName(),
@@ -510,6 +555,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 logResult.listOk() ? "ok" : "failed",
                 kvStatus,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - targetStartNanos));
+        scopeHeartbeat.targetComplete();
 
         FsPath remoteLogDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_LOG_DIR_NAME);
         FsPath remoteKvDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_KV_DIR_NAME);

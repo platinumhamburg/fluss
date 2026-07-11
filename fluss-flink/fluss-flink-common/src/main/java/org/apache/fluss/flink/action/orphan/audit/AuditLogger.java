@@ -146,6 +146,45 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Periodic heartbeat emitted independently from a potentially blocking scope call. */
+    public void logScopeHeartbeat(
+            String runId,
+            String phase,
+            long completedTargets,
+            long totalTargets,
+            String database,
+            String table,
+            Long tableId,
+            Long partitionId,
+            long targetElapsedMillis,
+            ScopePlanStats stats) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scope action=scope_heartbeat phase={}"
+                        + " completed_targets={} total_targets={} current_database={}"
+                        + " current_table={} current_table_id={} current_partition_id={}"
+                        + " current_target_elapsed_ms={} discovered_buckets={} bucket_tasks={}"
+                        + " orphan_dir_tasks={} skipped_no_remote_manifest={}"
+                        + " skipped_empty_kv_active_set={} skipped_out_of_scope_root={}"
+                        + " metadata_failures={} ts={}",
+                runId,
+                phase,
+                completedTargets,
+                totalTargets,
+                database,
+                table,
+                tableId,
+                partitionId,
+                targetElapsedMillis,
+                stats.discoveredBuckets(),
+                stats.bucketTasks(),
+                stats.orphanDirTasks(),
+                stats.skippedNoRemoteManifestCount(),
+                stats.skippedEmptyKvActiveSetCount(),
+                stats.skippedOutOfScopeRootCount(),
+                stats.metadataFailures(),
+                Instant.now());
+    }
+
     /** Low-frequency phase marker that identifies the next blocking scope operation. */
     public void logScopePhase(String runId, String phase) {
         AUDIT.info(

@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.action.orphan.audit;
 
+import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
+
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
@@ -31,6 +33,32 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class AuditLoggerTest {
+
+    @Test
+    void scopeHeartbeatIsSelfContainedForOperators() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        AuditLogger logger = new AuditLogger();
+        ScopePlanStats stats = new ScopePlanStats();
+        stats.discoveredBucket();
+        stats.bucketTask();
+
+        try (AuditCapture ignored = new AuditCapture(events)) {
+            logger.logScopeHeartbeat(
+                    "run-1", "task_planning", 3L, 9L, "db", "orders", 7L, 11L, 45_000L, stats);
+        }
+
+        assertThat(events)
+                .anyMatch(
+                        event ->
+                                event.contains("action=scope_heartbeat")
+                                        && event.contains("completed_targets=3")
+                                        && event.contains("total_targets=9")
+                                        && event.contains("current_database=db")
+                                        && event.contains("current_table=orders")
+                                        && event.contains("current_target_elapsed_ms=45000")
+                                        && event.contains("discovered_buckets=1")
+                                        && event.contains("bucket_tasks=1"));
+    }
 
     @Test
     void scopeTargetEventsIdentifyTableAndCompletionStatus() {
