@@ -17,24 +17,24 @@
 
 package org.apache.fluss.server.index;
 
-import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
-import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
-import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 
@@ -45,7 +45,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.function.ToIntFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -53,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Unit tests for {@link IndexReplicator#appendOneSpec} — the per-index mutation derivation. The
  * focus is the write-amplification guard: an UPDATE that leaves the index value columns (index
  * columns plus the main-table primary key) unchanged must not emit a redundant upsert, while
- * inserts and index-key changes still produce the expected mutations.
+ * inserts and index-key changes still produce the expected physical mutations.
  */
 public class IndexReplicatorAppendTest {
 
@@ -68,9 +67,7 @@ public class IndexReplicatorAppendTest {
                     .fromColumns(
                             Arrays.asList(
                                     new Schema.Column("idx", DataTypes.BIGINT()),
-                                    new Schema.Column("pk", DataTypes.BIGINT()),
-                                    new Schema.Column("__source_offset", DataTypes.BIGINT()),
-                                    new Schema.Column("__index_deleted", DataTypes.BOOLEAN())))
+                                    new Schema.Column("pk", DataTypes.BIGINT())))
                     .primaryKey("idx", "pk")
                     .build();
 
@@ -92,25 +89,22 @@ public class IndexReplicatorAppendTest {
      */
     private static IndexSpec spec() {
         int[] indexValueColumnIndices = new int[] {1, 0}; // idx column, then primary key
-        CompactedKeyEncoder keyEncoder =
-                new CompactedKeyEncoder(MAIN_ROW_TYPE, indexValueColumnIndices);
-
-        DataType[] valueTypes =
-                new DataType[] {
-                    DataTypes.BIGINT(), DataTypes.BIGINT(), DataTypes.BIGINT(), DataTypes.BOOLEAN()
-                };
-        RowEncoder valueRowEncoder = RowEncoder.create(KvFormat.COMPACTED, valueTypes);
-        IndexSpec.ValueEncoder valueEncoder =
-                (row, sourceOffset, deleted) -> {
+        RowType physicalRowType = RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT());
+        CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(physicalRowType, new int[] {0, 1});
+        RowEncoder valueRowEncoder =
+                RowEncoder.create(
+                        KvFormat.COMPACTED,
+                        new org.apache.fluss.types.DataType[] {
+                            DataTypes.BIGINT(), DataTypes.BIGINT()
+                        });
+        IndexSpec.EntryEncoder entryEncoder =
+                row -> {
                     valueRowEncoder.startNewRow();
                     valueRowEncoder.encodeField(0, row.getLong(1)); // idx
                     valueRowEncoder.encodeField(1, row.getLong(0)); // pk
-                    valueRowEncoder.encodeField(2, sourceOffset);
-                    valueRowEncoder.encodeField(3, deleted);
-                    return valueRowEncoder.finishRow();
+                    BinaryRow value = valueRowEncoder.finishRow();
+                    return new IndexSpec.IndexEntry(keyEncoder.encodeKey(value), value, 0);
                 };
-
-        ToIntFunction<InternalRow> bucketAssigner = r -> 0;
 
         return new IndexSpec(
                 "idx",
@@ -119,9 +113,7 @@ public class IndexReplicatorAppendTest {
                 INDEX_SCHEMA_ID,
                 KvFormat.COMPACTED,
                 new int[] {1}, // idxColumnIndices
-                keyEncoder,
-                valueEncoder,
-                bucketAssigner);
+                entryEncoder);
     }
 
     private static GenericRow row(long pk, long idx, long nonIndexed) {
@@ -141,6 +133,7 @@ public class IndexReplicatorAppendTest {
 
         assertThat(mutations).isEqualTo(1);
         assertThat(builders).hasSize(1);
+        assertThat(onlyRecords(builders.values().iterator().next()).get(0).getRow()).isNotNull();
     }
 
     @Test
@@ -169,6 +162,51 @@ public class IndexReplicatorAppendTest {
                 replicator.appendOneSpec(spec(), row(1L, 10L, 100L), row(1L, 20L, 100L), builders);
 
         assertThat(mutations).isEqualTo(2);
+        assertThat(builders).hasSize(1);
+        java.util.List<KvRecord> records = onlyRecords(builders.values().iterator().next());
+        assertThat(records).hasSize(2);
+        assertThat(records.get(0).getRow())
+                .as("same-bucket old-key DELETE must precede the new-key UPSERT")
+                .isNull();
+        assertThat(records.get(1).getRow()).isNotNull();
+        assertThat(records.get(0).getKey()).isNotEqualTo(records.get(1).getKey());
+    }
+
+    @Test
+    void validIndexToNullEmitsPhysicalDelete() {
+        IndexReplicator replicator = newReplicator();
+        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
+
+        int mutations =
+                replicator.appendOneSpec(spec(), row(1L, 10L, 100L), row(1L, null, 100L), builders);
+
+        assertThat(mutations).isEqualTo(1);
+        assertThat(onlyRecords(builders.values().iterator().next()).get(0).getRow()).isNull();
+    }
+
+    @Test
+    void nullIndexToValidEmitsUpsert() {
+        IndexReplicator replicator = newReplicator();
+        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
+
+        int mutations =
+                replicator.appendOneSpec(spec(), row(1L, null, 100L), row(1L, 10L, 100L), builders);
+
+        assertThat(mutations).isEqualTo(1);
+        assertThat(onlyRecords(builders.values().iterator().next()).get(0).getRow()).isNotNull();
+    }
+
+    @Test
+    void nullIndexToNullEmitsNothing() {
+        IndexReplicator replicator = newReplicator();
+        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
+
+        int mutations =
+                replicator.appendOneSpec(
+                        spec(), row(1L, null, 100L), row(1L, null, 200L), builders);
+
+        assertThat(mutations).isZero();
+        assertThat(builders).isEmpty();
     }
 
     @Test
@@ -278,7 +316,7 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
-    void deleteEmitsTombstoneOnly() {
+    void deleteEmitsPhysicalDeleteOnly() {
         IndexReplicator replicator = newReplicator();
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
 
@@ -286,19 +324,20 @@ public class IndexReplicatorAppendTest {
 
         assertThat(mutations).isEqualTo(1);
         assertThat(builders).hasSize(1);
-        BinaryRow tombstone = onlyRecordRow(builders.values().iterator().next());
-        assertThat(tombstone).isNotNull();
-        assertThat(tombstone.getLong(0)).isEqualTo(10L);
-        assertThat(tombstone.getLong(1)).isEqualTo(1L);
-        assertThat(tombstone.getBoolean(3))
-                .as("index deletes must be versioned tombstone rows, not physical KV deletes")
-                .isTrue();
+        KvRecord delete = onlyRecords(builders.values().iterator().next()).get(0);
+        assertThat(delete.getRow()).isNull();
+        assertThat(delete.getKey())
+                .isEqualTo(java.nio.ByteBuffer.wrap(spec().encodeEntry(row(1L, 10L, 100L)).key()));
     }
 
-    private static BinaryRow onlyRecordRow(IndexReplicator.BucketBatchBuilder builder) {
+    private static java.util.List<KvRecord> onlyRecords(
+            IndexReplicator.BucketBatchBuilder builder) {
         try {
+            builder.builder.setWriterState(new WriterKey(0L, 0L), 0L);
             BytesView bytes = builder.builder.build();
-            KvRecordBatch kvRecords = DefaultKvRecordBatch.pointToBytesView(bytes);
+            KvRecordBatch kvRecords =
+                    KvRecordBatchReader.pointToByteBuffer(bytes.getByteBuf().nioBuffer());
+            assertThat(kvRecords.idempotenceProtocolVersion()).isEqualTo(1);
             Iterator<KvRecord> iter =
                     kvRecords
                             .records(
@@ -306,13 +345,20 @@ public class IndexReplicatorAppendTest {
                                             KvFormat.COMPACTED,
                                             new TestingSchemaGetter(INDEX_SCHEMA_ID, INDEX_SCHEMA)))
                             .iterator();
-            assertThat(iter.hasNext()).isTrue();
-            KvRecord record = iter.next();
-            assertThat(iter.hasNext()).isFalse();
-            return record.getRow();
+            java.util.List<KvRecord> records = new java.util.ArrayList<>();
+            iter.forEachRemaining(records::add);
+            return records;
         } catch (Exception e) {
             throw new AssertionError("Failed to decode index batch", e);
         }
+    }
+
+    private static GenericRow row(long pk, Long idx, long nonIndexed) {
+        GenericRow r = new GenericRow(3);
+        r.setField(0, pk);
+        r.setField(1, idx);
+        r.setField(2, nonIndexed);
+        return r;
     }
 
     private static LogRecord record(long offset, ChangeType changeType, InternalRow row) {

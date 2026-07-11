@@ -19,12 +19,10 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.ChangelogImage;
-import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
-import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.types.DataTypes;
@@ -39,6 +37,34 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link IndexTableDescriptorFactory}. */
 class IndexTableDescriptorFactoryTest {
+
+    @Test
+    void testPartitionedPhysicalSchemaMatchesCompletePrimaryKey() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("idx", DataTypes.BIGINT())
+                        .column("partition_key", DataTypes.BIGINT())
+                        .column("base_id", DataTypes.BIGINT())
+                        .primaryKey("partition_key", "base_id")
+                        .index("idx_value", "idx")
+                        .build();
+        TableDescriptor main =
+                TableDescriptor.builder().schema(mainSchema).partitionedBy("partition_key").build();
+
+        TableDescriptor descriptor =
+                IndexTableDescriptorFactory.derive(main, 1L, "db.records", "idx_value");
+
+        assertThat(descriptor.getSchema().getColumnNames())
+                .containsExactly("idx", "partition_key", "base_id", "__partition_id");
+        assertThat(descriptor.getSchema().getPrimaryKeyColumnNames())
+                .containsExactly("idx", "partition_key", "base_id", "__partition_id");
+        assertThat(descriptor.getProperties())
+                .doesNotContainKeys(
+                        ConfigOptions.TABLE_MERGE_ENGINE.key(),
+                        ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(),
+                        ConfigOptions.TABLE_DELETE_BEHAVIOR.key())
+                .containsEntry(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "1");
+    }
 
     @Test
     void testDerivePartitionedIndexTableUsesAlignedWalAndAddsPartitionId() {
@@ -86,17 +112,10 @@ class IndexTableDescriptorFactoryTest {
         Schema dSchema = derived.getSchema();
         assertThat(dSchema.getPrimaryKey()).isPresent();
         assertThat(dSchema.getPrimaryKey().get().getColumnNames())
-                .containsExactly("user_id", "order_id", "dt");
-        assertThat(dSchema.getPrimaryKey().get().getColumnNames())
-                .doesNotContain(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
-        assertThat(dSchema.getPrimaryKey().get().getColumnNames())
-                .doesNotContain("__source_offset", "__index_deleted");
+                .containsExactly("user_id", "order_id", "dt", "__partition_id");
         assertThat(dSchema.getColumns())
                 .extracting(Schema.Column::getName)
-                .contains(
-                        IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN,
-                        "__source_offset",
-                        "__index_deleted");
+                .containsExactly("user_id", "order_id", "dt", "__partition_id");
     }
 
     @Test
@@ -117,12 +136,13 @@ class IndexTableDescriptorFactoryTest {
                 .doesNotContain(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
         assertThat(d.getSchema().getColumns())
                 .extracting(Schema.Column::getName)
-                .contains("__source_offset", "__index_deleted");
+                .containsExactly("u", "id");
+        assertThat(d.getSchema().getPrimaryKeyColumnNames()).containsExactly("u", "id");
         assertThat(d.isIndexTable()).isTrue();
     }
 
     @Test
-    void testDeriveIndexTableUsesVersionedTombstoneMergeContract() {
+    void testDeriveIndexTableUsesFencedPhysicalMutationContract() {
         Schema mainSchema =
                 Schema.newBuilder()
                         .column("id", DataTypes.BIGINT())
@@ -135,11 +155,11 @@ class IndexTableDescriptorFactoryTest {
         TableDescriptor d = IndexTableDescriptorFactory.derive(main, 1L, "db.t", "idx_u");
 
         assertThat(d.getProperties())
-                .containsEntry(
-                        ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.VERSIONED.name())
-                .containsEntry(ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(), "__source_offset")
-                .containsEntry(
-                        ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), DeleteBehavior.IGNORE.name());
+                .doesNotContainKeys(
+                        ConfigOptions.TABLE_MERGE_ENGINE.key(),
+                        ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(),
+                        ConfigOptions.TABLE_DELETE_BEHAVIOR.key())
+                .containsEntry(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "1");
     }
 
     @Test
@@ -226,10 +246,7 @@ class IndexTableDescriptorFactoryTest {
                                 8)
                         .build();
         TableDescriptor main =
-                TableDescriptor.builder()
-                        .schema(mainSchema)
-                        .partitionedBy("dt")
-                        .build();
+                TableDescriptor.builder().schema(mainSchema).partitionedBy("dt").build();
 
         TableDescriptor derived =
                 IndexTableDescriptorFactory.derive(main, 100L, "tdb.orders", "idx_user");

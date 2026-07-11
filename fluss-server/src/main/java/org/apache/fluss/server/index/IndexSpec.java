@@ -33,10 +33,39 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 @Internal
 public final class IndexSpec {
 
-    /** Encodes the index value from a base row. Partition handling is baked into the closure. */
+    /** Encodes one complete physical Index Table entry from a base row. */
     @FunctionalInterface
-    public interface ValueEncoder {
+    public interface EntryEncoder {
+        IndexEntry encode(InternalRow row);
+    }
+
+    @FunctionalInterface
+    interface ValueEncoder {
         BinaryRow encode(InternalRow row, long sourceOffset, boolean deleted);
+    }
+
+    static final class IndexEntry {
+        private final byte[] key;
+        private final BinaryRow value;
+        private final int targetBucket;
+
+        IndexEntry(byte[] key, BinaryRow value, int targetBucket) {
+            this.key = checkNotNull(key, "key");
+            this.value = checkNotNull(value, "value");
+            this.targetBucket = targetBucket;
+        }
+
+        byte[] key() {
+            return key;
+        }
+
+        BinaryRow value() {
+            return value;
+        }
+
+        int targetBucket() {
+            return targetBucket;
+        }
     }
 
     private final long indexTableId;
@@ -45,11 +74,27 @@ public final class IndexSpec {
     private final int indexSchemaId;
     private final KvFormat indexKvFormat;
     private final int[] idxColumnIndices;
-    private final KeyEncoder keyEncoder;
-    private final ValueEncoder valueEncoder;
-    private final ToIntFunction<InternalRow> bucketAssigner;
+    private final EntryEncoder entryEncoder;
 
     public IndexSpec(
+            String indexName,
+            IndexVisibility visibility,
+            long indexTableId,
+            int indexSchemaId,
+            KvFormat indexKvFormat,
+            int[] idxColumnIndices,
+            EntryEncoder entryEncoder) {
+        this.indexName = checkNotNull(indexName, "indexName");
+        this.visibility = checkNotNull(visibility, "visibility");
+        this.indexTableId = indexTableId;
+        this.indexSchemaId = indexSchemaId;
+        this.indexKvFormat = indexKvFormat;
+        this.idxColumnIndices = checkNotNull(idxColumnIndices, "idxColumnIndices").clone();
+        checkArgument(idxColumnIndices.length > 0, "idxColumnIndices must not be empty.");
+        this.entryEncoder = checkNotNull(entryEncoder, "entryEncoder");
+    }
+
+    IndexSpec(
             String indexName,
             IndexVisibility visibility,
             long indexTableId,
@@ -59,16 +104,18 @@ public final class IndexSpec {
             KeyEncoder keyEncoder,
             ValueEncoder valueEncoder,
             ToIntFunction<InternalRow> bucketAssigner) {
-        this.indexName = checkNotNull(indexName, "indexName");
-        this.visibility = checkNotNull(visibility, "visibility");
-        this.indexTableId = indexTableId;
-        this.indexSchemaId = indexSchemaId;
-        this.indexKvFormat = indexKvFormat;
-        this.idxColumnIndices = checkNotNull(idxColumnIndices, "idxColumnIndices").clone();
-        checkArgument(idxColumnIndices.length > 0, "idxColumnIndices must not be empty.");
-        this.keyEncoder = checkNotNull(keyEncoder, "keyEncoder");
-        this.valueEncoder = checkNotNull(valueEncoder, "valueEncoder");
-        this.bucketAssigner = checkNotNull(bucketAssigner, "bucketAssigner");
+        this(
+                indexName,
+                visibility,
+                indexTableId,
+                indexSchemaId,
+                indexKvFormat,
+                idxColumnIndices,
+                row ->
+                        new IndexEntry(
+                                keyEncoder.encodeKey(row),
+                                valueEncoder.encode(row, 0L, false),
+                                bucketAssigner.applyAsInt(row)));
     }
 
     public long getIndexTableId() {
@@ -99,16 +146,8 @@ public final class IndexSpec {
         return idxColumnIndices.clone();
     }
 
-    public KeyEncoder getKeyEncoder() {
-        return keyEncoder;
-    }
-
-    public ValueEncoder getValueEncoder() {
-        return valueEncoder;
-    }
-
-    public ToIntFunction<InternalRow> getBucketAssigner() {
-        return bucketAssigner;
+    IndexEntry encodeEntry(InternalRow row) {
+        return entryEncoder.encode(row);
     }
 
     boolean hasIndexColumns(InternalRow row) {

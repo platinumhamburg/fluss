@@ -95,9 +95,6 @@ public final class ReplicaIndexController {
      */
     @Nullable private TombstonedPartitionDiscriminator tombstoneDiscriminator;
 
-    /** Read-side filter for Index Table versioned tombstone rows; {@code null} for main tables. */
-    @Nullable private IndexEntryVisibilityFilter entryVisibilityFilter;
-
     public ReplicaIndexController(
             TableInfo tableInfo,
             TableBucket tableBucket,
@@ -154,8 +151,7 @@ public final class ReplicaIndexController {
             return;
         }
 
-        maybeStartIndexReplicator(
-                logTablet, schemaGetter, indexes, onProgress, initialOffset);
+        maybeStartIndexReplicator(logTablet, schemaGetter, indexes, onProgress, initialOffset);
     }
 
     /**
@@ -170,7 +166,6 @@ public final class ReplicaIndexController {
             IndexReplicator.IndexProgressListener onProgress,
             long initialOffset) {
         onBecomeLeader(logTablet, schemaGetter, onProgress, initialOffset);
-        installEntryVisibilityFilter(schemaGetter);
         installValueFilter(kvTablet);
     }
 
@@ -178,7 +173,6 @@ public final class ReplicaIndexController {
     public void onBecomeFollower() {
         stopIndexReplicator();
         this.tombstoneDiscriminator = null;
-        this.entryVisibilityFilter = null;
     }
 
     /**
@@ -197,15 +191,13 @@ public final class ReplicaIndexController {
         if (indexes.isEmpty()) {
             return;
         }
-        maybeStartIndexReplicator(
-                logTablet, schemaGetter, indexes, onProgress, initialOffset);
+        maybeStartIndexReplicator(logTablet, schemaGetter, indexes, onProgress, initialOffset);
     }
 
     /** Called when the replica is being deleted. */
     public void close() {
         stopIndexReplicator();
         this.tombstoneDiscriminator = null;
-        this.entryVisibilityFilter = null;
     }
 
     // ------------------------------------------------------------------------------------
@@ -232,7 +224,9 @@ public final class ReplicaIndexController {
         return r != null ? r.getSyncIndexPushedOffset() : -1L;
     }
 
-    /** Returns the conservative all-index replay floor, or {@code -1L} if no replicator is active. */
+    /**
+     * Returns the conservative all-index replay floor, or {@code -1L} if no replicator is active.
+     */
     public long getAllIndexPushedOffset() {
         IndexReplicator r = this.indexReplicator;
         return r != null ? r.getAllIndexPushedOffset() : -1L;
@@ -291,42 +285,24 @@ public final class ReplicaIndexController {
                 d.mainTableId());
     }
 
-    public void installEntryVisibilityFilter(SchemaGetter schemaGetter) {
-        this.entryVisibilityFilter =
-                IndexEntryVisibilityFilter.forIndexTable(tableInfo, schemaGetter);
-    }
-
-    // ------------------------------------------------------------------------------------
-    // Index Table: lookup visibility filtering
-    // ------------------------------------------------------------------------------------
-
-    /**
-     * Filters point-lookup results for an Index Table, replacing logically deleted rows with {@code
-     * null} while preserving the one-result-per-key response shape.
-     */
     public List<byte[]> filterLookupEntries(List<byte[]> rawResults) {
-        IndexEntryVisibilityFilter filter = this.entryVisibilityFilter;
-        return filter == null ? rawResults : filter.filterPointLookup(rawResults);
+        return rawResults;
     }
 
     /**
-     * Filters prefix-lookup results for an Index Table, removing logically deleted rows and rows
-     * whose source partition is tombstoned. Returns the input list unchanged if no filter applies.
+     * Filters prefix-lookup results for an Index Table, removing rows whose source partition is
+     * tombstoned. Returns the input list unchanged if no filter applies.
      */
     public List<byte[]> filterPrefixLookupEntries(List<byte[]> rawResults) {
-        IndexEntryVisibilityFilter filter = this.entryVisibilityFilter;
-        List<byte[]> visibleResults =
-                filter == null ? rawResults : filter.filterPrefixLookup(rawResults);
-
         TombstonedPartitionDiscriminator d = this.tombstoneDiscriminator;
-        if (visibleResults.isEmpty() || d == null) {
-            return visibleResults;
+        if (rawResults.isEmpty() || d == null) {
+            return rawResults;
         }
         if (!d.hasTombstonedPartitions()) {
-            return visibleResults;
+            return rawResults;
         }
-        List<byte[]> filtered = new ArrayList<>(visibleResults.size());
-        for (byte[] value : visibleResults) {
+        List<byte[]> filtered = new ArrayList<>(rawResults.size());
+        for (byte[] value : rawResults) {
             if (!d.isTombstoned(value)) {
                 filtered.add(value);
             }

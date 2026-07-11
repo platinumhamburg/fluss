@@ -24,6 +24,7 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
@@ -40,7 +41,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.function.ToLongFunction;
 
 /**
  * Factory for building {@link IndexSpec} instances from main-table metadata and the server-side
@@ -50,7 +50,7 @@ import java.util.function.ToLongFunction;
  * construction, bucket assignment) lives in one place rather than being scattered across a
  * 2600-line God Class.
  *
- * <p>Caller contract: the {@link IndexSpec.ValueEncoder} instances produced by this factory are
+ * <p>Caller contract: the {@link IndexSpec.EntryEncoder} instances produced by this factory are
  * {@link NotThreadSafe} because they capture a mutable {@link RowEncoder}. The caller (typically
  * {@link IndexReplicator}) must guarantee single-threaded invocation.
  */
@@ -83,8 +83,7 @@ public final class IndexSpecFactory {
         boolean partitioned = mainTableInfo.isPartitioned();
         RowType mainRowType = mainTableInfo.getRowType();
 
-        ToLongFunction<InternalRow> partitionIdResolver =
-                partitioned ? buildPartitionIdResolver(mainTableBucket) : null;
+        Long partitionId = partitioned ? mainTableBucket.getPartitionId() : null;
 
         List<IndexSpec> specs = new ArrayList<>(indexes.size());
         for (Schema.Index index : indexes) {
@@ -96,7 +95,7 @@ public final class IndexSpecFactory {
                             mainRowType,
                             basePkColumnIndices,
                             partitioned,
-                            partitionIdResolver,
+                            partitionId,
                             metadataCache));
         }
         return Collections.unmodifiableList(specs);
@@ -111,7 +110,7 @@ public final class IndexSpecFactory {
             RowType mainRowType,
             int[] basePkColumnIndices,
             boolean partitioned,
-            ToLongFunction<InternalRow> partitionIdResolver,
+            Long partitionId,
             TabletServerMetadataCache metadataCache) {
 
         int[] idxColumnIndices = schema.getColumnIndexes(index.getColumnNames());
@@ -123,18 +122,12 @@ public final class IndexSpecFactory {
         int indexBucketCount = resolveIndexBucketCount(mainTableInfo, indexName, metadataCache);
         int indexSchemaId = resolveIndexSchemaId(mainTableInfo, indexName, metadataCache);
 
-        CompactedKeyEncoder keyEncoder =
-                new CompactedKeyEncoder(mainRowType, indexValueColumnIndices);
-
         CompactedKeyEncoder bucketKeyEncoder =
                 new CompactedKeyEncoder(mainRowType, idxColumnIndices);
         FlussBucketingFunction bucketingFunction = new FlussBucketingFunction();
 
         int storedColCount = indexValueColumnIndices.length;
-        int partitionColumnCount = partitioned ? 1 : 0;
-        int sourceOffsetPosition = storedColCount + partitionColumnCount;
-        int deletedMarkerPosition = sourceOffsetPosition + 1;
-        int totalColCount = deletedMarkerPosition + 1;
+        int totalColCount = storedColCount + (partitioned ? 1 : 0);
         DataType[] valueFieldTypes = new DataType[totalColCount];
         InternalRow.FieldGetter[] valueFieldGetters = new InternalRow.FieldGetter[storedColCount];
         for (int i = 0; i < storedColCount; i++) {
@@ -146,25 +139,31 @@ public final class IndexSpecFactory {
         if (partitioned) {
             valueFieldTypes[storedColCount] = DataTypes.BIGINT().copy(false);
         }
-        valueFieldTypes[sourceOffsetPosition] = DataTypes.BIGINT().copy(false);
-        valueFieldTypes[deletedMarkerPosition] = DataTypes.BOOLEAN().copy(false);
 
         KvFormat indexKvFormat = partitioned ? KvFormat.ALIGNED : KvFormat.COMPACTED;
         RowEncoder valueRowEncoder = RowEncoder.create(indexKvFormat, valueFieldTypes);
+        int[] physicalPkIndices = new int[totalColCount];
+        for (int i = 0; i < totalColCount; i++) {
+            physicalPkIndices[i] = i;
+        }
+        CompactedKeyEncoder keyEncoder =
+                new CompactedKeyEncoder(RowType.of(valueFieldTypes), physicalPkIndices);
 
-        IndexSpec.ValueEncoder valueEncoder =
-                (row, sourceOffset, deleted) -> {
+        IndexSpec.EntryEncoder entryEncoder =
+                row -> {
                     valueRowEncoder.startNewRow();
                     for (int i = 0; i < valueFieldGetters.length; i++) {
                         valueRowEncoder.encodeField(i, valueFieldGetters[i].getFieldOrNull(row));
                     }
                     if (partitioned) {
-                        long pid = partitionIdResolver.applyAsLong(row);
-                        valueRowEncoder.encodeField(storedColCount, pid);
+                        valueRowEncoder.encodeField(storedColCount, partitionId);
                     }
-                    valueRowEncoder.encodeField(sourceOffsetPosition, sourceOffset);
-                    valueRowEncoder.encodeField(deletedMarkerPosition, deleted);
-                    return valueRowEncoder.finishRow();
+                    BinaryRow value = valueRowEncoder.finishRow();
+                    int targetBucket =
+                            bucketingFunction.bucketing(
+                                    bucketKeyEncoder.encodeKey(row), indexBucketCount);
+                    return new IndexSpec.IndexEntry(
+                            keyEncoder.encodeKey(value), value, targetBucket);
                 };
 
         return new IndexSpec(
@@ -174,11 +173,7 @@ public final class IndexSpecFactory {
                 indexSchemaId,
                 indexKvFormat,
                 idxColumnIndices,
-                keyEncoder,
-                valueEncoder,
-                row ->
-                        bucketingFunction.bucketing(
-                                bucketKeyEncoder.encodeKey(row), indexBucketCount));
+                entryEncoder);
     }
 
     /**
@@ -201,12 +196,6 @@ public final class IndexSpecFactory {
         int[] out = new int[len];
         System.arraycopy(tmp, 0, out, 0, len);
         return out;
-    }
-
-    private static ToLongFunction<InternalRow> buildPartitionIdResolver(
-            TableBucket mainTableBucket) {
-        long partitionId = mainTableBucket.getPartitionId();
-        return row -> partitionId;
     }
 
     private static TablePath indexTablePathFor(TableInfo mainTableInfo, String indexName) {
