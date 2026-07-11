@@ -17,6 +17,10 @@
 
 package org.apache.fluss.flink.action.orphan.job;
 
+import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
+
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.apache.logging.log4j.Level;
@@ -40,24 +44,42 @@ class StatsAggregateOperatorTest {
     void logsSummaryBeforeRetentionWaitAndThenEmitsTotals() throws Exception {
         List<String> events = new CopyOnWriteArrayList<String>();
         try (AuditCapture capture = new AuditCapture(events);
-                OneInputStreamOperatorTestHarness<CleanStats, CleanStats> harness =
+                OneInputStreamOperatorTestHarness<CleanStats, CleanupReport> harness =
                         new OneInputStreamOperatorTestHarness<>(
                                 new StatsAggregateOperator(
+                                        "run-1",
                                         false,
                                         Duration.ofMillis(5),
                                         millis -> events.add("sleeper")))) {
             harness.open();
-            harness.processElement(new StreamRecord<>(new CleanStats(1, 1, 1, 10, 1, 1, 0, 10)));
-            harness.processElement(new StreamRecord<>(new CleanStats(2, 2, 1, 20, 0, 0, 1, 0)));
+            ScopeIdentity orders = ScopeIdentity.table("db", "orders", 7L);
+            harness.processElement(
+                    new StreamRecord<>(
+                            CleanStats.builder(orders)
+                                    .scanned(CleanupObjectType.LOG_SEGMENT, 1L)
+                                    .planned(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
+                                    .deleted(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
+                                    .plannedDirectory(1L)
+                                    .removedDirectory(1L)
+                                    .build()));
+            harness.processElement(
+                    new StreamRecord<>(
+                            CleanStats.builder(orders)
+                                    .scanned(CleanupObjectType.KV_SHARED_SST, 2L)
+                                    .planned(CleanupObjectType.KV_SHARED_SST, 2L, 20L)
+                                    .deleteFailed(CleanupObjectType.KV_SHARED_SST, 1L)
+                                    .plannedDirectory(1L)
+                                    .skipped(SkipReasonCode.KEEP_ACTIVE, 2L)
+                                    .build()));
             harness.endInput();
 
-            CleanStats result = harness.getRecordOutput().iterator().next().getValue();
-            assertThat(result.scannedFiles()).isEqualTo(3L);
-            assertThat(result.plannedFiles()).isEqualTo(3L);
-            assertThat(result.plannedDirs()).isEqualTo(2L);
-            assertThat(result.plannedBytes()).isEqualTo(30L);
-            assertThat(result.deletedFiles()).isEqualTo(1L);
-            assertThat(result.bytesReclaimed()).isEqualTo(10L);
+            CleanupReport result = harness.getRecordOutput().iterator().next().getValue();
+            assertThat(result.global().scannedFiles()).isEqualTo(3L);
+            assertThat(result.global().plannedFiles()).isEqualTo(3L);
+            assertThat(result.global().plannedDirs()).isEqualTo(2L);
+            assertThat(result.global().plannedBytes()).isEqualTo(30L);
+            assertThat(result.global().deletedFiles()).isEqualTo(1L);
+            assertThat(result.global().bytesReclaimed()).isEqualTo(10L);
 
             assertThat(indexOf(events, "action=summary"))
                     .isLessThan(indexOf(events, "action=retention_wait_start"));
@@ -73,17 +95,25 @@ class StatsAggregateOperatorTest {
                                             && event.contains("planned_size=30 B")
                                             && event.contains("deleted_files=1")
                                             && event.contains("bytes_reclaimed=10")
-                                            && event.contains("reclaimed_size=10 B"));
+                                            && event.contains("reclaimed_size=10 B")
+                                            && event.contains("run_id=run-1"));
+            assertThat(events).anyMatch(event -> event.contains("action=table_summary"));
+            assertThat(events).anyMatch(event -> event.contains("action=table_object_summary"));
+            assertThat(events).anyMatch(event -> event.contains("action=table_skip_summary"));
+            assertThat(events).anyMatch(event -> event.contains("action=database_summary"));
+            assertThat(events).anyMatch(event -> event.contains("action=summary_by_type"));
+            assertThat(events).anyMatch(event -> event.contains("action=summary_by_reason"));
+            assertThat(events).anyMatch(event -> event.contains("action=audit_integrity"));
         }
     }
 
     @Test
     void zeroWaitDoesNotCallSleeper() throws Exception {
         AtomicBoolean slept = new AtomicBoolean();
-        try (OneInputStreamOperatorTestHarness<CleanStats, CleanStats> harness =
+        try (OneInputStreamOperatorTestHarness<CleanStats, CleanupReport> harness =
                 new OneInputStreamOperatorTestHarness<>(
                         new StatsAggregateOperator(
-                                true, Duration.ZERO, millis -> slept.set(true)))) {
+                                "run-1", true, Duration.ZERO, millis -> slept.set(true)))) {
             harness.open();
             harness.endInput();
         }

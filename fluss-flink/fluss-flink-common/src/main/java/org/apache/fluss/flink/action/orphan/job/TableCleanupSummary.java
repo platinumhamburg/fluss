@@ -18,9 +18,14 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 
 import java.io.Serializable;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 /** Self-contained per-table cleanup totals suitable for direct operator inspection. */
 @Internal
@@ -30,10 +35,22 @@ public final class TableCleanupSummary implements Serializable {
 
     private final ScopeIdentity scope;
     private final CleanupCounters counters;
+    private final Map<CleanupObjectType, CleanupCounters> byObjectType;
+    private final Map<SkipReasonCode, Long> bySkipReason;
 
-    TableCleanupSummary(ScopeIdentity scope, CleanupCounters counters) {
+    TableCleanupSummary(
+            ScopeIdentity scope,
+            CleanupCounters counters,
+            Map<CleanupObjectType, CleanupCounters> byObjectType,
+            Map<SkipReasonCode, Long> bySkipReason) {
         this.scope = scope.tableKey();
         this.counters = counters;
+        Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
+        objectCopy.putAll(byObjectType);
+        this.byObjectType = objectCopy;
+        Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
+        reasonCopy.putAll(bySkipReason);
+        this.bySkipReason = reasonCopy;
     }
 
     public ScopeIdentity scope() {
@@ -50,5 +67,13 @@ public final class TableCleanupSummary implements Serializable {
 
     public CleanupCounters counters() {
         return counters;
+    }
+
+    public Map<CleanupObjectType, CleanupCounters> byObjectType() {
+        return Collections.unmodifiableMap(byObjectType);
+    }
+
+    public Map<SkipReasonCode, Long> bySkipReason() {
+        return Collections.unmodifiableMap(bySkipReason);
     }
 }

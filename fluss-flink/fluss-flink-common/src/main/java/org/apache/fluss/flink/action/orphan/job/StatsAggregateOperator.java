@@ -39,29 +39,25 @@ import java.time.Duration;
  * #endInput()}.
  */
 @Internal
-public final class StatsAggregateOperator extends AbstractStreamOperator<CleanStats>
-        implements OneInputStreamOperator<CleanStats, CleanStats>, BoundedOneInput {
+public final class StatsAggregateOperator extends AbstractStreamOperator<CleanupReport>
+        implements OneInputStreamOperator<CleanStats, CleanupReport>, BoundedOneInput {
 
     private static final long serialVersionUID = 3L;
 
+    private final String runId;
     private final boolean dryRun;
     private final Duration postRunWait;
     private final InterruptibleSleeper sleeper;
 
-    private transient long scannedFiles;
-    private transient long plannedFiles;
-    private transient long plannedDirs;
-    private transient long plannedBytes;
-    private transient long deletedFiles;
-    private transient long emptyDirsRemoved;
-    private transient long deleteFailures;
-    private transient long bytesReclaimed;
+    private transient CleanupReport.Accumulator accumulator;
 
-    public StatsAggregateOperator(boolean dryRun, Duration postRunWait) {
-        this(dryRun, postRunWait, Thread::sleep);
+    public StatsAggregateOperator(String runId, boolean dryRun, Duration postRunWait) {
+        this(runId, dryRun, postRunWait, Thread::sleep);
     }
 
-    StatsAggregateOperator(boolean dryRun, Duration postRunWait, InterruptibleSleeper sleeper) {
+    StatsAggregateOperator(
+            String runId, boolean dryRun, Duration postRunWait, InterruptibleSleeper sleeper) {
+        this.runId = runId;
         this.dryRun = dryRun;
         this.postRunWait = postRunWait;
         this.sleeper = sleeper;
@@ -70,58 +66,34 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     @Override
     public void open() throws Exception {
         super.open();
-        scannedFiles = 0L;
-        plannedFiles = 0L;
-        plannedDirs = 0L;
-        plannedBytes = 0L;
-        deletedFiles = 0L;
-        emptyDirsRemoved = 0L;
-        deleteFailures = 0L;
-        bytesReclaimed = 0L;
+        accumulator = CleanupReport.accumulator(dryRun);
     }
 
     @Override
     public void processElement(StreamRecord<CleanStats> element) {
-        CleanStats stats = element.getValue();
-        scannedFiles += stats.scannedFiles();
-        plannedFiles += stats.plannedFiles();
-        plannedDirs += stats.plannedDirs();
-        plannedBytes += stats.plannedBytes();
-        deletedFiles += stats.deletedFiles();
-        emptyDirsRemoved += stats.emptyDirsRemoved();
-        deleteFailures += stats.deleteFailures();
-        bytesReclaimed += stats.bytesReclaimed();
+        accumulator.addStats(element.getValue());
     }
 
     @Override
     public void endInput() throws Exception {
         AuditLogger audit = new AuditLogger();
-        CleanStats finalStats =
-                new CleanStats(
-                        scannedFiles,
-                        plannedFiles,
-                        plannedDirs,
-                        plannedBytes,
-                        deletedFiles,
-                        emptyDirsRemoved,
-                        deleteFailures,
-                        bytesReclaimed);
+        CleanupReport report = accumulator.build();
 
-        audit.logSummary(finalStats, dryRun);
+        audit.logReport(runId, "aggregate", "summary", report, dryRun);
 
         if (!postRunWait.isZero()) {
             long waitMillis = postRunWait.toMillis();
-            audit.logRetentionWaitStart(waitMillis);
+            audit.logRetentionWaitStart(runId, waitMillis);
             try {
                 sleeper.sleep(waitMillis);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw e;
             }
-            audit.logRetentionWaitEnd(waitMillis);
+            audit.logRetentionWaitEnd(runId, waitMillis);
         }
 
-        output.collect(new StreamRecord<>(finalStats));
+        output.collect(new StreamRecord<>(report));
     }
 }
 

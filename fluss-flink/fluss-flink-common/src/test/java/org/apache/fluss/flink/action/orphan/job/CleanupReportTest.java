@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 
 import org.junit.jupiter.api.Test;
 
@@ -38,6 +39,7 @@ class CleanupReportTest {
         CleanStats second =
                 CleanStats.builder(orders)
                         .planned(CleanupObjectType.KV_SHARED_SST, 1L, 700L)
+                        .skipped(SkipReasonCode.KEEP_ACTIVE, 2L)
                         .build();
 
         CleanupReport report =
@@ -48,6 +50,15 @@ class CleanupReportTest {
         assertThat(report.tableSummary(orders).plannedBytes()).isEqualTo(1000L);
         assertThat(report.byObjectType().get(CleanupObjectType.KV_SHARED_SST).plannedBytes())
                 .isEqualTo(700L);
+        assertThat(
+                        report.tableSummary(orders)
+                                .byObjectType()
+                                .get(CleanupObjectType.LOG_SEGMENT)
+                                .plannedBytes())
+                .isEqualTo(300L);
+        assertThat(report.tableSummary(orders).bySkipReason())
+                .containsEntry(SkipReasonCode.KEEP_ACTIVE, 2L);
+        assertThat(report.databases().get("db").plannedBytes()).isEqualTo(1000L);
         assertThat(report.global().plannedBytes()).isEqualTo(1000L);
     }
 

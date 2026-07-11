@@ -21,7 +21,9 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.job.CleanStats;
 import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
+import org.apache.fluss.flink.action.orphan.job.CleanupReport;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
+import org.apache.fluss.flink.action.orphan.job.TableCleanupSummary;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
@@ -32,7 +34,12 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * Structured audit log writer for the orphan files cleanup action.
@@ -485,12 +492,198 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Emits a complete pre-aggregated report that can be inspected without log-side reduction. */
+    public void logReport(
+            String runId, String stage, String finalAction, CleanupReport report, boolean dryRun) {
+        List<TableCleanupSummary> tables = new ArrayList<>(report.tables().values());
+        tables.sort(
+                Comparator.comparing((TableCleanupSummary table) -> table.scope().database())
+                        .thenComparing(table -> table.scope().table())
+                        .thenComparing(table -> table.scope().kind().name())
+                        .thenComparing(
+                                table ->
+                                        table.scope().tableId() == null
+                                                ? Long.MIN_VALUE
+                                                : table.scope().tableId()));
+        CleanupCounters tableTotal = CleanupCounters.empty();
+        for (TableCleanupSummary table : tables) {
+            ScopeIdentity scope = table.scope();
+            tableTotal = tableTotal.add(table.counters());
+            logCounters(
+                    runId, stage, "table_summary", scopeFields(scope), table.counters(), dryRun);
+            for (Map.Entry<CleanupObjectType, CleanupCounters> entry :
+                    table.byObjectType().entrySet()) {
+                logCounters(
+                        runId,
+                        stage,
+                        "table_object_summary",
+                        scopeFields(scope) + " object_type=" + lower(entry.getKey().name()),
+                        entry.getValue(),
+                        dryRun);
+            }
+            for (Map.Entry<SkipReasonCode, Long> entry : table.bySkipReason().entrySet()) {
+                logReason(
+                        runId,
+                        stage,
+                        "table_skip_summary",
+                        scopeFields(scope),
+                        entry.getKey(),
+                        entry.getValue(),
+                        dryRun);
+            }
+        }
+        for (Map.Entry<String, CleanupCounters> entry :
+                new TreeMap<>(report.databases()).entrySet()) {
+            logCounters(
+                    runId,
+                    stage,
+                    "database_summary",
+                    "database=" + entry.getKey(),
+                    entry.getValue(),
+                    dryRun);
+        }
+        for (Map.Entry<CleanupObjectType, CleanupCounters> entry :
+                report.byObjectType().entrySet()) {
+            logCounters(
+                    runId,
+                    stage,
+                    "summary_by_type",
+                    "object_type=" + lower(entry.getKey().name()),
+                    entry.getValue(),
+                    dryRun);
+        }
+        for (Map.Entry<SkipReasonCode, Long> entry : report.bySkipReason().entrySet()) {
+            logReason(
+                    runId,
+                    stage,
+                    "summary_by_reason",
+                    "scope=global",
+                    entry.getKey(),
+                    entry.getValue(),
+                    dryRun);
+        }
+        AUDIT.info(
+                "audit_version=1 run_id={} stage={} action=audit_integrity"
+                        + " global_equals_table_sum={} table_count={} dry_run={} ts={}",
+                runId,
+                stage,
+                sameCounters(report.global(), tableTotal),
+                tables.size(),
+                dryRun,
+                Instant.now());
+        logCounters(runId, stage, finalAction, "scope=global", report.global(), dryRun);
+    }
+
+    public void logRetentionWaitStart(String runId, long waitMillis) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=aggregate action=retention_wait_start"
+                        + " wait_ms={} ts={}",
+                runId,
+                waitMillis,
+                Instant.now());
+    }
+
+    public void logRetentionWaitEnd(String runId, long waitMillis) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=aggregate action=retention_wait_end"
+                        + " wait_ms={} ts={}",
+                runId,
+                waitMillis,
+                Instant.now());
+    }
+
     public void logRetentionWaitStart(long waitMillis) {
         AUDIT.info("action=retention_wait_start wait_ms={} ts={}", waitMillis, Instant.now());
     }
 
     public void logRetentionWaitEnd(long waitMillis) {
         AUDIT.info("action=retention_wait_end wait_ms={} ts={}", waitMillis, Instant.now());
+    }
+
+    private static void logCounters(
+            String runId,
+            String stage,
+            String action,
+            String dimensions,
+            CleanupCounters counters,
+            boolean dryRun) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage={} action={} {}"
+                        + " scanned_files={} planned_files={} planned_dirs={} planned_bytes={}"
+                        + " planned_size={} deleted_total={} deleted_files={}"
+                        + " empty_dirs_removed={} delete_failures={} bytes_reclaimed={}"
+                        + " reclaimed_size={} dry_run={} ts={}",
+                runId,
+                stage,
+                action,
+                dimensions,
+                counters.scannedFiles(),
+                counters.plannedFiles(),
+                counters.plannedDirs(),
+                counters.plannedBytes(),
+                formatBytes(counters.plannedBytes()),
+                counters.deletedFiles() + counters.emptyDirsRemoved(),
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed(),
+                formatBytes(counters.bytesReclaimed()),
+                dryRun,
+                Instant.now());
+    }
+
+    private static void logReason(
+            String runId,
+            String stage,
+            String action,
+            String dimensions,
+            SkipReasonCode reason,
+            long count,
+            boolean dryRun) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage={} action={} {} reason_code={}"
+                        + " category={} count={} retryable={} action_required={} dry_run={} ts={}",
+                runId,
+                stage,
+                action,
+                dimensions,
+                lower(reason.name()),
+                lower(reason.category().name()),
+                count,
+                reason.retryable(),
+                reason.actionRequired(),
+                dryRun,
+                Instant.now());
+    }
+
+    private static String scopeFields(ScopeIdentity scope) {
+        return "scope_kind="
+                + lower(scope.kind().name())
+                + " database="
+                + scope.database()
+                + " table="
+                + scope.table()
+                + " table_id="
+                + nullable(scope.tableId());
+    }
+
+    private static String nullable(Object value) {
+        return value == null ? "none" : value.toString();
+    }
+
+    private static String lower(String value) {
+        return value.toLowerCase(Locale.ROOT);
+    }
+
+    private static boolean sameCounters(CleanupCounters left, CleanupCounters right) {
+        return left.scannedFiles() == right.scannedFiles()
+                && left.plannedFiles() == right.plannedFiles()
+                && left.plannedDirs() == right.plannedDirs()
+                && left.plannedBytes() == right.plannedBytes()
+                && left.deletedFiles() == right.deletedFiles()
+                && left.emptyDirsRemoved() == right.emptyDirsRemoved()
+                && left.deleteFailures() == right.deleteFailures()
+                && left.bytesReclaimed() == right.bytesReclaimed();
     }
 
     private static String formatBytes(long bytes) {

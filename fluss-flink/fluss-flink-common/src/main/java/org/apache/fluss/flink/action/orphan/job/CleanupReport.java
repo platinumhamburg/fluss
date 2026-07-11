@@ -37,66 +37,52 @@ public final class CleanupReport implements Serializable {
 
     private final CleanupCounters global;
     private final Map<ScopeIdentity, TableCleanupSummary> tables;
+    private final Map<String, CleanupCounters> databases;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<SkipReasonCode, Long> bySkipReason;
 
     private CleanupReport(
             CleanupCounters global,
             Map<ScopeIdentity, TableCleanupSummary> tables,
+            Map<String, CleanupCounters> databases,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
             Map<SkipReasonCode, Long> bySkipReason) {
         this.global = global;
-        this.tables = Collections.unmodifiableMap(new HashMap<>(tables));
-        EnumMap<CleanupObjectType, CleanupCounters> objectCopy =
-                new EnumMap<>(CleanupObjectType.class);
+        this.tables = new HashMap<>(tables);
+        this.databases = new HashMap<>(databases);
+        Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
         objectCopy.putAll(byObjectType);
-        this.byObjectType = Collections.unmodifiableMap(objectCopy);
-        EnumMap<SkipReasonCode, Long> reasonCopy = new EnumMap<>(SkipReasonCode.class);
+        this.byObjectType = objectCopy;
+        Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
         reasonCopy.putAll(bySkipReason);
-        this.bySkipReason = Collections.unmodifiableMap(reasonCopy);
+        this.bySkipReason = reasonCopy;
     }
 
     public static CleanupReport aggregate(
             Collection<TablePlanStats> plans, Collection<CleanStats> stats, boolean dryRun) {
-        CleanupCounters global = CleanupCounters.empty();
-        Map<ScopeIdentity, CleanupCounters> tableCounters = new HashMap<>();
-        EnumMap<CleanupObjectType, CleanupCounters> byObjectType =
-                new EnumMap<>(CleanupObjectType.class);
-        EnumMap<SkipReasonCode, Long> bySkipReason = new EnumMap<>(SkipReasonCode.class);
-
+        Accumulator accumulator = accumulator(dryRun);
         for (TablePlanStats plan : plans) {
-            tableCounters.putIfAbsent(plan.scope(), CleanupCounters.empty());
-            mergeReasons(bySkipReason, plan.skipped());
+            accumulator.addPlan(plan);
         }
         for (CleanStats taskStats : stats) {
-            CleanupCounters counters = taskStats.counters();
-            global = global.add(counters);
-            ScopeIdentity tableKey = taskStats.scope().tableKey();
-            tableCounters.put(
-                    tableKey,
-                    tableCounters.getOrDefault(tableKey, CleanupCounters.empty()).add(counters));
-            for (Map.Entry<CleanupObjectType, CleanupCounters> entry :
-                    taskStats.byObjectType().entrySet()) {
-                byObjectType.put(
-                        entry.getKey(),
-                        byObjectType
-                                .getOrDefault(entry.getKey(), CleanupCounters.empty())
-                                .add(entry.getValue()));
-            }
-            mergeReasons(bySkipReason, taskStats.bySkipReason());
+            accumulator.addStats(taskStats);
         }
-        if (dryRun
-                && (global.deletedFiles() != 0L
-                        || global.bytesReclaimed() != 0L
-                        || global.deleteFailures() != 0L)) {
-            throw new IllegalStateException("dry-run report contains actual deletion counters");
-        }
+        return accumulator.build();
+    }
 
-        Map<ScopeIdentity, TableCleanupSummary> tables = new HashMap<>();
-        for (Map.Entry<ScopeIdentity, CleanupCounters> entry : tableCounters.entrySet()) {
-            tables.put(entry.getKey(), new TableCleanupSummary(entry.getKey(), entry.getValue()));
+    public static Accumulator accumulator(boolean dryRun) {
+        return new Accumulator(dryRun);
+    }
+
+    private static void mergeCounters(
+            Map<CleanupObjectType, CleanupCounters> target,
+            Map<CleanupObjectType, CleanupCounters> source) {
+        for (Map.Entry<CleanupObjectType, CleanupCounters> entry : source.entrySet()) {
+            target.put(
+                    entry.getKey(),
+                    target.getOrDefault(entry.getKey(), CleanupCounters.empty())
+                            .add(entry.getValue()));
         }
-        return new CleanupReport(global, tables, byObjectType, bySkipReason);
     }
 
     private static void mergeReasons(
@@ -119,14 +105,93 @@ public final class CleanupReport implements Serializable {
     }
 
     public Map<ScopeIdentity, TableCleanupSummary> tables() {
-        return tables;
+        return Collections.unmodifiableMap(tables);
+    }
+
+    public Map<String, CleanupCounters> databases() {
+        return Collections.unmodifiableMap(databases);
     }
 
     public Map<CleanupObjectType, CleanupCounters> byObjectType() {
-        return byObjectType;
+        return Collections.unmodifiableMap(byObjectType);
     }
 
     public Map<SkipReasonCode, Long> bySkipReason() {
-        return bySkipReason;
+        return Collections.unmodifiableMap(bySkipReason);
+    }
+
+    /** Incremental bounded-memory report aggregation for the final Flink operator. */
+    public static final class Accumulator {
+        private final boolean dryRun;
+        private CleanupCounters global = CleanupCounters.empty();
+        private final Map<ScopeIdentity, TableAccumulator> tables = new HashMap<>();
+        private final Map<String, CleanupCounters> databases = new HashMap<>();
+        private final EnumMap<CleanupObjectType, CleanupCounters> byObjectType =
+                new EnumMap<>(CleanupObjectType.class);
+        private final EnumMap<SkipReasonCode, Long> bySkipReason =
+                new EnumMap<>(SkipReasonCode.class);
+
+        private Accumulator(boolean dryRun) {
+            this.dryRun = dryRun;
+        }
+
+        public void addPlan(TablePlanStats plan) {
+            TableAccumulator table =
+                    tables.computeIfAbsent(plan.scope(), ignored -> new TableAccumulator());
+            mergeReasons(table.bySkipReason, plan.skipped());
+            mergeReasons(bySkipReason, plan.skipped());
+            if (!plan.scope().database().isEmpty()) {
+                databases.putIfAbsent(plan.scope().database(), CleanupCounters.empty());
+            }
+        }
+
+        public void addStats(CleanStats taskStats) {
+            CleanupCounters counters = taskStats.counters();
+            global = global.add(counters);
+            ScopeIdentity tableKey = taskStats.scope().tableKey();
+            TableAccumulator table =
+                    tables.computeIfAbsent(tableKey, ignored -> new TableAccumulator());
+            table.counters = table.counters.add(counters);
+            mergeCounters(table.byObjectType, taskStats.byObjectType());
+            mergeReasons(table.bySkipReason, taskStats.bySkipReason());
+            if (!tableKey.database().isEmpty()) {
+                databases.put(
+                        tableKey.database(),
+                        databases
+                                .getOrDefault(tableKey.database(), CleanupCounters.empty())
+                                .add(counters));
+            }
+            mergeCounters(byObjectType, taskStats.byObjectType());
+            mergeReasons(bySkipReason, taskStats.bySkipReason());
+        }
+
+        public CleanupReport build() {
+            if (dryRun
+                    && (global.deletedFiles() != 0L
+                            || global.bytesReclaimed() != 0L
+                            || global.deleteFailures() != 0L)) {
+                throw new IllegalStateException("dry-run report contains actual deletion counters");
+            }
+            Map<ScopeIdentity, TableCleanupSummary> summaries = new HashMap<>();
+            for (Map.Entry<ScopeIdentity, TableAccumulator> entry : tables.entrySet()) {
+                TableAccumulator table = entry.getValue();
+                summaries.put(
+                        entry.getKey(),
+                        new TableCleanupSummary(
+                                entry.getKey(),
+                                table.counters,
+                                table.byObjectType,
+                                table.bySkipReason));
+            }
+            return new CleanupReport(global, summaries, databases, byObjectType, bySkipReason);
+        }
+    }
+
+    private static final class TableAccumulator {
+        private CleanupCounters counters = CleanupCounters.empty();
+        private final EnumMap<CleanupObjectType, CleanupCounters> byObjectType =
+                new EnumMap<>(CleanupObjectType.class);
+        private final EnumMap<SkipReasonCode, Long> bySkipReason =
+                new EnumMap<>(SkipReasonCode.class);
     }
 }
