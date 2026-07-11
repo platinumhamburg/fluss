@@ -18,6 +18,8 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
@@ -118,6 +120,9 @@ class BucketCleanerTest {
         assertThat(stats.plannedFiles).isEqualTo(0L);
         assertThat(stats.deletedFiles).isEqualTo(0L);
         assertThat(stats.emptyDirsRemoved).isEqualTo(0L);
+        assertThat(stats.byObjectType.get(CleanupObjectType.LOG_SEGMENT).scannedFiles())
+                .isEqualTo(1L);
+        assertThat(stats.bySkipReason).containsEntry(SkipReasonCode.UNKNOWN_FILE_TYPE, 1L);
         assertThat(Files.exists(dotFile)).isTrue();
         assertThat(Files.exists(segmentDir)).isTrue();
     }
@@ -148,6 +153,12 @@ class BucketCleanerTest {
         assertThat(stats.emptyDirsRemoved).isEqualTo(0L);
         assertThat(stats.deleteFailures).isEqualTo(0L);
         assertThat(stats.bytesReclaimed).isEqualTo(0L);
+        assertThat(stats.byObjectType.get(CleanupObjectType.LOG_SEGMENT).plannedFiles())
+                .isEqualTo(1L);
+        assertThat(stats.byObjectType.get(CleanupObjectType.LOG_SEGMENT).plannedBytes())
+                .isEqualTo(10L);
+        assertThat(stats.byObjectType.get(CleanupObjectType.LOG_SEGMENT).deletedFiles())
+                .isEqualTo(0L);
         assertThat(Files.exists(logFile)).isTrue();
     }
 
@@ -184,6 +195,8 @@ class BucketCleanerTest {
         assertThat(stats.deletedFiles).isEqualTo(0L);
         assertThat(stats.deleteFailures).isEqualTo(1L);
         assertThat(stats.bytesReclaimed).isEqualTo(0L);
+        assertThat(stats.byObjectType.get(CleanupObjectType.LOG_SEGMENT).deleteFailures())
+                .isEqualTo(1L);
     }
 
     private static void makeOld(Path path, long timestampMillis) throws IOException {

@@ -17,6 +17,10 @@
 
 package org.apache.fluss.flink.action.orphan.job;
 
+import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
+
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,5 +39,28 @@ class CleanStatsTest {
         assertThat(stats.emptyDirsRemoved()).isZero();
         assertThat(stats.deleteFailures()).isZero();
         assertThat(stats.bytesReclaimed()).isZero();
+    }
+
+    @Test
+    void builderRetainsAllOperationalCountersByObjectTypeAndSkipReason() {
+        CleanStats stats =
+                CleanStats.builder(ScopeIdentity.table("db", "orders", 7L))
+                        .scanned(CleanupObjectType.LOG_SEGMENT, 2L)
+                        .planned(CleanupObjectType.LOG_SEGMENT, 1L, 100L)
+                        .deleteFailed(CleanupObjectType.LOG_SEGMENT, 1L)
+                        .plannedDirectory(1L)
+                        .removedDirectory(1L)
+                        .skipped(SkipReasonCode.KEEP_ACTIVE, 1L)
+                        .build();
+
+        assertThat(stats.scannedFiles()).isEqualTo(2L);
+        assertThat(stats.plannedDirs()).isEqualTo(1L);
+        assertThat(stats.emptyDirsRemoved()).isEqualTo(1L);
+        assertThat(stats.deleteFailures()).isEqualTo(1L);
+        assertThat(stats.byObjectType().get(CleanupObjectType.LOG_SEGMENT).deleteFailures())
+                .isEqualTo(1L);
+        assertThat(stats.byObjectType().get(CleanupObjectType.DIRECTORY).plannedDirs())
+                .isEqualTo(1L);
+        assertThat(stats.bySkipReason()).containsEntry(SkipReasonCode.KEEP_ACTIVE, 1L);
     }
 }
