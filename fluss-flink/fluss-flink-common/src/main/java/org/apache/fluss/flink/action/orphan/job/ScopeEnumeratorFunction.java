@@ -145,16 +145,19 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
             ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3, remoteFsOpRateLimiter);
             MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
+            audit.logScopePhase(runId, "cluster_metadata");
             Map<String, String> clusterConfigMap = fetchClusterConfigMap(admin);
             String clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
             List<String> clusterRoots =
                     normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
 
+            audit.logScopePhase(runId, "active_metadata");
             Map<String, DbScanState> dbStates =
                     enumerateActiveScope(admin, audit, tracker, planStats);
             Set<Long> activeTableIds = collectActiveTableIds(dbStates);
             Set<Long> activePartitionIds = collectActivePartitionIds(dbStates);
 
+            audit.logScopePhase(runId, "task_planning");
             for (DbScanState dbState : dbStates.values()) {
                 for (LiveTableScope liveTable : dbState.liveTables) {
                     emitBucketTasks(

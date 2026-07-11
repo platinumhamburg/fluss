@@ -146,6 +146,15 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Low-frequency phase marker that identifies the next blocking scope operation. */
+    public void logScopePhase(String runId, String phase) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scope action=scope_phase phase={} ts={}",
+                runId,
+                phase,
+                Instant.now());
+    }
+
     public void logScanStart(
             String runId,
             boolean dryRun,
