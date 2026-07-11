@@ -110,6 +110,7 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
             throw new NullPointerException("writerKey must not be null");
         }
         checkArgument(sequence >= 0, "fenced sequence must be non-negative");
+        this.builtBuffer = null;
         this.writerKey = writerKey;
         this.sequence = sequence;
         this.writerStateSet = true;

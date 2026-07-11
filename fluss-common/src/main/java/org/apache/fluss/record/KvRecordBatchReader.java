@@ -31,7 +31,8 @@ public final class KvRecordBatchReader {
 
     /** Points a KV record batch at the remaining contents of the supplied buffer. */
     public static KvRecordBatch pointToByteBuffer(ByteBuffer buffer) {
-        if (buffer.remaining() < MINIMUM_PREFIX_SIZE) {
+        int remaining = buffer.remaining();
+        if (remaining < MINIMUM_PREFIX_SIZE) {
             throw new CorruptMessageException(
                     "KV batch is smaller than the minimum length and magic prefix");
         }
@@ -45,34 +46,51 @@ public final class KvRecordBatchReader {
             segment = MemorySegment.wrap(buffer.array());
             position = buffer.arrayOffset() + buffer.position();
         } else {
-            byte[] bytes = new byte[buffer.remaining()];
-            buffer.get(bytes);
+            byte[] bytes = new byte[remaining];
+            buffer.duplicate().get(bytes);
             segment = MemorySegment.wrap(bytes);
             position = 0;
         }
 
-        int sizeInBytes = DefaultKvRecordBatch.KV_OVERHEAD + segment.getInt(position);
+        int declaredLength = segment.getInt(position);
         byte magic = segment.get(position + DefaultKvRecordBatch.MAGIC_OFFSET);
-        KvRecordBatch batch;
         int headerSize;
         if (magic == KvRecordBatch.KV_MAGIC_VALUE_V0) {
-            batch = DefaultKvRecordBatch.pointToMemory(segment, position);
             headerSize = DefaultKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
         } else if (magic == KvRecordBatch.KV_MAGIC_VALUE_V1) {
-            batch = FencedKvRecordBatch.pointToMemory(segment, position);
             headerSize = FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
         } else {
             throw new CorruptMessageException(
                     "Unsupported KV batch magic " + Byte.toUnsignedInt(magic));
         }
 
-        if (sizeInBytes < headerSize || sizeInBytes > buffer.remaining()) {
-            throw new CorruptMessageException(
-                    "KV batch has invalid size "
-                            + sizeInBytes
-                            + " for magic "
-                            + Byte.toUnsignedInt(magic));
+        if (declaredLength < 0
+                || declaredLength > Integer.MAX_VALUE - DefaultKvRecordBatch.KV_OVERHEAD) {
+            throw new CorruptMessageException("Invalid KV batch length " + declaredLength);
         }
+        int sizeInBytes = DefaultKvRecordBatch.KV_OVERHEAD + declaredLength;
+        if (sizeInBytes < headerSize) {
+            throw new CorruptMessageException(
+                    "KV batch size "
+                            + sizeInBytes
+                            + " is smaller than magic "
+                            + Byte.toUnsignedInt(magic)
+                            + " header "
+                            + headerSize);
+        }
+        if (sizeInBytes > remaining) {
+            throw new CorruptMessageException(
+                    "KV batch size "
+                            + sizeInBytes
+                            + " exceeds remaining bytes "
+                            + remaining);
+        }
+
+        if (magic == KvRecordBatch.KV_MAGIC_VALUE_V0) {
+            return DefaultKvRecordBatch.pointToMemory(segment, position);
+        }
+        FencedKvRecordBatch batch = FencedKvRecordBatch.pointToMemory(segment, position);
+        batch.validateRecordCountAndPayloadSize();
         return batch;
     }
 }

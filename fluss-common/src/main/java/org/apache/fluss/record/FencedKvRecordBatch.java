@@ -152,20 +152,14 @@ public class FencedKvRecordBatch implements KvRecordBatch {
     }
 
     private Iterator<KvRecord> iterator(ReadContext readContext) {
+        validateRecordCountAndPayloadSize();
         int recordCount = getRecordCount();
-        if (recordCount < 0) {
-            throw new IllegalArgumentException(
-                    "Found invalid record count "
-                            + recordCount
-                            + " in magic v"
-                            + magic()
-                            + " batch");
-        }
         if (recordCount == 0) {
             return Collections.emptyIterator();
         }
         return new Iterator<KvRecord>() {
             private final short schemaId = schemaId();
+            private final int batchEnd = position + sizeInBytes();
             private int currentPosition = position + RECORD_BATCH_HEADER_SIZE;
             private int readRecordCount;
 
@@ -179,10 +173,15 @@ public class FencedKvRecordBatch implements KvRecordBatch {
                 if (!hasNext()) {
                     throw new NoSuchElementException();
                 }
+                int recordSize = validateRecordBounds(currentPosition, batchEnd);
                 KvRecord kvRecord =
                         DefaultKvRecord.readFrom(segment, currentPosition, schemaId, readContext);
-                currentPosition += kvRecord.getSizeInBytes();
+                currentPosition += recordSize;
                 readRecordCount++;
+                if (readRecordCount == recordCount && currentPosition != batchEnd) {
+                    throw new CorruptMessageException(
+                            "KV record payload does not end at declared batch end");
+                }
                 return kvRecord;
             }
 
@@ -191,6 +190,71 @@ public class FencedKvRecordBatch implements KvRecordBatch {
                 throw new UnsupportedOperationException();
             }
         };
+    }
+
+    void validateRecordCountAndPayloadSize() {
+        int recordCount = getRecordCount();
+        if (recordCount < 0) {
+            throw new CorruptMessageException(
+                    "Fenced KV batch has negative record count " + recordCount);
+        }
+        int payloadSize = sizeInBytes() - RECORD_BATCH_HEADER_SIZE;
+        long minimumPayloadSize =
+                (long) recordCount * (DefaultKvRecord.LENGTH_LENGTH + 1L);
+        if (minimumPayloadSize > payloadSize) {
+            throw new CorruptMessageException(
+                    "Fenced KV batch record count "
+                            + recordCount
+                            + " does not fit payload size "
+                            + payloadSize);
+        }
+        if (recordCount == 0 && payloadSize != 0) {
+            throw new CorruptMessageException(
+                    "Fenced KV batch record count 0 does not match payload size " + payloadSize);
+        }
+    }
+
+    private int validateRecordBounds(int recordPosition, int batchEnd) {
+        if (recordPosition > batchEnd - DefaultKvRecord.LENGTH_LENGTH) {
+            throw new CorruptMessageException(
+                    "KV record length crosses declared batch end");
+        }
+        int recordBodySize = segment.getInt(recordPosition);
+        if (recordBodySize < 1) {
+            throw new CorruptMessageException(
+                    "KV record has invalid body size " + recordBodySize);
+        }
+        long recordEnd =
+                (long) recordPosition + DefaultKvRecord.LENGTH_LENGTH + recordBodySize;
+        if (recordEnd > batchEnd) {
+            throw new CorruptMessageException("KV record crosses declared batch end");
+        }
+        validateKeyBounds(recordPosition + DefaultKvRecord.LENGTH_LENGTH, (int) recordEnd);
+        return DefaultKvRecord.LENGTH_LENGTH + recordBodySize;
+    }
+
+    private void validateKeyBounds(int keyLengthPosition, int recordEnd) {
+        long keyLength = 0;
+        int shift = 0;
+        int currentPosition = keyLengthPosition;
+        while (true) {
+            if (currentPosition >= recordEnd) {
+                throw new CorruptMessageException(
+                        "KV record key length crosses declared record end");
+            }
+            int currentByte = segment.get(currentPosition++) & 0xff;
+            keyLength |= (long) (currentByte & 0x7f) << shift;
+            if ((currentByte & 0x80) == 0) {
+                break;
+            }
+            shift += 7;
+            if (shift > 28) {
+                throw new CorruptMessageException("KV record has invalid key length");
+            }
+        }
+        if (keyLength > Integer.MAX_VALUE || keyLength > recordEnd - currentPosition) {
+            throw new CorruptMessageException("KV record key crosses declared record end");
+        }
     }
 
     private long computeChecksum() {
