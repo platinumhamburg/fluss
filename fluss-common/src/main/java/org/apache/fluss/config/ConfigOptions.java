@@ -864,10 +864,9 @@ public class ConfigOptions {
                     .memoryType()
                     .defaultValue(MemorySize.parse("256kb"))
                     .withDescription(
-                            "Maximum number of WAL bytes an index replicator reads per window. "
-                                    + "Window boundaries are aligned to WAL record-batch boundaries, "
-                                    + "so a restarted replicator replays the exact same window "
-                                    + "trajectory from its pushed offset.");
+                            "Maximum number of WAL bytes requested by an index replicator per read. "
+                                    + "A window ends only at a complete source mutation boundary and "
+                                    + "may end inside a WAL record batch based on derived output size.");
 
     public static final ConfigOption<Duration> INDEX_REPLICATION_BACKOFF_INTERVAL =
             key("index.replication.backoff-interval")
@@ -912,10 +911,9 @@ public class ConfigOptions {
                     .memoryType()
                     .defaultValue(MemorySize.parse("1mb"))
                     .withDescription(
-                            "Maximum total encoded bytes packed into a single PutKv request when the "
-                                    + "sender consolidates multiple index batches for one target "
-                                    + "leader. Batches exceeding this bound are split across multiple "
-                                    + "requests.");
+                            "Preferred aggregate encoded payload bound for one index replication "
+                                    + "window and for PutKv request consolidation. A complete source "
+                                    + "mutation group and an individual target batch are never split.");
 
     public static final ConfigOption<MemorySize> LOG_REPLICA_FETCH_MAX_BYTES =
             key("log.replica.fetch.max-bytes")

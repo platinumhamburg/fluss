@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.KvFormat;
@@ -38,6 +39,7 @@ import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.rpc.protocol.MessageCodec;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.tablet.TestTabletServerGateway;
 import org.apache.fluss.utils.MapUtils;
@@ -812,6 +814,82 @@ public class IndexSenderTest {
         }
     }
 
+    @Test
+    void exactFramedRequestAtHardLimitIsSent() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.autoCompleteSuccess = true;
+        TableBucket bucket = new TableBucket(43L, 0);
+        IndexReplicator owner = owner(accumulator);
+        IndexBatch encodedBatch = v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        long exactRequestBytes = exactRequestBytes(bucket, encodedBatch);
+        accumulator.append(encodedBatch);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, targetBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        exactRequestBytes,
+                        5_000L,
+                        IndexSender.LifecycleHooks.NO_OP);
+        try {
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+            assertThat(gateway.requests).hasSize(1);
+            assertThat(IndexSender.serializedRequestSize(gateway.requests.get(0)))
+                    .isEqualTo(exactRequestBytes);
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void singletonAboveHardLimitFailsOnceWithoutRetryOrOffsetAdvance() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.autoCompleteSuccess = true;
+        TableBucket bucket = new TableBucket(44L, 0);
+        IndexReplicator owner = owner(accumulator);
+        IndexBatch encodedBatch = v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        long exactRequestBytes = exactRequestBytes(bucket, encodedBatch);
+        long errorsBefore = TestingMetricGroups.TABLET_SERVER_METRICS.indexPushErrors().getCount();
+        accumulator.append(encodedBatch);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, targetBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        exactRequestBytes - 1,
+                        5_000L,
+                        IndexSender.LifecycleHooks.NO_OP);
+        try {
+            await(() -> owner.terminalFailure() != null);
+            await(() -> sender.inFlightRequestCount() == 0);
+
+            assertThat(owner.terminalFailure()).isInstanceOf(RecordTooLargeException.class);
+            assertThat(owner.getSyncIndexPushedOffset()).isZero();
+            assertThat(gateway.requests).isEmpty();
+            assertThat(encodedBatch.attempts()).isZero();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexPushErrors().getCount())
+                    .isEqualTo(errorsBefore + 1);
+        } finally {
+            sender.close();
+        }
+    }
+
     private static IndexBatch batch(TableBucket targetBucket, IndexWindow window) {
         byte[] bytes = new byte[] {1, 2, 3};
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length);
@@ -835,6 +913,19 @@ public class IndexSenderTest {
         byte[] bytes = new byte[view.getBytesLength()];
         view.getByteBuf().getBytes(view.getByteBuf().readerIndex(), bytes);
         return bytes;
+    }
+
+    private static long exactRequestBytes(TableBucket bucket, IndexBatch batch) {
+        PutKvRequest request =
+                new PutKvRequest()
+                        .setTableId(bucket.getTableId())
+                        .setAcks(-1)
+                        .setTimeoutMs(5_000)
+                        .setAggMode(MergeMode.OVERWRITE.getProtoValue());
+        request.addBucketsReq()
+                .setBucketId(bucket.getBucket())
+                .setRecordsBytesView(batch.encoded());
+        return Integer.BYTES + MessageCodec.REQUEST_HEADER_LENGTH + request.totalSize();
     }
 
     /** A per-bucket success response acking exactly the given bucket ids (no error set). */

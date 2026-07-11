@@ -308,6 +308,7 @@ public class ReplicaManager implements ServerReconfigurable {
                 new IndexReplicatorPool(
                         conf.getInt(ConfigOptions.INDEX_REPLICATION_READER_NUMBER),
                         (int) conf.get(ConfigOptions.INDEX_REPLICATION_MAX_WINDOW_BYTES).getBytes(),
+                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES).getBytes(),
                         conf.get(ConfigOptions.INDEX_REPLICATION_BACKOFF_INTERVAL).toMillis());
         this.indexSender =
                 new IndexSender(
@@ -319,7 +320,9 @@ public class ReplicaManager implements ServerReconfigurable {
                         conf.get(ConfigOptions.INDEX_REPLICATION_BACKOFF_INTERVAL).toMillis(),
                         conf.get(ConfigOptions.INDEX_REPLICATION_RETRY_BACKOFF).toMillis(),
                         conf.get(ConfigOptions.INDEX_REPLICATION_RETRY_MAX_BACKOFF).toMillis(),
-                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES).getBytes());
+                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES).getBytes(),
+                        conf.get(ConfigOptions.NETTY_SERVER_MAX_REQUEST_SIZE).getBytes(),
+                        30_000L);
         serverMetricGroup.registerIndexPushGauges(
                 indexAccumulator::pendingBytes,
                 indexSender::inFlightRequestCount,

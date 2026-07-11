@@ -19,6 +19,7 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
@@ -60,6 +61,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
+import static org.apache.fluss.rpc.protocol.MessageCodec.REQUEST_HEADER_LENGTH;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /**
@@ -132,6 +134,9 @@ public final class IndexSender implements AutoCloseable {
     /** Maximum total encoded bytes packed into a single consolidated PutKv request. */
     private final long maxRequestBytes;
 
+    /** Exact framed request limit enforced by the target Netty server. */
+    private final long maxTransportRequestBytes;
+
     /** Timeout applied to each index {@code PutKv} request. */
     private final long requestTimeoutMs;
 
@@ -195,7 +200,35 @@ public final class IndexSender implements AutoCloseable {
                 retryBackoffMs,
                 retryMaxBackoffMs,
                 maxRequestBytes,
+                Long.MAX_VALUE,
                 DEFAULT_TIMEOUT_MS,
+                LifecycleHooks.NO_OP);
+    }
+
+    public IndexSender(
+            IndexAccumulator accumulator,
+            LeaderResolver leaderResolver,
+            Function<Integer, TabletServerGateway> gatewayFactory,
+            TabletServerMetricGroup metrics,
+            int numWorkers,
+            long backoffMs,
+            long retryBackoffMs,
+            long retryMaxBackoffMs,
+            long maxRequestBytes,
+            long maxTransportRequestBytes,
+            long requestTimeoutMs) {
+        this(
+                accumulator,
+                leaderResolver,
+                gatewayFactory,
+                metrics,
+                numWorkers,
+                backoffMs,
+                retryBackoffMs,
+                retryMaxBackoffMs,
+                maxRequestBytes,
+                maxTransportRequestBytes,
+                requestTimeoutMs,
                 LifecycleHooks.NO_OP);
     }
 
@@ -221,6 +254,7 @@ public final class IndexSender implements AutoCloseable {
                 retryBackoffMs,
                 retryMaxBackoffMs,
                 maxRequestBytes,
+                Long.MAX_VALUE,
                 requestTimeoutMs,
                 LifecycleHooks.NO_OP);
     }
@@ -238,6 +272,35 @@ public final class IndexSender implements AutoCloseable {
             long maxRequestBytes,
             long requestTimeoutMs,
             LifecycleHooks lifecycleHooks) {
+        this(
+                accumulator,
+                leaderResolver,
+                gatewayFactory,
+                metrics,
+                numWorkers,
+                backoffMs,
+                retryBackoffMs,
+                retryMaxBackoffMs,
+                maxRequestBytes,
+                Long.MAX_VALUE,
+                requestTimeoutMs,
+                lifecycleHooks);
+    }
+
+    @VisibleForTesting
+    IndexSender(
+            IndexAccumulator accumulator,
+            LeaderResolver leaderResolver,
+            Function<Integer, TabletServerGateway> gatewayFactory,
+            TabletServerMetricGroup metrics,
+            int numWorkers,
+            long backoffMs,
+            long retryBackoffMs,
+            long retryMaxBackoffMs,
+            long maxRequestBytes,
+            long maxTransportRequestBytes,
+            long requestTimeoutMs,
+            LifecycleHooks lifecycleHooks) {
         this.accumulator = accumulator;
         this.leaderResolver = leaderResolver;
         this.gatewayFactory = gatewayFactory;
@@ -245,6 +308,7 @@ public final class IndexSender implements AutoCloseable {
         this.retryBackoffMs = retryBackoffMs;
         this.retryMaxBackoffMs = retryMaxBackoffMs;
         this.maxRequestBytes = maxRequestBytes;
+        this.maxTransportRequestBytes = maxTransportRequestBytes;
         this.requestTimeoutMs = requestTimeoutMs;
         this.lifecycleHooks = lifecycleHooks;
         int workerCount = Math.max(1, numWorkers);
@@ -741,8 +805,7 @@ public final class IndexSender implements AutoCloseable {
 
             for (Map.Entry<Long, List<IndexBatch>> tableEntry : byTable.entrySet()) {
                 long tableId = tableEntry.getKey();
-                // Split each table's batches so no single request exceeds maxRequestBytes.
-                for (List<IndexBatch> chunk : splitByRequestBytes(tableEntry.getValue())) {
+                for (List<IndexBatch> chunk : splitByRequestBytes(tableId, tableEntry.getValue())) {
                     sendOneRequest(target, tableId, chunk);
                 }
             }
@@ -751,6 +814,11 @@ public final class IndexSender implements AutoCloseable {
         private void sendOneRequest(
                 TargetContext target, long tableId, List<IndexBatch> chunk) {
             PutKvRequest request = buildRequest(tableId, chunk);
+            long serializedBytes = serializedRequestSize(request);
+            if (serializedBytes > maxTransportRequestBytes) {
+                failOversizedRequest(tableId, chunk, serializedBytes);
+                return;
+            }
             long startNs = System.nanoTime();
             lifecycleHooks.beforePutKvInvocation();
             boolean leadersCurrent = leadersMatch(target.serverId, chunk);
@@ -795,6 +863,32 @@ public final class IndexSender implements AutoCloseable {
             } catch (Throwable t) {
                 completePutKvRequest(target, tableId, chunk, startNs, null, t);
             }
+        }
+
+        private void failOversizedRequest(
+                long tableId, List<IndexBatch> chunk, long serializedBytes) {
+            RecordTooLargeException failure =
+                    new RecordTooLargeException(
+                            "Index PutKv request for table "
+                                    + tableId
+                                    + " is "
+                                    + serializedBytes
+                                    + " bytes, exceeding netty.server.max-request-size="
+                                    + maxTransportRequestBytes);
+            List<BatchAction> actions = new ArrayList<>();
+            lifecycleLock.lock();
+            try {
+                for (IndexBatch batch : chunk) {
+                    addOwnedBatchActionLocked(actions, batch, BatchDisposition.FAIL, failure);
+                }
+                if (!actions.isEmpty()) {
+                    metrics.indexPushErrors().inc();
+                }
+                beginAccountingLocked(actions);
+            } finally {
+                lifecycleLock.unlock();
+            }
+            runAccountingAndCallbacks(actions);
         }
 
         private void completePutKvRequest(
@@ -922,22 +1016,28 @@ public final class IndexSender implements AutoCloseable {
     }
 
     /**
-     * Splits batches into chunks whose total encoded size stays within {@link #maxRequestBytes}. A
-     * single oversized batch still forms its own chunk so it is never dropped.
+     * Consolidates whole target batches up to the preferred payload bound and exact hard transport
+     * bound. A singleton above the hard bound remains intact so it can enter terminal failure.
      */
-    private List<List<IndexBatch>> splitByRequestBytes(List<IndexBatch> batches) {
+    private List<List<IndexBatch>> splitByRequestBytes(long tableId, List<IndexBatch> batches) {
         List<List<IndexBatch>> chunks = new ArrayList<>();
         List<IndexBatch> current = new ArrayList<>();
         long currentBytes = 0L;
         for (IndexBatch batch : batches) {
             long size = batch.encoded().getBytesLength();
-            if (!current.isEmpty() && currentBytes + size > maxRequestBytes) {
-                chunks.add(current);
-                current = new ArrayList<>();
-                currentBytes = 0L;
-            }
             current.add(batch);
             currentBytes += size;
+            boolean exceedsPreferred = currentBytes > maxRequestBytes;
+            boolean exceedsHard =
+                    serializedRequestSize(buildRequest(tableId, current))
+                            > maxTransportRequestBytes;
+            if (current.size() > 1 && (exceedsPreferred || exceedsHard)) {
+                current.remove(current.size() - 1);
+                chunks.add(current);
+                current = new ArrayList<>();
+                current.add(batch);
+                currentBytes = size;
+            }
         }
         if (!current.isEmpty()) {
             chunks.add(current);
@@ -1019,6 +1119,14 @@ public final class IndexSender implements AutoCloseable {
 
     private void addOwnedBatchActionLocked(
             List<BatchAction> actions, IndexBatch batch, BatchDisposition requestedDisposition) {
+        addOwnedBatchActionLocked(actions, batch, requestedDisposition, null);
+    }
+
+    private void addOwnedBatchActionLocked(
+            List<BatchAction> actions,
+            IndexBatch batch,
+            BatchDisposition requestedDisposition,
+            @Nullable Throwable failure) {
         TableBucket bucket = batch.targetBucket();
         if (!inFlightBatches.remove(bucket, batch)) {
             return;
@@ -1033,7 +1141,7 @@ public final class IndexSender implements AutoCloseable {
         if (disposition != BatchDisposition.REQUEUE) {
             ownedBatches.remove(batch);
         }
-        actions.add(new BatchAction(batch, disposition));
+        actions.add(new BatchAction(batch, disposition, failure));
     }
 
     private void beginAccountingLocked(List<BatchAction> actions) {
@@ -1082,7 +1190,8 @@ public final class IndexSender implements AutoCloseable {
     private void runAccountingAndCallbacks(List<BatchAction> actions) {
         runAccounting(actions);
         for (BatchAction action : actions) {
-            if (action.disposition != BatchDisposition.ACK) {
+            if (action.disposition != BatchDisposition.ACK
+                    && action.disposition != BatchDisposition.FAIL) {
                 continue;
             }
             lifecycleLock.lock();
@@ -1096,8 +1205,12 @@ public final class IndexSender implements AutoCloseable {
             int previousDepth = activeExternalCallbackDepth.get();
             activeExternalCallbackDepth.set(previousDepth + 1);
             try {
-                lifecycleHooks.beforeProgressCallback();
-                action.batch.window().onBatchAcked();
+                if (action.disposition == BatchDisposition.ACK) {
+                    lifecycleHooks.beforeProgressCallback();
+                    action.batch.window().onBatchAcked();
+                } else {
+                    action.batch.window().onBatchFailed(action.failure);
+                }
             } finally {
                 activeExternalCallbackDepth.set(previousDepth);
             }
@@ -1107,16 +1220,24 @@ public final class IndexSender implements AutoCloseable {
     private enum BatchDisposition {
         ACK,
         REQUEUE,
-        RELEASE
+        RELEASE,
+        FAIL
     }
 
     private static final class BatchAction {
         private final IndexBatch batch;
         private final BatchDisposition disposition;
+        @Nullable private final Throwable failure;
 
         private BatchAction(IndexBatch batch, BatchDisposition disposition) {
+            this(batch, disposition, null);
+        }
+
+        private BatchAction(
+                IndexBatch batch, BatchDisposition disposition, @Nullable Throwable failure) {
             this.batch = batch;
             this.disposition = disposition;
+            this.failure = failure;
         }
     }
 
@@ -1173,5 +1294,10 @@ public final class IndexSender implements AutoCloseable {
             pb.setRecordsBytesView(encoded);
         }
         return req;
+    }
+
+    @VisibleForTesting
+    static long serializedRequestSize(PutKvRequest request) {
+        return Integer.BYTES + REQUEST_HEADER_LENGTH + (long) request.totalSize();
     }
 }

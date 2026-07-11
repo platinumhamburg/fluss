@@ -387,6 +387,7 @@ public final class ReplicaIndexController {
                         readContext,
                         initialOffset,
                         replicatorPool.maxWindowBytes(),
+                        replicatorPool.preferredMaxRequestBytes(),
                         onProgress);
         this.indexReplicator = replicator;
         state.set(State.RUNNING);

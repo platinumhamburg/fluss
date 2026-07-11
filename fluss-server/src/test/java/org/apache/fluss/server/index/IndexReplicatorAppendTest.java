@@ -27,6 +27,9 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecordReadContext;
+import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
@@ -35,8 +38,11 @@ import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
+import org.apache.fluss.server.log.FetchDataInfo;
+import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.CloseableIterator;
 
 import org.junit.jupiter.api.Test;
 
@@ -50,6 +56,9 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Unit tests for {@link IndexReplicator#appendOneSpec} — the per-index mutation derivation. The
@@ -64,6 +73,7 @@ public class IndexReplicatorAppendTest {
             RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT(), DataTypes.BIGINT());
 
     private static final long INDEX_TABLE_ID = 77L;
+    private static final TableBucket SOURCE_BUCKET = new TableBucket(55L, 3);
     private static final short INDEX_SCHEMA_ID = 1;
     private static final Schema INDEX_SCHEMA =
             Schema.newBuilder()
@@ -243,109 +253,194 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
-    void updatePairCanSpanRecordBatchBoundary() {
-        IndexReplicator replicator =
-                new IndexReplicator(
-                        null,
-                        Collections.singletonList(spec()),
-                        new IndexAccumulator(),
-                        null,
-                        0L,
-                        1024,
-                        (sync, all) -> {});
-        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
-
-        long beforeResult =
-                replicator.deriveAndAppend(
-                        record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)), builders);
-        long afterResult =
-                replicator.deriveAndAppend(
-                        record(6L, ChangeType.UPDATE_AFTER, row(1L, 20L, 100L)), builders);
-
-        assertThat(beforeResult)
-                .as("UPDATE_BEFORE is not a complete index mutation and must not advance")
-                .isEqualTo(5L);
-        assertThat(afterResult).isEqualTo(7L);
-        assertThat(builders).hasSize(1);
-        assertThat(builders.values().iterator().next().count).isEqualTo(2);
-    }
-
-    @Test
-    void pendingUpdateBeforeReadsFromNextOffsetWithoutAdvancingPushedOffset() {
-        IndexReplicator replicator =
-                new IndexReplicator(
-                        null,
-                        Collections.singletonList(spec()),
-                        new IndexAccumulator(),
-                        null,
+    void adjacentUpdatePairInOneSourceBatchProducesOneFencedTargetBatch() throws Exception {
+        PollFixture fixture =
+                pollFixture(
                         5L,
                         1024,
-                        (sync, all) -> {});
-        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
+                        Collections.singletonList(
+                                Arrays.asList(
+                                        record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)),
+                                        record(6L, ChangeType.UPDATE_AFTER, row(1L, 20L, 100L)))));
 
-        long beforeResult =
-                replicator.deriveAndAppend(
-                        record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)), builders);
+        assertThat(fixture.replicator.poll()).isTrue();
 
-        assertThat(beforeResult).isEqualTo(5L);
-        assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(5L);
-        assertThat(replicator.nextReadOffset())
-                .as("the next poll must continue after the pending UPDATE_BEFORE")
-                .isEqualTo(6L);
+        IndexBatch targetBatch = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        assertThat(targetBatch).isNotNull();
+        assertThat(targetBatch.window().windowEndOffset()).isEqualTo(7L);
+        KvRecordBatch decoded = decode(targetBatch);
+        assertThat(decoded.fencedWriterKey()).isEqualTo(IndexWriterKey.encode(SOURCE_BUCKET));
+        assertThat(decoded.fencedSequence()).isEqualTo(7L);
+        assertThat(decoded.getRecordCount()).isEqualTo(2);
     }
 
     @Test
-    void unmatchedUpdateBeforeStopsBeforeAdvancingPastIt() {
-        IndexReplicator replicator =
-                new IndexReplicator(
-                        null,
-                        Collections.singletonList(spec()),
-                        new IndexAccumulator(),
-                        null,
-                        0L,
-                        1024,
-                        (sync, all) -> {});
-        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
-
-        long beforeResult =
-                replicator.deriveAndAppend(
-                        record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)), builders);
-        long insertResult =
-                replicator.deriveAndAppend(
-                        record(6L, ChangeType.INSERT, row(2L, 30L, 100L)), builders);
-
-        assertThat(beforeResult).isEqualTo(5L);
-        assertThat(insertResult)
-                .as("the next window must re-read the incomplete UPDATE_BEFORE")
-                .isEqualTo(-1L);
-        assertThat(builders).isEmpty();
+    void missingUpdateAfterFailsClosedWithoutRetainedRowState() throws Exception {
+        assertCorrupt(
+                        5L,
+                Collections.singletonList(
+                        Collections.singletonList(
+                                record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)))));
     }
 
     @Test
-    void nonAdjacentUpdateAfterStopsBeforePairingWithUpdateBefore() {
+    void nonAdjacentUpdatePairFailsClosed() throws Exception {
+        assertCorrupt(
+                5L,
+                Collections.singletonList(
+                        Arrays.asList(
+                                record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)),
+                                record(6L, ChangeType.INSERT, row(2L, 30L, 100L)),
+                                record(7L, ChangeType.UPDATE_AFTER, row(1L, 20L, 100L)))));
+    }
+
+    @Test
+    void updatePairSplitAcrossSourceBatchesFailsClosed() throws Exception {
+        assertCorrupt(
+                5L,
+                Arrays.asList(
+                        Collections.singletonList(
+                                record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L))),
+                        Collections.singletonList(
+                                record(6L, ChangeType.UPDATE_AFTER, row(1L, 20L, 100L)))));
+    }
+
+    @Test
+    void resumeAtUnmatchedUpdateAfterFailsClosed() throws Exception {
+        assertCorrupt(
+                6L,
+                Collections.singletonList(
+                        Arrays.asList(
+                                record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)),
+                                record(6L, ChangeType.UPDATE_AFTER, row(1L, 20L, 100L)))));
+    }
+
+    @Test
+    void resumeInsideSourceBatchSkipsRecordsBelowRequestedBoundary() throws Exception {
+        PollFixture fixture =
+                pollFixture(
+                        6L,
+                        1024,
+                        Collections.singletonList(
+                                Arrays.asList(
+                                        record(5L, ChangeType.INSERT, row(1L, 10L, 100L)),
+                                        record(6L, ChangeType.INSERT, row(2L, 20L, 100L)))));
+
+        assertThat(fixture.replicator.poll()).isTrue();
+
+        IndexBatch targetBatch = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        KvRecordBatch decoded = decode(targetBatch);
+        assertThat(decoded.getRecordCount()).isEqualTo(1);
+        assertThat(decoded.fencedSequence()).isEqualTo(7L);
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(6L);
+    }
+
+    @Test
+    void emptySourceBatchAdvancesToItsExclusiveNextOffset() throws Exception {
+        LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        LogRecordBatch batch = mock(LogRecordBatch.class);
+        when(batch.baseLogOffset()).thenReturn(0L);
+        when(batch.nextLogOffset()).thenReturn(1L);
+        when(batch.records(readContext))
+                .thenAnswer(
+                        ignored ->
+                                CloseableIterator.wrap(
+                                        Collections.<LogRecord>emptyList().iterator()));
+        LogRecords records = mock(LogRecords.class);
+        when(records.batches()).thenReturn(Collections.singletonList(batch));
+        TestingSourceWal sourceWal = new TestingSourceWal(1L, records);
         IndexReplicator replicator =
-                new IndexReplicator(
-                        null,
+                IndexReplicator.forTesting(
+                        sourceWal,
                         Collections.singletonList(spec()),
                         new IndexAccumulator(),
-                        null,
-                        0L,
+                        readContext,
+                        -1L,
+                        1024,
                         1024,
                         (sync, all) -> {});
-        Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();
 
-        long beforeResult =
-                replicator.deriveAndAppend(
-                        record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)), builders);
-        long afterResult =
-                replicator.deriveAndAppend(
-                        record(7L, ChangeType.UPDATE_AFTER, row(1L, 20L, 100L)), builders);
+        assertThat(replicator.poll()).isTrue();
+        assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(1L);
+        assertThat(sourceWal.readOffsets).containsExactly(0L);
+    }
 
-        assertThat(beforeResult).isEqualTo(5L);
-        assertThat(afterResult)
-                .as("UPDATE_BEFORE and UPDATE_AFTER must be adjacent in the WAL")
-                .isEqualTo(-1L);
-        assertThat(builders).isEmpty();
+    @Test
+    void preferredBoundCutsBeforeGroupAndNeverSplitsMultiBucketUpdate() throws Exception {
+        PollFixture fixture =
+                pollFixture(
+                        5L,
+                        1,
+                        Collections.singletonList(
+                                Arrays.asList(
+                                        record(5L, ChangeType.INSERT, row(1L, 10L, 100L)),
+                                        record(6L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)),
+                                        record(7L, ChangeType.UPDATE_AFTER, row(1L, 11L, 100L)))));
+
+        assertThat(fixture.replicator.poll()).isTrue();
+        IndexBatch first = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        assertThat(first.window().windowEndOffset()).isEqualTo(6L);
+        assertThat(decode(first).getRecordCount()).isEqualTo(1);
+        acknowledge(fixture.accumulator, first);
+
+        assertThat(fixture.replicator.poll()).isTrue();
+        IndexBatch delete = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        IndexBatch upsert = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 1));
+        assertThat(delete.window()).isSameAs(upsert.window());
+        assertThat(delete.window().windowEndOffset()).isEqualTo(8L);
+        assertThat(decode(delete).fencedSequence()).isEqualTo(8L);
+        assertThat(decode(upsert).fencedSequence()).isEqualTo(8L);
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(6L);
+        acknowledge(fixture.accumulator, delete);
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(6L);
+        acknowledge(fixture.accumulator, upsert);
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(8L);
+    }
+
+    @Test
+    void failoverReplicatorsMayChooseDifferentValidWindowEnds() throws Exception {
+        List<List<LogRecord>> source =
+                Collections.singletonList(
+                        Arrays.asList(
+                                record(5L, ChangeType.INSERT, row(1L, 10L, 100L)),
+                                record(6L, ChangeType.INSERT, row(2L, 20L, 100L))));
+        PollFixture smaller = pollFixture(5L, 1, source);
+        PollFixture larger = pollFixture(5L, 1024, source);
+
+        assertThat(smaller.replicator.poll()).isTrue();
+        assertThat(larger.replicator.poll()).isTrue();
+
+        KvRecordBatch smallerBatch =
+                decode(smaller.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
+        KvRecordBatch largerBatch =
+                decode(larger.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
+        assertThat(smallerBatch.fencedWriterKey()).isEqualTo(largerBatch.fencedWriterKey());
+        assertThat(smallerBatch.fencedSequence()).isEqualTo(6L);
+        assertThat(largerBatch.fencedSequence()).isEqualTo(7L);
+        assertThat(largerBatch.getRecordCount()).isEqualTo(2);
+    }
+
+    @Test
+    void publishesWindowStateBeforeSynchronousAccumulatorCallbacks() throws Exception {
+        PollFixture fixture =
+                pollFixture(
+                        5L,
+                        1024,
+                        Collections.singletonList(
+                                Arrays.asList(
+                                        record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)),
+                                        record(6L, ChangeType.UPDATE_AFTER, row(1L, 11L, 100L)))));
+        fixture.accumulator.setAppendListener(
+                bucket -> {
+                    IndexBatch batch = fixture.accumulator.pollFirst(bucket);
+                    acknowledge(fixture.accumulator, batch);
+                });
+
+        assertThat(fixture.replicator.poll()).isTrue();
+
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(7L);
+        assertThat(fixture.accumulator.pendingBytes()).isZero();
+        assertThat(fixture.accumulator.hasUnsent()).isFalse();
     }
 
     @Test
@@ -382,6 +477,114 @@ public class IndexReplicatorAppendTest {
             return records;
         } catch (Exception e) {
             throw new AssertionError("Failed to decode index batch", e);
+        }
+    }
+
+    private static void assertCorrupt(long initialOffset, List<List<LogRecord>> sourceBatches)
+            throws Exception {
+        PollFixture fixture = pollFixture(initialOffset, 1024, sourceBatches);
+
+        assertThatThrownBy(fixture.replicator::poll)
+                .isInstanceOf(IndexSourceWalCorruptionException.class);
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(initialOffset);
+        assertThat(fixture.replicator.terminalFailure())
+                .isInstanceOf(IndexSourceWalCorruptionException.class);
+        assertThat(fixture.accumulator.hasUnsent()).isFalse();
+        assertThat(fixture.replicator.poll()).isFalse();
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(initialOffset);
+    }
+
+    private static PollFixture pollFixture(
+            long initialOffset, int preferredMaxRequestBytes, List<List<LogRecord>> sourceBatches)
+            throws Exception {
+        LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        LogRecords logRecords = mock(LogRecords.class);
+        List<LogRecordBatch> batches = new ArrayList<>();
+        long highWatermark = initialOffset;
+        for (List<LogRecord> sourceBatch : sourceBatches) {
+            LogRecordBatch batch = mock(LogRecordBatch.class);
+            long baseOffset = sourceBatch.get(0).logOffset();
+            long nextOffset = sourceBatch.get(sourceBatch.size() - 1).logOffset() + 1;
+            when(batch.baseLogOffset()).thenReturn(baseOffset);
+            when(batch.nextLogOffset()).thenReturn(nextOffset);
+            when(batch.records(readContext))
+                    .thenAnswer(
+                            ignored ->
+                                    CloseableIterator.wrap(
+                                            new ArrayList<>(sourceBatch).iterator()));
+            batches.add(batch);
+            highWatermark = Math.max(highWatermark, nextOffset);
+        }
+        when(logRecords.batches()).thenReturn(batches);
+        TestingSourceWal sourceWal = new TestingSourceWal(highWatermark, logRecords);
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator replicator =
+                IndexReplicator.forTesting(
+                        sourceWal,
+                        Collections.singletonList(spec()),
+                        accumulator,
+                        readContext,
+                        initialOffset,
+                        1024,
+                        preferredMaxRequestBytes,
+                        (sync, all) -> {});
+        return new PollFixture(sourceWal, accumulator, replicator);
+    }
+
+    private static KvRecordBatch decode(IndexBatch batch) {
+        return KvRecordBatchReader.pointToByteBuffer(batch.encoded().getByteBuf().nioBuffer());
+    }
+
+    private static void acknowledge(IndexAccumulator accumulator, IndexBatch batch) {
+        accumulator.release(batch);
+        batch.window().onBatchAcked();
+    }
+
+    private static final class PollFixture {
+        private final TestingSourceWal sourceWal;
+        private final IndexAccumulator accumulator;
+        private final IndexReplicator replicator;
+
+        private PollFixture(
+                TestingSourceWal sourceWal,
+                IndexAccumulator accumulator,
+                IndexReplicator replicator) {
+            this.sourceWal = sourceWal;
+            this.accumulator = accumulator;
+            this.replicator = replicator;
+        }
+    }
+
+    private static final class TestingSourceWal implements IndexReplicator.SourceWal {
+        private final long highWatermark;
+        private final LogRecords records;
+        private final List<Long> readOffsets = new ArrayList<>();
+
+        private TestingSourceWal(long highWatermark, LogRecords records) {
+            this.highWatermark = highWatermark;
+            this.records = records;
+        }
+
+        @Override
+        public TableBucket tableBucket() {
+            return SOURCE_BUCKET;
+        }
+
+        @Override
+        public long highWatermark() {
+            return highWatermark;
+        }
+
+        @Override
+        public long logStartOffset() {
+            return 0L;
+        }
+
+        @Override
+        public FetchDataInfo read(
+                long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage) {
+            readOffsets.add(offset);
+            return new FetchDataInfo(records);
         }
     }
 

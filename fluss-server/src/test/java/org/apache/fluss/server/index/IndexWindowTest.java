@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.row.BinaryRow;
@@ -113,6 +114,19 @@ public class IndexWindowTest {
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(42L);
         assertThat(replicator.getAllIndexPushedOffset()).isEqualTo(42L);
         assertThat(advanced.get()).isEqualTo(42L);
+    }
+
+    @Test
+    void terminalBatchFailurePreventsWindowFromAdvancing() {
+        IndexReplicator replicator = newReplicator(10L, (sync, all) -> {});
+        IndexWindow window = new IndexWindow("idx", 42L, 1, replicator);
+        RecordTooLargeException failure = new RecordTooLargeException("too large");
+
+        window.onBatchFailed(failure);
+        window.onBatchAcked();
+
+        assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(10L);
+        assertThat(replicator.terminalFailure()).isSameAs(failure);
     }
 
     @Test

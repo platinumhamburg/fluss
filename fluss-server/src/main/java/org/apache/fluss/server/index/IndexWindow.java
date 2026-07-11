@@ -31,9 +31,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * index buckets. Only when every one of those batches has been acknowledged does the window advance
  * that index's pushed offset to {@link #windowEndOffset}.
  *
- * <p>Because window boundaries are derived deterministically from the WAL batch layout plus a fixed
- * maximum window size, a replicator restarting from its pushed offset replays the exact same window
- * trajectory, making the scheme idempotent under at-least-once delivery.
+ * <p>Window boundaries may differ after failover. Correctness relies on the target WriterState
+ * fence, whose sequence is this window's exclusive end offset, rather than on reproducing an
+ * identical source-side trajectory.
  */
 @Internal
 final class IndexWindow {
@@ -43,8 +43,8 @@ final class IndexWindow {
     private final AtomicInteger remaining;
     private final IndexReplicator owner;
 
-    /** One-shot guard so the owning replicator's pushed offset is advanced at most once. */
-    private final AtomicBoolean completed = new AtomicBoolean(false);
+    /** One-shot guard for the mutually exclusive completed or failed terminal transition. */
+    private final AtomicBoolean terminal = new AtomicBoolean(false);
 
     IndexWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
         this.indexName = indexName;
@@ -73,8 +73,15 @@ final class IndexWindow {
      * over-acknowledgement.
      */
     void onBatchAcked() {
-        if (remaining.decrementAndGet() == 0 && completed.compareAndSet(false, true)) {
+        if (remaining.decrementAndGet() == 0 && terminal.compareAndSet(false, true)) {
             owner.onWindowComplete(indexName, windowEndOffset);
+        }
+    }
+
+    /** Fail this window terminally without advancing its source pushed offset. */
+    void onBatchFailed(Throwable failure) {
+        if (terminal.compareAndSet(false, true)) {
+            owner.onWindowFailed(failure);
         }
     }
 }

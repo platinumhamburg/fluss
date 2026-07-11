@@ -53,9 +53,16 @@ public final class IndexReplicatorPool implements AutoCloseable {
 
     private final ReplicatorWorker[] workers;
     private final int maxWindowBytes;
+    private final long preferredMaxRequestBytes;
 
     public IndexReplicatorPool(int numWorkers, int maxWindowBytes, long backoffMs) {
+        this(numWorkers, maxWindowBytes, maxWindowBytes, backoffMs);
+    }
+
+    public IndexReplicatorPool(
+            int numWorkers, int maxWindowBytes, long preferredMaxRequestBytes, long backoffMs) {
         this.maxWindowBytes = maxWindowBytes;
+        this.preferredMaxRequestBytes = preferredMaxRequestBytes;
         int workerCount = Math.max(1, numWorkers);
         this.workers = new ReplicatorWorker[workerCount];
         for (int i = 0; i < workerCount; i++) {
@@ -68,6 +75,11 @@ public final class IndexReplicatorPool implements AutoCloseable {
     /** Maximum number of WAL bytes a replicator reads per window. */
     public int maxWindowBytes() {
         return maxWindowBytes;
+    }
+
+    /** Preferred aggregate encoded output bound for one source window. */
+    public long preferredMaxRequestBytes() {
+        return preferredMaxRequestBytes;
     }
 
     /** Registers a replicator and wires its wake-up signal to the owning worker. */
