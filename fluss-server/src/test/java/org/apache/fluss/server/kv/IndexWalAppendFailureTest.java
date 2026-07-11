@@ -10,6 +10,7 @@ package org.apache.fluss.server.kv;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.KvFormat;
@@ -40,6 +41,7 @@ import org.apache.fluss.server.log.LogTabletTestHelper.FaultPhase;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestBase;
+import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableRegistration;
@@ -48,9 +50,16 @@ import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
+import java.lang.reflect.Field;
 import java.util.Collections;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
@@ -75,57 +84,74 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                     throw new TestBuildException();
                 });
 
-        assertThatThrownBy(() -> fixture.put(mutation)).isInstanceOf(TestBuildException.class);
+        assertThatThrownBy(() -> fixture.putDirect(mutation)).isInstanceOf(TestBuildException.class);
         assertThat(fixture.kv.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
         assertThat(fixture.kv.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount())
                 .isEqualTo(1L);
         assertThat(fixture.log.localLogEndOffset()).isZero();
 
         fixture.kv.setBeforeWalBuild(null);
-        fixture.put(mutation);
+        fixture.putDirect(mutation);
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
         assertWriterState(fixture.log, 100L);
     }
 
-    @Test
-    void testBeforeLocalAppendRestartConverges() throws Exception {
-        assertRestartConverges(FaultPhase.BEFORE_LOCAL_APPEND, 0L);
-    }
-
-    @Test
-    void testAfterLocalAppendRestartConverges() throws Exception {
-        assertRestartConverges(FaultPhase.AFTER_LOCAL_APPEND, 1L);
-    }
-
-    @Test
-    void testAfterWriterStatePublicationRestartConverges() throws Exception {
-        assertRestartConverges(FaultPhase.AFTER_WRITER_STATE_UPDATE, 1L);
-    }
-
-    private void assertRestartConverges(FaultPhase phase, long expectedWalEnd) throws Exception {
-        Fixture fixture = createFixture(8200L + phase.ordinal(), "phase_" + phase.name());
+    @ParameterizedTest(name = "phase={0}, wal={1}")
+    @MethodSource("restartCases")
+    void testReplicaFailStopAndRestartConvergence(FaultPhase phase, WalOutcome walOutcome)
+            throws Exception {
+        Fixture fixture =
+                createFixture(
+                        8200L + phase.ordinal() * 10L + walOutcome.ordinal(),
+                        "phase_" + phase.name() + "_" + walOutcome.name());
         KvRecordBatch mutation = mutation(WRITER_KEY, 100L, "value");
+        AtomicInteger fatalErrors = installCountingFatalHandler(fixture.replica);
         long errorTruncationsBefore =
                 fixture.kv.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount();
         LogTabletTestHelper.failOnceAt(fixture.log, phase, new TestAppendException());
 
-        assertThatThrownBy(() -> fixture.put(mutation))
-                .isInstanceOf(UncertainWalAppendException.class)
-                .hasCauseInstanceOf(TestAppendException.class);
-        assertThat(fixture.kv.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount())
-                .isEqualTo(errorTruncationsBefore);
-        assertThat(fixture.log.localLogEndOffset()).isEqualTo(expectedWalEnd);
+        try {
+            assertThatThrownBy(() -> fixture.putThroughReplica(mutation))
+                    .isInstanceOf(UncertainWalAppendException.class)
+                    .hasCauseInstanceOf(TestAppendException.class);
+            assertThat(fixture.kv.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount())
+                    .isEqualTo(errorTruncationsBefore);
+            assertThat(fixture.log.localLogEndOffset())
+                    .isEqualTo(phase == FaultPhase.BEFORE_LOCAL_APPEND ? 0L : 1L);
+            assertThat(fatalErrors).hasValue(1);
+            assertThat(isReplicaOnline(fixture.replica)).isFalse();
+            assertThat(fixture.replica.isLeader()).isFalse();
+            assertThatThrownBy(() -> fixture.putThroughReplica(mutation))
+                    .isInstanceOf(NotLeaderOrFollowerException.class);
+            assertThatThrownBy(() -> fixture.putDirect(mutation))
+                    .isInstanceOf(UncertainWalAppendException.class);
+            assertThat(fixture.log.localLogEndOffset())
+                    .isEqualTo(phase == FaultPhase.BEFORE_LOCAL_APPEND ? 0L : 1L);
+            assertThat(fatalErrors).hasValue(1);
 
-        restartFromDurableWal(fixture);
-        LogAppendInfo retried = fixture.put(mutation);
-        assertThat(retried.duplicated()).isEqualTo(expectedWalEnd == 1L);
-        assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
-        fixture.log.updateHighWatermark(1L);
-        fixture.kv.flush(1L, NOPErrorHandler.INSTANCE);
+            restartFromDurableWal(fixture, walOutcome);
+            LogAppendInfo retried = fixture.putDirect(mutation);
+            assertThat(retried.duplicated()).isEqualTo(walOutcome == WalOutcome.RETAINED);
+            assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
+            fixture.log.updateHighWatermark(1L);
+            fixture.kv.flush(1L, NOPErrorHandler.INSTANCE);
+            reopenDurableState(fixture);
 
-        assertThat(fixture.kv.multiGet(Collections.singletonList(fixture.expectedKey)))
-                .containsExactly(fixture.expectedValue);
-        assertWriterState(fixture.log, 100L);
+            assertThat(fixture.kv.limitScan(Integer.MAX_VALUE))
+                    .containsExactly(fixture.expectedValue);
+            assertWriterState(fixture.log, 100L);
+        } finally {
+            fixture.closeReplacements();
+        }
+    }
+
+    private static Stream<Arguments> restartCases() {
+        return Stream.of(
+                Arguments.of(FaultPhase.BEFORE_LOCAL_APPEND, WalOutcome.NO_WAL),
+                Arguments.of(FaultPhase.AFTER_LOCAL_APPEND, WalOutcome.RETAINED),
+                Arguments.of(FaultPhase.AFTER_LOCAL_APPEND, WalOutcome.LOST),
+                Arguments.of(FaultPhase.AFTER_WRITER_STATE_UPDATE, WalOutcome.RETAINED),
+                Arguments.of(FaultPhase.AFTER_WRITER_STATE_UPDATE, WalOutcome.LOST));
     }
 
     private static void assertWriterState(LogTablet logTablet, long sequence) {
@@ -141,30 +167,25 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                         });
     }
 
-    private void restartFromDurableWal(Fixture fixture) throws Exception {
-        File dataDir = fixture.log.getDataDir();
-        File logDir = fixture.log.getLogDir();
-        org.apache.fluss.metadata.LogFormat logFormat = fixture.log.getLogFormat();
+    private void restartFromDurableWal(Fixture fixture, WalOutcome walOutcome) throws Exception {
+        fixture.dataDir = fixture.log.getDataDir();
+        fixture.logDir = fixture.log.getLogDir();
+        fixture.logFormat = fixture.log.getLogFormat();
         fixture.kv.close();
-        fixture.log.flush(true);
+        if (walOutcome == WalOutcome.LOST) {
+            LogTabletTestHelper.truncateTo(fixture.log, 0L);
+        } else {
+            fixture.log.flush(true);
+        }
         fixture.log.close();
-        fixture.log =
-                LogTablet.create(
-                        dataDir,
-                        fixture.path,
-                        logDir,
-                        conf,
-                        TestingMetricGroups.TABLET_SERVER_METRICS,
-                        0L,
-                        new FlussScheduler(1),
-                        logFormat,
-                        1,
-                        true,
-                        SystemClock.getInstance(),
-                        false,
-                        KvIdempotenceProtocol.V1_FENCED);
+        fixture.replacementScheduler = new FlussScheduler(1);
+        fixture.replacementScheduler.startup();
+        fixture.log = createReplacementLog(fixture);
         fixture.log.updateHighWatermark(fixture.log.localLogEndOffset());
-        fixture.kv = createRecoveredKv(fixture);
+        fixture.recoveredKvDir =
+                new File(tempDir, "recovered-kv-" + fixture.log.getTableBucket().getTableId());
+        fixture.replacementAllocator = new RootAllocator(Long.MAX_VALUE);
+        fixture.kv = createReplacementKv(fixture);
 
         try (RemoteLogFetcher fetcher =
                 new RemoteLogFetcher(
@@ -178,7 +199,7 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                             new KvRecoverHelper.KvRecoverContext(
                                     fixture.path.getTablePath(), zkClient, Integer.MAX_VALUE),
                             KvFormat.COMPACTED,
-                            logFormat,
+                            fixture.logFormat,
                             fixture.schemaGetter,
                             fetcher,
                             fixture.kv.getValueEncoder())
@@ -186,7 +207,37 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
         }
     }
 
-    private KvTablet createRecoveredKv(Fixture fixture) throws Exception {
+    private void reopenDurableState(Fixture fixture) throws Exception {
+        fixture.log.flush(true);
+        fixture.kv.close();
+        fixture.replacementAllocator.close();
+        fixture.replacementAllocator = null;
+        fixture.log.close();
+
+        fixture.log = createReplacementLog(fixture);
+        fixture.log.updateHighWatermark(fixture.log.localLogEndOffset());
+        fixture.replacementAllocator = new RootAllocator(Long.MAX_VALUE);
+        fixture.kv = createReplacementKv(fixture);
+    }
+
+    private LogTablet createReplacementLog(Fixture fixture) throws Exception {
+        return LogTablet.create(
+                fixture.dataDir,
+                fixture.path,
+                fixture.logDir,
+                conf,
+                TestingMetricGroups.TABLET_SERVER_METRICS,
+                0L,
+                fixture.replacementScheduler,
+                fixture.logFormat,
+                1,
+                true,
+                SystemClock.getInstance(),
+                false,
+                KvIdempotenceProtocol.V1_FENCED);
+    }
+
+    private KvTablet createReplacementKv(Fixture fixture) throws Exception {
         TableConfig tableConfig = new TableConfig(new Configuration());
         RowMerger rowMerger =
                 RowMerger.create(tableConfig, KvFormat.COMPACTED, fixture.schemaGetter);
@@ -200,10 +251,10 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                 fixture.path,
                 fixture.log.getTableBucket(),
                 fixture.log,
-                new File(tempDir, "recovered-kv-" + fixture.log.getTableBucket().getTableId()),
+                fixture.recoveredKvDir,
                 conf,
                 TestingMetricGroups.TABLET_SERVER_METRICS,
-                new RootAllocator(Long.MAX_VALUE),
+                fixture.replacementAllocator,
                 new TestingMemorySegmentPool(10 * 1024),
                 KvFormat.COMPACTED,
                 rowMerger,
@@ -215,6 +266,20 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                 autoIncrementManager,
                 null,
                 null);
+    }
+
+    private static AtomicInteger installCountingFatalHandler(Replica replica) throws Exception {
+        AtomicInteger fatalErrors = new AtomicInteger();
+        Field field = Replica.class.getDeclaredField("fatalErrorHandler");
+        field.setAccessible(true);
+        field.set(replica, (FatalErrorHandler) ignored -> fatalErrors.incrementAndGet());
+        return fatalErrors;
+    }
+
+    private static boolean isReplicaOnline(Replica replica) throws Exception {
+        Field field = Replica.class.getDeclaredField("online");
+        field.setAccessible(true);
+        return ((AtomicBoolean) field.get(replica)).get();
     }
 
     private Fixture createFixture(long tableId, String tableName) throws Exception {
@@ -251,15 +316,12 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                 new TestingSchemaGetter(new SchemaInfo(TestData.DATA1_SCHEMA_PK, SCHEMA_ID));
         BinaryRow expectedRow =
                 compactedRow(TestData.DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "value"});
-        byte[] expectedKey =
-                new CompactedKeyEncoder(TestData.DATA1_SCHEMA_PK.getRowType(), new int[] {0})
-                        .encodeKey(expectedRow);
         return new Fixture(
                 physicalPath,
+                replica,
                 replica.getLogTablet(),
                 replica.getKvTablet(),
                 schemaGetter,
-                expectedKey,
                 ValueEncoder.encodeValue(SCHEMA_ID, expectedRow));
     }
 
@@ -280,30 +342,72 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
 
     private final class Fixture {
         private final PhysicalTablePath path;
+        private final Replica replica;
         private LogTablet log;
         private KvTablet kv;
         private final TestingSchemaGetter schemaGetter;
-        private final byte[] expectedKey;
         private final byte[] expectedValue;
+        private File dataDir;
+        private File logDir;
+        private File recoveredKvDir;
+        private org.apache.fluss.metadata.LogFormat logFormat;
+        private FlussScheduler replacementScheduler;
+        private RootAllocator replacementAllocator;
 
         private Fixture(
                 PhysicalTablePath path,
+                Replica replica,
                 LogTablet log,
                 KvTablet kv,
                 TestingSchemaGetter schemaGetter,
-                byte[] expectedKey,
                 byte[] expectedValue) {
             this.path = path;
+            this.replica = replica;
             this.log = log;
             this.kv = kv;
             this.schemaGetter = schemaGetter;
-            this.expectedKey = expectedKey;
             this.expectedValue = expectedValue;
         }
 
-        private LogAppendInfo put(KvRecordBatch records) throws Exception {
+        private LogAppendInfo putDirect(KvRecordBatch records) throws Exception {
             return kv.putAsLeader(records, null, org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
         }
+
+        private LogAppendInfo putThroughReplica(KvRecordBatch records) throws Exception {
+            return replica.putRecordsToLeader(
+                    records, null, org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE, -1);
+        }
+
+        private void closeReplacements() throws Exception {
+            if (replacementScheduler == null) {
+                return;
+            }
+            try {
+                if (kv != null) {
+                    kv.close();
+                }
+            } finally {
+                try {
+                    if (log != null) {
+                        log.close();
+                    }
+                } finally {
+                    try {
+                        replacementScheduler.shutdown();
+                    } finally {
+                        if (replacementAllocator != null) {
+                            replacementAllocator.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private enum WalOutcome {
+        NO_WAL,
+        RETAINED,
+        LOST
     }
 
     private static final class TestAppendException extends Exception {}

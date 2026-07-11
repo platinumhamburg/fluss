@@ -70,8 +70,8 @@ import org.apache.fluss.server.kv.wal.ArrowWalBuilder;
 import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.kv.wal.IndexWalBuilder;
 import org.apache.fluss.server.kv.wal.WalBuilder;
-import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogAppendInfo;
+import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
@@ -81,6 +81,7 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.function.SupplierWithException;
 
 import org.rocksdb.AbstractCompactionFilter;
 import org.rocksdb.AbstractCompactionFilterFactory;
@@ -102,6 +103,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.ToLongFunction;
@@ -124,6 +126,7 @@ public final class KvTablet {
 
     private final File kvTabletDir;
     @Nullable private volatile Runnable afterFencedPrecheck;
+    @Nullable private volatile Runnable putLockContentionHook;
     private final long writeBatchSize;
     private final RocksDBKv rocksDBKv;
     private final KvPreWriteBuffer kvPreWriteBuffer;
@@ -172,6 +175,10 @@ public final class KvTablet {
 
     @GuardedBy("kvLock")
     private volatile boolean isClosed = false;
+
+    @GuardedBy("kvLock")
+    @Nullable
+    private Throwable uncertainWalAppendFailure;
 
     private KvTablet(
             PhysicalTablePath physicalPath,
@@ -450,9 +457,9 @@ public final class KvTablet {
     public LogAppendInfo putAsLeader(
             KvRecordBatch kvRecords, @Nullable int[] targetColumns, MergeMode mergeMode)
             throws Exception {
-        return inWriteLock(
-                kvLock,
+        return inPutWriteLock(
                 () -> {
+                    throwIfUncertainWalAppend();
                     rocksDBKv.checkIfRocksDBClosed();
 
                     SchemaInfo schemaInfo = schemaGetter.getLatestSchemaInfo();
@@ -495,12 +502,14 @@ public final class KvTablet {
 
                     RowType latestRowType = latestSchema.getRowType();
                     boolean fenced = kvRecords.idempotenceProtocolVersion() == 1;
-                    WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType, fenced);
+                    WalBuilder walBuilder =
+                            createWalBuilder(latestSchemaId, latestRowType, fenced);
                     if (fenced) {
                         walBuilder.setFencedWriterState(
                                 kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
                     } else {
-                        walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
+                        walBuilder.setWriterState(
+                                kvRecords.writerId(), kvRecords.batchSequence());
                     }
                     // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
                     // only has fewer ending columns than latest schema, so we pad nulls to
@@ -554,9 +563,13 @@ public final class KvTablet {
                         //  those errors, we should not truncate the kvPreWriteBuffer.
                         if (fenced && appendInvoked) {
                             if (t instanceof Error) {
+                                uncertainWalAppendFailure = t;
                                 throw (Error) t;
                             }
-                            throw new UncertainWalAppendException(tableBucket, t);
+                            UncertainWalAppendException uncertainty =
+                                    new UncertainWalAppendException(tableBucket, t);
+                            uncertainWalAppendFailure = uncertainty;
+                            throw uncertainty;
                         }
                         kvPreWriteBuffer.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.ERROR);
                         throw t;
@@ -567,6 +580,34 @@ public final class KvTablet {
                 });
     }
 
+    private <T> T inPutWriteLock(SupplierWithException<T, Exception> action) throws Exception {
+        Lock writeLock = kvLock.writeLock();
+        Runnable contentionHook = putLockContentionHook;
+        if (contentionHook == null) {
+            writeLock.lock();
+        } else if (!writeLock.tryLock()) {
+            contentionHook.run();
+            writeLock.lock();
+        }
+        try {
+            return action.get();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    @GuardedBy("kvLock")
+    private void throwIfUncertainWalAppend() throws UncertainWalAppendException {
+        Throwable failure = uncertainWalAppendFailure;
+        if (failure == null) {
+            return;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        throw (UncertainWalAppendException) failure;
+    }
+
     @VisibleForTesting
     void setAfterFencedPrecheck(@Nullable Runnable afterFencedPrecheck) {
         this.afterFencedPrecheck = afterFencedPrecheck;
@@ -575,6 +616,11 @@ public final class KvTablet {
     @VisibleForTesting
     void setBeforeWalBuild(@Nullable Runnable beforeWalBuild) {
         this.beforeWalBuild = beforeWalBuild;
+    }
+
+    @VisibleForTesting
+    void setPutLockContentionHook(@Nullable Runnable putLockContentionHook) {
+        this.putLockContentionHook = putLockContentionHook;
     }
 
     private void validateSchemaId(short schemaIdOfNewData, short latestSchemaId) {

@@ -40,6 +40,25 @@ public final class LogTabletTestHelper {
                 });
     }
 
+    public static void runOnceAt(LogTablet tablet, FaultPhase phase, FaultAction action) {
+        tablet.setAppendFaultInjector(
+                new LogTablet.AppendFaultInjector() {
+                    private boolean fired;
+
+                    @Override
+                    public void inject(LogTablet.AppendPhase currentPhase) throws Exception {
+                        if (!fired && currentPhase.name().equals(phase.name())) {
+                            fired = true;
+                            action.run();
+                        }
+                    }
+                });
+    }
+
+    public static void truncateTo(LogTablet tablet, long offset) {
+        tablet.truncateTo(offset);
+    }
+
     public static void clearFault(LogTablet tablet) {
         tablet.setAppendFaultInjector(LogTablet.AppendFaultInjector.NO_OP);
     }
@@ -49,5 +68,11 @@ public final class LogTabletTestHelper {
         BEFORE_LOCAL_APPEND,
         AFTER_LOCAL_APPEND,
         AFTER_WRITER_STATE_UPDATE
+    }
+
+    /** Test action invoked at a selected append phase. */
+    @FunctionalInterface
+    public interface FaultAction {
+        void run() throws Exception;
     }
 }

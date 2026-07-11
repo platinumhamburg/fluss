@@ -36,8 +36,8 @@ import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.IndexVisibility;
-import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -197,6 +197,7 @@ public final class Replica {
     private final ArrowCompressionInfo arrowCompressionInfo;
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
     private final AtomicBoolean online = new AtomicBoolean(true);
+    @Nullable private volatile Runnable afterPutAdmission;
     private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
     private final RemoteLogManager remoteLogManager;
@@ -238,7 +239,9 @@ public final class Replica {
      */
     private final boolean hasSyncIndexes;
 
-    /** Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements. */
+    /**
+     * Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements.
+     */
     private volatile long syncIndexPushedOffset = -1L;
 
     /**
@@ -1250,6 +1253,10 @@ public final class Replica {
                         }
                     }
                     validateInSyncReplicaSize(requiredAcks);
+                    Runnable admissionHook = afterPutAdmission;
+                    if (admissionHook != null) {
+                        admissionHook.run();
+                    }
                     LogAppendInfo logAppendInfo;
                     try {
                         logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
@@ -2327,6 +2334,11 @@ public final class Replica {
     @VisibleForTesting
     boolean isOnline() {
         return online.get();
+    }
+
+    @VisibleForTesting
+    void setAfterPutAdmission(@Nullable Runnable afterPutAdmission) {
+        this.afterPutAdmission = afterPutAdmission;
     }
 
     private void failStop(Throwable failure) {

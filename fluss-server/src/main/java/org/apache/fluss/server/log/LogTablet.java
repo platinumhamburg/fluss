@@ -27,8 +27,8 @@ import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
-import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -827,7 +827,8 @@ public final class LogTablet {
                     throw new DuplicateSequenceException(
                             String.format(
                                     "Found all-stale fenced append for table bucket %s, dominating offset %s",
-                                    getTableBucket(), validateResult.dominatingTargetWalOffset()));
+                                    getTableBucket(),
+                                    validateResult.dominatingTargetWalOffset()));
                 }
                 updatedFencedWriters = validateResult.updates();
                 // A stale V1 batch returned above without rolling or otherwise mutating the WAL.
@@ -1229,9 +1230,13 @@ public final class LogTablet {
             FencedWriterStateEntry committed =
                     writerStateManager.lastFencedEntry(writerKey).orElse(null);
             FencedWriterStateEntry stagedCurrent = staged.get(writerKey);
-            if (stagedCurrent != null && batch.fencedSequence() <= stagedCurrent.lastSequence()) {
+            if (stagedCurrent != null
+                    && batch.fencedSequence() <= stagedCurrent.lastSequence()) {
                 throw fencedOrderingError(
-                        writerKey, batch.fencedSequence(), stagedCurrent.lastSequence(), "staged");
+                        writerKey,
+                        batch.fencedSequence(),
+                        stagedCurrent.lastSequence(),
+                        "staged");
             }
             if (committed != null && batch.fencedSequence() <= committed.lastSequence()) {
                 if (sawFresh) {
@@ -1251,7 +1256,8 @@ public final class LogTablet {
             FencedWriterStateEntry current = stagedCurrent != null ? stagedCurrent : committed;
             FencedWriterAppendInfo update =
                     new FencedWriterAppendInfo(writerKey, getTableBucket(), current);
-            update.append(batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
+            update.append(
+                    batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
             updates.add(update);
             staged.put(writerKey, update.updatedEntry());
         }
@@ -1260,7 +1266,8 @@ public final class LogTablet {
                 : FencedValidationResult.allFresh(updates);
     }
 
-    private void validateWalProtocol(LogRecordBatch batch, KvIdempotenceProtocol expectedProtocol) {
+    private void validateWalProtocol(
+            LogRecordBatch batch, KvIdempotenceProtocol expectedProtocol) {
         if (batch.idempotenceProtocolVersion() != expectedProtocol.version()) {
             throw new CorruptRecordException(
                     String.format(
@@ -1297,7 +1304,8 @@ public final class LogTablet {
             this.dominatingTimestamp = dominatingTimestamp;
         }
 
-        private static FencedValidationResult allFresh(Collection<FencedWriterAppendInfo> updates) {
+        private static FencedValidationResult allFresh(
+                Collection<FencedWriterAppendInfo> updates) {
             return new FencedValidationResult(updates, -1L, -1L);
         }
 
@@ -1557,7 +1565,9 @@ public final class LogTablet {
                 FencedWriterAppendInfo update =
                         writerStateManager.prepareFencedUpdate(batch.fencedWriterKey());
                 update.append(
-                        batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
+                        batch.fencedSequence(),
+                        batch.lastLogOffset(),
+                        batch.commitTimestamp());
                 writerStateManager.updateFenced(update);
             }
         }
