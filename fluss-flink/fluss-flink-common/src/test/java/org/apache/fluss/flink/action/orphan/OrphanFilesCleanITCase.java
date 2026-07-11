@@ -298,7 +298,7 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     private String summaryMessage() {
         List<String> summaries =
                 auditMessages().stream()
-                        .filter(message -> message.contains("action=summary"))
+                        .filter(message -> message.contains(" action=summary "))
                         .collect(java.util.stream.Collectors.toList());
         assertThat(summaries).hasSize(1);
         return summaries.get(0);
