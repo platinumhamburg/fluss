@@ -19,7 +19,9 @@ package org.apache.fluss.flink.action.orphan.fs;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
+import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
@@ -56,13 +58,27 @@ public final class SafeDeleter {
     private final boolean dryRun;
     private final AuditLogger audit;
     private final RateLimiter remoteFsOpRateLimiter;
+    private final String runId;
+    private final ScopeIdentity scope;
 
     public SafeDeleter(
             FileSystem fs, boolean dryRun, AuditLogger audit, RateLimiter remoteFsOpRateLimiter) {
+        this(fs, dryRun, audit, remoteFsOpRateLimiter, "unknown", ScopeIdentity.global());
+    }
+
+    public SafeDeleter(
+            FileSystem fs,
+            boolean dryRun,
+            AuditLogger audit,
+            RateLimiter remoteFsOpRateLimiter,
+            String runId,
+            ScopeIdentity scope) {
         this.fs = fs;
         this.dryRun = dryRun;
         this.audit = audit;
         this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
+        this.runId = runId;
+        this.scope = scope;
     }
 
     /**
@@ -74,22 +90,31 @@ public final class SafeDeleter {
      *     should track {@code false} returns as delete failures in their run summary.
      */
     public boolean deleteFile(FsPath file, Decision decision, RuleId ruleId) {
+        return deleteFile(new FileMeta(file, -1L, -1L), decision, ruleId);
+    }
+
+    public boolean deleteFile(FileMeta file, Decision decision, RuleId ruleId) {
         checkArgument(
                 decision == Decision.DELETE,
                 "deleteFile must only be called for Decision.DELETE, got %s",
                 decision);
         if (dryRun) {
-            audit.logWouldDelete(file, ruleId);
+            audit.logWouldDelete(runId, file, ruleId, scope);
             return true;
         }
         remoteFsOpRateLimiter.acquire();
         try {
-            boolean ok = fs.delete(file, false);
-            audit.logDeleted(file, ruleId, ok);
+            boolean ok = fs.delete(file.path(), false);
+            if (ok) {
+                audit.logDeleted(runId, file, ruleId, scope);
+            } else {
+                audit.logDeleteFailed(
+                        runId, file, ruleId, scope, "filesystem_returned_false", true);
+            }
             return ok;
         } catch (IOException e) {
-            LOG.warn("Failed to delete file: {}", file, e);
-            audit.logDeleted(file, ruleId, false);
+            LOG.warn("Failed to delete file: {}", file.path(), e);
+            audit.logDeleteFailed(runId, file, ruleId, scope, "io_error", true);
             return false;
         }
     }

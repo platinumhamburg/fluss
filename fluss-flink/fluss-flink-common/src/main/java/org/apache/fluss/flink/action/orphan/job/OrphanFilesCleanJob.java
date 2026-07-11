@@ -79,7 +79,8 @@ public final class OrphanFilesCleanJob {
                         .process(
                                 new ScanAndCleanFunction(
                                         config.remoteFsOpRateLimitPerSecond(),
-                                        config.extraConfigs()))
+                                        config.extraConfigs(),
+                                        runId))
                         .returns(TypeInformation.of(new TypeHint<CleanStats>() {}))
                         .name("ScanAndClean");
         if (parallelism != null) {
