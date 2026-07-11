@@ -99,6 +99,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     private final OrphanCleanConfig config;
     private final String runId;
     private transient TablePlanTracker tablePlans;
+    private transient ScopeProgressTracker scopeProgress;
 
     public ScopeEnumeratorFunction(OrphanCleanConfig config, String runId) {
         this.config = config;
@@ -135,6 +136,10 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             tablePlans = new TablePlanTracker();
             audit.logRunStart(runId, config);
             audit.logCutoff(runId, config.olderThanMillis());
+            scopeProgress =
+                    new ScopeProgressTracker(
+                            config.progressLogInterval(),
+                            (phase, stats) -> audit.logScopeProgress(runId, phase, stats));
 
             RateLimiter remoteFsOpRateLimiter =
                     RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
@@ -291,6 +296,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             if (config.table().isPresent()) {
                 dbState.tableInfosComplete = false;
                 resolveTable(admin, audit, tracker, dbState, config.table().get(), true, planStats);
+                scopeProgress.maybeLog("metadata", planStats);
                 continue;
             }
             List<String> tableNames;
@@ -304,6 +310,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             }
             for (String tableName : tableNames) {
                 resolveTable(admin, audit, tracker, dbState, tableName, false, planStats);
+                scopeProgress.maybeLog("metadata", planStats);
             }
         }
         return result;
@@ -486,6 +493,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
         for (TableBucket tableBucket : enumerateBuckets(liveTable.tableInfo, partitionInfo)) {
             planStats.discoveredBucket();
+            scopeProgress.maybeLog("bucket_tasks", planStats);
             int bucketId = tableBucket.getBucket();
 
             String logTabletDir = null;

@@ -123,6 +123,29 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Periodic cumulative progress while the single-threaded scope stage is still running. */
+    public void logScopeProgress(String runId, String phase, ScopePlanStats stats) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scope action=scope_progress phase={}"
+                        + " databases={} tables={} partitions={} discovered_buckets={}"
+                        + " bucket_tasks={} orphan_dir_tasks={} skipped_no_remote_manifest={}"
+                        + " skipped_empty_kv_active_set={} skipped_out_of_scope_root={}"
+                        + " metadata_failures={} ts={}",
+                runId,
+                phase,
+                stats.databases(),
+                stats.tables(),
+                stats.partitions(),
+                stats.discoveredBuckets(),
+                stats.bucketTasks(),
+                stats.orphanDirTasks(),
+                stats.skippedNoRemoteManifestCount(),
+                stats.skippedEmptyKvActiveSetCount(),
+                stats.skippedOutOfScopeRootCount(),
+                stats.metadataFailures(),
+                Instant.now());
+    }
+
     public void logScanStart(
             String runId,
             boolean dryRun,

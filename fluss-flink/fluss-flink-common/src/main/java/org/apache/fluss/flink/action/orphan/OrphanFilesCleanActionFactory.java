@@ -62,7 +62,7 @@ public class OrphanFilesCleanActionFactory implements ActionFactory {
                 + "    run, so a long scan cannot accidentally pull in files written after the\n"
                 + "    action started. The cutoff must be at least 1d before now (closer cutoffs\n"
                 + "    would race with mid-write files).\n"
-                + "  --progress-log-interval controls cumulative INFO progress per scan subtask.\n"
+                + "  --progress-log-interval controls cumulative INFO progress for scope and scan.\n"
                 + "    Default: 0ms (disabled); non-zero range: 1s to 1h.\n"
                 + "  --post-run-wait keeps the final TaskManager stage alive after its summary\n"
                 + "    is logged so short-lived batch logs can be collected. Default: 0ms; max: 1h.\n"
