@@ -1025,7 +1025,7 @@ public final class KvTablet {
 
     // only for testing.
     @VisibleForTesting
-    KvPreWriteBuffer getKvPreWriteBuffer() {
+    public KvPreWriteBuffer getKvPreWriteBuffer() {
         return kvPreWriteBuffer;
     }
 

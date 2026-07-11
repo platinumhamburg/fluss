@@ -20,14 +20,23 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.exception.DuplicateSequenceException;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.DefaultLogRecordBatch;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.MemoryLogRecordsCompactedBuilder;
+import org.apache.fluss.record.WriterKey;
+import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
@@ -39,9 +48,12 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -54,12 +66,14 @@ import java.util.Optional;
 import java.util.concurrent.ScheduledFuture;
 
 import static org.apache.fluss.record.TestData.DATA1;
+import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.record.TestData.TEST_SCHEMA_GETTER;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
+import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.utils.FlussPaths.offsetFromFile;
 import static org.apache.fluss.utils.FlussPaths.writerSnapshotFile;
@@ -480,6 +494,268 @@ final class LogTabletTest extends LogTestBase {
                                 "Out of order batch sequence for writer 1 at offset 25 in table-bucket "
                                         + "TableBucket{tableId=150001, bucket=%s} : 1 (incoming batch seq.), 6 (current batch seq.)",
                                 logTablet.getTableBucket().getBucket()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testFencedMultiBatchRejectsDescendingStagedSequenceAtomically(boolean follower)
+            throws Exception {
+        LogTablet log = createFencedLogTablet();
+        WriterKey key = new WriterKey(1L, 1L);
+        MemoryLogRecords records = fencedRecords(key, 101L, key, 100L);
+        prepareAppend(records, follower, 0L);
+
+        assertThatThrownBy(() -> append(log, records, follower))
+                .isInstanceOf(OutOfOrderSequenceException.class);
+        assertThat(log.localLogEndOffset()).isZero();
+        assertThat(log.writerStateManager().lastFencedEntry(key)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testFencedMultiBatchRejectsMixedCommittedStaleAndFreshAtomically(boolean follower)
+            throws Exception {
+        LogTablet log = createFencedLogTablet();
+        WriterKey committedKey = new WriterKey(2L, 1L);
+        WriterKey freshKey = new WriterKey(2L, 2L);
+        MemoryLogRecords seed = fencedRecords(committedKey, 100L);
+        prepareAppend(seed, follower, 0L);
+        append(log, seed, follower);
+
+        MemoryLogRecords mixed = fencedRecords(committedKey, 90L, freshKey, 1L);
+        prepareAppend(mixed, follower, 1L);
+        assertThatThrownBy(() -> append(log, mixed, follower))
+                .isInstanceOf(OutOfOrderSequenceException.class);
+
+        assertThat(log.localLogEndOffset()).isEqualTo(1L);
+        assertThat(
+                        log.writerStateManager()
+                                .lastFencedEntry(committedKey)
+                                .orElseThrow(AssertionError::new)
+                                .lastSequence())
+                .isEqualTo(100L);
+        assertThat(log.writerStateManager().lastFencedEntry(freshKey)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testFencedMultiBatchClassifiesAllCommittedStaleAtomically(boolean follower)
+            throws Exception {
+        LogTablet log = createFencedLogTablet();
+        WriterKey first = new WriterKey(3L, 1L);
+        WriterKey second = new WriterKey(3L, 2L);
+        MemoryLogRecords seed = fencedRecords(first, 100L, second, 100L);
+        prepareAppend(seed, follower, 0L);
+        append(log, seed, follower);
+
+        MemoryLogRecords stale = fencedRecords(first, 90L, second, 90L);
+        prepareAppend(stale, follower, 2L);
+        if (follower) {
+            assertThatThrownBy(() -> append(log, stale, true))
+                    .isInstanceOf(DuplicateSequenceException.class);
+        } else {
+            LogAppendInfo duplicate = append(log, stale, false);
+            assertThat(duplicate.duplicated()).isTrue();
+            assertThat(duplicate.lastOffset()).isEqualTo(1L);
+        }
+
+        assertThat(log.localLogEndOffset()).isEqualTo(2L);
+        assertThat(
+                        log.writerStateManager()
+                                .lastFencedEntry(first)
+                                .orElseThrow(AssertionError::new)
+                                .lastSequence())
+                .isEqualTo(100L);
+        assertThat(
+                        log.writerStateManager()
+                                .lastFencedEntry(second)
+                                .orElseThrow(AssertionError::new)
+                                .lastSequence())
+                .isEqualTo(100L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testFencedMultiBatchAcceptsAllFreshAtomically(boolean follower) throws Exception {
+        LogTablet log = createFencedLogTablet();
+        WriterKey key = new WriterKey(4L, 1L);
+        MemoryLogRecords fresh = fencedRecords(key, 100L, key, 101L);
+        prepareAppend(fresh, follower, 0L);
+
+        append(log, fresh, follower);
+
+        assertThat(log.localLogEndOffset()).isEqualTo(2L);
+        FencedWriterStateEntry state =
+                log.writerStateManager().lastFencedEntry(key).orElseThrow(AssertionError::new);
+        assertThat(state.lastSequence()).isEqualTo(101L);
+        assertThat(state.dominatingTargetWalOffset()).isEqualTo(1L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testFollowerRejectsWalProtocolMismatch(boolean fencedTable) throws Exception {
+        KvIdempotenceProtocol tableProtocol =
+                fencedTable
+                        ? KvIdempotenceProtocol.V1_FENCED
+                        : KvIdempotenceProtocol.V0_COMPACT;
+        KvIdempotenceProtocol incomingProtocol =
+                fencedTable
+                        ? KvIdempotenceProtocol.V0_COMPACT
+                        : KvIdempotenceProtocol.V1_FENCED;
+        LogTablet log = createProtocolLogTablet(tableProtocol);
+        MemoryLogRecords mismatched = protocolRecords(incomingProtocol);
+        prepareAppend(mismatched, true, 0L);
+
+        assertThatThrownBy(() -> log.appendAsFollower(mismatched))
+                .isInstanceOf(CorruptRecordException.class);
+        assertThat(log.localLogEndOffset()).isZero();
+        assertThat(log.writerStateManager().isEmpty()).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testRecoveryRejectsPersistedWalProtocolMismatch(boolean fencedWal) throws Exception {
+        File recoveryDir =
+                LogTestUtils.makeRandomLogTabletDir(
+                        tempDir,
+                        DATA1_TABLE_PATH.getDatabaseName(),
+                        DATA1_TABLE_ID,
+                        DATA1_TABLE_PATH.getTableName());
+        KvIdempotenceProtocol walProtocol =
+                fencedWal
+                        ? KvIdempotenceProtocol.V1_FENCED
+                        : KvIdempotenceProtocol.V0_COMPACT;
+        KvIdempotenceProtocol recoveryProtocol =
+                fencedWal
+                        ? KvIdempotenceProtocol.V0_COMPACT
+                        : KvIdempotenceProtocol.V1_FENCED;
+        LogTablet source = createProtocolLogTablet(recoveryDir, walProtocol);
+        source.appendAsLeader(protocolRecords(walProtocol));
+        source.close();
+
+        assertThatThrownBy(() -> createProtocolLogTablet(recoveryDir, recoveryProtocol))
+                .isInstanceOf(CorruptRecordException.class);
+    }
+
+    private LogTablet createFencedLogTablet() throws Exception {
+        File fencedDir =
+                LogTestUtils.makeRandomLogTabletDir(
+                        tempDir,
+                        DATA1_TABLE_PATH.getDatabaseName(),
+                        DATA1_TABLE_ID,
+                        DATA1_TABLE_PATH.getTableName());
+        return LogTablet.create(
+                tempDir,
+                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                fencedDir,
+                conf,
+                TestingMetricGroups.TABLET_SERVER_METRICS,
+                0,
+                scheduler,
+                LogFormat.COMPACTED,
+                1,
+                true,
+                SystemClock.getInstance(),
+                true,
+                KvIdempotenceProtocol.V1_FENCED);
+    }
+
+    private LogTablet createProtocolLogTablet(KvIdempotenceProtocol protocol) throws Exception {
+        File protocolDir =
+                LogTestUtils.makeRandomLogTabletDir(
+                        tempDir,
+                        DATA1_TABLE_PATH.getDatabaseName(),
+                        DATA1_TABLE_ID,
+                        DATA1_TABLE_PATH.getTableName());
+        return createProtocolLogTablet(protocolDir, protocol);
+    }
+
+    private LogTablet createProtocolLogTablet(
+            File protocolDir, KvIdempotenceProtocol protocol) throws Exception {
+        return LogTablet.create(
+                tempDir,
+                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                protocolDir,
+                conf,
+                TestingMetricGroups.TABLET_SERVER_METRICS,
+                0,
+                scheduler,
+                LogFormat.COMPACTED,
+                1,
+                true,
+                SystemClock.getInstance(),
+                true,
+                protocol);
+    }
+
+    private static MemoryLogRecords protocolRecords(KvIdempotenceProtocol protocol)
+            throws Exception {
+        MemoryLogRecordsCompactedBuilder builder =
+                protocol == KvIdempotenceProtocol.V1_FENCED
+                        ? MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                                DEFAULT_SCHEMA_ID,
+                                1024,
+                                new UnmanagedPagedOutputView(128),
+                                false)
+                        : MemoryLogRecordsCompactedBuilder.builder(
+                                DEFAULT_SCHEMA_ID,
+                                1024,
+                                new UnmanagedPagedOutputView(128),
+                                false);
+        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
+            builder.setFencedWriterState(new WriterKey(7L, 8L), 100L);
+        } else {
+            builder.setWriterState(7L, 0);
+        }
+        builder.append(
+                ChangeType.INSERT,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "protocol"}));
+        builder.close();
+        return MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
+    }
+
+    private static LogAppendInfo append(
+            LogTablet log, MemoryLogRecords records, boolean follower) throws Exception {
+        return follower ? log.appendAsFollower(records) : log.appendAsLeader(records);
+    }
+
+    private static void prepareAppend(
+            MemoryLogRecords records, boolean follower, long baseOffset) {
+        if (!follower) {
+            return;
+        }
+        long offset = baseOffset;
+        for (LogRecordBatch batch : records.batches()) {
+            DefaultLogRecordBatch mutable = (DefaultLogRecordBatch) batch;
+            mutable.setBaseLogOffset(offset++);
+            mutable.setCommitTimestamp(1_000L + offset);
+        }
+    }
+
+    private static MemoryLogRecords fencedRecords(Object... writerAndSequences) throws Exception {
+        List<byte[]> batches = new ArrayList<>();
+        int totalSize = 0;
+        for (int i = 0; i < writerAndSequences.length; i += 2) {
+            WriterKey writerKey = (WriterKey) writerAndSequences[i];
+            long sequence = (Long) writerAndSequences[i + 1];
+            MemoryLogRecordsCompactedBuilder builder =
+                    MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                            DEFAULT_SCHEMA_ID,
+                            1024,
+                            new UnmanagedPagedOutputView(128),
+                            false);
+            builder.setFencedWriterState(writerKey, sequence);
+            builder.close();
+            BytesView bytes = builder.build();
+            byte[] batch = new byte[bytes.getBytesLength()];
+            bytes.getByteBuf().getBytes(bytes.getByteBuf().readerIndex(), batch);
+            batches.add(batch);
+            totalSize += batch.length;
+        }
+        ByteBuffer combined = ByteBuffer.allocate(totalSize);
+        batches.forEach(combined::put);
+        combined.flip();
+        return MemoryLogRecords.pointToByteBuffer(combined);
     }
 
     private LogTablet createLogTablet(Configuration config) throws Exception {

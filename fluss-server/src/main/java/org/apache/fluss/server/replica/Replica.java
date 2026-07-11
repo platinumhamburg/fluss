@@ -1228,7 +1228,6 @@ public final class Replica {
                                         tableBucket, localTabletServerId));
                     }
 
-                    validateInSyncReplicaSize(requiredAcks);
                     KvTablet kv = this.kvTablet;
                     checkNotNull(
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
@@ -1250,6 +1249,7 @@ public final class Replica {
                                     "KV idempotence protocol V1 requires acks=-1");
                         }
                     }
+                    validateInSyncReplicaSize(requiredAcks);
                     LogAppendInfo logAppendInfo;
                     try {
                         logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);

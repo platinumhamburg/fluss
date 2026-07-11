@@ -67,6 +67,7 @@ import org.apache.fluss.server.kv.scan.ScannerContext;
 import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.FencedWriterAppendInfo;
+import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.LogTestUtils;
@@ -94,6 +95,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -1450,18 +1452,25 @@ class KvTabletTest {
                 new HashMap<>(),
                 KvIdempotenceProtocol.V1_FENCED);
         WriterKey writerKey = new WriterKey(9L, 3L);
-        KvRecordBatch older = emptyFencedBatch(writerKey, 100L);
+        byte[] key = "race-key".getBytes();
+        BinaryRow olderRow =
+                compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "old"});
+        BinaryRow newerRow =
+                compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "new"});
+        byte[] newerValue = ValueEncoder.encodeValue(schemaId, newerRow);
+        KvRecordBatch older = fencedBatch(writerKey, 100L, key, olderRow);
         CompactedWalBuilder newerBuilder =
                 CompactedWalBuilder.fencedBuilder(
                         schemaId,
                         DATA1_SCHEMA_PK.getRowType(),
                         new TestingMemorySegmentPool(1024));
         newerBuilder.setFencedWriterState(writerKey, 200L);
-        MemoryLogRecords newer = newerBuilder.build();
+        newerBuilder.append(ChangeType.INSERT, newerRow);
         kvTablet.setAfterFencedPrecheck(
                 () -> {
                     try {
-                        logTablet.appendAsLeader(newer);
+                        kvTablet.putToPreWriteBuffer(ChangeType.INSERT, key, newerValue, 0L);
+                        logTablet.appendAsLeader(newerBuilder.build());
                     } catch (Exception e) {
                         throw new RuntimeException(e);
                     }
@@ -1477,12 +1486,45 @@ class KvTabletTest {
         assertThat(result.duplicated()).isTrue();
         assertThat(result.lastOffset()).isZero();
         assertThat(logTablet.localLogEndOffset()).isEqualTo(1L);
-        assertThat(
-                        logTablet.writerStateManager()
-                                .lastFencedEntry(writerKey)
-                                .orElseThrow(AssertionError::new)
-                                .lastSequence())
-                .isEqualTo(200L);
+        FencedWriterStateEntry state =
+                logTablet.writerStateManager()
+                        .lastFencedEntry(writerKey)
+                        .orElseThrow(AssertionError::new);
+        assertThat(state.lastSequence()).isEqualTo(200L);
+        assertThat(state.dominatingTargetWalOffset()).isZero();
+        assertThat(kvTablet.getKvPreWriteBuffer().get(Key.of(key))).isEqualTo(Value.of(newerValue));
+        assertThat(kvTablet.getKvPreWriteBuffer().getAllKvEntries()).hasSize(1);
+        assertThat(kvTablet.getKvPreWriteBuffer().getTruncateAsDuplicatedCount().getCount())
+                .isEqualTo(1L);
+        assertThat(kvTablet.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount()).isZero();
+
+        Iterator<LogRecordBatch> batches = readLogRecords().batches().iterator();
+        LogRecordBatch batch = batches.next();
+        assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
+        assertThat(batch.baseLogOffset()).isZero();
+        assertThat(batch.lastLogOffset()).isZero();
+        assertThat(batch.getRecordCount()).isEqualTo(1);
+        assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
+        assertThat(batch.fencedSequence()).isEqualTo(200L);
+        assertThat(batches.hasNext()).isFalse();
+
+        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        assertThat(kvTablet.multiGet(Collections.singletonList(key)))
+                .containsExactly(newerValue);
+    }
+
+    private static KvRecordBatch fencedBatch(
+            WriterKey writerKey, long sequence, byte[] key, BinaryRow row) throws Exception {
+        FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        schemaId,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED);
+        builder.append(key, row);
+        builder.setWriterState(writerKey, sequence);
+        return KvRecordBatchReader.pointToByteBuffer(
+                builder.build().getByteBuf().nioBuffer());
     }
 
     private static KvRecordBatch emptyFencedBatch(WriterKey writerKey, long sequence)

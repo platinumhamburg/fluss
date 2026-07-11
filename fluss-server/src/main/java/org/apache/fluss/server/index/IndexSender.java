@@ -115,9 +115,13 @@ public final class IndexSender implements AutoCloseable {
 
     /** Buckets with an in-flight request; value is the request send timestamp in millis. */
     private final ConcurrentMap<TableBucket, Long> inFlightSinceMs = MapUtils.newConcurrentMap();
+    private final ConcurrentMap<TableBucket, IndexBatch> inFlightBatches =
+            MapUtils.newConcurrentMap();
     private final ConcurrentMap<TableBucket, Integer> resolvedLeaders = MapUtils.newConcurrentMap();
     private final Object capabilityLock = new Object();
     private final Map<Integer, CapabilityEntry> capabilitiesByServer = new HashMap<>();
+    private volatile boolean closed;
+    private long nextTargetGeneration;
 
     public IndexSender(
             IndexAccumulator accumulator,
@@ -213,6 +217,9 @@ public final class IndexSender implements AutoCloseable {
     }
 
     private void enqueueReadyBucket(TableBucket bucket) {
+        if (closed) {
+            return;
+        }
         workers[ownerOf(bucket)].enqueueReadyBucket(bucket);
     }
 
@@ -223,6 +230,14 @@ public final class IndexSender implements AutoCloseable {
     @Override
     public void close() {
         LOG.info("IndexSender closing");
+        synchronized (capabilityLock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            nextTargetGeneration++;
+            capabilitiesByServer.clear();
+        }
         for (SenderWorker worker : workers) {
             worker.initiateShutdown();
         }
@@ -234,6 +249,11 @@ public final class IndexSender implements AutoCloseable {
                 Thread.currentThread().interrupt();
             }
         }
+        for (IndexBatch batch : inFlightBatches.values()) {
+            accumulator.release(batch);
+        }
+        inFlightBatches.clear();
+        inFlightSinceMs.clear();
     }
 
     /** A single sender worker that owns the buckets hashing to its index. */
@@ -299,6 +319,9 @@ public final class IndexSender implements AutoCloseable {
 
         /** Claims at most one batch per owned, non-muted bucket and dispatches them. */
         private boolean drainAndSend() {
+            if (closed) {
+                return false;
+            }
             long now = System.currentTimeMillis();
             List<IndexBatch> claimed = new ArrayList<>();
             List<TableBucket> deferredBuckets = new ArrayList<>();
@@ -315,6 +338,7 @@ public final class IndexSender implements AutoCloseable {
                     continue;
                 }
                 inFlightSinceMs.put(bucket, now);
+                inFlightBatches.put(bucket, batch);
                 claimed.add(batch);
             }
             for (TableBucket deferredBucket : deferredBuckets) {
@@ -355,6 +379,10 @@ public final class IndexSender implements AutoCloseable {
         }
 
         private void sendToServer(int serverId, List<IndexBatch> batches) {
+            if (closed) {
+                discardAll(batches);
+                return;
+            }
             TabletServerGateway gateway;
             try {
                 gateway = gatewayFactory.apply(serverId);
@@ -372,22 +400,38 @@ public final class IndexSender implements AutoCloseable {
             long now = System.currentTimeMillis();
             boolean useCachedCapability = false;
             boolean waitForRetry = false;
+            boolean closedAfterResolve = false;
+            long generation = -1L;
             synchronized (capabilityLock) {
-                CapabilityEntry cached = capabilitiesByServer.get(serverId);
-                if (cached != null && cached.gateway == gateway) {
-                    if (cached.compatible) {
-                        useCachedCapability = true;
-                    } else if (cached.queryInFlight || now < cached.retryAtMs) {
-                        waitForRetry = true;
+                if (closed) {
+                    closedAfterResolve = true;
+                } else {
+                    CapabilityEntry cached = capabilitiesByServer.get(serverId);
+                    if (cached != null && cached.gateway == gateway) {
+                        if (cached.compatible) {
+                            useCachedCapability = true;
+                        } else if (cached.queryInFlight || now < cached.retryAtMs) {
+                            waitForRetry = true;
+                        }
+                    }
+                    if (!useCachedCapability && !waitForRetry) {
+                        generation = ++nextTargetGeneration;
+                        capabilitiesByServer.put(
+                                serverId,
+                                new CapabilityEntry(
+                                        gateway, generation, false, true, Long.MAX_VALUE));
+                    } else {
+                        generation = cached.generation;
                     }
                 }
-                if (!useCachedCapability && !waitForRetry) {
-                    capabilitiesByServer.put(
-                            serverId, new CapabilityEntry(gateway, false, true, Long.MAX_VALUE));
-                }
             }
+            if (closedAfterResolve) {
+                discardAll(batches);
+                return;
+            }
+            final long targetGeneration = generation;
             if (useCachedCapability) {
-                sendCapableBatches(gateway, batches);
+                dispatchIfCurrent(serverId, gateway, targetGeneration, batches);
                 return;
             }
             if (waitForRetry) {
@@ -403,7 +447,8 @@ public final class IndexSender implements AutoCloseable {
                                         .setClientSoftwareName("fluss-index-replicator")
                                         .setClientSoftwareVersion("2"));
             } catch (Throwable t) {
-                completeCapabilityQuery(serverId, gateway, batches, null, t);
+                completeCapabilityQuery(
+                        serverId, gateway, targetGeneration, batches, null, t);
                 return;
             }
             FutureUtils.orTimeout(
@@ -414,15 +459,25 @@ public final class IndexSender implements AutoCloseable {
                     .whenComplete(
                             (response, error) ->
                                     completeCapabilityQuery(
-                                            serverId, gateway, batches, response, error));
+                                            serverId,
+                                            gateway,
+                                            targetGeneration,
+                                            batches,
+                                            response,
+                                            error));
         }
 
         private void completeCapabilityQuery(
                 int serverId,
                 TabletServerGateway gateway,
+                long generation,
                 List<IndexBatch> batches,
                 @Nullable ApiVersionsResponse response,
                 @Nullable Throwable error) {
+            if (!targetIsCurrent(serverId, gateway, generation, batches)) {
+                retryOrDiscard(batches);
+                return;
+            }
             boolean compatible = error == null && supportsPutKvV2(response);
             long retryAtMs =
                     compatible
@@ -432,19 +487,24 @@ public final class IndexSender implements AutoCloseable {
             boolean invalidated;
             synchronized (capabilityLock) {
                 CapabilityEntry current = capabilitiesByServer.get(serverId);
-                invalidated = current == null || current.gateway != gateway;
+                invalidated =
+                        closed
+                                || current == null
+                                || current.gateway != gateway
+                                || current.generation != generation;
                 if (!invalidated) {
                     capabilitiesByServer.put(
                             serverId,
-                            new CapabilityEntry(gateway, compatible, false, retryAtMs));
+                            new CapabilityEntry(
+                                    gateway, generation, compatible, false, retryAtMs));
                 }
             }
             if (invalidated) {
-                reEnqueueAll(batches);
+                retryOrDiscard(batches);
                 return;
             }
             if (compatible) {
-                sendCapableBatches(gateway, batches);
+                dispatchIfCurrent(serverId, gateway, generation, batches);
             } else {
                 metrics.indexPushErrors().inc();
                 LOG.warn(
@@ -455,8 +515,16 @@ public final class IndexSender implements AutoCloseable {
             }
         }
 
-        private void sendCapableBatches(
-                TabletServerGateway gateway, List<IndexBatch> batches) {
+        private void dispatchIfCurrent(
+                int serverId,
+                TabletServerGateway gateway,
+                long generation,
+                List<IndexBatch> batches) {
+            if (!targetIsCurrent(serverId, gateway, generation, batches)) {
+                invalidateTarget(serverId, gateway, generation);
+                retryOrDiscard(batches);
+                return;
+            }
 
             // Group by tableId for consolidated multi-bucket requests.
             Map<Long, List<IndexBatch>> byTable = new HashMap<>();
@@ -469,13 +537,22 @@ public final class IndexSender implements AutoCloseable {
                 long tableId = tableEntry.getKey();
                 // Split each table's batches so no single request exceeds maxRequestBytes.
                 for (List<IndexBatch> chunk : splitByRequestBytes(tableEntry.getValue())) {
-                    sendOneRequest(gateway, tableId, chunk);
+                    sendOneRequest(serverId, gateway, generation, tableId, chunk);
                 }
             }
         }
 
         private void sendOneRequest(
-                TabletServerGateway gateway, long tableId, List<IndexBatch> chunk) {
+                int serverId,
+                TabletServerGateway gateway,
+                long generation,
+                long tableId,
+                List<IndexBatch> chunk) {
+            if (!targetIsCurrent(serverId, gateway, generation, chunk)) {
+                invalidateTarget(serverId, gateway, generation);
+                retryOrDiscard(chunk);
+                return;
+            }
             PutKvRequest request = buildRequest(tableId, chunk);
             long startNs = System.nanoTime();
             try {
@@ -487,6 +564,11 @@ public final class IndexSender implements AutoCloseable {
                                 "Index push PutKv timed out for tableId=" + tableId)
                         .whenComplete(
                                 (resp, err) -> {
+                                    if (!targetIsCurrent(
+                                            serverId, gateway, generation, chunk)) {
+                                        retryOrDiscard(chunk);
+                                        return;
+                                    }
                                     metrics.indexPushLatencyHistogram()
                                             .update((System.nanoTime() - startNs) / 1_000_000L);
                                     if (err != null) {
@@ -500,7 +582,54 @@ public final class IndexSender implements AutoCloseable {
                                 });
             } catch (Throwable t) {
                 metrics.indexPushErrors().inc();
-                reEnqueueAll(chunk);
+                retryOrDiscard(chunk);
+            }
+        }
+    }
+
+    private boolean targetIsCurrent(
+            int serverId,
+            TabletServerGateway gateway,
+            long generation,
+            List<IndexBatch> batches) {
+        if (closed) {
+            return false;
+        }
+        synchronized (capabilityLock) {
+            CapabilityEntry current = capabilitiesByServer.get(serverId);
+            if (current == null
+                    || current.gateway != gateway
+                    || current.generation != generation) {
+                return false;
+            }
+        }
+        try {
+            if (gatewayFactory.apply(serverId) != gateway) {
+                return false;
+            }
+            for (IndexBatch batch : batches) {
+                TableBucket bucket = batch.targetBucket();
+                OptionalInt leader =
+                        leaderResolver.resolveLeader(bucket.getTableId(), bucket.getBucket());
+                if (!leader.isPresent() || leader.getAsInt() != serverId) {
+                    return false;
+                }
+            }
+            return !closed;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private void invalidateTarget(
+            int serverId, TabletServerGateway gateway, long generation) {
+        synchronized (capabilityLock) {
+            CapabilityEntry current = capabilitiesByServer.get(serverId);
+            if (current != null
+                    && current.gateway == gateway
+                    && current.generation == generation) {
+                capabilitiesByServer.remove(serverId);
+                nextTargetGeneration++;
             }
         }
     }
@@ -519,16 +648,19 @@ public final class IndexSender implements AutoCloseable {
 
     private static final class CapabilityEntry {
         private final TabletServerGateway gateway;
+        private final long generation;
         private final boolean compatible;
         private final boolean queryInFlight;
         private final long retryAtMs;
 
         private CapabilityEntry(
                 TabletServerGateway gateway,
+                long generation,
                 boolean compatible,
                 boolean queryInFlight,
                 long retryAtMs) {
             this.gateway = gateway;
+            this.generation = generation;
             this.compatible = compatible;
             this.queryInFlight = queryInFlight;
             this.retryAtMs = retryAtMs;
@@ -609,10 +741,29 @@ public final class IndexSender implements AutoCloseable {
         }
     }
 
+    private void retryOrDiscard(List<IndexBatch> batches) {
+        if (closed) {
+            discardAll(batches);
+        } else {
+            reEnqueueAll(batches);
+        }
+    }
+
+    private void discardAll(List<IndexBatch> batches) {
+        for (IndexBatch batch : batches) {
+            accumulator.release(batch);
+            unmute(batch.targetBucket());
+        }
+    }
+
     /**
      * Re-enqueue a failed batch with an exponential retry backoff applied before it is eligible.
      */
     private boolean reEnqueueIfOwnerActive(IndexBatch batch) {
+        if (closed) {
+            accumulator.release(batch);
+            return false;
+        }
         if (batch.ownerClosed()) {
             accumulator.release(batch);
             return false;
@@ -628,7 +779,8 @@ public final class IndexSender implements AutoCloseable {
 
     private void unmute(TableBucket bucket) {
         inFlightSinceMs.remove(bucket);
-        if (accumulator.hasPending(bucket)) {
+        inFlightBatches.remove(bucket);
+        if (!closed && accumulator.hasPending(bucket)) {
             enqueueReadyBucket(bucket);
         }
     }

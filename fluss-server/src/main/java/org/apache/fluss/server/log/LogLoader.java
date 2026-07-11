@@ -19,10 +19,12 @@ package org.apache.fluss.server.log;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.InvalidOffsetException;
 import org.apache.fluss.exception.LogSegmentOffsetOverflowException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -92,6 +94,7 @@ final class LogLoader {
         Tuple2<Long, Long> result = recoverLog();
         newRecoveryPoint = result.f0;
         nextOffset = result.f1;
+        validateWalProtocol();
 
         // Any segment loading or recovery code must not use writerStateManager, so that we can
         // build the full state here from scratch.
@@ -121,6 +124,31 @@ final class LogLoader {
                 newRecoveryPoint,
                 new LogOffsetMetadata(
                         nextOffset, activeSegment.getBaseOffset(), activeSegment.getSizeInBytes()));
+    }
+
+    private void validateWalProtocol() throws IOException {
+        int expectedProtocol = writerStateManager.protocol().version();
+        for (LogSegment segment : logSegments.values()) {
+            FetchDataInfo data =
+                    segment.read(
+                            segment.getBaseOffset(),
+                            Integer.MAX_VALUE,
+                            segment.getSizeInBytes(),
+                            false);
+            if (data == null) {
+                continue;
+            }
+            for (LogRecordBatch batch : data.getRecords().batches()) {
+                if (batch.idempotenceProtocolVersion() != expectedProtocol) {
+                    throw new CorruptRecordException(
+                            String.format(
+                                    "Target WAL magic v%s does not match table protocol V%s while recovering %s",
+                                    batch.magic(),
+                                    expectedProtocol,
+                                    logSegments.getTableBucket()));
+                }
+            }
+        }
     }
 
     /**

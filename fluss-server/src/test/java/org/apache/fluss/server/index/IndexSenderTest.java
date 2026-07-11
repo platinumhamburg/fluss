@@ -18,7 +18,13 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
+import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.FencedKvRecordBatchBuilder;
+import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchReader;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
@@ -36,12 +42,15 @@ import org.apache.fluss.server.tablet.TestTabletServerGateway;
 import org.apache.fluss.utils.MapUtils;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
@@ -62,6 +71,7 @@ public class IndexSenderTest {
         private volatile boolean autoCompleteSuccess;
         private volatile short putKvMaxVersion = 2;
         private volatile int apiVersionsCalls;
+        private volatile CompletableFuture<ApiVersionsResponse> pendingApiVersions;
 
         RecordingGateway() {
             super(false, Collections.emptySet());
@@ -83,6 +93,13 @@ public class IndexSenderTest {
         @Override
         public CompletableFuture<ApiVersionsResponse> apiVersions(ApiVersionsRequest request) {
             apiVersionsCalls++;
+            if (pendingApiVersions != null) {
+                return pendingApiVersions;
+            }
+            return CompletableFuture.completedFuture(apiVersionsResponse());
+        }
+
+        private ApiVersionsResponse apiVersionsResponse() {
             ApiVersionsResponse response = new ApiVersionsResponse();
             response.addAllApiVersions(
                     Collections.singletonList(
@@ -90,7 +107,16 @@ public class IndexSenderTest {
                                     .setApiKey(ApiKeys.PUT_KV.id)
                                     .setMinVersion(0)
                                     .setMaxVersion(putKvMaxVersion)));
-            return CompletableFuture.completedFuture(response);
+            return response;
+        }
+
+        private void completeApiVersions(boolean success) {
+            CompletableFuture<ApiVersionsResponse> future = pendingApiVersions;
+            if (success) {
+                future.complete(apiVersionsResponse());
+            } else {
+                future.completeExceptionally(new RuntimeException("injected capability failure"));
+            }
         }
 
         /**
@@ -109,6 +135,116 @@ public class IndexSenderTest {
                 }
             }
             return response;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void closeFencesLateCapabilityCallback(boolean success) throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.pendingApiVersions = new CompletableFuture<>();
+        TableBucket bucket = new TableBucket(40L, 0);
+        IndexReplicator owner = owner(accumulator);
+        accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, indexBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L);
+
+        await(() -> gateway.apiVersionsCalls == 1);
+        sender.close();
+        gateway.completeApiVersions(success);
+
+        assertThat(gateway.requests).isEmpty();
+        assertThat(sender.inFlightRequestCount()).isZero();
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void leaderChangeFencesLateCapabilityCallbackAndRetriesNewTarget(boolean success)
+            throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway first = new RecordingGateway();
+        first.pendingApiVersions = new CompletableFuture<>();
+        RecordingGateway second = new RecordingGateway();
+        second.autoCompleteSuccess = true;
+        AtomicInteger leader = new AtomicInteger(1);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, indexBucket) -> OptionalInt.of(leader.get()),
+                        serverId -> serverId == 1 ? first : second,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        5_000L);
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(
+                            new TableBucket(41L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            await(() -> first.apiVersionsCalls == 1);
+
+            leader.set(2);
+            first.completeApiVersions(success);
+
+            await(() -> second.requests.size() == 1);
+            assertThat(first.requests).isEmpty();
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+        } finally {
+            sender.close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void gatewayReplacementFencesLateCapabilityCallbackAndRetriesNewGateway(boolean success)
+            throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway first = new RecordingGateway();
+        first.pendingApiVersions = new CompletableFuture<>();
+        RecordingGateway second = new RecordingGateway();
+        second.autoCompleteSuccess = true;
+        RecordingGateway[] current = {first};
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, indexBucket) -> OptionalInt.of(1),
+                        serverId -> current[0],
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        5_000L);
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(
+                            new TableBucket(42L, 0),
+                            new IndexWindow("idx", 10L, 1, owner)));
+            await(() -> first.apiVersionsCalls == 1);
+
+            current[0] = second;
+            first.completeApiVersions(success);
+
+            await(() -> second.requests.size() == 1);
+            assertThat(first.requests).isEmpty();
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+        } finally {
+            sender.close();
         }
     }
 
@@ -133,7 +269,16 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(42L, 0);
             IndexReplicator owner = owner(accumulator);
-            accumulator.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+            IndexBatch encodedBatch =
+                    v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+            byte[] expected = bytes(encodedBatch.encoded());
+            KvRecordBatch parsed =
+                    KvRecordBatchReader.pointToByteBuffer(
+                            encodedBatch.encoded().getByteBuf().nioBuffer());
+            assertThat(parsed.magic()).isEqualTo(KvRecordBatch.KV_MAGIC_VALUE_V1);
+            assertThat(parsed.fencedWriterKey()).isEqualTo(new WriterKey(9L, 3L));
+            assertThat(parsed.fencedSequence()).isEqualTo(10L);
+            accumulator.append(encodedBatch);
 
             await(() -> gateway.apiVersionsCalls == 1);
             assertThat(gateway.requests).isEmpty();
@@ -149,7 +294,7 @@ public class IndexSenderTest {
                     request.getBucketsReqsList().get(0).getRecordsSlice();
             byte[] sent = new byte[records.readableBytes()];
             records.getBytes(records.readerIndex(), sent);
-            assertThat(sent).containsExactly(1, 2, 3);
+            assertThat(sent).containsExactly(expected);
         } finally {
             sender.close();
         }
@@ -200,6 +345,25 @@ public class IndexSenderTest {
         byte[] bytes = new byte[] {1, 2, 3};
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length);
         return new IndexBatch(targetBucket, encoded, window);
+    }
+
+    private static IndexBatch v1Batch(TableBucket targetBucket, IndexWindow window)
+            throws Exception {
+        FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        1,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED);
+        builder.append(new byte[] {7, 8, 9}, null);
+        builder.setWriterState(new WriterKey(9L, 3L), 10L);
+        return new IndexBatch(targetBucket, builder.build(), window);
+    }
+
+    private static byte[] bytes(BytesView view) {
+        byte[] bytes = new byte[view.getBytesLength()];
+        view.getByteBuf().getBytes(view.getByteBuf().readerIndex(), bytes);
+        return bytes;
     }
 
     /** A per-bucket success response acking exactly the given bucket ids (no error set). */

@@ -26,6 +26,7 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -779,7 +780,6 @@ public final class LogTablet {
                 }
             }
 
-            validateWalProtocol(validRecords);
             Collection<WriterAppendInfo> updatedWriters = Collections.emptyList();
             Collection<FencedWriterAppendInfo> updatedFencedWriters = Collections.emptyList();
             if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT) {
@@ -815,23 +815,21 @@ public final class LogTablet {
                     return appendInfo;
                 }
             } else {
-                Either<FencedWriterStateEntry, Collection<FencedWriterAppendInfo>> validateResult =
+                FencedValidationResult validateResult =
                         analyzeAndValidateFencedWriterState(validRecords);
-                if (validateResult.isLeft()) {
-                    FencedWriterStateEntry dominating = validateResult.left();
+                if (validateResult.allStale()) {
                     if (appendAsLeader) {
                         return LogAppendInfo.duplicatedAt(
-                                dominating.dominatingTargetWalOffset(),
-                                dominating.lastTimestamp());
+                                validateResult.dominatingTargetWalOffset(),
+                                validateResult.dominatingTimestamp());
                     }
                     throw new DuplicateSequenceException(
                             String.format(
-                                    "Found stale fenced batch for table bucket %s, writer key %s and sequence %s",
+                                    "Found all-stale fenced append for table bucket %s, dominating offset %s",
                                     getTableBucket(),
-                                    dominating.writerKey(),
-                                    dominating.lastSequence()));
+                                    validateResult.dominatingTargetWalOffset()));
                 }
-                updatedFencedWriters = validateResult.right();
+                updatedFencedWriters = validateResult.updates();
                 // A stale V1 batch returned above without rolling or otherwise mutating the WAL.
                 maybeRoll(validRecords.sizeInBytes(), appendInfo);
             }
@@ -862,18 +860,6 @@ public final class LogTablet {
                 flush(false);
             }
             return appendInfo;
-        }
-    }
-
-    private void validateWalProtocol(MemoryLogRecords records) {
-        int expected = writerStateManager.protocol().version();
-        for (LogRecordBatch batch : records.batches()) {
-            if (batch.idempotenceProtocolVersion() != expected) {
-                throw new CorruptRecordException(
-                        String.format(
-                                "Target WAL magic v%s does not match table protocol V%s for %s",
-                                batch.magic(), expected, getTableBucket()));
-            }
         }
     }
 
@@ -1188,6 +1174,7 @@ public final class LogTablet {
         Map<Long, WriterAppendInfo> updatedWriters = new HashMap<>();
 
         for (LogRecordBatch batch : records.batches()) {
+            validateWalProtocol(batch, KvIdempotenceProtocol.V0_COMPACT);
             if (batch.hasWriterId()) {
                 // if this is a write request, there will be up to 5 batches which could
                 // have been duplicated. If we find a duplicate, we return the metadata of the
@@ -1208,19 +1195,43 @@ public final class LogTablet {
         return Either.right(updatedWriters.values());
     }
 
-    private Either<FencedWriterStateEntry, Collection<FencedWriterAppendInfo>>
-            analyzeAndValidateFencedWriterState(MemoryLogRecords records) {
+    private FencedValidationResult analyzeAndValidateFencedWriterState(MemoryLogRecords records) {
         List<FencedWriterAppendInfo> updates = new ArrayList<>();
         Map<WriterKey, FencedWriterStateEntry> staged = new HashMap<>();
+        boolean sawFresh = false;
+        boolean sawCommittedStale = false;
+        long dominatingOffset = -1L;
+        long dominatingTimestamp = -1L;
         for (LogRecordBatch batch : records.batches()) {
+            validateWalProtocol(batch, KvIdempotenceProtocol.V1_FENCED);
             WriterKey writerKey = batch.fencedWriterKey();
-            FencedWriterStateEntry current =
-                    staged.containsKey(writerKey)
-                            ? staged.get(writerKey)
-                            : writerStateManager.lastFencedEntry(writerKey).orElse(null);
-            if (current != null && batch.fencedSequence() <= current.lastSequence()) {
-                return Either.left(current);
+            FencedWriterStateEntry committed =
+                    writerStateManager.lastFencedEntry(writerKey).orElse(null);
+            FencedWriterStateEntry stagedCurrent = staged.get(writerKey);
+            if (stagedCurrent != null
+                    && batch.fencedSequence() <= stagedCurrent.lastSequence()) {
+                throw fencedOrderingError(
+                        writerKey,
+                        batch.fencedSequence(),
+                        stagedCurrent.lastSequence(),
+                        "staged");
             }
+            if (committed != null && batch.fencedSequence() <= committed.lastSequence()) {
+                if (sawFresh) {
+                    throw mixedFencedAppendError();
+                }
+                sawCommittedStale = true;
+                if (committed.dominatingTargetWalOffset() > dominatingOffset) {
+                    dominatingOffset = committed.dominatingTargetWalOffset();
+                    dominatingTimestamp = committed.lastTimestamp();
+                }
+                continue;
+            }
+            if (sawCommittedStale) {
+                throw mixedFencedAppendError();
+            }
+            sawFresh = true;
+            FencedWriterStateEntry current = stagedCurrent != null ? stagedCurrent : committed;
             FencedWriterAppendInfo update =
                     new FencedWriterAppendInfo(writerKey, getTableBucket(), current);
             update.append(
@@ -1228,7 +1239,73 @@ public final class LogTablet {
             updates.add(update);
             staged.put(writerKey, update.updatedEntry());
         }
-        return Either.right(updates);
+        return sawCommittedStale
+                ? FencedValidationResult.allStale(dominatingOffset, dominatingTimestamp)
+                : FencedValidationResult.allFresh(updates);
+    }
+
+    private void validateWalProtocol(
+            LogRecordBatch batch, KvIdempotenceProtocol expectedProtocol) {
+        if (batch.idempotenceProtocolVersion() != expectedProtocol.version()) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "Target WAL magic v%s does not match table protocol V%s for %s",
+                            batch.magic(), expectedProtocol.version(), getTableBucket()));
+        }
+    }
+
+    private OutOfOrderSequenceException fencedOrderingError(
+            WriterKey writerKey, long incoming, long current, String stateKind) {
+        return new OutOfOrderSequenceException(
+                String.format(
+                        "Out-of-order fenced sequence %s for writer %s in %s; %s state is %s",
+                        incoming, writerKey, getTableBucket(), stateKind, current));
+    }
+
+    private OutOfOrderSequenceException mixedFencedAppendError() {
+        return new OutOfOrderSequenceException(
+                "A fenced WAL append cannot mix committed-stale and fresh batches for "
+                        + getTableBucket());
+    }
+
+    private static final class FencedValidationResult {
+        private final Collection<FencedWriterAppendInfo> updates;
+        private final long dominatingTargetWalOffset;
+        private final long dominatingTimestamp;
+
+        private FencedValidationResult(
+                Collection<FencedWriterAppendInfo> updates,
+                long dominatingTargetWalOffset,
+                long dominatingTimestamp) {
+            this.updates = updates;
+            this.dominatingTargetWalOffset = dominatingTargetWalOffset;
+            this.dominatingTimestamp = dominatingTimestamp;
+        }
+
+        private static FencedValidationResult allFresh(
+                Collection<FencedWriterAppendInfo> updates) {
+            return new FencedValidationResult(updates, -1L, -1L);
+        }
+
+        private static FencedValidationResult allStale(long offset, long timestamp) {
+            return new FencedValidationResult(Collections.emptyList(), offset, timestamp);
+        }
+
+        private boolean allStale() {
+            return dominatingTargetWalOffset >= 0L;
+        }
+
+        private Collection<FencedWriterAppendInfo> updates() {
+            return updates;
+        }
+
+        private long dominatingTargetWalOffset() {
+            return dominatingTargetWalOffset;
+        }
+
+        private long dominatingTimestamp() {
+            return dominatingTimestamp;
+        }
     }
 
     @VisibleForTesting

@@ -25,6 +25,7 @@ import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -37,6 +38,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecordBatch;
@@ -44,6 +46,8 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.record.WriterKey;
+import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexTableDescriptorFactory;
@@ -57,6 +61,7 @@ import org.apache.fluss.server.metadata.BucketMetadata;
 import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.testutils.KvTestUtils;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableRegistration;
@@ -69,6 +74,9 @@ import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
 import java.io.IOException;
@@ -81,6 +89,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
@@ -103,6 +112,7 @@ import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.apache.fluss.testutils.DataTestUtils.assertLogRecordsEquals;
+import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
@@ -113,6 +123,7 @@ import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link Replica}. */
@@ -183,6 +194,29 @@ final class ReplicaTest extends ReplicaTestBase {
                                         fenced, null, MergeMode.OVERWRITE, 0))
                 .isInstanceOf(InvalidTableException.class);
         v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1);
+
+        conf.set(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER, 2);
+        assertThatThrownBy(
+                        () ->
+                                v0.putRecordsToLeader(
+                                        emptyFencedBatch(new WriterKey(9L, 4L), 2L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThatThrownBy(
+                        () ->
+                                v1.putRecordsToLeader(
+                                        compact, null, MergeMode.OVERWRITE, -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThatThrownBy(
+                        () ->
+                                v1.putRecordsToLeader(
+                                        emptyFencedBatch(new WriterKey(9L, 5L), 2L),
+                                        null,
+                                        MergeMode.DEFAULT,
+                                        -1))
+                .isInstanceOf(InvalidTableException.class);
     }
 
     private static KvRecordBatch emptyFencedBatch(WriterKey writerKey, long sequence)
@@ -1312,5 +1346,109 @@ final class ReplicaTest extends ReplicaTestBase {
                                         f.indexTableInfo,
                                         Collections.singletonList(bucketMetadata))),
                         Collections.emptyList()));
+    }
+
+    @ParameterizedTest(name = "table={0}, api={1}, magic={2}, accepted={3}")
+    @MethodSource("putKvProtocolMatrix")
+    void testExactPutKvProtocolMatrix(
+            KvIdempotenceProtocol tableProtocol,
+            short apiVersion,
+            byte batchMagic,
+            boolean accepted)
+            throws Exception {
+        long tableId = tableProtocol == KvIdempotenceProtocol.V0_COMPACT ? 992L : 993L;
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        Replica replica = makeProtocolReplica(tableProtocol, tableId, tableBucket);
+        BytesView encoded = encodedKvBatch(batchMagic);
+        PutKvRequest request =
+                new PutKvRequest().setTableId(tableId).setAcks(-1).setTimeoutMs(1000);
+        request.addBucketsReq()
+                .setBucketId(0)
+                .setRecordsBytesView(encoded);
+
+        org.assertj.core.api.ThrowableAssert.ThrowingCallable put =
+                () -> {
+                    KvRecordBatch parsed =
+                            ServerRpcMessageUtils.getPutKvData(request, apiVersion)
+                                    .get(tableBucket);
+                    replica.putRecordsToLeader(parsed, null, MergeMode.OVERWRITE, -1);
+                };
+        if (accepted) {
+            assertThatCode(put).doesNotThrowAnyException();
+            assertThat(replica.getLogTablet().localLogEndOffset()).isEqualTo(1L);
+        } else {
+            assertThatThrownBy(put).isInstanceOf(UnsupportedVersionException.class);
+            assertThat(replica.getKvTablet().getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
+            assertThat(replica.getLogTablet().localLogEndOffset()).isZero();
+        }
+    }
+
+    private static Stream<Arguments> putKvProtocolMatrix() {
+        return Stream.of(
+                Arguments.of(KvIdempotenceProtocol.V0_COMPACT, (short) 1, (byte) 0, true),
+                Arguments.of(KvIdempotenceProtocol.V0_COMPACT, (short) 2, (byte) 0, true),
+                Arguments.of(KvIdempotenceProtocol.V0_COMPACT, (short) 2, (byte) 1, false),
+                Arguments.of(KvIdempotenceProtocol.V1_FENCED, (short) 1, (byte) 1, false),
+                Arguments.of(KvIdempotenceProtocol.V1_FENCED, (short) 2, (byte) 0, false),
+                Arguments.of(KvIdempotenceProtocol.V1_FENCED, (short) 2, (byte) 1, true));
+    }
+
+    private Replica makeProtocolReplica(
+            KvIdempotenceProtocol protocol, long tableId, TableBucket tableBucket)
+            throws Exception {
+        TablePath path = TablePath.of("test_db", "matrix_" + protocol.version());
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(3)
+                        .property(
+                                ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION,
+                                protocol.version())
+                        .build();
+        zkClient.registerTable(
+                path,
+                TableRegistration.newTable(
+                        tableId, DEFAULT_REMOTE_DATA_DIR, descriptor));
+        zkClient.registerFirstSchema(path, DATA1_SCHEMA_PK);
+        long now = System.currentTimeMillis();
+        TableInfo info =
+                TableInfo.of(
+                        path,
+                        tableId,
+                        DEFAULT_SCHEMA_ID,
+                        descriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+        Replica replica = makeKvReplica(PhysicalTablePath.of(path), tableBucket, info);
+        makeLeaderReplica(replica, path, tableBucket, INITIAL_LEADER_EPOCH);
+        return replica;
+    }
+
+    private static BytesView encodedKvBatch(byte magic) throws Exception {
+        if (magic == KvRecordBatch.KV_MAGIC_VALUE_V0) {
+            KvRecordBatchBuilder builder =
+                    KvRecordBatchBuilder.builder(
+                            DEFAULT_SCHEMA_ID,
+                            1024,
+                            new UnmanagedPagedOutputView(128),
+                            KvFormat.COMPACTED);
+            builder.append(
+                    "matrix-key".getBytes(),
+                    compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "v0"}));
+            builder.setWriterState(11L, 0);
+            return builder.build();
+        }
+        FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        DEFAULT_SCHEMA_ID,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED);
+        builder.append(
+                "matrix-key".getBytes(),
+                compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "v1"}));
+        builder.setWriterState(new WriterKey(9L, 3L), 1L);
+        return builder.build();
     }
 }
