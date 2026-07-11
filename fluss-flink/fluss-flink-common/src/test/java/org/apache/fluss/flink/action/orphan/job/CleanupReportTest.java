@@ -41,10 +41,20 @@ class CleanupReportTest {
                         .planned(CleanupObjectType.KV_SHARED_SST, 1L, 700L)
                         .skipped(SkipReasonCode.KEEP_ACTIVE, 2L)
                         .build();
+        ScopeIdentity inventory = ScopeIdentity.table("db", "inventory", 8L);
+        TablePlanStats ordersPlan = new TablePlanStats(orders, 2L, 0L, Collections.emptyMap());
+        TablePlanStats inventoryPlan =
+                new TablePlanStats(
+                        inventory,
+                        0L,
+                        1L,
+                        Collections.singletonMap(SkipReasonCode.METADATA_READ_FAILED, 1L));
 
         CleanupReport report =
                 CleanupReport.aggregate(
-                        Collections.emptyList(), Arrays.asList(first, second), true);
+                        Arrays.asList(ordersPlan, inventoryPlan),
+                        Arrays.asList(first, second),
+                        true);
 
         assertThat(report.tableSummary(orders).plannedFiles()).isEqualTo(3L);
         assertThat(report.tableSummary(orders).plannedBytes()).isEqualTo(1000L);
@@ -59,6 +69,11 @@ class CleanupReportTest {
         assertThat(report.tableSummary(orders).bySkipReason())
                 .containsEntry(SkipReasonCode.KEEP_ACTIVE, 2L);
         assertThat(report.databases().get("db").plannedBytes()).isEqualTo(1000L);
+        assertThat(report.tasksPlanned()).isEqualTo(2L);
+        assertThat(report.metadataFailures()).isEqualTo(1L);
+        assertThat(report.tableSummary(inventory).plannedFiles()).isZero();
+        assertThat(report.tableSummary(inventory).bySkipReason())
+                .containsEntry(SkipReasonCode.METADATA_READ_FAILED, 1L);
         assertThat(report.global().plannedBytes()).isEqualTo(1000L);
     }
 

@@ -30,6 +30,7 @@ import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
 import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.KvSharedSstFetchResult;
@@ -50,6 +51,7 @@ import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.OutputTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -91,9 +93,12 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     private static final String[] TOP_LEVEL_DIRS = {
         FlussPaths.REMOTE_LOG_DIR_NAME, FlussPaths.REMOTE_KV_DIR_NAME
     };
+    public static final OutputTag<TablePlanStats> TABLE_PLAN_STATS =
+            new OutputTag<TablePlanStats>("table-plan-stats") {};
 
     private final OrphanCleanConfig config;
     private final String runId;
+    private transient TablePlanTracker tablePlans;
 
     public ScopeEnumeratorFunction(OrphanCleanConfig config, String runId) {
         this.config = config;
@@ -127,6 +132,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
             AuditLogger audit = new AuditLogger();
             ScopePlanStats planStats = new ScopePlanStats();
+            tablePlans = new TablePlanTracker();
             audit.logRunStart(runId, config);
             audit.logCutoff(runId, config.olderThanMillis());
 
@@ -185,6 +191,9 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     planStats,
                     out);
             audit.logScopePlan(runId, planStats);
+            for (TablePlanStats tablePlan : tablePlans.snapshots()) {
+                ctx.output(TABLE_PLAN_STATS, tablePlan);
+            }
         }
     }
 
@@ -347,6 +356,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             tableInfo = admin.getTableInfo(tablePath).get();
         } catch (Exception e) {
             RpcErrorClassifier.Category category = RpcErrorClassifier.classify(e);
+            ScopeIdentity unresolved = ScopeIdentity.unresolvedTable(dbState.dbName, tableName);
+            tablePlans.ensure(unresolved);
+            if (category == RpcErrorClassifier.Category.NOT_FOUND) {
+                tablePlans.skip(unresolved, SkipReasonCode.TABLE_NOT_EXIST);
+            } else {
+                tablePlans.metadataFailure(unresolved);
+            }
             if (category != RpcErrorClassifier.Category.NOT_FOUND || explicitTableTarget) {
                 audit.logSkipTable(dbState.dbName, tableName, category.name());
                 planStats.metadataFailure();
@@ -358,6 +374,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         dbState.activeTableIds.add(tableInfo.getTableId());
 
         LiveTableScope liveTable = new LiveTableScope(dbState.dbName, tableName, tableInfo);
+        tablePlans.ensure(liveTable.scope());
         dbState.liveTables.add(liveTable);
         planStats.table();
         if (!tableInfo.isPartitioned()) {
@@ -369,6 +386,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             if (confirm.getTableId() != tableInfo.getTableId()) {
                 audit.logSkipTable(dbState.dbName, tableName, "table-recreated-during-enumeration");
                 liveTable.partitionInfosComplete = false;
+                tablePlans.metadataFailure(liveTable.scope());
                 return;
             }
             for (PartitionInfo partition : partitions) {
@@ -381,6 +399,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             audit.logSkipPartitionList(dbState.dbName, tableName, classifyName(e));
             planStats.metadataFailure();
             liveTable.partitionInfosComplete = false;
+            tablePlans.metadataFailure(liveTable.scope());
         }
     }
 
@@ -435,6 +454,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         if (!clusterRoots.contains(normalizeRoot(remoteDataDir))) {
             audit.logSkipBucketOutOfScope(liveTable.tableId, partitionId, remoteDataDir);
             planStats.skippedOutOfScopeRoot();
+            tablePlans.skip(liveTable.scope(), SkipReasonCode.OUT_OF_SCOPE_ROOT);
             return;
         }
 
@@ -443,6 +463,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         if (!logResult.listOk()) {
             audit.logSkipLogTarget(liveTable.tableId, partitionId, logResult.listFailureReason());
             planStats.metadataFailure();
+            tablePlans.metadataFailure(liveTable.scope());
         }
 
         Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
@@ -456,6 +477,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             } else {
                 audit.logSkipKvTarget(liveTable.tableId, partitionId, kvResult.listFailureReason());
                 planStats.metadataFailure();
+                tablePlans.metadataFailure(liveTable.scope());
             }
         }
 
@@ -491,9 +513,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                         liveTable.tableId, partitionId, bucketId),
                                 logResult.readFailureReason(bucketId));
                         planStats.metadataFailure();
+                        tablePlans.metadataFailure(liveTable.scope());
                         break;
                     case NOT_LISTED:
                         planStats.skippedNoRemoteManifest();
+                        tablePlans.skip(liveTable.scope(), SkipReasonCode.NO_REMOTE_MANIFEST);
                         break;
                     default:
                         break;
@@ -521,6 +545,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 }
             } else if (kvTargetOk) {
                 planStats.skippedEmptyKvActiveSet();
+                tablePlans.skip(liveTable.scope(), SkipReasonCode.EMPTY_KV_ACTIVE_SET);
             }
 
             if (logTabletDir == null && kvTabletDir == null) {
@@ -544,6 +569,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             config.dryRun(),
                             config.allowDeleteManifest()));
             planStats.bucketTask();
+            tablePlans.task(liveTable.scope());
         }
     }
 
@@ -584,6 +610,9 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                                         dbState.dbName, dir.getName(), null),
                                                 dir));
                                 planStats.orphanDirTask();
+                                tablePlans.task(
+                                        ScopeIdentity.orphanTable(
+                                                dbState.dbName, dir.getName(), null));
                             },
                             planStats);
                 } else {
@@ -593,7 +622,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                     OrphanDirDetector.isOrphanTable(
                                             dirName, activeTableIds, maxKnownTableId),
                             remoteFsOpRateLimiter,
-                            dir -> audit.logSkipOrphanTable(dir, "default-conservative"),
+                            dir -> {
+                                audit.logSkipOrphanTable(dir, "default-conservative");
+                                tablePlans.skip(
+                                        ScopeIdentity.orphanTable(
+                                                dbState.dbName, dir.getName(), null),
+                                        SkipReasonCode.CONSERVATIVE_MODE_DISABLED);
+                            },
                             planStats);
                 }
             }
@@ -638,6 +673,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                                         liveTable.tableId),
                                                 dir));
                                 planStats.orphanDirTask();
+                                tablePlans.task(liveTable.scope());
                             },
                             planStats);
                 } else {
@@ -647,7 +683,12 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                     OrphanDirDetector.isOrphanPartition(
                                             dirName, activePartitionIds, maxKnownPartitionId),
                             remoteFsOpRateLimiter,
-                            dir -> audit.logSkipOrphanPartition(dir, "default-conservative"),
+                            dir -> {
+                                audit.logSkipOrphanPartition(dir, "default-conservative");
+                                tablePlans.skip(
+                                        liveTable.scope(),
+                                        SkipReasonCode.CONSERVATIVE_MODE_DISABLED);
+                            },
                             planStats);
                 }
             }
@@ -975,6 +1016,10 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             this.tableId = tableInfo.getTableId();
             this.tableInfo = tableInfo;
             this.partitioned = tableInfo.isPartitioned();
+        }
+
+        ScopeIdentity scope() {
+            return ScopeIdentity.table(dbName, tableName, tableId);
         }
     }
 }

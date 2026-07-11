@@ -36,6 +36,8 @@ public final class CleanupReport implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final CleanupCounters global;
+    private final long tasksPlanned;
+    private final long metadataFailures;
     private final Map<ScopeIdentity, TableCleanupSummary> tables;
     private final Map<String, CleanupCounters> databases;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
@@ -43,11 +45,15 @@ public final class CleanupReport implements Serializable {
 
     private CleanupReport(
             CleanupCounters global,
+            long tasksPlanned,
+            long metadataFailures,
             Map<ScopeIdentity, TableCleanupSummary> tables,
             Map<String, CleanupCounters> databases,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
             Map<SkipReasonCode, Long> bySkipReason) {
         this.global = global;
+        this.tasksPlanned = tasksPlanned;
+        this.metadataFailures = metadataFailures;
         this.tables = new HashMap<>(tables);
         this.databases = new HashMap<>(databases);
         Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
@@ -96,6 +102,14 @@ public final class CleanupReport implements Serializable {
         return global;
     }
 
+    public long tasksPlanned() {
+        return tasksPlanned;
+    }
+
+    public long metadataFailures() {
+        return metadataFailures;
+    }
+
     public TableCleanupSummary tableSummary(ScopeIdentity scope) {
         TableCleanupSummary summary = tables.get(scope.tableKey());
         if (summary == null) {
@@ -124,6 +138,8 @@ public final class CleanupReport implements Serializable {
     public static final class Accumulator {
         private final boolean dryRun;
         private CleanupCounters global = CleanupCounters.empty();
+        private long tasksPlanned;
+        private long metadataFailures;
         private final Map<ScopeIdentity, TableAccumulator> tables = new HashMap<>();
         private final Map<String, CleanupCounters> databases = new HashMap<>();
         private final EnumMap<CleanupObjectType, CleanupCounters> byObjectType =
@@ -136,8 +152,12 @@ public final class CleanupReport implements Serializable {
         }
 
         public void addPlan(TablePlanStats plan) {
+            tasksPlanned += plan.tasksPlanned();
+            metadataFailures += plan.metadataFailures();
             TableAccumulator table =
                     tables.computeIfAbsent(plan.scope(), ignored -> new TableAccumulator());
+            table.tasksPlanned += plan.tasksPlanned();
+            table.metadataFailures += plan.metadataFailures();
             mergeReasons(table.bySkipReason, plan.skipped());
             mergeReasons(bySkipReason, plan.skipped());
             if (!plan.scope().database().isEmpty()) {
@@ -179,15 +199,26 @@ public final class CleanupReport implements Serializable {
                         entry.getKey(),
                         new TableCleanupSummary(
                                 entry.getKey(),
+                                table.tasksPlanned,
+                                table.metadataFailures,
                                 table.counters,
                                 table.byObjectType,
                                 table.bySkipReason));
             }
-            return new CleanupReport(global, summaries, databases, byObjectType, bySkipReason);
+            return new CleanupReport(
+                    global,
+                    tasksPlanned,
+                    metadataFailures,
+                    summaries,
+                    databases,
+                    byObjectType,
+                    bySkipReason);
         }
     }
 
     private static final class TableAccumulator {
+        private long tasksPlanned;
+        private long metadataFailures;
         private CleanupCounters counters = CleanupCounters.empty();
         private final EnumMap<CleanupObjectType, CleanupCounters> byObjectType =
                 new EnumMap<>(CleanupObjectType.class);

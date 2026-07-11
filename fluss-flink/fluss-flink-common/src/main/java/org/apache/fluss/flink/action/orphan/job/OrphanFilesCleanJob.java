@@ -72,6 +72,8 @@ public final class OrphanFilesCleanJob {
                         .setParallelism(1)
                         .setMaxParallelism(1)
                         .name("ScopeEnumerator");
+        DataStream<TablePlanStats> tablePlans =
+                tasks.getSideOutput(ScopeEnumeratorFunction.TABLE_PLAN_STATS);
 
         // Stage 2: ScanAndClean (parallelism=N)
         SingleOutputStreamOperator<CleanStats> stats =
@@ -97,9 +99,22 @@ public final class OrphanFilesCleanJob {
                                         runId, config.dryRun(), config.progressLogInterval()))
                         .setParallelism(scanParallelism);
 
+        DataStream<CleanupReportInput> reportInputs =
+                statsWithProgress
+                        .map(CleanupReportInput::stats)
+                        .returns(TypeInformation.of(new TypeHint<CleanupReportInput>() {}))
+                        .name("CleanupStatsReportInput")
+                        .union(
+                                tablePlans
+                                        .map(CleanupReportInput::plan)
+                                        .returns(
+                                                TypeInformation.of(
+                                                        new TypeHint<CleanupReportInput>() {}))
+                                        .name("TablePlanReportInput"));
+
         // Stage 3: StatsAggregate (parallelism=1)
         SingleOutputStreamOperator<CleanupReport> result =
-                statsWithProgress
+                reportInputs
                         .transform(
                                 "StatsAggregate",
                                 TypeInformation.of(new TypeHint<CleanupReport>() {}),
