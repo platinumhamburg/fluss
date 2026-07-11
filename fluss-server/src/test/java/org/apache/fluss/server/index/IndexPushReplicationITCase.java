@@ -20,7 +20,6 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.IndexType;
@@ -30,15 +29,17 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.DefaultKvRecordBatch;
+import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
-import org.apache.fluss.record.KvRecordBatchBuilder;
+import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.aligned.AlignedRowWriter;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
@@ -127,6 +128,16 @@ class IndexPushReplicationITCase {
             DataTypes.ROW(
                     new DataField("b", DataTypes.STRING().copy(false)),
                     new DataField("a", DataTypes.INT().copy(false)));
+
+    /** Physical partitioned Index Table row: index columns, deduplicated base PK, partition ID. */
+    private static final RowType PARTITIONED_INDEX_VALUE_ROW_TYPE =
+            DataTypes.ROW(
+                    new DataField("b", DataTypes.STRING().copy(false)),
+                    new DataField("a", DataTypes.INT().copy(false)),
+                    new DataField("p", DataTypes.STRING().copy(false)),
+                    new DataField(
+                            IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN,
+                            DataTypes.BIGINT().copy(false)));
 
     /** Bounded poll deadline for index visibility checks — well above the longest observed push. */
     private static final Duration INDEX_VISIBILITY_TIMEOUT = Duration.ofSeconds(30);
@@ -269,9 +280,9 @@ class IndexPushReplicationITCase {
     /**
      * Scenario #5 (Plan 3 §2.9.8, partition tombstone): once the TabletServer's metadata cache
      * holds a tombstone for a given {@code (mainTableId, partitionId)} pair, any subsequent Index
-     * Table PutKv whose value carries that partitionId in the 8-byte BE prefix must be silently
-     * dropped by the apply-path filter — no KV state change, no error, the surrounding batch is
-     * still acked normally.
+     * Table PutKv whose physical value carries that partitionId must be silently dropped by the
+     * apply-path filter — no KV state change, no error, the surrounding batch is still acked
+     * normally.
      *
      * <p><b>Pragmatic scoping (per P3T13 spec):</b> driving the full multi-partition + drop +
      * propagation chain through {@link FlussClusterExtension} is fixture-heavy and largely covered
@@ -279,15 +290,15 @@ class IndexPushReplicationITCase {
      * ITCase therefore exercises the end-to-end apply-path drop in-process by:
      *
      * <ol>
-     *   <li>asserting a normal main-table push lands an Index entry (apply path is healthy);
+     *   <li>asserting a live partition entry lands in the Index Table (apply path is healthy);
      *   <li>injecting a tombstone for the {@code mainTableId} back-link the Index Table replica was
      *       constructed with directly into the TabletServer's metadata cache (simulating the
      *       Coordinator → TabletServer propagation that P3T6/P3T7 already cover);
      *   <li>sending a synthetic PutKv straight to the Index Table whose value bytes carry the
-     *       tombstoned partitionId in the 8-byte prefix — bypassing the main table to control the
-     *       wire bytes exactly the way a partitioned production push would shape them;
-     *   <li>asserting the synthetic key is invisible (filter dropped) AND the original control
-     *       entry is still visible (filter is targeted, the apply path itself still works).
+     *       tombstoned partitionId — bypassing the main table to control the wire bytes exactly the
+     *       way a partitioned production push would shape them;
+     *   <li>asserting the synthetic key is invisible (filter dropped), a second live partition is
+     *       visible, and the original live entry remains visible.
      * </ol>
      */
     @Test
@@ -295,9 +306,10 @@ class IndexPushReplicationITCase {
         String mainName = "main_t_tombstone";
         Fixture f = setupPartitionedTables(mainName);
 
-        // (1) Verify the Index Table is up by looking up a synthetic key (should be absent).
-        byte[] controlIndexKey = encodeIndexKey("hello", 1);
-        waitForIndexEntry(f.indexGateway, f.indexTableId, controlIndexKey, "hello", false);
+        // (1) Prove a live partition entry reaches the Index Table before installing a tombstone.
+        byte[] controlIndexKey =
+                putPartitionedIndexEntry(f, "hello", 1, "p-live-before", 1001L, 1L);
+        waitForIndexEntry(f.indexGateway, f.indexTableId, controlIndexKey, "hello", true);
 
         // (2) Inject a tombstone into the TabletServer's metadata cache.
         int indexLeaderServerId =
@@ -319,30 +331,19 @@ class IndexPushReplicationITCase {
                     .as("tombstone is observable on the Index Table leader's metadata cache")
                     .isTrue();
 
-            // (3) Send a synthetic PutKv DIRECTLY to the Index Table whose value bytes carry the
-            // tombstoned partitionId as a regular __partition_id column encoded in AlignedRow
-            // format
-            // — exactly the shape the production push pipeline produces for a partitioned main
-            // table (see Replica#buildIndexSpecs).
-            byte[] droppedIndexKey = encodeIndexKey("dropped", 99);
-            int droppedBucket = computeIndexBucket("dropped");
-            byte[] tombstonedValue = encodeAlignedValueWithPartitionId(droppedPartitionId);
-            KvRecordBatch dropBatch = synthesizeIndexBatch(droppedIndexKey, tombstonedValue);
-            f.indexGateway
-                    .putKv(newPutKvRequest(f.indexTableId, droppedBucket, 1, dropBatch))
-                    .get();
+            // (3) Send a fenced PutKv directly to the Index Table with a physical row carrying the
+            // tombstoned partition ID, matching the production partitioned index-push shape.
+            byte[] droppedIndexKey =
+                    putPartitionedIndexEntry(f, "dropped", 99, "p-dropped", droppedPartitionId, 1L);
 
             // (4) The filter dropped the record silently (no WAL append, no KV state change), so
             // the lookup for the synthetic key must return empty.
             waitForIndexEntry(f.indexGateway, f.indexTableId, droppedIndexKey, "dropped", false);
 
             // (5) Send a non-tombstoned entry and verify it survives the filter.
-            byte[] liveKey = encodeIndexKey("alive", 77);
-            int liveBucket = computeIndexBucket("alive");
-            byte[] liveValue = encodeAlignedValueWithPartitionId(9999L);
-            KvRecordBatch liveBatch = synthesizeIndexBatch(liveKey, liveValue);
-            f.indexGateway.putKv(newPutKvRequest(f.indexTableId, liveBucket, 1, liveBatch)).get();
+            byte[] liveKey = putPartitionedIndexEntry(f, "alive", 77, "p-live-after", 9999L, 1L);
             waitForIndexEntry(f.indexGateway, f.indexTableId, liveKey, "alive", true);
+            waitForIndexEntry(f.indexGateway, f.indexTableId, controlIndexKey, "hello", true);
         } finally {
             // Reset the tombstone for this test's main-table id so any later interaction with
             // the same cache instance sees a clean state.
@@ -589,52 +590,51 @@ class IndexPushReplicationITCase {
         return new FlussBucketingFunction().bucketing(bucketKey, INDEX_BUCKET_COUNT);
     }
 
-    /**
-     * Build an AlignedRow value body for a partitioned Index Table with columns (b, a, p,
-     * __partition_id, __source_offset, __index_deleted). The test only cares about the __partition_id
-     * value for the tombstone filter; the other fields are filled with dummy data.
-     */
-    private static byte[] encodeAlignedValueWithPartitionId(long partitionId) {
-        // Partitioned Index Table schema:
-        // [b STRING, a INT, p STRING, __partition_id BIGINT, __source_offset BIGINT,
-        // __index_deleted BOOLEAN]
-        int arity = 6;
-        AlignedRow row = new AlignedRow(arity);
+    private static AlignedRow encodePartitionedIndexValue(
+            String b, int a, String p, long partitionId) {
+        AlignedRow row = new AlignedRow(PARTITIONED_INDEX_VALUE_ROW_TYPE.getFieldCount());
         AlignedRowWriter writer = new AlignedRowWriter(row);
         writer.reset();
-        writer.writeString(0, fromString("dummy"));
-        writer.writeInt(1, 0);
-        writer.writeString(2, fromString("p0"));
+        writer.writeString(0, fromString(b));
+        writer.writeInt(1, a);
+        writer.writeString(2, fromString(p));
         writer.writeLong(3, partitionId);
-        writer.writeLong(4, 0L);
-        writer.writeBoolean(5, false);
         writer.complete();
-        byte[] body = new byte[row.getSizeInBytes()];
-        row.copyTo(body, 0);
-        return body;
+        return row;
     }
 
     /**
-     * Build a single-record {@link KvRecordBatch} whose value's raw bytes are exactly {@code
-     * valueBytes} — bypassing the row-type encoder so the test can control the value content.
+     * Writes one physical partitioned Index Table row through the protocol-V1 tablet path and
+     * returns its complete physical key.
      */
-    private static KvRecordBatch synthesizeIndexBatch(byte[] key, byte[] valueBytes)
+    private static byte[] putPartitionedIndexEntry(
+            Fixture fixture, String b, int a, String p, long partitionId, long sequence)
             throws IOException {
-        KvRecordBatchBuilder builder =
-                KvRecordBatchBuilder.builder(
-                        /* schemaId */ 1,
+        AlignedRow row = encodePartitionedIndexValue(b, a, p, partitionId);
+        byte[] key = new CompactedKeyEncoder(PARTITIONED_INDEX_VALUE_ROW_TYPE).encodeKey(row);
+        int targetBucket = computeIndexBucket(b);
+        TableBucket sourceBucket = new TableBucket(fixture.mainTableId, partitionId, 0);
+
+        try (FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        1,
                         Integer.MAX_VALUE,
                         new UnmanagedPagedOutputView(4096),
-                        KvFormat.ALIGNED);
-        try {
-            AlignedRow row = new AlignedRow(0);
-            row.pointTo(MemorySegment.wrap(valueBytes), 0, valueBytes.length);
+                        KvFormat.ALIGNED)) {
             builder.append(key, row);
-            KvRecordBatch batch = DefaultKvRecordBatch.pointToBytesView(builder.build());
-            batch.ensureValid();
-            return batch;
-        } finally {
-            builder.close();
+            builder.setWriterState(IndexWriterKey.encode(sourceBucket), sequence);
+            BytesView batch = builder.build();
+
+            PutKvRequest request =
+                    new PutKvRequest()
+                            .setTableId(fixture.indexTableId)
+                            .setAcks(-1)
+                            .setTimeoutMs(10_000);
+            request.setAggMode(MergeMode.OVERWRITE.getProtoValue());
+            PbPutKvReqForBucket bucketRequest = request.addBucketsReq().setBucketId(targetBucket);
+            bucketRequest.setRecordsBytesView(batch);
+            fixture.indexGateway.putKv(request).join();
         }
+        return key;
     }
 }
