@@ -19,6 +19,7 @@ package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
@@ -52,15 +53,19 @@ import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.UncertainWalAppendException;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
+import org.apache.fluss.server.log.LogTabletTestHelper;
+import org.apache.fluss.server.log.LogTabletTestHelper.FaultPhase;
 import org.apache.fluss.server.metadata.BucketMetadata;
 import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.testutils.KvTestUtils;
+import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
@@ -80,6 +85,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -89,6 +95,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
@@ -99,11 +106,11 @@ import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
-import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA2;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
@@ -134,9 +141,7 @@ final class ReplicaTest extends ReplicaTestBase {
     @Test
     void testPutKvTableProtocolContract() throws Exception {
         Replica v0 =
-                makeKvReplica(
-                        DATA1_PHYSICAL_TABLE_PATH_PK,
-                        new TableBucket(DATA1_TABLE_ID_PK, 1));
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
         makeKvReplicaAsLeader(v0);
         KvRecordTestUtils.KvRecordBatchFactory v0Factory =
                 KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
@@ -144,10 +149,7 @@ final class ReplicaTest extends ReplicaTestBase {
         KvRecordBatch fenced = emptyFencedBatch(new WriterKey(9L, 3L), 1L);
 
         v0.putRecordsToLeader(compact, null, MergeMode.DEFAULT, 0);
-        assertThatThrownBy(
-                        () ->
-                                v0.putRecordsToLeader(
-                                        fenced, null, MergeMode.OVERWRITE, -1))
+        assertThatThrownBy(() -> v0.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
 
         TablePath v1Path = TablePath.of("test_db", "protocol_v1");
@@ -160,8 +162,7 @@ final class ReplicaTest extends ReplicaTestBase {
                         .build();
         zkClient.registerTable(
                 v1Path,
-                TableRegistration.newTable(
-                        v1TableId, DEFAULT_REMOTE_DATA_DIR, v1Descriptor));
+                TableRegistration.newTable(v1TableId, DEFAULT_REMOTE_DATA_DIR, v1Descriptor));
         zkClient.registerFirstSchema(v1Path, DATA1_SCHEMA_PK);
         long now = System.currentTimeMillis();
         TableInfo v1Info =
@@ -174,24 +175,14 @@ final class ReplicaTest extends ReplicaTestBase {
                         now,
                         now);
         TableBucket v1Bucket = new TableBucket(v1TableId, 0);
-        Replica v1 =
-                makeKvReplica(PhysicalTablePath.of(v1Path), v1Bucket, v1Info);
+        Replica v1 = makeKvReplica(PhysicalTablePath.of(v1Path), v1Bucket, v1Info);
         makeLeaderReplica(v1, v1Path, v1Bucket, INITIAL_LEADER_EPOCH);
 
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        compact, null, MergeMode.OVERWRITE, -1))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(compact, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        fenced, null, MergeMode.DEFAULT, -1))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(fenced, null, MergeMode.DEFAULT, -1))
                 .isInstanceOf(InvalidTableException.class);
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        fenced, null, MergeMode.OVERWRITE, 0))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, 0))
                 .isInstanceOf(InvalidTableException.class);
         v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1);
 
@@ -204,10 +195,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                         MergeMode.OVERWRITE,
                                         -1))
                 .isInstanceOf(UnsupportedVersionException.class);
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        compact, null, MergeMode.OVERWRITE, -1))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(compact, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
         assertThatThrownBy(
                         () ->
@@ -219,6 +207,66 @@ final class ReplicaTest extends ReplicaTestBase {
                 .isInstanceOf(InvalidTableException.class);
     }
 
+    @Test
+    void testUncertainV1AppendFailStopsExactlyOnce() throws Exception {
+        TableBucket tableBucket = new TableBucket(994L, 0);
+        Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 994L, tableBucket);
+        AtomicInteger fatalErrors = installCountingFatalHandler(replica);
+        LogTabletTestHelper.failOnceAt(
+                replica.getLogTablet(),
+                FaultPhase.AFTER_LOCAL_APPEND,
+                new IOException("injected append failure"));
+
+        assertThatThrownBy(
+                        () ->
+                                replica.putRecordsToLeader(
+                                        emptyFencedBatch(new WriterKey(7L, 3L), 100L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isInstanceOf(UncertainWalAppendException.class);
+        assertThat(fatalErrors).hasValue(1);
+        assertThat(replica.isOnline()).isFalse();
+        assertThatThrownBy(
+                        () ->
+                                replica.putRecordsToLeader(
+                                        emptyFencedBatch(new WriterKey(7L, 3L), 101L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isInstanceOf(NotLeaderOrFollowerException.class);
+        assertThat(fatalErrors).hasValue(1);
+    }
+
+    @Test
+    void testUncertainV1ErrorFailStopsAndRethrowsSameError() throws Exception {
+        TableBucket tableBucket = new TableBucket(995L, 0);
+        Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 995L, tableBucket);
+        AtomicInteger fatalErrors = installCountingFatalHandler(replica);
+        AssertionError injected = new AssertionError("injected fatal append error");
+        LogTabletTestHelper.failOnceAt(
+                replica.getLogTablet(), FaultPhase.BEFORE_LOCAL_APPEND, injected);
+
+        assertThatThrownBy(
+                        () ->
+                                replica.putRecordsToLeader(
+                                        emptyFencedBatch(new WriterKey(8L, 4L), 100L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isSameAs(injected);
+        assertThat(fatalErrors).hasValue(1);
+        assertThat(replica.isOnline()).isFalse();
+    }
+
+    private static AtomicInteger installCountingFatalHandler(Replica replica) throws Exception {
+        AtomicInteger fatalErrors = new AtomicInteger();
+        Field field = Replica.class.getDeclaredField("fatalErrorHandler");
+        field.setAccessible(true);
+        field.set(replica, (FatalErrorHandler) ignored -> fatalErrors.incrementAndGet());
+        return fatalErrors;
+    }
+
     private static KvRecordBatch emptyFencedBatch(WriterKey writerKey, long sequence)
             throws Exception {
         FencedKvRecordBatchBuilder builder =
@@ -228,8 +276,7 @@ final class ReplicaTest extends ReplicaTestBase {
                         new UnmanagedPagedOutputView(128),
                         KvFormat.COMPACTED);
         builder.setWriterState(writerKey, sequence);
-        return KvRecordBatchReader.pointToByteBuffer(
-                builder.build().getByteBuf().nioBuffer());
+        return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
     @Test
@@ -342,8 +389,7 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     @Test
-    void testIndexReplicatorInitDefersWhenIndexTableIdVisibleButMetadataMissing()
-            throws Exception {
+    void testIndexReplicatorInitDefersWhenIndexTableIdVisibleButMetadataMissing() throws Exception {
         IndexedFixture f = setupIndexedMainTableReplica();
         publishIndexTableToCache(f);
         assertThat(serverMetadataCache.getTableId(f.indexTablePath)).isPresent();
@@ -1260,10 +1306,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                 1)
                         .build();
         TableDescriptor mainDescriptor =
-                TableDescriptor.builder()
-                        .schema(mainSchema)
-                        .distributedBy(1, "a")
-                        .build();
+                TableDescriptor.builder().schema(mainSchema).distributedBy(1, "a").build();
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(
                         mainDescriptor, mainTableId, mainPath.toString(), indexName);
@@ -1362,9 +1405,7 @@ final class ReplicaTest extends ReplicaTestBase {
         BytesView encoded = encodedKvBatch(batchMagic);
         PutKvRequest request =
                 new PutKvRequest().setTableId(tableId).setAcks(-1).setTimeoutMs(1000);
-        request.addBucketsReq()
-                .setBucketId(0)
-                .setRecordsBytesView(encoded);
+        request.addBucketsReq().setBucketId(0).setRecordsBytesView(encoded);
 
         org.assertj.core.api.ThrowableAssert.ThrowingCallable put =
                 () -> {
@@ -1406,9 +1447,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                 protocol.version())
                         .build();
         zkClient.registerTable(
-                path,
-                TableRegistration.newTable(
-                        tableId, DEFAULT_REMOTE_DATA_DIR, descriptor));
+                path, TableRegistration.newTable(tableId, DEFAULT_REMOTE_DATA_DIR, descriptor));
         zkClient.registerFirstSchema(path, DATA1_SCHEMA_PK);
         long now = System.currentTimeMillis();
         TableInfo info =

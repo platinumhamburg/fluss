@@ -36,8 +36,8 @@ import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.IndexVisibility;
-import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
+import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -65,6 +65,7 @@ import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.RemoteLogFetcher;
+import org.apache.fluss.server.kv.UncertainWalAppendException;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
@@ -195,6 +196,7 @@ public final class Replica {
     private final LogFormat logFormat;
     private final ArrowCompressionInfo arrowCompressionInfo;
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
+    private final AtomicBoolean online = new AtomicBoolean(true);
     private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
     private final RemoteLogManager remoteLogManager;
@@ -236,9 +238,7 @@ public final class Replica {
      */
     private final boolean hasSyncIndexes;
 
-    /**
-     * Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements.
-     */
+    /** Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements. */
     private volatile long syncIndexPushedOffset = -1L;
 
     /**
@@ -1253,11 +1253,19 @@ public final class Replica {
                     LogAppendInfo logAppendInfo;
                     try {
                         logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
+                    } catch (UncertainWalAppendException e) {
+                        failStop(e);
+                        throw e;
                     } catch (IOException e) {
                         LOG.error("Error while putting records to {}", tableBucket, e);
                         fatalErrorHandler.onFatalError(e);
                         throw new KvStorageException(
                                 "Error while putting records to " + tableBucket, e);
+                    } catch (Error error) {
+                        if (tableProtocol == KvIdempotenceProtocol.V1_FENCED) {
+                            failStop(error);
+                        }
+                        throw error;
                     }
                     // we may need to increment high watermark.
                     maybeIncrementLeaderHW(logTablet, clock.milliseconds());
@@ -2311,7 +2319,22 @@ public final class Replica {
     @VisibleForTesting
     public boolean isLeader() {
         Integer leaderReplicaId = leaderReplicaIdOpt.get();
-        return leaderReplicaId != null && leaderReplicaId.equals(localTabletServerId);
+        return online.get()
+                && leaderReplicaId != null
+                && leaderReplicaId.equals(localTabletServerId);
+    }
+
+    @VisibleForTesting
+    boolean isOnline() {
+        return online.get();
+    }
+
+    private void failStop(Throwable failure) {
+        if (online.compareAndSet(true, false)) {
+            leaderReplicaIdOpt.set(null);
+            LOG.error("Fail-stopping replica {} after uncertain WAL append", tableBucket, failure);
+            fatalErrorHandler.onFatalError(failure);
+        }
     }
 
     private LogTablet createLog(

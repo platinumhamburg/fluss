@@ -41,6 +41,7 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
@@ -69,8 +70,8 @@ import org.apache.fluss.server.kv.wal.ArrowWalBuilder;
 import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.kv.wal.IndexWalBuilder;
 import org.apache.fluss.server.kv.wal.WalBuilder;
-import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
+import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
@@ -375,6 +376,7 @@ public final class KvTablet {
     private static final java.util.function.Predicate<byte[]> NO_OP_VALUE_FILTER = v -> false;
 
     private volatile java.util.function.Predicate<byte[]> valueFilter = NO_OP_VALUE_FILTER;
+    @Nullable private Runnable beforeWalBuild;
 
     public void setValueFilter(@Nullable java.util.function.Predicate<byte[]> filter) {
         this.valueFilter = filter == null ? NO_OP_VALUE_FILTER : filter;
@@ -493,14 +495,12 @@ public final class KvTablet {
 
                     RowType latestRowType = latestSchema.getRowType();
                     boolean fenced = kvRecords.idempotenceProtocolVersion() == 1;
-                    WalBuilder walBuilder =
-                            createWalBuilder(latestSchemaId, latestRowType, fenced);
+                    WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType, fenced);
                     if (fenced) {
                         walBuilder.setFencedWriterState(
                                 kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
                     } else {
-                        walBuilder.setWriterState(
-                                kvRecords.writerId(), kvRecords.batchSequence());
+                        walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
                     }
                     // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
                     // only has fewer ending columns than latest schema, so we pad nulls to
@@ -509,6 +509,7 @@ public final class KvTablet {
                     // get offset to track the offset corresponded to the kv record
                     long logEndOffsetOfPrevBatch = logTablet.localLogEndOffset();
 
+                    boolean appendInvoked = false;
                     try {
                         processKvRecords(
                                 kvRecords,
@@ -529,7 +530,13 @@ public final class KvTablet {
                         // put a batch into file with recordCount 0 and offset plus 1L, it will
                         // update the batchSequence corresponding to the writerId and also increment
                         // the CDC log offset by 1.
-                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
+                        Runnable buildHook = beforeWalBuild;
+                        if (buildHook != null) {
+                            buildHook.run();
+                        }
+                        MemoryLogRecords wal = walBuilder.build();
+                        appendInvoked = true;
+                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(wal);
 
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
@@ -545,6 +552,12 @@ public final class KvTablet {
                         // retry-send batch will produce incorrect CDC logs.
                         // TODO for some errors, the cdc logs may already be written to disk, for
                         //  those errors, we should not truncate the kvPreWriteBuffer.
+                        if (fenced && appendInvoked) {
+                            if (t instanceof Error) {
+                                throw (Error) t;
+                            }
+                            throw new UncertainWalAppendException(tableBucket, t);
+                        }
                         kvPreWriteBuffer.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.ERROR);
                         throw t;
                     } finally {
@@ -557,6 +570,11 @@ public final class KvTablet {
     @VisibleForTesting
     void setAfterFencedPrecheck(@Nullable Runnable afterFencedPrecheck) {
         this.afterFencedPrecheck = afterFencedPrecheck;
+    }
+
+    @VisibleForTesting
+    void setBeforeWalBuild(@Nullable Runnable beforeWalBuild) {
+        this.beforeWalBuild = beforeWalBuild;
     }
 
     private void validateSchemaId(short schemaIdOfNewData, short latestSchemaId) {
