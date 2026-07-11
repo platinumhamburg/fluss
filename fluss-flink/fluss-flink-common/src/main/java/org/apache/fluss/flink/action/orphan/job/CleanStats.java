@@ -25,6 +25,7 @@ import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import java.io.Serializable;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -78,13 +79,12 @@ public final class CleanStats implements Serializable {
             Map<CleanupObjectType, CleanupCounters> byObjectType,
             Map<SkipReasonCode, Long> bySkipReason) {
         this.scope = scope;
-        EnumMap<CleanupObjectType, CleanupCounters> objectCopy =
-                new EnumMap<>(CleanupObjectType.class);
+        Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
         objectCopy.putAll(byObjectType);
-        this.byObjectType = Collections.unmodifiableMap(objectCopy);
-        EnumMap<SkipReasonCode, Long> reasonCopy = new EnumMap<>(SkipReasonCode.class);
+        this.byObjectType = objectCopy;
+        Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
         reasonCopy.putAll(bySkipReason);
-        this.bySkipReason = Collections.unmodifiableMap(reasonCopy);
+        this.bySkipReason = reasonCopy;
         this.scannedFiles = counters.scannedFiles();
         this.plannedFiles = counters.plannedFiles();
         this.plannedDirs = counters.plannedDirs();
@@ -125,11 +125,11 @@ public final class CleanStats implements Serializable {
     }
 
     public Map<CleanupObjectType, CleanupCounters> byObjectType() {
-        return byObjectType;
+        return Collections.unmodifiableMap(byObjectType);
     }
 
     public Map<SkipReasonCode, Long> bySkipReason() {
-        return bySkipReason;
+        return Collections.unmodifiableMap(bySkipReason);
     }
 
     public long scannedFiles() {

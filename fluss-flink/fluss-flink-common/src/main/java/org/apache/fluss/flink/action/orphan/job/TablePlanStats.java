@@ -23,7 +23,7 @@ import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 
 import java.io.Serializable;
 import java.util.Collections;
-import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.Map;
 
 /** Per-table work plan produced by scope enumeration for final audit reporting. */
@@ -45,9 +45,9 @@ public final class TablePlanStats implements Serializable {
         this.scope = scope.tableKey();
         this.tasksPlanned = tasksPlanned;
         this.metadataFailures = metadataFailures;
-        EnumMap<SkipReasonCode, Long> copy = new EnumMap<>(SkipReasonCode.class);
+        Map<SkipReasonCode, Long> copy = new HashMap<>();
         copy.putAll(skipped);
-        this.skipped = Collections.unmodifiableMap(copy);
+        this.skipped = copy;
     }
 
     public ScopeIdentity scope() {
@@ -63,6 +63,6 @@ public final class TablePlanStats implements Serializable {
     }
 
     public Map<SkipReasonCode, Long> skipped() {
-        return skipped;
+        return Collections.unmodifiableMap(skipped);
     }
 }

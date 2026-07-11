@@ -37,7 +37,7 @@ import java.util.List;
  * <pre>
  * Stage 1: ScopeEnumerator (p=1)   — coordinator RPCs, emits CleanTask
  * Stage 2: ScanAndClean (p=N)      — FS scan + rate-limited delete, emits CleanStats
- * Stage 3: StatsAggregate (p=1)    — merge stats, emits final CleanStats
+ * Stage 3: StatsAggregate (p=1)    — merge stats, emits final CleanupReport
  * </pre>
  */
 @Internal
@@ -54,7 +54,7 @@ public final class OrphanFilesCleanJob {
      * @param parallelism the parallelism for Stage 2 (ScanAndClean); null uses env default
      * @return the final cleanup statistics
      */
-    public static CleanStats execute(
+    public static CleanupReport execute(
             StreamExecutionEnvironment env,
             OrphanCleanConfig config,
             Integer parallelism,
@@ -98,27 +98,30 @@ public final class OrphanFilesCleanJob {
                         .setParallelism(scanParallelism);
 
         // Stage 3: StatsAggregate (parallelism=1)
-        SingleOutputStreamOperator<CleanStats> result =
+        SingleOutputStreamOperator<CleanupReport> result =
                 statsWithProgress
                         .transform(
                                 "StatsAggregate",
-                                TypeInformation.of(new TypeHint<CleanStats>() {}),
-                                new StatsAggregateOperator(config.dryRun(), config.postRunWait()))
+                                TypeInformation.of(new TypeHint<CleanupReport>() {}),
+                                new StatsAggregateOperator(
+                                        runId, config.dryRun(), config.postRunWait()))
                         .setParallelism(1)
                         .setMaxParallelism(1);
 
         // Execute and collect the single result
-        List<CleanStats> collected = collectResults(result);
+        List<CleanupReport> collected = collectResults(result);
         if (collected.isEmpty()) {
-            return CleanStats.empty();
+            return CleanupReport.aggregate(
+                    Collections.emptyList(), Collections.emptyList(), config.dryRun());
         }
         return collected.get(0);
     }
 
     @SuppressWarnings("deprecation")
-    private static List<CleanStats> collectResults(DataStream<CleanStats> result) throws Exception {
-        Iterator<CleanStats> iterator = result.executeAndCollect("OrphanFilesClean");
-        List<CleanStats> results = new java.util.ArrayList<CleanStats>();
+    private static List<CleanupReport> collectResults(DataStream<CleanupReport> result)
+            throws Exception {
+        Iterator<CleanupReport> iterator = result.executeAndCollect("OrphanFilesClean");
+        List<CleanupReport> results = new java.util.ArrayList<CleanupReport>();
         while (iterator.hasNext()) {
             results.add(iterator.next());
         }
