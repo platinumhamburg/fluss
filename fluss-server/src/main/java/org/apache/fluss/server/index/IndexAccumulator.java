@@ -42,8 +42,9 @@ import java.util.function.Consumer;
  *
  * <p>This class is a pure per-bucket queue store: it has no knowledge of leaders, RPC, or retry
  * policy. Leader resolution and in-flight muting are the sender's concern. It does, however, track
- * the total pending (un-acknowledged) encoded bytes so the read layer can apply back-pressure via
- * {@link #isFull()} and stop deriving new windows when the send layer falls behind.
+ * both total pending (un-acknowledged) encoded bytes for observability and per-replicator pending
+ * bytes so the read layer can apply back-pressure without letting one stalled replicator stop
+ * unrelated replicators from deriving new windows.
  */
 @Internal
 @ThreadSafe
@@ -52,13 +53,15 @@ public final class IndexAccumulator {
     private final ConcurrentMap<TableBucket, Deque<IndexBatch>> batches =
             MapUtils.newConcurrentMap();
 
-    /**
-     * Upper bound on total pending encoded bytes before {@link #isFull()} reports back-pressure.
-     */
+    /** Upper bound on pending encoded bytes for one producing replicator. */
     private final long maxPendingBytes;
 
     /** Total encoded bytes of all batches currently pending, including queued and in-flight. */
     private final AtomicLong pendingBytes = new AtomicLong(0L);
+
+    /** Pending encoded bytes grouped by the leader-side replicator that produced the batches. */
+    private final ConcurrentMap<IndexReplicator, AtomicLong> pendingBytesByReplicator =
+            MapUtils.newConcurrentMap();
 
     /** Optional callback fired on each append to promptly wake the owning sender worker. */
     @Nullable private volatile Consumer<TableBucket> appendListener;
@@ -68,7 +71,7 @@ public final class IndexAccumulator {
         this(Long.MAX_VALUE);
     }
 
-    /** Creates an accumulator that reports {@link #isFull()} once pending bytes reach the bound. */
+    /** Creates an accumulator that reports back-pressure once a producer reaches the bound. */
     public IndexAccumulator(long maxPendingBytes) {
         this.maxPendingBytes = maxPendingBytes;
     }
@@ -85,7 +88,11 @@ public final class IndexAccumulator {
         synchronized (deque) {
             deque.addLast(batch);
         }
-        pendingBytes.addAndGet(batch.encoded().getBytesLength());
+        long bytes = batch.encoded().getBytesLength();
+        pendingBytes.addAndGet(bytes);
+        pendingBytesByReplicator
+                .computeIfAbsent(batch.window().owner(), ignored -> new AtomicLong())
+                .addAndGet(bytes);
         Consumer<TableBucket> listener = this.appendListener;
         if (listener != null) {
             listener.accept(batch.targetBucket());
@@ -101,9 +108,24 @@ public final class IndexAccumulator {
         return pendingBytes.get() >= maxPendingBytes;
     }
 
+    /**
+     * Returns {@code true} when the given producing replicator has reached its pending-byte
+     * back-pressure bound. The bound is intentionally scoped to the producer so one unhealthy
+     * target index bucket cannot stop unrelated main-table buckets from reading WAL.
+     */
+    public boolean isFull(IndexReplicator owner) {
+        return pendingBytes(owner) >= maxPendingBytes;
+    }
+
     /** Total encoded bytes currently pending, including queued and in-flight. */
     public long pendingBytes() {
         return pendingBytes.get();
+    }
+
+    /** Encoded bytes currently pending for the given producing replicator. */
+    public long pendingBytes(IndexReplicator owner) {
+        AtomicLong ownerPendingBytes = pendingBytesByReplicator.get(owner);
+        return ownerPendingBytes == null ? 0L : ownerPendingBytes.get();
     }
 
     /** Snapshot of the buckets currently tracked. May include buckets that have just drained. */
@@ -174,7 +196,12 @@ public final class IndexAccumulator {
     /** Release pending-byte accounting for a batch that reached a terminal state. */
     public void release(IndexBatch batch) {
         if (batch.markReleased()) {
-            pendingBytes.addAndGet(-batch.encoded().getBytesLength());
+            long bytes = batch.encoded().getBytesLength();
+            pendingBytes.addAndGet(-bytes);
+            AtomicLong ownerPendingBytes = pendingBytesByReplicator.get(batch.window().owner());
+            if (ownerPendingBytes != null) {
+                ownerPendingBytes.addAndGet(-bytes);
+            }
         }
     }
 
@@ -219,6 +246,7 @@ public final class IndexAccumulator {
                 }
             }
         }
+        pendingBytesByReplicator.remove(owner);
         return dropped;
     }
 }

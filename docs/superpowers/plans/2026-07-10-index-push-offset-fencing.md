@@ -2,1258 +2,2052 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace per-row index versions and logical tombstones with a stable-writer, source-WAL-offset fence that makes physical Index Table UPSERT and DELETE safe across source and target failover.
+**Goal:** Replace row-level index versions and logical tombstones with a protocol-V1 target WriterState fence keyed by an opaque 128-bit WriterKey and `long batchSequence = windowEndOffset`, while preserving protocol V0 byte-for-byte for ordinary KV tables.
 
-**Architecture:** Every source `TableBucket` receives a persistent writer ID. Index batches carry that writer ID, the exclusive source WAL end offset, and the source partition ID in a new internal KV batch format. Target IndexBuckets reuse generic WAL writer-state and delayed-HW-ack machinery with a separate `MONOTONIC_SOURCE_OFFSET` policy, while partition IDs in physical keys isolate partition incarnations.
+**Architecture:** Every KV table has an immutable `table.kv.idempotence-protocol-version`, defaulting to V0 unless explicitly set. V0 keeps the existing compact writer ID, int sequence, WriterState map, WAL, and snapshot; Index Tables explicitly select V1, whose opaque WriterKey is canonically derived from the source `TableBucket` and whose long sequence is the exclusive source WAL window end. Source committed snapshots bound local and remote WAL deletion, while target KV snapshots, V1 WriterState snapshots, and WAL are recovered as one provably covered state.
 
-**Tech Stack:** Java, Maven, Fluss KV/WAL record formats, ZooKeeper metadata, Fluss RPC/protogen, RocksDB-backed KV tablets, JUnit 5, AssertJ, JMH.
+**Tech Stack:** Java, Maven, Fluss KV/WAL record formats, WriterState, RocksDB KV tablets, remote log tiering, ZooKeeper metadata, JUnit 5, AssertJ, JMH.
 
 ## Global Constraints
 
-- Source ordering is the exclusive source `TableBucket` WAL end offset stored as `long`.
-- Replication remains at-least-once and eventually consistent; exactly-once is not required.
-- Ordinary client writers retain the existing `int` contiguous sequence contract.
-- Internal ordering state lives in generic target WAL writer-state snapshots, not an Index Table-specific store or RocksDB column family.
-- A stale internal batch must not decode rows, mutate KV, or append target WAL.
-- A stale acknowledgement waits for the target WAL offset that dominates the stored frontier to enter HW.
-- Active internal writer state never expires by ordinary writer TTL.
-- Partitioned physical keys are `(indexColumns, basePrimaryKey, __partition_id)` and values continue carrying `__partition_id`.
-- Existing partition tombstone write, query, and compaction filters remain.
-- `__source_offset`, `__index_deleted`, versioned Index Table merge configuration, and logical index visibility filtering are removed.
-- Generic `VersionedRowMerger` support outside secondary indexes remains.
-- The rejected Index Table format never entered Git history; do not build migration machinery for it.
-- Unknown internal magic, unsupported tables, and incomplete tombstone baseline states fail before KV prewrite.
-- Preserve unrelated dirty-worktree changes; never reset or rewrite user changes.
-- Asynchronous tests use latches, fault hooks, or condition waiting. Do not add fixed `Thread.sleep` synchronization.
+- Source progress and `IndexWindow.windowEndOffset` are exclusive next-read offsets.
+- Protocol V1 `batchSequence` is `long` and exactly equals `windowEndOffset`; it is not a generated counter.
+- `table.kv.idempotence-protocol-version` defaults to 0 for every KV table unless explicitly set; IndexTableDescriptorFactory explicitly writes 1 and runtime code never infers V1 from table type.
+- Protocol V0 retains its current `writerId:int64`, `batchSequence:int32`, `Map<Long,...>`, exact-next validation, five-batch duplicate history, expiry, WAL, snapshot, and `Integer.MAX_VALUE -> 0` rollover.
+- Protocol V1 uses an opaque 128-bit WriterKey, `batchSequence:int64`, latest-only sequence fence, explicit retirement, KV magic v1, target WAL magic v3, and WriterState snapshot v2.
+- The index module alone canonically maps source `(partitionId?, bucketId)` to WriterKey; common PutKv, WAL, and WriterState code never interprets index fields.
+- No source bucket count or writer field is added to Index Table metadata, table assignment, partition assignment, or leader-assignment RPCs.
+- One `(WriterKey, windowEndOffset, targetBucket)` produces exactly one V1 KV batch and one target WAL batch.
+- PutKv API v2 is a transport capability, not a protocol selector. API version, table protocol, and batch magic must agree; there is no V1-to-V0 fallback.
+- Log Tables and ProduceLog remain on their existing idempotence path and reject an explicit KV idempotence protocol property.
+- IndexSender uses `acks=-1` and `MergeMode.OVERWRITE`; index deletion is a null-value physical DELETE.
+- `__source_offset`, `__index_deleted`, Index Table versioned merge settings, and `IndexEntryVisibilityFilter` are removed.
+- Partitioned physical keys are `(indexColumns, basePrimaryKey, __partition_id)`; values retain the v3 partition tag.
+- A stale V1 batch performs no row decode, KV mutation, or target WAL append, and waits for the dominating target WAL offset to enter HW.
+- V1 WriterState retains one latest batch, never expires by V0 writer TTL, and is retired only by partition tombstone or Index Table deletion.
+- Unknown tombstone state is not authoritative empty state. Partitioned internal writes remain not-ready until the empty or non-empty baseline is initialized.
+- Only committed source KV snapshot progress may release local or remote raw WAL.
+- An uncertain target WAL append fail-stops the replica; it never truncates prewrite and continues serving.
+- Target recovery fails closed unless KV snapshot, WriterState snapshot, and continuous local/remote WAL jointly cover recovery.
+- Do not change lake-table creation, deletion, or cleanup behavior. Index Tables remain non-lake internal tables.
+- Preserve all existing user changes. Do not use broad reset, restore, checkout, or clean commands.
+- Do not add fixed `Thread.sleep` synchronization. Use latches, fault injectors, manual clocks, or condition waiting.
+- Each checkpoint commit has one concise message and no coauthor trailer.
 
 ---
 
 ## File And Interface Map
 
-- `TableAssignment` and `PartitionAssignment` own persistent `indexWriterIdBase`.
-- `CoordinatorContext` derives `writerId = base + bucketId`; NotifyLeaderAndIsr carries it to `Replica`.
-- `KvRecordBatch` and `LogRecordBatch` own the request and persisted internal formats.
-- `WriterStateManager` owns validation, recovery, expiry, retirement, and snapshots.
-- `LogTablet` owns frontier serialization, stale result offsets, and snapshot-before-delete.
-- `KvTablet` owns the no-prewrite stale path and ambiguous-append fail-stop decision.
-- `IndexTableDescriptorFactory` and `IndexSpecFactory` own physical schema and pid-qualified encoding.
-- `IndexReplicator` owns physical mutations and internal batch metadata.
-- `ReplicaIndexController` owns tombstone readiness and the internal write guard.
+- `KvIdempotenceProtocol` resolves the immutable table property to `V0_COMPACT` or `V1_FENCED`.
+- `WriterKey` is a generic opaque two-long value; `IndexWriterKey` alone owns canonical source-bucket encoding and decoding.
+- `ConfigOptions` and `TableInfo` expose `table.kv.idempotence-protocol-version`, with default 0.
+- `KvRecordBatch` magic v1 carries WriterKey plus a long sequence; V0 magic and parser stay byte-compatible.
+- `LogRecordBatch` magic v3 carries WriterKey plus a long sequence; ordinary magic v0-v2 stays unchanged.
+- `WriterStateManager` remains the lifecycle owner but preserves separate V0 compact and V1 fenced state representations.
+- `KvTablet` owns the pre-decode stale path and prewrite/WAL append failure boundary.
+- `IndexSpec` owns physical index row/key encoding; `IndexReplicator` owns source mutation grouping and windows.
+- `TombstonedPartitionDiscriminator` owns writer/key/value partition validation and the tombstone gate.
+- `IndexSourceReader` owns continuous local/remote raw-WAL reading without blocking the shared reader pool.
+- `CompletedSnapshot.getMinRetainLogOffset()` is the common local/remote WAL deletion bound.
+
+## Requirement Coverage
+
+| Design requirement | Owning task |
+|---|---|
+| Default-V0 table protocol, V1 metadata, opaque WriterKey, canonical index codec | Task 1 |
+| V1 KV and target WAL formats with byte-compatible V0 | Tasks 2-3 |
+| Protocol-specific V0 compact and V1 fenced WriterState | Task 4 |
+| Table/API/magic matrix, stale no-op, delayed HW acknowledgement | Task 5 |
+| Uncertain target append fail-stop | Task 6 |
+| Physical DELETE, pid-qualified key, dead row-version removal | Task 7 |
+| Complete UPDATE groups, unaligned/output-aware windows, one batch per sequence | Task 8 |
+| Tombstone initialization, pid validation, serialized writer retirement | Task 9 |
+| Committed source retention floor and continuous raw remote replay | Task 10 |
+| Joint target snapshot/WAL recovery and tiering coverage | Task 11 |
+| Old/new leader races, model checking, partition lifecycle, metrics, capacity | Task 12 |
 
 ---
 
-## Task 0: Freeze the rejected-design baseline without committing it
-
-**Artifacts outside the repository:**
-- Create directory: `/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710/`
-- Create: `/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710.manifest`
-
-- [ ] **Step 1: Inventory the current dirty worktree**
-
-```bash
-git status --short
-git diff --stat
-git diff --check
-```
-
-Expected: every pre-existing modified and untracked path is understood. Do not reset, stash, or commit the rejected per-row format merely to obtain a checkpoint.
-
-- [ ] **Step 2: Copy the exact baseline outside the repository**
-
-```bash
-BASELINE_DIR=/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710
-test ! -e "$BASELINE_DIR"
-rsync -a --exclude=.git --exclude=.cache --exclude=target \
-  /Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/fluss-index-v2/ \
-  "$BASELINE_DIR"/
-```
-
-This copy includes tracked modifications and untracked source files but excludes generated build output. It is read-only reference input for Task 9, not a supported migration artifact.
-
-- [ ] **Step 3: Record a reproducible manifest**
-
-```bash
-BASELINE_DIR=/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710
-find "$BASELINE_DIR" -type f -exec shasum -a 256 {} + | LC_ALL=C sort \
-  > /Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710.manifest
-shasum -a 256 /Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710.manifest
-```
-
-Record the manifest checksum in the execution notes. Task 9 must benchmark this frozen copy, not reconstruct the rejected design from memory.
-
-- [ ] **Step 4: Run the existing focused tests in the copied baseline**
-
-```bash
-mvn -o -Dmaven.repo.local=/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/fluss-index-v2/.cache \
-  -f /Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710/pom.xml \
-  -pl fluss-server -am -Dspotless.check.skip=true \
-  -Dtest=IndexReplicatorAppendTest,IndexPushReplicationITCase,IndexPushFailoverITCase test
-```
-
-Expected: the frozen baseline compiles and its existing index tests pass. Preserve failures as baseline facts; do not edit the copy to make an unexplained failure disappear.
-
----
-
-## Task 1: Persist And Propagate Stable Source Writer IDs
+### Task 1: Table Protocol And Opaque WriterKey
 
 **Files:**
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/ZooKeeperClient.java:1425-1432`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/TableAssignment.java:30-102`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/PartitionAssignment.java:30-72`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/TableAssignmentJsonSerde.java:35-90`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/PartitionAssignmentJsonSerde.java:35-66`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/MetadataManager.java:375-430,808-900`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorContext.java:340-395`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/TableManager.java:90-150`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorRequestBatch.java:214-246`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessor.java:1665-1710`
-- Modify: `fluss-rpc/src/main/proto/FlussApi.proto:1004-1016`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/entity/NotifyLeaderAndIsrData.java:28-100`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/utils/ServerRpcMessageUtils.java:752-805`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java:205-215,455-565`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/zk/data/TableAssignmentJsonSerdeTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/zk/data/PartitionAssignmentJsonSerdeTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/zk/ZooKeeperClientTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/coordinator/CoordinatorContextTest.java`
-- Create: `fluss-server/src/test/java/org/apache/fluss/server/utils/ServerRpcMessageUtilsIndexWriterTest.java`
+- Create: `fluss-common/src/main/java/org/apache/fluss/metadata/KvIdempotenceProtocol.java`
+- Create: `fluss-common/src/main/java/org/apache/fluss/record/WriterKey.java`
+- Create: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexWriterKey.java`
+- Create: `fluss-common/src/test/java/org/apache/fluss/metadata/KvIdempotenceProtocolTest.java`
+- Create: `fluss-common/src/test/java/org/apache/fluss/record/WriterKeyTest.java`
+- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexWriterKeyTest.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/config/ConfigOptions.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/metadata/TableInfo.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/utils/TableDescriptorValidation.java`
+- Modify: `fluss-common/src/test/java/org/apache/fluss/metadata/TableInfoIndexTableTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/utils/TableDescriptorValidationTest.java`
+- Modify later in Task 7: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexTableDescriptorFactory.java`
 
 **Interfaces:**
-- Produces: `OptionalLong TableAssignment.getIndexWriterIdBase()`
-- Produces: `TableAssignment TableAssignment.withIndexWriterIdBase(long base)`
-- Produces: `long ZooKeeperClient.reserveWriterIds(long count)`
-- Produces: `OptionalLong CoordinatorContext.getIndexWriterId(TableBucket tableBucket)`
-- Produces: `OptionalLong NotifyLeaderAndIsrData.getIndexWriterId()`
-- Produces: `long Replica.getIndexWriterId()` using `NO_WRITER_ID` when absent
+- Produces: `ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION`, default `0`
+- Produces: `KvIdempotenceProtocol.forVersion(int)` with `V0_COMPACT` and `V1_FENCED`
+- Produces: `KvIdempotenceProtocol TableInfo.getKvIdempotenceProtocol()`
+- Produces: immutable `WriterKey(long high, long low)` with exact equality and hash code
+- Produces: `WriterKey IndexWriterKey.encode(TableBucket sourceBucket)`
+- Produces: `IndexWriterKey.SourceBucket IndexWriterKey.decode(WriterKey writerKey)`
 
-- [ ] **Step 1: Add failing assignment serde tests**
-
-```java
-@Test
-void testIndexWriterIdBaseRoundTripAndV1Compatibility() {
-    TableAssignment v2 =
-            TableAssignment.builder()
-                    .add(0, BucketAssignment.of(1, 2))
-                    .add(3, BucketAssignment.of(2, 3))
-                    .indexWriterIdBase(100L)
-                    .build();
-    assertThat(roundTrip(v2).getIndexWriterIdBase()).hasValue(100L);
-    assertThat(readJson("{\"version\":1,\"buckets\":{\"0\":[1,2]}}")
-                    .getIndexWriterIdBase())
-            .isEmpty();
-}
-
-@Test
-void testPartitionAssignmentPreservesWriterBase() {
-    PartitionAssignment assignment = new PartitionAssignment(7L, assignments(), 1000L);
-    assertThat(roundTrip(assignment).getIndexWriterIdBase()).hasValue(1000L);
-}
-```
-
-- [ ] **Step 2: Run the serde tests and verify red**
-
-```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=TableAssignmentJsonSerdeTest,PartitionAssignmentJsonSerdeTest test
-```
-
-Expected: compilation fails because the base field, builder method, and partition constructor do not exist.
-
-- [ ] **Step 3: Implement versioned assignment metadata**
-
-```java
-private final @Nullable Long indexWriterIdBase;
-
-public OptionalLong getIndexWriterIdBase() {
-    return indexWriterIdBase == null
-            ? OptionalLong.empty()
-            : OptionalLong.of(indexWriterIdBase);
-}
-
-public TableAssignment withIndexWriterIdBase(long base) {
-    checkArgument(base >= 0L, "indexWriterIdBase must be non-negative");
-    return new TableAssignment(assignments, base);
-}
-```
-
-Serialize `index_writer_id_base` only when present, deserialize it optionally, and bump both assignment JSON versions to `2`. Preserve old constructors by delegating with `null`.
-
-- [ ] **Step 4: Add failing range and propagation tests**
+- [ ] **Step 1: Write protocol-default and table-validation tests**
 
 ```java
 @Test
-void testReserveWriterIdRangeIsDisjoint() throws Exception {
-    long first = zookeeperClient.reserveWriterIds(4L);
-    long second = zookeeperClient.reserveWriterIds(3L);
-    assertThat(second).isEqualTo(first + 4L);
+void testMissingKvIdempotenceProtocolDefaultsToV0() {
+    TableInfo tableInfo = createPrimaryKeyTableInfo(Collections.emptyMap());
+    assertThat(tableInfo.getKvIdempotenceProtocol())
+            .isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
 }
 
 @Test
-void testCoordinatorContextDerivesBucketWriterId() {
-    context.putIndexWriterIdBase(7L, null, 100L);
-    assertThat(context.getIndexWriterId(new TableBucket(7L, 3))).hasValue(103L);
+void testExplicitProtocolV1IsResolved() {
+    TableInfo tableInfo =
+            createPrimaryKeyTableInfo(
+                    Collections.singletonMap(
+                            ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "1"));
+    assertThat(tableInfo.getKvIdempotenceProtocol())
+            .isEqualTo(KvIdempotenceProtocol.V1_FENCED);
 }
 
 @Test
-void testNotifyLeaderRoundTripCarriesWriterId() {
-    NotifyLeaderAndIsrData decoded = roundTrip(notifyDataWithWriterId(1234L));
-    assertThat(decoded.getIndexWriterId()).hasValue(1234L);
-}
-```
-
-Run the range assertion concurrently with varied spans, sort returned intervals, and strongly assert every adjacent pair is disjoint. Inject assignment persistence failure after reservation and assert the next reservation starts beyond the leaked range rather than reusing it.
-
-- [ ] **Step 5: Implement atomic range allocation**
-
-```java
-public long reserveWriterIds(long count) throws Exception {
-    checkArgument(count > 0L, "writer id range size must be positive");
-    long base = writerIdCounter.getAndAdd(count);
-    checkState(base >= 0L && base <= Long.MAX_VALUE - count,
-            "writer id range overflows: base=%s, count=%s", base, count);
-    return base;
-}
-```
-
-Before persisting each data-table or data-partition assignment, reserve `span = maxBucketId + 1`. Reject negative bucket IDs. An allocation may leak if later creation fails, but it is never reclaimed. Derived Index Tables do not receive a source range.
-
-- [ ] **Step 6: Preserve bases in Coordinator state and reassignment**
-
-Populate table/partition base maps from `TableManager`, clear them on completed deletion, and preserve the original base in reassignment writes.
-
-```java
-public OptionalLong getIndexWriterId(TableBucket bucket) {
-    OptionalLong base = getIndexWriterIdBase(bucket.getTableId(), bucket.getPartitionId());
-    return base.isPresent()
-            ? OptionalLong.of(Math.addExact(base.getAsLong(), bucket.getBucket()))
-            : OptionalLong.empty();
-}
-```
-
-- [ ] **Step 7: Propagate the ID through NotifyLeaderAndIsr**
-
-```protobuf
-optional int64 index_writer_id = 9;
-```
-
-`CoordinatorRequestBatch` resolves it from `CoordinatorContext`; RPC conversion preserves field presence; `Replica.makeLeader/makeFollower` stores it. An indexed source replica with a missing ID remains deferred instead of sending unordered batches.
-
-- [ ] **Step 8: Run Task 1 tests**
-
-```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=TableAssignmentJsonSerdeTest,PartitionAssignmentJsonSerdeTest,ZooKeeperClientTest,CoordinatorContextTest,ServerRpcMessageUtilsIndexWriterTest test
-```
-
-Expected: old v1 JSON remains readable; ranges are disjoint; reassignment preserves bases; RPC presence and absence round trip exactly.
-
-- [ ] **Step 9: Commit Task 1**
-
-```bash
-git add fluss-rpc/src/main/proto/FlussApi.proto \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/ZooKeeperClient.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/TableAssignment.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/PartitionAssignment.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/TableAssignmentJsonSerde.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/PartitionAssignmentJsonSerde.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/MetadataManager.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorContext.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/TableManager.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorRequestBatch.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessor.java \
-  fluss-server/src/main/java/org/apache/fluss/server/entity/NotifyLeaderAndIsrData.java \
-  fluss-server/src/main/java/org/apache/fluss/server/utils/ServerRpcMessageUtils.java \
-  fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java \
-  fluss-server/src/test/java/org/apache/fluss/server/zk/data/TableAssignmentJsonSerdeTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/zk/data/PartitionAssignmentJsonSerdeTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/zk/ZooKeeperClientTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/coordinator/CoordinatorContextTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/utils/ServerRpcMessageUtilsIndexWriterTest.java
-git commit -m "[index-v2] persist index writer identity"
-```
-
----
-
-## Task 2: Add Isolated Internal KV And WAL Batch Formats
-
-**Files:**
-- Create: `fluss-common/src/main/java/org/apache/fluss/record/WriterStateMode.java`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/KvRecordBatch.java:30-100`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/DefaultKvRecordBatch.java:35-190`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/KvRecordBatchBuilder.java:45-220`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatch.java:95-150`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchFormat.java:30-390`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatch.java`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsCompactedBuilder.java`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsArrowBuilder.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/WalBuilder.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/CompactedWalBuilder.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/ArrowWalBuilder.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/IndexWalBuilder.java`
-- Test: `fluss-common/src/test/java/org/apache/fluss/record/DefaultKvRecordBatchTest.java`
-- Test: `fluss-common/src/test/java/org/apache/fluss/record/MemoryLogRecordsCompactedBuilderTest.java`
-- Test: `fluss-common/src/test/java/org/apache/fluss/record/MemoryLogRecordsArrowBuilderTest.java`
-
-**Interfaces:**
-- Produces: `WriterStateMode { NONE, CONTIGUOUS, MONOTONIC_SOURCE_OFFSET }`
-- Produces: `long writerSequence()`, `long sourcePartitionId()`, and `WriterStateMode writerStateMode()` on KV and WAL batches
-- Produces: `setInternalWriterState(long writerId, long sourceEndOffset, long sourcePartitionId)` on KV and WAL builders
-
-- [ ] **Step 1: Write failing KV format tests**
-
-```java
-@Test
-void testInternalWriterMetadataRoundTrip() throws Exception {
-    KvRecordBatchBuilder builder = internalBuilder();
-    builder.setInternalWriterState(11L, ((long) Integer.MAX_VALUE) + 99L, 23L);
-    builder.append(KEY, VALUE);
-    KvRecordBatch batch = pointTo(builder.build());
-    assertThat(batch.writerStateMode()).isEqualTo(MONOTONIC_SOURCE_OFFSET);
-    assertThat(batch.writerId()).isEqualTo(11L);
-    assertThat(batch.writerSequence()).isEqualTo(((long) Integer.MAX_VALUE) + 99L);
-    assertThat(batch.sourcePartitionId()).isEqualTo(23L);
-    assertThat(batch.isValid()).isTrue();
+void testProtocolPropertyRejectedForLogTable() {
+    TableDescriptor logTable =
+            logTableDescriptorWithProperty(
+                    ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "0");
+    assertThatThrownBy(
+                    () ->
+                            TableDescriptorValidation.validateTableDescriptor(
+                                    logTable, 100, null))
+            .isInstanceOf(InvalidConfigException.class)
+            .hasMessageContaining("only supported for primary key tables");
 }
 
 @Test
-void testOrdinaryBatchRemainsContiguous() {
-    assertThat(ordinaryBatch.writerStateMode()).isEqualTo(CONTIGUOUS);
-    assertThat(ordinaryBatch.writerSequence()).isEqualTo(ordinaryBatch.batchSequence());
+void testProtocolV1RejectedForUserDataTable() {
+    TableDescriptor dataTable = primaryKeyDataTableWithProtocol(1);
+    assertThatThrownBy(
+                    () ->
+                            TableDescriptorValidation.validateTableDescriptor(
+                                    dataTable, 100, null))
+            .isInstanceOf(InvalidConfigException.class)
+            .hasMessageContaining("protocol version 1 is reserved for system-managed Index Tables");
 }
 ```
 
-Also assert internal writer IDs and source end offsets are non-negative, and `sourcePartitionId` is either non-negative or the single explicit `NO_PARTITION_ID` marker. Malformed combinations and truncated magic-v1 headers must fail CRC/header validation before record iteration.
+Add `KvIdempotenceProtocolTest` assertions that versions 0 and 1 resolve exactly and
+versions `-1` and `2` throw `IllegalArgumentException`. Use existing test helpers in
+`TableInfoIndexTableTest` and `TableDescriptorValidationTest`; do not create a second
+descriptor builder framework.
 
-- [ ] **Step 2: Run KV tests and verify red**
-
-```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-common \
-  -Dspotless.check.skip=true -Dtest=DefaultKvRecordBatchTest test
-```
-
-Expected: compilation fails on the new mode, builder, and accessors.
-
-- [ ] **Step 3: Implement KV magic v1 without changing public defaults**
-
-```java
-public enum WriterStateMode {
-    NONE,
-    CONTIGUOUS,
-    MONOTONIC_SOURCE_OFFSET
-}
-```
-
-Keep public writers on KV magic v0. Internal magic v1 replaces the v0 `int32 sequence` with `int64 sourceEndOffset` and appends `int64 sourcePartitionId`. Make header offsets and sizes magic-dependent; CRC still covers schema ID through records. Reject ordinary state setters on v1 and internal setters on v0. Legacy `batchSequence()` access on internal magic must fail fast rather than truncate the long value; generic validation uses `writerSequence()`.
-
-- [ ] **Step 4: Write failing target WAL format tests**
+- [ ] **Step 2: Write WriterKey and canonical index-codec tests**
 
 ```java
 @Test
-void testInternalWriterMetadataSurvivesWalBuild() throws Exception {
-    CompactedWalBuilder builder = newCompactedWalBuilder();
-    builder.setInternalWriterState(11L, 5_000_000_000L, 23L);
-    builder.append(INSERT, KEY, VALUE);
-    LogRecordBatch batch = onlyBatch(builder.build());
-    assertThat(batch.writerStateMode()).isEqualTo(MONOTONIC_SOURCE_OFFSET);
-    assertThat(batch.writerSequence()).isEqualTo(5_000_000_000L);
-    assertThat(batch.sourcePartitionId()).isEqualTo(23L);
+void testWriterKeyUsesAllBitsForEquality() {
+    assertThat(new WriterKey(7L, 9L)).isEqualTo(new WriterKey(7L, 9L));
+    assertThat(new WriterKey(7L, 9L)).isNotEqualTo(new WriterKey(8L, 9L));
+    assertThat(new WriterKey(7L, 9L)).isNotEqualTo(new WriterKey(7L, 10L));
+}
+
+@Test
+void testPartitionedSourceBucketRoundTrip() {
+    WriterKey key = IndexWriterKey.encode(new TableBucket(99L, Long.MAX_VALUE, 3));
+    assertThat(key.high()).isEqualTo(Long.MAX_VALUE);
+    assertThat(key.low()).isEqualTo(Long.MIN_VALUE | 3L);
+    IndexWriterKey.SourceBucket decoded = IndexWriterKey.decode(key);
+    assertThat(decoded.getPartitionId()).hasValue(Long.MAX_VALUE);
+    assertThat(decoded.getBucketId()).isEqualTo(3);
+}
+
+@Test
+void testUnpartitionedSourceBucketRoundTrip() {
+    WriterKey key = IndexWriterKey.encode(new TableBucket(99L, Integer.MAX_VALUE));
+    assertThat(key).isEqualTo(new WriterKey(0L, Integer.MAX_VALUE));
+    assertThat(IndexWriterKey.decode(key).getPartitionId()).isEmpty();
+}
+
+@Test
+void testRejectsNonCanonicalWriterKeys() {
+    assertThatThrownBy(() -> IndexWriterKey.decode(new WriterKey(1L, 3L)))
+            .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> IndexWriterKey.decode(new WriterKey(1L, Long.MIN_VALUE | (1L << 40))))
+            .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> IndexWriterKey.encode(new TableBucket(99L, -1)))
+            .isInstanceOf(IllegalArgumentException.class);
 }
 ```
 
-- [ ] **Step 5: Implement WAL magic v3**
-
-Keep ordinary builders on current magic. Add log magic v3 with `int64 writerSequence` and `int64 sourcePartitionId`. Existing v0-v2 batches with writer metadata report `CONTIGUOUS` and widen the current `int` sequence; batches without writer metadata report `NONE`:
-
-```java
-default long writerSequence() {
-    return batchSequence();
-}
-
-default long sourcePartitionId() {
-    return NO_PARTITION_ID;
-}
-```
-
-All WAL builders select v3 only after `setInternalWriterState`. Follower parsing and file projection recognize v3 header and CRC offsets.
-
-- [ ] **Step 6: Run Task 2 tests**
+- [ ] **Step 3: Run the focused tests and verify red**
 
 ```bash
 mvn -o -Dmaven.repo.local=.cache -pl fluss-common,fluss-server -am \
   -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=DefaultKvRecordBatchTest,MemoryLogRecordsCompactedBuilderTest,MemoryLogRecordsArrowBuilderTest test
+  -Dtest=KvIdempotenceProtocolTest,WriterKeyTest,IndexWriterKeyTest,TableInfoIndexTableTest,TableDescriptorValidationTest test
 ```
 
-Expected: v0-v2 compatibility and v1/v3 internal round trips pass; malformed magic and short headers are rejected.
+Expected: compilation fails because the protocol option, protocol class, WriterKey, and
+IndexWriterKey do not exist.
 
-- [ ] **Step 7: Commit Task 2**
+- [ ] **Step 4: Implement the versioned protocol contract and default-zero metadata**
+
+```java
+public enum KvIdempotenceProtocol {
+    V0_COMPACT(0),
+    V1_FENCED(1);
+
+    private final int version;
+
+    KvIdempotenceProtocol(int version) {
+        this.version = version;
+    }
+
+    public int version() {
+        return version;
+    }
+
+    public static KvIdempotenceProtocol forVersion(int version) {
+        switch (version) {
+            case 0:
+                return V0_COMPACT;
+            case 1:
+                return V1_FENCED;
+            default:
+                throw new IllegalArgumentException(
+                        "Unsupported KV idempotence protocol version " + version);
+        }
+    }
+}
+```
+
+Add:
+
+```java
+public static final ConfigOption<Integer> TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION =
+        key("table.kv.idempotence-protocol-version")
+                .intType()
+                .defaultValue(0)
+                .withDescription(
+                        "The immutable KV idempotence protocol version. Version 0 is the "
+                                + "compact writer-id protocol and is the default. Version 1 "
+                                + "is the fenced WriterKey protocol reserved for system-managed "
+                                + "Index Tables.");
+```
+
+`TableInfo` reads the defaulted value, so absence deterministically returns 0:
+
+```java
+public KvIdempotenceProtocol getKvIdempotenceProtocol() {
+    return KvIdempotenceProtocol.forVersion(
+            properties.get(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION));
+}
+```
+
+Add this validation while `hasPrimaryKey` and the original descriptor property map are
+both available:
+
+```java
+boolean protocolExplicitlySet =
+        tableDescriptor
+                .getProperties()
+                .containsKey(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key());
+if (!hasPrimaryKey && protocolExplicitlySet) {
+    throw new InvalidConfigException(
+            "table.kv.idempotence-protocol-version is only supported for primary key tables");
+}
+KvIdempotenceProtocol protocol;
+try {
+    protocol =
+            KvIdempotenceProtocol.forVersion(
+                    tableConf.get(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION));
+} catch (IllegalArgumentException e) {
+    throw new InvalidConfigException(e.getMessage());
+}
+if (protocol == KvIdempotenceProtocol.V1_FENCED && !tableDescriptor.isIndexTable()) {
+    throw new InvalidConfigException(
+            "KV idempotence protocol version 1 is reserved for system-managed Index Tables");
+}
+```
+
+- [ ] **Step 5: Implement opaque WriterKey and index-owned canonical encoding**
+
+```java
+public final class WriterKey {
+    private final long high;
+    private final long low;
+
+    public WriterKey(long high, long low) {
+        this.high = high;
+        this.low = low;
+    }
+
+    public long high() {
+        return high;
+    }
+
+    public long low() {
+        return low;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof WriterKey)) {
+            return false;
+        }
+        WriterKey that = (WriterKey) other;
+        return high == that.high && low == that.low;
+    }
+
+    @Override
+    public int hashCode() {
+        return 31 * Long.hashCode(high) + Long.hashCode(low);
+    }
+}
+```
+
+Implement the index-owned codec without exposing its layout to common WriterState code:
+
+```java
+public final class IndexWriterKey {
+    private static final long PARTITIONED_MASK = Long.MIN_VALUE;
+    private static final long BUCKET_MASK = Integer.MAX_VALUE;
+    private static final long RESERVED_MASK = ~(PARTITIONED_MASK | BUCKET_MASK);
+
+    private IndexWriterKey() {}
+
+    public static WriterKey encode(TableBucket sourceBucket) {
+        int bucketId = sourceBucket.getBucket();
+        checkArgument(bucketId >= 0, "bucketId must be non-negative");
+        Long partitionId = sourceBucket.getPartitionId();
+        if (partitionId == null) {
+            return new WriterKey(0L, bucketId);
+        }
+        checkArgument(partitionId >= 0L, "partitionId must be non-negative");
+        return new WriterKey(partitionId, PARTITIONED_MASK | (long) bucketId);
+    }
+
+    public static SourceBucket decode(WriterKey writerKey) {
+        long high = writerKey.high();
+        long low = writerKey.low();
+        checkArgument((low & RESERVED_MASK) == 0L, "WriterKey has reserved bits set");
+        int bucketId = (int) (low & BUCKET_MASK);
+        if ((low & PARTITIONED_MASK) == 0L) {
+            checkArgument(high == 0L, "Unpartitioned WriterKey must have high=0");
+            return new SourceBucket(null, bucketId);
+        }
+        checkArgument(high >= 0L, "partitionId must be non-negative");
+        return new SourceBucket(high, bucketId);
+    }
+
+    public static final class SourceBucket {
+        private final @Nullable Long partitionId;
+        private final int bucketId;
+
+        private SourceBucket(@Nullable Long partitionId, int bucketId) {
+            this.partitionId = partitionId;
+            this.bucketId = bucketId;
+        }
+
+        public OptionalLong getPartitionId() {
+            return partitionId == null
+                    ? OptionalLong.empty()
+                    : OptionalLong.of(partitionId);
+        }
+
+        public int getBucketId() {
+            return bucketId;
+        }
+    }
+}
+```
+
+The source table ID is deliberately not encoded.
+
+- [ ] **Step 6: Run focused and compatibility tests**
+
+Run the Step 3 command. Expected: PASS. Then run:
 
 ```bash
-git add fluss-common/src/main/java/org/apache/fluss/record \
-  fluss-common/src/test/java/org/apache/fluss/record \
-  fluss-server/src/main/java/org/apache/fluss/server/kv/wal
-git commit -m "[index-v2] add internal writer batch format"
+mvn -o -Dmaven.repo.local=.cache -pl fluss-common,fluss-server -am \
+  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
+  -Dtest=TableDescriptorValidationTest,TableDescriptorTest,TableInfoIndexTableTest test
+```
+
+Expected: PASS with existing primary-key and Log Table defaults unchanged.
+
+- [ ] **Step 7: Commit the protocol boundary**
+
+```bash
+git add fluss-common/src/main/java/org/apache/fluss/config/ConfigOptions.java \
+  fluss-common/src/main/java/org/apache/fluss/metadata/KvIdempotenceProtocol.java \
+  fluss-common/src/main/java/org/apache/fluss/metadata/TableInfo.java \
+  fluss-common/src/main/java/org/apache/fluss/record/WriterKey.java \
+  fluss-common/src/test/java/org/apache/fluss/metadata/KvIdempotenceProtocolTest.java \
+  fluss-common/src/test/java/org/apache/fluss/metadata/TableInfoIndexTableTest.java \
+  fluss-common/src/test/java/org/apache/fluss/record/WriterKeyTest.java \
+  fluss-server/src/main/java/org/apache/fluss/server/index/IndexWriterKey.java \
+  fluss-server/src/main/java/org/apache/fluss/server/utils/TableDescriptorValidation.java \
+  fluss-server/src/test/java/org/apache/fluss/server/index/IndexWriterKeyTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/utils/TableDescriptorValidationTest.java
+git commit -m "Add KV idempotence protocols"
 ```
 
 ---
 
-## Task 3: Implement Monotonic Writer State And Durable Frontiers
+### Task 2: Protocol V1 KV Batch Without V0 Layout Changes
 
 **Files:**
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateEntry.java:30-160`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/WriterAppendInfo.java:30-175`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateManager.java:75-540`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogAppendInfo.java:20-145`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogTablet.java:700-820,1100-1380`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/log/WriterStateManagerTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/log/LogTabletTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/log/remote/RemoteLogTabletTest.java`
+- Create: `fluss-common/src/main/java/org/apache/fluss/record/FencedKvRecordBatch.java`
+- Create: `fluss-common/src/main/java/org/apache/fluss/record/FencedKvRecordBatchBuilder.java`
+- Create: `fluss-common/src/main/java/org/apache/fluss/record/KvRecordBatchReader.java`
+- Create: `fluss-common/src/test/java/org/apache/fluss/record/FencedKvRecordBatchTest.java`
+- Create: `fluss-common/src/test/java/org/apache/fluss/record/KvRecordBatchBuilderTest.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/KvRecordBatch.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/DefaultKvRecordBatch.java`
+- Modify: `fluss-common/src/test/java/org/apache/fluss/record/DefaultKvRecordBatchTest.java`
 
 **Interfaces:**
-- Produces: `OptionalLong LogTablet.findDominatingInternalOffset(long writerId, long sourceEndOffset)`
-- Produces: `boolean WriterStateManager.removeInternalWritersForPartition(long partitionId)`
-- Produces: `void WriterStateManager.takeForcedSnapshot()`
-- Produces: `boolean LogTablet.retireInternalWritersForPartition(long partitionId)`
-- Produces: `int WriterStateManager.internalWriterCount()`
-- Produces: `LogAppendInfo LogAppendInfo.staleAt(long targetWalOffset)`
+- Produces: `KvRecordBatch.KV_MAGIC_VALUE_V1`
+- Preserves: `long KvRecordBatch.writerId()` and `int KvRecordBatch.batchSequence()` for V0
+- Produces: `int KvRecordBatch.idempotenceProtocolVersion()`
+- Produces: `WriterKey KvRecordBatch.fencedWriterKey()` for V1 only
+- Produces: `long KvRecordBatch.fencedSequence()` for V1 only
+- Produces: `KvRecordBatch KvRecordBatchReader.pointToByteBuffer(ByteBuffer)`
+- Produces: `FencedKvRecordBatchBuilder.builder(int, int, AbstractPagedOutputView, KvFormat)`
+- Produces: `void FencedKvRecordBatchBuilder.setWriterState(WriterKey, long)`
 
-- [ ] **Step 1: Write failing state-machine tests**
+- [ ] **Step 1: Add byte-exact V0 compatibility tests**
+
+Extend `DefaultKvRecordBatchTest` and `KvRecordBatchBuilderTest`:
 
 ```java
 @Test
-void testMonotonicWriterAcceptsGapsAndStalesAnyOlderOffset() throws Exception {
-    appendInternal(WRITER, 100L, PID);
-    appendInternal(WRITER, 500L, PID);
-    appendInternal(WRITER, 5_000_000_000L, PID);
-    long before = logEndOffset();
-    LogAppendInfo stale = appendInternal(WRITER, 100L, PID);
-    assertThat(stale.duplicated()).isTrue();
-    assertThat(stale.lastOffset()).isEqualTo(offsetOf(5_000_000_000L));
-    assertThat(logEndOffset()).isEqualTo(before);
+void testV0HeaderAndAccessorsRemainByteCompatible() throws Exception {
+    byte[] bytes = buildV0BatchBytes(33L, Integer.MAX_VALUE);
+    KvRecordBatch batch = KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
+    assertThat(batch.getClass()).isEqualTo(DefaultKvRecordBatch.class);
+    assertThat(batch.magic()).isEqualTo(KvRecordBatch.KV_MAGIC_VALUE_V0);
+    assertThat(batch.idempotenceProtocolVersion()).isZero();
+    assertThat(batch.writerId()).isEqualTo(33L);
+    assertThat(batch.batchSequence()).isEqualTo(Integer.MAX_VALUE);
+    assertThat(DefaultKvRecordBatch.RECORD_BATCH_HEADER_SIZE).isEqualTo(28);
+    assertThat(bytes).isEqualTo(EXPECTED_V0_FIXTURE);
 }
 
 @Test
-void testOrdinaryWriterStillRejectsGap() {
-    appendOrdinary(WRITER, 0);
-    assertThatThrownBy(() -> appendOrdinary(WRITER, 2))
-            .isInstanceOf(OutOfOrderSequenceException.class);
+void testCurrentBuilderStillProducesV0() throws Exception {
+    KvRecordBatch batch = buildWithExistingKvRecordBatchBuilder();
+    assertThat(batch.magic()).isEqualTo(KvRecordBatch.KV_MAGIC_VALUE_V0);
+    assertThat(batch.idempotenceProtocolVersion()).isZero();
 }
 ```
 
-- [ ] **Step 2: Run state tests and verify red**
+Define `EXPECTED_V0_FIXTURE` from the current builder output before implementation and
+commit the literal fixture in the test. Do not regenerate it from the code under test.
+
+- [ ] **Step 2: Add V1 round-trip, bounds, and parser-rejection tests**
+
+```java
+@ParameterizedTest
+@ValueSource(longs = {0L, 1L, Integer.MAX_VALUE, 2147483648L, Long.MAX_VALUE})
+void testV1WriterKeyAndSequenceRoundTrip(long sequence) throws Exception {
+    WriterKey writerKey = new WriterKey(33L, Long.MIN_VALUE | 7L);
+    KvRecordBatch batch = buildV1Batch(writerKey, sequence);
+    assertThat(batch).isInstanceOf(FencedKvRecordBatch.class);
+    assertThat(batch.magic()).isEqualTo(KvRecordBatch.KV_MAGIC_VALUE_V1);
+    assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
+    assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
+    assertThat(batch.fencedSequence()).isEqualTo(sequence);
+    assertThat(FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE).isEqualTo(40);
+    batch.ensureValid();
+}
+
+@Test
+void testV1RejectsNegativeSequence() {
+    assertThatThrownBy(
+                    () ->
+                            FencedKvRecordBatchBuilder.builder(
+                                            1, 1024, outputView, KvFormat.COMPACTED)
+                                    .setWriterState(new WriterKey(1L, 2L), -1L))
+            .isInstanceOf(IllegalArgumentException.class);
+}
+
+@Test
+void testReaderRejectsUnknownMagicBeforeHeaderAccess() {
+    byte[] bytes = minimumBatchWithMagic((byte) 2);
+    assertThatThrownBy(
+                    () -> KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes)))
+            .isInstanceOf(CorruptMessageException.class)
+            .hasMessageContaining("Unsupported KV batch magic 2");
+}
+```
+
+- [ ] **Step 3: Run format tests and verify red**
 
 ```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=WriterStateManagerTest,LogTabletTest test
+mvn -o -Dmaven.repo.local=.cache -pl fluss-common -am \
+  -Dspotless.check.skip=true \
+  -Dtest=DefaultKvRecordBatchTest,KvRecordBatchBuilderTest,FencedKvRecordBatchTest test
 ```
 
-Expected: internal long monotonic state is not represented.
+Expected: compilation fails because V1 classes, reader, and V1 accessors do not exist.
 
-- [ ] **Step 3: Extend WriterStateEntry without weakening contiguous writers**
+- [ ] **Step 4: Implement separate V0 and V1 parsers and builders**
 
-Keep the five-entry deque for `CONTIGUOUS`; store one frontier for `MONOTONIC_SOURCE_OFFSET`:
+Keep `DefaultKvRecordBatch` offsets and `KvRecordBatchBuilder` unchanged. Add default V0
+methods to `KvRecordBatch`:
 
 ```java
-static final class InternalBatchMetadata {
-    final long sourceEndOffset;
-    final long targetWalOffset;
-    final long timestamp;
-    final long sourcePartitionId;
+default int idempotenceProtocolVersion() {
+    return 0;
+}
+
+default WriterKey fencedWriterKey() {
+    throw new UnsupportedOperationException("V0 batch has no fenced WriterKey");
+}
+
+default long fencedSequence() {
+    throw new UnsupportedOperationException("V0 batch has no fenced sequence");
 }
 ```
 
-`WriterAppendInfo` accepts any increasing internal sequence and reports lower/equal as stale. A writer ID cannot change mode.
+`FencedKvRecordBatch` uses fixed offsets:
 
-- [ ] **Step 4: Implement stale revalidation inside LogTablet**
-
-`findDominatingInternalOffset` runs under the `LogTablet` lock. `analyzeAndValidateWriterState` revalidates at append time. `E <= last` returns `LogAppendInfo.staleAt(lastInternal.targetWalOffset)` without append; `E > last` appends and advances state.
-
-- [ ] **Step 5: Write failing durability tests**
-
-```java
-@Test
-void testInternalWriterDoesNotExpire() {
-    loadInternalWriter(WRITER, 900L, PID, now);
-    manager.removeExpiredWriters(now + writerExpirationMs + 1L);
-    assertThat(manager.lastEntry(WRITER)).isPresent();
-}
-
-@Test
-void testSegmentDeletionCannotDeleteLastCoveringFrontier() throws Exception {
-    appendInternalAndRoll(WRITER, 900L, PID);
-    deleteOldSegmentsAndRestart();
-    assertThat(appendInternal(WRITER, 800L, PID).duplicated()).isTrue();
-}
+```text
+length=0, magic=4, crc=5, schemaId=9, attributes=11,
+writerKeyHigh=12, writerKeyLow=20, sequence=28,
+recordCount=36, records=40
 ```
 
-Add two complementary unknown-writer recovery tests: with `logStartOffset == 0`, full WAL scan proves history completeness and a new writer may start at any non-negative offset; with `logStartOffset > 0`, missing/corrupt covering state fails tablet recovery instead of treating the writer as new. A validated full snapshot that omits a never-seen writer is sufficient proof to accept that writer's first batch.
+Its CRC starts at schema ID exactly like V0. `FencedKvRecordBatchBuilder` must share
+`DefaultKvRecord` encoding but own its 40-byte header and require writer state before
+build. `KvRecordBatchReader` peeks length and magic, validates the minimum header length,
+then returns `DefaultKvRecordBatch` for magic 0 or `FencedKvRecordBatch` for magic 1. It
+must reject every other magic without invoking a version-specific accessor.
 
-- [ ] **Step 6: Version snapshots and protect frontier retention**
+- [ ] **Step 5: Run format and downstream compatibility tests**
 
-Writer snapshot v2 persists `mode`, `last_writer_sequence`, `last_target_wal_offset`, and `source_partition_id`; v1 reads as contiguous. Internal entries bypass TTL. Serialize entries in writer-ID order and protect the v2 payload with a checksum so structurally valid but corrupted JSON cannot establish a false frontier.
-
-Before deleting WAL that can reconstruct an internal entry, write a full snapshot to a temporary file, fsync it, atomically move it with parent-directory flush, read back and validate checksum/content, verify its offset dominates the last deleted segment end, then delete old WAL and older snapshots. Retain at least one validated covering snapshot. Mark writer history complete only after scanning from `logStartOffset == 0` or loading a validated full snapshot that covers retained history and replaying its WAL tail. Remove the clean-shutdown branch that manufactures empty writer snapshots merely because no snapshot exists; absence now triggers WAL scan, and missing state with truncated history fails recovery before the tablet becomes online.
-
-- [ ] **Step 7: Implement partition retirement primitive**
-
-```java
-public boolean removeInternalWritersForPartition(long partitionId) {
-    List<Long> ids = writers.entrySet().stream()
-            .filter(e -> e.getValue().isInternal()
-                    && e.getValue().sourcePartitionId() == partitionId)
-            .map(Map.Entry::getKey)
-            .collect(toList());
-    removeWriterIds(ids);
-    return !ids.isEmpty();
-}
-```
-
-Return whether the map changed and add `takeForcedSnapshot()` for metadata-driven retirement. Unlike ordinary offset-triggered snapshots, it atomically replaces the snapshot at the current map-end offset even when no new WAL record advanced that offset. Keep these manager methods package-private; `LogTablet.retireInternalWritersForPartition` invokes them while holding the log lock.
-
-- [ ] **Step 8: Run Task 3 tests**
+Run the Step 3 command. Expected: PASS. Then run:
 
 ```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=WriterStateManagerTest,LogTabletTest,RemoteLogTabletTest test
+mvn -o -Dmaven.repo.local=.cache -pl fluss-client,fluss-server -am \
+  -Dspotless.check.skip=true -DskipTests compile
 ```
 
-Expected: sparse offsets, arbitrary stale success, ordinary gap rejection, TTL immunity, restart, truncation, segment deletion, and remote recovery pass.
+Expected: BUILD SUCCESS with no changes required in `KvWriteBatch`, RecordAccumulator,
+or the ordinary client writer.
 
-- [ ] **Step 9: Commit Task 3**
+- [ ] **Step 6: Commit the V1 KV format**
 
 ```bash
-git add fluss-server/src/main/java/org/apache/fluss/server/log \
-  fluss-server/src/test/java/org/apache/fluss/server/log
-git commit -m "[index-v2] add monotonic writer frontier"
+git add fluss-common/src/main/java/org/apache/fluss/record/KvRecordBatch.java \
+  fluss-common/src/main/java/org/apache/fluss/record/DefaultKvRecordBatch.java \
+  fluss-common/src/main/java/org/apache/fluss/record/FencedKvRecordBatch.java \
+  fluss-common/src/main/java/org/apache/fluss/record/FencedKvRecordBatchBuilder.java \
+  fluss-common/src/main/java/org/apache/fluss/record/KvRecordBatchReader.java \
+  fluss-common/src/test/java/org/apache/fluss/record/DefaultKvRecordBatchTest.java \
+  fluss-common/src/test/java/org/apache/fluss/record/FencedKvRecordBatchTest.java \
+  fluss-common/src/test/java/org/apache/fluss/record/KvRecordBatchBuilderTest.java
+git commit -m "Add fenced KV batch format"
 ```
 
-## Task 4: Add the target stale fast path and typed fail-stop append outcomes
+---
+
+### Task 3: Protocol V1 Target WAL Format Without ProduceLog Changes
 
 **Files:**
-- Create: `fluss-server/src/main/java/org/apache/fluss/server/log/AmbiguousLogAppendException.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogSegment.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LocalLog.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogTablet.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogAppendInfo.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogAppendInfo.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/log/LogSegmentTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/log/LogTabletTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaTest.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatch.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchFormat.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatch.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/FileLogInputStream.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/FileLogProjection.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsRowBuilder.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsArrowBuilder.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsCompactedBuilder.java`
+- Modify: `fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsIndexedBuilder.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/WalBuilder.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/ArrowWalBuilder.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/CompactedWalBuilder.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/wal/IndexWalBuilder.java`
+- Modify: `fluss-common/src/test/java/org/apache/fluss/record/DefaultLogRecordBatchTest.java`
+- Modify: `fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchFormatTest.java`
+- Modify: `fluss-common/src/test/java/org/apache/fluss/record/FileLogInputStreamTest.java`
+- Modify: `fluss-common/src/test/java/org/apache/fluss/record/FileLogProjectionTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/kv/wal/ArrowWalBuilderTest.java`
 
-- [ ] **Step 1: Write a failing stale fast-path test**
+**Interfaces:**
+- Produces: `LogRecordBatchFormat.LOG_MAGIC_VALUE_V3`
+- Preserves: `long LogRecordBatch.writerId()` and `int LogRecordBatch.batchSequence()` for v0-v2
+- Produces: `int LogRecordBatch.idempotenceProtocolVersion()`
+- Produces: `WriterKey LogRecordBatch.fencedWriterKey()` for v3 only
+- Produces: `long LogRecordBatch.fencedSequence()` for v3 only
+- Produces: `void WalBuilder.setFencedWriterState(WriterKey writerKey, long sequence)`
 
-Append internal source offset `100`, advance target HW past its target WAL offset, then submit offset `90`. Instrument the KV prewrite path and assert that the stale request performs no decode, no prewrite, no target WAL append, and returns the dominating target WAL offset.
+- [ ] **Step 1: Add byte-exact v0-v2 and ProduceLog compatibility tests**
+
+Retain every current header-offset assertion and add literal fixtures for representative
+v0 and v2 batches:
 
 ```java
-assertThat(result.stale()).isTrue();
-assertThat(result.lastOffset()).isEqualTo(offsetForSource100);
-verify(kvPreWriteBuffer, never()).preWrite(any());
-assertThat(logTablet.localLogEndOffset()).isEqualTo(endBeforeStale);
+@ParameterizedTest
+@ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1, LOG_MAGIC_VALUE_V2})
+void testExistingWriterAccessorsRemainCompact(byte magic) throws Exception {
+    LogRecordBatch batch = buildOrdinaryBatch(magic, 7L, Integer.MAX_VALUE);
+    assertThat(batch.writerId()).isEqualTo(7L);
+    assertThat(batch.batchSequence()).isEqualTo(Integer.MAX_VALUE);
+    assertThat(batch.idempotenceProtocolVersion()).isZero();
+}
+
+@Test
+void testProduceLogBuilderCannotCreateV3() throws Exception {
+    MemoryLogRecords records = buildThroughExistingClientWriter();
+    assertThat(records.batches())
+            .allSatisfy(batch -> assertThat(batch.magic()).isLessThan(LOG_MAGIC_VALUE_V3));
+}
 ```
 
-- [ ] **Step 2: Run the focused test to verify the red state**
+- [ ] **Step 2: Add v3 WriterKey round-trip tests across every reader**
+
+```java
+@Test
+void testV3WriterKeyAndLongSequenceSurviveFileRoundTrip() throws Exception {
+    WriterKey key = new WriterKey(17L, Long.MIN_VALUE | 3L);
+    long sequence = (long) Integer.MAX_VALUE + 17L;
+    MemoryLogRecords records = buildFencedRecords(key, sequence);
+    LogRecordBatch batch = writeAndRead(records).batches().iterator().next();
+    assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+    assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
+    assertThat(batch.fencedWriterKey()).isEqualTo(key);
+    assertThat(batch.fencedSequence()).isEqualTo(sequence);
+}
+```
+
+Repeat the same key and sequence assertions through `FileLogInputStream` and
+`FileLogProjection`. Add a corruption test for magic 3 whose declared size is smaller
+than the v3 fixed header.
+
+- [ ] **Step 3: Run format tests and verify red**
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-common,fluss-server -am \
+  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
+  -Dtest=DefaultLogRecordBatchTest,LogRecordBatchFormatTest,FileLogInputStreamTest,FileLogProjectionTest,ArrowWalBuilderTest test
+```
+
+Expected: compilation fails on v3, fenced accessors, and fenced WalBuilder state.
+
+- [ ] **Step 4: Implement v3 as a protocol-specific extension of v2**
+
+V3 keeps every v2 field through `lastOffsetDelta`, then stores:
+
+```text
+writerKeyHigh:int64
+writerKeyLow:int64
+sequence:int64
+recordCount:int32
+statisticsLength:int32
+```
+
+V3 therefore adds 12 bytes relative to v2. Add explicit v3 cases to every offset and
+header-size switch. Keep existing v0-v2 constants and methods unchanged. Add default
+throwing fenced accessors to `LogRecordBatch`; `DefaultLogRecordBatch` overrides them only
+when `magic == LOG_MAGIC_VALUE_V3`.
+
+All in-memory row builders retain their existing `setWriterState(long, int)` method and
+add:
+
+```java
+public void setFencedWriterState(WriterKey writerKey, long sequence) {
+    checkState(magic == LOG_MAGIC_VALUE_V3, "Fenced writer state requires WAL magic v3");
+    checkArgument(sequence >= 0L, "fenced sequence must be non-negative");
+    this.writerKey = checkNotNull(writerKey);
+    this.fencedSequence = sequence;
+}
+```
+
+Add explicit v3 factories/constructor overloads to the in-memory builders while retaining
+every existing factory default. Expose the corresponding method from every server
+`WalBuilder`; Task 5 selects the v3 factory when the owning table protocol is V1.
+Existing client writer classes must not call it and must not be modified merely to
+accommodate v3.
+
+- [ ] **Step 5: Run format, client, and server compatibility tests**
+
+Run the Step 3 command. Expected: PASS. Then run:
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-client,fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest=RecordAccumulatorTest,SenderTest,LogTabletTest test
+```
+
+Expected: PASS with existing ProduceLog batches and V0 WriterState behavior unchanged.
+
+- [ ] **Step 6: Commit the V1 target WAL format**
+
+```bash
+git add fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatch.java \
+  fluss-common/src/main/java/org/apache/fluss/record/LogRecordBatchFormat.java \
+  fluss-common/src/main/java/org/apache/fluss/record/DefaultLogRecordBatch.java \
+  fluss-common/src/main/java/org/apache/fluss/record/FileLogInputStream.java \
+  fluss-common/src/main/java/org/apache/fluss/record/FileLogProjection.java \
+  fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsRowBuilder.java \
+  fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsArrowBuilder.java \
+  fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsCompactedBuilder.java \
+  fluss-common/src/main/java/org/apache/fluss/record/MemoryLogRecordsIndexedBuilder.java \
+  fluss-common/src/test/java/org/apache/fluss/record/DefaultLogRecordBatchTest.java \
+  fluss-common/src/test/java/org/apache/fluss/record/LogRecordBatchFormatTest.java \
+  fluss-common/src/test/java/org/apache/fluss/record/FileLogInputStreamTest.java \
+  fluss-common/src/test/java/org/apache/fluss/record/FileLogProjectionTest.java \
+  fluss-server/src/main/java/org/apache/fluss/server/kv/wal \
+  fluss-server/src/test/java/org/apache/fluss/server/kv/wal/ArrowWalBuilderTest.java
+git commit -m "Add fenced target WAL format"
+```
+
+---
+
+### Task 4: Protocol-Specific WriterState And Snapshot V2
+
+**Files:**
+- Create: `fluss-server/src/main/java/org/apache/fluss/server/log/FencedWriterStateEntry.java`
+- Create: `fluss-server/src/main/java/org/apache/fluss/server/log/FencedWriterAppendInfo.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateManager.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/log/WriterStateManagerTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/log/WriterSnapshotMapJsonSerdeTest.java`
+
+**Interfaces:**
+- Preserves: existing three-argument `WriterStateManager` constructor as V0
+- Produces: `WriterStateManager(TableBucket, File, int, KvIdempotenceProtocol)`
+- Preserves: existing V0 `lastEntry(long)`, `prepareUpdate(long)`, and `update(WriterAppendInfo)`
+- Produces: `Optional<FencedWriterStateEntry> lastFencedEntry(WriterKey)`
+- Produces: `Optional<FencedWriterStateEntry> findStaleFencedBatch(WriterKey, long)`
+- Produces: `FencedWriterAppendInfo prepareFencedUpdate(WriterKey)`
+- Produces: `void FencedWriterAppendInfo.append(long sequence, long targetWalOffset, long timestamp)`
+- Produces: `void updateFenced(FencedWriterAppendInfo)`
+- Produces: `void removeFencedWriters(Predicate<WriterKey>)`
+
+- [ ] **Step 1: Add V0 no-regression tests around data structures and snapshots**
+
+```java
+@Test
+void testThreeArgumentConstructorRemainsV0Compact() throws Exception {
+    WriterStateManager manager = new WriterStateManager(tableBucket, logDir, 1000);
+    appendV0(manager, 5L, 0, 8L);
+    assertThat(manager.activeWriters()).containsOnlyKeys(5L);
+    assertThat(manager.protocol()).isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
+}
+
+@Test
+void testV0SnapshotFixtureRoundTripsByteForByte() throws Exception {
+    WriterStateManager manager = new WriterStateManager(tableBucket, logDir, 1000);
+    WriterAppendInfo appendInfo = manager.prepareUpdate(5L);
+    appendInfo.appendDataBatch(
+            7, new LogOffsetMetadata(8L), 8L, false, false, 9L);
+    manager.update(appendInfo);
+    manager.updateMapEndOffset(9L);
+    manager.takeSnapshot();
+    assertThat(Files.readAllBytes(writerSnapshotFile(logDir, 9L).toPath()))
+            .isEqualTo(V0_SNAPSHOT_FIXTURE);
+}
+```
+
+Use the repository's current writer snapshot bytes as `V0_SNAPSHOT_FIXTURE`; do not
+generate the expected bytes with the modified serde.
+
+- [ ] **Step 2: Add V1 fence, expiry, and snapshot tests**
+
+```java
+@Test
+void testV1SparseSequenceUsesLatestFenceOnly() throws Exception {
+    WriterStateManager manager = fencedManager();
+    WriterKey key = new WriterKey(4L, 5L);
+    appendV1(manager, key, 100L, 10L);
+    appendV1(manager, key, 500L, 20L);
+    appendV1(manager, key, (long) Integer.MAX_VALUE + 1L, 30L);
+    FencedWriterStateEntry entry = manager.lastFencedEntry(key).orElseThrow(AssertionError::new);
+    assertThat(entry.lastSequence()).isEqualTo((long) Integer.MAX_VALUE + 1L);
+    assertThat(entry.dominatingTargetWalOffset()).isEqualTo(30L);
+    assertThat(manager.findStaleFencedBatch(key, 500L)).contains(entry);
+    assertThat(manager.findStaleFencedBatch(key, entry.lastSequence())).contains(entry);
+    assertThat(manager.findStaleFencedBatch(key, entry.lastSequence() + 1L)).isEmpty();
+}
+
+@Test
+void testV1WriterDoesNotExpireAndCanBeExplicitlyRetired() throws Exception {
+    WriterStateManager manager = fencedManager();
+    WriterKey key = new WriterKey(4L, 5L);
+    appendV1(manager, key, 100L, 10L);
+    manager.removeExpiredWriters(Long.MAX_VALUE);
+    assertThat(manager.lastFencedEntry(key)).isPresent();
+    manager.removeFencedWriters(key::equals);
+    assertThat(manager.lastFencedEntry(key)).isEmpty();
+}
+
+@Test
+void testV1SnapshotRoundTripPreservesFullWriterKeyAndLongSequence() throws Exception {
+    WriterStateManager manager = fencedManager();
+    WriterKey key = new WriterKey(Long.MAX_VALUE, Long.MIN_VALUE | 3L);
+    appendV1(manager, key, 2147483648L, 30L);
+    manager.takeSnapshot();
+    WriterStateManager recovered = fencedManager();
+    recovered.truncateAndReload(0L, 31L, Long.MAX_VALUE);
+    FencedWriterStateEntry entry = recovered.lastFencedEntry(key).orElseThrow(AssertionError::new);
+    assertThat(entry.lastSequence()).isEqualTo(2147483648L);
+    assertThat(entry.dominatingTargetWalOffset()).isEqualTo(30L);
+}
+```
+
+- [ ] **Step 3: Run WriterState tests and verify red**
 
 ```bash
 mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=KvTabletTest#testStaleInternalBatchSkipsPrewrite test
+  -Dspotless.check.skip=true \
+  -Dtest=WriterStateManagerTest,WriterSnapshotMapJsonSerdeTest test
 ```
 
-Expected: the current implementation enters the prewrite path.
+Expected: compilation fails because the fenced entry, protocol constructor, and V1 APIs
+do not exist.
 
-- [ ] **Step 3: Implement the early stale check and append-time revalidation**
-
-Before decoding records or touching the prewrite buffer, ask `LogTablet` for a dominating internal frontier:
+- [ ] **Step 4: Implement a V1 entry without widening the V0 entry**
 
 ```java
-if (records.writerStateMode() == WriterStateMode.MONOTONIC_SOURCE_OFFSET) {
-    OptionalLong dominatingOffset =
-            logTablet.findDominatingInternalOffset(
-                    records.writerId(), records.sourceEndOffset());
-    if (dominatingOffset.isPresent()) {
-        return LogAppendInfo.staleAt(dominatingOffset.getAsLong());
+public final class FencedWriterStateEntry {
+    private final WriterKey writerKey;
+    private final long lastSequence;
+    private final long dominatingTargetWalOffset;
+    private final long lastTimestamp;
+
+    public FencedWriterStateEntry(
+            WriterKey writerKey,
+            long lastSequence,
+            long dominatingTargetWalOffset,
+            long lastTimestamp) {
+        checkArgument(lastSequence >= 0L, "lastSequence must be non-negative");
+        this.writerKey = checkNotNull(writerKey);
+        this.lastSequence = lastSequence;
+        this.dominatingTargetWalOffset = dominatingTargetWalOffset;
+        this.lastTimestamp = lastTimestamp;
+    }
+
+    public WriterKey writerKey() {
+        return writerKey;
+    }
+
+    public long lastSequence() {
+        return lastSequence;
+    }
+
+    public long dominatingTargetWalOffset() {
+        return dominatingTargetWalOffset;
+    }
+
+    public long lastTimestamp() {
+        return lastTimestamp;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof FencedWriterStateEntry)) {
+            return false;
+        }
+        FencedWriterStateEntry that = (FencedWriterStateEntry) other;
+        return lastSequence == that.lastSequence
+                && dominatingTargetWalOffset == that.dominatingTargetWalOffset
+                && lastTimestamp == that.lastTimestamp
+                && writerKey.equals(that.writerKey);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = writerKey.hashCode();
+        result = 31 * result + Long.hashCode(lastSequence);
+        result = 31 * result + Long.hashCode(dominatingTargetWalOffset);
+        return 31 * result + Long.hashCode(lastTimestamp);
     }
 }
 ```
 
-Treat this only as a fast path. `LogTablet.append` must repeat the comparison while holding its writer-state lock, so two concurrent requests cannot both pass validation and append out of order.
+Keep `WriterStateEntry`, `WriterAppendInfo`, and `Map<Long, WriterStateEntry>` unchanged.
+`WriterStateManager` stores exactly one active map based on its constructor protocol.
+Every V0 method checks V0 and every fenced method checks V1, failing with
+`IllegalStateException` on cross-protocol use. The existing constructor delegates to
+`V0_COMPACT`. `removeExpiredWriters` executes existing code for V0 and returns without
+mutation for V1. `writerIdCount()` reports the size of the selected protocol map so
+existing metrics continue to count V1 WriterKeys without maintaining two live stores.
 
-- [ ] **Step 4: Write failing ambiguous-append tests**
+`FencedWriterAppendInfo` captures the current entry at prepare time. Its `append` method
+requires `sequence >= 0`, and when a current entry exists requires
+`sequence > current.lastSequence()`. It creates exactly one updated
+`FencedWriterStateEntry` using the supplied inclusive target WAL offset. `updateFenced`
+replaces the map value only after target WAL append succeeds; it rejects an append info
+whose updated entry is absent.
 
-Inject failures before physical WAL write, after bytes are appended but before offset-index completion, and after `localLogEndOffset` advances:
+- [ ] **Step 5: Implement snapshot v2 and strict protocol matching**
 
-```java
-assertThatThrownBy(this::failBeforeWalAppend)
-        .isInstanceOf(ExpectedRetryableException.class);
-verify(kvPreWriteBuffer).truncateTo(mark);
+Continue writing the exact current snapshot for V0. Write V1 snapshots as:
 
-assertThatThrownBy(this::failAfterWalBytesAppend)
-        .isInstanceOf(AmbiguousLogAppendException.class);
-verify(fatalErrorHandler).onFatalError(any(AmbiguousLogAppendException.class));
+```json
+{"version":2,"kv_idempotence_protocol_version":1,"writer_entries":[{"writer_key_high":4,"writer_key_low":5,"last_sequence":2147483648,"last_target_wal_offset":30,"last_timestamp":1}]}
 ```
 
-Also inject a partial `FileLogRecords.append` failure and assert it is ambiguous even when in-memory LEO is unchanged. Assert that no post-write path is converted into an ordinary retry on the same live replica.
+V0 rejects snapshot version 2. V1 rejects snapshot version 1, a missing protocol field,
+duplicate WriterKeys, a negative sequence, or a malformed key field. Loading must never
+convert a V0 writer ID into a V1 WriterKey. Corrupt-snapshot fallback rules remain for
+Task 11; this task returns the parse error to the caller.
 
-- [ ] **Step 5: Make the log layer report an explicit append outcome**
+- [ ] **Step 6: Run V0, V1, and LogTablet regression tests**
 
-`LogSegment.append` records the active log-file position before write. If `FileLogRecords.append` or later index maintenance throws and the file position changed, wrap the cause in `AmbiguousLogAppendException`. `LogTablet.append` also wraps any failure after `LocalLog.append` returns, including writer-state update or flush failure. A segment roll without WAL bytes is not ambiguous.
+Run the Step 3 command. Expected: PASS. Then run:
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest=WriterStateManagerTest,WriterSnapshotMapJsonSerdeTest,LogTabletTest test
+```
+
+Expected: PASS, especially existing V0 duplicate, out-of-order, rollover, expiry, and
+snapshot assertions.
+
+- [ ] **Step 7: Commit protocol-specific WriterState**
+
+```bash
+git add fluss-server/src/main/java/org/apache/fluss/server/log/FencedWriterAppendInfo.java \
+  fluss-server/src/main/java/org/apache/fluss/server/log/FencedWriterStateEntry.java \
+  fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateManager.java \
+  fluss-server/src/test/java/org/apache/fluss/server/log/WriterSnapshotMapJsonSerdeTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/log/WriterStateManagerTest.java
+git commit -m "Add fenced WriterState protocol"
+```
+
+---
+
+### Task 5: Target Batch Contract And Stale Fast Path
+
+**Files:**
+- Modify: `fluss-rpc/src/main/java/org/apache/fluss/rpc/protocol/ApiKeys.java`
+- Modify: `fluss-rpc/src/test/java/org/apache/fluss/rpc/protocol/ApiKeysTest.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/tablet/TabletService.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/utils/ServerRpcMessageUtils.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogLoader.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogManager.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogAppendInfo.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexSender.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/log/LogTabletTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexSenderTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/tablet/TabletServiceITCase.java`
+
+**Interfaces:**
+- Consumes: `KvIdempotenceProtocol`, V1 KV magic, V3 WAL magic, and V1 WriterState
+- Produces: `Optional<FencedWriterStateEntry> LogTablet.findStaleFencedBatch(WriterKey, long)`
+- Produces: `LogAppendInfo LogAppendInfo.duplicatedAt(long targetWalOffset, long timestamp)`
+- Produces: exact table/API/magic acceptance matrix from the spec
+- Produces: PutKv API v2 capability gate keyed by concrete target server/gateway
+
+- [ ] **Step 1: Add the complete API/table/magic compatibility matrix tests**
+
+In `ReplicaTest` or `TabletServiceITCase`, parameterize these six cases:
 
 ```java
-int beforeBytes = fileLogRecords.sizeInBytes();
+@ParameterizedTest
+@MethodSource("putKvProtocolMatrix")
+void testPutKvProtocolMatrix(
+        KvIdempotenceProtocol tableProtocol,
+        short apiVersion,
+        byte batchMagic,
+        boolean accepted) {
+    ThrowingCallable call = () -> put(tableProtocol, apiVersion, batchMagic);
+    if (accepted) {
+        assertThatCode(call).doesNotThrowAnyException();
+    } else {
+        assertThatThrownBy(call).isInstanceOf(UnsupportedVersionException.class);
+        assertThat(kvPrewriteCount()).isZero();
+    }
+}
+```
+
+The matrix is:
+
+```text
+V0 + API 1 + magic 0 -> accept
+V0 + API 2 + magic 0 -> accept
+V0 + API 2 + magic 1 -> reject
+V1 + API 1 + magic 1 -> reject
+V1 + API 2 + magic 0 -> reject
+V1 + API 2 + magic 1 -> accept
+```
+
+Add a V1-under-API-1 payload whose bytes after magic are deliberately too short for a V1
+header. Assert `UnsupportedVersionException`, not buffer underflow, proving rejection
+occurs before V1 field access. Update `ApiKeysTest` to assert PUT_KV max version 2 while
+its min remains 0.
+
+- [ ] **Step 2: Add stale pre-decode and LogTablet revalidation tests**
+
+```java
+@Test
+void testStaleV1BatchDoesNotDecodeOrAppend() throws Exception {
+    WriterKey key = new WriterKey(9L, Long.MIN_VALUE | 3L);
+    appendFenced(target, key, 500L, validPut("k", "new"));
+    long leo = logTablet.localLogEndOffset();
+    KvRecordBatch malformedButHeaderValid = malformedV1Batch(key, 100L);
+    LogAppendInfo result =
+            target.putAsLeader(malformedButHeaderValid, null, MergeMode.OVERWRITE);
+    assertThat(result.duplicated()).isTrue();
+    assertThat(result.lastOffset()).isEqualTo(
+            logTablet.writerStateManager()
+                    .lastFencedEntry(key)
+                    .orElseThrow(AssertionError::new)
+                    .dominatingTargetWalOffset());
+    assertThat(logTablet.localLogEndOffset()).isEqualTo(leo);
+    assertThat(lookup("k")).contains("new");
+}
+
+@Test
+void testLogLockRevalidationTurnsFreshPrecheckIntoStale() throws Exception {
+    WriterKey key = new WriterKey(9L, 3L);
+    pauseAfterKvPrecheck();
+    CompletableFuture<LogAppendInfo> older = putAsync(key, 100L, put("k", "old"));
+    appendDirectlyUnderLogLock(key, 200L, put("k", "new"));
+    resumeAfterKvPrecheck();
+    assertThat(older.get()).matches(LogAppendInfo::duplicated);
+    assertThat(lookup("k")).contains("new");
+    assertThat(kvPrewriteTruncateReason()).isEqualTo(TruncateReason.DUPLICATED);
+}
+```
+
+- [ ] **Step 3: Add IndexSender capability-cache and no-fallback tests**
+
+Assert requests use `acks=-1`, `MergeMode.OVERWRITE`, and preserve one encoded V1 batch.
+A gateway advertising PutKv max version 1 receives no PutKv payload. A gateway advertising
+version 2 receives the exact V1 bytes. Then:
+
+```java
+@Test
+void testNegativeCapabilityExpiresAndLeaderReplacementInvalidatesCache() {
+    gateway(server1).advertisePutKvMaxVersion((short) 1);
+    enqueueV1Batch(targetBucketOn(server1));
+    runSender();
+    assertThat(gateway(server1).putKvRequests()).isEmpty();
+
+    gateway(server1).advertisePutKvMaxVersion((short) 2);
+    manualClock.advanceMillis(RETRY_BACKOFF_MS);
+    runSender();
+    assertThat(gateway(server1).putKvRequests()).hasSize(1);
+
+    moveLeaderTo(server2);
+    gateway(server2).advertisePutKvMaxVersion((short) 1);
+    enqueueV1Batch(targetBucketOn(server2));
+    runSender();
+    assertThat(gateway(server2).putKvRequests()).isEmpty();
+}
+```
+
+- [ ] **Step 4: Run focused tests and verify red**
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
+  -Dtest=ApiKeysTest,LogTabletTest,KvTabletTest,ReplicaTest,IndexSenderTest,TabletServiceITCase test
+```
+
+- [ ] **Step 5: Propagate the immutable table protocol without table-type inference**
+
+For a primary-key table, production replica creation passes only the explicit/defaulted
+table property:
+
+```java
+KvIdempotenceProtocol protocol = tableInfo.getKvIdempotenceProtocol();
+```
+
+Log Tables keep the existing `WriterStateManager` constructor and therefore V0 behavior;
+they do not read the KV table property. Add protocol parameters through `Replica`,
+`LogManager`, and `LogLoader` only for primary-key table construction. Existing test
+helpers default to V0. Follower append and recovery reject WAL magic v3 unless the owning
+KV table protocol is V1, and reject v0-v2 writer batches for V1.
+
+- [ ] **Step 6: Implement API-aware batch parsing and the table contract**
+
+Bump `ApiKeys.PUT_KV` max version from 1 to 2. Change TabletService to pass
+`currentSession().getApiVersion()` into batch parsing. `ServerRpcMessageUtils` peeks the
+batch magic first:
+
+```java
+if (magic == KvRecordBatch.KV_MAGIC_VALUE_V1 && apiVersion < 2) {
+    throw new UnsupportedVersionException(
+            "KV idempotence protocol V1 requires PutKv API v2");
+}
+KvRecordBatch records = KvRecordBatchReader.pointToByteBuffer(recordsBuffer);
+```
+
+`Replica.putRecordsToLeader` compares `tableInfo.getKvIdempotenceProtocol()` with
+`records.idempotenceProtocolVersion()`. V0 accepts only magic 0. V1 accepts only magic 1,
+`MergeMode.OVERWRITE`, and `requiredAcks == -1`. Use `UnsupportedVersionException` for
+API/protocol incompatibility and `InvalidTableException` for merge/acks violations. All
+checks occur before `KvTablet.putAsLeader`.
+
+- [ ] **Step 7: Add the pre-decode stale path and append revalidation**
+
+At the beginning of `KvTablet.putAsLeader`, under `kvLock` and after header/table
+validation:
+
+```java
+if (kvRecords.idempotenceProtocolVersion() == 1) {
+    Optional<FencedWriterStateEntry> stale =
+            logTablet.findStaleFencedBatch(
+                    kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
+    if (stale.isPresent()) {
+        FencedWriterStateEntry entry = stale.get();
+        return LogAppendInfo.duplicatedAt(
+                entry.dominatingTargetWalOffset(), entry.lastTimestamp());
+    }
+}
+```
+
+When writing the target WAL, call
+`walBuilder.setFencedWriterState(kvRecords.fencedWriterKey(),
+kvRecords.fencedSequence())`. `LogTablet.append` validates v3 under its lock against
+`WriterStateManager.findStaleFencedBatch`; if state advanced after precheck, it returns
+`LogAppendInfo.duplicatedAt(...)`, and KvTablet truncates only that known-stale prewrite.
+On fresh append, update V1 WriterState only after local WAL append succeeds.
+
+`KvTablet.createWalBuilder` selects the explicit magic-v3 builder factory only when
+`kvRecords.idempotenceProtocolVersion() == 1`; its existing V0 branch and all ProduceLog
+builders retain their current magic selection.
+
+- [ ] **Step 8: Gate IndexSender on the concrete target's PutKv v2 capability**
+
+`IndexSender` caches capability by concrete target server ID plus gateway identity. It
+calls:
+
+```java
+gateway.apiVersions(
+        new ApiVersionsRequest()
+                .setClientSoftwareName("fluss-index-replicator")
+                .setClientSoftwareVersion("2"))
+```
+
+Find the PUT_KV entry and require `maxVersion >= 2` before sending a V1 batch. An
+incompatible or unresolved target is retried with normal backoff and an error metric; V1
+bytes are never sent to it. Cache a positive result only for that gateway instance. A
+negative/error result expires at the retry deadline and is queried again. Any
+leader/gateway replacement removes the old entry. Never rebuild or resend the batch as
+V0.
+
+- [ ] **Step 9: Run focused and V0 regression tests**
+
+Run the Step 4 command. Expected: PASS. Then run:
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-client,fluss-server -am \
+  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
+  -Dtest=RecordAccumulatorTest,SenderTest,WriterStateManagerTest,LogTabletTest,KvTabletTest test
+```
+
+Expected: PASS with V0 clients, Log Tables, and ProduceLog unchanged.
+
+- [ ] **Step 10: Commit the target protocol contract**
+
+```bash
+git add fluss-rpc/src/main/java/org/apache/fluss/rpc/protocol/ApiKeys.java \
+  fluss-rpc/src/test/java/org/apache/fluss/rpc/protocol/ApiKeysTest.java \
+  fluss-server/src/main/java/org/apache/fluss/server/tablet/TabletService.java \
+  fluss-server/src/main/java/org/apache/fluss/server/utils/ServerRpcMessageUtils.java \
+  fluss-server/src/main/java/org/apache/fluss/server/log \
+  fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java \
+  fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java \
+  fluss-server/src/main/java/org/apache/fluss/server/index/IndexSender.java \
+  fluss-server/src/test/java/org/apache/fluss/server/log/LogTabletTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/index/IndexSenderTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/tablet/TabletServiceITCase.java
+git commit -m "Fence stale index batches"
+```
+
+---
+
+### Task 6: Ambiguous Target WAL Append Must Fail-Stop
+
+**Files:**
+- Create: `fluss-server/src/main/java/org/apache/fluss/server/kv/UncertainWalAppendException.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java`
+- Create: `fluss-server/src/test/java/org/apache/fluss/server/kv/IndexWalAppendFailureTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaTest.java`
+
+**Interfaces:**
+- Produces: `UncertainWalAppendException extends IOException`
+- Produces: package-private `LogTablet.AppendFaultInjector` with deterministic append phases
+
+- [ ] **Step 1: Add phase-specific failure tests**
+
+Inject at `BEFORE_LOCAL_APPEND`, `AFTER_LOCAL_APPEND`, and
+`AFTER_WRITER_STATE_UPDATE`. Assert:
+
+- before the LogTablet append call, a known encoding/build failure truncates prewrite and is retryable;
+- every exception after the V1 append call begins becomes `UncertainWalAppendException`;
+- uncertain paths do not call the normal error truncation;
+- `Replica` invokes its fatal error handler and returns no success;
+- restart plus retry converges KV and WriterState to the source mutation.
+
+```java
+@Test
+void testFailureAfterLocalAppendFailStopsReplica() {
+    faultInjector.failAt(AFTER_LOCAL_APPEND);
+    assertThatThrownBy(
+                    () -> putFenced(new WriterKey(7L, Long.MIN_VALUE | 3L), 100L))
+            .isInstanceOf(UncertainWalAppendException.class);
+    assertThat(fatalErrors).hasSize(1);
+    assertThat(replicaAcceptsWrites()).isFalse();
+}
+```
+
+- [ ] **Step 2: Run the new tests and verify red**
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest=IndexWalAppendFailureTest,ReplicaTest test
+```
+
+- [ ] **Step 3: Mark the exact uncertainty boundary**
+
+Build target WAL before setting the flag. Set `appendInvoked` immediately before
+`logTablet.appendAsLeader`:
+
+```java
+MemoryLogRecords wal = walBuilder.build();
+boolean appendInvoked = false;
 try {
-    int physicalPosition = beforeBytes;
-    fileLogRecords.append(records);
-    if (bytesSinceLastIndexEntry > indexIntervalBytes) {
-        offsetIndex().append(largestOffset, physicalPosition);
-        timeIndex().maybeAppend(maxTimestampSoFar(), startOffsetOfMaxTimestampSoFar());
-    }
+    appendInvoked = true;
+    return logTablet.appendAsLeader(wal);
 } catch (Throwable failure) {
-    if (fileLogRecords.sizeInBytes() != beforeBytes) {
-        throw new AmbiguousLogAppendException(tableBucket, failure);
+    if (kvRecords.idempotenceProtocolVersion() == 1 && appendInvoked) {
+        throw new UncertainWalAppendException(tableBucket, failure);
     }
+    kvPreWriteBuffer.truncateTo(previousLogEnd, TruncateReason.ERROR);
     throw failure;
 }
 ```
 
-The existing `KvTablet.kvLock` serializes this decision with all other tablet writes. `KvTablet` propagates `AmbiguousLogAppendException` without truncating prewrite state; it truncates only for failures the log layer proves occurred before WAL bytes. `Replica.putRecordsToLeader` routes the typed exception to the existing fatal-error handler. Document that recovery must rebuild KV and writer state from valid target WAL before this replica serves writes again.
+If the caught value is an `Error`, invoke the fatal path and rethrow the `Error`; wrap
+checked/runtime `Exception` in `UncertainWalAppendException`. Do not truncate V1
+prewrite on the uncertain branch.
 
-- [ ] **Step 6: Prove stale success waits for the dominating HW**
+- [ ] **Step 4: Add deterministic LogTablet fault phases**
 
-Hold the target WAL high watermark below the offset that established source offset `100`; submit stale offset `90`; assert its future remains incomplete. Advance HW to the dominating target offset and assert success. Repeat with a leader transition before HW advancement and assert the caller retries against the recovered leader.
+The default injector is a no-op. Tests install one through a package-private constructor.
+Invoke it immediately before `localLog.append`, immediately after `localLog.append`, and
+immediately after WriterState update. Do not expose the injector in public APIs.
 
-- [ ] **Step 7: Run Task 4 tests**
+- [ ] **Step 5: Run tests**
 
-```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=LogSegmentTest,LogTabletTest,KvTabletTest,ReplicaTest test
-```
+Run the Step 2 command. Expected: PASS.
 
-Expected: stale batches bypass prewrite, append-time races are fenced, ambiguous appends fail-stop, and acknowledgements remain HW-bound.
-
-- [ ] **Step 8: Commit Task 4**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add fluss-server/src/main/java/org/apache/fluss/server/log \
+git add fluss-server/src/main/java/org/apache/fluss/server/kv/UncertainWalAppendException.java \
   fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java \
+  fluss-server/src/main/java/org/apache/fluss/server/log/LogTablet.java \
   fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java \
-  fluss-server/src/test/java/org/apache/fluss/server/log \
-  fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/kv/IndexWalAppendFailureTest.java \
   fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaTest.java
-git commit -m "[index-v2] fence stale target writes"
+git commit -m "Fail stop uncertain index appends"
 ```
 
-## Task 5: Emit physical index mutations with partition-aware keys
+---
+
+### Task 7: Physical Index Schema And Mutation Encoding
 
 **Files:**
 - Modify: `fluss-common/src/main/java/org/apache/fluss/utils/IndexTableUtils.java`
-- Test: `fluss-common/src/test/java/org/apache/fluss/utils/IndexTableUtilsTest.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexAccumulator.java`
+- Modify: `fluss-common/src/test/java/org/apache/fluss/utils/IndexTableUtilsTest.java`
 - Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexTableDescriptorFactory.java`
 - Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexSpec.java`
 - Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexSpecFactory.java`
-- Create: `fluss-server/src/main/java/org/apache/fluss/server/index/PartitionedIndexKeyEncoder.java`
 - Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexReplicator.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexWindow.java`
 - Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/ReplicaIndexController.java`
 - Delete: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexEntryVisibilityFilter.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexTableDescriptorFactoryTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexSpecFactoryTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexReplicatorAppendTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexAccumulatorTest.java`
 - Delete: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexEntryVisibilityFilterTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexTableDescriptorFactoryTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexSpecFactoryTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexReplicatorAppendTest.java`
 
-- [ ] **Step 1: Write failing schema-contract tests**
+**Interfaces:**
+- Produces: `IndexSpec.IndexEntry IndexSpec.encodeEntry(InternalRow row)`
+- Produces: `IndexEntry.key()`, `IndexEntry.value()`, and `IndexEntry.targetBucket()`
+- Consumes: `TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION` from Task 1
 
-For a partitioned source table, assert the physical index primary key is exactly `(index columns, base primary key, __partition_id)`. Assert the value contains the source row fields required by recheck plus `__partition_id`, and that neither `__source_offset` nor `__index_deleted` exists.
+- [ ] **Step 1: Replace row-version assertions with physical schema assertions**
+
+For a partitioned source, assert exact columns and PK:
 
 ```java
-assertThat(indexSchema.getPrimaryKeyColumnNames())
-        .containsExactly("indexed_col", "base_pk", "__partition_id");
-assertThat(indexSchema.getColumnNames())
-        .doesNotContain("__source_offset", "__index_deleted");
+assertThat(descriptor.getSchema().getColumnNames())
+        .containsExactly("idx", "partition_key", "base_id", "__partition_id");
+assertThat(descriptor.getSchema().getPrimaryKeyColumnNames())
+        .containsExactly("idx", "partition_key", "base_id", "__partition_id");
+assertThat(descriptor.getProperties())
+        .doesNotContainKeys(
+                ConfigOptions.TABLE_MERGE_ENGINE.key(),
+                ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(),
+                ConfigOptions.TABLE_DELETE_BEHAVIOR.key());
+assertThat(descriptor.getProperties())
+        .containsEntry(
+                ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "1");
 ```
 
-- [ ] **Step 2: Run the descriptor test to verify the red state**
+Add mutation tests asserting old-key changes emit a null-value DELETE and new-key UPSERT,
+including a same-target-bucket update where delete precedes upsert.
+
+- [ ] **Step 2: Run index encoding tests and verify red**
 
 ```bash
 mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=IndexTableDescriptorFactoryTest test
+  -Dspotless.check.skip=true \
+  -Dtest=IndexTableDescriptorFactoryTest,IndexSpecFactoryTest,IndexReplicatorAppendTest test
 ```
 
-Expected: the current descriptor still exposes logical-delete/version columns or excludes the partition ID from the physical key.
+- [ ] **Step 3: Derive the physical schema and immutable metadata**
 
-- [ ] **Step 3: Implement the partition-aware key encoder**
+Remove source-offset/deleted columns and their reserved names. Append `__partition_id` to
+the primary-key list only for partitioned sources. Explicitly set
+`TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION` to 1 in `IndexTableDescriptorFactory`; do not
+infer V1 later from `TABLE_TYPE`. Keep the existing index-target bucket-count derivation,
+but do not persist source bucket count as writer metadata.
 
-`PartitionedIndexKeyEncoder` mirrors `CompactedKeyEncoder`, reuses `CompactedKeyWriter` through `KeyEncodingRecycler`, and appends a fixed BIGINT partition ID directly to the compacted key. Do not allocate a `GenericRow` for each index row.
+Do not remove generic `VersionedRowMerger` or its tests; only remove its Index Table
+configuration.
+
+- [ ] **Step 4: Encode one complete physical entry**
+
+Replace separate source-row key/value calls with one encoder result:
 
 ```java
-BinaryRow encode(RowData sourceRow, long partitionId) {
-    CompactedKeyWriter writer = recycler.borrow();
-    try {
-        writer.writeProjectedKey(sourceRow);
-        writer.writeLong(partitionId);
-        return writer.finish();
-    } finally {
-        recycler.recycle(writer);
+static final class IndexEntry {
+    private final byte[] key;
+    private final BinaryRow value;
+    private final int targetBucket;
+    IndexEntry(byte[] key, BinaryRow value, int targetBucket) {
+        this.key = checkNotNull(key, "key");
+        this.value = checkNotNull(value, "value");
+        this.targetBucket = targetBucket;
+    }
+    byte[] key() {
+        return key;
+    }
+    BinaryRow value() {
+        return value;
+    }
+    int targetBucket() {
+        return targetBucket;
     }
 }
 ```
 
-Keep the non-partitioned encoder byte-compatible with the existing key format.
+`IndexSpecFactory` projects index columns plus deduplicated base PK into an Index Table
+row; for partitioned input it appends the source replica's constant partition ID. Build
+the physical key from the Index Table PK row, not by concatenating bytes manually. The
+bucket hash still uses only index columns.
 
-- [ ] **Step 4: Simplify IndexSpec encoding contracts**
-
-Change the value encoder from `encode(row, sourceOffset, deleted)` to `encode(row, partitionId)` for partitioned sources and `encode(row)` otherwise. Add explicit `encodeDeleteKey(oldRow, partitionId)` and `encodeUpsertKey(newRow, partitionId)` paths so key-changing updates emit a physical DELETE for the old key and UPSERT for the new key.
-
-- [ ] **Step 5: Write failing mutation tests**
-
-Cover insert, same-key update, index-key-changing update, delete, partitioned key collision, and repeated replay:
+- [ ] **Step 5: Emit physical operations and remove visibility code**
 
 ```java
-assertThat(mutationsFor(updateChangingIndexKey))
-        .containsExactly(delete(oldPhysicalKey), upsert(newPhysicalKey, newValue));
-assertThat(keyFor(row, 7L)).isNotEqualTo(keyFor(row, 8L));
-assertThat(replayTwice(finalKvState)).isEqualTo(replayOnce(finalKvState));
+if (oldEntry.hasIndexColumns && keysDiffer) {
+    getBuilder(oldEntry.targetBucket).appendDelete(oldEntry.key);
+}
+if (newEntry != null && (!oldEntry.hasIndexColumns || keysDiffer)) {
+    getBuilder(newEntry.targetBucket()).appendUpsert(newEntry.key(), newEntry.value());
+}
 ```
 
-- [ ] **Step 6: Emit internal writer metadata on every target batch**
+Remove all `IndexEntryVisibilityFilter` installation and lookup calls. Keep the partition
+tombstone query filter. Delete tests that only prove logical-delete visibility.
 
-Pass the stable source writer ID into `IndexReplicator`. Immediately before each `BucketBatchBuilder.build()`, set:
+- [ ] **Step 6: Run focused tests**
 
-```java
-builder.setInternalWriterState(
-        sourceWriterId,
-        window.lastProcessedOffset(),
-        sourcePartitionId);
-```
+Run the Step 2 command. Expected: PASS with strong byte-level key/value assertions.
 
-Add `BucketBatchBuilder.appendDelete(key)` as `builder.append(key, null)`. Remove the `IndexWindow` claim that replay reproduces identical window boundaries; correctness now depends only on monotonic end offsets and physical mutation order.
-
-- [ ] **Step 7: Remove logical visibility code and dead tests**
-
-Delete `IndexEntryVisibilityFilter`, its unit tests, versioned index-table merge configuration, and every read/write dependency on `__source_offset` or `__index_deleted`. Retain the partition tombstone query and compaction filters because they protect partition-drop semantics independently of row ordering.
-
-- [ ] **Step 8: Run Task 5 tests**
+- [ ] **Step 7: Commit**
 
 ```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=IndexTableDescriptorFactoryTest,IndexSpecFactoryTest,IndexReplicatorAppendTest test
-```
-
-Expected: physical DELETE/UPSERT semantics, partition-aware keys, and internal batch headers pass without logical visibility fields.
-
-- [ ] **Step 9: Commit Task 5**
-
-```bash
-git add fluss-common/src/main/java/org/apache/fluss/utils/IndexTableUtils.java \
+git add -A fluss-common/src/main/java/org/apache/fluss/utils/IndexTableUtils.java \
   fluss-common/src/test/java/org/apache/fluss/utils/IndexTableUtilsTest.java \
   fluss-server/src/main/java/org/apache/fluss/server/index \
   fluss-server/src/test/java/org/apache/fluss/server/index
-git commit -m "[index-v2] use physical index mutations"
+git commit -m "Use physical index mutations"
 ```
 
-## Task 6: Gate partition traffic on a complete tombstone baseline
+---
 
-**Files:**
-- Modify: `fluss-rpc/src/main/proto/FlussApi.proto`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/metadata/ClusterMetadata.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/metadata/TabletServerMetadataCache.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorRequestBatch.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/utils/ServerRpcMessageUtils.java`
-- Create: `fluss-common/src/main/java/org/apache/fluss/exception/IndexMetadataNotReadyException.java`
-- Create: `fluss-server/src/main/java/org/apache/fluss/server/index/InternalIndexWriteGuard.java`
-- Modify: `fluss-rpc/src/main/java/org/apache/fluss/rpc/protocol/Errors.java`
-- Test: `fluss-rpc/src/test/java/org/apache/fluss/rpc/protocol/ApiErrorTest.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/TombstonedPartitionDiscriminator.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/ReplicaIndexController.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/ReplicaManager.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/metadata/TabletServerMetadataCacheTest.java`
-- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/InternalIndexWriteGuardTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/metadata/PartitionTombstoneMetadataPropagationTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaManagerTest.java`
-
-- [ ] **Step 1: Write failing metadata-baseline tests**
-
-Apply an incremental tombstone update and assert the cache remains not ready. Apply a full snapshot, including an empty full snapshot, and assert readiness becomes true only after the whole update is installed.
-
-```java
-cache.updateMetadata(incrementalTombstoneUpdate());
-assertThat(cache.hasPartitionTombstoneBaseline()).isFalse();
-
-cache.updateMetadata(emptyFullTombstoneSnapshot());
-assertThat(cache.hasPartitionTombstoneBaseline()).isTrue();
-```
-
-Also deliver a newer incremental tombstone before an older full snapshot and assert the installed state retains the greater per-table tombstone version.
-
-- [ ] **Step 2: Add the explicit full-snapshot marker**
-
-Add this backward-compatible protobuf field:
-
-```proto
-optional bool partition_tombstones_full_snapshot = 7 [default = false];
-```
-
-Carry the marker through `ClusterMetadata`, `CoordinatorRequestBatch`, `ServerRpcMessageUtils`, and `TabletServerMetadataCache`. Never infer completeness from a non-empty list. The startup full snapshot and any already-observed incremental entries are combined by retaining the greatest per-table tombstone version, then readiness is published after the resulting map is installed.
-
-- [ ] **Step 3: Write failing write-guard tests**
-
-Cover all three outcomes:
-
-```java
-assertThatThrownBy(() -> guard.validate(batchBeforeBaseline))
-        .isInstanceOf(IndexMetadataNotReadyException.class);
-assertThat(guard.validate(batchForTombstonedPartition)).isEqualTo(NO_OP);
-assertThat(guard.validate(batchForActivePartition)).isEqualTo(APPLY);
-```
-
-For active partitioned writes, reject a header partition ID that differs from any UPSERT value tag or DELETE key partition ID. Assert rejected and tombstoned requests do not advance internal writer state or mutate KV.
-
-- [ ] **Step 4: Implement the guard before writer-state and KV processing**
-
-`InternalIndexWriteGuard` is invoked only for internal index-table batches. Non-partitioned batches use the explicit `NO_PARTITION_ID` marker and bypass tombstone-baseline checks. Its order for partitioned batches is:
-
-1. Require a complete tombstone baseline.
-2. If the source partition is tombstoned, return immediate metadata-backed `LogAppendInfo.noOp()` success with no required WAL offset before writer-state validation, delayed-HW acknowledgement, row decode, or prewrite.
-3. Otherwise validate the batch partition ID against every physical key/value partition tag and return `APPLY`.
-
-Make `IndexMetadataNotReadyException` extend `RetriableException`, allocate the next unassigned stable protocol error code, and add a uniqueness/round-trip assertion in the RPC error tests. Malformed partition identity remains a non-retryable corruption error.
-
-- [ ] **Step 5: Write failing retirement, follower-lag, and drop-race tests**
-
-Block an active partition write at the guard, install the tombstone, release it, and assert no visible index row and no retained writer frontier. With `requiredAcks=-1`, assert tombstone no-op completes immediately without registering a HW-dependent delayed write. Delay follower replication of a pre-drop target WAL until after retirement and assert follower apply removes the recreated frontier. Run retirement concurrently with segment cleanup and assert both complete without deadlock. Restart from WAL/snapshot and assert the same after baseline reconciliation. Also assert a non-partitioned internal batch proceeds before any tombstone baseline exists.
-
-- [ ] **Step 6: Serialize writer retirement with KV and follower apply**
-
-After installing a tombstone metadata update, `ReplicaManager` visits online index replicas and invokes retirement under the same per-tablet serialization used by KV apply:
-
-```java
-kvTablet.retireInternalWriterState(partitionId);
-```
-
-`KvTablet.retireInternalWriterState` acquires its write lock and delegates to the locked `LogTablet` API; do not expose `WriterStateManager` through KV. Follower apply already holding the reentrant KV write lock calls the same method. Preserve the established `kvLock -> LogTablet lock` acquisition order and add a concurrent segment-cleanup/retirement test that completes without deadlock. Retirement is idempotent. A concurrent old partition request either applies before the tombstone and is later hidden/compacted, or observes the tombstone and becomes a no-op; it cannot recreate retired state after the metadata barrier.
-
-Follower apply is a distinct late path: a target WAL batch accepted before drop may arrive after local retirement. After appending/applying an internal v3 follower batch, recheck its `sourcePartitionId` under the same KV serialization; if now tombstoned, remove the reconstructed frontier immediately. The follower still retains the replicated target WAL for log correctness, while query/compaction filters keep its row effects invisible.
-
-- [ ] **Step 7: Run Task 6 tests**
-
-```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=ApiErrorTest,TabletServerMetadataCacheTest,InternalIndexWriteGuardTest,KvTabletTest,ReplicaManagerTest test
-```
-
-Expected: readiness, tombstoned no-op, active validation, retirement serialization, restart, and race assertions pass.
-
-- [ ] **Step 8: Commit Task 6**
-
-```bash
-git add fluss-rpc/src/main/proto/FlussApi.proto \
-  fluss-rpc/src/main/java/org/apache/fluss/rpc/protocol/Errors.java \
-  fluss-rpc/src/test/java/org/apache/fluss/rpc/protocol/ApiErrorTest.java \
-  fluss-common/src/main/java/org/apache/fluss/exception/IndexMetadataNotReadyException.java \
-  fluss-server/src/main/java/org/apache/fluss/server/metadata/ClusterMetadata.java \
-  fluss-server/src/main/java/org/apache/fluss/server/metadata/TabletServerMetadataCache.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorRequestBatch.java \
-  fluss-server/src/main/java/org/apache/fluss/server/utils/ServerRpcMessageUtils.java \
-  fluss-server/src/main/java/org/apache/fluss/server/index/InternalIndexWriteGuard.java \
-  fluss-server/src/main/java/org/apache/fluss/server/index/TombstonedPartitionDiscriminator.java \
-  fluss-server/src/main/java/org/apache/fluss/server/index/ReplicaIndexController.java \
-  fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java \
-  fluss-server/src/main/java/org/apache/fluss/server/log/LogAppendInfo.java \
-  fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java \
-  fluss-server/src/main/java/org/apache/fluss/server/replica/ReplicaManager.java \
-  fluss-server/src/test/java/org/apache/fluss/server/metadata/TabletServerMetadataCacheTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/metadata/PartitionTombstoneMetadataPropagationTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/index/InternalIndexWriteGuardTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaManagerTest.java
-git commit -m "[index-v2] gate partition writer retirement"
-```
-
-## Task 7: Gate the new internal format and isolate it from public KV
+### Task 8: Source Windows And Protocol V1 IndexSender Batches
 
 **Files:**
 - Modify: `fluss-common/src/main/java/org/apache/fluss/config/ConfigOptions.java`
-- Modify: `fluss-common/src/main/java/org/apache/fluss/metadata/TableInfo.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexTableDescriptorFactory.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/TabletServerRegistration.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/TabletServerRegistrationJsonSerde.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/CoordinatorAddress.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/CoordinatorAddressJsonSerde.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/data/ZkData.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/zk/ZooKeeperClient.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/tablet/TabletServer.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorServer.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/metadata/ServerInfo.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorContext.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessor.java`
-- Create: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/event/ActivateIndexPushFeatureEvent.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/event/watcher/TabletServerChangeWatcher.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorService.java`
-- Test: `fluss-common/src/test/java/org/apache/fluss/metadata/TableInfoIndexTableTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/zk/data/TabletServerRegistrationJsonSerdeTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/zk/data/CoordinatorAddressJsonSerdeTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/zk/ZooKeeperClientTest.java`
-- Create: `fluss-server/src/test/java/org/apache/fluss/server/coordinator/CoordinatorServiceIndexCapabilityTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessorTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/coordinator/AutoPartitionManagerTest.java`
-- Test: `fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexReplicator.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexWindow.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexBatch.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexSender.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/ReplicaIndexController.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexReplicatorAppendTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexWindowTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexSenderTest.java`
 
-- [ ] **Step 1: Write failing isolation tests**
+**Interfaces:**
+- Produces: one V1 batch per `(WriterKey, windowEndOffset, targetBucket)`
+- Produces: source mutation groups that never span polls
+- Consumes: `IndexWriterKey.encode`, `FencedKvRecordBatchBuilder`, physical `IndexEntry`
 
-Assert that an internal monotonic batch is rejected by an ordinary table and by an index table without the new push-format property. Assert that the ordinary contiguous writer still rejects a sequence gap and still emits legacy KV/WAL magic.
+- [ ] **Step 1: Add source-boundary tests**
+
+Add tests for:
+
+- `UPDATE_BEFORE` + adjacent `UPDATE_AFTER` in one source batch succeeds;
+- missing, non-adjacent, and cross-batch UPDATE halves fail without advancing;
+- resume in the middle of a source batch skips records below the requested offset;
+- old and new leaders may choose different window ends;
+- two mutations to one target share exactly one V1 batch and sequence;
+- one mutation group is never split, even when it crosses the preferred payload bound;
+- a single request above Netty's hard limit reports record-too-large once and does not enter retry.
 
 ```java
-assertThatThrownBy(() -> ordinaryTablet.put(internalBatch))
-        .isInstanceOf(InvalidRecordException.class);
-assertThatThrownBy(() -> oldIndexTablet.put(internalBatch))
-        .isInstanceOf(InvalidRecordException.class);
-assertThatThrownBy(() -> appendOrdinarySequence(1, 3))
-        .isInstanceOf(OutOfOrderSequenceException.class);
+assertThat(window.windowEndOffset()).isEqualTo(expectedExclusiveOffset);
+assertThat(decodedBatch.fencedWriterKey()).isEqualTo(IndexWriterKey.encode(sourceBucket));
+assertThat(decodedBatch.fencedSequence()).isEqualTo(window.windowEndOffset());
+assertThat(decodedBatch.getRecordCount()).isEqualTo(2);
 ```
 
-- [ ] **Step 2: Add the internal table property**
+- [ ] **Step 2: Run focused tests and verify red**
 
-Define the system-owned property `table.index-meta.push-format-version` and expose:
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest=IndexReplicatorAppendTest,IndexWindowTest,IndexSenderTest test
+```
+
+- [ ] **Step 3: Remove cross-poll UPDATE state**
+
+Delete `PendingUpdateBefore`. Process a source `LogRecordBatch` as complete mutation
+groups. Throw a typed corruption exception when FULL changelog violates adjacency or
+batch completeness. Never assign a new pushed offset after consuming only
+`UPDATE_BEFORE`.
+
+When `LogTablet.read(P)` returns a batch whose base is below `P`, skip individual records
+with `record.logOffset() < P` before constructing groups.
+
+- [ ] **Step 4: Cut windows by derived output, then attach writer state**
+
+Before adding a group, use builder size deltas for all affected target buckets. End a
+non-empty window before a group that crosses the preferred payload. Finalization is:
 
 ```java
-public int getIndexPushFormatVersion() {
-    return properties.getInt(INDEX_PUSH_FORMAT_VERSION, 0);
+BytesView finish(WriterKey writerKey, long windowEndOffset) throws IOException {
+    builder.setWriterState(writerKey, windowEndOffset);
+    return builder.build();
 }
 ```
 
-`IndexTableDescriptorFactory` sets it to `1`; user-created tables cannot opt themselves into internal semantics through public DDL validation.
+Create the `IndexWindow` before publishing any batch, set `inFlightWindow` before
+accumulator append, and use the same exclusive end for every target batch.
 
-- [ ] **Step 3: Write failing registration, activation, and join-race tests**
+- [ ] **Step 5: Enforce exact serialized request size**
 
-```java
-assertThat(readV3Registration(jsonV3).features()).isEmpty();
-assertThatThrownBy(() -> createIndexedTable(withLegacyLiveServer()))
-        .isInstanceOf(UnsupportedOperationException.class)
-        .hasMessageContaining("index-offset-fencing-v1");
-assertThatThrownBy(() -> createIndexedTable(withLegacyLiveCoordinator()))
-        .isInstanceOf(UnsupportedOperationException.class)
-        .hasMessageContaining("index-offset-fencing-v1");
-assertThat(createOrdinaryTable(withLegacyLiveServer())).succeeds();
-```
+Keep `index.replication.max-request-bytes` as a preferred aggregate payload limit and fix
+its description so it does not claim an individual batch can be split. Before send, use
+the built PutKv request's serialized size against `netty.server.max-request-size`. An
+oversized singleton completes its window with a deterministic failure state and metric;
+it is not re-enqueued.
 
-Race a legacy TabletServer joining before, during, and after marker activation. Before activation it blocks index creation; during activation it must be removed before assignment; after activation startup/watcher admission must reject it, so manual partition, auto-partition, and rebalance cannot select it. Assert insufficient compatible replicas fail instead of using the legacy server. Assert a failed table creation does not remove an already-created activation marker.
+- [ ] **Step 6: Run focused tests**
 
-- [ ] **Step 4: Version registrations and implement the activation barrier**
+Run the Step 2 command. Expected: PASS.
 
-Upgrade `TabletServerRegistration` JSON to v4 and `CoordinatorAddress` JSON to v3 with a `features` set. Preserve older deserialization as an empty feature set. TabletServer and Coordinator advertise `index-offset-fencing-v1` only when their runtime contains the corresponding new record readers, assignment serde, and guarded control/apply paths. Carry TabletServer features through `ServerInfo`, startup discovery, and `TabletServerChangeWatcher` without changing endpoint semantics.
-
-Add a persistent `/metadata/features/index-offset-fencing-v1` activation marker. On the first indexed-table request, complete all pure descriptor and permission validation, validate all registrations, create the marker idempotently, then submit `ActivateIndexPushFeatureEvent` and wait for the Coordinator event loop to reconcile live state before generating assignments. Marker activation is monotonic and is not rolled back when table creation later fails.
-
-While the marker is absent, a legacy TabletServer remains usable by ordinary tables and causes indexed-table creation to fail. Once present, Coordinator startup and `TabletServerChangeWatcher` do not admit a TabletServer lacking the feature into live assignment or metadata state; activation reconciliation removes one that raced with validation. This cluster admission barrier closes join races without adding per-table eligibility logic to auto-partitioning and rebalance.
-
-- [ ] **Step 5: Enforce the create-time capability gate**
-
-Retain live server feature sets in `CoordinatorContext`; obtain all live Coordinator and TabletServer registrations through `ZooKeeperClient`. `CoordinatorService.createTable` requires every live registration to advertise `index-offset-fencing-v1`, activates and awaits the event-loop barrier, then generates main/index assignments only from reconciled compatible TabletServers and rechecks capability before persisting metadata. Ordinary tables remain unaffected before activation. Unknown internal KV/WAL magic continues to fail closed during read and recovery.
-
-Document the operational contract in code: once an offset-fenced index table exists, downgrading the Coordinator or any hosting TabletServer below this feature is unsupported.
-
-- [ ] **Step 6: Run Task 7 tests**
-
-```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-common,fluss-server -am \
-  -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-  -Dtest=TableInfoIndexTableTest,TabletServerRegistrationJsonSerdeTest,CoordinatorAddressJsonSerdeTest,ZooKeeperClientTest,CoordinatorServiceIndexCapabilityTest,CoordinatorEventProcessorTest,AutoPartitionManagerTest,KvTabletTest test
-```
-
-Expected: old registrations remain readable, indexed-table creation is gated, and public KV behavior is byte- and sequence-compatible.
-
-- [ ] **Step 7: Commit Task 7**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add fluss-common/src/main/java/org/apache/fluss/config/ConfigOptions.java \
-  fluss-common/src/main/java/org/apache/fluss/metadata/TableInfo.java \
-  fluss-common/src/test/java/org/apache/fluss/metadata/TableInfoIndexTableTest.java \
-  fluss-server/src/main/java/org/apache/fluss/server/index/IndexTableDescriptorFactory.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/TabletServerRegistration.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/TabletServerRegistrationJsonSerde.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/CoordinatorAddress.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/CoordinatorAddressJsonSerde.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/data/ZkData.java \
-  fluss-server/src/main/java/org/apache/fluss/server/zk/ZooKeeperClient.java \
-  fluss-server/src/main/java/org/apache/fluss/server/tablet/TabletServer.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorServer.java \
-  fluss-server/src/main/java/org/apache/fluss/server/metadata/ServerInfo.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorContext.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessor.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/event/ActivateIndexPushFeatureEvent.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/event/watcher/TabletServerChangeWatcher.java \
-  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorService.java \
-  fluss-server/src/test/java/org/apache/fluss/server/zk/data/TabletServerRegistrationJsonSerdeTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/zk/data/CoordinatorAddressJsonSerdeTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/zk/ZooKeeperClientTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/coordinator/CoordinatorServiceIndexCapabilityTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessorTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/coordinator/AutoPartitionManagerTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/kv/KvTabletTest.java
-git commit -m "[index-v2] gate offset-fenced index format"
+  fluss-server/src/main/java/org/apache/fluss/server/index \
+  fluss-server/src/test/java/org/apache/fluss/server/index
+git commit -m "Fence index replication windows"
 ```
 
-## Task 8: Prove failover correctness with deterministic state-machine tests
+---
+
+### Task 9: Tombstone Readiness, Partition Validation, And Writer Retirement
 
 **Files:**
-- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/OffsetFencedIndexStateMachineTest.java`
+- Create: `fluss-server/src/main/java/org/apache/fluss/server/kv/KvWriteGuard.java`
+- Create: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexKvWriteGuard.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/metadata/TabletServerMetadataCache.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessor.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/ReplicaManager.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/delay/DelayedWrite.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/TombstonedPartitionDiscriminator.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/ReplicaIndexController.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogAppendInfo.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateManager.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/metadata/TabletServerMetadataCacheTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/TombstonedPartitionDiscriminatorTest.java`
+- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexPartitionFenceTest.java`
+
+**Interfaces:**
+- Produces: `Optional<PartitionTombstone> TabletServerMetadataCache.getInitializedPartitionTombstone(long)`
+- Produces: explicit `removePartitionTombstone(long)` for table deletion
+- Produces: `KvWriteGuard.Decision { APPLY, NO_OP }`
+- Produces: `Decision KvWriteGuard.beforeWriterState(WriterKey)` and `void KvWriteGuard.validateRecord(WriterKey, byte[], @Nullable BinaryRow)`
+- Produces: `IndexKvWriteGuard` installed only for Index Table KvTablet instances
+- Consumes: `IndexWriterKey.decode` and `WriterStateManager.removeFencedWriters`
+- Produces: `LogAppendInfo.noAppend()` and immediate-success handling in delayed write
+
+- [ ] **Step 1: Add unknown-vs-empty and race tests**
+
+```java
+@Test
+void testAuthoritativeEmptyIsInitialized() {
+    assertThat(cache.getInitializedPartitionTombstone(8L)).isEmpty();
+    cache.updatePartitionTombstone(8L, PartitionTombstone.EMPTY);
+    assertThat(cache.getInitializedPartitionTombstone(8L))
+            .contains(PartitionTombstone.EMPTY);
+}
+
+@Test
+void testUninitializedPartitionedIndexRejectsBeforePrewrite() {
+    assertThatThrownBy(() -> putPartitionedV1(writerKeyForPid(10), 100L))
+            .isInstanceOf(StaleMetadataException.class);
+    assertNoKvWalOrWriterStateChange();
+}
+```
+
+Use latches to execute both race orders: apply holds `kvLock` before tombstone publication,
+and tombstone publication/retirement acquires it before apply. Assert the first row becomes
+query-invisible and the second apply becomes a no-op; both end with no pid-10 WriterState.
+
+- [ ] **Step 2: Run tests and verify red**
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest=TabletServerMetadataCacheTest,TombstonedPartitionDiscriminatorTest,IndexPartitionFenceTest test
+```
+
+- [ ] **Step 3: Preserve authoritative empty baseline**
+
+`updatePartitionTombstone(tableId, EMPTY)` stores EMPTY instead of removing it.
+Coordinator `collectPartitionTombstonesForIndexedTables()` includes every partitioned
+indexed table, including EMPTY. Table deletion uses the explicit remove method.
+
+Query and compaction paths use `optional.orElse(EMPTY)` for fail-open behavior. V1 write
+apply requires the Optional to be present.
+
+- [ ] **Step 4: Add the generic guard boundary and index-owned validation**
+
+Define the common interface without any index type:
+
+```java
+public interface KvWriteGuard {
+    enum Decision {
+        APPLY,
+        NO_OP
+    }
+
+    Decision beforeWriterState(WriterKey writerKey) throws Exception;
+
+    void validateRecord(
+            WriterKey writerKey, byte[] key, @Nullable BinaryRow value) throws Exception;
+
+    KvWriteGuard ACCEPT_ALL = new KvWriteGuard() {
+        @Override
+        public Decision beforeWriterState(WriterKey writerKey) {
+            return Decision.APPLY;
+        }
+
+        @Override
+        public void validateRecord(
+                WriterKey writerKey, byte[] key, @Nullable BinaryRow value) {}
+    };
+}
+```
+
+KvTablet invokes `beforeWriterState` only for V1, under `kvLock`, before WriterState
+lookup. It invokes `validateRecord` only on the fresh path after decoding each record and
+before applying that record to prewrite. `ReplicaIndexController` creates and injects
+`IndexKvWriteGuard` during Index Table KvTablet construction; V0 tables use `ACCEPT_ALL`.
+
+- [ ] **Step 5: Validate WriterKey-derived, key, and value partition IDs**
+
+Under `kvLock`, before WriterState lookup:
+
+```java
+IndexWriterKey.SourceBucket source = IndexWriterKey.decode(writerKey);
+long expectedPid = source.getPartitionId().getAsLong();
+PartitionTombstone tombstone = metadataCache
+        .getInitializedPartitionTombstone(mainTableId)
+        .orElseThrow(() -> new StaleMetadataException(
+                "Partition tombstone baseline is not initialized for " + mainTableId));
+if (tombstone.isTombstoned(expectedPid)) {
+    return KvWriteGuard.Decision.NO_OP;
+}
+return KvWriteGuard.Decision.APPLY;
+```
+
+For an unpartitioned Index Table, require that the decoded WriterKey has no partition ID
+and return APPLY without consulting tombstones. For a partitioned Index Table, require a
+partition ID before the snippet above. This mode check and canonical WriterKey decode
+must happen even when the current tombstone set is empty.
+
+For UPSERT, compare expected pid with both the structured Index Table row and the last
+field decoded from the physical key. `ValueEncoder` derives the v3 value tag from that
+same validated row field; assert the resulting encoded tag in `IndexPartitionFenceTest`.
+For DELETE, decode the physical key with `KeyDecoder` and compare its last PK field. Do
+not compare raw byte suffixes.
+
+- [ ] **Step 6: Serialize retirement with apply**
+
+After cache update, `ReplicaManager` identifies local Index Table replicas whose main
+table ID appears in the tombstone update. Each replica executes under its KvTablet guarded
+executor, then calls:
+
+```java
+logTablet.removeFencedWriters(
+        writerKey -> {
+            IndexWriterKey.SourceBucket source = IndexWriterKey.decode(writerKey);
+            return tombstone.isTombstoned(source.getPartitionId().getAsLong());
+        });
+```
+
+The method takes LogTablet lock after `kvLock`, preserving the established order. A
+tombstoned request returns `LogAppendInfo.noAppend()` before WriterState lookup. The
+Replica/DelayedWrite path treats `noAppend` as immediate success with no HW wait, no WAL,
+and no WriterState creation.
+
+- [ ] **Step 7: Run tests**
+
+Run the Step 2 command. Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add fluss-server/src/main/java/org/apache/fluss/server/metadata/TabletServerMetadataCache.java \
+  fluss-server/src/main/java/org/apache/fluss/server/coordinator/CoordinatorEventProcessor.java \
+  fluss-server/src/main/java/org/apache/fluss/server/replica \
+  fluss-server/src/main/java/org/apache/fluss/server/index \
+  fluss-server/src/main/java/org/apache/fluss/server/kv/KvTablet.java \
+  fluss-server/src/main/java/org/apache/fluss/server/kv/KvWriteGuard.java \
+  fluss-server/src/main/java/org/apache/fluss/server/log \
+  fluss-server/src/test/java/org/apache/fluss/server/metadata/TabletServerMetadataCacheTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/index
+git commit -m "Fence dropped index partitions"
+```
+
+---
+
+### Task 10: Committed Source Retention And Remote Raw-WAL Reader
+
+**Files:**
+- Keep and complete: `fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot/CompletedSnapshot.java`
+- Keep and complete: `fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot/CompletedSnapshotJsonSerde.java`
+- Keep and complete: `fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot/TabletState.java`
+- Keep and complete: `fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot/KvTabletSnapshotTarget.java`
+- Keep and complete: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/remote/RemoteLogTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/remote/LogTieringTask.java`
+- Create: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexSourceReader.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/IndexReplicator.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/index/ReplicaIndexController.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/kv/snapshot/KvTabletSnapshotTargetTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/log/remote/RemoteLogTTLTest.java`
+- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexSourceReaderTest.java`
+
+**Interfaces:**
+- Produces: `long CompletedSnapshot.getMinRetainLogOffset()`
+- Produces: `RemoteLogTablet.expiredRemoteLogSegments(long now, Long lakeEnd, long committedMinRetainOffset)`
+- Produces: `CompletableFuture<IndexSourceReader.ReadResult> IndexSourceReader.read(long nextOffset, long highWatermark, int maxBytes)`
+- Produces: `IndexSourceReader.ReadResult implements AutoCloseable` with `List<LogRecordBatch> batches()` and `long nextOffset()`
+
+- [ ] **Step 1: Add snapshot failure and remote TTL tests**
+
+Use a manual committer that fails upload and commit. Advance volatile index progress to
+500 and assert LogTablet's min-retain offset stays at the prior committed value. Commit a
+later snapshot and assert it advances exactly once.
+
+For remote segments `[0,10)`, `[10,20)`, `[20,30)`, expired by time with committed floor
+15, assert only `[0,10)` is returned. Repeat with lake end below 10 and assert none.
+
+- [ ] **Step 2: Add remote reader continuity tests**
+
+Cover exact `[0,10) -> [10,20) -> local[20,highWatermark)`, an overlapping remote segment, a gap at
+10, corrupt remote bytes, remote end before local start, and records at/above HW. Assert
+the reader emits each source offset once and fails closed on every gap.
+
+Use a controllable executor to prove a pending remote fetch does not block a second local
+IndexReplicator assigned to the same shared read worker.
+
+- [ ] **Step 3: Run focused tests and verify red**
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest=KvTabletSnapshotTargetTest,CompletedSnapshotJsonSerdeTest,RemoteLogTTLTest,IndexSourceReaderTest test
+```
+
+- [ ] **Step 4: Make committed snapshot the only deletion authority**
+
+Keep `Replica#augmentTabletState` capturing the current all-index value, but retain the
+ordering already established in `KvTabletSnapshotTarget`: update latest snapshot fields
+and invoke `logTablet.updateMinRetainOffset(snapshot.getMinRetainLogOffset())` only after
+snapshot commit succeeds. No volatile progress callback calls `updateMinRetainOffset`.
+
+Pass the same committed min-retain offset to remote expiry:
+
+```java
+if (segment.remoteLogEndOffset() <= committedMinRetainOffset
+        && ttlExpired
+        && (lakeEnd == null || segment.remoteLogEndOffset() <= lakeEnd)) {
+    expired.add(segment);
+}
+```
+
+- [ ] **Step 5: Implement non-blocking local/remote source reading**
+
+`IndexSourceReader` owns at most one remote fetch future. Local reads return an already
+completed future. When `nextOffset < localLogStartOffset`, submit `RemoteLogFetcher.fetch`
+to the dedicated remote-log executor and return that future. `IndexReplicator` stores the
+future, returns from `poll()` while it is incomplete, and consumes it with `getNow` only
+after completion.
+Validate every batch/record next offset, skip overlap below expected offset, and require
+the remote/local handoff to equal the next expected offset.
+
+`IndexReplicator.poll()` returns without occupying its worker while the read is pending.
+Closing the replicator cancels the future and closes downloaded resources.
+
+- [ ] **Step 6: Run focused tests**
+
+Run the Step 3 command. Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot \
+  fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java \
+  fluss-server/src/main/java/org/apache/fluss/server/log/remote \
+  fluss-server/src/main/java/org/apache/fluss/server/index \
+  fluss-server/src/test/java/org/apache/fluss/server/kv/snapshot \
+  fluss-server/src/test/java/org/apache/fluss/server/log/remote/RemoteLogTTLTest.java \
+  fluss-server/src/test/java/org/apache/fluss/server/index/IndexSourceReaderTest.java
+git commit -m "Retain source WAL for index replay"
+```
+
+---
+
+### Task 11: Target Joint Recovery And Tiering Coverage
+
+**Files:**
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateManager.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogTablet.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/LogLoader.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/remote/LogTieringTask.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/fetcher/ReplicaFetcherThread.java`
+- Modify: `fluss-server/src/main/java/org/apache/fluss/server/replica/Replica.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/log/WriterStateManagerTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/log/LogLoaderTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/log/remote/RemoteLogMaxUploadSegmentsTest.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/replica/fetcher/ReplicaFetcherThreadTest.java`
+- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexTargetRecoveryITCase.java`
+
+**Interfaces:**
+- Produces: `WriterStateManager.validateRecoveryCoverage(long logStart, long recoveryEnd)`
+- Produces: V1 segment upload requires writer snapshot at exclusive segment end
+- Consumes: committed KV snapshot min-retain offset from Task 10
+
+- [ ] **Step 1: Add fail-closed recovery tests**
+
+Create target histories with KV snapshot offset `K`, WriterState snapshot offset `R`, and
+retained WAL ranges. Assert success for continuous `[K,end)` and `[R,end)`. Assert failure
+for:
+
+- no V1 WriterState snapshot with `logStart > 0`;
+- corrupt latest snapshot and an older snapshot whose replay range has a gap;
+- snapshot after truncation target;
+- clean shutdown with no V1 snapshot;
+- remote Index Table segment without writer snapshot;
+- `ReplicaFetcherThread` writer snapshot download/parse failure.
+
+Also assert fallback succeeds when an older valid snapshot has continuous WAL to the
+recovery end.
+
+- [ ] **Step 2: Run tests and verify red**
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest=WriterStateManagerTest,LogLoaderTest,RemoteLogMaxUploadSegmentsTest,ReplicaFetcherThreadTest,IndexTargetRecoveryITCase test
+```
+
+- [ ] **Step 3: Disable unsafe internal recovery shortcuts**
+
+In `LogTablet.rebuildWriterState`, the clean-shutdown empty-snapshot branch is allowed
+only for `V0_COMPACT`. For `V1_FENCED`, choose a valid snapshot `R <= recoveryEnd`
+and require either `R >= logStart` or continuous remote/local WAL from R to log start.
+If no snapshot exists, scanning from zero is allowed only when retained WAL begins at zero.
+
+Do not remove a corrupt snapshot and continue with unknown V1 writers unless the
+next candidate passes the same coverage check.
+
+- [ ] **Step 4: Require WriterState snapshot in Index Table tiering**
+
+For each closed segment ending at exclusive offset `E`:
+
+```java
+Path writerSnapshot = log.writerStateManager().fetchSnapshot(E)
+        .map(File::toPath)
+        .orElseThrow(() -> new LogStorageException(
+                "Missing V1 writer snapshot at " + E));
+```
+
+Every protocol-V1 KV table requires this path; V0 and Log Tables keep current tiering. A
+copy or manifest commit failure leaves
+`remoteLogEndOffset` unchanged and makes the segment ineligible for local deletion.
+
+- [ ] **Step 5: Make remote snapshot restore fatal for Index Tables**
+
+In `ReplicaFetcherThread`, rethrow snapshot download, parse, reload, or coverage failures
+for a V1 target. Keep existing V0 and Log Table tolerance unchanged. The follower
+must not advance its fetch offset or become leader after failure.
+
+- [ ] **Step 6: Verify joint recovery IT**
+
+The IT creates an Index Table, writes a sparse sequence, commits a KV snapshot, rolls and
+tiers target WAL, deletes eligible local segments, restarts on a new replica, then sends a
+delayed smaller sequence. Assert the delayed batch is stale, target WAL does not grow, and
+KV equals the pre-restart state.
+
+- [ ] **Step 7: Run focused tests**
+
+Run the Step 2 command. Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add fluss-server/src/main/java/org/apache/fluss/server/log \
+  fluss-server/src/main/java/org/apache/fluss/server/replica \
+  fluss-server/src/test/java/org/apache/fluss/server/log \
+  fluss-server/src/test/java/org/apache/fluss/server/replica \
+  fluss-server/src/test/java/org/apache/fluss/server/index/IndexTargetRecoveryITCase.java
+git commit -m "Harden index target recovery"
+```
+
+---
+
+### Task 12: Adversarial Failover, Partition Lifecycle, Metrics, And Capacity Gate
+
+**Files:**
+- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexPushOrderingITCase.java`
+- Create: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexPushModelTest.java`
 - Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexPushFailoverITCase.java`
 - Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexPushReplicationITCase.java`
-- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexSenderTest.java`
-- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/IndexReplicatorLifecycleTest.java`
-- Modify: `fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaTest.java`
-
-- [ ] **Step 1: Build a fixed-seed reference model**
-
-Use a small in-test model keyed by `(indexKey, basePrimaryKey, partitionId)` with per `(writerId, targetBucket)` source frontiers. Generate inserts, same-key updates, key-changing updates, deletes, duplicate windows, changed replay boundaries, stale windows, and leader changes from fixed seeds. Do not add a property-testing dependency if the repository does not already have one.
-
-```java
-for (long seed : new long[] {1L, 7L, 31L, 127L}) {
-    assertImplementationMatchesModel(seed, 10_000);
-}
-```
-
-- [ ] **Step 2: Reproduce old-leader late arrival explicitly**
-
-Block old leader batch `E=100` before target apply. Elect a new source leader, replay `E=40`, then apply `E=150`. Release the old `E=100` batch last. Assert final index bytes and query results equal the source-table model, the target frontier is `150`, and the late batch performs no KV mutation.
-
-- [ ] **Step 3: Prove the source pipeline invariants**
-
-Use controlled source WAL, sender, and snapshot hooks to assert: uncommitted source WAL is never read; one index has at most one unacknowledged window per source leader; a later window and source progress wait for every target batch acknowledgement; an empty target projection sends no batch but advances source progress; failover restarts at or before the durable all-index minimum; and source WAL retention never passes that minimum.
-
-- [ ] **Step 4: Cover target HW delay and target failover**
-
-Append target state for source `E=200` but hold target HW below it. Submit stale `E=150` and assert no acknowledgement. Fail over the target leader, recover state from WAL, advance HW, and assert stale success is tied to the recovered dominating target offset rather than the request's arrival order.
-
-- [ ] **Step 5: Cover snapshot, segment deletion, and restart combinations**
-
-Exercise all four recovery sources: WAL-only, snapshot plus WAL tail, segment deletion after a covering fsynced snapshot, and unclean restart during snapshot creation. Corrupt and remove the only required covering snapshot after deleting earlier WAL and assert fail-closed recovery. Assert no accepted source frontier regresses and no stale mutation becomes visible.
-
-- [ ] **Step 6: Cover partition drop races end to end**
-
-Write a real partitioned source row and assert the index value and physical key carry pid `10`. Race drop partition against blocked old-leader and replay requests, recreate the logical partition as pid `20`, then release delayed pid-10 UPSERT and DELETE batches. Assert query filtering, compaction filtering, internal write guard, and writer retirement converge to no visible pid-10 rows, cannot delete pid-20 rows, and leave other partitions intact.
-
-- [ ] **Step 7: Cover multi-bucket skew and mutation distributions**
-
-Use source buckets whose offsets differ by orders of magnitude and route them to shared target index buckets. Assert independent writer IDs prevent cross-source comparisons. Include hot and uniform index values, null index columns, repeated same-primary-key updates, multiple same-key mutations in one batch, key-changing updates whose old/new keys route to different target buckets, physical `UPSERT -> DELETE -> UPSERT`, empty windows, retries, and changed window sizes.
-
-- [ ] **Step 8: Complete the ambiguous-failure matrix**
-
-Inject failures before prewrite, after prewrite, during target WAL append, after target WAL append, after writer-state update, and before/after HW advancement. For every uncertain append, assert local fail-stop, recovery from target WAL, source retry, and exact convergence to the reference model; for failures proven to precede WAL advancement, assert bounded rollback and ordinary retry.
-
-- [ ] **Step 9: Remove fixed sleeps and weak duplicate tests**
-
-Replace every `Thread.sleep` in the affected index tests with `waitUntil`, latches, mock callbacks, or exact HW/LEO predicates. Remove tests that only repeat a stronger state-machine assertion without exercising a distinct invariant.
-
-- [ ] **Step 10: Run the focused suite three times**
-
-```bash
-for run in 1 2 3; do
-  mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
-    -Dspotless.check.skip=true -Dsurefire.failIfNoSpecifiedTests=false \
-    -Dtest=OffsetFencedIndexStateMachineTest,IndexPushFailoverITCase,IndexPushReplicationITCase,IndexSenderTest,IndexReplicatorLifecycleTest,ReplicaTest test || exit 1
-done
-```
-
-Expected: all fixed seeds and controlled interleavings pass in all three runs without time-based synchronization.
-
-- [ ] **Step 11: Commit Task 8**
-
-```bash
-git add fluss-server/src/test/java/org/apache/fluss/server/index \
-  fluss-server/src/test/java/org/apache/fluss/server/replica/ReplicaTest.java
-git commit -m "[index-v2] prove offset-fenced failover"
-```
-
-## Task 9: Measure cost, update the FIP, and run the full quality gate
-
-**Files:**
-- Create: `fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexPushBenchmark.java`
-- Create: `fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexWriterStateBenchmark.java`
-- Create: `fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexWriterStateCapacityBenchmark.java`
+- Modify: `fluss-server/src/test/java/org/apache/fluss/server/index/PartitionTTLGoldenPathITCase.java`
 - Modify: `fluss-common/src/main/java/org/apache/fluss/metrics/MetricNames.java`
 - Modify: `fluss-server/src/main/java/org/apache/fluss/server/metrics/group/TabletServerMetricGroup.java`
-- Modify: `fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateManager.java`
-- Modify outside repository: `/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/fip/FIP-Global-Secondary-Index-V2.md`
+- Create: `fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexWriterStateBenchmark.java`
+- Verify: `docs/superpowers/specs/2026-07-10-index-push-offset-fencing-design.md`
+- Modify: `/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/fip/FIP-Global-Secondary-Index-V2.md`
 
-- [ ] **Step 1: Add production diagnostics**
+**Interfaces:**
+- Consumes: the complete offset-fenced protocol
+- Produces: production gate evidence and final documentation consistency
 
-Expose counters for accepted internal batches, stale batches, tombstone no-ops, metadata-not-ready rejections, ambiguous append fail-stops, writer frontier count, snapshot bytes, and snapshot duration. Keep labels bounded to table/bucket dimensions already used by TabletServer metrics; never label by writer ID or partition ID.
+- [ ] **Step 1: Add old-leader/new-leader ordering IT**
 
-- [ ] **Step 2: Add focused microbenchmarks**
+Use a target-side latch to hold old leader requests. Fail over the source leader, let the
+new leader restore a conservative snapshot and send differently sized windows, then
+release old requests in reverse order. Include:
 
-`IndexWriterStateBenchmark` measures ordinary contiguous validation, accepted internal monotonic validation, stale fast path, physical UPSERT, mixed UPSERT/DELETE, and writer-snapshot serialization at `1`, `1_000`, and `100_000` internal frontiers. Use prebuilt records so writer-state methods isolate validation overhead; mutation methods report RocksDB Get count and allocation with the JMH GC profiler.
+- UPSERT -> DELETE;
+- DELETE -> UPSERT;
+- same-key UPSERT -> DELETE -> UPSERT;
+- index-key change across two target buckets;
+- lost response and retry;
+- target leader failover while the dominating sequence is below HW.
+
+Final assertions compare every index entry to a reference projection of committed source
+WAL and assert target WAL did not grow for stale requests.
+
+- [ ] **Step 2: Add deterministic model-based test**
+
+For seeds `0..199`, generate 200 source operations and delivery events. The model state is
+a map keyed by physical index key; the system-under-test state uses the target apply
+state machine. Randomly duplicate, drop responses, reorder, change window boundaries,
+truncate uncommitted target WAL, restart, and drop/recreate partitions. After redelivery
+settles:
 
 ```java
-@Benchmark
-public LogAppendInfo staleInternalBatch(BenchmarkState state) {
-    return state.logTablet.append(state.staleBatch);
-}
+assertThat(actualIndexRows).as("seed=%s", seed).isEqualTo(referenceRows);
+assertThat(staleKvMutationCount).isZero();
+assertThat(staleWalAppendCount).isZero();
 ```
 
-- [ ] **Step 3: Add a stable public-API baseline and capacity runner**
+- [ ] **Step 3: Strengthen partition lifecycle IT**
 
-`IndexPushBenchmark` drives table creation, main-table writes, index push, lookup, and deletes only through APIs shared by the frozen rejected design and the final implementation. `IndexWriterStateCapacityBenchmark` records retained heap after full GC, frontier count, snapshot bytes, snapshot wall time, recovery time, recovery peak heap, and fresh/stale P50/P95/P99 at increasing topology sizes. Warm up before recording and write machine/JVM/config metadata beside every result.
+Write real rows to pid 10, assert the physical index key and v3 value tag both contain 10,
+drop it, recreate the logical partition as pid 20, and release delayed pid-10 UPSERT and
+DELETE. Assert pid-20 row survives, pid-10 lookup is filtered immediately, pid-10 writer
+state is retired, and compaction physically removes the old row.
 
-- [ ] **Step 4: Run rejected and offset-fenced implementations on the same machine**
-
-Copy only the stable public-API benchmark into the frozen Task 0 tree, then run baseline and final code sequentially with the same JDK, Maven cache, JVM flags, data sizes, and iteration counts. Store outputs outside either source tree:
+- [ ] **Step 4: Remove fixed sleeps and weak assertions**
 
 ```bash
-RESULTS=/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/index-v2-benchmark-results
-BASELINE=/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/.index-v2-rejected-baseline-20260710
-mkdir -p "$RESULTS" "$BASELINE/fluss-jmh/src/test/java/org/apache/fluss/jmh"
-cp fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexPushBenchmark.java \
-  "$BASELINE/fluss-jmh/src/test/java/org/apache/fluss/jmh/"
+rg -n "Thread\.sleep|sleep\(" fluss-server/src/test/java/org/apache/fluss/server/index
+```
+
+Replace each synchronization sleep with `waitUntil`, a latch, or a manual clock. Keep a
+sleep only when elapsed time itself is the behavior under test and add a comment naming
+that timing contract. Replace non-null/count-only assertions with exact offsets, rows,
+WriterState sequences, target WAL sizes, and failure types.
+
+- [ ] **Step 5: Add metrics**
+
+Register and assert:
+
+- stale V1 batches;
+- V1 WriterState entry count and snapshot bytes;
+- source remote-read bytes and failures;
+- record-too-large failures;
+- tombstone no-op batches; and
+- recovery coverage failures.
+
+Do not add a configurable stale threshold or max-Hop2 setting in this task.
+
+- [ ] **Step 6: Add JMH capacity benchmark**
+
+`IndexWriterStateBenchmark` has protocol parameters `{V0_COMPACT,V1_FENCED}`, source
+writers `{64,1024,16384}`, and target buckets `{1,16,128}`. For both protocols benchmark
+fresh append validation, snapshot serialization, and snapshot reload; for V1 also
+benchmark stale fence lookup. Record operations/sec, allocation rate, retained heap,
+snapshot bytes, and recovery time. Assert V0 still uses `Map<Long,...>` and its existing
+snapshot representation. The V1 setup uses one latest metadata entry per WriterKey and
+does not benchmark the rejected logical-row format as production code.
+
+- [ ] **Step 7: Run the full focused index suite**
+
+```bash
+mvn -o -Dmaven.repo.local=.cache -pl fluss-server -am \
+  -Dspotless.check.skip=true \
+  -Dtest='Index*Test,Index*ITCase,PartitionTTLGoldenPathITCase,CompactionFilterITCase,RemoteLogTTLTest,ReplicaFetcherThreadTest' test
+```
+
+Expected: PASS with no fixed-sleep synchronization.
+
+- [ ] **Step 8: Compile and run the capacity benchmark**
+
+```bash
 mvn -o -Dmaven.repo.local=.cache -pl fluss-jmh -am \
-  -Dspotless.check.skip=true -DskipTests test-compile
+  -Dspotless.check.skip=true -DskipTests package
+
 mvn -o -Dmaven.repo.local=.cache -pl fluss-jmh \
-  -DskipTests -Dexec.mainClass=org.openjdk.jmh.Main -Dexec.classpathScope=test \
-  -Dexec.args="IndexPushBenchmark -prof gc -rf json -rff $RESULTS/offset-fenced-index-push.json" exec:java
-mvn -o -Dmaven.repo.local=.cache -f "$BASELINE/pom.xml" -pl fluss-jmh -am \
-  -Dspotless.check.skip=true -DskipTests test-compile
-mvn -o -Dmaven.repo.local=.cache -f "$BASELINE/pom.xml" -pl fluss-jmh \
-  -DskipTests -Dexec.mainClass=org.openjdk.jmh.Main -Dexec.classpathScope=test \
-  -Dexec.args="IndexPushBenchmark -prof gc -rf json -rff $RESULTS/rejected-index-push.json" exec:java
+  dependency:build-classpath -Dmdep.outputFile=target/jmh.classpath
+
+java -cp "fluss-jmh/target/test-classes:fluss-jmh/target/classes:$(cat fluss-jmh/target/jmh.classpath)" \
+  org.openjdk.jmh.Main '.*IndexWriterStateBenchmark.*' \
+  -wi 3 -i 5 -f 1 -rf json -rff fluss-jmh/target/index-writer-state-result.json
 ```
 
-- [ ] **Step 5: Establish and record performance acceptance criteria**
+Expected: BUILD SUCCESS and a JSON result containing every writer/target-bucket parameter
+combination. Record heap, snapshot bytes, operation throughput, and recovery duration in
+the execution review; do not infer production capacity from a compile-only result.
 
-Record raw JMH JSON and capacity CSV. The merge gate is:
+- [ ] **Step 9: Update FIP and verify documentation against code names**
 
-- Ordinary KV throughput regression versus the frozen baseline is less than 2%.
-- Accepted internal validation adds no per-row allocation and remains O(1) per target batch.
-- Pure physical index UPSERT performs zero RocksDB Gets; stale batches perform zero row decode, prewrite, RocksDB Get, and WAL I/O.
-- Fresh and stale throughput plus mixed UPSERT/DELETE P99 are recorded against the rejected implementation.
-- Snapshot bytes/time, recovery time/peak heap, and retained heap scale linearly through at least 100,000 frontiers.
-- The reviewed FIP records a supported maximum frontier topology and explicit memory, snapshot-pause, recovery-time, and P99 limits derived from the curves.
+Update the FIP to state all of the following exact contracts:
 
-If a numeric threshold fails, or capacity limits have not been reviewed and recorded, stop before declaring production readiness. Do not weaken a threshold without measured evidence and an explicit review decision.
-
-- [ ] **Step 6: Revise FIP V2 to the code contract**
-
-Update `/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/fip/FIP-Global-Secondary-Index-V2.md` to describe physical DELETE/UPSERT, stable writer IDs, exclusive long source end offsets, target WAL/HW-bound stale success, durable monotonic frontiers, partition-aware keys, tombstone baseline/retirement, the monotonic cluster activation marker, capability admission, and unsupported Coordinator downgrade. Remove `__source_offset`, `__index_deleted`, logical visibility, and deterministic replay-window claims.
-
-The FIP is outside the Git repository and is therefore verified separately and not included in the repository commit.
-
-- [ ] **Step 7: Scan for dead design artifacts and fixed sleeps**
+- `table.kv.idempotence-protocol-version` defaults to 0 unless explicitly set;
+- IndexTableDescriptorFactory explicitly writes version 1;
+- V0 keeps writerId:int64, sequence:int32, current WriterState/WAL/snapshot/TTL;
+- V1 uses opaque WriterKey:128bit, sequence:int64, latest fence, explicit retirement;
+- PutKv API v2 is capability only and cannot select or downgrade table protocol;
+- Log Tables and ProduceLog remain outside V1; and
+- the index module alone canonically encodes source partition/bucket into WriterKey.
 
 ```bash
-rg -n "__source_offset|__index_deleted|IndexEntryVisibilityFilter" \
-  fluss-common fluss-server fluss-flink
-rg -n "MergeEngineType\.VERSIONED|DeleteBehavior\.IGNORE" \
-  fluss-common/src/main/java/org/apache/fluss/utils \
-  fluss-server/src/main/java/org/apache/fluss/server/index
-rg -n "Thread\.sleep" fluss-server/src/test/java/org/apache/fluss/server/index
+rg -n "indexWriterIdBase|sourceEndOffset|source-bucket-count|IndexWriterId|CONTIGUOUS_INT|MONOTONIC_LONG|table.kv.idempotence-mode|table.writer.idempotence|__source_offset|__index_deleted|inflightChunks|PK 幂等性吸收" \
+  docs/superpowers/specs/2026-07-10-index-push-offset-fencing-design.md \
+  /Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/fip/FIP-Global-Secondary-Index-V2.md
 ```
 
-Expected: no obsolete index-push fields/filter/secondary-index merge mode and no fixed sleeps in V2 index tests. Generic versioned-row support outside secondary indexes remains untouched.
+Expected: only explicit rejected-alternative/removal references to the two deleted columns;
+no long writer mapping, source bucket count, behavior-only mode, assignment writer range,
+separate source-end field, or PK-only recovery claim. Confirm both documents contain
+`table.kv.idempotence-protocol-version`, `V0_COMPACT`, `V1_FENCED`, `WriterKey`,
+`PutKv API v2`, and `ProduceLog`.
 
-- [ ] **Step 8: Run focused module tests**
-
-```bash
-mvn -o -Dmaven.repo.local=.cache -pl fluss-common,fluss-rpc,fluss-server -am \
-  -Dspotless.check.skip=true test
-```
-
-Expected: all common format, metadata, server recovery, index push, and failover tests pass.
-
-- [ ] **Step 9: Run the workspace compile gate**
+- [ ] **Step 10: Run repository verification**
 
 ```bash
 mvn clean compile -o -Dmaven.repo.local=.cache \
   -pl '!fluss-lake/fluss-lake-lance,!fluss-dist' \
   -Dspotless.check.skip=true
-```
 
-Expected: all included modules compile. If offline resolution alone fails, rerun once without `-o` to populate `.cache`, then rerun the offline command.
-
-- [ ] **Step 10: Run the workspace test gate**
-
-```bash
 mvn test -o -Dmaven.repo.local=.cache \
   -pl '!fluss-lake/fluss-lake-lance,!fluss-dist' \
   -Dspotless.check.skip=true
-```
 
-Expected: all included tests pass. Preserve complete failure logs for any retry; do not classify an unexplained rerun pass as success.
-
-- [ ] **Step 11: Run and retain internal benchmark results**
-
-```bash
-RESULTS=/Users/wangyang/Desktop/Projects/Activate/index-rebase-workspace/index-v2-benchmark-results
-mkdir -p "$RESULTS"
-mvn -o -Dmaven.repo.local=.cache -pl fluss-jmh -am \
-  -Dspotless.check.skip=true -DskipTests test-compile
-mvn -o -Dmaven.repo.local=.cache -pl fluss-jmh \
-  -Dspotless.check.skip=true -DskipTests \
-  -Dexec.mainClass=org.openjdk.jmh.Main -Dexec.classpathScope=test \
-  -Dexec.args="IndexWriterStateBenchmark -prof gc -rf json -rff $RESULTS/index-writer-state-benchmark.json" \
-  exec:java
-mvn -o -Dmaven.repo.local=.cache -pl fluss-jmh \
-  -Dspotless.check.skip=true -DskipTests \
-  -Dexec.mainClass=org.apache.fluss.jmh.IndexWriterStateCapacityBenchmark \
-  -Dexec.classpathScope=test -Dexec.args="$RESULTS/index-writer-state-capacity.csv" exec:java
-```
-
-Expected: all acceptance criteria in Step 5 hold, and raw results are retained outside the repository.
-
-- [ ] **Step 12: Audit and commit all intended repository changes**
-
-Review every path that was already dirty at Task 0, including snapshot fixes and `docs/index-push-mechanism.html`. Confirm each intended change has focused test evidence, remove only dead rejected-design artifacts, and leave no unreviewed file silently staged.
-
-```bash
-git status --short
 git diff --check
-git add fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexPushBenchmark.java \
-  fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexWriterStateBenchmark.java \
-  fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexWriterStateCapacityBenchmark.java \
-  fluss-common/src/main/java/org/apache/fluss/metrics/MetricNames.java \
-  fluss-server/src/main/java/org/apache/fluss/server/metrics/group/TabletServerMetricGroup.java \
-  fluss-server/src/main/java/org/apache/fluss/server/log/WriterStateManager.java \
-  docs/index-push-mechanism.html \
-  fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot/CompletedSnapshot.java \
-  fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot/KvTabletSnapshotTarget.java \
-  fluss-server/src/main/java/org/apache/fluss/server/kv/snapshot/SnapshotLocation.java \
-  fluss-server/src/test/java/org/apache/fluss/server/kv/snapshot/CompletedSnapshotJsonSerdeTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/kv/snapshot/KvSnapshotDataUploaderTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/kv/snapshot/KvTabletSnapshotTargetTest.java \
-  fluss-server/src/test/java/org/apache/fluss/server/kv/snapshot/SnapshotLocationTest.java
-git commit -m "[index-v2] benchmark offset-fenced index push"
 ```
 
-- [ ] **Step 13: Verify repository accounting**
+If offline resolution alone fails, rerun the same Maven command once without `-o` to fill
+`.cache`, then repeat offline. Expected: both offline commands end in BUILD SUCCESS and
+`git diff --check` is silent.
+
+- [ ] **Step 11: Commit the production gate**
 
 ```bash
-git status --short
-git diff --check HEAD^
+git add fluss-common/src/main/java/org/apache/fluss/metrics/MetricNames.java \
+  fluss-server/src/main/java/org/apache/fluss/server/metrics/group/TabletServerMetricGroup.java \
+  fluss-server/src/test/java/org/apache/fluss/server/index \
+  fluss-jmh/src/test/java/org/apache/fluss/jmh/IndexWriterStateBenchmark.java \
+  docs/superpowers/specs/2026-07-10-index-push-offset-fencing-design.md \
+  docs/superpowers/plans/2026-07-10-index-push-offset-fencing.md
+git commit -m "Verify offset fenced index push"
 ```
 
-Expected: no repository changes remain unstaged or uncommitted, and the complete final commit diff has no whitespace errors. The FIP, frozen baseline, and benchmark results remain intentionally outside the repository.
+Do not declare production-ready until the benchmark result for the supported maximum
+topology has been recorded and reviewed. Passing functional tests proves semantics, not
+capacity.
 
-## Completion Gate
+---
 
-- [ ] Stable source `TableBucket` writer IDs survive reassignment and recovery.
-- [ ] Internal source offsets are exclusive `long` end offsets and never share ordinary contiguous writer semantics.
-- [ ] Target apply is physical, monotonic, stale-safe, HW-bound, and fail-stop after ambiguous WAL advancement.
-- [ ] Partition ID is part of the physical key, tombstone baseline is explicit, and retirement cannot race writer recreation.
-- [ ] Ordinary public KV bytes, sequence validation, and table behavior remain unchanged.
-- [ ] Mixed-version clusters reject indexed-table activation before internal records can be emitted.
-- [ ] Deterministic tests prove old-leader late arrival, target failover, recovery, partition drop, multi-bucket skew, and changed replay boundaries.
-- [ ] No obsolete hidden columns, logical visibility code, fixed sleeps, or low-value duplicate tests remain.
-- [ ] Full compile/test gates pass and benchmark evidence satisfies the recorded performance thresholds.
-- [ ] FIP V2 describes exactly the implemented contract and its downgrade boundary.
+## Final Review Checklist
+
+- [ ] Every KV table defaults to protocol V0 unless the property is explicitly set.
+- [ ] V0 KV/WAL/snapshot bytes, `Map<Long,...>`, expiration, and exact-next tests are unchanged.
+- [ ] V1 KV/WAL sequences and full WriterKeys round-trip above `Integer.MAX_VALUE`.
+- [ ] PutKv API/table protocol/batch magic matrix passes with no automatic fallback.
+- [ ] Log Tables and ProduceLog cannot create or consume V1 writer state.
+- [ ] No assignment metadata or leader RPC contains index writer identity.
+- [ ] No Index Table row contains source offset or logical-delete state.
+- [ ] Stale requests do not decode, mutate KV, append WAL, or acknowledge before dominating HW.
+- [ ] Source snapshot commit failure cannot release local or remote WAL.
+- [ ] Target recovery cannot continue with missing WriterState coverage.
+- [ ] Partition unknown/empty states are distinct and drop/recreate is incarnation-safe.
+- [ ] Ambiguous append tests prove fail-stop and convergent recovery.
+- [ ] Model-based and failover ITs compare exact final state to committed source WAL.
+- [ ] No fixed-sleep synchronization remains in the index suite.
+- [ ] Full offline compile and test commands pass.
+- [ ] Capacity evidence is reviewed before production-ready status.

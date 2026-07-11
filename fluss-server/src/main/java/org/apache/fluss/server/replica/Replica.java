@@ -1090,11 +1090,13 @@ public final class Replica {
             RocksIncrementalSnapshot rocksIncrementalSnapshot;
             long lastCompletedSnapshotId = -1;
             long lastCompletedSnapshotLogOffset = 0;
+            Long lastCompletedSnapshotIndexPushedOffset = null;
             long snapshotSize = 0L;
             Map<Long, Collection<KvFileHandleAndLocalPath>> uploadedSstFiles = new HashMap<>();
             if (completedSnapshot != null) {
                 lastCompletedSnapshotId = completedSnapshot.getSnapshotID();
                 lastCompletedSnapshotLogOffset = completedSnapshot.getLogOffset();
+                lastCompletedSnapshotIndexPushedOffset = completedSnapshot.getIndexPushedOffset();
                 snapshotSize = completedSnapshot.getSnapshotSize();
                 uploadedSstFiles.put(
                         completedSnapshot.getSnapshotID(),
@@ -1146,6 +1148,7 @@ public final class Replica {
                             bucketLeaderEpochSupplier,
                             coordinatorEpochSupplier,
                             lastCompletedSnapshotLogOffset,
+                            lastCompletedSnapshotIndexPushedOffset,
                             snapshotSize);
             this.kvSnapshotManager =
                     PeriodicSnapshotManager.create(
@@ -1456,7 +1459,7 @@ public final class Replica {
                         }
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return kvTablet.multiGet(keys);
+                        return indexManager.filterLookupEntries(kvTablet.multiGet(keys));
                     } catch (IOException e) {
                         String errorMsg =
                                 String.format(
@@ -1486,7 +1489,7 @@ public final class Replica {
                         }
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return indexManager.filterTombstonedEntries(
+                        return indexManager.filterPrefixLookupEntries(
                                 kvTablet.prefixLookup(prefixKey));
                     } catch (IOException e) {
                         String errorMsg =

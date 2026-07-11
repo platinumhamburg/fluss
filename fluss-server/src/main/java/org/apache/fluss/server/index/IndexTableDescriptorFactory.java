@@ -20,8 +20,10 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableType;
@@ -86,6 +88,14 @@ public final class IndexTableDescriptorFactory {
                             IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN,
                             DataTypes.BIGINT().copy(false)));
         }
+        columns.add(
+                new Schema.Column(
+                        IndexTableUtils.SOURCE_OFFSET_SYSTEM_COLUMN,
+                        DataTypes.BIGINT().copy(false)));
+        columns.add(
+                new Schema.Column(
+                        IndexTableUtils.INDEX_DELETED_SYSTEM_COLUMN,
+                        DataTypes.BOOLEAN().copy(false)));
         List<String> idxPk = new ArrayList<>(seen);
         Schema derivedSchema = Schema.newBuilder().fromColumns(columns).primaryKey(idxPk).build();
 
@@ -108,6 +118,11 @@ public final class IndexTableDescriptorFactory {
                         .changelogImage(ChangelogImage.WAL)
                         .property(ConfigOptions.TABLE_TYPE, TableType.INDEX_TABLE)
                         .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, mainTableId)
+                        .property(ConfigOptions.TABLE_MERGE_ENGINE, MergeEngineType.VERSIONED)
+                        .property(
+                                ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN,
+                                IndexTableUtils.SOURCE_OFFSET_SYSTEM_COLUMN)
+                        .property(ConfigOptions.TABLE_DELETE_BEHAVIOR, DeleteBehavior.IGNORE)
                         .property(
                                 ConfigOptions.TABLE_KV_FORMAT_VERSION,
                                 partitioned

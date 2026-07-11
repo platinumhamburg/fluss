@@ -31,8 +31,9 @@ class IndexTableUtilsTest {
     }
 
     @Test
-    void testReservedIndexSystemColumnSetContainsOnlyPartitionId() {
-        assertThat(IndexTableUtils.RESERVED_INDEX_SYSTEM_COLUMNS).containsExactly("__partition_id");
+    void testReservedIndexSystemColumnSetContainsIndexTableSystemColumns() {
+        assertThat(IndexTableUtils.RESERVED_INDEX_SYSTEM_COLUMNS)
+                .containsExactly("__partition_id", "__source_offset", "__index_deleted");
     }
 
     @Test

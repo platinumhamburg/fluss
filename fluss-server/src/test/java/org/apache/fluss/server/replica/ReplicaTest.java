@@ -221,6 +221,28 @@ final class ReplicaTest extends ReplicaTestBase {
                 .isTrue();
     }
 
+    @Test
+    void testIndexReplicatorInitDefersWhenIndexTableIdVisibleButMetadataMissing()
+            throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        publishIndexTableToCache(f);
+        assertThat(serverMetadataCache.getTableId(f.indexTablePath)).isPresent();
+
+        // Simulate a half-propagated/stale metadata state: the path->tableId mapping is already
+        // visible locally, but getTableMetadata(path) cannot resolve the table info yet.
+        zkClient.deleteTable(f.indexTablePath);
+        assertThat(serverMetadataCache.getTableMetadata(f.indexTablePath)).isEmpty();
+
+        makeIndexedMainReplicaAsLeader(f);
+
+        assertThat(f.replica.getIndexReplicator())
+                .as("scheduler must not be wired until full index table metadata is visible")
+                .isNull();
+        assertThat(f.replica.isIndexReplicatorInitDeferred())
+                .as("half-propagated metadata must keep initialization deferred")
+                .isTrue();
+    }
+
     /**
      * P3T14 retry path: after the auto-derived Index Table propagates into the cache, the next
      * cluster-metadata update (or an explicit {@code retryMaybeStartIndexReplicator()} call) must

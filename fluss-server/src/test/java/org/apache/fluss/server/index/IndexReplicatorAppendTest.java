@@ -19,9 +19,17 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.DefaultKvRecordBatch;
+import org.apache.fluss.record.KvRecord;
+import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
@@ -32,8 +40,10 @@ import org.apache.fluss.types.RowType;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.function.ToIntFunction;
 
@@ -52,6 +62,17 @@ public class IndexReplicatorAppendTest {
             RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT(), DataTypes.BIGINT());
 
     private static final long INDEX_TABLE_ID = 77L;
+    private static final short INDEX_SCHEMA_ID = 1;
+    private static final Schema INDEX_SCHEMA =
+            Schema.newBuilder()
+                    .fromColumns(
+                            Arrays.asList(
+                                    new Schema.Column("idx", DataTypes.BIGINT()),
+                                    new Schema.Column("pk", DataTypes.BIGINT()),
+                                    new Schema.Column("__source_offset", DataTypes.BIGINT()),
+                                    new Schema.Column("__index_deleted", DataTypes.BOOLEAN())))
+                    .primaryKey("idx", "pk")
+                    .build();
 
     private static IndexReplicator newReplicator() {
         return new IndexReplicator(
@@ -74,13 +95,18 @@ public class IndexReplicatorAppendTest {
         CompactedKeyEncoder keyEncoder =
                 new CompactedKeyEncoder(MAIN_ROW_TYPE, indexValueColumnIndices);
 
-        DataType[] valueTypes = new DataType[] {DataTypes.BIGINT(), DataTypes.BIGINT()};
+        DataType[] valueTypes =
+                new DataType[] {
+                    DataTypes.BIGINT(), DataTypes.BIGINT(), DataTypes.BIGINT(), DataTypes.BOOLEAN()
+                };
         RowEncoder valueRowEncoder = RowEncoder.create(KvFormat.COMPACTED, valueTypes);
         IndexSpec.ValueEncoder valueEncoder =
-                row -> {
+                (row, sourceOffset, deleted) -> {
                     valueRowEncoder.startNewRow();
                     valueRowEncoder.encodeField(0, row.getLong(1)); // idx
                     valueRowEncoder.encodeField(1, row.getLong(0)); // pk
+                    valueRowEncoder.encodeField(2, sourceOffset);
+                    valueRowEncoder.encodeField(3, deleted);
                     return valueRowEncoder.finishRow();
                 };
 
@@ -90,7 +116,7 @@ public class IndexReplicatorAppendTest {
                 "idx",
                 IndexVisibility.SYNC,
                 INDEX_TABLE_ID,
-                1,
+                INDEX_SCHEMA_ID,
                 KvFormat.COMPACTED,
                 new int[] {1}, // idxColumnIndices
                 keyEncoder,
@@ -260,6 +286,33 @@ public class IndexReplicatorAppendTest {
 
         assertThat(mutations).isEqualTo(1);
         assertThat(builders).hasSize(1);
+        BinaryRow tombstone = onlyRecordRow(builders.values().iterator().next());
+        assertThat(tombstone).isNotNull();
+        assertThat(tombstone.getLong(0)).isEqualTo(10L);
+        assertThat(tombstone.getLong(1)).isEqualTo(1L);
+        assertThat(tombstone.getBoolean(3))
+                .as("index deletes must be versioned tombstone rows, not physical KV deletes")
+                .isTrue();
+    }
+
+    private static BinaryRow onlyRecordRow(IndexReplicator.BucketBatchBuilder builder) {
+        try {
+            BytesView bytes = builder.builder.build();
+            KvRecordBatch kvRecords = DefaultKvRecordBatch.pointToBytesView(bytes);
+            Iterator<KvRecord> iter =
+                    kvRecords
+                            .records(
+                                    KvRecordReadContext.createReadContext(
+                                            KvFormat.COMPACTED,
+                                            new TestingSchemaGetter(INDEX_SCHEMA_ID, INDEX_SCHEMA)))
+                            .iterator();
+            assertThat(iter.hasNext()).isTrue();
+            KvRecord record = iter.next();
+            assertThat(iter.hasNext()).isFalse();
+            return record.getRow();
+        } catch (Exception e) {
+            throw new AssertionError("Failed to decode index batch", e);
+        }
     }
 
     private static LogRecord record(long offset, ChangeType changeType, InternalRow row) {

@@ -901,10 +901,11 @@ public class ConfigOptions {
                     .memoryType()
                     .defaultValue(MemorySize.parse("64mb"))
                     .withDescription(
-                            "Maximum total bytes of pending (un-acknowledged) index batches buffered "
-                                    + "in the server-global index accumulator. When this limit is "
-                                    + "reached the read layer stops polling new WAL windows, applying "
-                                    + "back-pressure so derivation cannot outrun the send layer.");
+                            "Maximum bytes of pending (un-acknowledged) index batches buffered per "
+                                    + "leader-side index replicator. When one replicator reaches "
+                                    + "this limit the read layer stops polling new WAL windows for "
+                                    + "that replicator, applying back-pressure without blocking "
+                                    + "unrelated main-table buckets.");
 
     public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_REQUEST_BYTES =
             key("index.replication.max-request-bytes")

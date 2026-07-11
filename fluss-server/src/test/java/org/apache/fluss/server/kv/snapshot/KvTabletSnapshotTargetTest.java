@@ -91,6 +91,7 @@ class KvTabletSnapshotTargetTest {
 
     private AtomicLong snapshotIdGenerator;
     private AtomicLong logOffsetGenerator;
+    private AtomicLong indexPushedOffsetGenerator;
     private AtomicLong updateMinRetainOffsetConsumer;
 
     static ZooKeeperClient zooKeeperClient;
@@ -112,6 +113,7 @@ class KvTabletSnapshotTargetTest {
         // init snapshot id and log offset generator
         snapshotIdGenerator = new AtomicLong(1);
         logOffsetGenerator = new AtomicLong(1);
+        indexPushedOffsetGenerator = new AtomicLong(-1);
         updateMinRetainOffsetConsumer = new AtomicLong(Long.MAX_VALUE);
         scheduledExecutorService = new ManuallyTriggeredScheduledExecutorService();
     }
@@ -192,6 +194,27 @@ class KvTabletSnapshotTargetTest {
             assertThat(rocksDBKv.get("key1".getBytes())).isEqualTo("val1".getBytes());
             assertThat(rocksDBKv.get("key2".getBytes())).isEqualTo("val2".getBytes());
         }
+    }
+
+    @Test
+    void testShouldSnapshotWhenIndexPushedOffsetAdvancesWithoutLogOffset() {
+        assertThat(
+                        KvTabletSnapshotTarget.shouldCreateSnapshot(
+                                new TabletState(1L, null, 1L, null), 1L, null))
+                .as(
+                        "index-pushed-offset is snapshot metadata; advancing it must trigger a new "
+                                + "snapshot even when the flushed log offset is unchanged")
+                .isTrue();
+        assertThat(
+                        KvTabletSnapshotTarget.shouldCreateSnapshot(
+                                new TabletState(1L, null, 1L, null), 1L, 1L))
+                .as("unchanged flushed log offset and unchanged index-pushed-offset can skip")
+                .isFalse();
+        assertThat(
+                        KvTabletSnapshotTarget.shouldCreateSnapshot(
+                                new TabletState(2L, null, null, null), 1L, 1L))
+                .as("ordinary KV progress must still trigger a snapshot")
+                .isTrue();
     }
 
     @Test
@@ -547,7 +570,12 @@ class KvTabletSnapshotTargetTest {
     }
 
     private TabletState getCurrentTabletState() {
-        return new TabletState(logOffsetGenerator.get(), null, null);
+        long indexPushedOffset = indexPushedOffsetGenerator.get();
+        return new TabletState(
+                logOffsetGenerator.get(),
+                null,
+                indexPushedOffset >= 0 ? indexPushedOffset : null,
+                null);
     }
 
     private RocksIncrementalSnapshot createIncrementalSnapshot(SnapshotFailType snapshotFailType)

@@ -244,6 +244,7 @@ public class CompletedSnapshot {
                 && Objects.equals(tableBucket, that.tableBucket)
                 && Objects.equals(kvSnapshotHandle, that.kvSnapshotHandle)
                 && Objects.equals(rowCount, that.rowCount)
+                && Objects.equals(indexPushedOffset, that.indexPushedOffset)
                 && Objects.equals(autoIncIDRanges, that.autoIncIDRanges)
                 && Objects.equals(snapshotLocation, that.snapshotLocation);
     }
@@ -256,6 +257,7 @@ public class CompletedSnapshot {
                 kvSnapshotHandle,
                 logOffset,
                 rowCount,
+                indexPushedOffset,
                 autoIncIDRanges,
                 snapshotLocation);
     }

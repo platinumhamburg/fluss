@@ -36,7 +36,7 @@ public final class IndexSpec {
     /** Encodes the index value from a base row. Partition handling is baked into the closure. */
     @FunctionalInterface
     public interface ValueEncoder {
-        BinaryRow encode(InternalRow row);
+        BinaryRow encode(InternalRow row, long sourceOffset, boolean deleted);
     }
 
     private final long indexTableId;

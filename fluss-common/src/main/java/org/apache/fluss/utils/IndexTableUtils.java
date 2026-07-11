@@ -17,7 +17,9 @@
 
 package org.apache.fluss.utils;
 
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.Optional;
 import java.util.Set;
 
@@ -31,13 +33,24 @@ public final class IndexTableUtils {
      */
     public static final String PARTITION_ID_SYSTEM_COLUMN = "__partition_id";
 
+    /** Source main-table WAL offset used by Index Tables to reject stale failover writes. */
+    public static final String SOURCE_OFFSET_SYSTEM_COLUMN = "__source_offset";
+
+    /** Marker row flag for versioned Index Table tombstones. */
+    public static final String INDEX_DELETED_SYSTEM_COLUMN = "__index_deleted";
+
     /**
      * Reserved system column names that user-defined schemas must not declare on a main table
      * (otherwise Index Table derivation would collide). Index Tables themselves may add these
      * columns at derive time; user-facing schemas must keep their column namespace clean.
      */
     public static final Set<String> RESERVED_INDEX_SYSTEM_COLUMNS =
-            Collections.singleton(PARTITION_ID_SYSTEM_COLUMN);
+            Collections.unmodifiableSet(
+                    new LinkedHashSet<>(
+                            Arrays.asList(
+                                    PARTITION_ID_SYSTEM_COLUMN,
+                                    SOURCE_OFFSET_SYSTEM_COLUMN,
+                                    INDEX_DELETED_SYSTEM_COLUMN)));
 
     /**
      * Separator between main table name and index name in Index Table paths.

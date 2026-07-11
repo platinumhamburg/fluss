@@ -19,10 +19,12 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.types.DataTypes;
@@ -87,9 +89,14 @@ class IndexTableDescriptorFactoryTest {
                 .containsExactly("user_id", "order_id", "dt");
         assertThat(dSchema.getPrimaryKey().get().getColumnNames())
                 .doesNotContain(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
+        assertThat(dSchema.getPrimaryKey().get().getColumnNames())
+                .doesNotContain("__source_offset", "__index_deleted");
         assertThat(dSchema.getColumns())
                 .extracting(Schema.Column::getName)
-                .contains(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
+                .contains(
+                        IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN,
+                        "__source_offset",
+                        "__index_deleted");
     }
 
     @Test
@@ -108,7 +115,31 @@ class IndexTableDescriptorFactoryTest {
         assertThat(d.getSchema().getColumns())
                 .extracting(Schema.Column::getName)
                 .doesNotContain(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
+        assertThat(d.getSchema().getColumns())
+                .extracting(Schema.Column::getName)
+                .contains("__source_offset", "__index_deleted");
         assertThat(d.isIndexTable()).isTrue();
+    }
+
+    @Test
+    void testDeriveIndexTableUsesVersionedTombstoneMergeContract() {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("u", DataTypes.BIGINT())
+                        .primaryKey("id")
+                        .index("idx_u", "u")
+                        .build();
+
+        TableDescriptor main = TableDescriptor.builder().schema(mainSchema).build();
+        TableDescriptor d = IndexTableDescriptorFactory.derive(main, 1L, "db.t", "idx_u");
+
+        assertThat(d.getProperties())
+                .containsEntry(
+                        ConfigOptions.TABLE_MERGE_ENGINE.key(), MergeEngineType.VERSIONED.name())
+                .containsEntry(ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(), "__source_offset")
+                .containsEntry(
+                        ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), DeleteBehavior.IGNORE.name());
     }
 
     @Test

@@ -30,7 +30,6 @@ import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
@@ -80,7 +79,7 @@ class IndexPushFailoverITCase {
     private static Configuration initConfig() {
         Configuration conf = new Configuration();
         conf.setInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR, 3);
-        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1));
+        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofHours(1));
         return conf;
     }
 
@@ -175,8 +174,11 @@ class IndexPushFailoverITCase {
         assertThat(offsetBefore)
                 .as("sync write must have advanced the pushed offset before failover")
                 .isGreaterThan(0L);
+        assertThat(mainReplica.getAllIndexPushedOffset())
+                .as("all-index pushed offset must advance with the sync pushed offset")
+                .isEqualTo(offsetBefore);
         CompletedSnapshot persistedSnapshot =
-                waitForSnapshotPersistingIndexPushedOffset(mainBucket, offsetBefore);
+                triggerSnapshotPersistingIndexPushedOffset(mainBucket, offsetBefore);
         assertThat(persistedSnapshot.getIndexPushedOffset())
                 .as("snapshot must persist the exact indexPushedOffset used for failover restore")
                 .isEqualTo(offsetBefore);
@@ -397,28 +399,13 @@ class IndexPushFailoverITCase {
         return new org.apache.fluss.bucketing.FlussBucketingFunction().bucketing(bucketKey, 3);
     }
 
-    private static CompletedSnapshot waitForSnapshotPersistingIndexPushedOffset(
+    private static CompletedSnapshot triggerSnapshotPersistingIndexPushedOffset(
             TableBucket tableBucket, long expectedOffset) {
-        return waitValue(
-                () -> {
-                    Optional<BucketSnapshot> latest =
-                            FLUSS_CLUSTER_EXTENSION
-                                    .getZooKeeperClient()
-                                    .getTableBucketLatestSnapshot(tableBucket);
-                    if (!latest.isPresent()) {
-                        return Optional.empty();
-                    }
-                    CompletedSnapshot completedSnapshot =
-                            latest.get()
-                                    .toCompletedSnapshotHandle()
-                                    .retrieveCompleteSnapshot();
-                    Long snapshotOffset = completedSnapshot.getIndexPushedOffset();
-                    if (snapshotOffset != null && snapshotOffset == expectedOffset) {
-                        return Optional.of(completedSnapshot);
-                    }
-                    return Optional.empty();
-                },
-                TIMEOUT,
-                "wait for KV snapshot to persist indexPushedOffset " + expectedOffset);
+        CompletedSnapshot completedSnapshot =
+                FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tableBucket);
+        assertThat(completedSnapshot.getIndexPushedOffset())
+                .as("triggered KV snapshot must persist indexPushedOffset")
+                .isEqualTo(expectedOffset);
+        return completedSnapshot;
     }
 }

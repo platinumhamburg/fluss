@@ -131,7 +131,10 @@ public final class IndexSpecFactory {
         FlussBucketingFunction bucketingFunction = new FlussBucketingFunction();
 
         int storedColCount = indexValueColumnIndices.length;
-        int totalColCount = partitioned ? storedColCount + 1 : storedColCount;
+        int partitionColumnCount = partitioned ? 1 : 0;
+        int sourceOffsetPosition = storedColCount + partitionColumnCount;
+        int deletedMarkerPosition = sourceOffsetPosition + 1;
+        int totalColCount = deletedMarkerPosition + 1;
         DataType[] valueFieldTypes = new DataType[totalColCount];
         InternalRow.FieldGetter[] valueFieldGetters = new InternalRow.FieldGetter[storedColCount];
         for (int i = 0; i < storedColCount; i++) {
@@ -143,12 +146,14 @@ public final class IndexSpecFactory {
         if (partitioned) {
             valueFieldTypes[storedColCount] = DataTypes.BIGINT().copy(false);
         }
+        valueFieldTypes[sourceOffsetPosition] = DataTypes.BIGINT().copy(false);
+        valueFieldTypes[deletedMarkerPosition] = DataTypes.BOOLEAN().copy(false);
 
         KvFormat indexKvFormat = partitioned ? KvFormat.ALIGNED : KvFormat.COMPACTED;
         RowEncoder valueRowEncoder = RowEncoder.create(indexKvFormat, valueFieldTypes);
 
         IndexSpec.ValueEncoder valueEncoder =
-                row -> {
+                (row, sourceOffset, deleted) -> {
                     valueRowEncoder.startNewRow();
                     for (int i = 0; i < valueFieldGetters.length; i++) {
                         valueRowEncoder.encodeField(i, valueFieldGetters[i].getFieldOrNull(row));
@@ -157,6 +162,8 @@ public final class IndexSpecFactory {
                         long pid = partitionIdResolver.applyAsLong(row);
                         valueRowEncoder.encodeField(storedColCount, pid);
                     }
+                    valueRowEncoder.encodeField(sourceOffsetPosition, sourceOffset);
+                    valueRowEncoder.encodeField(deletedMarkerPosition, deleted);
                     return valueRowEncoder.finishRow();
                 };
 

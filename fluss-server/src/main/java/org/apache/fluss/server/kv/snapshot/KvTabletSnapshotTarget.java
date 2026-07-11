@@ -34,6 +34,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
@@ -82,6 +83,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
 
     private volatile long logOffsetOfLatestSnapshot;
 
+    @Nullable private volatile Long indexPushedOffsetOfLatestSnapshot;
+
     private volatile long snapshotSize;
 
     @VisibleForTesting
@@ -116,6 +119,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                 bucketLeaderEpochSupplier,
                 coordinatorEpochSupplier,
                 logOffsetOfLatestSnapshot,
+                null,
                 snapshotSize);
     }
 
@@ -136,6 +140,43 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             long logOffsetOfLatestSnapshot,
             long snapshotSize)
             throws IOException {
+        this(
+                tableBucket,
+                completedKvSnapshotCommitter,
+                zooKeeperClient,
+                rocksIncrementalSnapshot,
+                remoteKvTabletDir,
+                snapshotWriteBufferSize,
+                ioExecutor,
+                cancelStreamRegistry,
+                snapshotIdCounter,
+                tabletStateSupplier,
+                updateMinRetainOffset,
+                bucketLeaderEpochSupplier,
+                coordinatorEpochSupplier,
+                logOffsetOfLatestSnapshot,
+                null,
+                snapshotSize);
+    }
+
+    public KvTabletSnapshotTarget(
+            TableBucket tableBucket,
+            CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
+            @Nonnull ZooKeeperClient zooKeeperClient,
+            RocksIncrementalSnapshot rocksIncrementalSnapshot,
+            FsPath remoteKvTabletDir,
+            int snapshotWriteBufferSize,
+            Executor ioExecutor,
+            CloseableRegistry cancelStreamRegistry,
+            SequenceIDCounter snapshotIdCounter,
+            Supplier<TabletState> tabletStateSupplier,
+            Consumer<Long> updateMinRetainOffset,
+            Supplier<Integer> bucketLeaderEpochSupplier,
+            Supplier<Integer> coordinatorEpochSupplier,
+            long logOffsetOfLatestSnapshot,
+            @Nullable Long indexPushedOffsetOfLatestSnapshot,
+            long snapshotSize)
+            throws IOException {
         this.tableBucket = tableBucket;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
         this.zooKeeperClient = zooKeeperClient;
@@ -150,6 +191,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         this.bucketLeaderEpochSupplier = bucketLeaderEpochSupplier;
         this.coordinatorEpochSupplier = coordinatorEpochSupplier;
         this.logOffsetOfLatestSnapshot = logOffsetOfLatestSnapshot;
+        this.indexPushedOffsetOfLatestSnapshot = indexPushedOffsetOfLatestSnapshot;
         this.snapshotSize = snapshotSize;
         this.ioExecutor = ioExecutor;
         this.snapshotRunner = createSnapshotRunner(cancelStreamRegistry);
@@ -170,13 +212,16 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     public Optional<PeriodicSnapshotManager.SnapshotRunnable> initSnapshot() throws Exception {
         TabletState tabletState = tabletStateSupplier.get();
         long logOffset = tabletState.getFlushedLogOffset();
-        if (logOffset <= logOffsetOfLatestSnapshot) {
+        if (!shouldCreateSnapshot(
+                tabletState, logOffsetOfLatestSnapshot, indexPushedOffsetOfLatestSnapshot)) {
             LOG.debug(
-                    "The current offset for the log whose kv data is flushed is {}, "
-                            + "which is not greater than the log offset in the latest snapshot {}, "
+                    "The current flushed log offset is {} and index-pushed-offset is {}, "
+                            + "which do not advance beyond the latest snapshot offsets ({}, {}), "
                             + "so skip one snapshot for it.",
                     logOffset,
-                    logOffsetOfLatestSnapshot);
+                    tabletState.getIndexPushedOffset(),
+                    logOffsetOfLatestSnapshot,
+                    indexPushedOffsetOfLatestSnapshot);
             return Optional.empty();
         }
         // init snapshot stream factory for this snapshot
@@ -266,6 +311,24 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     }
 
     @VisibleForTesting
+    static boolean shouldCreateSnapshot(
+            TabletState tabletState,
+            long logOffsetOfLatestSnapshot,
+            @Nullable Long indexPushedOffsetOfLatestSnapshot) {
+        long logOffset = tabletState.getFlushedLogOffset();
+        if (logOffset > logOffsetOfLatestSnapshot) {
+            return true;
+        }
+        if (logOffset < logOffsetOfLatestSnapshot) {
+            return false;
+        }
+        Long indexPushedOffset = tabletState.getIndexPushedOffset();
+        return indexPushedOffset != null
+                && (indexPushedOffsetOfLatestSnapshot == null
+                        || indexPushedOffset > indexPushedOffsetOfLatestSnapshot);
+    }
+
+    @VisibleForTesting
     protected RocksIncrementalSnapshot getRocksIncrementalSnapshot() {
         return rocksIncrementalSnapshot;
     }
@@ -285,6 +348,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         long flushedLogOffset = snapshotResult.getTabletState().getFlushedLogOffset();
         try {
             logOffsetOfLatestSnapshot = flushedLogOffset;
+            indexPushedOffsetOfLatestSnapshot =
+                    snapshotResult.getTabletState().getIndexPushedOffset();
             snapshotSize = snapshotResult.getSnapshotSize();
             // update LogTablet to notify the lowest offset that should be retained
             updateMinRetainOffset.accept(snapshotResult.getTabletState().getMinRetainLogOffset());

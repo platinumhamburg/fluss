@@ -95,6 +95,9 @@ public final class ReplicaIndexController {
      */
     @Nullable private TombstonedPartitionDiscriminator tombstoneDiscriminator;
 
+    /** Read-side filter for Index Table versioned tombstone rows; {@code null} for main tables. */
+    @Nullable private IndexEntryVisibilityFilter entryVisibilityFilter;
+
     public ReplicaIndexController(
             TableInfo tableInfo,
             TableBucket tableBucket,
@@ -167,6 +170,7 @@ public final class ReplicaIndexController {
             IndexReplicator.IndexProgressListener onProgress,
             long initialOffset) {
         onBecomeLeader(logTablet, schemaGetter, onProgress, initialOffset);
+        installEntryVisibilityFilter(schemaGetter);
         installValueFilter(kvTablet);
     }
 
@@ -174,6 +178,7 @@ public final class ReplicaIndexController {
     public void onBecomeFollower() {
         stopIndexReplicator();
         this.tombstoneDiscriminator = null;
+        this.entryVisibilityFilter = null;
     }
 
     /**
@@ -200,6 +205,7 @@ public final class ReplicaIndexController {
     public void close() {
         stopIndexReplicator();
         this.tombstoneDiscriminator = null;
+        this.entryVisibilityFilter = null;
     }
 
     // ------------------------------------------------------------------------------------
@@ -285,25 +291,42 @@ public final class ReplicaIndexController {
                 d.mainTableId());
     }
 
+    public void installEntryVisibilityFilter(SchemaGetter schemaGetter) {
+        this.entryVisibilityFilter =
+                IndexEntryVisibilityFilter.forIndexTable(tableInfo, schemaGetter);
+    }
+
     // ------------------------------------------------------------------------------------
-    // Main Table: prefix-lookup tombstone filtering
+    // Index Table: lookup visibility filtering
     // ------------------------------------------------------------------------------------
 
     /**
-     * Filters prefix-lookup results for an Index Table, removing rows whose partition is
-     * tombstoned. Returns the input list unchanged if this is not an Index Table or no tombstones
-     * exist.
+     * Filters point-lookup results for an Index Table, replacing logically deleted rows with {@code
+     * null} while preserving the one-result-per-key response shape.
      */
-    public List<byte[]> filterTombstonedEntries(List<byte[]> rawResults) {
+    public List<byte[]> filterLookupEntries(List<byte[]> rawResults) {
+        IndexEntryVisibilityFilter filter = this.entryVisibilityFilter;
+        return filter == null ? rawResults : filter.filterPointLookup(rawResults);
+    }
+
+    /**
+     * Filters prefix-lookup results for an Index Table, removing logically deleted rows and rows
+     * whose source partition is tombstoned. Returns the input list unchanged if no filter applies.
+     */
+    public List<byte[]> filterPrefixLookupEntries(List<byte[]> rawResults) {
+        IndexEntryVisibilityFilter filter = this.entryVisibilityFilter;
+        List<byte[]> visibleResults =
+                filter == null ? rawResults : filter.filterPrefixLookup(rawResults);
+
         TombstonedPartitionDiscriminator d = this.tombstoneDiscriminator;
-        if (rawResults.isEmpty() || d == null) {
-            return rawResults;
+        if (visibleResults.isEmpty() || d == null) {
+            return visibleResults;
         }
         if (!d.hasTombstonedPartitions()) {
-            return rawResults;
+            return visibleResults;
         }
-        List<byte[]> filtered = new ArrayList<>(rawResults.size());
-        for (byte[] value : rawResults) {
+        List<byte[]> filtered = new ArrayList<>(visibleResults.size());
+        for (byte[] value : visibleResults) {
             if (!d.isTombstoned(value)) {
                 filtered.add(value);
             }
@@ -359,10 +382,28 @@ public final class ReplicaIndexController {
                         indexPath);
                 return;
             }
+            if (!metadataCache.getTableMetadata(indexPath).isPresent()) {
+                state.set(State.DEFERRED);
+                LOG.info(
+                        "Index table {} metadata not yet visible in cache -- deferring "
+                                + "IndexReplicator; will retry on next metadata update.",
+                        indexPath);
+                return;
+            }
         }
 
-        List<IndexSpec> indexSpecs =
-                IndexSpecFactory.buildIndexSpecs(tableInfo, tableBucket, metadataCache);
+        List<IndexSpec> indexSpecs;
+        try {
+            indexSpecs = IndexSpecFactory.buildIndexSpecs(tableInfo, tableBucket, metadataCache);
+        } catch (IllegalStateException e) {
+            state.set(State.DEFERRED);
+            LOG.info(
+                    "Index table metadata became unavailable while building specs for {} -- "
+                            + "deferring IndexReplicator; will retry on next metadata update.",
+                    tableBucket,
+                    e);
+            return;
+        }
         LogRecordReadContext readContext =
                 LogRecordReadContext.createReadContext(tableInfo, false, null, schemaGetter);
         // Use the already-seeded offset (from snapshot restore or -1) as the starting point.

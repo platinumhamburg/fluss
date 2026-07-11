@@ -48,6 +48,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * WAL-driven index replicator that reads committed WAL entries, derives index mutations, and stages
@@ -86,7 +87,7 @@ public final class IndexReplicator implements AutoCloseable {
 
     /** Progress used only by empty test owners; production replicators always have index states. */
     private volatile long emptyIndexPushedOffset;
-    private volatile boolean closed;
+    private final AtomicBoolean closed;
 
     /** Signal fired to wake the owning read-pool worker so it polls again promptly. */
     @Nullable private volatile Runnable wakeupSignal;
@@ -114,7 +115,7 @@ public final class IndexReplicator implements AutoCloseable {
         this.readContext = readContext;
         this.emptyIndexPushedOffset = initialOffset;
         this.maxWindowBytes = maxWindowBytes;
-        this.closed = false;
+        this.closed = new AtomicBoolean(false);
         this.onProgress = onProgress;
     }
 
@@ -133,20 +134,20 @@ public final class IndexReplicator implements AutoCloseable {
      * @return {@code true} if a window was read (work was done), {@code false} otherwise
      */
     public boolean poll() {
-        if (closed) {
+        if (closed.get()) {
             return false;
         }
 
-        // Back-pressure: if the send layer is saturated, stop deriving new windows so the
-        // accumulator does not grow unbounded. The owning read worker will retry after its backoff.
-        if (accumulator.isFull()) {
+        // Back-pressure is scoped to this producer. A stalled target index bucket should stop this
+        // replicator from deriving more windows, but must not stop unrelated table buckets.
+        if (accumulator.isFull(this)) {
             return false;
         }
 
         long hw = logTablet.getHighWatermark();
         boolean polled = false;
         for (IndexProgressState state : indexStates) {
-            if (closed || accumulator.isFull()) {
+            if (closed.get() || accumulator.isFull(this)) {
                 break;
             }
             if (state.inFlightWindow != null) {
@@ -197,6 +198,7 @@ public final class IndexReplicator implements AutoCloseable {
             if (stoppedAtUnmatchedUpdateBefore) {
                 break;
             }
+            lastProcessedOffset = Math.max(lastProcessedOffset, batch.nextLogOffset());
         }
 
         // No records advanced: nothing to do this cycle.
@@ -322,7 +324,7 @@ public final class IndexReplicator implements AutoCloseable {
 
         switch (changeType) {
             case INSERT:
-                appendOneSpec(state.spec, (InternalRow) null, row, builders);
+                appendOneSpec(state.spec, (InternalRow) null, row, offset, builders);
                 clearPendingUpdateBefore(state);
                 return offset + 1;
             case UPDATE_BEFORE:
@@ -330,14 +332,15 @@ public final class IndexReplicator implements AutoCloseable {
                 return offset;
             case UPDATE_AFTER:
                 if (state.pendingUpdateBefore == null) {
-                    appendOneSpec(state.spec, (InternalRow) null, row, builders);
+                    appendOneSpec(state.spec, (InternalRow) null, row, offset, builders);
                 } else {
-                    appendOneSpec(state.spec, state.pendingUpdateBefore.oldEntry, row, builders);
+                    appendOneSpec(
+                            state.spec, state.pendingUpdateBefore.oldEntry, row, offset, builders);
                 }
                 clearPendingUpdateBefore(state);
                 return offset + 1;
             case DELETE:
-                appendOneSpec(state.spec, row, null, builders);
+                appendOneSpec(state.spec, row, null, offset, builders);
                 clearPendingUpdateBefore(state);
                 return offset + 1;
             default:
@@ -356,13 +359,25 @@ public final class IndexReplicator implements AutoCloseable {
             @Nullable InternalRow oldRow,
             @Nullable InternalRow newRow,
             Map<TableBucket, BucketBatchBuilder> builders) {
-        return appendOneSpec(spec, OldIndexEntry.fromNullable(spec, oldRow), newRow, builders);
+        return appendOneSpec(spec, OldIndexEntry.fromNullable(spec, oldRow), newRow, 0L, builders);
+    }
+
+    @VisibleForTesting
+    int appendOneSpec(
+            IndexSpec spec,
+            @Nullable InternalRow oldRow,
+            @Nullable InternalRow newRow,
+            long sourceOffset,
+            Map<TableBucket, BucketBatchBuilder> builders) {
+        return appendOneSpec(
+                spec, OldIndexEntry.fromNullable(spec, oldRow), newRow, sourceOffset, builders);
     }
 
     private int appendOneSpec(
             IndexSpec spec,
             OldIndexEntry oldEntry,
             @Nullable InternalRow newRow,
+            long sourceOffset,
             Map<TableBucket, BucketBatchBuilder> builders) {
         boolean oldHasIdx = oldEntry.hasIndexColumns;
         boolean newHasIdx = newRow != null && spec.hasIndexColumns(newRow);
@@ -377,14 +392,15 @@ public final class IndexReplicator implements AutoCloseable {
         int count = 0;
         if (oldHasIdx && keysDiffer) {
             TableBucket tb = new TableBucket(spec.getIndexTableId(), oldEntry.bucket);
-            getBuilder(tb, spec, builders).appendDelete(oldEntry.key);
+            BinaryRow tombstone = spec.getValueEncoder().encode(oldEntry.row, sourceOffset, true);
+            getBuilder(tb, spec, builders).appendUpsert(oldEntry.key, tombstone);
             count++;
         }
         if (newHasIdx) {
             // Skip an UPDATE upsert when the index key/value is byte-for-byte identical.
             boolean valueUnchanged = oldHasIdx && !keysDiffer;
             if (!valueUnchanged) {
-                BinaryRow value = spec.getValueEncoder().encode(newRow);
+                BinaryRow value = spec.getValueEncoder().encode(newRow, sourceOffset, false);
                 int bucket = spec.getBucketAssigner().applyAsInt(newRow);
                 TableBucket tb = new TableBucket(spec.getIndexTableId(), bucket);
                 getBuilder(tb, spec, builders).appendUpsert(newKey, value);
@@ -443,11 +459,13 @@ public final class IndexReplicator implements AutoCloseable {
 
     @Override
     public void close() {
-        closed = true;
+        if (closed.compareAndSet(false, true) && readContext != null) {
+            readContext.close();
+        }
     }
 
     boolean isClosed() {
-        return closed;
+        return closed.get();
     }
 
     private static final class IndexProgressState {
@@ -478,28 +496,32 @@ public final class IndexReplicator implements AutoCloseable {
 
     private static final class OldIndexEntry {
         private final boolean hasIndexColumns;
+        @Nullable private final InternalRow row;
         @Nullable private final byte[] key;
         private final int bucket;
 
-        private OldIndexEntry(boolean hasIndexColumns, @Nullable byte[] key, int bucket) {
+        private OldIndexEntry(
+                boolean hasIndexColumns, @Nullable InternalRow row, @Nullable byte[] key, int bucket) {
             this.hasIndexColumns = hasIndexColumns;
+            this.row = row;
             this.key = key;
             this.bucket = bucket;
         }
 
         private static OldIndexEntry from(IndexSpec spec, InternalRow row) {
             if (!spec.hasIndexColumns(row)) {
-                return new OldIndexEntry(false, null, 0);
+                return new OldIndexEntry(false, null, null, 0);
             }
             return new OldIndexEntry(
                     true,
+                    row,
                     spec.getKeyEncoder().encodeKey(row),
                     spec.getBucketAssigner().applyAsInt(row));
         }
 
         private static OldIndexEntry fromNullable(IndexSpec spec, @Nullable InternalRow row) {
             if (row == null) {
-                return new OldIndexEntry(false, null, 0);
+                return new OldIndexEntry(false, null, null, 0);
             }
             return from(spec, row);
         }
@@ -526,13 +548,5 @@ public final class IndexReplicator implements AutoCloseable {
             }
         }
 
-        void appendDelete(byte[] key) {
-            try {
-                builder.append(key, null);
-                count++;
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to append delete to batch", e);
-            }
-        }
     }
 }

@@ -38,7 +38,11 @@ public class IndexAccumulatorTest {
     }
 
     private static IndexBatch batch(TableBucket targetBucket, IndexWindow window) {
-        byte[] bytes = new byte[] {1, 2, 3};
+        return batch(targetBucket, window, 3);
+    }
+
+    private static IndexBatch batch(TableBucket targetBucket, IndexWindow window, int size) {
+        byte[] bytes = new byte[size];
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length);
         return new IndexBatch(targetBucket, encoded, window);
     }
@@ -129,6 +133,33 @@ public class IndexAccumulatorTest {
         // ownerA's batch on the other bucket is gone; once ownerB's is drained nothing remains.
         assertThat(accumulator.pollFirst(otherBucket)).isNull();
         assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(accumulator.pendingBytes()).isZero();
+    }
+
+    @Test
+    void backPressureIsScopedToProducingReplicator() {
+        IndexAccumulator accumulator = new IndexAccumulator(3);
+        IndexReplicator ownerA = replicator(accumulator);
+        IndexReplicator ownerB = replicator(accumulator);
+
+        accumulator.append(
+                batch(
+                        new TableBucket(10L, 0),
+                        new IndexWindow("idx", 1L, 1, ownerA),
+                        3));
+
+        assertThat(accumulator.isFull()).isTrue();
+        assertThat(accumulator.isFull(ownerA)).isTrue();
+        assertThat(accumulator.pendingBytes(ownerA)).isEqualTo(3L);
+        assertThat(accumulator.isFull(ownerB)).isFalse();
+        assertThat(accumulator.pendingBytes(ownerB)).isZero();
+
+        IndexBatch batch = accumulator.pollFirst(new TableBucket(10L, 0));
+        assertThat(batch).isNotNull();
+        accumulator.release(batch);
+
+        assertThat(accumulator.isFull(ownerA)).isFalse();
+        assertThat(accumulator.pendingBytes(ownerA)).isZero();
         assertThat(accumulator.pendingBytes()).isZero();
     }
 }

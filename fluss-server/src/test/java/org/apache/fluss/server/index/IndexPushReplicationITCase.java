@@ -57,6 +57,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
@@ -77,6 +78,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>{@link #testUpdateRewritesIndexEntry()} — UPDATE on the indexed column produces a DELETE on
  *       the old composite key and an UPSERT on the new composite key.
  *   <li>{@link #testDeleteRemovesIndexEntry()} — DELETE on the main table removes the index entry.
+ *   <li>{@link #testEmptyWalBatchAdvancesSyncIndexOffset()} — empty WAL batches still advance index
+ *       progress.
  *   <li>{@link #testAsyncVisibilityEventuallyVisible()} — with async {@code Schema.Index}
  *       visibility the PutKv ack does not wait for the push, but the index entry is eventually
  *       visible.
@@ -221,6 +224,25 @@ class IndexPushReplicationITCase {
 
         // (3) The index entry for ("hello", 1) goes away.
         waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, "hello", false);
+    }
+
+    @Test
+    void testEmptyWalBatchAdvancesSyncIndexOffset() throws Exception {
+        String mainName = "main_t_empty_wal_batch";
+        Fixture f = setupTables(mainName, /* visibility */ null);
+
+        KvRecordBatch deleteMissingKey =
+                genKvRecordBatch(
+                        Collections.singletonList(
+                                Tuple2.of(new Object[] {404}, /* value */ null)));
+
+        f.mainGateway
+                .putKv(newPutKvRequest(f.mainTableId, 0, 1, deleteMissingKey))
+                .get(30, TimeUnit.SECONDS);
+
+        assertThat(f.mainLeaderReplica.getSyncIndexPushedOffset())
+                .as("empty WAL batches must advance index progress to the batch next offset")
+                .isEqualTo(1L);
     }
 
     /**
@@ -568,13 +590,15 @@ class IndexPushReplicationITCase {
     }
 
     /**
-     * Build an AlignedRow value body for a partitioned Index Table with 4 columns (b, a, p,
-     * __partition_id). The test only cares about the __partition_id value for the compaction
-     * filter; the other fields are filled with dummy data.
+     * Build an AlignedRow value body for a partitioned Index Table with columns (b, a, p,
+     * __partition_id, __source_offset, __index_deleted). The test only cares about the __partition_id
+     * value for the tombstone filter; the other fields are filled with dummy data.
      */
     private static byte[] encodeAlignedValueWithPartitionId(long partitionId) {
-        // Partitioned Index Table schema: [b STRING, a INT, p STRING, __partition_id BIGINT]
-        int arity = 4;
+        // Partitioned Index Table schema:
+        // [b STRING, a INT, p STRING, __partition_id BIGINT, __source_offset BIGINT,
+        // __index_deleted BOOLEAN]
+        int arity = 6;
         AlignedRow row = new AlignedRow(arity);
         AlignedRowWriter writer = new AlignedRowWriter(row);
         writer.reset();
@@ -582,6 +606,8 @@ class IndexPushReplicationITCase {
         writer.writeInt(1, 0);
         writer.writeString(2, fromString("p0"));
         writer.writeLong(3, partitionId);
+        writer.writeLong(4, 0L);
+        writer.writeBoolean(5, false);
         writer.complete();
         byte[] body = new byte[row.getSizeInBytes()];
         row.copyTo(body, 0);
