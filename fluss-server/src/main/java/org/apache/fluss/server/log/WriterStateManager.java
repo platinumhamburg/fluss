@@ -86,7 +86,7 @@ public class WriterStateManager {
     private final int writerExpirationMs;
     private final KvIdempotenceProtocol protocol;
     @Nullable private final Map<Long, WriterStateEntry> writers;
-    @Nullable private final Map<WriterKey, FencedWriterStateEntry> fencedWriters;
+    @Nullable private Map<WriterKey, FencedWriterStateEntry> fencedWriters;
 
     private final File logTabletDir;
     /** The selected protocol map size, available without acquiring the manager's owning lock. */
@@ -178,6 +178,11 @@ public class WriterStateManager {
      */
     public void truncateAndReload(long logStartOffset, long logEndOffset, long currentTimeMs)
             throws IOException {
+        if (protocol == KvIdempotenceProtocol.V1_FENCED && logEndOffset != mapEndOffset()) {
+            truncateAndReloadFenced(logStartOffset, logEndOffset);
+            return;
+        }
+
         // remove all out of range snapshots.
         for (SnapshotFile snapshot : snapshots.values()) {
             if (snapshot.offset > logEndOffset || snapshot.offset <= logStartOffset) {
@@ -194,6 +199,41 @@ public class WriterStateManager {
             }
             lastSnapOffset = latestSnapshotOffset().orElse(logStartOffset);
         }
+    }
+
+    private void truncateAndReloadFenced(long logStartOffset, long logEndOffset)
+            throws IOException {
+        Optional<SnapshotFile> snapshotToLoad =
+                Optional.ofNullable(
+                                snapshots
+                                        .subMap(logStartOffset, false, logEndOffset, true)
+                                        .lastEntry())
+                        .map(Map.Entry::getValue);
+
+        Map<WriterKey, FencedWriterStateEntry> reloadedWriters = new HashMap<>();
+        if (snapshotToLoad.isPresent()) {
+            SnapshotFile snapshot = snapshotToLoad.get();
+            LOG.info("Loading fenced writer state from snapshot file '{}'", snapshot);
+            for (FencedWriterStateEntry entry : readFencedSnapshot(snapshot.file())) {
+                FencedWriterStateEntry previous =
+                        reloadedWriters.put(entry.writerKey(), entry);
+                if (previous != null) {
+                    throw new CorruptSnapshotException(
+                            "Duplicate fenced writer key in snapshot: " + entry.writerKey());
+                }
+            }
+        }
+
+        for (SnapshotFile snapshot : snapshots.values()) {
+            if (snapshot.offset > logEndOffset || snapshot.offset <= logStartOffset) {
+                removeAndDeleteSnapshot(snapshot.offset);
+            }
+        }
+
+        fencedWriters = reloadedWriters;
+        writerIdCount = fencedWriters.size();
+        lastSnapOffset = snapshotToLoad.map(snapshot -> snapshot.offset).orElse(logStartOffset);
+        lastMapOffset = lastSnapOffset;
     }
 
     public void truncateFullyAndStartAt(long offset) throws IOException {
@@ -393,21 +433,6 @@ public class WriterStateManager {
     }
 
     private void loadFromSnapshot(long logStartOffset, long currentTime) throws IOException {
-        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
-            Optional<SnapshotFile> latestSnapshotFileOptional = latestSnapshotFile();
-            if (latestSnapshotFileOptional.isPresent()) {
-                SnapshotFile snapshot = latestSnapshotFileOptional.get();
-                LOG.info("Loading fenced writer state from snapshot file '{}'", snapshot);
-                readFencedSnapshot(snapshot.file()).forEach(this::loadFencedWriterEntry);
-                lastSnapOffset = snapshot.offset;
-                lastMapOffset = lastSnapOffset;
-            } else {
-                lastSnapOffset = logStartOffset;
-                lastMapOffset = logStartOffset;
-            }
-            return;
-        }
-
         while (true) {
             Optional<SnapshotFile> latestSnapshotFileOptional = latestSnapshotFile();
             if (latestSnapshotFileOptional.isPresent()) {
@@ -521,16 +546,6 @@ public class WriterStateManager {
         requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
         long writerId = entry.writerId();
         addWriterId(writerId, entry);
-    }
-
-    private void loadFencedWriterEntry(FencedWriterStateEntry entry) {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
-        FencedWriterStateEntry previous = fencedWriters.put(entry.writerKey(), entry);
-        if (previous != null) {
-            throw new CorruptSnapshotException(
-                    "Duplicate fenced writer key in snapshot: " + entry.writerKey());
-        }
-        writerIdCount = fencedWriters.size();
     }
 
     private boolean isWriterExpired(long currentTimeMs, WriterStateEntry writerStateEntry) {

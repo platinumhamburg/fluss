@@ -248,6 +248,62 @@ public class WriterStateManagerTest {
     }
 
     @Test
+    void testV1FailedReloadPreservesLiveStateAndSnapshotMetadata() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey liveKey = new WriterKey(4L, 5L);
+        appendFenced(manager, liveKey, 100L, 10L, 1L);
+        manager.updateMapEndOffset(20L);
+
+        File corruptSnapshot = writerSnapshotFile(logDir, 15L);
+        byte[] corruptBytes = "{\"version\":2}".getBytes(StandardCharsets.UTF_8);
+        Files.write(corruptSnapshot.toPath(), corruptBytes);
+        File outOfRangeSnapshot = writerSnapshotFile(logDir, 25L);
+        byte[] outOfRangeBytes = v2SnapshotBytes();
+        Files.write(outOfRangeSnapshot.toPath(), outOfRangeBytes);
+        manager.reloadSnapshots();
+
+        Optional<FencedWriterStateEntry> liveEntry = manager.lastFencedEntry(liveKey);
+        Optional<Long> latestSnapshotOffset = manager.latestSnapshotOffset();
+        Optional<Long> oldestSnapshotOffset = manager.oldestSnapshotOffset();
+
+        assertThatThrownBy(() -> manager.truncateAndReload(0L, 15L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class);
+
+        assertThat(manager.lastFencedEntry(liveKey)).isEqualTo(liveEntry);
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+        assertThat(manager.mapEndOffset()).isEqualTo(20L);
+        assertThat(manager.latestSnapshotOffset()).isEqualTo(latestSnapshotOffset);
+        assertThat(manager.oldestSnapshotOffset()).isEqualTo(oldestSnapshotOffset);
+        assertThat(manager.fetchSnapshot(15L)).contains(corruptSnapshot);
+        assertThat(Files.readAllBytes(corruptSnapshot.toPath())).isEqualTo(corruptBytes);
+        assertThat(manager.fetchSnapshot(25L)).contains(outOfRangeSnapshot);
+        assertThat(Files.readAllBytes(outOfRangeSnapshot.toPath())).isEqualTo(outOfRangeBytes);
+    }
+
+    @Test
+    void testV1SuccessfulReloadAtomicallyReplacesLiveState() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey oldKey = new WriterKey(4L, 5L);
+        WriterKey snapshotKey = new WriterKey(6L, 7L);
+        appendFenced(manager, oldKey, 100L, 10L, 1L);
+        manager.updateMapEndOffset(20L);
+
+        WriterStateManager snapshotWriter = fencedManager();
+        appendFenced(snapshotWriter, snapshotKey, 200L, 14L, 2L);
+        snapshotWriter.updateMapEndOffset(15L);
+        snapshotWriter.takeSnapshot();
+        manager.reloadSnapshots();
+
+        manager.truncateAndReload(0L, 15L, Long.MAX_VALUE);
+
+        assertThat(manager.lastFencedEntry(oldKey)).isEmpty();
+        assertThat(manager.lastFencedEntry(snapshotKey))
+                .contains(new FencedWriterStateEntry(snapshotKey, 200L, 14L, 2L));
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+        assertThat(manager.mapEndOffset()).isEqualTo(15L);
+    }
+
+    @Test
     void testBasicWriterIdMapping() {
         // First entry for id 0 added.
         append(stateManager, writerId, 0, 0L);
