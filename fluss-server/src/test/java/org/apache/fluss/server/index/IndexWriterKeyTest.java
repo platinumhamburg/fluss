@@ -46,7 +46,12 @@ class IndexWriterKeyTest {
         WriterKey key = IndexWriterKey.encode(new TableBucket(99L, Integer.MAX_VALUE));
 
         assertThat(key).isEqualTo(new WriterKey(0L, Integer.MAX_VALUE));
-        assertThat(IndexWriterKey.decode(key).getPartitionId()).isEmpty();
+        IndexWriterKey.SourceBucket decoded = IndexWriterKey.decode(key);
+        assertThat(decoded.getPartitionId()).isEmpty();
+        assertThat(decoded.getBucketId()).isEqualTo(Integer.MAX_VALUE);
+
+        TableBucket reconstructed = new TableBucket(99L, decoded.getBucketId());
+        assertThat(IndexWriterKey.encode(reconstructed)).isEqualTo(key);
     }
 
     @Test

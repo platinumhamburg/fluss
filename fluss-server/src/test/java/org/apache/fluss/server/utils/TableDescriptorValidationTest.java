@@ -161,6 +161,26 @@ class TableDescriptorValidationTest {
     }
 
     @Test
+    void testProtocolV1AcceptedForSystemManagedIndexTable() {
+        TableDescriptor indexTable =
+                TableDescriptor.builder(
+                                IndexTableDescriptorFactory.derive(
+                                        baseDescriptorBuilder().build(),
+                                        1L,
+                                        "db.orders",
+                                        INDEX_NAME))
+                        .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 1)
+                        .property(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION, 1)
+                        .build();
+
+        assertThatCode(
+                        () ->
+                                TableDescriptorValidation.validateTableDescriptor(
+                                        indexTable, MAX_BUCKET_NUM, null))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     void testRejectsSecondaryIndexOnUnknownColumn() {
         Schema schema =
                 Schema.newBuilder()
