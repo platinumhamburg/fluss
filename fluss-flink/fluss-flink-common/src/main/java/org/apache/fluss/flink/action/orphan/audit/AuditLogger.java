@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan.audit;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.job.CleanStats;
+import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
@@ -56,25 +57,29 @@ public final class AuditLogger {
      * decisions. Emitted before any other audit line so log readers can recover the exact threshold
      * without having to re-parse the original CLI arguments.
      */
-    public void logCutoff(long olderThanMillis) {
+    public void logCutoff(String runId, long olderThanMillis) {
         AUDIT.info(
-                "action=cutoff older_than_iso={} older_than_ms={} ts={}",
+                "audit_version=1 run_id={} stage=scope action=cutoff"
+                        + " older_than_iso={} older_than_ms={} ts={}",
+                runId,
                 CUTOFF_FORMATTER.format(Instant.ofEpochMilli(olderThanMillis)),
                 olderThanMillis,
                 Instant.now());
     }
 
     /** One-shot, non-secret execution configuration at normal INFO level. */
-    public void logRunStart(OrphanCleanConfig config) {
+    public void logRunStart(String runId, OrphanCleanConfig config) {
         String scope = config.allDatabases() ? "all-databases" : config.database().get();
         if (config.table().isPresent()) {
             scope = scope + "." + config.table().get();
         }
         AUDIT.info(
-                "action=run_start scope={} older_than_ms={} dry_run={} parallelism={}"
+                "audit_version=1 run_id={} stage=scope action=run_start"
+                        + " scope={} older_than_ms={} dry_run={} parallelism={}"
                         + " remote_fs_rate_limit={} allow_delete_manifest={}"
                         + " allow_clean_orphan_tables={} allow_clean_orphan_partitions={}"
-                        + " post_run_wait_ms={} ts={}",
+                        + " progress_log_interval_ms={} post_run_wait_ms={} ts={}",
+                runId,
                 scope,
                 config.olderThanMillis(),
                 config.dryRun(),
@@ -83,17 +88,20 @@ public final class AuditLogger {
                 config.allowDeleteManifest(),
                 config.allowCleanOrphanTables(),
                 config.allowCleanOrphanPartitions(),
+                config.progressLogInterval().toMillis(),
                 config.postRunWait().toMillis(),
                 Instant.now());
     }
 
     /** One-shot aggregate of discovered scope, expected skips, and emitted cleanup work. */
-    public void logScopePlan(ScopePlanStats stats) {
+    public void logScopePlan(String runId, ScopePlanStats stats) {
         AUDIT.info(
-                "action=scope_plan databases={} tables={} partitions={} discovered_buckets={}"
+                "audit_version=1 run_id={} stage=scope action=scope_plan"
+                        + " databases={} tables={} partitions={} discovered_buckets={}"
                         + " bucket_tasks={} orphan_dir_tasks={} skipped_no_remote_manifest={}"
                         + " skipped_empty_kv_active_set={} skipped_out_of_scope_root={}"
                         + " metadata_failures={} ts={}",
+                runId,
                 stats.databases(),
                 stats.tables(),
                 stats.partitions(),
@@ -104,6 +112,102 @@ public final class AuditLogger {
                 stats.skippedEmptyKvActiveSetCount(),
                 stats.skippedOutOfScopeRootCount(),
                 stats.metadataFailures(),
+                Instant.now());
+    }
+
+    public void logScanStart(
+            String runId,
+            boolean dryRun,
+            int subtask,
+            int parallelism,
+            int attempt,
+            long progressIntervalMillis) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scan action=scan_start dry_run={}"
+                        + " subtask={} parallelism={} attempt={} progress_interval_ms={} ts={}",
+                runId,
+                dryRun,
+                subtask,
+                parallelism,
+                attempt,
+                progressIntervalMillis,
+                Instant.now());
+    }
+
+    public void logScanProgress(
+            String runId,
+            boolean dryRun,
+            int subtask,
+            int parallelism,
+            int attempt,
+            long tasksCompleted,
+            CleanupCounters counters,
+            long elapsedMillis) {
+        logScanCounters(
+                "scan_progress",
+                runId,
+                dryRun,
+                subtask,
+                parallelism,
+                attempt,
+                tasksCompleted,
+                counters,
+                elapsedMillis);
+    }
+
+    public void logScanSubtaskSummary(
+            String runId,
+            boolean dryRun,
+            int subtask,
+            int parallelism,
+            int attempt,
+            long tasksCompleted,
+            CleanupCounters counters,
+            long elapsedMillis) {
+        logScanCounters(
+                "scan_subtask_summary",
+                runId,
+                dryRun,
+                subtask,
+                parallelism,
+                attempt,
+                tasksCompleted,
+                counters,
+                elapsedMillis);
+    }
+
+    private void logScanCounters(
+            String action,
+            String runId,
+            boolean dryRun,
+            int subtask,
+            int parallelism,
+            int attempt,
+            long tasksCompleted,
+            CleanupCounters counters,
+            long elapsedMillis) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scan action={} dry_run={} subtask={}"
+                        + " parallelism={} attempt={} tasks_completed={} scanned_files={}"
+                        + " planned_files={} planned_dirs={} planned_bytes={} deleted_files={}"
+                        + " empty_dirs_removed={} delete_failures={} bytes_reclaimed={}"
+                        + " elapsed_ms={} ts={}",
+                runId,
+                action,
+                dryRun,
+                subtask,
+                parallelism,
+                attempt,
+                tasksCompleted,
+                counters.scannedFiles(),
+                counters.plannedFiles(),
+                counters.plannedDirs(),
+                counters.plannedBytes(),
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed(),
+                elapsedMillis,
                 Instant.now());
     }
 

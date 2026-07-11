@@ -27,6 +27,8 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.UUID;
+
 /**
  * Orphan files cleanup action. Delegates to a distributed Flink Batch job ({@link
  * OrphanFilesCleanJob}) that executes a 3-stage DAG:
@@ -51,8 +53,9 @@ public class OrphanFilesCleanAction implements Action {
     @Override
     public void run() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        String runId = UUID.randomUUID().toString();
         CleanStats stats =
-                OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null));
+                OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null), runId);
         LOG.info(
                 "remove_orphan_files done: scope={} scannedFiles={} plannedFiles={} plannedDirs={}"
                         + " plannedBytes={} deletedFiles={} emptyDirsRemoved={} failures={}"
