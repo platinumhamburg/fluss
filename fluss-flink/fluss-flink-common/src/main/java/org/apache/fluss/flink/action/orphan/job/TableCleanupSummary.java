@@ -34,16 +34,22 @@ public final class TableCleanupSummary implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final ScopeIdentity scope;
+    private final long tasksPlanned;
+    private final long metadataFailures;
     private final CleanupCounters counters;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<SkipReasonCode, Long> bySkipReason;
 
     TableCleanupSummary(
             ScopeIdentity scope,
+            long tasksPlanned,
+            long metadataFailures,
             CleanupCounters counters,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
             Map<SkipReasonCode, Long> bySkipReason) {
         this.scope = scope.tableKey();
+        this.tasksPlanned = tasksPlanned;
+        this.metadataFailures = metadataFailures;
         this.counters = counters;
         Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
         objectCopy.putAll(byObjectType);
@@ -59,6 +65,14 @@ public final class TableCleanupSummary implements Serializable {
 
     public long plannedFiles() {
         return counters.plannedFiles();
+    }
+
+    public long tasksPlanned() {
+        return tasksPlanned;
+    }
+
+    public long metadataFailures() {
+        return metadataFailures;
     }
 
     public long plannedBytes() {

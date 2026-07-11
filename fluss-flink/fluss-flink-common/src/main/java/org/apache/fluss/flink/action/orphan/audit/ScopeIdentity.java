@@ -63,6 +63,10 @@ public final class ScopeIdentity implements Serializable {
         return new ScopeIdentity(ScopeKind.TABLE, database, table, tableId, null, null);
     }
 
+    public static ScopeIdentity unresolvedTable(String database, String table) {
+        return new ScopeIdentity(ScopeKind.TABLE, database, table, null, null, null);
+    }
+
     public static ScopeIdentity orphanTable(
             String database, String directoryName, @Nullable Long tableId) {
         return new ScopeIdentity(

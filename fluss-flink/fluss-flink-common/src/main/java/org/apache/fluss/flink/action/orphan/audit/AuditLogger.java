@@ -491,11 +491,24 @@ public final class AuditLogger {
                                                 ? Long.MIN_VALUE
                                                 : table.scope().tableId()));
         CleanupCounters tableTotal = CleanupCounters.empty();
+        long tableTasksPlanned = 0L;
+        long tableMetadataFailures = 0L;
         for (TableCleanupSummary table : tables) {
             ScopeIdentity scope = table.scope();
             tableTotal = tableTotal.add(table.counters());
+            tableTasksPlanned += table.tasksPlanned();
+            tableMetadataFailures += table.metadataFailures();
             logCounters(
-                    runId, stage, "table_summary", scopeFields(scope), table.counters(), dryRun);
+                    runId,
+                    stage,
+                    "table_summary",
+                    scopeFields(scope)
+                            + " tasks_planned="
+                            + table.tasksPlanned()
+                            + " metadata_failures="
+                            + table.metadataFailures(),
+                    table.counters(),
+                    dryRun);
             for (Map.Entry<CleanupObjectType, CleanupCounters> entry :
                     table.byObjectType().entrySet()) {
                 logCounters(
@@ -511,7 +524,11 @@ public final class AuditLogger {
                         runId,
                         stage,
                         "table_skip_summary",
-                        scopeFields(scope),
+                        scopeFields(scope)
+                                + " tasks_planned="
+                                + table.tasksPlanned()
+                                + " metadata_failures="
+                                + table.metadataFailures(),
                         entry.getKey(),
                         entry.getValue(),
                         dryRun);
@@ -549,14 +566,26 @@ public final class AuditLogger {
         }
         AUDIT.info(
                 "audit_version=1 run_id={} stage={} action=audit_integrity"
-                        + " global_equals_table_sum={} table_count={} dry_run={} ts={}",
+                        + " global_equals_table_sum={} plan_equals_table_sum={} table_count={}"
+                        + " dry_run={} ts={}",
                 runId,
                 stage,
                 sameCounters(report.global(), tableTotal),
+                report.tasksPlanned() == tableTasksPlanned
+                        && report.metadataFailures() == tableMetadataFailures,
                 tables.size(),
                 dryRun,
                 Instant.now());
-        logCounters(runId, stage, finalAction, "scope=global", report.global(), dryRun);
+        logCounters(
+                runId,
+                stage,
+                finalAction,
+                "scope=global tasks_planned="
+                        + report.tasksPlanned()
+                        + " metadata_failures="
+                        + report.metadataFailures(),
+                report.global(),
+                dryRun);
     }
 
     public void logRetentionWaitStart(String runId, long waitMillis) {

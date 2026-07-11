@@ -40,7 +40,7 @@ import java.time.Duration;
  */
 @Internal
 public final class StatsAggregateOperator extends AbstractStreamOperator<CleanupReport>
-        implements OneInputStreamOperator<CleanStats, CleanupReport>, BoundedOneInput {
+        implements OneInputStreamOperator<CleanupReportInput, CleanupReport>, BoundedOneInput {
 
     private static final long serialVersionUID = 3L;
 
@@ -70,8 +70,14 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
     }
 
     @Override
-    public void processElement(StreamRecord<CleanStats> element) {
-        accumulator.addStats(element.getValue());
+    public void processElement(StreamRecord<CleanupReportInput> element) {
+        CleanupReportInput input = element.getValue();
+        if (input.plan() != null) {
+            accumulator.addPlan(input.plan());
+        }
+        if (input.stats() != null) {
+            accumulator.addStats(input.stats());
+        }
     }
 
     @Override
