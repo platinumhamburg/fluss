@@ -19,98 +19,100 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 /** Compact counters describing the cleanup scope and the tasks emitted by stage 1. */
 @Internal
 public final class ScopePlanStats {
 
-    private long databases;
-    private long tables;
-    private long partitions;
-    private long discoveredBuckets;
-    private long bucketTasks;
-    private long orphanDirTasks;
-    private long skippedNoRemoteManifest;
-    private long skippedEmptyKvActiveSet;
-    private long skippedOutOfScopeRoot;
-    private long metadataFailures;
+    private final AtomicLong databases = new AtomicLong();
+    private final AtomicLong tables = new AtomicLong();
+    private final AtomicLong partitions = new AtomicLong();
+    private final AtomicLong discoveredBuckets = new AtomicLong();
+    private final AtomicLong bucketTasks = new AtomicLong();
+    private final AtomicLong orphanDirTasks = new AtomicLong();
+    private final AtomicLong skippedNoRemoteManifest = new AtomicLong();
+    private final AtomicLong skippedEmptyKvActiveSet = new AtomicLong();
+    private final AtomicLong skippedOutOfScopeRoot = new AtomicLong();
+    private final AtomicLong metadataFailures = new AtomicLong();
 
     public void database() {
-        databases++;
+        databases.incrementAndGet();
     }
 
     public void table() {
-        tables++;
+        tables.incrementAndGet();
     }
 
     public void partition() {
-        partitions++;
+        partitions.incrementAndGet();
     }
 
     public void discoveredBucket() {
-        discoveredBuckets++;
+        discoveredBuckets.incrementAndGet();
     }
 
     public void bucketTask() {
-        bucketTasks++;
+        bucketTasks.incrementAndGet();
     }
 
     public void orphanDirTask() {
-        orphanDirTasks++;
+        orphanDirTasks.incrementAndGet();
     }
 
     public void skippedNoRemoteManifest() {
-        skippedNoRemoteManifest++;
+        skippedNoRemoteManifest.incrementAndGet();
     }
 
     public void skippedEmptyKvActiveSet() {
-        skippedEmptyKvActiveSet++;
+        skippedEmptyKvActiveSet.incrementAndGet();
     }
 
     public void skippedOutOfScopeRoot() {
-        skippedOutOfScopeRoot++;
+        skippedOutOfScopeRoot.incrementAndGet();
     }
 
     public void metadataFailure() {
-        metadataFailures++;
+        metadataFailures.incrementAndGet();
     }
 
     public long databases() {
-        return databases;
+        return databases.get();
     }
 
     public long tables() {
-        return tables;
+        return tables.get();
     }
 
     public long partitions() {
-        return partitions;
+        return partitions.get();
     }
 
     public long discoveredBuckets() {
-        return discoveredBuckets;
+        return discoveredBuckets.get();
     }
 
     public long bucketTasks() {
-        return bucketTasks;
+        return bucketTasks.get();
     }
 
     public long orphanDirTasks() {
-        return orphanDirTasks;
+        return orphanDirTasks.get();
     }
 
     public long skippedNoRemoteManifestCount() {
-        return skippedNoRemoteManifest;
+        return skippedNoRemoteManifest.get();
     }
 
     public long skippedEmptyKvActiveSetCount() {
-        return skippedEmptyKvActiveSet;
+        return skippedEmptyKvActiveSet.get();
     }
 
     public long skippedOutOfScopeRootCount() {
-        return skippedOutOfScopeRoot;
+        return skippedOutOfScopeRoot.get();
     }
 
     public long metadataFailures() {
-        return metadataFailures;
+        return metadataFailures.get();
     }
 }
