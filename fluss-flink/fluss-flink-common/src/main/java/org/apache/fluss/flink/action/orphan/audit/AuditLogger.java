@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
+import org.apache.fluss.flink.action.orphan.job.CleanStats;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
@@ -29,6 +30,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 /**
  * Structured audit log writer for the orphan files cleanup action.
@@ -274,23 +276,44 @@ public final class AuditLogger {
      * Routed through the dedicated audit logger so the result is queryable from the same sink as
      * the per-file {@code action=deleted} / {@code action=skip_*} lines.
      */
-    public void logSummary(
-            long scanned,
-            long deletedFiles,
-            long emptyDirsRemoved,
-            long deleteFailures,
-            long bytesReclaimed,
-            boolean dryRun) {
+    public void logSummary(CleanStats stats, boolean dryRun) {
         AUDIT.info(
-                "action=summary scanned={} deleted_total={} deleted_files={} empty_dirs_removed={}"
-                        + " delete_failures={} bytes_reclaimed={} dry_run={} ts={}",
-                scanned,
-                deletedFiles + emptyDirsRemoved,
-                deletedFiles,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed,
+                "action=summary scanned_files={} planned_files={} planned_dirs={} planned_bytes={}"
+                        + " planned_size={} deleted_total={} deleted_files={} empty_dirs_removed={}"
+                        + " delete_failures={} bytes_reclaimed={} reclaimed_size={} dry_run={} ts={}",
+                stats.scannedFiles(),
+                stats.plannedFiles(),
+                stats.plannedDirs(),
+                stats.plannedBytes(),
+                formatBytes(stats.plannedBytes()),
+                stats.deletedFiles() + stats.emptyDirsRemoved(),
+                stats.deletedFiles(),
+                stats.emptyDirsRemoved(),
+                stats.deleteFailures(),
+                stats.bytesReclaimed(),
+                formatBytes(stats.bytesReclaimed()),
                 dryRun,
                 Instant.now());
+    }
+
+    public void logRetentionWaitStart(long waitMillis) {
+        AUDIT.info("action=retention_wait_start wait_ms={} ts={}", waitMillis, Instant.now());
+    }
+
+    public void logRetentionWaitEnd(long waitMillis) {
+        AUDIT.info("action=retention_wait_end wait_ms={} ts={}", waitMillis, Instant.now());
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes < 1024L) {
+            return bytes + " B";
+        }
+        if (bytes < 1024L * 1024L) {
+            return String.format(Locale.ROOT, "%.2f KiB", bytes / 1024.0);
+        }
+        if (bytes < 1024L * 1024L * 1024L) {
+            return String.format(Locale.ROOT, "%.2f MiB", bytes / (1024.0 * 1024.0));
+        }
+        return String.format(Locale.ROOT, "%.2f GiB", bytes / (1024.0 * 1024.0 * 1024.0));
     }
 }

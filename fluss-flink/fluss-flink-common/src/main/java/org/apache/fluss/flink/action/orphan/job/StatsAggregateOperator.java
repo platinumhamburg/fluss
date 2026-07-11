@@ -25,6 +25,9 @@ import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
+import java.io.Serializable;
+import java.time.Duration;
+
 /**
  * Stage 3 of the orphan files cleanup job. Runs at parallelism=1 to aggregate per-subtask {@link
  * CleanStats} records.
@@ -39,9 +42,11 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 public final class StatsAggregateOperator extends AbstractStreamOperator<CleanStats>
         implements OneInputStreamOperator<CleanStats, CleanStats>, BoundedOneInput {
 
-    private static final long serialVersionUID = 2L;
+    private static final long serialVersionUID = 3L;
 
     private final boolean dryRun;
+    private final Duration postRunWait;
+    private final InterruptibleSleeper sleeper;
 
     private transient long scannedFiles;
     private transient long plannedFiles;
@@ -52,8 +57,14 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     private transient long deleteFailures;
     private transient long bytesReclaimed;
 
-    public StatsAggregateOperator(boolean dryRun) {
+    public StatsAggregateOperator(boolean dryRun, Duration postRunWait) {
+        this(dryRun, postRunWait, Thread::sleep);
+    }
+
+    StatsAggregateOperator(boolean dryRun, Duration postRunWait, InterruptibleSleeper sleeper) {
         this.dryRun = dryRun;
+        this.postRunWait = postRunWait;
+        this.sleeper = sleeper;
     }
 
     @Override
@@ -83,7 +94,7 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     }
 
     @Override
-    public void endInput() {
+    public void endInput() throws Exception {
         AuditLogger audit = new AuditLogger();
         CleanStats finalStats =
                 new CleanStats(
@@ -96,14 +107,25 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
                         deleteFailures,
                         bytesReclaimed);
 
-        audit.logSummary(
-                scannedFiles,
-                deletedFiles,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed,
-                dryRun);
+        audit.logSummary(finalStats, dryRun);
+
+        if (!postRunWait.isZero()) {
+            long waitMillis = postRunWait.toMillis();
+            audit.logRetentionWaitStart(waitMillis);
+            try {
+                sleeper.sleep(waitMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw e;
+            }
+            audit.logRetentionWaitEnd(waitMillis);
+        }
 
         output.collect(new StreamRecord<>(finalStats));
     }
+}
+
+@FunctionalInterface
+interface InterruptibleSleeper extends Serializable {
+    void sleep(long millis) throws InterruptedException;
 }
