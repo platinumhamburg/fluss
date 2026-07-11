@@ -54,11 +54,15 @@ public class OrphanFilesCleanAction implements Action {
         CleanStats stats =
                 OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null));
         LOG.info(
-                "remove_orphan_files done: scope={} scanned={} deletedTotal={}"
-                        + " emptyDirsRemoved={} failures={} bytesReclaimed={} dryRun={}",
+                "remove_orphan_files done: scope={} scannedFiles={} plannedFiles={} plannedDirs={}"
+                        + " plannedBytes={} deletedFiles={} emptyDirsRemoved={} failures={}"
+                        + " bytesReclaimed={} dryRun={}",
                 scopeDescription(),
-                stats.scanned(),
-                stats.deleted(),
+                stats.scannedFiles(),
+                stats.plannedFiles(),
+                stats.plannedDirs(),
+                stats.plannedBytes(),
+                stats.deletedFiles(),
                 stats.emptyDirsRemoved(),
                 stats.deleteFailures(),
                 stats.bytesReclaimed(),
