@@ -29,6 +29,7 @@ import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
 import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.LogActiveRefsFetchResult;
@@ -502,6 +503,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
             out.collect(
                     new BucketCleanTask(
+                            ScopeIdentity.table(
+                                            liveTable.dbName,
+                                            liveTable.tableName,
+                                            liveTable.tableId)
+                                    .withPartitionAndBucket(partitionId, bucketId),
                             logTabletDir,
                             kvTabletDir,
                             logSegmentRelativePaths,
@@ -547,6 +553,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             dir -> {
                                 out.collect(
                                         new OrphanDirCleanTask(
+                                                ScopeIdentity.orphanTable(
+                                                        dbState.dbName, dir.getName(), null),
                                                 dir.toString(),
                                                 config.olderThanMillis(),
                                                 config.dryRun(),
@@ -600,6 +608,10 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             dir -> {
                                 out.collect(
                                         new OrphanDirCleanTask(
+                                                ScopeIdentity.table(
+                                                        liveTable.dbName,
+                                                        liveTable.tableName,
+                                                        liveTable.tableId),
                                                 dir.toString(),
                                                 config.olderThanMillis(),
                                                 config.dryRun(),

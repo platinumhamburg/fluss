@@ -38,6 +38,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.Map;
 
@@ -116,7 +117,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
         FsPath anyDir = logDir != null ? logDir : kvDir;
         if (anyDir == null) {
-            return CleanStats.empty();
+            return CleanStats.empty(task.scope());
         }
 
         BucketActiveRefs activeRefs =
@@ -138,14 +139,18 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
         return new CleanStats(
-                bucketStats.scannedFiles,
-                bucketStats.plannedFiles,
-                bucketStats.plannedDirs,
-                bucketStats.plannedBytes,
-                bucketStats.deletedFiles,
-                bucketStats.emptyDirsRemoved,
-                bucketStats.deleteFailures,
-                bucketStats.bytesReclaimed);
+                task.scope(),
+                new CleanupCounters(
+                        bucketStats.scannedFiles,
+                        bucketStats.plannedFiles,
+                        bucketStats.plannedDirs,
+                        bucketStats.plannedBytes,
+                        bucketStats.deletedFiles,
+                        bucketStats.emptyDirsRemoved,
+                        bucketStats.deleteFailures,
+                        bucketStats.bytesReclaimed),
+                Collections.emptyMap(),
+                Collections.emptyMap());
     }
 
     // -------------------------------------------------------------------------
@@ -157,7 +162,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         FileSystem fs = dirPath.getFileSystem();
         remoteFsOpRateLimiter.acquire();
         if (!fs.exists(dirPath)) {
-            return CleanStats.empty();
+            return CleanStats.empty(task.scope());
         }
 
         SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun());
@@ -266,14 +271,18 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         }
 
         return new CleanStats(
-                scannedFiles,
-                plannedFiles,
-                plannedDirs,
-                plannedBytes,
-                deletedFiles,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed);
+                task.scope(),
+                new CleanupCounters(
+                        scannedFiles,
+                        plannedFiles,
+                        plannedDirs,
+                        plannedBytes,
+                        deletedFiles,
+                        emptyDirsRemoved,
+                        deleteFailures,
+                        bytesReclaimed),
+                Collections.emptyMap(),
+                Collections.emptyMap());
     }
 
     // -------------------------------------------------------------------------

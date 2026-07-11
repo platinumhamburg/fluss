@@ -99,6 +99,11 @@ public final class CleanStats implements Serializable {
         return new CleanStats(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
+    public static CleanStats empty(ScopeIdentity scope) {
+        return new CleanStats(
+                scope, CleanupCounters.empty(), Collections.emptyMap(), Collections.emptyMap());
+    }
+
     public static Builder builder(ScopeIdentity scope) {
         return new Builder(scope);
     }

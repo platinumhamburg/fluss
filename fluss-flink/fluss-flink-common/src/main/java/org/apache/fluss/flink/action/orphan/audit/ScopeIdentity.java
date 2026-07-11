@@ -63,6 +63,18 @@ public final class ScopeIdentity implements Serializable {
         return new ScopeIdentity(ScopeKind.TABLE, database, table, tableId, null, null);
     }
 
+    public static ScopeIdentity orphanTable(
+            String database, String directoryName, @Nullable Long tableId) {
+        return new ScopeIdentity(
+                ScopeKind.ORPHAN_TABLE, database, directoryName, tableId, null, null);
+    }
+
+    public static ScopeIdentity orphanPartition(
+            String database, String table, long tableId, @Nullable Long partitionId) {
+        return new ScopeIdentity(
+                ScopeKind.ORPHAN_PARTITION, database, table, tableId, partitionId, null);
+    }
+
     public ScopeIdentity withPartitionAndBucket(
             @Nullable Long partitionId, @Nullable Integer bucketId) {
         return new ScopeIdentity(kind, database, table, tableId, partitionId, bucketId);
