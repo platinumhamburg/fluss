@@ -66,7 +66,9 @@ public class FileLogInputStream
     @Override
     public FileChannelLogRecordBatch nextBatch() throws IOException {
         FileChannel channel = fileRecords.channel();
-        if (position > end - HEADER_SIZE_UP_TO_MAGIC) {
+        long availableEnd = Math.min((long) end, channel.size());
+        long availableBytes = availableEnd - position;
+        if (availableBytes < HEADER_SIZE_UP_TO_MAGIC) {
             return null;
         }
 
@@ -103,16 +105,7 @@ public class FileLogInputStream
                             + " is smaller than fixed header "
                             + minimumHeaderSize);
         }
-        if ((long) end - position < minimumHeaderSize) {
-            throw new CorruptMessageException(
-                    "Record batch magic v"
-                            + magic
-                            + " has only "
-                            + (end - position)
-                            + " bytes remaining for fixed header "
-                            + minimumHeaderSize);
-        }
-        if ((long) end - position < batchSize) {
+        if (availableBytes < minimumHeaderSize || availableBytes < batchSize) {
             return null;
         }
         FileChannelLogRecordBatch batch =

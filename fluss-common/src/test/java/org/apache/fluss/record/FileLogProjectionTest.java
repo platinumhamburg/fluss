@@ -29,7 +29,13 @@ import org.apache.fluss.row.arrow.ArrowWriter;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.compression.NoCompressionCodec;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.ipc.WriteChannel;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.ipc.message.ArrowBuffer;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.ipc.message.ArrowFieldNode;
+import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.ArrowUtils;
 import org.apache.fluss.utils.CloseableIterator;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -40,10 +46,12 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.Channels;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -554,6 +562,241 @@ class FileLogProjectionTest {
         assertMalformedV3LayoutRejected(80, Integer.MAX_VALUE, 0, true, "overflow");
         assertMalformedV3LayoutRejected(80, 0, Integer.MAX_VALUE, false, "overflow");
         assertMalformedV3LayoutRejected(70, 0, 0, true, "Arrow header");
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            bytes = {
+                LOG_MAGIC_VALUE_V0,
+                LOG_MAGIC_VALUE_V1,
+                LOG_MAGIC_VALUE_V2,
+                LOG_MAGIC_VALUE_V3
+            })
+    void testRangeProjectionPreservesOutputBeforeIncompleteTail(byte tailMagic) throws Exception {
+        try (FileLogRecords records =
+                createFileLogRecords(
+                        LOG_MAGIC_VALUE_V0,
+                        TestData.DATA1_ROW_TYPE,
+                        java.util.Collections.singletonList(new Object[] {1, "complete"}))) {
+            int completeEnd = records.sizeInBytes();
+            byte[] expected = projectToBytes(records, completeEnd);
+            int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(tailMagic);
+            int validDeclaredLength = headerSize - LogRecordBatchFormat.LOG_OVERHEAD;
+
+            for (int physicalSize = LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
+                    physicalSize < headerSize;
+                    physicalSize++) {
+                records.channel().truncate(completeEnd);
+                records.channel()
+                        .write(rawBatchTail(physicalSize, validDeclaredLength, tailMagic), completeEnd);
+                assertThat(projectToBytes(records, (int) records.channel().size()))
+                        .isEqualTo(expected);
+            }
+
+            records.channel().truncate(completeEnd);
+            records.channel()
+                    .write(rawBatchTail(headerSize, validDeclaredLength + 8, tailMagic), completeEnd);
+            assertThat(projectToBytes(records, (int) records.channel().size())).isEqualTo(expected);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            bytes = {
+                LOG_MAGIC_VALUE_V0,
+                LOG_MAGIC_VALUE_V1,
+                LOG_MAGIC_VALUE_V2,
+                LOG_MAGIC_VALUE_V3
+            })
+    void testRangeProjectionRejectsInvalidDeclarationFromCommonPrefix(byte magic)
+            throws Exception {
+        int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(magic);
+        assertProjectionDeclarationRejected(magic, -1, "negative");
+        assertProjectionDeclarationRejected(magic, Integer.MAX_VALUE, "overflow");
+        assertProjectionDeclarationRejected(
+                magic,
+                headerSize - LogRecordBatchFormat.LOG_OVERHEAD - 1,
+                "smaller");
+    }
+
+    @Test
+    void testRangeProjectionRejectsUnknownMagicFromCommonPrefix() throws Exception {
+        assertProjectionDeclarationRejected((byte) 99, 0, "Unsupported log magic");
+    }
+
+    @Test
+    void testProjectRecordBatchRetainsStrictFullBatchContract() throws Exception {
+        ByteBuffer header =
+                rawBatchTail(
+                        V3_RECORD_BATCH_HEADER_SIZE,
+                        V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD,
+                        LOG_MAGIC_VALUE_V3);
+        try (FileLogRecords records =
+                FileLogRecords.open(new File(tempDir, "strict-project-record-batch.log"))) {
+            records.channel().write(header);
+            FileLogInputStream.FileChannelLogRecordBatch batch =
+                    new FileLogInputStream.FileChannelLogRecordBatch(
+                            0L,
+                            LOG_MAGIC_VALUE_V3,
+                            records,
+                            0,
+                            V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD);
+            records.channel().truncate(V3_RECORD_BATCH_HEADER_SIZE - 1L);
+
+            assertThatThrownBy(
+                            () ->
+                                    new FileLogProjection(new ProjectionPushdownCache())
+                                            .projectRecordBatch(batch))
+                    .isInstanceOf(EOFException.class)
+                    .hasMessageContaining("Expected to read 68 bytes");
+
+            int declaredLength =
+                    V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD + 8;
+            records.channel().truncate(0);
+            records.channel()
+                    .write(
+                            rawBatchTail(
+                                    V3_RECORD_BATCH_HEADER_SIZE,
+                                    declaredLength,
+                                    LOG_MAGIC_VALUE_V3));
+            FileLogInputStream.FileChannelLogRecordBatch payloadTruncatedBatch =
+                    new FileLogInputStream.FileChannelLogRecordBatch(
+                            0L,
+                            LOG_MAGIC_VALUE_V3,
+                            records,
+                            0,
+                            declaredLength);
+
+            assertThatThrownBy(
+                            () ->
+                                    new FileLogProjection(new ProjectionPushdownCache())
+                                            .projectRecordBatch(payloadTruncatedBatch))
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining("exceeds physical end");
+        }
+    }
+
+    @Test
+    void testProjectionRejectsOverlappingArrowBufferSpans() throws Exception {
+        List<ArrowFieldNode> nodes =
+                List.of(new ArrowFieldNode(1, 0), new ArrowFieldNode(1, 0));
+        List<ArrowBuffer> buffers =
+                List.of(
+                        new ArrowBuffer(0, 16),
+                        new ArrowBuffer(8, 8),
+                        new ArrowBuffer(16, 8),
+                        new ArrowBuffer(24, 8),
+                        new ArrowBuffer(32, 8));
+        assertMalformedArrowMetadataRejected(nodes, buffers, "overlap");
+    }
+
+    @Test
+    void testProjectionRejectsMissingRequiredArrowNodesAndBuffers() throws Exception {
+        List<ArrowBuffer> completeBuffers =
+                List.of(
+                        new ArrowBuffer(0, 8),
+                        new ArrowBuffer(8, 8),
+                        new ArrowBuffer(16, 8),
+                        new ArrowBuffer(24, 8),
+                        new ArrowBuffer(32, 8));
+        assertMalformedArrowMetadataRejected(
+                List.of(new ArrowFieldNode(1, 0)), completeBuffers, "node count");
+        assertMalformedArrowMetadataRejected(
+                List.of(new ArrowFieldNode(1, 0), new ArrowFieldNode(1, 0)),
+                completeBuffers.subList(0, 4),
+                "buffer count");
+    }
+
+    private byte[] projectToBytes(FileLogRecords records, int end) throws Exception {
+        FileLogProjection projection = new FileLogProjection(new ProjectionPushdownCache());
+        projection.setCurrentProjection(
+                1L, testingSchemaGetter, DEFAULT_COMPRESSION, new int[] {0});
+        BytesView projected =
+                projection.project(records.channel(), 0, end, Integer.MAX_VALUE).getBytesView();
+        ByteBuf buffer = projected.getByteBuf();
+        byte[] bytes = new byte[buffer.readableBytes()];
+        buffer.getBytes(buffer.readerIndex(), bytes);
+        return bytes;
+    }
+
+    private void assertProjectionDeclarationRejected(byte magic, int declaredLength, String message)
+            throws Exception {
+        try (FileLogRecords records =
+                FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"))) {
+            records.channel()
+                    .write(
+                            rawBatchTail(
+                                    LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
+                                    declaredLength,
+                                    magic));
+            assertThatThrownBy(
+                            () ->
+                                    new FileLogProjection(new ProjectionPushdownCache())
+                                            .project(
+                                                    records.channel(),
+                                                    0,
+                                                    (int) records.channel().size(),
+                                                    Integer.MAX_VALUE))
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining(message);
+        }
+    }
+
+    private void assertMalformedArrowMetadataRejected(
+            List<ArrowFieldNode> nodes, List<ArrowBuffer> buffers, String message) throws Exception {
+        try (FileLogRecords records = createFileWithArrowMetadata(nodes, buffers, 40)) {
+            FileLogProjection projection = new FileLogProjection(new ProjectionPushdownCache());
+            projection.setCurrentProjection(
+                    1L, testingSchemaGetter, DEFAULT_COMPRESSION, new int[] {0});
+            assertThatThrownBy(
+                            () ->
+                                    projection.project(
+                                            records.channel(),
+                                            0,
+                                            (int) records.channel().size(),
+                                            Integer.MAX_VALUE))
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining(message);
+        }
+    }
+
+    private FileLogRecords createFileWithArrowMetadata(
+            List<ArrowFieldNode> nodes, List<ArrowBuffer> buffers, int bodyLength)
+            throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        ArrowUtils.serializeArrowRecordBatchMetadata(
+                new WriteChannel(Channels.newChannel(output)),
+                1L,
+                nodes,
+                buffers,
+                NoCompressionCodec.DEFAULT_BODY_COMPRESSION,
+                bodyLength);
+        byte[] metadata = output.toByteArray();
+        int batchSize = V0_RECORD_BATCH_HEADER_SIZE + metadata.length + bodyLength;
+        ByteBuffer batch = ByteBuffer.allocate(batchSize).order(ByteOrder.LITTLE_ENDIAN);
+        batch.putInt(LENGTH_OFFSET, batchSize - LogRecordBatchFormat.LOG_OVERHEAD);
+        batch.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V0);
+        batch.putShort(schemaIdOffset(LOG_MAGIC_VALUE_V0), (short) DEFAULT_SCHEMA_ID);
+        batch.put(
+                attributeOffset(LOG_MAGIC_VALUE_V0),
+                DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK);
+        batch.putInt(recordsCountOffset(LOG_MAGIC_VALUE_V0), 1);
+        batch.position(V0_RECORD_BATCH_HEADER_SIZE);
+        batch.put(metadata);
+        batch.position(batchSize);
+        batch.flip();
+
+        FileLogRecords records =
+                FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"));
+        records.channel().write(batch);
+        return records;
+    }
+
+    private static ByteBuffer rawBatchTail(int physicalSize, int declaredLength, byte magic) {
+        ByteBuffer tail = ByteBuffer.allocate(physicalSize).order(ByteOrder.LITTLE_ENDIAN);
+        tail.putInt(LENGTH_OFFSET, declaredLength);
+        tail.put(MAGIC_OFFSET, magic);
+        return tail;
     }
 
     private void assertMalformedV3LayoutRejected(

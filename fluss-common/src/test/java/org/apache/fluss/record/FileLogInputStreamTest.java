@@ -105,27 +105,24 @@ public class FileLogInputStreamTest extends LogTestBase {
         }
     }
 
-    @Test
-    void testRejectsPhysicallyUndersizedV3Header() throws Exception {
-        ByteBuffer corruptHeader =
-                ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE - 1)
-                        .order(ByteOrder.LITTLE_ENDIAN);
-        corruptHeader.putInt(
-                LENGTH_OFFSET, V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD);
-        corruptHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
-
-        try (FileLogRecords fileLogRecords =
-                FileLogRecords.open(new File(tempDir, "truncated-v3.log"))) {
-            fileLogRecords.channel().write(corruptHeader);
-            fileLogRecords.flush();
-            FileLogInputStream input =
-                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
-
-            assertThatThrownBy(input::nextBatch)
-                    .isInstanceOf(CorruptMessageException.class)
-                    .hasMessageContaining("v3")
-                    .hasMessageContaining("fixed header");
+    @ParameterizedTest
+    @ValueSource(
+            bytes = {
+                LOG_MAGIC_VALUE_V0,
+                LOG_MAGIC_VALUE_V1,
+                LOG_MAGIC_VALUE_V2,
+                LOG_MAGIC_VALUE_V3
+            })
+    void testIncompletePhysicalTailsReturnNoBatch(byte magic) throws Exception {
+        int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(magic);
+        int validDeclaredLength = headerSize - LogRecordBatchFormat.LOG_OVERHEAD;
+        for (int physicalSize = LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
+                physicalSize < headerSize;
+                physicalSize++) {
+            assertFileTailIgnored(physicalSize, validDeclaredLength, magic);
         }
+
+        assertFileTailIgnored(headerSize, validDeclaredLength + 8, magic);
     }
 
     @Test
@@ -140,18 +137,47 @@ public class FileLogInputStreamTest extends LogTestBase {
                 V0_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD,
                 (byte) 99,
                 "Unsupported log magic");
-        assertFileHeaderRejected(
-                V0_RECORD_BATCH_HEADER_SIZE, -1, LOG_MAGIC_VALUE_V0, "negative");
-        assertFileHeaderRejected(
-                V0_RECORD_BATCH_HEADER_SIZE,
-                Integer.MAX_VALUE,
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            bytes = {
                 LOG_MAGIC_VALUE_V0,
+                LOG_MAGIC_VALUE_V1,
+                LOG_MAGIC_VALUE_V2,
+                LOG_MAGIC_VALUE_V3
+            })
+    void testInvalidDeclarationsAreCorruptEvenWithOnlyCommonPrefix(byte magic) throws Exception {
+        int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(magic);
+        assertFileHeaderRejected(
+                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
+                -1,
+                magic,
+                "negative");
+        assertFileHeaderRejected(
+                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
+                Integer.MAX_VALUE,
+                magic,
                 "overflow");
         assertFileHeaderRejected(
-                V0_RECORD_BATCH_HEADER_SIZE,
-                V0_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1,
-                LOG_MAGIC_VALUE_V0,
+                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
+                headerSize - LogRecordBatchFormat.LOG_OVERHEAD - 1,
+                magic,
                 "smaller");
+    }
+
+    private void assertFileTailIgnored(int physicalSize, int declaredLength, byte magic)
+            throws Exception {
+        ByteBuffer header = ByteBuffer.allocate(physicalSize).order(ByteOrder.LITTLE_ENDIAN);
+        header.putInt(LENGTH_OFFSET, declaredLength);
+        header.put(MAGIC_OFFSET, magic);
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"))) {
+            fileLogRecords.channel().write(header);
+            FileLogInputStream input =
+                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
+            assertThat(input.nextBatch()).isNull();
+        }
     }
 
     private void assertFileHeaderRejected(

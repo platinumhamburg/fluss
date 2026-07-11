@@ -22,6 +22,8 @@ import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.testutils.DataTestUtils;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -30,11 +32,12 @@ import java.util.Iterator;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
-import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -82,21 +85,57 @@ public class MemorySegmentLogInputStreamTest {
     @Test
     void testRejectsMalformedBatchHeadersBeforeReturningBatch() {
         assertCorruptBatch(
-                rawBatch(
-                        V3_RECORD_BATCH_HEADER_SIZE,
-                        V3_RECORD_BATCH_HEADER_SIZE - LOG_OVERHEAD - 1,
-                        LOG_MAGIC_VALUE_V3),
-                "smaller");
+                rawBatch(LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC, 0, (byte) 99),
+                "Unsupported log magic");
         assertCorruptBatch(
                 rawBatch(V0_RECORD_BATCH_HEADER_SIZE, 0, (byte) 99), "Unsupported log magic");
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            bytes = {
+                LOG_MAGIC_VALUE_V0,
+                LOG_MAGIC_VALUE_V1,
+                LOG_MAGIC_VALUE_V2,
+                LOG_MAGIC_VALUE_V3
+            })
+    void testIncompletePhysicalTailsReturnNoBatch(byte magic) {
+        int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(magic);
+        int validDeclaredLength = headerSize - LOG_OVERHEAD;
+        for (int physicalSize = LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
+                physicalSize < headerSize;
+                physicalSize++) {
+            assertThat(getIterator(rawBatch(physicalSize, validDeclaredLength, magic)).hasNext())
+                    .isFalse();
+        }
+        assertThat(getIterator(rawBatch(headerSize, validDeclaredLength + 8, magic)).hasNext())
+                .isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            bytes = {
+                LOG_MAGIC_VALUE_V0,
+                LOG_MAGIC_VALUE_V1,
+                LOG_MAGIC_VALUE_V2,
+                LOG_MAGIC_VALUE_V3
+            })
+    void testInvalidDeclarationsAreCorruptEvenWithOnlyCommonPrefix(byte magic) {
+        int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(magic);
         assertCorruptBatch(
-                rawBatch(V0_RECORD_BATCH_HEADER_SIZE, -1, LOG_MAGIC_VALUE_V0), "negative");
+                rawBatch(LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC, -1, magic), "negative");
         assertCorruptBatch(
                 rawBatch(
-                        V0_RECORD_BATCH_HEADER_SIZE,
+                        LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
                         Integer.MAX_VALUE,
-                        LOG_MAGIC_VALUE_V0),
+                        magic),
                 "overflow");
+        assertCorruptBatch(
+                rawBatch(
+                        LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
+                        headerSize - LOG_OVERHEAD - 1,
+                        magic),
+                "smaller");
     }
 
     private static MemoryLogRecords rawBatch(int physicalSize, int declaredLength, byte magic) {

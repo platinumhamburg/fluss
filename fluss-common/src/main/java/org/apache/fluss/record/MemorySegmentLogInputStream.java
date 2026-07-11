@@ -89,11 +89,7 @@ class MemorySegmentLogInputStream implements LogInputStream<LogRecordBatch> {
                             + minimumHeaderSize);
         }
         if (remaining < minimumHeaderSize) {
-            throw new CorruptMessageException(
-                    "Only "
-                            + remaining
-                            + " bytes remain for fixed header "
-                            + minimumHeaderSize);
+            return null;
         }
         return (int) batchSize;
     }
