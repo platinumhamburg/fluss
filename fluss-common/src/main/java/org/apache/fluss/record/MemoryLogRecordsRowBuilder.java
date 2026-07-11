@@ -158,6 +158,7 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
     public void setFencedWriterState(WriterKey writerKey, long sequence) {
         checkState(magic == LOG_MAGIC_VALUE_V3, "Fenced writer state requires WAL magic v3");
         checkArgument(sequence >= 0L, "fenced sequence must be non-negative");
+        this.builtBuffer = null;
         this.writerKey = checkNotNull(writerKey);
         this.fencedSequence = sequence;
     }

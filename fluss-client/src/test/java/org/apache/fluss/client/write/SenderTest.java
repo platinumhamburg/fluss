@@ -29,6 +29,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
@@ -58,6 +59,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
@@ -119,6 +121,22 @@ final class SenderTest {
         sender.runOnce();
         assertThat(sender.numOfInFlightBatches(tb1)).isEqualTo(0);
         assertThat(future.get()).isNull();
+    }
+
+    @Test
+    void testOrdinaryProduceRequestCannotContainTargetProtocolBatches() throws Exception {
+        appendToAccumulator(tb1, row(1, "a"), (tb, leo, e) -> {});
+        sender.runOnce();
+
+        ApiMessage request = getRequest(tb1, 0);
+        assertThat(request).isInstanceOf(ProduceLogRequest.class);
+        MemoryLogRecords records = getProduceLogData((ProduceLogRequest) request).get(tb1);
+        assertThat(records).isNotNull();
+        for (LogRecordBatch batch : records.batches()) {
+            assertThat(batch.magic()).isLessThan(LOG_MAGIC_VALUE_V3);
+            assertThat(batch.idempotenceProtocolVersion()).isZero();
+            batch.ensureValid();
+        }
     }
 
     @Test

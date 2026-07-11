@@ -32,13 +32,15 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Collections;
 import java.util.Optional;
+import java.util.UUID;
 
+import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
-import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
@@ -123,6 +125,48 @@ public class FileLogInputStreamTest extends LogTestBase {
                     .isInstanceOf(CorruptMessageException.class)
                     .hasMessageContaining("v3")
                     .hasMessageContaining("fixed header");
+        }
+    }
+
+    @Test
+    void testRejectsUnknownMagicAndInvalidDeclaredLengths() throws Exception {
+        assertFileHeaderRejected(
+                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
+                0,
+                (byte) 99,
+                "Unsupported log magic");
+        assertFileHeaderRejected(
+                V0_RECORD_BATCH_HEADER_SIZE,
+                V0_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD,
+                (byte) 99,
+                "Unsupported log magic");
+        assertFileHeaderRejected(
+                V0_RECORD_BATCH_HEADER_SIZE, -1, LOG_MAGIC_VALUE_V0, "negative");
+        assertFileHeaderRejected(
+                V0_RECORD_BATCH_HEADER_SIZE,
+                Integer.MAX_VALUE,
+                LOG_MAGIC_VALUE_V0,
+                "overflow");
+        assertFileHeaderRejected(
+                V0_RECORD_BATCH_HEADER_SIZE,
+                V0_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1,
+                LOG_MAGIC_VALUE_V0,
+                "smaller");
+    }
+
+    private void assertFileHeaderRejected(
+            int physicalSize, int declaredLength, byte magic, String message) throws Exception {
+        ByteBuffer header = ByteBuffer.allocate(physicalSize).order(ByteOrder.LITTLE_ENDIAN);
+        header.putInt(LENGTH_OFFSET, declaredLength);
+        header.put(MAGIC_OFFSET, magic);
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"))) {
+            fileLogRecords.channel().write(header);
+            FileLogInputStream input =
+                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
+            assertThatThrownBy(input::nextBatch)
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining(message);
         }
     }
 

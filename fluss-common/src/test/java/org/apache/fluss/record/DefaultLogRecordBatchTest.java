@@ -97,6 +97,31 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
     }
 
     @Test
+    void testRowBuilderRewritesBuiltHeaderAfterFencedStateChanges() throws Exception {
+        MemoryLogRecordsIndexedBuilder builder =
+                MemoryLogRecordsIndexedBuilder.fencedBuilder(
+                        schemaId,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(100),
+                        false);
+        builder.setFencedWriterState(FENCED_WRITER_KEY, FENCED_SEQUENCE);
+        LogRecordBatch first =
+                MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
+        long firstChecksum = first.checksum();
+
+        WriterKey replacementKey = new WriterKey(-9L, 27L);
+        long replacementSequence = Long.MAX_VALUE;
+        builder.setFencedWriterState(replacementKey, replacementSequence);
+        LogRecordBatch rebuilt =
+                MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
+
+        assertThat(rebuilt.fencedWriterKey()).isEqualTo(replacementKey);
+        assertThat(rebuilt.fencedSequence()).isEqualTo(replacementSequence);
+        assertThat(rebuilt.checksum()).isNotEqualTo(firstChecksum);
+        rebuilt.ensureValid();
+    }
+
+    @Test
     void testV3RequiresWriterKeyAndAcceptsLongMaxSequence() throws Exception {
         MemoryLogRecordsCompactedBuilder missingKeyBuilder =
                 MemoryLogRecordsCompactedBuilder.fencedBuilder(

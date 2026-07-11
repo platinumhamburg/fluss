@@ -42,6 +42,7 @@ import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.types.pojo.Field;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.ArrowUtils;
+import org.apache.fluss.utils.crc.Crc32C;
 import org.apache.fluss.utils.types.Tuple2;
 
 import java.io.ByteArrayOutputStream;
@@ -55,6 +56,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
+import java.util.zip.Checksum;
 
 import static org.apache.fluss.record.DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
@@ -69,6 +71,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.V1_RECORD_BATCH_HEADE
 import static org.apache.fluss.record.LogRecordBatchFormat.V2_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordsCountOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
@@ -103,6 +106,7 @@ public class FileLogProjection {
     private final ByteBuffer logHeaderBuffer = ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE);
 
     private final ByteBuffer arrowHeaderBuffer = ByteBuffer.allocate(ARROW_HEADER_SIZE);
+    private final ByteBuffer crcReadBuffer = ByteBuffer.allocate(16 * 1024);
     private ByteBuffer arrowMetadataBuffer;
     private SchemaGetter schemaGetter;
     private long tableId;
@@ -145,11 +149,8 @@ public class FileLogProjection {
         logHeaderBuffer.rewind();
         readLogHeaderFullyOrFail(channel, logHeaderBuffer, position);
         logHeaderBuffer.rewind();
-        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
-        int recordBatchHeaderSize = recordBatchHeaderSize(magic);
-        int batchSizeInBytes = LOG_OVERHEAD + logHeaderBuffer.getInt(LENGTH_OFFSET);
-        validateV3DeclaredHeaderSize(magic, batchSizeInBytes);
-        short schemaId = logHeaderBuffer.getShort(schemaIdOffset(magic));
+        BatchLayout layout = validateBatchLayout(channel, position, channel.size());
+        short schemaId = logHeaderBuffer.getShort(schemaIdOffset(layout.magic));
 
         ProjectionInfo currentProjection = getOrCreateProjectionInfo(schemaId);
         checkNotNull(currentProjection, "There is no projection registered yet.");
@@ -158,11 +159,12 @@ public class FileLogProjection {
 
         // Empty batches (header-only) can occur for CDC log batches with no changes;
         // return empty projection to preserve offset advancement.
-        if (batchSizeInBytes == recordBatchHeaderSize) {
+        if (layout.isHeaderOnly()) {
             return builder.build();
         }
 
-        projectSingleBatch(channel, position, currentProjection, builder, Integer.MAX_VALUE);
+        projectSingleBatch(
+                channel, position, layout, currentProjection, builder, Integer.MAX_VALUE);
         return builder.build();
     }
 
@@ -194,11 +196,8 @@ public class FileLogProjection {
             readLogHeaderFullyOrFail(channel, logHeaderBuffer, position);
 
             logHeaderBuffer.rewind();
-            byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
-            int recordBatchHeaderSize = recordBatchHeaderSize(magic);
-            int batchSizeInBytes = LOG_OVERHEAD + logHeaderBuffer.getInt(LENGTH_OFFSET);
-            validateV3DeclaredHeaderSize(magic, batchSizeInBytes);
-            short schemaId = logHeaderBuffer.getShort(schemaIdOffset(magic));
+            BatchLayout layout = validateBatchLayout(channel, position, end);
+            short schemaId = logHeaderBuffer.getShort(schemaIdOffset(layout.magic));
 
             // reuse projection in the current log file
             if (currentProjection == null || prevSchemaId != schemaId) {
@@ -206,30 +205,26 @@ public class FileLogProjection {
                 currentProjection = getOrCreateProjectionInfo(schemaId);
             }
 
-            if (position > end - batchSizeInBytes) {
-                // the remaining bytes in the file are not enough to read a full batch
-                return new BytesViewLogRecords(builder.build());
-            }
-
             // Return empty batch to push forward log offset. The empty batch was generated when
             // build cdc log batch when there
             // is no cdc log generated for this kv batch. See the comments about the field
             // 'lastOffsetDelta' in DefaultLogRecordBatch.
-            if (batchSizeInBytes == recordBatchHeaderSize) {
-                builder.addBytes(channel, position, batchSizeInBytes);
-                position += batchSizeInBytes;
+            if (layout.isHeaderOnly()) {
+                builder.addBytes(channel, position, layout.batchSize);
+                position += layout.batchSize;
                 continue;
             }
 
             int newBatchSizeInBytes =
-                    projectSingleBatch(channel, position, currentProjection, builder, maxBytes);
+                    projectSingleBatch(
+                            channel, position, layout, currentProjection, builder, maxBytes);
             if (newBatchSizeInBytes < 0) {
                 // the projected batch exceeds the remaining budget, stop here
                 return new BytesViewLogRecords(builder.build());
             }
 
             maxBytes -= newBatchSizeInBytes;
-            position += batchSizeInBytes;
+            position += layout.batchSize;
         }
 
         return new BytesViewLogRecords(builder.build());
@@ -251,39 +246,34 @@ public class FileLogProjection {
     private int projectSingleBatch(
             FileChannel channel,
             int position,
+            BatchLayout layout,
             ProjectionInfo currentProjection,
             MultiBytesView.Builder builder,
             int maxBytes)
             throws IOException {
         logHeaderBuffer.rewind();
-        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
-        int recordBatchHeaderSize = recordBatchHeaderSize(magic);
-
-        boolean isAppendOnly =
-                (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
-
-        // For V1+, skip statistics data between header and records
-        int statisticsLength = 0;
-        if (magic >= LOG_MAGIC_VALUE_V1) {
-            statisticsLength = logHeaderBuffer.getInt(statisticsLengthOffset(magic));
-        }
-        int recordsStartOffset = recordBatchHeaderSize + statisticsLength;
-
-        final int changeTypeBytes;
-        final long arrowHeaderOffset;
-        if (isAppendOnly) {
-            changeTypeBytes = 0;
-            arrowHeaderOffset = position + recordsStartOffset;
-        } else {
-            changeTypeBytes = logHeaderBuffer.getInt(recordsCountOffset(magic));
-            arrowHeaderOffset = position + recordsStartOffset + changeTypeBytes;
-        }
+        byte magic = layout.magic;
+        int recordBatchHeaderSize = layout.headerSize;
+        int changeTypeBytes = layout.changeTypeBytes;
+        long arrowHeaderOffset = position + (long) layout.arrowHeaderOffset;
 
         // read arrow header
         arrowHeaderBuffer.rewind();
         readFullyOrFail(channel, arrowHeaderBuffer, arrowHeaderOffset, "arrow header");
         arrowHeaderBuffer.position(ARROW_IPC_METADATA_SIZE_OFFSET);
         int arrowMetadataSize = arrowHeaderBuffer.getInt();
+        if (arrowMetadataSize < 0) {
+            throw corrupt("Arrow metadata size is negative: " + arrowMetadataSize);
+        }
+        int arrowBodyOffset =
+                checkedRelativeOffset(
+                        layout.arrowHeaderOffset,
+                        ARROW_HEADER_SIZE,
+                        arrowMetadataSize,
+                        "Arrow metadata offset");
+        if (arrowBodyOffset > layout.batchSize) {
+            throw corrupt("Arrow metadata exceeds the declared record batch");
+        }
 
         resizeArrowMetadataBuffer(arrowMetadataSize);
         arrowMetadataBuffer.rewind();
@@ -294,7 +284,13 @@ public class FileLogProjection {
                 "arrow metadata");
 
         arrowMetadataBuffer.rewind();
-        Message metadata = Message.getRootAsMessage(arrowMetadataBuffer);
+        final Message metadata;
+        try {
+            metadata = Message.getRootAsMessage(arrowMetadataBuffer);
+        } catch (RuntimeException e) {
+            throw new CorruptMessageException("Invalid Arrow metadata", e);
+        }
+        validateArrowBody(metadata, layout, arrowBodyOffset);
         ProjectedArrowBatch projectedArrowBatch =
                 projectArrowBatch(
                         metadata,
@@ -303,11 +299,15 @@ public class FileLogProjection {
                         currentProjection.bufferCount);
         long arrowBodyLength = projectedArrowBatch.bodyLength();
 
-        int newBatchSizeInBytes =
-                recordBatchHeaderSize
+        long newBatchSize =
+                (long) recordBatchHeaderSize
                         + changeTypeBytes
                         + currentProjection.arrowMetadataLength
-                        + (int) arrowBodyLength;
+                        + arrowBodyLength;
+        if (newBatchSize > Integer.MAX_VALUE) {
+            throw corrupt("Projected record batch size overflow: " + newBatchSize);
+        }
+        int newBatchSizeInBytes = (int) newBatchSize;
 
         if (newBatchSizeInBytes > maxBytes) {
             return -1;
@@ -332,13 +332,30 @@ public class FileLogProjection {
         byte[] logHeader = new byte[recordBatchHeaderSize];
         logHeaderBuffer.get(logHeader);
 
+        final long bufferOffset = position + (long) arrowBodyOffset;
+        validateSelectedBuffers(projectedArrowBatch, metadata.bodyLength());
+        // The projected body remains file-backed and zero-copy. CRC calculation adds one bounded,
+        // sequential read over only the bytes selected for the output batch.
+        long crc =
+                computeProjectedCrc(
+                        channel,
+                        logHeader,
+                        magic,
+                        position + (long) layout.recordsStartOffset,
+                        changeTypeBytes,
+                        headerMetadata,
+                        bufferOffset,
+                        projectedArrowBatch.buffers);
+        ByteBuffer.wrap(logHeader)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(crcOffset(magic), (int) crc);
+
         // build log records
         builder.addBytes(logHeader);
-        if (!isAppendOnly) {
-            builder.addBytes(channel, position + recordsStartOffset, changeTypeBytes);
+        if (!layout.appendOnly) {
+            builder.addBytes(channel, position + layout.recordsStartOffset, changeTypeBytes);
         }
         builder.addBytes(headerMetadata);
-        final long bufferOffset = arrowHeaderOffset + ARROW_HEADER_SIZE + arrowMetadataSize;
         projectedArrowBatch.buffers.forEach(
                 b -> builder.addBytes(channel, bufferOffset + b.getOffset(), (int) b.getSize()));
 
@@ -506,14 +523,196 @@ public class FileLogProjection {
         }
     }
 
-    private static void validateV3DeclaredHeaderSize(byte magic, int batchSizeInBytes) {
-        if (magic == LOG_MAGIC_VALUE_V3 && batchSizeInBytes < V3_RECORD_BATCH_HEADER_SIZE) {
+    private BatchLayout validateBatchLayout(FileChannel channel, int position, long physicalEnd)
+            throws IOException {
+        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
+        final int headerSize;
+        try {
+            headerSize = recordBatchHeaderSize(magic);
+        } catch (IllegalArgumentException e) {
             throw new CorruptMessageException(
-                    "Magic v3 record batch is corrupt: declared size "
-                            + batchSizeInBytes
-                            + " is smaller than fixed header "
-                            + V3_RECORD_BATCH_HEADER_SIZE);
+                    "Unsupported log magic " + Byte.toUnsignedInt(magic), e);
         }
+
+        int declaredLength = logHeaderBuffer.getInt(LENGTH_OFFSET);
+        if (declaredLength < 0) {
+            throw corrupt("Record batch has negative declared length " + declaredLength);
+        }
+        long batchSizeLong = (long) LOG_OVERHEAD + declaredLength;
+        if (batchSizeLong > Integer.MAX_VALUE) {
+            throw corrupt("Record batch declared size overflow: " + batchSizeLong);
+        }
+        if (batchSizeLong < headerSize) {
+            throw corrupt(
+                    "Record batch magic v"
+                            + magic
+                            + " declared size "
+                            + batchSizeLong
+                            + " is smaller than fixed header "
+                            + headerSize);
+        }
+        long batchEnd = position + batchSizeLong;
+        long availableEnd = Math.min(physicalEnd, channel.size());
+        if (position < 0 || batchEnd > availableEnd) {
+            throw corrupt(
+                    "Record batch range ["
+                            + position
+                            + ", "
+                            + batchEnd
+                            + ") exceeds physical end "
+                            + availableEnd);
+        }
+
+        int statisticsLength =
+                magic == LOG_MAGIC_VALUE_V0
+                        ? 0
+                        : logHeaderBuffer.getInt(statisticsLengthOffset(magic));
+        if (statisticsLength < 0) {
+            throw corrupt("statisticsLength is negative: " + statisticsLength);
+        }
+        int recordCount = logHeaderBuffer.getInt(recordsCountOffset(magic));
+        if (recordCount < 0) {
+            throw corrupt("recordCount is negative: " + recordCount);
+        }
+
+        int batchSize = (int) batchSizeLong;
+        if (batchSize == headerSize && (statisticsLength != 0 || recordCount != 0)) {
+            throw corrupt(
+                    "A header-only batch must have zero statisticsLength and recordCount");
+        }
+
+        int recordsStartOffset =
+                checkedRelativeOffset(headerSize, statisticsLength, "records offset");
+        if (recordsStartOffset > batchSize) {
+            throw corrupt("Statistics exceed the declared record batch");
+        }
+        boolean appendOnly =
+                (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
+        int changeTypeBytes = appendOnly ? 0 : recordCount;
+        int arrowHeaderOffset =
+                checkedRelativeOffset(
+                        recordsStartOffset, changeTypeBytes, "change-type offset");
+        if (arrowHeaderOffset > batchSize) {
+            throw corrupt("Change types exceed the declared record batch");
+        }
+        if (batchSize != headerSize
+                && checkedRelativeOffset(
+                                arrowHeaderOffset, ARROW_HEADER_SIZE, "Arrow header offset")
+                        > batchSize) {
+            throw corrupt("Arrow header exceeds the declared record batch");
+        }
+        return new BatchLayout(
+                magic,
+                headerSize,
+                batchSize,
+                recordsStartOffset,
+                changeTypeBytes,
+                arrowHeaderOffset,
+                appendOnly);
+    }
+
+    private static int checkedRelativeOffset(int base, int addition, String description) {
+        return checkedRelativeOffset(base, addition, 0, description);
+    }
+
+    private static int checkedRelativeOffset(
+            int base, int firstAddition, int secondAddition, String description) {
+        long result = (long) base + firstAddition + secondAddition;
+        if (result > Integer.MAX_VALUE) {
+            throw corrupt(description + " overflow: " + result);
+        }
+        return (int) result;
+    }
+
+    private static void validateArrowBody(
+            Message metadata, BatchLayout layout, int arrowBodyOffset) {
+        long bodyLength = metadata.bodyLength();
+        if (bodyLength < 0) {
+            throw corrupt("Arrow body length is negative: " + bodyLength);
+        }
+        if (bodyLength > layout.batchSize - (long) arrowBodyOffset) {
+            throw corrupt("Arrow body exceeds the declared record batch");
+        }
+
+        final RecordBatch recordBatch;
+        try {
+            recordBatch = (RecordBatch) metadata.header(new RecordBatch());
+            long previousOffset = 0L;
+            for (int i = 0; i < recordBatch.buffersLength(); i++) {
+                Buffer buffer = recordBatch.buffers(i);
+                long offset = buffer.offset();
+                long length = buffer.length();
+                if (offset < previousOffset
+                        || length < 0
+                        || offset > bodyLength
+                        || length > bodyLength - offset) {
+                    throw corrupt("Arrow buffer lies outside the declared Arrow body");
+                }
+                previousOffset = offset;
+            }
+        } catch (CorruptMessageException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new CorruptMessageException("Invalid Arrow record batch metadata", e);
+        }
+    }
+
+    private static void validateSelectedBuffers(
+            ProjectedArrowBatch projectedBatch, long sourceBodyLength) {
+        for (ArrowBuffer buffer : projectedBatch.buffers) {
+            long offset = buffer.getOffset();
+            long size = buffer.getSize();
+            if (offset < 0
+                    || size < 0
+                    || offset > sourceBodyLength
+                    || size > sourceBodyLength - offset) {
+                throw corrupt("Projected Arrow buffer lies outside the source Arrow body");
+            }
+        }
+    }
+
+    private long computeProjectedCrc(
+            FileChannel channel,
+            byte[] logHeader,
+            byte magic,
+            long changeTypeOffset,
+            int changeTypeBytes,
+            byte[] arrowMetadata,
+            long arrowBodyOffset,
+            List<ArrowBuffer> selectedBuffers)
+            throws IOException {
+        Checksum checksum = Crc32C.create();
+        int crcStart = schemaIdOffset(magic);
+        checksum.update(logHeader, crcStart, logHeader.length - crcStart);
+        updateChecksumFromFile(checksum, channel, changeTypeOffset, changeTypeBytes);
+        checksum.update(arrowMetadata, 0, arrowMetadata.length);
+        for (ArrowBuffer buffer : selectedBuffers) {
+            updateChecksumFromFile(
+                    checksum,
+                    channel,
+                    arrowBodyOffset + buffer.getOffset(),
+                    (int) buffer.getSize());
+        }
+        return checksum.getValue();
+    }
+
+    private void updateChecksumFromFile(
+            Checksum checksum, FileChannel channel, long position, int size) throws IOException {
+        int remaining = size;
+        long currentPosition = position;
+        while (remaining > 0) {
+            int chunkSize = Math.min(remaining, crcReadBuffer.capacity());
+            crcReadBuffer.clear();
+            crcReadBuffer.limit(chunkSize);
+            readFullyOrFail(channel, crcReadBuffer, currentPosition, "projected record CRC");
+            checksum.update(crcReadBuffer.array(), 0, chunkSize);
+            currentPosition += chunkSize;
+            remaining -= chunkSize;
+        }
+    }
+
+    private static CorruptMessageException corrupt(String message) {
+        return new CorruptMessageException(message);
     }
 
     @VisibleForTesting
@@ -598,6 +797,37 @@ public class FileLogProjection {
             this.arrowMetadataLength = arrowMetadataLength;
             this.bodyCompression = bodyCompression;
             this.selectedFieldPositions = selectedFieldPositions;
+        }
+    }
+
+    private static final class BatchLayout {
+        private final byte magic;
+        private final int headerSize;
+        private final int batchSize;
+        private final int recordsStartOffset;
+        private final int changeTypeBytes;
+        private final int arrowHeaderOffset;
+        private final boolean appendOnly;
+
+        private BatchLayout(
+                byte magic,
+                int headerSize,
+                int batchSize,
+                int recordsStartOffset,
+                int changeTypeBytes,
+                int arrowHeaderOffset,
+                boolean appendOnly) {
+            this.magic = magic;
+            this.headerSize = headerSize;
+            this.batchSize = batchSize;
+            this.recordsStartOffset = recordsStartOffset;
+            this.changeTypeBytes = changeTypeBytes;
+            this.arrowHeaderOffset = arrowHeaderOffset;
+            this.appendOnly = appendOnly;
+        }
+
+        private boolean isHeaderOnly() {
+            return batchSize == headerSize;
         }
     }
 

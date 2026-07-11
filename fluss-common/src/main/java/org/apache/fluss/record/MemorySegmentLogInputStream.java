@@ -17,11 +17,14 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.memory.MemorySegment;
 
+import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
-import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
+import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 
 /**
  * A byte buffer backed log input stream. This class avoids the need to copy records by returning
@@ -41,8 +44,7 @@ class MemorySegmentLogInputStream implements LogInputStream<LogRecordBatch> {
 
     public LogRecordBatch nextBatch() {
         Integer batchSize = nextBatchSize();
-        // should at-least larger than V0 header size, because V1 header is larger than V0.
-        if (batchSize == null || remaining < batchSize || remaining < V0_RECORD_BATCH_HEADER_SIZE) {
+        if (batchSize == null || remaining < batchSize) {
             return null;
         }
 
@@ -56,11 +58,43 @@ class MemorySegmentLogInputStream implements LogInputStream<LogRecordBatch> {
 
     /** Validates the header of the next batch and returns batch size. */
     private Integer nextBatchSize() {
-        if (remaining < LOG_OVERHEAD) {
+        if (remaining < HEADER_SIZE_UP_TO_MAGIC) {
             return null;
         }
 
         int recordSize = memorySegment.getInt(currentPosition + LENGTH_OFFSET);
-        return recordSize + LOG_OVERHEAD;
+        byte magic = memorySegment.get(currentPosition + MAGIC_OFFSET);
+        final int minimumHeaderSize;
+        try {
+            minimumHeaderSize = recordBatchHeaderSize(magic);
+        } catch (IllegalArgumentException e) {
+            throw new CorruptMessageException(
+                    "Unsupported log magic " + Byte.toUnsignedInt(magic), e);
+        }
+
+        if (recordSize < 0) {
+            throw new CorruptMessageException(
+                    "Record batch has negative declared length " + recordSize);
+        }
+        long batchSize = (long) LOG_OVERHEAD + recordSize;
+        if (batchSize > Integer.MAX_VALUE) {
+            throw new CorruptMessageException(
+                    "Record batch declared size overflow: " + batchSize);
+        }
+        if (batchSize < minimumHeaderSize) {
+            throw new CorruptMessageException(
+                    "Record batch declared size "
+                            + batchSize
+                            + " is smaller than fixed header "
+                            + minimumHeaderSize);
+        }
+        if (remaining < minimumHeaderSize) {
+            throw new CorruptMessageException(
+                    "Only "
+                            + remaining
+                            + " bytes remain for fixed header "
+                            + minimumHeaderSize);
+        }
+        return (int) batchSize;
     }
 }

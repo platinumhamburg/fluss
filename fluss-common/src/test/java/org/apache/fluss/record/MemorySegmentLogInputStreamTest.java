@@ -17,18 +17,27 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.testutils.DataTestUtils;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Iterator;
 
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
+import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
+import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link MemorySegmentLogInputStream}. */
 public class MemorySegmentLogInputStreamTest {
@@ -63,12 +72,48 @@ public class MemorySegmentLogInputStreamTest {
         // gen batch with enough size.
         MemorySegment memory = MemorySegment.allocateHeapMemory(100);
         memory.put(MAGIC_OFFSET, CURRENT_LOG_MAGIC_VALUE);
+        memory.putInt(
+                LENGTH_OFFSET, V0_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD);
         memoryLogRecords = MemoryLogRecords.pointToBytes(memory.getHeapMemory());
         iterator = getIterator(memoryLogRecords);
         assertThat(iterator.hasNext()).isTrue();
     }
 
-    private Iterator<LogRecordBatch> getIterator(MemoryLogRecords memoryLogRecords) {
+    @Test
+    void testRejectsMalformedBatchHeadersBeforeReturningBatch() {
+        assertCorruptBatch(
+                rawBatch(
+                        V3_RECORD_BATCH_HEADER_SIZE,
+                        V3_RECORD_BATCH_HEADER_SIZE - LOG_OVERHEAD - 1,
+                        LOG_MAGIC_VALUE_V3),
+                "smaller");
+        assertCorruptBatch(
+                rawBatch(V0_RECORD_BATCH_HEADER_SIZE, 0, (byte) 99), "Unsupported log magic");
+        assertCorruptBatch(
+                rawBatch(V0_RECORD_BATCH_HEADER_SIZE, -1, LOG_MAGIC_VALUE_V0), "negative");
+        assertCorruptBatch(
+                rawBatch(
+                        V0_RECORD_BATCH_HEADER_SIZE,
+                        Integer.MAX_VALUE,
+                        LOG_MAGIC_VALUE_V0),
+                "overflow");
+    }
+
+    private static MemoryLogRecords rawBatch(int physicalSize, int declaredLength, byte magic) {
+        ByteBuffer buffer = ByteBuffer.allocate(physicalSize).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putInt(LENGTH_OFFSET, declaredLength);
+        buffer.put(MAGIC_OFFSET, magic);
+        return MemoryLogRecords.pointToBytes(buffer.array());
+    }
+
+    private static void assertCorruptBatch(MemoryLogRecords records, String message) {
+        Iterator<LogRecordBatch> iterator = getIterator(records);
+        assertThatThrownBy(iterator::hasNext)
+                .isInstanceOf(CorruptMessageException.class)
+                .hasMessageContaining(message);
+    }
+
+    private static Iterator<LogRecordBatch> getIterator(MemoryLogRecords memoryLogRecords) {
         return memoryLogRecords.batches().iterator();
     }
 }

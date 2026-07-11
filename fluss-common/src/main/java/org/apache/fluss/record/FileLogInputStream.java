@@ -39,8 +39,6 @@ import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAG
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
-import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
-import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
@@ -68,7 +66,7 @@ public class FileLogInputStream
     @Override
     public FileChannelLogRecordBatch nextBatch() throws IOException {
         FileChannel channel = fileRecords.channel();
-        if (position >= end - HEADER_SIZE_UP_TO_MAGIC) {
+        if (position > end - HEADER_SIZE_UP_TO_MAGIC) {
             return null;
         }
 
@@ -80,30 +78,47 @@ public class FileLogInputStream
         int length = logHeaderBuffer.getInt(LENGTH_OFFSET);
         byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
 
-        if (magic == LOG_MAGIC_VALUE_V3 && position > end - V3_RECORD_BATCH_HEADER_SIZE) {
+        final int minimumHeaderSize;
+        try {
+            minimumHeaderSize = recordBatchHeaderSize(magic);
+        } catch (IllegalArgumentException e) {
             throw new CorruptMessageException(
-                    "Magic v3 record batch is corrupt: only "
-                            + (end - position)
-                            + " bytes remain for fixed header "
-                            + V3_RECORD_BATCH_HEADER_SIZE);
+                    "Unsupported log magic " + Byte.toUnsignedInt(magic), e);
         }
-
-        if (position > end - LOG_OVERHEAD - length) {
-            return null;
-        }
-
-        if (magic == LOG_MAGIC_VALUE_V3
-                && length < V3_RECORD_BATCH_HEADER_SIZE - LOG_OVERHEAD) {
+        if (length < 0) {
             throw new CorruptMessageException(
-                    "Magic v3 record batch is corrupt: declared size "
-                            + ((long) LOG_OVERHEAD + length)
+                    "Record batch has negative declared length " + length);
+        }
+        long batchSize = (long) LOG_OVERHEAD + length;
+        if (batchSize > Integer.MAX_VALUE) {
+            throw new CorruptMessageException(
+                    "Record batch declared size overflow: " + batchSize);
+        }
+        if (batchSize < minimumHeaderSize) {
+            throw new CorruptMessageException(
+                    "Record batch magic v"
+                            + magic
+                            + " declared size "
+                            + batchSize
                             + " is smaller than fixed header "
-                            + V3_RECORD_BATCH_HEADER_SIZE);
+                            + minimumHeaderSize);
+        }
+        if ((long) end - position < minimumHeaderSize) {
+            throw new CorruptMessageException(
+                    "Record batch magic v"
+                            + magic
+                            + " has only "
+                            + (end - position)
+                            + " bytes remaining for fixed header "
+                            + minimumHeaderSize);
+        }
+        if ((long) end - position < batchSize) {
+            return null;
         }
         FileChannelLogRecordBatch batch =
                 new FileChannelLogRecordBatch(offset, magic, fileRecords, position, length);
 
-        position += batch.sizeInBytes();
+        position += (int) batchSize;
         return batch;
     }
 

@@ -18,7 +18,6 @@
 package org.apache.fluss.record;
 
 import org.apache.fluss.exception.InvalidColumnProjectionException;
-import org.apache.fluss.exception.SchemaNotExistException;
 import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.memory.ManagedPagedOutputView;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
@@ -60,6 +59,10 @@ import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.V1_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.V3_RECORD_BATCH_HEADER_SIZE;
+import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.recordsCountOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.statisticsLengthOffset;
 import static org.apache.fluss.record.LogRecordReadContext.createArrowReadContext;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
@@ -290,7 +293,8 @@ class FileLogProjectionTest {
                                         fileLogRecords,
                                         new int[] {0, 1},
                                         Integer.MAX_VALUE))
-                .isInstanceOf(SchemaNotExistException.class);
+                .isInstanceOf(CorruptMessageException.class)
+                .hasMessageContaining("negative declared length");
 
         // The BIG_ENDIAN of schema will be read as 256 wronly. In this case, we use 256 to skip it.
         short schemaId = 256;
@@ -312,8 +316,8 @@ class FileLogProjectionTest {
                                         fileLogRecords2,
                                         new int[] {0, 1},
                                         Integer.MAX_VALUE))
-                .isInstanceOf(EOFException.class)
-                .hasMessageContaining("Failed to read `arrow header` from file channel");
+                .isInstanceOf(CorruptMessageException.class)
+                .hasMessageContaining("negative declared length");
         fileLogRecords2.close();
     }
 
@@ -505,6 +509,8 @@ class FileLogProjectionTest {
             assertThat(projectedBatch.idempotenceProtocolVersion()).isEqualTo(1);
             assertThat(projectedBatch.fencedWriterKey()).isEqualTo(writerKey);
             assertThat(projectedBatch.fencedSequence()).isEqualTo(sequence);
+            assertThat(projectedBatch.isValid()).isTrue();
+            projectedBatch.ensureValid();
         }
     }
 
@@ -532,6 +538,60 @@ class FileLogProjectionTest {
                     .isInstanceOf(CorruptMessageException.class)
                     .hasMessageContaining("v3")
                     .hasMessageContaining("smaller");
+        }
+    }
+
+    @Test
+    void testProjectionRejectsMalformedLayoutBeforeReadingFollowingBatchBytes() throws Exception {
+        assertMalformedV3LayoutRejected(
+                V3_RECORD_BATCH_HEADER_SIZE, -1, 0, true, "statisticsLength");
+        assertMalformedV3LayoutRejected(
+                V3_RECORD_BATCH_HEADER_SIZE, 0, -1, true, "recordCount");
+        assertMalformedV3LayoutRejected(
+                V3_RECORD_BATCH_HEADER_SIZE, 1, 0, true, "header-only");
+        assertMalformedV3LayoutRejected(
+                V3_RECORD_BATCH_HEADER_SIZE, 0, 1, true, "header-only");
+        assertMalformedV3LayoutRejected(80, Integer.MAX_VALUE, 0, true, "overflow");
+        assertMalformedV3LayoutRejected(80, 0, Integer.MAX_VALUE, false, "overflow");
+        assertMalformedV3LayoutRejected(70, 0, 0, true, "Arrow header");
+    }
+
+    private void assertMalformedV3LayoutRejected(
+            int declaredSize,
+            int statisticsLength,
+            int recordCount,
+            boolean appendOnly,
+            String message)
+            throws Exception {
+        ByteBuffer bytesAfterHeader =
+                ByteBuffer.allocate(declaredSize + 64).order(ByteOrder.LITTLE_ENDIAN);
+        bytesAfterHeader.putInt(
+                LENGTH_OFFSET, declaredSize - LogRecordBatchFormat.LOG_OVERHEAD);
+        bytesAfterHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
+        bytesAfterHeader.putShort(schemaIdOffset(LOG_MAGIC_VALUE_V3), (short) DEFAULT_SCHEMA_ID);
+        bytesAfterHeader.put(
+                attributeOffset(LOG_MAGIC_VALUE_V3),
+                appendOnly ? DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK : 0);
+        bytesAfterHeader.putInt(recordsCountOffset(LOG_MAGIC_VALUE_V3), recordCount);
+        bytesAfterHeader.putInt(
+                statisticsLengthOffset(LOG_MAGIC_VALUE_V3), statisticsLength);
+
+        try (FileLogRecords records =
+                FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"))) {
+            records.channel().write(bytesAfterHeader);
+            FileLogProjection projection = new FileLogProjection(new ProjectionPushdownCache());
+            projection.setCurrentProjection(
+                    1L, testingSchemaGetter, DEFAULT_COMPRESSION, new int[] {0});
+
+            assertThatThrownBy(
+                            () ->
+                                    projection.project(
+                                            records.channel(),
+                                            0,
+                                            (int) records.channel().size(),
+                                            Integer.MAX_VALUE))
+                    .isInstanceOf(CorruptMessageException.class)
+                    .hasMessageContaining(message);
         }
     }
 
@@ -607,6 +667,8 @@ class FileLogProjectionTest {
         try (LogRecordReadContext context =
                 createArrowReadContext(projectedType, schemaId, testingSchemaGetter, true)) {
             for (LogRecordBatch batch : project.batches()) {
+                assertThat(batch.isValid()).isTrue();
+                batch.ensureValid();
                 try (CloseableIterator<LogRecord> records = batch.records(context)) {
                     while (records.hasNext()) {
                         LogRecord record = records.next();
@@ -688,6 +750,8 @@ class FileLogProjectionTest {
         try (LogRecordReadContext context =
                 createArrowReadContext(projectedType, schemaIdForData2, testingSchemaGetter)) {
             for (LogRecordBatch projectedBatch : projectedRecords.batches()) {
+                assertThat(projectedBatch.isValid()).isTrue();
+                projectedBatch.ensureValid();
                 try (CloseableIterator<LogRecord> records = projectedBatch.records(context)) {
                     int recordCount = 0;
                     while (records.hasNext()) {
