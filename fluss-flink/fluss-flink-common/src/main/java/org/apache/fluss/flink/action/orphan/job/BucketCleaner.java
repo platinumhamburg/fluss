@@ -95,17 +95,36 @@ public final class BucketCleaner {
             return;
         }
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
-        stack.push(new DirVisit(root, false, false, null, true));
+        stack.push(new DirVisit(root, false, false, -1L, null, true));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
                     stats.recordPlannedDirectory();
-                    if (dryRun) {
-                        audit.logWouldDeleteDir(visit.dir);
-                    } else if (safeDeleter.deleteEmptyDir(visit.dir)) {
-                        stats.recordRemovedDirectory();
+                    SafeDeleter.DirectoryDeleteResult result =
+                            safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
+                    switch (result) {
+                        case SUCCESS:
+                            if (!dryRun) {
+                                stats.recordRemovedDirectory();
+                            }
+                            break;
+                        case NOT_EMPTY:
+                            stats.recordSkip(SkipReasonCode.DIRECTORY_NOT_EMPTY);
+                            visit.markParentRemaining();
+                            break;
+                        case LIST_FAILED:
+                            stats.recordSkip(SkipReasonCode.DIRECTORY_LIST_FAILED);
+                            visit.markParentRemaining();
+                            break;
+                        case DELETE_FAILED:
+                            stats.recordDeleteFailure(CleanupObjectType.DIRECTORY);
+                            visit.markParentRemaining();
+                            break;
+                        default:
+                            visit.markParentRemaining();
+                            break;
                     }
                 } else if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
@@ -142,6 +161,7 @@ public final class BucketCleaner {
                                     childPath,
                                     false,
                                     child.getModificationTime() < cutoffMillis,
+                                    child.getModificationTime(),
                                     visit,
                                     false));
                     continue;
@@ -253,17 +273,30 @@ public final class BucketCleaner {
         private final FsPath dir;
         private boolean postOrder;
         private final boolean oldEnough;
+        private final long modificationTime;
         private final DirVisit parent;
         private final boolean root;
         private boolean hasRemainingChild;
 
         private DirVisit(
-                FsPath dir, boolean postOrder, boolean oldEnough, DirVisit parent, boolean root) {
+                FsPath dir,
+                boolean postOrder,
+                boolean oldEnough,
+                long modificationTime,
+                DirVisit parent,
+                boolean root) {
             this.dir = dir;
             this.postOrder = postOrder;
             this.oldEnough = oldEnough;
+            this.modificationTime = modificationTime;
             this.parent = parent;
             this.root = root;
+        }
+
+        private void markParentRemaining() {
+            if (parent != null) {
+                parent.hasRemainingChild = true;
+            }
         }
     }
 }

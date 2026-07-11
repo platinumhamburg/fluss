@@ -131,6 +131,37 @@ class SafeDeleterTest {
         assertThat(Files.exists(dir)).isFalse();
     }
 
+    @Test
+    void dryRunDirectoryAuditContainsScopeAndMetadata() throws IOException {
+        Path dir = Files.createDirectory(tmp.resolve("d"));
+        List<String> events = new CopyOnWriteArrayList<>();
+        ScopeIdentity scope = ScopeIdentity.table("db", "orders", 7L);
+
+        try (AuditCapture capture = new AuditCapture(events)) {
+            SafeDeleter deleter =
+                    new SafeDeleter(
+                            localFs(),
+                            true,
+                            new AuditLogger(),
+                            RateLimiter.create(1000.0),
+                            "run-1",
+                            scope);
+            assertThat(deleter.deleteEmptyDir(new FsPath(dir.toString()), 123L)).isTrue();
+        }
+
+        assertThat(events)
+                .anyMatch(
+                        event ->
+                                event.contains("action=would_delete")
+                                        && event.contains("run_id=run-1")
+                                        && event.contains("object_type=directory")
+                                        && event.contains("mtime_ms=123")
+                                        && event.contains("database=db")
+                                        && event.contains("table=orders")
+                                        && event.contains(
+                                                "reason_code=empty_and_older_than_cutoff"));
+    }
+
     private static SafeDeleter newDeleter(FileSystem fs, boolean dryRun) {
         return new SafeDeleter(fs, dryRun, new AuditLogger(), RateLimiter.create(1000.0));
     }
