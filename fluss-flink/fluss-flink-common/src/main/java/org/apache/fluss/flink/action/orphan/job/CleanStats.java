@@ -30,39 +30,56 @@ public final class CleanStats implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    private final long scanned;
-    private final long deleted;
+    private final long scannedFiles;
+    private final long plannedFiles;
+    private final long plannedDirs;
+    private final long plannedBytes;
+    private final long deletedFiles;
     private final long emptyDirsRemoved;
     private final long deleteFailures;
     private final long bytesReclaimed;
 
-    public CleanStats(long scanned, long deleted, long deleteFailures, long bytesReclaimed) {
-        this(scanned, deleted, 0L, deleteFailures, bytesReclaimed);
-    }
-
     public CleanStats(
-            long scanned,
-            long deleted,
+            long scannedFiles,
+            long plannedFiles,
+            long plannedDirs,
+            long plannedBytes,
+            long deletedFiles,
             long emptyDirsRemoved,
             long deleteFailures,
             long bytesReclaimed) {
-        this.scanned = scanned;
-        this.deleted = deleted;
+        this.scannedFiles = scannedFiles;
+        this.plannedFiles = plannedFiles;
+        this.plannedDirs = plannedDirs;
+        this.plannedBytes = plannedBytes;
+        this.deletedFiles = deletedFiles;
         this.emptyDirsRemoved = emptyDirsRemoved;
         this.deleteFailures = deleteFailures;
         this.bytesReclaimed = bytesReclaimed;
     }
 
     public static CleanStats empty() {
-        return new CleanStats(0L, 0L, 0L, 0L);
+        return new CleanStats(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
-    public long scanned() {
-        return scanned;
+    public long scannedFiles() {
+        return scannedFiles;
     }
 
-    public long deleted() {
-        return deleted;
+    public long plannedFiles() {
+        return plannedFiles;
+    }
+
+    public long plannedDirs() {
+        return plannedDirs;
+    }
+
+    public long plannedBytes() {
+        return plannedBytes;
+    }
+
+    public long deletedFiles() {
+        return deletedFiles;
     }
 
     public long emptyDirsRemoved() {

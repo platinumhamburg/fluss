@@ -43,8 +43,11 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
 
     private final boolean dryRun;
 
-    private transient long scanned;
-    private transient long deleted;
+    private transient long scannedFiles;
+    private transient long plannedFiles;
+    private transient long plannedDirs;
+    private transient long plannedBytes;
+    private transient long deletedFiles;
     private transient long emptyDirsRemoved;
     private transient long deleteFailures;
     private transient long bytesReclaimed;
@@ -56,8 +59,11 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     @Override
     public void open() throws Exception {
         super.open();
-        scanned = 0L;
-        deleted = 0L;
+        scannedFiles = 0L;
+        plannedFiles = 0L;
+        plannedDirs = 0L;
+        plannedBytes = 0L;
+        deletedFiles = 0L;
         emptyDirsRemoved = 0L;
         deleteFailures = 0L;
         bytesReclaimed = 0L;
@@ -66,8 +72,11 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     @Override
     public void processElement(StreamRecord<CleanStats> element) {
         CleanStats stats = element.getValue();
-        scanned += stats.scanned();
-        deleted += stats.deleted();
+        scannedFiles += stats.scannedFiles();
+        plannedFiles += stats.plannedFiles();
+        plannedDirs += stats.plannedDirs();
+        plannedBytes += stats.plannedBytes();
+        deletedFiles += stats.deletedFiles();
         emptyDirsRemoved += stats.emptyDirsRemoved();
         deleteFailures += stats.deleteFailures();
         bytesReclaimed += stats.bytesReclaimed();
@@ -77,11 +86,19 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     public void endInput() {
         AuditLogger audit = new AuditLogger();
         CleanStats finalStats =
-                new CleanStats(scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed);
+                new CleanStats(
+                        scannedFiles,
+                        plannedFiles,
+                        plannedDirs,
+                        plannedBytes,
+                        deletedFiles,
+                        emptyDirsRemoved,
+                        deleteFailures,
+                        bytesReclaimed);
 
         audit.logSummary(
-                scanned,
-                deleted - emptyDirsRemoved,
+                scannedFiles,
+                deletedFiles,
                 emptyDirsRemoved,
                 deleteFailures,
                 bytesReclaimed,
