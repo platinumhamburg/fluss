@@ -55,6 +55,7 @@ class OrphanCleanConfigTest {
         assertThat(config.allowCleanOrphanTables()).isFalse();
         assertThat(config.allowCleanOrphanPartitions()).isFalse();
         assertThat(config.postRunWait()).isEqualTo(Duration.ZERO);
+        assertThat(config.progressLogInterval()).isEqualTo(Duration.ZERO);
     }
 
     @Test
@@ -75,6 +76,36 @@ class OrphanCleanConfigTest {
         assertThatThrownBy(() -> config("--all-databases", "--post-run-wait", "61m"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("--post-run-wait must be between 0ms and 1h");
+    }
+
+    @Test
+    void parsesProgressLogInterval() {
+        assertThat(
+                        config("--all-databases", "--progress-log-interval", "30s")
+                                .progressLogInterval())
+                .isEqualTo(Duration.ofSeconds(30));
+    }
+
+    @Test
+    void acceptsExplicitZeroProgressLogInterval() {
+        assertThat(
+                        config("--all-databases", "--progress-log-interval", "0ms")
+                                .progressLogInterval())
+                .isEqualTo(Duration.ZERO);
+    }
+
+    @Test
+    void rejectsProgressLogIntervalBelowOneSecond() {
+        assertThatThrownBy(() -> config("--all-databases", "--progress-log-interval", "500ms"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--progress-log-interval must be 0ms or between 1s and 1h");
+    }
+
+    @Test
+    void rejectsProgressLogIntervalAboveOneHour() {
+        assertThatThrownBy(() -> config("--all-databases", "--progress-log-interval", "61m"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--progress-log-interval must be 0ms or between 1s and 1h");
     }
 
     @Test
