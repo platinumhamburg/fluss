@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 
 import java.io.Serializable;
 
@@ -27,4 +28,8 @@ import java.io.Serializable;
  * cleanup independently (no further coordinator interaction needed).
  */
 @Internal
-public interface CleanTask extends Serializable {}
+public interface CleanTask extends Serializable {
+
+    /** Returns the stable ownership used for audit aggregation. */
+    ScopeIdentity scope();
+}

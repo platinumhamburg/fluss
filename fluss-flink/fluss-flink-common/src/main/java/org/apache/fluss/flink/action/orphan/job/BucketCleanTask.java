@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 
 import javax.annotation.Nullable;
 
@@ -34,6 +35,7 @@ public final class BucketCleanTask implements CleanTask {
 
     private static final long serialVersionUID = 1L;
 
+    private final ScopeIdentity scope;
     @Nullable private final String logTabletDir;
     @Nullable private final String kvTabletDir;
     private final Set<String> logSegmentRelativePaths;
@@ -45,6 +47,7 @@ public final class BucketCleanTask implements CleanTask {
     private final boolean allowDeleteManifest;
 
     public BucketCleanTask(
+            ScopeIdentity scope,
             @Nullable String logTabletDir,
             @Nullable String kvTabletDir,
             Set<String> logSegmentRelativePaths,
@@ -54,6 +57,7 @@ public final class BucketCleanTask implements CleanTask {
             long cutoffMillis,
             boolean dryRun,
             boolean allowDeleteManifest) {
+        this.scope = scope;
         this.logTabletDir = logTabletDir;
         this.kvTabletDir = kvTabletDir;
         this.logSegmentRelativePaths = new HashSet<>(logSegmentRelativePaths);
@@ -63,6 +67,11 @@ public final class BucketCleanTask implements CleanTask {
         this.cutoffMillis = cutoffMillis;
         this.dryRun = dryRun;
         this.allowDeleteManifest = allowDeleteManifest;
+    }
+
+    @Override
+    public ScopeIdentity scope() {
+        return scope;
     }
 
     @Nullable

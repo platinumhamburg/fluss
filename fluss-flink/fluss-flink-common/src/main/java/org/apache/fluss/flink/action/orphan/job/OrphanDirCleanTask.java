@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 
 /**
  * Work item for cleaning an orphan table or partition directory. The directory has already been
@@ -28,17 +29,28 @@ public final class OrphanDirCleanTask implements CleanTask {
 
     private static final long serialVersionUID = 1L;
 
+    private final ScopeIdentity scope;
     private final String dirPath;
     private final long cutoffMillis;
     private final boolean dryRun;
     private final boolean allowDeleteManifest;
 
     public OrphanDirCleanTask(
-            String dirPath, long cutoffMillis, boolean dryRun, boolean allowDeleteManifest) {
+            ScopeIdentity scope,
+            String dirPath,
+            long cutoffMillis,
+            boolean dryRun,
+            boolean allowDeleteManifest) {
+        this.scope = scope;
         this.dirPath = dirPath;
         this.cutoffMillis = cutoffMillis;
         this.dryRun = dryRun;
         this.allowDeleteManifest = allowDeleteManifest;
+    }
+
+    @Override
+    public ScopeIdentity scope() {
+        return scope;
     }
 
     public String dirPath() {

@@ -29,6 +29,7 @@ import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
 import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.KvSharedSstFetchResult;
@@ -526,6 +527,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
             out.collect(
                     new BucketCleanTask(
+                            ScopeIdentity.table(
+                                            liveTable.dbName,
+                                            liveTable.tableName,
+                                            liveTable.tableId)
+                                    .withPartitionAndBucket(partitionId, bucketId),
                             logTabletDir,
                             kvTabletDir,
                             logSegmentRelativePaths,
@@ -570,7 +576,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                             dirName, activeTableIds, maxKnownTableId),
                             remoteFsOpRateLimiter,
                             dir -> {
-                                out.collect(orphanDirCleanTask(dir));
+                                out.collect(
+                                        orphanDirCleanTask(
+                                                ScopeIdentity.orphanTable(
+                                                        dbState.dbName, dir.getName(), null),
+                                                dir));
                                 planStats.orphanDirTask();
                             },
                             planStats);
@@ -618,7 +628,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                             dirName, activePartitionIds, maxKnownPartitionId),
                             remoteFsOpRateLimiter,
                             dir -> {
-                                out.collect(orphanDirCleanTask(dir));
+                                out.collect(
+                                        orphanDirCleanTask(
+                                                ScopeIdentity.table(
+                                                        liveTable.dbName,
+                                                        liveTable.tableName,
+                                                        liveTable.tableId),
+                                                dir));
                                 planStats.orphanDirTask();
                             },
                             planStats);
@@ -770,7 +786,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 continue;
             }
             if (config.allowCleanOrphanTables()) {
-                out.collect(orphanDirCleanTask(tableDir));
+                out.collect(
+                        orphanDirCleanTask(
+                                ScopeIdentity.orphanTable(
+                                        dbDir.getName(), tableDir.getName(), null),
+                                tableDir));
                 planStats.orphanDirTask();
             } else {
                 audit.logSkipOrphanTable(tableDir, "default-conservative");
@@ -806,14 +826,21 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 dirName, activePartitionIds, maxKnownPartitionId),
                 remoteFsOpRateLimiter,
                 dir -> {
-                    out.collect(orphanDirCleanTask(dir));
+                    out.collect(
+                            orphanDirCleanTask(
+                                    ScopeIdentity.orphanTable(
+                                            tableDir.getParent().getName(),
+                                            tableDir.getName(),
+                                            null),
+                                    dir));
                     planStats.orphanDirTask();
                 },
                 planStats);
     }
 
-    private OrphanDirCleanTask orphanDirCleanTask(FsPath dir) {
+    private OrphanDirCleanTask orphanDirCleanTask(ScopeIdentity scope, FsPath dir) {
         return new OrphanDirCleanTask(
+                scope,
                 dir.toString(),
                 config.olderThanMillis(),
                 config.dryRun(),
