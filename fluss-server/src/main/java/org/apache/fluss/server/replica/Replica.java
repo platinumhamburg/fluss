@@ -538,14 +538,18 @@ public final class Replica {
 
                             int requestLeaderEpoch = data.getLeaderEpoch();
                             if (requestLeaderEpoch > leaderEpoch) {
+                                // Revoke the old role before destructive KV recovery. A failed
+                                // transition must remain retryable at the same requested epoch.
+                                leaderReplicaIdOpt.set(null);
+                                onBecomeNewLeader(requestLeaderEpoch);
                                 leaderEpoch = requestLeaderEpoch;
-                                onBecomeNewLeader();
                                 leaderReplicaIdOpt.set(localTabletServerId);
                                 LOG.info(
                                         "TabletServer {} becomes leader for bucket {}",
                                         localTabletServerId,
                                         tableBucket);
                             } else if (requestLeaderEpoch == leaderEpoch) {
+                                ensureLocalLeaderReady();
                                 LOG.info(
                                         "Skipped the become-leader state change for bucket {} since "
                                                 + "it's already the leader with leader epoch {}",
@@ -663,7 +667,7 @@ public final class Replica {
 
     // -------------------------------------------------------------------------------------------
 
-    private void onBecomeNewLeader() {
+    private void onBecomeNewLeader(int requestLeaderEpoch) {
         // Clear standby flag — a leader is never a standby replica.
         isStandbyReplica = false;
 
@@ -682,7 +686,7 @@ public final class Replica {
             // if exist. Otherwise, it'll use still the old kv tablet which will cause data loss
             dropKv();
             // now, we can create a new kv tablet
-            createKv();
+            createKv(requestLeaderEpoch);
             retireCurrentTombstonedIndexWriters();
             indexManager.onLeaderKvReady(
                     logTablet,
@@ -816,13 +820,13 @@ public final class Replica {
                 base.getAutoIncIDRanges());
     }
 
-    private void createKv() {
+    private void createKv(int requestLeaderEpoch) {
         RuntimeException lastFailure = null;
         for (int i = 1; i <= INIT_KV_TABLET_MAX_RETRY_TIMES; i++) {
             initializeKvAttempt();
             try {
                 Optional<CompletedSnapshot> snapshotUsed = initKvTablet();
-                startPeriodicKvSnapshot(snapshotUsed.orElse(null));
+                startPeriodicKvSnapshot(snapshotUsed.orElse(null), requestLeaderEpoch);
                 return;
             } catch (Error error) {
                 cleanupFailedKvAttempt(error);
@@ -838,6 +842,28 @@ public final class Replica {
             }
         }
         throw checkNotNull(lastFailure, "KV recovery failed without an exception");
+    }
+
+    private void ensureLocalLeaderReady() {
+        if (!isLeader()) {
+            throw new NotLeaderOrFollowerException(
+                    String.format(
+                            "Replica %s cannot acknowledge leader epoch %d because the local leader role is not published",
+                            tableBucket, leaderEpoch));
+        }
+        if (isKvTable()) {
+            KvTablet currentTablet = kvTablet;
+            if (currentTablet == null
+                    || kvSnapshotManager == null
+                    || !kvManager.getKv(tableBucket)
+                            .filter(registeredTablet -> registeredTablet == currentTablet)
+                            .isPresent()) {
+                throw new NotLeaderOrFollowerException(
+                        String.format(
+                                "Replica %s cannot acknowledge leader epoch %d because its KV tablet is not fully initialized",
+                                tableBucket, leaderEpoch));
+            }
+        }
     }
 
     private void initializeKvAttempt() {
@@ -1174,7 +1200,8 @@ public final class Replica {
                 end - start);
     }
 
-    private void startPeriodicKvSnapshot(@Nullable CompletedSnapshot completedSnapshot) {
+    private void startPeriodicKvSnapshot(
+            @Nullable CompletedSnapshot completedSnapshot, int requestLeaderEpoch) {
         checkNotNull(kvTablet);
         KvTabletSnapshotTarget kvTabletSnapshotTarget;
         try {
@@ -1223,7 +1250,7 @@ public final class Replica {
             // refactor the snapshot logic in FLUSS-56282058, may should prepare the
             // bucket/coordinator leader epoch, kv snapshot data in replica
             // instead of a separate class
-            Supplier<Integer> bucketLeaderEpochSupplier = () -> leaderEpoch;
+            Supplier<Integer> bucketLeaderEpochSupplier = () -> requestLeaderEpoch;
             Supplier<Integer> coordinatorEpochSupplier = () -> coordinatorEpoch;
             FsPath remoteKvTabletDir =
                     FlussPaths.remoteKvTabletDir(

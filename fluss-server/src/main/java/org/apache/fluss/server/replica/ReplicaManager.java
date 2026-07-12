@@ -1225,6 +1225,9 @@ public class ReplicaManager implements ServerReconfigurable {
             TableBucket tb = data.getTableBucket();
             try {
                 Replica replica = getReplicaOrException(tb);
+                // Revoke any task owned by the previous local-leader incarnation before role
+                // recovery. It is restarted only after makeLeader publishes a ready leader.
+                remoteLogManager.stopLogTiering(replica);
                 // register replica to remote log manager first.
                 remoteLogManager.registerReplica(replica);
 
