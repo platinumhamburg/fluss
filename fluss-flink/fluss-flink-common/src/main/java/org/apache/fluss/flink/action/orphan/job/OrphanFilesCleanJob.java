@@ -82,7 +82,9 @@ public final class OrphanFilesCleanJob {
                                 new ScanAndCleanFunction(
                                         config.remoteFsOpRateLimitPerSecond(),
                                         config.extraConfigs(),
-                                        runId))
+                                        runId,
+                                        config.dryRun(),
+                                        config.progressLogInterval()))
                         .returns(TypeInformation.of(new TypeHint<CleanStats>() {}))
                         .name("ScanAndClean");
         if (parallelism != null) {
@@ -95,8 +97,7 @@ public final class OrphanFilesCleanJob {
                         .transform(
                                 "ScanProgress",
                                 TypeInformation.of(new TypeHint<CleanStats>() {}),
-                                new ScanProgressOperator(
-                                        runId, config.dryRun(), config.progressLogInterval()))
+                                new ScanProgressOperator(runId, config.dryRun()))
                         .setParallelism(scanParallelism);
 
         DataStream<CleanupReportInput> reportInputs =
@@ -118,8 +119,7 @@ public final class OrphanFilesCleanJob {
                         .transform(
                                 "StatsAggregate",
                                 TypeInformation.of(new TypeHint<CleanupReport>() {}),
-                                new StatsAggregateOperator(
-                                        runId, config.dryRun(), config.postRunWait()))
+                                new StatsAggregateOperator(runId, config.dryRun()))
                         .setParallelism(1)
                         .setMaxParallelism(1);
 

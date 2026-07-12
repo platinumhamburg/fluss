@@ -19,6 +19,8 @@ package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.client.metadata.ActiveKvSnapshots;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.exception.PartitionNotExistException;
+import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.utils.FlussPaths;
@@ -49,6 +51,21 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link ActiveRefsFetcher} — log active set sourced from coordinator metadata. */
 class ActiveRefsFetcherTest {
+
+    @Test
+    void partitionDisappearancePreservesNotFoundCategoryWithoutRetry() {
+        AtomicInteger rpcCalls = new AtomicInteger(0);
+        StubAdmin admin = new StubAdmin(rpcCalls);
+        admin.queueLogFailure(new PartitionNotExistException("partition disappeared"));
+
+        LogActiveRefsFetchResult result =
+                new ActiveRefsFetcher(admin, new StubManifestReader(), /* maxRetries= */ 3)
+                        .fetchLogActiveRefsByBucket(7L, 42L);
+
+        assertThat(result.listOk()).isFalse();
+        assertThat(result.listFailureCategory()).isEqualTo(RpcErrorClassifier.Category.NOT_FOUND);
+        assertThat(rpcCalls.get()).isEqualTo(1);
+    }
 
     @Test
     void emptyManifestListReturnsEmptyResult() {
@@ -318,6 +335,7 @@ class ActiveRefsFetcherTest {
     private static final class StubAdmin implements ActiveRefsFetcher.AdminFacade {
 
         private final Deque<List<RemoteLogManifestInfo>> responses = new ArrayDeque<>();
+        private final Deque<Throwable> logFailures = new ArrayDeque<>();
         private final Deque<ActiveKvSnapshots> kvResponses = new ArrayDeque<>();
         private final AtomicInteger callCounter;
         private final AtomicReference<Long> lastLogPartitionId =
@@ -356,6 +374,10 @@ class ActiveRefsFetcherTest {
             responses.add(Collections.emptyList());
         }
 
+        void queueLogFailure(Throwable failure) {
+            logFailures.add(failure);
+        }
+
         void queueKvResponse(int bucketId, long... snapshotIds) {
             Map<Integer, Set<Long>> snapshotIdsByBucket = new HashMap<>();
             Set<Long> ids = new HashSet<>();
@@ -375,6 +397,12 @@ class ActiveRefsFetcherTest {
                 long tableId, @Nullable Long partitionId) {
             callCounter.incrementAndGet();
             lastLogPartitionId.set(partitionId);
+            Throwable failure = logFailures.poll();
+            if (failure != null) {
+                CompletableFuture<List<RemoteLogManifestInfo>> failed = new CompletableFuture<>();
+                failed.completeExceptionally(failure);
+                return failed;
+            }
             List<RemoteLogManifestInfo> next = responses.poll();
             if (next == null) {
                 CompletableFuture<List<RemoteLogManifestInfo>> failed = new CompletableFuture<>();

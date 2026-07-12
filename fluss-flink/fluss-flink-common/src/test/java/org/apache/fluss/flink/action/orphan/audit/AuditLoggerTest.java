@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.action.orphan.audit;
 
+import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
 
 import org.apache.logging.log4j.Level;
@@ -33,6 +34,42 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class AuditLoggerTest {
+
+    @Test
+    void scanHeartbeatIdentifiesSubtaskCurrentTargetAndCounters() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        AuditLogger logger = new AuditLogger();
+        ScopeIdentity scope =
+                ScopeIdentity.table("db", "orders", 7L).withPartitionAndBucket(11L, 4);
+
+        try (AuditCapture ignored = new AuditCapture(events)) {
+            logger.logScanHeartbeat(
+                    "run-1",
+                    true,
+                    3,
+                    16,
+                    1,
+                    12L,
+                    new CleanupCounters(100L, 2L, 0L, 256L, 0L, 0L, 0L, 0L),
+                    scope,
+                    45_000L);
+        }
+
+        assertThat(events)
+                .anyMatch(
+                        event ->
+                                event.contains("action=scan_heartbeat")
+                                        && event.contains("subtask=3")
+                                        && event.contains("parallelism=16")
+                                        && event.contains("tasks_completed=12")
+                                        && event.contains("current_database=db")
+                                        && event.contains("current_table=orders")
+                                        && event.contains("current_partition_id=11")
+                                        && event.contains("current_bucket_id=4")
+                                        && event.contains("current_task_elapsed_ms=45000")
+                                        && event.contains("scanned_files=100")
+                                        && event.contains("planned_bytes=256"));
+    }
 
     @Test
     void scopeHeartbeatIsSelfContainedForOperators() {

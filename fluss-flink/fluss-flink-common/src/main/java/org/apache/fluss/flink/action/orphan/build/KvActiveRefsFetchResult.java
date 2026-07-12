@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 
 import javax.annotation.Nullable;
 
@@ -54,8 +55,13 @@ public final class KvActiveRefsFetchResult {
 
     /** Result for a target whose {@code LIST_KV_SNAPSHOTS} RPC failed and exhausted retries. */
     public static KvActiveRefsFetchResult listFailed(String reason) {
+        return listFailed(RpcErrorClassifier.Category.UNKNOWN, reason);
+    }
+
+    public static KvActiveRefsFetchResult listFailed(
+            RpcErrorClassifier.Category category, String reason) {
         return new KvActiveRefsFetchResult(
-                RpcListStatus.listFailed(reason), Collections.emptyMap());
+                RpcListStatus.listFailed(category, reason), Collections.emptyMap());
     }
 
     /** Result for a target whose {@code LIST_KV_SNAPSHOTS} RPC succeeded. */
@@ -72,6 +78,12 @@ public final class KvActiveRefsFetchResult {
     @Nullable
     public String listFailureReason() {
         return list.reason();
+    }
+
+    /** Stable RPC category for a failed target list; {@code null} when the list succeeded. */
+    @Nullable
+    public RpcErrorClassifier.Category listFailureCategory() {
+        return list.category();
     }
 
     /**

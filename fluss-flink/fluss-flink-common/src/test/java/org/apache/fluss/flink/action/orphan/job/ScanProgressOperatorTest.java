@@ -27,7 +27,6 @@ import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.LoggerConfig;
 import org.junit.jupiter.api.Test;
 
-import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
@@ -37,20 +36,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ScanProgressOperatorTest {
 
     @Test
-    void zeroIntervalSuppressesProgressButKeepsLifecycleAndForwardsStats() throws Exception {
+    void downstreamOperatorOnlyEmitsBoundedCompletionSummary() throws Exception {
         List<String> events = new CopyOnWriteArrayList<>();
         AtomicLong clock = new AtomicLong(0L);
         try (AuditCapture capture = new AuditCapture(events);
                 OneInputStreamOperatorTestHarness<CleanStats, CleanStats> harness =
                         new OneInputStreamOperatorTestHarness<>(
-                                new ScanProgressOperator(
-                                        "run-1", true, Duration.ZERO, clock::get))) {
+                                new ScanProgressOperator("run-1", true, clock::get))) {
             harness.open();
             harness.processElement(new StreamRecord<>(stats(2L, 300L)));
             harness.endInput();
 
             assertThat(events).noneMatch(event -> event.contains("action=scan_progress"));
-            assertThat(events).anyMatch(event -> event.contains("action=scan_start"));
+            assertThat(events).noneMatch(event -> event.contains("action=scan_start"));
             assertThat(events)
                     .anyMatch(
                             event ->
@@ -63,14 +61,13 @@ class ScanProgressOperatorTest {
     }
 
     @Test
-    void emitsAtMostOneCumulativeProgressPerInterval() throws Exception {
+    void downstreamOperatorNeverPretendsToBeRealtimeProgress() throws Exception {
         List<String> events = new CopyOnWriteArrayList<>();
         AtomicLong clock = new AtomicLong(0L);
         try (AuditCapture capture = new AuditCapture(events);
                 OneInputStreamOperatorTestHarness<CleanStats, CleanStats> harness =
                         new OneInputStreamOperatorTestHarness<>(
-                                new ScanProgressOperator(
-                                        "run-2", true, Duration.ofSeconds(30), clock::get))) {
+                                new ScanProgressOperator("run-2", true, clock::get))) {
             harness.open();
             clock.set(30_000L);
             harness.processElement(new StreamRecord<>(stats(1L, 100L)));
@@ -79,10 +76,15 @@ class ScanProgressOperatorTest {
             clock.set(60_000L);
             harness.processElement(new StreamRecord<>(stats(1L, 400L)));
 
-            List<String> progress = matching(events, "action=scan_progress");
-            assertThat(progress).hasSize(2);
-            assertThat(progress.get(0)).contains("tasks_completed=1", "planned_bytes=100");
-            assertThat(progress.get(1)).contains("tasks_completed=3", "planned_bytes=700");
+            assertThat(matching(events, "action=scan_start")).isEmpty();
+            assertThat(matching(events, "action=scan_progress")).isEmpty();
+            harness.endInput();
+            assertThat(matching(events, "action=scan_subtask_summary"))
+                    .singleElement()
+                    .satisfies(
+                            event ->
+                                    assertThat(event)
+                                            .contains("tasks_completed=3", "planned_bytes=700"));
         }
     }
 

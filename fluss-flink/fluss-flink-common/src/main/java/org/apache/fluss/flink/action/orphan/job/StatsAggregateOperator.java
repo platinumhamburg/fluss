@@ -25,9 +25,6 @@ import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
-import java.io.Serializable;
-import java.time.Duration;
-
 /**
  * Stage 3 of the orphan files cleanup job. Runs at parallelism=1 to aggregate per-subtask {@link
  * CleanStats} records.
@@ -46,21 +43,11 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
 
     private final String runId;
     private final boolean dryRun;
-    private final Duration postRunWait;
-    private final InterruptibleSleeper sleeper;
-
     private transient CleanupReport.Accumulator accumulator;
 
-    public StatsAggregateOperator(String runId, boolean dryRun, Duration postRunWait) {
-        this(runId, dryRun, postRunWait, Thread::sleep);
-    }
-
-    StatsAggregateOperator(
-            String runId, boolean dryRun, Duration postRunWait, InterruptibleSleeper sleeper) {
+    public StatsAggregateOperator(String runId, boolean dryRun) {
         this.runId = runId;
         this.dryRun = dryRun;
-        this.postRunWait = postRunWait;
-        this.sleeper = sleeper;
     }
 
     @Override
@@ -86,24 +73,6 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
         CleanupReport report = accumulator.build();
 
         audit.logReport(runId, "aggregate", "summary", report, dryRun);
-
-        if (!postRunWait.isZero()) {
-            long waitMillis = postRunWait.toMillis();
-            audit.logRetentionWaitStart(runId, waitMillis);
-            try {
-                sleeper.sleep(waitMillis);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw e;
-            }
-            audit.logRetentionWaitEnd(runId, waitMillis);
-        }
-
         output.collect(new StreamRecord<>(report));
     }
-}
-
-@FunctionalInterface
-interface InterruptibleSleeper extends Serializable {
-    void sleep(long millis) throws InterruptedException;
 }

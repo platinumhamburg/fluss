@@ -510,8 +510,19 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 fetcher.fetchLogActiveRefsByBucket(liveTable.tableId, partitionId);
         if (!logResult.listOk()) {
             audit.logSkipLogTarget(liveTable.tableId, partitionId, logResult.listFailureReason());
-            planStats.metadataFailure();
-            tablePlans.metadataFailure(liveTable.scope());
+            SkipReasonCode reason =
+                    recordTargetListFailure(
+                            liveTable, partitionId, logResult.listFailureCategory(), planStats);
+            if (!TargetListFailureClassifier.isMetadataFailure(reason)) {
+                completeSkippedTarget(
+                        audit,
+                        liveTable,
+                        partitionId,
+                        "skipped",
+                        "not_applicable",
+                        targetStartNanos);
+                return;
+            }
         }
 
         Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
@@ -527,8 +538,14 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             } else {
                 kvStatus = "failed";
                 audit.logSkipKvTarget(liveTable.tableId, partitionId, kvResult.listFailureReason());
-                planStats.metadataFailure();
-                tablePlans.metadataFailure(liveTable.scope());
+                SkipReasonCode reason =
+                        recordTargetListFailure(
+                                liveTable, partitionId, kvResult.listFailureCategory(), planStats);
+                if (!TargetListFailureClassifier.isMetadataFailure(reason)) {
+                    completeSkippedTarget(
+                            audit, liveTable, partitionId, "ok", "skipped", targetStartNanos);
+                    return;
+                }
             }
         }
         audit.logScopeTargetComplete(
@@ -623,6 +640,42 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             planStats.bucketTask();
             tablePlans.task(liveTable.scope());
         }
+    }
+
+    private SkipReasonCode recordTargetListFailure(
+            LiveTableScope liveTable,
+            @Nullable Long partitionId,
+            @Nullable RpcErrorClassifier.Category category,
+            ScopePlanStats planStats) {
+        RpcErrorClassifier.Category resolvedCategory =
+                category == null ? RpcErrorClassifier.Category.UNKNOWN : category;
+        SkipReasonCode reason = TargetListFailureClassifier.reason(partitionId, resolvedCategory);
+        if (TargetListFailureClassifier.isMetadataFailure(reason)) {
+            planStats.metadataFailure();
+            tablePlans.metadataFailure(liveTable.scope());
+        } else {
+            tablePlans.skip(liveTable.scope(), reason);
+        }
+        return reason;
+    }
+
+    private void completeSkippedTarget(
+            AuditLogger audit,
+            LiveTableScope liveTable,
+            @Nullable Long partitionId,
+            String logStatus,
+            String kvStatus,
+            long targetStartNanos) {
+        audit.logScopeTargetComplete(
+                runId,
+                liveTable.tablePath.getDatabaseName(),
+                liveTable.tablePath.getTableName(),
+                liveTable.tableId,
+                partitionId,
+                logStatus,
+                kvStatus,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - targetStartNanos));
+        scopeHeartbeat.targetComplete();
     }
 
     // -------------------------------------------------------------------------
