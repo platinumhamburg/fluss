@@ -32,12 +32,14 @@ import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
+import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -51,6 +53,7 @@ import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COO
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_BUCKET_EPOCH;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ReplicaLeaderTransitionTest extends ReplicaTestBase {
 
@@ -164,6 +167,120 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
         CompletableFuture<byte[]> recoveredValue = new CompletableFuture<>();
         replicaManager.lookup(fixture.tableBucket, new byte[] {2}, recoveredValue::complete);
         assertThat(recoveredValue.get()).isNotNull();
+    }
+
+    @Test
+    void testSnapshotInitializationFailureCleansAttemptAndRetryPublishesOnce()
+            throws Exception {
+        ReplayRecoveryFixture fixture =
+                prepareReplayRecoveryFixture(150104L, "snapshot_initialization_retry");
+        Replica replica = fixture.replica;
+        int priorLeaderEpoch = replica.getLeaderEpoch();
+        int requestedLeaderEpoch = priorLeaderEpoch + 1;
+        AtomicBoolean failInitialization = new AtomicBoolean(true);
+        AtomicInteger replayedBatches = new AtomicInteger();
+        List<PeriodicSnapshotManager> attemptedManagers = new ArrayList<>();
+        replica.setKvRecoveryFaultInjector(ignored -> replayedBatches.incrementAndGet());
+        replica.setKvSnapshotInitializationFaultInjector(
+                manager -> {
+                    attemptedManagers.add(manager);
+                    if (failInitialization.get()) {
+                        throw new IOException("injected snapshot initialization failure");
+                    }
+                });
+
+        List<NotifyLeaderAndIsrResultForBucket> failedReassignment =
+                notifyLeader(
+                                fixture.tablePath,
+                                fixture.tableBucket,
+                                TABLET_SERVER_ID,
+                                requestedLeaderEpoch)
+                        .get();
+
+        assertThat(failedReassignment.get(0).getErrorMessage())
+                .contains("Failed to initialize periodic KV snapshots");
+        assertThat(attemptedManagers).hasSize(5).allMatch(manager -> !manager.isStarted());
+        assertThat(replayedBatches).hasValue(10);
+        assertThat(replica.isLeader()).isFalse();
+        assertThat(replica.getLeaderId()).isNull();
+        assertThat(replica.getLeaderEpoch()).isEqualTo(priorLeaderEpoch);
+        assertThat(replica.getKvTablet()).isNull();
+        assertThat(kvManager.getKv(fixture.tableBucket)).isEmpty();
+        assertThat(replica.getKvSnapshotManager()).isNull();
+        assertThat(replica.hasReadyKvSnapshotManager()).isFalse();
+        assertThat(remoteLogTaskScheduler.getActivePeriodicScheduledTask()).isEmpty();
+
+        List<NotifyLeaderAndIsrResultForBucket> incompleteEqualEpoch =
+                notifyLeader(
+                                fixture.tablePath,
+                                fixture.tableBucket,
+                                TABLET_SERVER_ID,
+                                priorLeaderEpoch)
+                        .get();
+        assertThat(incompleteEqualEpoch.get(0).getErrorMessage())
+                .contains("local leader role is not published");
+        assertThat(attemptedManagers).hasSize(5);
+        assertThat(replayedBatches).hasValue(10);
+        assertThat(remoteLogTaskScheduler.getActivePeriodicScheduledTask()).isEmpty();
+
+        failInitialization.set(false);
+        List<NotifyLeaderAndIsrResultForBucket> successfulRetry =
+                notifyLeader(
+                                fixture.tablePath,
+                                fixture.tableBucket,
+                                TABLET_SERVER_ID,
+                                requestedLeaderEpoch)
+                        .get();
+
+        assertThat(successfulRetry)
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(fixture.tableBucket));
+        assertThat(attemptedManagers).hasSize(6);
+        assertThat(attemptedManagers.subList(0, 5))
+                .allMatch(manager -> !manager.isStarted());
+        assertThat(attemptedManagers.get(5)).isSameAs(replica.getKvSnapshotManager());
+        assertThat(attemptedManagers.get(5).isStarted()).isTrue();
+        assertThat(replayedBatches).hasValue(12);
+        assertThat(replica.isLeader()).isTrue();
+        assertThat(replica.getLeaderEpoch()).isEqualTo(requestedLeaderEpoch);
+        assertThat(replica.hasReadyKvSnapshotManager()).isTrue();
+        assertThat(remoteLogTaskScheduler.getActivePeriodicScheduledTask()).hasSize(1);
+        CompletableFuture<byte[]> recoveredValue = new CompletableFuture<>();
+        replicaManager.lookup(fixture.tableBucket, new byte[] {2}, recoveredValue::complete);
+        assertThat(recoveredValue.get()).isNotNull();
+    }
+
+    @Test
+    void testSnapshotInitializationErrorCleansAttemptAndPreservesIdentity() throws Exception {
+        ReplayRecoveryFixture fixture =
+                prepareReplayRecoveryFixture(150105L, "snapshot_initialization_error");
+        Replica replica = fixture.replica;
+        int priorLeaderEpoch = replica.getLeaderEpoch();
+        AssertionError injected = new AssertionError("injected snapshot initialization error");
+        List<PeriodicSnapshotManager> attemptedManagers = new ArrayList<>();
+        replica.setKvSnapshotInitializationFaultInjector(
+                manager -> {
+                    attemptedManagers.add(manager);
+                    throw injected;
+                });
+
+        assertThatThrownBy(
+                        () ->
+                                notifyLeader(
+                                        fixture.tablePath,
+                                        fixture.tableBucket,
+                                        TABLET_SERVER_ID,
+                                        priorLeaderEpoch + 1))
+                .isSameAs(injected);
+
+        assertThat(attemptedManagers).hasSize(1).allMatch(manager -> !manager.isStarted());
+        assertThat(replica.isLeader()).isFalse();
+        assertThat(replica.getLeaderId()).isNull();
+        assertThat(replica.getLeaderEpoch()).isEqualTo(priorLeaderEpoch);
+        assertThat(replica.getKvTablet()).isNull();
+        assertThat(kvManager.getKv(fixture.tableBucket)).isEmpty();
+        assertThat(replica.getKvSnapshotManager()).isNull();
+        assertThat(replica.hasReadyKvSnapshotManager()).isFalse();
+        assertThat(remoteLogTaskScheduler.getActivePeriodicScheduledTask()).isEmpty();
     }
 
     private CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> notifyLeader(

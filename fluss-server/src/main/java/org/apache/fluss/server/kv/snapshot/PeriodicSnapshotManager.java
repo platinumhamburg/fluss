@@ -164,15 +164,34 @@ public class PeriodicSnapshotManager implements Closeable {
                 guardedExecutor);
     }
 
-    public void start() {
+    public synchronized void start() {
         if (!started && snapshotIntervalSupplier.getAsLong() > 0) {
-
+            if (periodicExecutor.isShutdown()) {
+                throw new IllegalStateException(
+                        "Cannot start periodic snapshot manager because its scheduler is shut down");
+            }
             started = true;
-
-            LOG.info("TableBucket {} starts periodic snapshot", tableBucket);
-
-            scheduleNextSnapshot(Math.max(initialDelay, 1));
+            try {
+                LOG.info("TableBucket {} starts periodic snapshot", tableBucket);
+                scheduleNextSnapshot(Math.max(initialDelay, 1));
+                if (scheduledTask == null) {
+                    throw new IllegalStateException(
+                            "Periodic snapshot manager started without owning a scheduled task");
+                }
+            } catch (Error failure) {
+                started = false;
+                scheduledTask = null;
+                throw failure;
+            } catch (RuntimeException failure) {
+                started = false;
+                scheduledTask = null;
+                throw failure;
+            }
         }
+    }
+
+    public boolean isStarted() {
+        return started;
     }
 
     public long getSnapshotSize() {

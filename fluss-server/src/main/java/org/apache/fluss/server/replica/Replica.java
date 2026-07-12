@@ -208,6 +208,8 @@ public final class Replica {
     private final RemoteLogManager remoteLogManager;
     private KvRecoverHelper.RecoveryFaultInjector kvRecoveryFaultInjector =
             KvRecoverHelper.RecoveryFaultInjector.NO_OP;
+    private KvSnapshotInitializationFaultInjector kvSnapshotInitializationFaultInjector =
+            KvSnapshotInitializationFaultInjector.NO_OP;
 
     private static final int INIT_KV_TABLET_MAX_RETRY_TIMES = 5;
     /**
@@ -854,16 +856,26 @@ public final class Replica {
         if (isKvTable()) {
             KvTablet currentTablet = kvTablet;
             if (currentTablet == null
-                    || kvSnapshotManager == null
                     || !kvManager.getKv(tableBucket)
                             .filter(registeredTablet -> registeredTablet == currentTablet)
-                            .isPresent()) {
+                            .isPresent()
+                    || !hasReadyKvSnapshotManager()) {
                 throw new NotLeaderOrFollowerException(
                         String.format(
                                 "Replica %s cannot acknowledge leader epoch %d because its KV tablet is not fully initialized",
                                 tableBucket, leaderEpoch));
             }
         }
+    }
+
+    @VisibleForTesting
+    boolean hasReadyKvSnapshotManager() {
+        PeriodicSnapshotManager snapshotManager = kvSnapshotManager;
+        CloseableRegistry kvRegistry = closeableRegistryForKv;
+        return snapshotManager != null
+                && snapshotManager.isStarted()
+                && kvRegistry != null
+                && kvRegistry.isCloseableRegistered(snapshotManager);
     }
 
     private void initializeKvAttempt() {
@@ -1203,7 +1215,8 @@ public final class Replica {
     private void startPeriodicKvSnapshot(
             @Nullable CompletedSnapshot completedSnapshot, int requestLeaderEpoch) {
         checkNotNull(kvTablet);
-        KvTabletSnapshotTarget kvTabletSnapshotTarget;
+        PeriodicSnapshotManager snapshotManager = null;
+        boolean registered = false;
         try {
             // get the snapshot reporter to report the completed snapshot
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter =
@@ -1256,7 +1269,7 @@ public final class Replica {
                     FlussPaths.remoteKvTabletDir(
                             snapshotContext.getRemoteKvDir(), physicalPath, tableBucket);
 
-            kvTabletSnapshotTarget =
+            KvTabletSnapshotTarget kvTabletSnapshotTarget =
                     new KvTabletSnapshotTarget(
                             tableBucket,
                             completedKvSnapshotCommitter,
@@ -1274,16 +1287,38 @@ public final class Replica {
                             lastCompletedSnapshotLogOffset,
                             lastCompletedSnapshotIndexPushedOffset,
                             snapshotSize);
-            this.kvSnapshotManager =
+            snapshotManager =
                     PeriodicSnapshotManager.create(
                             tableBucket,
                             kvTabletSnapshotTarget,
                             snapshotContext,
                             kvTablet.getGuardedExecutor());
-            kvSnapshotManager.start();
-            closeableRegistryForKv.registerCloseable(kvSnapshotManager);
-        } catch (Exception e) {
-            LOG.error("init kv periodic snapshot for {} failed.", tableBucket, e);
+            CloseableRegistry kvRegistry = checkNotNull(closeableRegistryForKv);
+            kvRegistry.registerCloseable(snapshotManager);
+            registered = true;
+            snapshotManager.start();
+            kvSnapshotInitializationFaultInjector.afterManagerStarted(snapshotManager);
+            if (!snapshotManager.isStarted()
+                    || !kvRegistry.isCloseableRegistered(snapshotManager)) {
+                throw new KvStorageException(
+                        "KV snapshot manager did not establish started registry ownership for "
+                                + tableBucket);
+            }
+            this.kvSnapshotManager = snapshotManager;
+        } catch (Error error) {
+            closeUnownedSnapshotManager(snapshotManager, registered);
+            throw error;
+        } catch (Exception failure) {
+            closeUnownedSnapshotManager(snapshotManager, registered);
+            throw new KvStorageException(
+                    "Failed to initialize periodic KV snapshots for " + tableBucket, failure);
+        }
+    }
+
+    private static void closeUnownedSnapshotManager(
+            @Nullable PeriodicSnapshotManager snapshotManager, boolean registered) {
+        if (snapshotManager != null && !registered) {
+            IOUtils.closeQuietly(snapshotManager);
         }
     }
 
@@ -2565,6 +2600,19 @@ public final class Replica {
     void setKvRecoveryFaultInjector(
             KvRecoverHelper.RecoveryFaultInjector kvRecoveryFaultInjector) {
         this.kvRecoveryFaultInjector = kvRecoveryFaultInjector;
+    }
+
+    @VisibleForTesting
+    void setKvSnapshotInitializationFaultInjector(
+            KvSnapshotInitializationFaultInjector kvSnapshotInitializationFaultInjector) {
+        this.kvSnapshotInitializationFaultInjector = kvSnapshotInitializationFaultInjector;
+    }
+
+    @FunctionalInterface
+    interface KvSnapshotInitializationFaultInjector {
+        KvSnapshotInitializationFaultInjector NO_OP = ignored -> {};
+
+        void afterManagerStarted(PeriodicSnapshotManager snapshotManager) throws Exception;
     }
 
     private void failStop(Throwable failure) {
