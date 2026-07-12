@@ -126,6 +126,7 @@ public final class IndexReplicatorPool implements AutoCloseable {
         private final Map<TableBucket, IndexReplicator> replicators = MapUtils.newConcurrentMap();
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition condition = lock.newCondition();
+        private boolean wakeupRequested;
 
         ReplicatorWorker(String name, long backoffMs) {
             super(name, false);
@@ -142,7 +143,12 @@ public final class IndexReplicatorPool implements AutoCloseable {
         }
 
         void wakeup() {
-            inLock(lock, condition::signalAll);
+            inLock(
+                    lock,
+                    () -> {
+                        wakeupRequested = true;
+                        condition.signalAll();
+                    });
         }
 
         @Override
@@ -162,7 +168,10 @@ public final class IndexReplicatorPool implements AutoCloseable {
                         lock,
                         () -> {
                             try {
-                                condition.await(backoffMs, TimeUnit.MILLISECONDS);
+                                if (!wakeupRequested) {
+                                    condition.await(backoffMs, TimeUnit.MILLISECONDS);
+                                }
+                                wakeupRequested = false;
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                             }

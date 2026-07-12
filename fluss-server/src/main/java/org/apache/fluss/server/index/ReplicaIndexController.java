@@ -29,6 +29,7 @@ import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.KvWriteGuard;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.utils.IndexTableUtils;
@@ -85,6 +86,7 @@ public final class ReplicaIndexController {
     private final TabletServerMetadataCache metadataCache;
     @Nullable private final IndexReplicatorPool replicatorPool;
     @Nullable private final IndexAccumulator accumulator;
+    private final RemoteLogManager remoteLogManager;
     private final TabletServerMetricGroup metrics;
     private final AtomicReference<State> state = new AtomicReference<>(State.NOT_STARTED);
 
@@ -102,12 +104,14 @@ public final class ReplicaIndexController {
             TabletServerMetadataCache metadataCache,
             @Nullable IndexReplicatorPool replicatorPool,
             @Nullable IndexAccumulator accumulator,
+            RemoteLogManager remoteLogManager,
             TabletServerMetricGroup metrics) {
         this.tableInfo = tableInfo;
         this.tableBucket = tableBucket;
         this.metadataCache = metadataCache;
         this.replicatorPool = replicatorPool;
         this.accumulator = accumulator;
+        this.remoteLogManager = remoteLogManager;
         this.metrics = metrics;
     }
 
@@ -386,10 +390,16 @@ public final class ReplicaIndexController {
         }
         LogRecordReadContext readContext =
                 LogRecordReadContext.createReadContext(tableInfo, false, null, schemaGetter);
+        IndexSourceReader sourceReader =
+                new IndexSourceReader(
+                        logTablet,
+                        remoteLogManager,
+                        remoteLogManager.remoteLogExecutor(),
+                        readContext);
         // Use the already-seeded offset (from snapshot restore or -1) as the starting point.
         IndexReplicator replicator =
                 new IndexReplicator(
-                        logTablet,
+                        sourceReader,
                         indexSpecs,
                         accumulator,
                         readContext,

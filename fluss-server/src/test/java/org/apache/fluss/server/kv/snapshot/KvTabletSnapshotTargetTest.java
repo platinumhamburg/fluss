@@ -64,6 +64,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
@@ -93,6 +94,7 @@ class KvTabletSnapshotTargetTest {
     private AtomicLong logOffsetGenerator;
     private AtomicLong indexPushedOffsetGenerator;
     private AtomicLong updateMinRetainOffsetConsumer;
+    private AtomicInteger updateMinRetainOffsetCount;
 
     static ZooKeeperClient zooKeeperClient;
 
@@ -115,6 +117,7 @@ class KvTabletSnapshotTargetTest {
         logOffsetGenerator = new AtomicLong(1);
         indexPushedOffsetGenerator = new AtomicLong(-1);
         updateMinRetainOffsetConsumer = new AtomicLong(Long.MAX_VALUE);
+        updateMinRetainOffsetCount = new AtomicInteger();
         scheduledExecutorService = new ManuallyTriggeredScheduledExecutorService();
     }
 
@@ -215,6 +218,65 @@ class KvTabletSnapshotTargetTest {
                                 new TabletState(2L, null, null, null), 1L, 1L))
                 .as("ordinary KV progress must still trigger a snapshot")
                 .isTrue();
+    }
+
+    @Test
+    void testOnlyCommittedSnapshotAdvancesIndexReplayRetention(@TempDir Path kvTabletDir)
+            throws Exception {
+        FsPath remoteKvTabletDir = FsPath.fromLocalFile(kvTabletDir.toFile());
+        updateMinRetainOffsetConsumer.set(40L);
+        logOffsetGenerator.set(600L);
+        indexPushedOffsetGenerator.set(500L);
+
+        KvTabletSnapshotTarget uploadFailingTarget =
+                createSnapshotTarget(
+                        remoteKvTabletDir,
+                        TestCompletedSnapshotHandleStore.newBuilder().build(),
+                        SnapshotFailType.ASYNC_PHASE);
+        periodicSnapshotManager = createSnapshotManager(uploadFailingTarget);
+        periodicSnapshotManager.start();
+        periodicSnapshotManager.triggerSnapshot();
+        TestRocksIncrementalSnapshot uploadFailingSnapshot =
+                (TestRocksIncrementalSnapshot) uploadFailingTarget.getRocksIncrementalSnapshot();
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(uploadFailingSnapshot.abortedSnapshots).contains(1L));
+        assertThat(updateMinRetainOffsetConsumer.get()).isEqualTo(40L);
+        assertThat(updateMinRetainOffsetCount.get()).isZero();
+
+        periodicSnapshotManager.close();
+        CompletedKvSnapshotCommitter failingCommitter =
+                (snapshot, coordinatorEpoch, bucketLeaderEpoch) -> {
+                    throw new FlussException("injected commit failure");
+                };
+        KvTabletSnapshotTarget commitFailingTarget =
+                createSnapshotTargetWithCustomCommitter(remoteKvTabletDir, failingCommitter);
+        periodicSnapshotManager = createSnapshotManager(commitFailingTarget);
+        periodicSnapshotManager.start();
+        periodicSnapshotManager.triggerSnapshot();
+        TestRocksIncrementalSnapshot commitFailingSnapshot =
+                (TestRocksIncrementalSnapshot) commitFailingTarget.getRocksIncrementalSnapshot();
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(commitFailingSnapshot.abortedSnapshots).contains(2L));
+        assertThat(updateMinRetainOffsetConsumer.get()).isEqualTo(40L);
+        assertThat(updateMinRetainOffsetCount.get()).isZero();
+
+        periodicSnapshotManager.close();
+        KvTabletSnapshotTarget committedTarget =
+                createSnapshotTargetWithCustomCommitter(
+                        remoteKvTabletDir,
+                        (snapshot, coordinatorEpoch, bucketLeaderEpoch) -> {});
+        periodicSnapshotManager = createSnapshotManager(committedTarget);
+        periodicSnapshotManager.start();
+        periodicSnapshotManager.triggerSnapshot();
+        TestRocksIncrementalSnapshot committedSnapshot =
+                (TestRocksIncrementalSnapshot) committedTarget.getRocksIncrementalSnapshot();
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(committedSnapshot.completedSnapshots).contains(3L));
+        assertThat(updateMinRetainOffsetConsumer.get()).isEqualTo(500L);
+        assertThat(updateMinRetainOffsetCount.get()).isOne();
     }
 
     @Test
@@ -524,7 +586,7 @@ class KvTabletSnapshotTargetTest {
                 cancelStreamRegistry,
                 testingSnapshotIdCounter,
                 this::getCurrentTabletState,
-                updateMinRetainOffsetConsumer::set,
+                this::recordMinRetainOffset,
                 bucketLeaderEpochSupplier,
                 coordinatorEpochSupplier,
                 0,
@@ -562,7 +624,7 @@ class KvTabletSnapshotTargetTest {
                 cancelStreamRegistry,
                 testingSnapshotIdCounter,
                 this::getCurrentTabletState,
-                updateMinRetainOffsetConsumer::set,
+                this::recordMinRetainOffset,
                 bucketLeaderEpochSupplier,
                 coordinatorEpochSupplier,
                 0,
@@ -576,6 +638,11 @@ class KvTabletSnapshotTargetTest {
                 null,
                 indexPushedOffset >= 0 ? indexPushedOffset : null,
                 null);
+    }
+
+    private void recordMinRetainOffset(long offset) {
+        updateMinRetainOffsetConsumer.set(offset);
+        updateMinRetainOffsetCount.incrementAndGet();
     }
 
     private RocksIncrementalSnapshot createIncrementalSnapshot(SnapshotFailType snapshotFailType)

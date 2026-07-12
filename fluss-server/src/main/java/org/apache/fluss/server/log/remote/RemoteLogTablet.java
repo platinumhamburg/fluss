@@ -156,7 +156,8 @@ public class RemoteLogTablet {
     }
 
     /**
-     * Returns the expired segments based on the given time and lake log end offset.
+     * Returns the expired segments based on time, lake coverage, and the committed KV snapshot
+     * replay floor.
      *
      * <p>Only segments that have been tiered to lake (i.e., remoteLogEndOffset <= lakeLogEndOffset)
      * can be safely deleted. This ensures that we don't delete segments that haven't been tiered to
@@ -165,10 +166,12 @@ public class RemoteLogTablet {
      * @param currentTimeMs the current time in milliseconds
      * @param lakeLogEndOffset the log end offset that has been synced to lake, null if data lake is
      *     disabled
+     * @param committedMinRetainOffset the minimum raw WAL offset retained by the latest committed KV
+     *     snapshot
      * @return list of expired segments that can be safely deleted
      */
     public List<RemoteLogSegment> expiredRemoteLogSegments(
-            long currentTimeMs, Long lakeLogEndOffset) {
+            long currentTimeMs, Long lakeLogEndOffset, long committedMinRetainOffset) {
         if (!logExpireEnable()) {
             return Collections.emptyList();
         }
@@ -182,13 +185,10 @@ public class RemoteLogTablet {
                         if (currentTimeMs - ts > ttlMs) {
                             for (UUID uuid : entry.getValue()) {
                                 RemoteLogSegment segment = idToRemoteLogSegment.get(uuid);
-                                if (lakeLogEndOffset != null) {
-                                    // if datalake is enabled, only include segments that have been
-                                    // tiered to lake.
-                                    if (segment.remoteLogEndOffset() <= lakeLogEndOffset) {
-                                        expiredSegments.add(segment);
-                                    }
-                                } else {
+                                if (segment.remoteLogEndOffset() <= committedMinRetainOffset
+                                        && (lakeLogEndOffset == null
+                                                || segment.remoteLogEndOffset()
+                                                        <= lakeLogEndOffset)) {
                                     expiredSegments.add(segment);
                                 }
                             }

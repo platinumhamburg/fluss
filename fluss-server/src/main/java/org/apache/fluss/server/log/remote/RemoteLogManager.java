@@ -51,6 +51,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -137,6 +138,11 @@ public class RemoteLogManager implements Closeable {
 
     public RemoteLogStorage getRemoteLogStorage() {
         return remoteLogStorage;
+    }
+
+    /** Executor dedicated to remote-log work, including asynchronous raw-WAL downloads. */
+    public Executor remoteLogExecutor() {
+        return rlManagerScheduledThreadPool;
     }
 
     public FsPath remoteLogDir() {

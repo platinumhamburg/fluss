@@ -283,7 +283,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             completedKvSnapshotCommitter.commitKvSnapshot(
                     completedSnapshot, coordinatorEpoch, bucketLeaderEpoch);
             // update local state after successful commit
-            updateStateOnCommitSuccess(snapshotId, snapshotResult);
+            updateStateOnCommitSuccess(snapshotId, snapshotResult, completedSnapshot);
         } catch (Exception e) {
             Throwable t = ExceptionUtils.stripExecutionException(e);
             // handle the exception with idempotent check
@@ -344,7 +344,10 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
      * before the outward state catches up — see FLUSS-2624. The {@code finally} block also
      * guarantees the internal SST bookkeeping cleanup runs even if any outward update throws.
      */
-    private void updateStateOnCommitSuccess(long snapshotId, SnapshotResult snapshotResult) {
+    private void updateStateOnCommitSuccess(
+            long snapshotId,
+            SnapshotResult snapshotResult,
+            CompletedSnapshot completedSnapshot) {
         long flushedLogOffset = snapshotResult.getTabletState().getFlushedLogOffset();
         try {
             logOffsetOfLatestSnapshot = flushedLogOffset;
@@ -352,7 +355,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                     snapshotResult.getTabletState().getIndexPushedOffset();
             snapshotSize = snapshotResult.getSnapshotSize();
             // update LogTablet to notify the lowest offset that should be retained
-            updateMinRetainOffset.accept(snapshotResult.getTabletState().getMinRetainLogOffset());
+            updateMinRetainOffset.accept(completedSnapshot.getMinRetainLogOffset());
         } finally {
             // notify the snapshot complete (must run last to preserve the ordering contract above,
             // and run in finally to guarantee internal SST bookkeeping is always cleaned up).
@@ -396,7 +399,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                         tableBucket);
 
                 // Update local state as if the commit was successful
-                updateStateOnCommitSuccess(snapshotId, snapshotResult);
+                updateStateOnCommitSuccess(snapshotId, snapshotResult, completedSnapshot);
                 return; // Snapshot commit succeeded, return directly
             } else {
                 // Snapshot does not exist in ZK, indicating the commit truly failed

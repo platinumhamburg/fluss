@@ -25,6 +25,7 @@ import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogTablet;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -71,6 +72,9 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
 
         // advance time past TTL (7 days)
         manualClock.advanceTime(Duration.ofDays(7).plusHours(1));
+
+        // Remote TTL is bounded by the latest committed KV snapshot replay floor.
+        logTablet.updateMinRetainOffset(40L);
 
         // since data lake is enabled and no data has been tiered to data lake,
         // the expired segments should not be deleted.
@@ -121,5 +125,26 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
         FetchLogResultForBucket resultForBucket = result.get(tb);
         assertThat(resultForBucket.getErrorCode())
                 .isEqualTo(Errors.LOG_OFFSET_OUT_OF_RANGE_EXCEPTION.code());
+    }
+
+    @Test
+    void testRemoteLogTTLIsClampedByCommittedSnapshotAndLakeFloors() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 4);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLog.allRemoteLogSegments())
+                .extracting(segment -> segment.remoteLogStartOffset())
+                .containsExactlyInAnyOrder(0L, 10L, 20L);
+        manualClock.advanceTime(Duration.ofDays(7).plusHours(1));
+
+        assertThat(remoteLog.expiredRemoteLogSegments(manualClock.milliseconds(), null, 15L))
+                .extracting(segment -> segment.remoteLogStartOffset())
+                .containsExactly(0L);
+        assertThat(remoteLog.expiredRemoteLogSegments(manualClock.milliseconds(), 9L, 15L))
+                .isEmpty();
     }
 }

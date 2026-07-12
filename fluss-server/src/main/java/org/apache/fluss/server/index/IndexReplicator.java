@@ -29,7 +29,6 @@ import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
-import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.BinaryRow;
@@ -51,6 +50,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -81,7 +82,7 @@ public final class IndexReplicator implements AutoCloseable {
         void onProgress(long syncIndexPushedOffset, long allIndexPushedOffset);
     }
 
-    @Nullable private final SourceWal sourceWal;
+    private final IndexSourceReader sourceReader;
     private final List<IndexProgressState> indexStates;
     private final Map<String, IndexProgressState> indexStatesByName;
     private final IndexAccumulator accumulator;
@@ -95,6 +96,10 @@ public final class IndexReplicator implements AutoCloseable {
 
     private final AtomicBoolean closed;
     private final AtomicReference<Throwable> terminalFailure;
+
+    @Nullable private volatile CompletableFuture<IndexSourceReader.ReadResult> pendingRead;
+    @Nullable private volatile IndexProgressState pendingReadState;
+    private volatile long pendingReadOffset;
 
     /** Signal fired to wake the owning read-pool worker so it polls again promptly. */
     @Nullable private volatile Runnable wakeupSignal;
@@ -147,7 +152,31 @@ public final class IndexReplicator implements AutoCloseable {
             int maxWindowBytes,
             long preferredMaxRequestBytes,
             IndexProgressListener onProgress) {
-        this.sourceWal = sourceWal;
+        this(
+                new IndexSourceReader(
+                        sourceWal == null ? UnavailableSourceWal.INSTANCE : sourceWal,
+                        null,
+                        Runnable::run,
+                        readContext),
+                indexSpecs,
+                accumulator,
+                readContext,
+                initialOffset,
+                maxWindowBytes,
+                preferredMaxRequestBytes,
+                onProgress);
+    }
+
+    IndexReplicator(
+            IndexSourceReader sourceReader,
+            List<IndexSpec> indexSpecs,
+            IndexAccumulator accumulator,
+            LogRecordReadContext readContext,
+            long initialOffset,
+            int maxWindowBytes,
+            long preferredMaxRequestBytes,
+            IndexProgressListener onProgress) {
+        this.sourceReader = sourceReader;
         this.indexStates = new ArrayList<>(indexSpecs.size());
         this.indexStatesByName = new LinkedHashMap<>();
         for (IndexSpec indexSpec : indexSpecs) {
@@ -189,6 +218,27 @@ public final class IndexReplicator implements AutoCloseable {
                 onProgress);
     }
 
+    @VisibleForTesting
+    static IndexReplicator forTesting(
+            IndexSourceReader sourceReader,
+            List<IndexSpec> indexSpecs,
+            IndexAccumulator accumulator,
+            LogRecordReadContext readContext,
+            long initialOffset,
+            int maxWindowBytes,
+            long preferredMaxRequestBytes,
+            IndexProgressListener onProgress) {
+        return new IndexReplicator(
+                sourceReader,
+                indexSpecs,
+                accumulator,
+                readContext,
+                initialOffset,
+                maxWindowBytes,
+                preferredMaxRequestBytes,
+                onProgress);
+    }
+
     /** Sets the wake-up signal used to nudge the read-pool worker after a window completes. */
     void setWakeupSignal(Runnable wakeupSignal) {
         this.wakeupSignal = wakeupSignal;
@@ -214,7 +264,11 @@ public final class IndexReplicator implements AutoCloseable {
             return false;
         }
 
-        long hw = sourceWal.highWatermark();
+        if (pendingRead != null) {
+            return consumePendingRead();
+        }
+
+        long hw = sourceReader.highWatermark();
         boolean polled = false;
         for (IndexProgressState state : indexStates) {
             if (closed.get() || terminalFailure.get() != null || accumulator.isFull(this)) {
@@ -229,13 +283,17 @@ public final class IndexReplicator implements AutoCloseable {
                 break;
             }
             if (state.pushedOffset < 0) {
-                state.pushedOffset = sourceWal.logStartOffset();
+                state.pushedOffset = sourceReader.logStartOffset();
             }
             long readOffset = nextReadOffset(state);
             if (readOffset >= hw) {
                 continue;
             }
-            polled |= pollOneWindow(state, readOffset);
+            boolean statePolled = pollOneWindow(state, readOffset, hw);
+            polled |= statePolled;
+            if (pendingRead != null) {
+                break;
+            }
         }
         return polled;
     }
@@ -243,28 +301,90 @@ public final class IndexReplicator implements AutoCloseable {
     /**
      * Read and process a single window of WAL records. Returns {@code true} if a window was read.
      */
-    private boolean pollOneWindow(IndexProgressState state, long readOffset) {
-        FetchDataInfo fetchData;
+    private boolean pollOneWindow(IndexProgressState state, long readOffset, long highWatermark) {
         try {
-            fetchData =
-                    sourceWal.read(readOffset, maxWindowBytes, FetchIsolation.HIGH_WATERMARK, true);
-        } catch (IOException e) {
-            LOG.warn("Failed to read WAL at offset {}: {}", readOffset, e.getMessage());
+            CompletableFuture<IndexSourceReader.ReadResult> future =
+                    sourceReader.read(readOffset, highWatermark, maxWindowBytes);
+            pendingRead = future;
+            pendingReadState = state;
+            pendingReadOffset = readOffset;
+            future.whenComplete((ignored, failure) -> wakeup());
+            if (!future.isDone()) {
+                return false;
+            }
+            return consumePendingRead();
+        } catch (IndexSourceWalCorruptionException failure) {
+            terminalFailure.compareAndSet(null, failure);
+            throw failure;
+        } catch (RuntimeException failure) {
+            LOG.warn("Failed to start WAL read at offset {}: {}", readOffset, failure.getMessage());
+            return false;
+        }
+    }
+
+    private boolean consumePendingRead() {
+        CompletableFuture<IndexSourceReader.ReadResult> future = pendingRead;
+        IndexProgressState state = pendingReadState;
+        if (future == null || state == null || !future.isDone()) {
             return false;
         }
 
-        LogRecords records = fetchData.getRecords();
+        IndexSourceReader.ReadResult result;
+        try {
+            result = future.getNow(null);
+        } catch (CompletionException failure) {
+            clearPendingRead(future);
+            Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+            if (cause instanceof IndexSourceWalCorruptionException) {
+                terminalFailure.compareAndSet(null, cause);
+                throw (IndexSourceWalCorruptionException) cause;
+            }
+            LOG.warn(
+                    "Failed to read WAL at offset {}: {}", pendingReadOffset, cause.getMessage());
+            return false;
+        }
+        clearPendingRead(future);
+        if (result == null) {
+            return false;
+        }
+        try (IndexSourceReader.ReadResult ownedResult = result) {
+            return processReadResult(state, pendingReadOffset, ownedResult);
+        }
+    }
+
+    private void clearPendingRead(CompletableFuture<IndexSourceReader.ReadResult> future) {
+        if (pendingRead == future) {
+            pendingRead = null;
+            pendingReadState = null;
+        }
+    }
+
+    private void wakeup() {
+        Runnable signal = this.wakeupSignal;
+        if (signal != null) {
+            signal.run();
+        }
+    }
+
+    private boolean processReadResult(
+            IndexProgressState state,
+            long readOffset,
+            IndexSourceReader.ReadResult readResult) {
+
         Map<TableBucket, BucketBatchBuilder> builders = new HashMap<>();
         long lastProcessedOffset = state.pushedOffset;
         long currentWindowEncodedSize = 0L;
         boolean windowFull = false;
-        for (LogRecordBatch batch : records.batches()) {
-            validateSourceBatch(batch);
+        for (LogRecordBatch batch : readResult.batches()) {
             try (CloseableIterator<LogRecord> iter = batch.records(readContext)) {
                 while (iter.hasNext()) {
                     LogRecord record = iter.next();
-                    if (record.logOffset() < readOffset) {
+                    if (record.logOffset() < readOffset
+                            || record.logOffset() < lastProcessedOffset) {
                         continue;
+                    }
+                    if (record.logOffset() >= readResult.nextOffset()) {
+                        break;
                     }
                     MutationGroup group = readMutationGroup(state.spec, iter, record);
                     MutationPlan plan = deriveMutationPlan(state.spec, group);
@@ -283,7 +403,13 @@ public final class IndexReplicator implements AutoCloseable {
             if (windowFull) {
                 break;
             }
-            lastProcessedOffset = Math.max(lastProcessedOffset, batch.nextLogOffset());
+            lastProcessedOffset =
+                    Math.max(
+                            lastProcessedOffset,
+                            Math.min(batch.nextLogOffset(), readResult.nextOffset()));
+        }
+        if (!windowFull) {
+            lastProcessedOffset = Math.max(lastProcessedOffset, readResult.nextOffset());
         }
 
         // No records advanced: nothing to do this cycle.
@@ -297,7 +423,7 @@ public final class IndexReplicator implements AutoCloseable {
         // would silently drop that bucket's index mutations (permanent data loss), so a failure
         // must stall the window rather than leak past it.
         Map<TableBucket, BytesView> encoded = new HashMap<>(builders.size());
-        WriterKey writerKey = IndexWriterKey.encode(sourceWal.tableBucket());
+        WriterKey writerKey = IndexWriterKey.encode(sourceReader.tableBucket());
         for (Map.Entry<TableBucket, BucketBatchBuilder> entry : builders.entrySet()) {
             try {
                 encoded.put(
@@ -335,14 +461,6 @@ public final class IndexReplicator implements AutoCloseable {
             accumulator.append(batch);
         }
         return true;
-    }
-
-    private void validateSourceBatch(LogRecordBatch batch) {
-        try {
-            batch.ensureValid();
-        } catch (RuntimeException failure) {
-            throw corruption("record batch failed integrity validation", failure);
-        }
     }
 
     private void advanceOnEmptyWindow(IndexProgressState state, long windowEndOffset) {
@@ -401,7 +519,7 @@ public final class IndexReplicator implements AutoCloseable {
         if (firstFailure) {
             LOG.error(
                     "Index replication for source bucket {} failed terminally at pushed offset {}",
-                    sourceWal == null ? "unknown" : sourceWal.tableBucket(),
+                    sourceReader.tableBucket(),
                     getAllIndexPushedOffset(),
                     failure);
         }
@@ -469,7 +587,7 @@ public final class IndexReplicator implements AutoCloseable {
     private IndexSourceWalCorruptionException corruption(String message) {
         IndexSourceWalCorruptionException failure =
                 new IndexSourceWalCorruptionException(
-                        "Corrupt source WAL for " + sourceWal.tableBucket() + ": " + message);
+                        "Corrupt source WAL for " + sourceReader.tableBucket() + ": " + message);
         terminalFailure.compareAndSet(null, failure);
         return failure;
     }
@@ -477,7 +595,7 @@ public final class IndexReplicator implements AutoCloseable {
     private IndexSourceWalCorruptionException corruption(String message, Throwable cause) {
         IndexSourceWalCorruptionException failure =
                 new IndexSourceWalCorruptionException(
-                        "Corrupt source WAL for " + sourceWal.tableBucket() + ": " + message,
+                        "Corrupt source WAL for " + sourceReader.tableBucket() + ": " + message,
                         cause);
         terminalFailure.compareAndSet(null, failure);
         return failure;
@@ -577,8 +695,25 @@ public final class IndexReplicator implements AutoCloseable {
 
     @Override
     public void close() {
-        if (closed.compareAndSet(false, true) && readContext != null) {
-            readContext.close();
+        if (closed.compareAndSet(false, true)) {
+            CompletableFuture<IndexSourceReader.ReadResult> future = pendingRead;
+            pendingRead = null;
+            pendingReadState = null;
+            if (future != null) {
+                if (future.isDone()
+                        && !future.isCompletedExceptionally()
+                        && !future.isCancelled()) {
+                    IndexSourceReader.ReadResult result = future.getNow(null);
+                    if (result != null) {
+                        result.close();
+                    }
+                }
+                future.cancel(true);
+            }
+            sourceReader.close();
+            if (readContext != null) {
+                readContext.close();
+            }
         }
     }
 
@@ -587,16 +722,32 @@ public final class IndexReplicator implements AutoCloseable {
     }
 
     @VisibleForTesting
-    interface SourceWal {
-        TableBucket tableBucket();
+    interface SourceWal extends IndexSourceReader.SourceLog {}
 
-        long highWatermark();
+    private static final class UnavailableSourceWal implements SourceWal {
+        private static final UnavailableSourceWal INSTANCE = new UnavailableSourceWal();
+        private static final TableBucket UNKNOWN_BUCKET = new TableBucket(-1L, 0);
 
-        long logStartOffset();
+        @Override
+        public TableBucket tableBucket() {
+            return UNKNOWN_BUCKET;
+        }
 
-        FetchDataInfo read(
-                long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage)
-                throws IOException;
+        @Override
+        public long highWatermark() {
+            throw new IllegalStateException("Source WAL is unavailable");
+        }
+
+        @Override
+        public long logStartOffset() {
+            throw new IllegalStateException("Source WAL is unavailable");
+        }
+
+        @Override
+        public FetchDataInfo read(
+                long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage) {
+            throw new IllegalStateException("Source WAL is unavailable");
+        }
     }
 
     private static final class LogTabletSourceWal implements SourceWal {
@@ -619,6 +770,11 @@ public final class IndexReplicator implements AutoCloseable {
         @Override
         public long logStartOffset() {
             return logTablet.logStartOffset();
+        }
+
+        @Override
+        public long localLogStartOffset() {
+            return logTablet.localLogStartOffset();
         }
 
         @Override

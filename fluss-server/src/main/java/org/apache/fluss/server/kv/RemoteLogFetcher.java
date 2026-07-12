@@ -40,6 +40,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -214,6 +215,7 @@ public class RemoteLogFetcher implements Closeable {
         private int currentSegmentIndex = 0;
         private FileLogRecords currentFileLogRecords;
         private Iterator<LogRecordBatch> currentBatchIterator;
+        private final List<FileLogRecords> openedFileLogRecords = new ArrayList<>();
         private LogRecordBatch nextBatch;
         private boolean finished = false;
         private volatile boolean closed = false;
@@ -229,15 +231,14 @@ public class RemoteLogFetcher implements Closeable {
         public void close() {
             if (!closed) {
                 closed = true;
-                closeCurrentFileLogRecords();
+                closeOpenedFileLogRecords();
             }
         }
 
         @Override
         public boolean hasNext() {
-            // Lazily advance: only fetch next batch when needed. This ensures the
-            // previously returned FileChannelLogRecordBatch has been fully consumed
-            // by the caller before advance() potentially closes its underlying file.
+            // Lazily advance while retaining opened files until close. Index replay may collect
+            // lightweight batch views whose bytes must stay owned by its ReadResult.
             if (nextBatch == null && !finished) {
                 advance();
             }
@@ -267,7 +268,6 @@ public class RemoteLogFetcher implements Closeable {
                     // stop if we've reached localLogStartOffset
                     if (batch.baseLogOffset() >= localLogStartOffset) {
                         finished = true;
-                        closeCurrentFileLogRecords();
                         return;
                     }
                     nextBatch = batch;
@@ -276,8 +276,8 @@ public class RemoteLogFetcher implements Closeable {
                     return;
                 }
 
-                // close current file log records
-                closeCurrentFileLogRecords();
+                currentFileLogRecords = null;
+                currentBatchIterator = null;
 
                 // move to next segment
                 if (currentSegmentIndex >= segments.size()) {
@@ -286,8 +286,8 @@ public class RemoteLogFetcher implements Closeable {
                 }
 
                 RemoteLogSegment segment = segments.get(currentSegmentIndex++);
-                // remoteLogEndOffset() is inclusive — last offset in segment
-                if (segment.remoteLogEndOffset() < currentOffset) {
+                // Remote segment ends are exclusive.
+                if (segment.remoteLogEndOffset() <= currentOffset) {
                     continue;
                 }
                 // skip segments that start at or after localLogStartOffset
@@ -303,6 +303,7 @@ public class RemoteLogFetcher implements Closeable {
                     // segments to fetch. trace by: https://github.com/apache/fluss/issues/3091
                     File localFile = downloadSegment(segment);
                     currentFileLogRecords = FileLogRecords.open(localFile, false);
+                    openedFileLogRecords.add(currentFileLogRecords);
                     int startPosition = 0;
                     // if this segment contains data before currentOffset, find the right position
                     if (segment.remoteLogStartOffset() < currentOffset) {
@@ -325,7 +326,7 @@ public class RemoteLogFetcher implements Closeable {
                     }
                 } catch (Exception e) {
                     // Ensure resources are cleaned up if an exception occurs during segment loading
-                    closeCurrentFileLogRecords();
+                    closeOpenedFileLogRecords();
                     throw new RuntimeException(
                             "Failed to fetch remote log segment: " + segment.remoteLogSegmentId(),
                             e);
@@ -333,12 +334,13 @@ public class RemoteLogFetcher implements Closeable {
             }
         }
 
-        private void closeCurrentFileLogRecords() {
-            if (currentFileLogRecords != null) {
-                IOUtils.closeQuietly(currentFileLogRecords, "FileLogRecords");
-                currentFileLogRecords = null;
-                currentBatchIterator = null;
+        private void closeOpenedFileLogRecords() {
+            for (FileLogRecords records : openedFileLogRecords) {
+                IOUtils.closeQuietly(records, "FileLogRecords");
             }
+            openedFileLogRecords.clear();
+            currentFileLogRecords = null;
+            currentBatchIterator = null;
         }
     }
 }

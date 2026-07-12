@@ -325,6 +325,7 @@ public final class Replica {
                         metadataCache,
                         indexReplicatorPool,
                         indexAccumulator,
+                        remoteLogManager,
                         serverMetricGroup);
         this.hasSyncIndexes =
                 tableInfo.getSchema().getIndexes().stream()
