@@ -561,7 +561,7 @@ public final class IndexSender implements AutoCloseable {
         public void doWork() {
             boolean didWork = drainAndSend();
             if (!didWork) {
-                discoverPendingBuckets();
+                dispatchMissedAppendNotifications();
                 didWork = drainAndSend();
             }
             if (!didWork) {
@@ -577,15 +577,14 @@ public final class IndexSender implements AutoCloseable {
             }
         }
 
-        /** Recover work when append notification failed before this worker was woken. */
-        private void discoverPendingBuckets() {
+        /** Route only append notifications whose normal callback failed. */
+        private void dispatchMissedAppendNotifications() {
             if (lifecyclePhase != LifecyclePhase.OPEN) {
                 return;
             }
-            for (TableBucket bucket : accumulator.buckets()) {
-                if (ownerOf(bucket) == workerId && accumulator.hasPending(bucket)) {
-                    enqueueReadyBucket(bucket);
-                }
+            TableBucket bucket;
+            while ((bucket = accumulator.pollMissedAppendNotification()) != null) {
+                IndexSender.this.enqueueReadyBucket(bucket);
             }
         }
 

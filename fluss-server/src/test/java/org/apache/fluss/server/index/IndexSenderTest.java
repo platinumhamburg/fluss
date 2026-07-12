@@ -49,14 +49,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.List;
 import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -1166,41 +1170,92 @@ public class IndexSenderTest {
     }
 
     @Test
-    void throwingAppendListenerKeepsPublishedBatchDiscoverableToSender() {
+    void repeatedListenerFailuresEventuallySendOnOwnerWorker() {
         IndexAccumulator accumulator = new IndexAccumulator();
         TableBucket bucket = new TableBucket(494L, 0);
         IndexReplicator owner = owner(accumulator);
-        IndexBatch batch = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        IndexBatch first = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        IndexBatch second = batch(bucket, new IndexWindow("idx", 20L, 1, owner));
+        IndexBatch third = batch(bucket, new IndexWindow("idx", 30L, 1, owner));
         RecordingGateway gateway = new RecordingGateway();
         gateway.autoCompleteSuccess = true;
+        AtomicReference<String> invocationThread = new AtomicReference<>();
+        IndexSender.LifecycleHooks hooks =
+                new IndexSender.LifecycleHooks() {
+                    @Override
+                    public void beforePutKvInvocation() {
+                        invocationThread.compareAndSet(null, Thread.currentThread().getName());
+                    }
+                };
         IndexSender sender =
                 new IndexSender(
                         accumulator,
                         (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
                         serverId -> gateway,
                         TestingMetricGroups.TABLET_SERVER_METRICS,
-                        1,
-                        5L);
+                        2,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        5_000L,
+                        hooks);
         accumulator.setAppendListener(
                 ignored -> {
                     throw new RuntimeException("injected append listener failure");
                 });
+        int ownerWorkerId = Math.floorMod(bucket.hashCode(), 2);
         try {
-            accumulator.append(batch);
+            accumulator.append(first);
+            accumulator.append(second);
+            accumulator.append(third);
 
             assertThat(accumulator.hasPending(bucket)).isTrue();
             assertThat(accumulator.pendingBytes(owner))
-                    .isEqualTo(batch.encoded().getBytesLength());
-            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+                    .isEqualTo(
+                            first.encoded().getBytesLength()
+                                    + second.encoded().getBytesLength()
+                                    + third.encoded().getBytesLength());
+            await(() -> owner.getSyncIndexPushedOffset() == 30L);
+            await(() -> accumulator.missedAppendNotificationCountForTesting() == 0);
 
-            assertThat(gateway.requests).hasSize(1);
-            assertThat(batch.window().registeredBatchCount()).isZero();
+            assertThat(gateway.requests).hasSize(3);
+            assertThat(invocationThread.get()).isEqualTo("index-sender-" + ownerWorkerId);
+            assertThat(first.window().registeredBatchCount()).isZero();
+            assertThat(second.window().registeredBatchCount()).isZero();
+            assertThat(third.window().registeredBatchCount()).isZero();
             assertThat(accumulator.pendingBytes()).isZero();
             assertThat(accumulator.pendingBytes(owner)).isZero();
             assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
             assertThat(accumulator.hasUnsent()).isFalse();
+            assertThat(accumulator.buckets()).isEmpty();
             assertThat(sender.ownedBatchCountForTesting()).isZero();
             assertThat(sender.ownedBatchPayloadBytesForTesting()).isZero();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void idleWorkersWithoutMissedNotificationsDoNotSnapshotBucketRegistry() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        CountingBucketMap queues = new CountingBucketMap();
+        replaceQueueRegistry(accumulator, queues);
+        RecordingGateway gateway = new RecordingGateway();
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        3,
+                        TimeUnit.MINUTES.toMillis(1));
+        try {
+            await(() -> Arrays.stream(senderWorkers(sender)).allMatch(IndexSenderTest::isIdle));
+
+            assertThat(queues.snapshotCount())
+                    .as("only sender startup may snapshot the active bucket registry")
+                    .isEqualTo(1);
         } finally {
             sender.close();
         }
@@ -1691,6 +1746,47 @@ public class IndexSenderTest {
                 condition::getAsBoolean,
                 Duration.ofSeconds(5),
                 "Condition was not met within timeout");
+    }
+
+    private static boolean isIdle(Thread worker) {
+        return worker.getState() == Thread.State.TIMED_WAITING;
+    }
+
+    private static Thread[] senderWorkers(IndexSender sender) {
+        try {
+            Field field = IndexSender.class.getDeclaredField("workers");
+            field.setAccessible(true);
+            Object[] workers = (Object[]) field.get(sender);
+            Thread[] threads = new Thread[workers.length];
+            for (int i = 0; i < workers.length; i++) {
+                threads[i] = (Thread) workers[i];
+            }
+            return threads;
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("Unable to inspect sender workers", e);
+        }
+    }
+
+    private static void replaceQueueRegistry(
+            IndexAccumulator accumulator, CountingBucketMap queues) throws Exception {
+        Field field = IndexAccumulator.class.getDeclaredField("batches");
+        field.setAccessible(true);
+        field.set(accumulator, queues);
+    }
+
+    private static final class CountingBucketMap
+            extends ConcurrentHashMap<TableBucket, Deque<IndexBatch>> {
+        private final AtomicInteger snapshots = new AtomicInteger();
+
+        @Override
+        public KeySetView<TableBucket, Deque<IndexBatch>> keySet() {
+            snapshots.incrementAndGet();
+            return super.keySet();
+        }
+
+        private int snapshotCount() {
+            return snapshots.get();
+        }
     }
 
     private static void awaitLatch(CountDownLatch latch) {

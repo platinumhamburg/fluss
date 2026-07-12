@@ -197,6 +197,43 @@ public class IndexAccumulatorTest {
     }
 
     @Test
+    void appendListenerFailureMarkersRearmAndDeduplicate() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator owner = replicator(accumulator);
+        TableBucket bucket = new TableBucket(504L, 0);
+        IndexBatch first = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        IndexBatch second = batch(bucket, new IndexWindow("idx", 20L, 1, owner));
+        IndexBatch third = batch(bucket, new IndexWindow("idx", 30L, 1, owner));
+        accumulator.setAppendListener(
+                ignored -> {
+                    throw new RuntimeException("injected append listener failure");
+                });
+
+        accumulator.append(first);
+        assertThat(accumulator.missedAppendNotificationCountForTesting()).isEqualTo(1);
+        assertThat(accumulator.pollMissedAppendNotification()).isEqualTo(bucket);
+        assertThat(accumulator.missedAppendNotificationCountForTesting()).isZero();
+
+        accumulator.append(second);
+        accumulator.append(third);
+        assertThat(accumulator.missedAppendNotificationCountForTesting())
+                .as("later repeated failures must install exactly one new marker")
+                .isEqualTo(1);
+        assertThat(accumulator.pollMissedAppendNotification()).isEqualTo(bucket);
+        assertThat(accumulator.pollMissedAppendNotification()).isNull();
+
+        for (IndexBatch batch : new IndexBatch[] {first, second, third}) {
+            assertThat(accumulator.pollFirst(bucket)).isSameAs(batch);
+            accumulator.release(batch);
+            batch.window().onBatchAcked(batch);
+        }
+        assertThat(owner.getSyncIndexPushedOffset()).isEqualTo(30L);
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+        assertThat(registrySize(accumulator)).isZero();
+    }
+
+    @Test
     void ownerCleanupCannotDetachConcurrentInitialAppend() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         IndexReplicator stoppingOwner = replicator(accumulator);
@@ -205,13 +242,21 @@ public class IndexAccumulatorTest {
         IndexBatch seed =
                 batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
         accumulator.append(seed);
-        assertThat(accumulator.pollFirst(bucket)).isSameAs(seed);
-        accumulator.release(seed);
-        seed.window().onBatchAcked(seed);
-
         Deque<IndexBatch> deque = queue(accumulator, bucket);
         IndexBatch published =
                 batch(bucket, new IndexWindow("idx", 10L, 1, publishingOwner), 7);
+        AtomicInteger dropped = new AtomicInteger(-1);
+        AtomicReference<Throwable> cleanupFailure = new AtomicReference<>();
+        Thread cleanupThread =
+                new Thread(
+                        () -> {
+                            try {
+                                dropped.set(accumulator.dropForReplicator(stoppingOwner));
+                            } catch (Throwable t) {
+                                cleanupFailure.set(t);
+                            }
+                        },
+                        "index-owner-cleanup");
         AtomicReference<Throwable> appendFailure = new AtomicReference<>();
         Thread appendThread =
                 new Thread(
@@ -224,16 +269,21 @@ public class IndexAccumulatorTest {
                         },
                         "index-initial-publisher");
 
+        stoppingOwner.close();
         synchronized (deque) {
+            cleanupThread.start();
+            awaitBlocked(cleanupThread);
             appendThread.start();
             awaitBlocked(appendThread);
-            stoppingOwner.close();
-            assertThat(accumulator.dropForReplicator(stoppingOwner)).isZero();
         }
+        cleanupThread.join(5_000L);
         appendThread.join(5_000L);
 
+        assertThat(cleanupThread.isAlive()).isFalse();
         assertThat(appendThread.isAlive()).isFalse();
+        assertThat(cleanupFailure.get()).isNull();
         assertThat(appendFailure.get()).isNull();
+        assertThat(dropped).hasValue(1);
         assertThat(accumulator.pollFirst(bucket)).isSameAs(published);
         accumulator.release(published);
         published.window().onBatchAcked(published);
@@ -243,6 +293,7 @@ public class IndexAccumulatorTest {
         assertThat(accumulator.pendingBytes(publishingOwner)).isZero();
         assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
         assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(registrySize(accumulator)).isZero();
     }
 
     @Test
@@ -253,7 +304,10 @@ public class IndexAccumulatorTest {
         TableBucket bucket = new TableBucket(503L, 0);
         IndexBatch retry =
                 batch(bucket, new IndexWindow("idx", 10L, 1, retryingOwner), 11);
+        IndexBatch seed =
+                batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
         accumulator.append(retry);
+        accumulator.append(seed);
         assertThat(accumulator.pollFirst(bucket)).isSameAs(retry);
 
         Deque<IndexBatch> deque = queue(accumulator, bucket);
@@ -269,18 +323,35 @@ public class IndexAccumulatorTest {
                             }
                         },
                         "index-retry-publisher");
+        AtomicInteger dropped = new AtomicInteger(-1);
+        AtomicReference<Throwable> cleanupFailure = new AtomicReference<>();
+        Thread cleanupThread =
+                new Thread(
+                        () -> {
+                            try {
+                                dropped.set(accumulator.dropForReplicator(stoppingOwner));
+                            } catch (Throwable t) {
+                                cleanupFailure.set(t);
+                            }
+                        },
+                        "index-owner-cleanup");
 
+        stoppingOwner.close();
         synchronized (deque) {
             retryThread.start();
             awaitBlocked(retryThread);
-            stoppingOwner.close();
-            assertThat(accumulator.dropForReplicator(stoppingOwner)).isZero();
+            cleanupThread.start();
+            awaitBlocked(cleanupThread);
         }
         retryThread.join(5_000L);
+        cleanupThread.join(5_000L);
 
         assertThat(retryThread.isAlive()).isFalse();
+        assertThat(cleanupThread.isAlive()).isFalse();
         assertThat(retryFailure.get()).isNull();
+        assertThat(cleanupFailure.get()).isNull();
         assertThat(reEnqueued.get()).isTrue();
+        assertThat(dropped).hasValue(1);
         assertThat(retry.attempts()).isEqualTo(1);
         assertThat(accumulator.pollFirst(bucket)).isSameAs(retry);
         accumulator.release(retry);
@@ -291,6 +362,27 @@ public class IndexAccumulatorTest {
         assertThat(accumulator.pendingBytes(retryingOwner)).isZero();
         assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
         assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(registrySize(accumulator)).isZero();
+    }
+
+    @Test
+    void repeatedBucketChurnReclaimsQueueRegistry() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator owner = replicator(accumulator);
+
+        for (int i = 0; i < 100; i++) {
+            TableBucket bucket = new TableBucket(600L + i, i);
+            IndexBatch batch =
+                    batch(bucket, new IndexWindow("idx", i + 1L, 1, owner), 3);
+            accumulator.append(batch);
+            assertThat(accumulator.pollFirst(bucket)).isSameAs(batch);
+            accumulator.release(batch);
+            batch.window().onBatchAcked(batch);
+            assertThat(registrySize(accumulator)).isZero();
+        }
+
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
     }
 
     @Test
@@ -331,10 +423,18 @@ public class IndexAccumulatorTest {
     @SuppressWarnings("unchecked")
     private static Deque<IndexBatch> queue(IndexAccumulator accumulator, TableBucket bucket)
             throws Exception {
+        return queues(accumulator).get(bucket);
+    }
+
+    private static int registrySize(IndexAccumulator accumulator) throws Exception {
+        return queues(accumulator).size();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<TableBucket, Deque<IndexBatch>> queues(IndexAccumulator accumulator)
+            throws Exception {
         Field field = IndexAccumulator.class.getDeclaredField("batches");
         field.setAccessible(true);
-        Map<TableBucket, Deque<IndexBatch>> batches =
-                (Map<TableBucket, Deque<IndexBatch>>) field.get(accumulator);
-        return batches.get(bucket);
+        return (Map<TableBucket, Deque<IndexBatch>>) field.get(accumulator);
     }
 }

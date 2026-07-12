@@ -35,6 +35,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -72,6 +73,13 @@ public final class IndexAccumulator {
 
     /** Optional callback fired on each append to promptly wake the owning sender worker. */
     @Nullable private volatile Consumer<TableBucket> appendListener;
+
+    /** Deduplicated recovery work for append callbacks that failed before waking a sender. */
+    private final ConcurrentMap<TableBucket, Boolean> missedAppendNotifications =
+            MapUtils.newConcurrentMap();
+
+    private final ConcurrentLinkedQueue<TableBucket> missedAppendNotificationQueue =
+            new ConcurrentLinkedQueue<>();
 
     /**
      * Optional callback fired after a queued batch is dropped for a stopped replicator, outside
@@ -122,23 +130,31 @@ public final class IndexAccumulator {
                 if (hook != null) {
                     hook.run();
                 }
-                Deque<IndexBatch> deque =
-                        batches.computeIfAbsent(batch.targetBucket(), k -> new ArrayDeque<>());
-                synchronized (deque) {
-                    deque.addLast(batch);
-                    long bytes = batch.encoded().getBytesLength();
-                    pendingBytes.addAndGet(bytes);
-                    pendingBytesByReplicator.compute(
-                            batch.window().owner(),
-                            (ignored, current) -> current == null ? bytes : current + bytes);
-                    batch.markAccounted();
+                batches.compute(
+                        batch.targetBucket(),
+                        (ignored, current) -> {
+                            Deque<IndexBatch> deque =
+                                    current == null ? new ArrayDeque<>() : current;
+                            synchronized (deque) {
+                                deque.addLast(batch);
+                                long bytes = batch.encoded().getBytesLength();
+                                pendingBytes.addAndGet(bytes);
+                                pendingBytesByReplicator.compute(
+                                        batch.window().owner(),
+                                        (ignoredOwner, ownerBytes) ->
+                                                ownerBytes == null
+                                                        ? bytes
+                                                        : ownerBytes + bytes);
+                                batch.markAccounted();
 
-                    published = batch.ownerActive();
-                    if (!published) {
-                        removeExact(deque, batch);
-                        release(batch);
-                    }
-                }
+                                if (!batch.ownerActive()) {
+                                    removeExact(deque, batch);
+                                    release(batch);
+                                }
+                                return deque.isEmpty() ? null : deque;
+                            }
+                        });
+                published = !batch.isReleased();
             }
         }
         if (!published) {
@@ -149,12 +165,36 @@ public final class IndexAccumulator {
             try {
                 listener.accept(batch.targetBucket());
             } catch (Throwable t) {
+                recordMissedAppendNotification(batch.targetBucket());
                 LOG.warn(
                         "Error notifying appended index batch for target bucket {}",
                         batch.targetBucket(),
                         t);
             }
         }
+    }
+
+    private void recordMissedAppendNotification(TableBucket bucket) {
+        if (missedAppendNotifications.putIfAbsent(bucket, Boolean.TRUE) == null) {
+            missedAppendNotificationQueue.add(bucket);
+        }
+    }
+
+    /** Returns one bucket whose append callback failed, or {@code null} when none remain. */
+    @Nullable
+    TableBucket pollMissedAppendNotification() {
+        TableBucket bucket;
+        while ((bucket = missedAppendNotificationQueue.poll()) != null) {
+            if (missedAppendNotifications.remove(bucket) != null) {
+                return bucket;
+            }
+        }
+        return null;
+    }
+
+    @VisibleForTesting
+    int missedAppendNotificationCountForTesting() {
+        return missedAppendNotifications.size();
     }
 
     /**
@@ -213,15 +253,16 @@ public final class IndexAccumulator {
      */
     @Nullable
     public IndexBatch pollFirst(TableBucket bucket) {
-        Deque<IndexBatch> deque = batches.get(bucket);
-        if (deque == null) {
-            return null;
-        }
-        IndexBatch batch;
-        synchronized (deque) {
-            batch = deque.pollFirst();
-        }
-        return batch;
+        IndexBatch[] result = new IndexBatch[1];
+        batches.computeIfPresent(
+                bucket,
+                (ignored, deque) -> {
+                    synchronized (deque) {
+                        result[0] = deque.pollFirst();
+                        return deque.isEmpty() ? null : deque;
+                    }
+                });
+        return result[0];
     }
 
     /**
@@ -231,19 +272,23 @@ public final class IndexAccumulator {
      */
     @Nullable
     public IndexBatch pollFirstReady(TableBucket bucket, long nowMs) {
-        Deque<IndexBatch> deque = batches.get(bucket);
-        if (deque == null) {
-            return null;
-        }
-        IndexBatch batch;
-        synchronized (deque) {
-            IndexBatch head = deque.peekFirst();
-            if (head == null || head.readyAtMs() > nowMs) {
-                return null;
-            }
-            batch = deque.pollFirst();
-        }
-        return batch;
+        IndexBatch[] result = new IndexBatch[1];
+        batches.computeIfPresent(
+                bucket,
+                (ignored, deque) -> {
+                    synchronized (deque) {
+                        IndexBatch head = deque.peekFirst();
+                        if (head == null) {
+                            return null;
+                        }
+                        if (head.readyAtMs() > nowMs) {
+                            return deque;
+                        }
+                        result[0] = deque.pollFirst();
+                        return deque.isEmpty() ? null : deque;
+                    }
+                });
+        return result[0];
     }
 
     /**
@@ -257,13 +302,18 @@ public final class IndexAccumulator {
                 if (!batch.ownerActive() || batch.isReleased()) {
                     return false;
                 }
-                Deque<IndexBatch> deque =
-                        batches.computeIfAbsent(batch.targetBucket(), k -> new ArrayDeque<>());
-                batch.setReadyAtMs(readyAtMs);
-                batch.reEnqueued();
-                synchronized (deque) {
-                    deque.addFirst(batch);
-                }
+                batches.compute(
+                        batch.targetBucket(),
+                        (ignored, current) -> {
+                            Deque<IndexBatch> deque =
+                                    current == null ? new ArrayDeque<>() : current;
+                            synchronized (deque) {
+                                batch.setReadyAtMs(readyAtMs);
+                                batch.reEnqueued();
+                                deque.addFirst(batch);
+                                return deque;
+                            }
+                        });
                 return true;
             }
         }
@@ -271,13 +321,16 @@ public final class IndexAccumulator {
 
     /** Remove the exact batch from its target queue without changing pending-byte accounting. */
     public boolean remove(IndexBatch batch) {
-        Deque<IndexBatch> deque = batches.get(batch.targetBucket());
-        if (deque == null) {
-            return false;
-        }
-        synchronized (deque) {
-            return removeExact(deque, batch);
-        }
+        boolean[] removed = new boolean[1];
+        batches.computeIfPresent(
+                batch.targetBucket(),
+                (ignored, deque) -> {
+                    synchronized (deque) {
+                        removed[0] = removeExact(deque, batch);
+                        return deque.isEmpty() ? null : deque;
+                    }
+                });
+        return removed[0];
     }
 
     /** Release pending-byte accounting for a batch that reached a terminal state. */
@@ -325,23 +378,24 @@ public final class IndexAccumulator {
      * table that may still have a live leader.
      */
     public int dropForReplicator(IndexReplicator owner) {
-        int dropped = 0;
         Set<IndexBatch> droppedBatches = new HashSet<>();
-        // Keep deque identities stable for the accumulator lifetime. A concurrent publisher may
-        // already hold this deque reference before taking its monitor.
-        for (Deque<IndexBatch> deque : batches.values()) {
-            synchronized (deque) {
-                Iterator<IndexBatch> it = deque.iterator();
-                while (it.hasNext()) {
-                    IndexBatch batch = it.next();
-                    IndexWindow window = batch.window();
-                    if (window != null && window.owner() == owner) {
-                        it.remove();
-                        droppedBatches.add(batch);
-                        dropped++;
-                    }
-                }
-            }
+        for (TableBucket bucket : new ArrayList<>(batches.keySet())) {
+            batches.computeIfPresent(
+                    bucket,
+                    (ignored, deque) -> {
+                        synchronized (deque) {
+                            Iterator<IndexBatch> it = deque.iterator();
+                            while (it.hasNext()) {
+                                IndexBatch batch = it.next();
+                                IndexWindow window = batch.window();
+                                if (window != null && window.owner() == owner) {
+                                    it.remove();
+                                    droppedBatches.add(batch);
+                                }
+                            }
+                            return deque.isEmpty() ? null : deque;
+                        }
+                    });
         }
         for (IndexBatch batch : droppedBatches) {
             release(batch);
@@ -360,6 +414,6 @@ public final class IndexAccumulator {
                 LOG.warn("Error notifying dropped index batch for replicator {}", owner, failure);
             }
         }
-        return dropped;
+        return droppedBatches.size();
     }
 }
