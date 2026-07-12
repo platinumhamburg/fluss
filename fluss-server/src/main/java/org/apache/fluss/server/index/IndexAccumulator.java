@@ -83,21 +83,25 @@ public final class IndexAccumulator {
 
     /** Append a batch to the tail of its target bucket's queue. */
     public void append(IndexBatch batch) {
-        synchronized (batch) {
-            if (!batch.ownerActive() || batch.isReleased()) {
-                return;
+        // Publication order is window -> batch -> deque. Sender lifecycle code never acquires its
+        // lifecycle lock while holding any of these monitors.
+        synchronized (batch.window()) {
+            synchronized (batch) {
+                if (!batch.ownerActive() || batch.isReleased()) {
+                    return;
+                }
+                Deque<IndexBatch> deque =
+                        batches.computeIfAbsent(batch.targetBucket(), k -> new ArrayDeque<>());
+                synchronized (deque) {
+                    deque.addLast(batch);
+                }
+                long bytes = batch.encoded().getBytesLength();
+                pendingBytes.addAndGet(bytes);
+                pendingBytesByReplicator
+                        .computeIfAbsent(batch.window().owner(), ignored -> new AtomicLong())
+                        .addAndGet(bytes);
+                batch.markAccounted();
             }
-            Deque<IndexBatch> deque =
-                    batches.computeIfAbsent(batch.targetBucket(), k -> new ArrayDeque<>());
-            synchronized (deque) {
-                deque.addLast(batch);
-            }
-            long bytes = batch.encoded().getBytesLength();
-            pendingBytes.addAndGet(bytes);
-            pendingBytesByReplicator
-                    .computeIfAbsent(batch.window().owner(), ignored -> new AtomicLong())
-                    .addAndGet(bytes);
-            batch.markAccounted();
         }
         Consumer<TableBucket> listener = this.appendListener;
         if (listener != null) {
@@ -189,13 +193,26 @@ public final class IndexAccumulator {
         return batch;
     }
 
-    /** Re-enqueue a failed batch at the front of its bucket queue, preserving per-bucket order. */
-    public void reEnqueue(IndexBatch batch) {
-        batch.reEnqueued();
-        Deque<IndexBatch> deque =
-                batches.computeIfAbsent(batch.targetBucket(), k -> new ArrayDeque<>());
-        synchronized (deque) {
-            deque.addFirst(batch);
+    /**
+     * Publish a retry only while its window and accounting ownership are active. The final state
+     * check, attempt increment, deadline, and deque insertion linearize under the window monitor
+     * against {@link IndexWindow#tryFailAndDrain(Throwable)}.
+     */
+    public boolean reEnqueueIfActive(IndexBatch batch, long readyAtMs) {
+        synchronized (batch.window()) {
+            synchronized (batch) {
+                if (!batch.ownerActive() || batch.isReleased()) {
+                    return false;
+                }
+                Deque<IndexBatch> deque =
+                        batches.computeIfAbsent(batch.targetBucket(), k -> new ArrayDeque<>());
+                batch.setReadyAtMs(readyAtMs);
+                batch.reEnqueued();
+                synchronized (deque) {
+                    deque.addFirst(batch);
+                }
+                return true;
+            }
         }
     }
 

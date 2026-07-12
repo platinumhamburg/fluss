@@ -76,9 +76,10 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
  *
  * <p>Reliability follows at-least-once semantics: on RPC failure (or unresolved leader) the batch
  * is re-enqueued to the front of its bucket queue via {@link
- * IndexAccumulator#reEnqueue(IndexBatch)} for unlimited retry, and the owning window's offset is
- * never advanced. On success the batch notifies its window via {@link IndexBatch#window()}, which
- * advances the replicator's pushed offset once the whole window is acknowledged.
+ * IndexAccumulator#reEnqueueIfActive(IndexBatch, long)} for unlimited retry, and the owning
+ * window's offset is never advanced. On success the batch notifies its window via {@link
+ * IndexBatch#window()}, which advances the replicator's pushed offset once the whole window is
+ * acknowledged.
  */
 @Internal
 @ThreadSafe
@@ -108,6 +109,8 @@ public final class IndexSender implements AutoCloseable {
         default void beforeProgressCallback() {}
 
         default void beforeBatchRequeue() {}
+
+        default void beforeRetryPublication() {}
     }
 
     private static final Logger LOG = LoggerFactory.getLogger(IndexSender.class);
@@ -1283,10 +1286,12 @@ public final class IndexSender implements AutoCloseable {
     private void failOversizedBatch(IndexBatch batch, RequestSizeAccumulator size) {
         RecordTooLargeException failure = oversizedFailure(batch, size);
         IndexWindow window = batch.window();
-        if (window.tryFail(failure)) {
-            metrics.indexPushErrors().inc();
+        List<IndexBatch> siblings = window.tryFailAndDrain(failure);
+        if (siblings == null) {
+            return;
         }
-        releaseWindowBatches(window);
+        metrics.indexPushErrors().inc();
+        releaseWindowBatches(siblings);
     }
 
     private RecordTooLargeException oversizedFailure(
@@ -1317,13 +1322,15 @@ public final class IndexSender implements AutoCloseable {
                         + maxTransportRequestBytes);
     }
 
-    private void releaseWindowBatches(IndexWindow window) {
-        List<IndexBatch> siblings = window.batches();
+    private void releaseWindowBatches(List<IndexBatch> siblings) {
         List<BatchAction> actions = new ArrayList<>();
         lifecycleLock.lock();
         try {
             for (IndexBatch sibling : siblings) {
                 addOwnedBatchActionLocked(actions, sibling, BatchDisposition.RELEASE);
+                // A sibling may already be between lifecycle admission and accounting. Its local
+                // action retains enough ownership to finish, so the sender registry can be cleared.
+                ownedBatches.remove(sibling);
             }
             beginAccountingLocked(actions);
         } finally {
@@ -1423,20 +1430,14 @@ public final class IndexSender implements AutoCloseable {
             for (BatchAction action : actions) {
                 if (action.disposition == BatchDisposition.REQUEUE) {
                     IndexBatch batch = action.batch;
-                    if (!batch.ownerActive()) {
-                        accumulator.release(batch);
-                        continue;
-                    }
                     lifecycleHooks.beforeBatchRequeue();
-                    if (!batch.ownerActive()) {
-                        accumulator.release(batch);
-                        continue;
-                    }
-                    // Publish the retry deadline before putting the batch back in its queue.
-                    batch.setReadyAtMs(
+                    long readyAtMs =
                             System.currentTimeMillis()
-                                    + retryDelayMs(batch.attempts() + 1));
-                    accumulator.reEnqueue(batch);
+                                    + retryDelayMs(batch.attempts() + 1);
+                    lifecycleHooks.beforeRetryPublication();
+                    if (!accumulator.reEnqueueIfActive(batch, readyAtMs)) {
+                        accumulator.release(batch);
+                    }
                 } else {
                     accumulator.release(action.batch);
                 }
@@ -1555,13 +1556,4 @@ public final class IndexSender implements AutoCloseable {
         return req;
     }
 
-    @VisibleForTesting
-    static long serializedRequestSize(PutKvRequest request) {
-        RequestSizeAccumulator size =
-                newRequestSizeAccumulator(request.getTableId(), request.getTimeoutMs());
-        for (PbPutKvReqForBucket bucket : request.getBucketsReqsList()) {
-            size.addBucket(bucket.getBucketId(), bucket.getRecordsSlice().readableBytes());
-        }
-        return size.framedBytes();
-    }
 }

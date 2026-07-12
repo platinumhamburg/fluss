@@ -20,6 +20,7 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
@@ -78,7 +79,8 @@ public class IndexSenderTest {
         PUT_KV_INVOCATION,
         PUT_KV_COMPLETION,
         PROGRESS_CALLBACK,
-        BATCH_REQUEUE
+        BATCH_REQUEUE,
+        RETRY_PUBLICATION
     }
 
     private static final class BlockingLifecycleHooks implements IndexSender.LifecycleHooks {
@@ -109,6 +111,11 @@ public class IndexSenderTest {
         @Override
         public void beforeBatchRequeue() {
             blockAt(LifecyclePoint.BATCH_REQUEUE);
+        }
+
+        @Override
+        public void beforeRetryPublication() {
+            blockAt(LifecyclePoint.RETRY_PUBLICATION);
         }
 
         private void blockAt(LifecyclePoint candidate) {
@@ -841,8 +848,12 @@ public class IndexSenderTest {
         try {
             await(() -> owner.getSyncIndexPushedOffset() == 10L);
             assertThat(gateway.requests).hasSize(1);
-            assertThat(IndexSender.serializedRequestSize(gateway.requests.get(0)))
+            assertThat(
+                            Integer.BYTES
+                                    + MessageCodec.REQUEST_HEADER_LENGTH
+                                    + gateway.requests.get(0).totalSize())
                     .isEqualTo(exactRequestBytes);
+            assertThat(encodedBatch.window().registeredBatchCount()).isZero();
         } finally {
             sender.close();
         }
@@ -935,8 +946,74 @@ public class IndexSenderTest {
             assertThat(large.attempts()).isZero();
             assertThat(sibling.attempts()).isZero();
             assertThat(accumulator.hasUnsent()).isFalse();
+            assertThat(window.registeredBatchCount()).isZero();
         } finally {
             sender.close();
+        }
+    }
+
+    @Test
+    void terminalizationAtFinalRetryPublicationBoundaryPreventsRetry() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        long tableId = 49L;
+        int retryBucketId = 0;
+        int oversizedBucketId = 1;
+        while (Math.floorMod(new TableBucket(tableId, retryBucketId).hashCode(), 2)
+                == Math.floorMod(new TableBucket(tableId, oversizedBucketId).hashCode(), 2)) {
+            oversizedBucketId++;
+        }
+        TableBucket retryBucket = new TableBucket(tableId, retryBucketId);
+        TableBucket oversizedBucket = new TableBucket(tableId, oversizedBucketId);
+        IndexReplicator owner = ownerWithIndex(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        owner.registerInFlightWindow("idx", window);
+        IndexBatch retry = batchOfSize(retryBucket, window, 1);
+        IndexBatch oversized = batchOfSize(oversizedBucket, window, 1024 * 1024);
+        BlockingLifecycleHooks hooks =
+                new BlockingLifecycleHooks(LifecyclePoint.RETRY_PUBLICATION);
+        accumulator.append(retry);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        2,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        exactRequestBytes(retryBucket, retry),
+                        5_000L,
+                        hooks);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            assertThat(owner.inFlightWindow("idx")).isSameAs(window);
+            await(() -> gateway.pending.size() == 1);
+            Future<?> failedRequest =
+                    executor.submit(() -> completePutKv(gateway, 0, false));
+            hooks.awaitReached();
+
+            accumulator.append(oversized);
+            await(() -> owner.terminalFailure() != null);
+            await(() -> accumulator.pendingBytes() == 0L);
+
+            hooks.release();
+            failedRequest.get(5, TimeUnit.SECONDS);
+
+            assertThat(retry.attempts()).isZero();
+            assertThat(oversized.attempts()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(gateway.requests).hasSize(1);
+            assertThat(window.registeredBatchCount()).isZero();
+            assertThat(owner.inFlightWindow("idx")).isNull();
+            assertThat(owner.getSyncIndexPushedOffset()).isZero();
+        } finally {
+            hooks.release();
+            sender.close();
+            executor.shutdownNow();
         }
     }
 
@@ -1070,25 +1147,61 @@ public class IndexSenderTest {
     }
 
     @Test
-    void exactSizerMatchesGeneratedCodecForLargeVarintWidths() {
-        long tableId = Long.MAX_VALUE;
-        int bucketId = Integer.MAX_VALUE;
-        IndexSender.RequestSizeAccumulator size =
-                IndexSender.newRequestSizeAccumulator(tableId, 5_000L);
-        size.addBucket(bucketId, 17L);
-        PutKvRequest request =
-                new PutKvRequest()
-                        .setTableId(tableId)
-                        .setAcks(-1)
-                        .setTimeoutMs(5_000)
-                        .setAggMode(MergeMode.OVERWRITE.getProtoValue());
-        request.addBucketsReq()
-                .setBucketId(bucketId)
-                .setRecordsBytesView(
-                        new MemorySegmentBytesView(MemorySegment.wrap(new byte[17]), 0, 17));
+    void exactSizerMatchesGeneratedCodecAcrossVarintAndRecordBoundaries() {
+        long[] tableIds =
+                new long[] {
+                    Long.MIN_VALUE, -1L, 0L, 127L, 128L, 16_383L, 16_384L, Long.MAX_VALUE
+                };
+        int[] bucketIds =
+                new int[] {
+                    Integer.MIN_VALUE,
+                    -1,
+                    0,
+                    127,
+                    128,
+                    16_383,
+                    16_384,
+                    Integer.MAX_VALUE
+                };
+        int[] recordLengths = new int[] {0, 1, 127, 128, 16_383, 16_384};
 
-        assertThat(size.framedBytes()).isEqualTo(IndexSender.serializedRequestSize(request));
-        assertThat(size.codecRepresentable()).isTrue();
+        for (long tableId : tableIds) {
+            for (int bucketId : bucketIds) {
+                for (int recordLength : recordLengths) {
+                    IndexSender.RequestSizeAccumulator size =
+                            IndexSender.newRequestSizeAccumulator(tableId, 5_000L);
+                    size.addBucket(bucketId, recordLength);
+                    PutKvRequest request =
+                            new PutKvRequest()
+                                    .setTableId(tableId)
+                                    .setAcks(-1)
+                                    .setTimeoutMs(5_000)
+                                    .setAggMode(MergeMode.OVERWRITE.getProtoValue());
+                    PbPutKvReqForBucket bucket =
+                            request.addBucketsReq()
+                                    .setBucketId(bucketId)
+                                    .setRecordsBytesView(
+                                            new MemorySegmentBytesView(
+                                                    MemorySegment.wrap(new byte[recordLength]),
+                                                    0,
+                                                    recordLength));
+
+                    assertThat(request.hasAggMode()).isTrue();
+                    assertThat(bucket.hasPartitionId()).isFalse();
+                    assertThat(size.codecRepresentable()).isTrue();
+                    assertThat(size.framedBytes())
+                            .as(
+                                    "tableId=%s, bucketId=%s, records=%s",
+                                    tableId,
+                                    bucketId,
+                                    recordLength)
+                            .isEqualTo(
+                                    Integer.BYTES
+                                            + MessageCodec.REQUEST_HEADER_LENGTH
+                                            + request.totalSize());
+                }
+            }
+        }
     }
 
     @Test
@@ -1199,6 +1312,26 @@ public class IndexSenderTest {
 
     private static IndexReplicator owner(IndexAccumulator accumulator) {
         return owner(accumulator, (sync, all) -> {});
+    }
+
+    private static IndexReplicator ownerWithIndex(IndexAccumulator accumulator) {
+        IndexSpec spec =
+                new IndexSpec(
+                        "idx",
+                        IndexVisibility.SYNC,
+                        1L,
+                        1,
+                        KvFormat.COMPACTED,
+                        new int[] {0},
+                        row -> null);
+        return new IndexReplicator(
+                null,
+                Collections.singletonList(spec),
+                accumulator,
+                null,
+                0L,
+                1024,
+                (sync, all) -> {});
     }
 
     private static IndexReplicator owner(

@@ -19,6 +19,8 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 
+import javax.annotation.Nullable;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -67,15 +69,36 @@ final class IndexWindow {
     }
 
     synchronized void register(IndexBatch batch) {
-        batches.add(batch);
+        if (!terminal) {
+            batches.add(batch);
+        }
     }
 
-    synchronized List<IndexBatch> batches() {
-        return new ArrayList<>(batches);
+    /**
+     * Atomically fail this window and transfer ownership of its registered batches to the caller.
+     * A null result means another terminal transition won.
+     */
+    @Nullable
+    List<IndexBatch> tryFailAndDrain(Throwable failure) {
+        List<IndexBatch> drained;
+        synchronized (this) {
+            if (terminal) {
+                return null;
+            }
+            terminal = true;
+            drained = new ArrayList<>(batches);
+            batches.clear();
+        }
+        owner.onWindowFailed(indexName, this, failure);
+        return drained;
     }
 
     synchronized boolean isActive() {
         return !terminal;
+    }
+
+    synchronized int registeredBatchCount() {
+        return batches.size();
     }
 
     /**
@@ -89,6 +112,7 @@ final class IndexWindow {
         synchronized (this) {
             if (!terminal && --remaining == 0) {
                 terminal = true;
+                batches.clear();
                 completed = true;
             }
         }
@@ -97,21 +121,4 @@ final class IndexWindow {
         }
     }
 
-    /** Fail this window terminally without advancing its source pushed offset. */
-    void onBatchFailed(Throwable failure) {
-        tryFail(failure);
-    }
-
-    boolean tryFail(Throwable failure) {
-        synchronized (this) {
-            if (terminal) {
-                return false;
-            }
-            terminal = true;
-        }
-        if (failure != null) {
-            owner.onWindowFailed(failure);
-        }
-        return true;
-    }
 }

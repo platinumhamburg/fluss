@@ -217,11 +217,16 @@ public final class IndexReplicator implements AutoCloseable {
         long hw = sourceWal.highWatermark();
         boolean polled = false;
         for (IndexProgressState state : indexStates) {
-            if (closed.get() || accumulator.isFull(this)) {
+            if (closed.get() || terminalFailure.get() != null || accumulator.isFull(this)) {
                 break;
             }
             if (state.inFlightWindow != null) {
                 continue;
+            }
+            // Failure is published before its matching in-flight reference is cleared. Recheck
+            // after observing an empty slot so this poll cannot start a successor window.
+            if (terminalFailure.get() != null) {
+                break;
             }
             if (state.pushedOffset < 0) {
                 state.pushedOffset = sourceWal.logStartOffset();
@@ -321,7 +326,7 @@ public final class IndexReplicator implements AutoCloseable {
         IndexWindow window =
                 new IndexWindow(
                         state.spec.getIndexName(), lastProcessedOffset, encoded.size(), this);
-        state.inFlightWindow = window;
+        registerInFlightWindow(state.spec.getIndexName(), window);
         List<IndexBatch> batches = new ArrayList<>(encoded.size());
         for (Map.Entry<TableBucket, BytesView> entry : encoded.entrySet()) {
             batches.add(new IndexBatch(entry.getKey(), entry.getValue(), window));
@@ -380,8 +385,20 @@ public final class IndexReplicator implements AutoCloseable {
         }
     }
 
-    void onWindowFailed(Throwable failure) {
-        if (terminalFailure.compareAndSet(null, failure)) {
+    void registerInFlightWindow(String indexName, IndexWindow window) {
+        IndexProgressState state = indexStatesByName.get(indexName);
+        if (state != null) {
+            state.inFlightWindow = window;
+        }
+    }
+
+    void onWindowFailed(String indexName, IndexWindow window, Throwable failure) {
+        boolean firstFailure = terminalFailure.compareAndSet(null, failure);
+        IndexProgressState state = indexStatesByName.get(indexName);
+        if (state != null && state.inFlightWindow == window) {
+            state.inFlightWindow = null;
+        }
+        if (firstFailure) {
             LOG.error(
                     "Index replication for source bucket {} failed terminally at pushed offset {}",
                     sourceWal == null ? "unknown" : sourceWal.tableBucket(),
@@ -394,6 +411,13 @@ public final class IndexReplicator implements AutoCloseable {
     @Nullable
     Throwable terminalFailure() {
         return terminalFailure.get();
+    }
+
+    @VisibleForTesting
+    @Nullable
+    IndexWindow inFlightWindow(String indexName) {
+        IndexProgressState state = indexStatesByName.get(indexName);
+        return state == null ? null : state.inFlightWindow;
     }
 
     private MutationGroup readMutationGroup(

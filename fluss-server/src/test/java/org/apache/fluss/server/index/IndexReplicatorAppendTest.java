@@ -555,6 +555,38 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
+    void terminalWindowFailureClearsMatchingInFlightWithoutAdvancing() throws Exception {
+        PollFixture fixture =
+                pollFixture(
+                        5L,
+                        1024,
+                        Collections.singletonList(
+                                Collections.singletonList(
+                                        record(5L, ChangeType.INSERT, row(1L, 10L, 100L)))));
+
+        assertThat(fixture.replicator.poll()).isTrue();
+        IndexWindow window = fixture.replicator.inFlightWindow("idx");
+        RuntimeException failure = new RuntimeException("terminal failure");
+
+        assertThat(window).isNotNull();
+        List<IndexBatch> drained = window.tryFailAndDrain(failure);
+
+        assertThat(drained).hasSize(1);
+        for (IndexBatch batch : drained) {
+            fixture.accumulator.remove(batch);
+            fixture.accumulator.release(batch);
+        }
+
+        assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
+        assertThat(fixture.replicator.terminalFailure()).isSameAs(failure);
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(5L);
+        assertThat(fixture.replicator.getAllIndexPushedOffset()).isEqualTo(5L);
+        assertThat(window.registeredBatchCount()).isZero();
+        assertThat(fixture.accumulator.pendingBytes()).isZero();
+        assertThat(fixture.accumulator.hasUnsent()).isFalse();
+    }
+
+    @Test
     void deleteEmitsPhysicalDeleteOnly() {
         IndexReplicator replicator = newReplicator();
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();

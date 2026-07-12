@@ -122,7 +122,7 @@ public class IndexWindowTest {
         IndexWindow window = new IndexWindow("idx", 42L, 1, replicator);
         RecordTooLargeException failure = new RecordTooLargeException("too large");
 
-        window.onBatchFailed(failure);
+        assertThat(window.tryFailAndDrain(failure)).isEmpty();
         window.onBatchAcked();
 
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(10L);

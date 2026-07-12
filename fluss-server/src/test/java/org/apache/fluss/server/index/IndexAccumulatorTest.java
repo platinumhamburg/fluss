@@ -64,7 +64,7 @@ public class IndexAccumulatorTest {
 
         // Poll the head, then a failed send re-enqueues it to the front.
         assertThat(accumulator.pollFirst(bucket)).isSameAs(first);
-        accumulator.reEnqueue(first);
+        assertThat(accumulator.reEnqueueIfActive(first, 0L)).isTrue();
 
         // Re-enqueued batch must come back before the rest, preserving order.
         assertThat(accumulator.pollFirst(bucket)).isSameAs(first);
