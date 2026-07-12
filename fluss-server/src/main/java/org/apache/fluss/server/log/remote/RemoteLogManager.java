@@ -333,6 +333,7 @@ public class RemoteLogManager implements Closeable {
                                     remoteLog,
                                     remoteLogStorage,
                                     coordinatorGateway,
+                                    () -> zkClient.getRemoteLogManifestHandle(tableBucket),
                                     clock,
                                     maxUploadSegmentsPerTask);
                     LOG.info(

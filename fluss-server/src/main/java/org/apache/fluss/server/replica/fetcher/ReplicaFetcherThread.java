@@ -55,7 +55,9 @@ import javax.annotation.concurrent.GuardedBy;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Collections;
 import java.util.HashSet;
@@ -105,6 +107,8 @@ final class ReplicaFetcherThread extends ShutdownableThread {
 
     private final TabletServerMetricGroup serverMetricGroup;
     private RemoteWriterStateRecovery remoteWriterStateRecovery = this::recoverRemoteWriterState;
+    private SnapshotFileMover snapshotFileMover =
+            (source, target) -> FileUtils.atomicMoveWithFallback(source, target, false);
 
     public ReplicaFetcherThread(
             String name, ReplicaManager replicaManager, LeaderEndpoint leader, int fetchBackOffMs) {
@@ -677,17 +681,30 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                 nextFetchOffset);
     }
 
-    private void buildWriterIdSnapshotFile(
+    void buildWriterIdSnapshotFile(
             File snapshotFile, RemoteLogSegment remoteLogSegment, RemoteLogManager rlm)
             throws RemoteStorageException, IOException {
         File tmpSnapshotFile = new File(snapshotFile.getAbsolutePath() + ".tmp");
-        // Copy it to snapshot file in atomic manner.
-        Files.copy(
+        try (InputStream snapshotInput =
                 rlm.getRemoteLogStorage()
-                        .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT),
-                tmpSnapshotFile.toPath(),
-                StandardCopyOption.REPLACE_EXISTING);
-        FileUtils.atomicMoveWithFallback(tmpSnapshotFile.toPath(), snapshotFile.toPath(), false);
+                        .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT)) {
+            Files.copy(
+                    snapshotInput,
+                    tmpSnapshotFile.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING);
+            snapshotFileMover.move(tmpSnapshotFile.toPath(), snapshotFile.toPath());
+        } catch (RemoteStorageException | IOException | RuntimeException | Error failure) {
+            try {
+                Files.deleteIfExists(tmpSnapshotFile.toPath());
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    void setSnapshotFileMover(SnapshotFileMover snapshotFileMover) {
+        this.snapshotFileMover = snapshotFileMover;
     }
 
     @FunctionalInterface
@@ -695,6 +712,11 @@ final class ReplicaFetcherThread extends ShutdownableThread {
         void recover(
                 Replica replica, RemoteLogFetchInfo remoteLogFetchInfo, long nextFetchOffset)
                 throws Exception;
+    }
+
+    @FunctionalInterface
+    interface SnapshotFileMover {
+        void move(Path source, Path target) throws IOException;
     }
 
     private void truncate(TableBucket tableBucket, long offset) {

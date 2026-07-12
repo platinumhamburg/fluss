@@ -29,6 +29,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
+import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.BinaryRow;
@@ -42,6 +43,8 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.replica.Replica;
+import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.replica.fetcher.InitialFetchStatus;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
@@ -50,6 +53,7 @@ import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -62,7 +66,9 @@ import java.util.Optional;
 
 import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
+import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -85,8 +91,7 @@ class IndexTargetRecoveryITCase {
                     .build();
 
     @Test
-    void testSparseSequenceSurvivesJointRemoteRecoveryAndRejectsDelayedWrite()
-            throws Exception {
+    void testLiveFollowerReplaysCommittedSnapshotToLogEndBeforePromotion() throws Exception {
         TablePath mainPath = TablePath.of(DB, MAIN_TABLE);
         TablePath indexPath =
                 TablePath.of(DB, IndexTableUtils.indexTableName(MAIN_TABLE, INDEX_NAME));
@@ -113,6 +118,15 @@ class IndexTargetRecoveryITCase {
                         .tableId;
         TableBucket indexBucket = new TableBucket(indexTableId, 0);
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(indexBucket);
+        TableBucket mainBucket = new TableBucket(mainTableId, 0);
+        Replica mainLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
+        waitUntil(
+                () -> mainLeader.getIndexReplicator() != null,
+                Duration.ofSeconds(30),
+                "wait for IndexReplicator");
+        int mainLeaderId = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(mainBucket);
+        TabletServerGateway mainGateway =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(mainLeaderId);
 
         int originalLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(indexBucket);
         ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
@@ -121,53 +135,65 @@ class IndexTargetRecoveryITCase {
         List<Integer> replicas = assignment.get().getBucketAssignment(0).getReplicas();
         int followerToPromote =
                 replicas.stream().filter(id -> id != originalLeader).findFirst().orElseThrow();
-        int otherFollower =
-                replicas.stream()
-                        .filter(id -> id != originalLeader && id != followerToPromote)
-                        .findFirst()
-                        .orElseThrow();
+        ReplicaManager followerManager =
+                FLUSS_CLUSTER_EXTENSION
+                        .getTabletServerById(followerToPromote)
+                        .getReplicaManager();
+        followerManager
+                .getReplicaFetcherManager()
+                .removeFetcherForBuckets(Collections.singleton(indexBucket));
+        Replica pausedFollower = followerManager.getReplicaOrException(indexBucket);
+        long pausedFollowerOffset = pausedFollower.getLogTablet().localLogEndOffset();
 
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(followerToPromote);
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(otherFollower);
-        FLUSS_CLUSTER_EXTENSION.waitUntilReplicaShrinkFromIsr(indexBucket, followerToPromote);
-        FLUSS_CLUSTER_EXTENSION.waitUntilReplicaShrinkFromIsr(indexBucket, otherFollower);
+        putMainMutation(mainGateway, mainTableId, 1, "before-update");
+        putMainMutation(mainGateway, mainTableId, 2, "removed-after-snapshot");
 
-        TabletServerGateway originalGateway =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(originalLeader);
-        WriterKey writerKey = IndexWriterKey.encode(new TableBucket(mainTableId, 0));
-        byte[] key = encodeIndexKey("latest", 1);
-        putIndexMutation(originalGateway, indexTableId, writerKey, 100L, key, true);
+        CompletedSnapshot committedKvSnapshot;
+        try {
+            committedKvSnapshot = FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(indexBucket);
+        } catch (Exception failure) {
+            throw new AssertionError("failed target KV snapshot after pre-K writes", failure);
+        }
+        long kvSnapshotOffset = committedKvSnapshot.getLogOffset();
+        assertThat(pausedFollowerOffset).isLessThan(kvSnapshotOffset);
+
         Replica originalReplica =
                 FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(indexBucket);
+        putMainMutation(mainGateway, mainTableId, 1, "after-update");
         originalReplica.getLogTablet().roll(Optional.empty());
-        putIndexMutation(originalGateway, indexTableId, writerKey, 500L, key, true);
+        deleteMainMutation(mainGateway, mainTableId, 2);
+        originalReplica.getLogTablet().roll(Optional.empty());
+        putMainMutation(mainGateway, mainTableId, 3, "inserted-after-snapshot");
         originalReplica.getLogTablet().roll(Optional.empty());
 
-        CompletedSnapshot committedKvSnapshot =
-                FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(indexBucket);
-        long kvSnapshotOffset = committedKvSnapshot.getLogOffset();
-
-        for (long sequence : Arrays.asList(900L, 1_300L, 1_700L)) {
-            putIndexMutation(originalGateway, indexTableId, writerKey, sequence, key, true);
-            originalReplica.getLogTablet().roll(Optional.empty());
-        }
+        WriterKey writerKey = IndexWriterKey.encode(new TableBucket(mainTableId, 0));
+        long expectedFence = mainLeader.getSyncIndexPushedOffset();
 
         LogTablet originalLog = originalReplica.getLogTablet();
         FLUSS_CLUSTER_EXTENSION.waitUntilSomeLogSegmentsCopyToRemote(indexBucket);
         waitUntil(
                 () ->
-                        originalLog.canFetchFromRemoteLog(kvSnapshotOffset)
-                                && originalLog.localLogStartOffset() >= kvSnapshotOffset,
+                        originalLog.canFetchFromRemoteLog(pausedFollowerOffset)
+                                && originalLog.localLogStartOffset() > pausedFollowerOffset,
                 Duration.ofMinutes(2),
-                "wait for target WAL after the committed KV snapshot to be tiered and deleted");
+                "wait for target WAL beyond the live follower to be tiered and deleted");
 
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(followerToPromote);
+        followerManager
+                .getReplicaFetcherManager()
+                .addFetcherForBuckets(
+                        Collections.singletonMap(
+                                indexBucket,
+                                new InitialFetchStatus(
+                                        indexTableId,
+                                        indexPath,
+                                        originalLeader,
+                                        pausedFollowerOffset)));
         FLUSS_CLUSTER_EXTENSION.waitUntilReplicaExpandToIsr(indexBucket, followerToPromote);
         Replica recoveredReplica =
                 FLUSS_CLUSTER_EXTENSION.waitAndGetFollowerReplica(
                         indexBucket, followerToPromote);
         assertThat(recoveredReplica.getLogTablet().localLogStartOffset())
-                .isGreaterThan(kvSnapshotOffset);
+                .isGreaterThan(pausedFollowerOffset);
 
         LeaderAndIsr current = FLUSS_CLUSTER_EXTENSION.waitLeaderAndIsrReady(indexBucket);
         LeaderAndIsr promoted =
@@ -180,21 +206,24 @@ class IndexTargetRecoveryITCase {
                         current.bucketEpoch() + 1);
         FLUSS_CLUSTER_EXTENSION.notifyLeaderAndIsr(
                 followerToPromote, indexPath, indexBucket, promoted, replicas);
-
         waitUntil(
-                () -> {
-                    try {
-                        return recoveredReplica.lookups(Collections.singletonList(key)).get(0)
-                                != null;
-                    } catch (Exception ignored) {
-                        return false;
-                    }
-                },
+                recoveredReplica::isLeader,
                 Duration.ofMinutes(3),
-                "wait for recovered Index Table KV state");
+                "wait for production promotion and synchronous KV replay");
 
-        byte[] valueBefore =
-                recoveredReplica.lookups(Collections.singletonList(key)).get(0);
+        byte[] oldUpdatedKey = encodeIndexKey("before-update", 1);
+        byte[] updatedKey = encodeIndexKey("after-update", 1);
+        byte[] deletedKey = encodeIndexKey("removed-after-snapshot", 2);
+        byte[] insertedKey = encodeIndexKey("inserted-after-snapshot", 3);
+        List<byte[]> recoveredValues =
+                recoveredReplica.lookups(
+                        Arrays.asList(oldUpdatedKey, updatedKey, deletedKey, insertedKey));
+        assertThat(recoveredValues.get(0)).isNull();
+        assertThat(recoveredValues.get(1)).isNotNull();
+        assertThat(recoveredValues.get(2)).isNull();
+        assertThat(recoveredValues.get(3)).isNotNull();
+
+        byte[] insertedValueBefore = recoveredValues.get(3);
         long walEndBefore = recoveredReplica.getLogTablet().localLogEndOffset();
         FencedWriterStateEntry writerStateBefore =
                 recoveredReplica
@@ -202,11 +231,11 @@ class IndexTargetRecoveryITCase {
                         .writerStateManager()
                         .lastFencedEntry(writerKey)
                         .orElseThrow(AssertionError::new);
-        assertThat(writerStateBefore.lastSequence()).isEqualTo(1_700L);
+        assertThat(writerStateBefore.lastSequence()).isEqualTo(expectedFence);
 
         TabletServerGateway promotedGateway =
                 FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(followerToPromote);
-        putIndexMutation(promotedGateway, indexTableId, writerKey, 100L, key, false);
+        putIndexMutation(promotedGateway, indexTableId, writerKey, 0L, insertedKey, false);
 
         assertThat(recoveredReplica.getLogTablet().localLogEndOffset()).isEqualTo(walEndBefore);
         assertThat(
@@ -215,11 +244,8 @@ class IndexTargetRecoveryITCase {
                                 .writerStateManager()
                                 .lastFencedEntry(writerKey))
                 .contains(writerStateBefore);
-        assertThat(recoveredReplica.lookups(Collections.singletonList(key)).get(0))
-                .isEqualTo(valueBefore);
-
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(otherFollower);
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+        assertThat(recoveredReplica.lookups(Collections.singletonList(insertedKey)).get(0))
+                .isEqualTo(insertedValueBefore);
     }
 
     private static Configuration initConfig() {
@@ -240,6 +266,29 @@ class IndexTargetRecoveryITCase {
         row.setField(0, fromString(b));
         row.setField(1, a);
         return new CompactedKeyEncoder(INDEX_ROW_TYPE).encodeKey(row);
+    }
+
+    private static void putMainMutation(
+            TabletServerGateway gateway, long mainTableId, int key, String indexedValue)
+            throws Exception {
+        KvRecordBatch batch = genKvRecordBatch(new Object[] {key, indexedValue});
+        try {
+            gateway.putKv(newPutKvRequest(mainTableId, 0, 1, batch)).get();
+        } catch (Exception failure) {
+            throw new AssertionError("failed main-table UPSERT for key " + key, failure);
+        }
+    }
+
+    private static void deleteMainMutation(
+            TabletServerGateway gateway, long mainTableId, int key) throws Exception {
+        KvRecordBatch batch =
+                genKvRecordBatch(
+                        Collections.singletonList(Tuple2.of(new Object[] {key}, null)));
+        try {
+            gateway.putKv(newPutKvRequest(mainTableId, 0, 1, batch)).get();
+        } catch (Exception failure) {
+            throw new AssertionError("failed main-table DELETE for key " + key, failure);
+        }
     }
 
     private static void putIndexMutation(

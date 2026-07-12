@@ -901,7 +901,8 @@ public final class LogTablet {
     enum AppendPhase {
         BEFORE_LOCAL_APPEND,
         AFTER_LOCAL_APPEND,
-        AFTER_WRITER_STATE_UPDATE
+        AFTER_WRITER_STATE_UPDATE,
+        DURING_WRITER_RECOVERY
     }
 
     interface AppendFaultInjector {
@@ -1400,7 +1401,8 @@ public final class LogTablet {
                     localLog.getSegments(),
                     retainedLogStartOffset,
                     lastOffset,
-                    false);
+                    false,
+                    appendFaultInjector);
         }
     }
 
@@ -1476,6 +1478,23 @@ public final class LogTablet {
             long lastOffset,
             boolean reloadFromCleanShutdown)
             throws IOException {
+        rebuildWriterState(
+                writerStateManager,
+                segments,
+                logStartOffset,
+                lastOffset,
+                reloadFromCleanShutdown,
+                AppendFaultInjector.NO_OP);
+    }
+
+    private static void rebuildWriterState(
+            WriterStateManager writerStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long lastOffset,
+            boolean reloadFromCleanShutdown,
+            AppendFaultInjector recoveryFaultInjector)
+            throws IOException {
         List<Optional<Long>> offsetsToSnapshot = new ArrayList<>();
         if (!segments.isEmpty()) {
             long lastSegmentBaseOffset = segments.lastSegment().get().getBaseOffset();
@@ -1524,8 +1543,15 @@ public final class LogTablet {
             boolean isEmptyBeforeTruncation =
                     writerStateManager.isEmpty() && writerStateManager.mapEndOffset() >= lastOffset;
             long writerStateLoadStart = System.currentTimeMillis();
-            writerStateManager.truncateAndReload(
-                    logStartOffset, lastOffset, System.currentTimeMillis());
+            WriterStateManager recoveryStateManager;
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
+                recoveryStateManager =
+                        writerStateManager.fencedRecoveryCandidate(logStartOffset, lastOffset);
+            } else {
+                writerStateManager.truncateAndReload(
+                        logStartOffset, lastOffset, System.currentTimeMillis());
+                recoveryStateManager = writerStateManager;
+            }
             long segmentRecoveryStart = System.currentTimeMillis();
 
             // Only do the potentially expensive reloading if the last snapshot offset is lower than
@@ -1535,32 +1561,32 @@ public final class LogTablet {
             // could cause a writer id to expire earlier than expected), and we can skip the
             // loading. This is an optimization for users which are not yet using idempotent
             // features yet.
-            if (lastOffset > writerStateManager.mapEndOffset()
+            if (lastOffset > recoveryStateManager.mapEndOffset()
                     && (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
                             || !isEmptyBeforeTruncation)) {
                 Optional<LogSegment> segmentOfLastOffset = segments.floorSegment(lastOffset);
 
                 List<LogSegment> segmentsList =
-                        segments.values(writerStateManager.mapEndOffset(), lastOffset);
+                        segments.values(recoveryStateManager.mapEndOffset(), lastOffset);
                 for (LogSegment segment : segmentsList) {
                     long startOffset =
                             Math.max(
                                     Math.max(
                                             segment.getBaseOffset(),
-                                            writerStateManager.mapEndOffset()),
+                                            recoveryStateManager.mapEndOffset()),
                                     logStartOffset);
                     if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
-                        if (startOffset > writerStateManager.mapEndOffset()) {
-                            throw recoveryGap(writerStateManager, startOffset, lastOffset);
+                        if (startOffset > recoveryStateManager.mapEndOffset()) {
+                            throw recoveryGap(recoveryStateManager, startOffset, lastOffset);
                         }
                     } else {
-                        writerStateManager.updateMapEndOffset(startOffset);
+                        recoveryStateManager.updateMapEndOffset(startOffset);
                     }
 
                     if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT
                             && offsetsToSnapshot.contains(
                                     Optional.of(segment.getBaseOffset()))) {
-                        writerStateManager.takeSnapshot();
+                        recoveryStateManager.takeSnapshot();
                     }
 
                     int maxPosition = segment.getSizeInBytes();
@@ -1575,13 +1601,17 @@ public final class LogTablet {
                     FetchDataInfo fetchDataInfo =
                             segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
                     if (fetchDataInfo != null) {
-                        loadWritersFromRecords(writerStateManager, fetchDataInfo.getRecords());
+                        loadWritersFromRecords(
+                                recoveryStateManager,
+                                fetchDataInfo.getRecords(),
+                                recoveryFaultInjector);
                     }
                 }
             }
 
             if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
-                writerStateManager.validateRecoveryCoverage(logStartOffset, lastOffset);
+                recoveryStateManager.validateRecoveryCoverage(logStartOffset, lastOffset);
+                writerStateManager.publishFencedRecovery(recoveryStateManager, lastOffset);
             } else {
                 writerStateManager.updateMapEndOffset(lastOffset);
             }
@@ -1596,7 +1626,10 @@ public final class LogTablet {
     }
 
     private static void loadWritersFromRecords(
-            WriterStateManager writerStateManager, LogRecords records) {
+            WriterStateManager writerStateManager,
+            LogRecords records,
+            AppendFaultInjector recoveryFaultInjector)
+            throws IOException {
         if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT) {
             Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
             for (LogRecordBatch batch : records.batches()) {
@@ -1638,6 +1671,13 @@ public final class LogTablet {
                         batch.commitTimestamp());
                 writerStateManager.updateFenced(update);
                 writerStateManager.updateMapEndOffset(batch.nextLogOffset());
+                try {
+                    recoveryFaultInjector.inject(AppendPhase.DURING_WRITER_RECOVERY);
+                } catch (Error error) {
+                    throw error;
+                } catch (Exception failure) {
+                    throw new IOException("Injected V1 WriterState recovery failure", failure);
+                }
             }
         }
     }

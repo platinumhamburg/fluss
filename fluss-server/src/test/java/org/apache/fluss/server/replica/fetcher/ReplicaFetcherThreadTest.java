@@ -48,6 +48,8 @@ import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.LogManager;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.log.remote.RemoteLogStorage;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
@@ -78,6 +80,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
@@ -108,6 +111,8 @@ import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWr
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Test for {@link ReplicaFetcherThread}. */
 public class ReplicaFetcherThreadTest {
@@ -708,6 +713,64 @@ public class ReplicaFetcherThreadTest {
         assertThat(endpoint.requestsFor(tb)).isEqualTo(1);
     }
 
+    @Test
+    void testWriterSnapshotCopyFailureClosesStreamAndRemovesTempFile() throws Exception {
+        File snapshotFile = new File(tempDir, "copy-failure.snapshot");
+        RemoteLogSegment segment = remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
+                .remoteLogFetchInfo()
+                .remoteLogSegmentList()
+                .get(0);
+        TrackingInputStream input = new TrackingInputStream(true);
+        RemoteLogManager remoteLogManager = remoteLogManagerReturning(segment, input);
+
+        assertThatThrownBy(
+                        () ->
+                                followerFetcher.buildWriterIdSnapshotFile(
+                                        snapshotFile, segment, remoteLogManager))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("copy failure");
+
+        assertThat(input.closed).isTrue();
+        assertThat(snapshotFile).doesNotExist();
+        assertThat(new File(snapshotFile.getAbsolutePath() + ".tmp")).doesNotExist();
+    }
+
+    @Test
+    void testWriterSnapshotMoveFailureClosesStreamAndRemovesTempFile() throws Exception {
+        File snapshotFile = new File(tempDir, "move-failure.snapshot");
+        RemoteLogSegment segment = remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
+                .remoteLogFetchInfo()
+                .remoteLogSegmentList()
+                .get(0);
+        TrackingInputStream input = new TrackingInputStream(false);
+        RemoteLogManager remoteLogManager = remoteLogManagerReturning(segment, input);
+        followerFetcher.setSnapshotFileMover(
+                (source, target) -> {
+                    throw new IOException("move failure");
+                });
+
+        assertThatThrownBy(
+                        () ->
+                                followerFetcher.buildWriterIdSnapshotFile(
+                                        snapshotFile, segment, remoteLogManager))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("move failure");
+
+        assertThat(input.closed).isTrue();
+        assertThat(snapshotFile).doesNotExist();
+        assertThat(new File(snapshotFile.getAbsolutePath() + ".tmp")).doesNotExist();
+    }
+
+    private RemoteLogManager remoteLogManagerReturning(
+            RemoteLogSegment segment, InputStream input) throws Exception {
+        RemoteLogStorage storage = mock(RemoteLogStorage.class);
+        when(storage.fetchIndex(segment, RemoteLogStorage.IndexType.WRITER_ID_SNAPSHOT))
+                .thenReturn(input);
+        RemoteLogManager remoteLogManager = mock(RemoteLogManager.class);
+        when(remoteLogManager.getRemoteLogStorage()).thenReturn(storage);
+        return remoteLogManager;
+    }
+
     private void registerTableInZkClient() throws Exception {
         ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupRoot();
         zkClient.registerTable(
@@ -782,6 +845,29 @@ public class ReplicaFetcherThreadTest {
                         Collections.singletonList(segment),
                         0),
                 remoteEndOffset);
+    }
+
+    private static final class TrackingInputStream extends InputStream {
+        private final boolean failRead;
+        private int nextByte;
+        private boolean closed;
+
+        private TrackingInputStream(boolean failRead) {
+            this.failRead = failRead;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (failRead) {
+                throw new IOException("copy failure");
+            }
+            return nextByte++ == 0 ? 1 : -1;
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
     }
 
     private void makeLeaderAndFollower() {

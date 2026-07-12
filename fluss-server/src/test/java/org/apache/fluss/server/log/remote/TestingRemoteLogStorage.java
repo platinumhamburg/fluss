@@ -44,6 +44,10 @@ public class TestingRemoteLogStorage extends DefaultRemoteLogStorage {
 
     private final AtomicInteger copySegmentCount = new AtomicInteger(0);
 
+    public int copiedSegmentCount() {
+        return copySegmentCount.get();
+    }
+
     public TestingRemoteLogStorage(Configuration conf, ExecutorService ioExecutor)
             throws IOException {
         super(conf, ioExecutor);

@@ -1872,8 +1872,14 @@ public final class Replica {
         inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
-                    logManager.truncateTo(tableBucket, offset);
-                    retireCurrentTombstonedIndexWriters();
+                    ensureOnline();
+                    try {
+                        logManager.truncateTo(tableBucket, offset);
+                        retireCurrentTombstonedIndexWriters();
+                    } catch (Throwable failure) {
+                        failIndexFollowerRecovery(failure);
+                        rethrowRecoveryFailure(failure);
+                    }
                 });
     }
 
@@ -1882,8 +1888,14 @@ public final class Replica {
         inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
-                    logManager.truncateFullyAndStartAt(tableBucket, newOffset);
-                    retireCurrentTombstonedIndexWriters();
+                    ensureOnline();
+                    try {
+                        logManager.truncateFullyAndStartAt(tableBucket, newOffset);
+                        retireCurrentTombstonedIndexWriters();
+                    } catch (Throwable failure) {
+                        failIndexFollowerRecovery(failure);
+                        rethrowRecoveryFailure(failure);
+                    }
                 });
     }
 
@@ -2479,6 +2491,16 @@ public final class Replica {
                     tableBucket,
                     failure);
         }
+    }
+
+    private static void rethrowRecoveryFailure(Throwable failure) {
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException) failure;
+        }
+        throw new StorageException("V1 WriterState recovery failed", failure);
     }
 
     @VisibleForTesting

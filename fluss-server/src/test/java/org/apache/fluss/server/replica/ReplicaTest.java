@@ -21,6 +21,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
@@ -56,6 +57,7 @@ import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.UncertainWalAppendException;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
+import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
@@ -280,6 +282,74 @@ final class ReplicaTest extends ReplicaTestBase {
                 .isSameAs(injected);
         assertThat(fatalErrors).hasValue(1);
         assertThat(replica.isOnline()).isFalse();
+    }
+
+    @Test
+    void testFailedDestructiveV1RecoveryPublishesNoPartialStateAndPreventsPromotion()
+            throws Exception {
+        long tableId = 997L;
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        TablePath tablePath = TablePath.of("test_db", "matrix_1");
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, tableId, tableBucket);
+        WriterKey writerKey = new WriterKey(8L, 5L);
+        replica.putRecordsToLeader(
+                emptyFencedBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
+        replica.putRecordsToLeader(
+                emptyFencedBatch(writerKey, 500L), null, MergeMode.OVERWRITE, -1);
+        replica.putRecordsToLeader(
+                emptyFencedBatch(writerKey, 900L), null, MergeMode.OVERWRITE, -1);
+        FencedWriterStateEntry stateBefore =
+                replica.getLogTablet()
+                        .writerStateManager()
+                        .lastFencedEntry(writerKey)
+                        .orElseThrow(AssertionError::new);
+
+        replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket,
+                        Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID + 1,
+                                INITIAL_LEADER_EPOCH + 1,
+                                Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                INITIAL_LEADER_EPOCH + 1)));
+        LogTabletTestHelper.failOnceAt(
+                replica.getLogTablet(),
+                FaultPhase.DURING_WRITER_RECOVERY,
+                new IOException("injected recovery failure"));
+
+        assertThatThrownBy(() -> replica.truncateTo(2L)).isInstanceOf(StorageException.class);
+
+        assertThat(replica.isOnline()).isFalse();
+        assertThat(
+                        replica.getLogTablet()
+                                .writerStateManager()
+                                .lastFencedEntry(writerKey))
+                .contains(stateBefore);
+        assertThatThrownBy(
+                        () ->
+                                replica.makeLeader(
+                                        new NotifyLeaderAndIsrData(
+                                                PhysicalTablePath.of(tablePath),
+                                                tableBucket,
+                                                Arrays.asList(
+                                                        TABLET_SERVER_ID,
+                                                        TABLET_SERVER_ID + 1),
+                                                new LeaderAndIsr(
+                                                        TABLET_SERVER_ID,
+                                                        INITIAL_LEADER_EPOCH + 2,
+                                                        Arrays.asList(
+                                                                TABLET_SERVER_ID,
+                                                                TABLET_SERVER_ID + 1),
+                                                        Collections.emptyList(),
+                                                        INITIAL_COORDINATOR_EPOCH,
+                                                        INITIAL_LEADER_EPOCH + 2))))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
     }
 
     @Test

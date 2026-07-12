@@ -20,6 +20,7 @@ package org.apache.fluss.server.log.remote;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
@@ -33,16 +34,22 @@ import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
@@ -121,6 +128,29 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
     }
 
     @ParameterizedTest
+    @EnumSource(InvalidV1Snapshot.class)
+    void testV1TieringPreflightsExactEndSnapshotBeforeRemoteMutation(
+            InvalidV1Snapshot invalidSnapshot) throws Exception {
+        TableBucket tb = makeIndexTableAsLeader(9920L + invalidSnapshot.ordinal());
+        LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addFencedSegments(log, 3);
+        long localStartBefore = log.localLogStartOffset();
+        long firstClosedEnd = log.getSegments().get(1).getBaseOffset();
+        Files.write(
+                FlussPaths.writerSnapshotFile(log.getLogDir(), firstClosedEnd).toPath(),
+                invalidSnapshot.bytes(firstClosedEnd));
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLogStorage.copiedSegmentCount()).isZero();
+        assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
+        assertThat(remoteLog.getRemoteLogEndOffset()).isEmpty();
+        assertThat(log.localLogStartOffset()).isEqualTo(localStartBefore);
+        assertThat(zkClient.getRemoteLogManifestHandle(tb)).isEmpty();
+    }
+
+    @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void testV1TieringFailureDoesNotPublishPartialSegments(boolean manifestFailure)
             throws Exception {
@@ -140,6 +170,117 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
         assertThat(remoteLog.getRemoteLogEndOffset()).isEmpty();
         assertThat(log.localLogStartOffset()).isEqualTo(localStartBefore);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testV1PostCommitResponseLossResolvesAuthoritativeManifest(boolean retry)
+            throws Exception {
+        TableBucket tb = makeIndexTableAsLeader(retry ? 9913L : 9914L);
+        LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addFencedSegments(log, 4);
+        testCoordinatorGateway.loseRemoteLogManifestResponseAfterCommit.set(true);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        if (retry) {
+            remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        }
+
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLog.allRemoteLogSegments()).hasSize(3);
+        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(3L);
+        assertThat(listIndexRemoteLogFiles(tb))
+                .containsExactlyInAnyOrderElementsOf(
+                        remoteLog.allRemoteLogSegments().stream()
+                                .map(segment -> segment.remoteLogSegmentId().toString())
+                                .collect(Collectors.toSet()));
+        assertThat(zkClient.getRemoteLogManifestHandle(tb)).isPresent();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testV1AmbiguousCommitDoesNotDeleteFilesAfterAuthoritativeReplacement(boolean retry)
+            throws Exception {
+        TableBucket tb = makeIndexTableAsLeader(retry ? 9915L : 9916L);
+        LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addFencedSegments(log, 4);
+        RemoteLogManifestHandle authoritativeReplacement =
+                new RemoteLogManifestHandle(
+                        new FsPath("file:///authoritative-replacement"), 4L);
+        testCoordinatorGateway.authoritativeManifestOverride.set(authoritativeReplacement);
+        testCoordinatorGateway.loseRemoteLogManifestResponseAfterCommit.set(true);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        if (retry) {
+            remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        }
+
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
+        assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
+        assertThat(remoteLog.getRemoteLogEndOffset()).isEmpty();
+        assertThat(listIndexRemoteLogFiles(tb)).hasSize(retry ? 6 : 3);
+        assertThat(zkClient.getRemoteLogManifestHandle(tb)).contains(authoritativeReplacement);
+    }
+
+    private Set<String> listIndexRemoteLogFiles(TableBucket tableBucket) throws Exception {
+        FsPath dir =
+                FlussPaths.remoteLogTabletDir(
+                        FlussPaths.remoteLogDir(conf),
+                        replicaManager
+                                .getReplicaOrException(tableBucket)
+                                .getPhysicalTablePath(),
+                        tableBucket);
+        return Arrays.stream(dir.getFileSystem().listStatus(dir))
+                .map(fileStatus -> fileStatus.getPath().getName())
+                .filter(fileName -> !fileName.equals("metadata"))
+                .collect(Collectors.toSet());
+    }
+
+    private enum InvalidV1Snapshot {
+        MALFORMED,
+        PROTOCOL_MISMATCH,
+        DUPLICATE_WRITER,
+        TARGET_OFFSET_AT_END;
+
+        byte[] bytes(long endOffset) {
+            String entries;
+            switch (this) {
+                case MALFORMED:
+                    return "{\"version\":2}".getBytes(StandardCharsets.UTF_8);
+                case PROTOCOL_MISMATCH:
+                    return snapshot(0, entry(4L, 5L, endOffset - 1L))
+                            .getBytes(StandardCharsets.UTF_8);
+                case DUPLICATE_WRITER:
+                    entries =
+                            entry(4L, 5L, endOffset - 1L)
+                                    + ","
+                                    + entry(4L, 5L, endOffset - 1L);
+                    return snapshot(1, entries).getBytes(StandardCharsets.UTF_8);
+                case TARGET_OFFSET_AT_END:
+                    return snapshot(1, entry(4L, 5L, endOffset))
+                            .getBytes(StandardCharsets.UTF_8);
+                default:
+                    throw new AssertionError(this);
+            }
+        }
+
+        private static String snapshot(int protocol, String entries) {
+            return "{\"version\":2,\"kv_idempotence_protocol_version\":"
+                    + protocol
+                    + ",\"writer_entries\":["
+                    + entries
+                    + "]}";
+        }
+
+        private static String entry(long high, long low, long targetOffset) {
+            return "{\"writer_key_high\":"
+                    + high
+                    + ",\"writer_key_low\":"
+                    + low
+                    + ",\"last_sequence\":100,\"last_target_wal_offset\":"
+                    + targetOffset
+                    + ",\"last_timestamp\":1}";
+        }
     }
 
     private TableBucket makeTableBucket(boolean partitionTable) {

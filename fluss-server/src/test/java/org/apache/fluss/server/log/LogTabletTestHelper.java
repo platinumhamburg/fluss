@@ -67,7 +67,8 @@ public final class LogTabletTestHelper {
     public enum FaultPhase {
         BEFORE_LOCAL_APPEND,
         AFTER_LOCAL_APPEND,
-        AFTER_WRITER_STATE_UPDATE
+        AFTER_WRITER_STATE_UPDATE,
+        DURING_WRITER_RECOVERY
     }
 
     /** Test action invoked at a selected append phase. */

@@ -30,8 +30,10 @@ import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
 import org.apache.fluss.server.log.LogSegment;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.WriterStateManager;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.replica.Replica;
+import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.utils.clock.Clock;
 
 import org.slf4j.Logger;
@@ -42,6 +44,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
 
@@ -59,6 +62,7 @@ public class LogTieringTask implements Runnable {
     private final TableBucket tableBucket;
     private final RemoteLogStorage remoteLogStorage;
     private final CoordinatorGateway coordinatorGateway;
+    private final ManifestHandleResolver manifestHandleResolver;
     private final Clock clock;
     private final int maxUploadSegmentsPerTask;
 
@@ -73,6 +77,7 @@ public class LogTieringTask implements Runnable {
             RemoteLogTablet remoteLog,
             RemoteLogStorage remoteLogStorage,
             CoordinatorGateway coordinatorGateway,
+            ManifestHandleResolver manifestHandleResolver,
             Clock clock,
             int maxUploadSegmentsPerTask) {
         this.replica = replica;
@@ -81,6 +86,7 @@ public class LogTieringTask implements Runnable {
         this.tableBucket = replica.getTableBucket();
         this.remoteLogStorage = remoteLogStorage;
         this.coordinatorGateway = coordinatorGateway;
+        this.manifestHandleResolver = manifestHandleResolver;
         this.clock = clock;
         this.maxUploadSegmentsPerTask = maxUploadSegmentsPerTask;
     }
@@ -150,11 +156,11 @@ public class LogTieringTask implements Runnable {
             // 2. try to commit the remote log manifest snapshot to coordinator server and
             // update the local cache of remote log manifest.
             if (!copiedSegments.isEmpty() || !expiredRemoteLogSegments.isEmpty()) {
-                boolean success =
+                ManifestCommitResult commitResult =
                         tryToCommitRemoteLogManifest(
                                 remoteLog, expiredRemoteLogSegments, copiedSegments);
 
-                if (success) {
+                if (commitResult == ManifestCommitResult.COMMITTED) {
                     if (!expiredRemoteLogSegments.isEmpty()) {
                         // 3. For these expiredRemoteLogSegments, we will delete remote log
                         // segment files from remote after commit the remote log manifest.
@@ -168,7 +174,7 @@ public class LogTieringTask implements Runnable {
                         // by 1 to get the last copied segment's highest offset.
                         copiedOffset = endOffset - 1;
                     }
-                } else {
+                } else if (commitResult == ManifestCommitResult.NOT_COMMITTED) {
                     LOG.error(
                             "Failed commit remote log manifest snapshot to coordinator server "
                                     + "for bucket: {}, copied segments: {}, expired segments: {}",
@@ -181,6 +187,11 @@ public class LogTieringTask implements Runnable {
                         // delete remote log segment files already copied in step 1.
                         deleteRemoteLogSegmentFiles(copiedSegments, metricGroup);
                     }
+                } else {
+                    LOG.error(
+                            "Remote log manifest commit outcome is unresolved for bucket {}. "
+                                    + "Keeping copied segments for authoritative reconciliation.",
+                            tableBucket);
                 }
             }
 
@@ -267,6 +278,11 @@ public class LogTieringTask implements Runnable {
                                                         "Missing V1 writer snapshot at "
                                                                 + segmentEndOffset)));
             }
+            for (int segmentIndex = 0; segmentIndex < segments.size(); segmentIndex++) {
+                WriterStateManager.validateFencedSnapshot(
+                        requiredWriterSnapshots.get(segmentIndex).toFile(),
+                        segments.get(segmentIndex).nextSegmentOffset);
+            }
         }
 
         for (int segmentIndex = 0; segmentIndex < segments.size(); segmentIndex++) {
@@ -351,11 +367,12 @@ public class LogTieringTask implements Runnable {
      *     1. apply the build snapshot method (may be copy to/delete from remote)
      *     2. upload the remote log manifest file to remote storage.
      *     3. sending the CommitRemoteLogManifestRequest to coordinator server to try to commit this snapshot.
-     *        - If commit success, we will apply the commit success action (e.g., delete expired remote segments), and return true.
-     *        - If commit failed, we will apply rollback action (i.e., delete the new added remote segments), and return false.
+     *        - A committed result publishes locally and permits expired-segment deletion.
+     *        - A definite rejection permits rollback of newly added segments.
+     *        - An unknown V1 result retains uploaded files without local publication.
      * </pre>
      */
-    public boolean tryToCommitRemoteLogManifest(
+    private ManifestCommitResult tryToCommitRemoteLogManifest(
             RemoteLogTablet remoteLogTablet,
             List<RemoteLogSegment> expiredSegments,
             List<RemoteLogSegment> newAddedSegments) {
@@ -374,7 +391,7 @@ public class LogTieringTask implements Runnable {
                     "Write remote log manifest file to remote storage failed for bucket {}.",
                     tableBucket,
                     e);
-            return false;
+            return ManifestCommitResult.NOT_COMMITTED;
         }
 
         // 2. sending the CommitRemoteLogManifestRequest to coordinator server
@@ -407,17 +424,16 @@ public class LogTieringTask implements Runnable {
                                     + " written remote log manifest file",
                             tableBucket);
                     remoteLogStorage.deleteRemoteLogManifestSnapshot(remoteLogManifestPath);
-                    return false;
+                    return ManifestCommitResult.NOT_COMMITTED;
                 } else {
-                    // commit succeed.
-                    // TODO: commit with version to avoid the manifest has been updated
-                    remoteLogTablet.addAndDeleteLogSegments(newAddedSegments, expiredSegments);
-                    LogTablet logTablet = replica.getLogTablet();
-                    logTablet.updateRemoteLogStartOffset(newRemoteLogStartOffset);
-                    // make the local log cleaner clean log segments that are committed to remote.
-                    logTablet.updateRemoteLogEndOffset(newRemoteLogEndOffset);
-                    logTablet.updateRemoteLogSize(newRemoteLogSize);
-                    return true;
+                    publishCommittedManifest(
+                            remoteLogTablet,
+                            expiredSegments,
+                            newAddedSegments,
+                            newRemoteLogStartOffset,
+                            newRemoteLogEndOffset,
+                            newRemoteLogSize);
+                    return ManifestCommitResult.COMMITTED;
                 }
             } catch (Exception e) {
                 // the commit failed with unexpected exception, like network error, we will
@@ -431,12 +447,56 @@ public class LogTieringTask implements Runnable {
             }
         }
 
-        LOG.error(
-                "Commit remote log manifest failed after retry 10 times for table-bucket {}. "
-                        + "We will ignore this commit but don't delete the remote log "
-                        + "manifest file",
-                tableBucket);
-        return false;
+        if (replica.getLogTablet().writerStateManager().protocol()
+                != KvIdempotenceProtocol.V1_FENCED) {
+            LOG.error(
+                    "Commit remote log manifest failed after retry 10 times for table-bucket {}.",
+                    tableBucket);
+            return ManifestCommitResult.NOT_COMMITTED;
+        }
+
+        RemoteLogManifestHandle attemptedHandle =
+                new RemoteLogManifestHandle(remoteLogManifestPath, newRemoteLogEndOffset);
+        try {
+            Optional<RemoteLogManifestHandle> authoritativeHandle = manifestHandleResolver.resolve();
+            if (authoritativeHandle.filter(attemptedHandle::equals).isPresent()) {
+                publishCommittedManifest(
+                        remoteLogTablet,
+                        expiredSegments,
+                        newAddedSegments,
+                        newRemoteLogStartOffset,
+                        newRemoteLogEndOffset,
+                        newRemoteLogSize);
+                return ManifestCommitResult.COMMITTED;
+            }
+
+            if (!authoritativeHandle.isPresent()) {
+                remoteLogStorage.deleteRemoteLogManifestSnapshot(remoteLogManifestPath);
+                return ManifestCommitResult.NOT_COMMITTED;
+            }
+            return ManifestCommitResult.UNKNOWN;
+        } catch (Exception resolutionFailure) {
+            LOG.error(
+                    "Unable to resolve the authoritative remote log manifest after an ambiguous "
+                            + "V1 commit for table-bucket {}.",
+                    tableBucket,
+                    resolutionFailure);
+            return ManifestCommitResult.UNKNOWN;
+        }
+    }
+
+    private void publishCommittedManifest(
+            RemoteLogTablet remoteLogTablet,
+            List<RemoteLogSegment> expiredSegments,
+            List<RemoteLogSegment> newAddedSegments,
+            long newRemoteLogStartOffset,
+            long newRemoteLogEndOffset,
+            long newRemoteLogSize) {
+        remoteLogTablet.addAndDeleteLogSegments(newAddedSegments, expiredSegments);
+        LogTablet logTablet = replica.getLogTablet();
+        logTablet.updateRemoteLogStartOffset(newRemoteLogStartOffset);
+        logTablet.updateRemoteLogEndOffset(newRemoteLogEndOffset);
+        logTablet.updateRemoteLogSize(newRemoteLogSize);
     }
 
     private boolean commitRemoteLogManifest(CommitRemoteLogManifestData data) throws Exception {
@@ -585,5 +645,16 @@ public class LogTieringTask implements Runnable {
                     + nextSegmentOffset
                     + '}';
         }
+    }
+
+    @FunctionalInterface
+    interface ManifestHandleResolver {
+        Optional<RemoteLogManifestHandle> resolve() throws Exception;
+    }
+
+    private enum ManifestCommitResult {
+        COMMITTED,
+        NOT_COMMITTED,
+        UNKNOWN
     }
 }

@@ -360,6 +360,27 @@ public class WriterStateManagerTest {
     }
 
     @Test
+    void testV1RecoveryCandidateFailureDoesNotPublishSelectedSnapshot() throws Exception {
+        WriterKey writerKey = new WriterKey(4L, 5L);
+        WriterStateManager manager = fencedManager();
+        appendFenced(manager, writerKey, 100L, 4L, 1L);
+        manager.updateMapEndOffset(5L);
+        manager.takeSnapshot();
+        appendFenced(manager, writerKey, 900L, 9L, 2L);
+        manager.updateMapEndOffset(10L);
+
+        WriterStateManager candidate = manager.fencedRecoveryCandidate(5L, 10L);
+        assertThatThrownBy(() -> candidate.validateRecoveryCoverage(5L, 10L))
+                .isInstanceOf(CorruptSnapshotException.class);
+
+        assertThat(manager.mapEndOffset()).isEqualTo(10L);
+        assertThat(manager.lastFencedEntry(writerKey))
+                .get()
+                .extracting(FencedWriterStateEntry::lastSequence)
+                .isEqualTo(900L);
+    }
+
+    @Test
     void testV1SuccessfulReloadAtomicallyReplacesLiveState() throws Exception {
         WriterStateManager manager = fencedManager();
         WriterKey oldKey = new WriterKey(4L, 5L);

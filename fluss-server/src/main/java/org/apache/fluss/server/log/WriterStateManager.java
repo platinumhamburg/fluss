@@ -173,6 +173,36 @@ public class WriterStateManager {
         }
     }
 
+    /** Validate that a V1 snapshot is a complete proof for the exact exclusive end offset. */
+    public static void validateFencedSnapshot(File snapshotFile, long expectedEndOffset) {
+        if (expectedEndOffset < 0L) {
+            throw new CorruptSnapshotException(
+                    "Invalid V1 writer snapshot end offset " + expectedEndOffset);
+        }
+        Path expectedPath =
+                writerSnapshotFile(snapshotFile.getParentFile(), expectedEndOffset)
+                        .toPath()
+                        .toAbsolutePath()
+                        .normalize();
+        Path actualPath = snapshotFile.toPath().toAbsolutePath().normalize();
+        if (!actualPath.equals(expectedPath)) {
+            throw new CorruptSnapshotException(
+                    String.format(
+                            "V1 writer snapshot %s does not prove exact end offset %d",
+                            snapshotFile, expectedEndOffset));
+        }
+
+        for (FencedWriterStateEntry entry : readFencedSnapshot(snapshotFile)) {
+            long targetWalOffset = entry.dominatingTargetWalOffset();
+            if (targetWalOffset < 0L || targetWalOffset >= expectedEndOffset) {
+                throw new CorruptSnapshotException(
+                        String.format(
+                                "V1 writer snapshot at %d contains target WAL offset %d outside [0,%d)",
+                                expectedEndOffset, targetWalOffset, expectedEndOffset));
+            }
+        }
+    }
+
     /** Get the last written entry for the given writer id. */
     public Optional<WriterStateEntry> lastEntry(long writerId) {
         requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
@@ -215,7 +245,7 @@ public class WriterStateManager {
     public void truncateAndReload(long logStartOffset, long logEndOffset, long currentTimeMs)
             throws IOException {
         if (protocol == KvIdempotenceProtocol.V1_FENCED) {
-            truncateAndReloadFenced(logStartOffset, logEndOffset);
+            truncateAndReloadFenced(logStartOffset, logEndOffset, true);
             return;
         }
 
@@ -237,7 +267,37 @@ public class WriterStateManager {
         }
     }
 
-    private void truncateAndReloadFenced(long logStartOffset, long logEndOffset)
+    WriterStateManager fencedRecoveryCandidate(long logStartOffset, long logEndOffset)
+            throws IOException {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        WriterStateManager candidate =
+                new WriterStateManager(
+                        tableBucket, logTabletDir, writerExpirationMs, protocol);
+        candidate.truncateAndReloadFenced(logStartOffset, logEndOffset, false);
+        return candidate;
+    }
+
+    void publishFencedRecovery(WriterStateManager candidate, long recoveryEndOffset)
+            throws IOException {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        candidate.requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        if (!tableBucket.equals(candidate.tableBucket)
+                || !logTabletDir.equals(candidate.logTabletDir)
+                || candidate.lastMapOffset != recoveryEndOffset) {
+            throw new IllegalArgumentException("Invalid V1 WriterState recovery candidate");
+        }
+        for (SnapshotFile snapshot : snapshots.tailMap(recoveryEndOffset, false).values()) {
+            removeAndDeleteSnapshot(snapshot.offset);
+        }
+        fencedWriters = new HashMap<>(candidate.fencedWriters);
+        writerIdCount = fencedWriters.size();
+        loadedSnapshotOffset = candidate.loadedSnapshotOffset;
+        lastSnapOffset = candidate.lastSnapOffset;
+        lastMapOffset = candidate.lastMapOffset;
+    }
+
+    private void truncateAndReloadFenced(
+            long logStartOffset, long logEndOffset, boolean deleteFutureSnapshots)
             throws IOException {
         if (logStartOffset < 0L || logEndOffset < logStartOffset) {
             throw new CorruptSnapshotException(
@@ -296,8 +356,10 @@ public class WriterStateManager {
         lastSnapOffset = selectedSnapshot == null ? 0L : selectedSnapshot.offset;
         lastMapOffset = lastSnapOffset;
 
-        for (SnapshotFile snapshot : snapshots.tailMap(logEndOffset, false).values()) {
-            removeAndDeleteSnapshot(snapshot.offset);
+        if (deleteFutureSnapshots) {
+            for (SnapshotFile snapshot : snapshots.tailMap(logEndOffset, false).values()) {
+                removeAndDeleteSnapshot(snapshot.offset);
+            }
         }
     }
 
