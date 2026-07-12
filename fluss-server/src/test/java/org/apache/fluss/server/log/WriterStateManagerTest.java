@@ -30,6 +30,8 @@ import org.apache.fluss.utils.types.Tuple2;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
@@ -210,11 +212,11 @@ public class WriterStateManagerTest {
         WriterStateManager manager = fencedManager();
         WriterKey key = new WriterKey(Long.MAX_VALUE, Long.MIN_VALUE | 3L);
         appendFenced(manager, key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L);
-        manager.updateMapEndOffset(31L);
+        manager.updateMapEndOffset(Long.MAX_VALUE);
         manager.takeSnapshot();
 
         WriterStateManager recovered = fencedManager();
-        recovered.truncateAndReload(0L, 31L, Long.MAX_VALUE);
+        recovered.truncateAndReload(0L, Long.MAX_VALUE, Long.MAX_VALUE);
 
         assertThat(recovered.lastFencedEntry(key))
                 .contains(
@@ -378,6 +380,30 @@ public class WriterStateManagerTest {
                 .get()
                 .extracting(FencedWriterStateEntry::lastSequence)
                 .isEqualTo(900L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {-1L, 5L})
+    void testLocalV1CandidateRejectsInvalidDominatingOffsetAndKeepsOlderEligible(
+            long invalidTargetOffset) throws Exception {
+        WriterKey writerKey = new WriterKey(4L, 5L);
+        WriterStateManager snapshotWriter = fencedManager();
+        appendFenced(snapshotWriter, writerKey, 100L, 0L, 1L);
+        snapshotWriter.updateMapEndOffset(2L);
+        snapshotWriter.takeSnapshot();
+        File invalidSnapshot = writerSnapshotFile(logDir, 5L);
+        byte[] invalidBytes = v2SnapshotBytes(900L, invalidTargetOffset);
+        Files.write(invalidSnapshot.toPath(), invalidBytes);
+
+        WriterStateManager manager = fencedManager();
+        WriterStateManager candidate = manager.fencedRecoveryCandidate(0L, 5L);
+
+        assertThat(candidate.mapEndOffset()).isEqualTo(2L);
+        assertThat(candidate.lastFencedEntry(writerKey))
+                .get()
+                .extracting(FencedWriterStateEntry::lastSequence)
+                .isEqualTo(100L);
+        assertThat(Files.readAllBytes(invalidSnapshot.toPath())).isEqualTo(invalidBytes);
     }
 
     @Test
@@ -876,9 +902,16 @@ public class WriterStateManagerTest {
     }
 
     private static byte[] v2SnapshotBytes() {
+        return v2SnapshotBytes(100L, 10L);
+    }
+
+    private static byte[] v2SnapshotBytes(long sequence, long targetOffset) {
         return ("{\"version\":2,\"kv_idempotence_protocol_version\":1,\"writer_entries\":[{"
-                        + "\"writer_key_high\":4,\"writer_key_low\":5,\"last_sequence\":100,"
-                        + "\"last_target_wal_offset\":10,\"last_timestamp\":1}]}")
+                        + "\"writer_key_high\":4,\"writer_key_low\":5,\"last_sequence\":"
+                        + sequence
+                        + ",\"last_target_wal_offset\":"
+                        + targetOffset
+                        + ",\"last_timestamp\":1}]}")
                 .getBytes(StandardCharsets.UTF_8);
     }
 

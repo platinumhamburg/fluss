@@ -25,6 +25,7 @@ import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -535,6 +536,63 @@ final class LogLoaderTest extends LogTestBase {
     }
 
     @Test
+    void testV1RecoveryFallsBackFromEntryValidNewestWithIncompatibleSequence()
+            throws Exception {
+        WriterKey writerKey = new WriterKey(7L, 8L);
+        LogTablet log = createFencedLogTablet(true);
+        appendFenced(log, writerKey, 100L);
+        log.roll(Optional.empty());
+        appendFenced(log, writerKey, 500L);
+        long recoveryEnd = log.localLogEndOffset();
+        writeFencedSnapshot(1L, writerKey, 900L, 0L);
+        log.writerStateManager().reloadSnapshots();
+        LogSegments recoverySegments = new LogSegments(log.getTableBucket());
+        log.logSegments().forEach(recoverySegments::add);
+
+        LogTablet.rebuildWriterState(
+                log.writerStateManager(),
+                recoverySegments,
+                log.localLogStartOffset(),
+                recoveryEnd,
+                false);
+
+        assertThat(log.writerStateManager().lastFencedEntry(writerKey))
+                .get()
+                .extracting(FencedWriterStateEntry::lastSequence)
+                .isEqualTo(500L);
+        assertThat(log.writerStateManager().mapEndOffset()).isEqualTo(recoveryEnd);
+        assertThat(FlussPaths.writerSnapshotFile(logDir, 1L)).exists();
+        log.close();
+    }
+
+    @Test
+    void testV1RecoveryFallsBackWhenNewestStartsInsideWalBatch() throws Exception {
+        WriterKey writerKey = new WriterKey(7L, 8L);
+        LogTablet log = createFencedLogTablet(true);
+        appendFencedBatch(log, writerKey, 100L, 3);
+        long recoveryEnd = log.localLogEndOffset();
+        writeFencedSnapshot(1L, writerKey, 100L, 0L);
+        log.writerStateManager().reloadSnapshots();
+        LogSegments recoverySegments = new LogSegments(log.getTableBucket());
+        log.logSegments().forEach(recoverySegments::add);
+
+        LogTablet.rebuildWriterState(
+                log.writerStateManager(),
+                recoverySegments,
+                log.localLogStartOffset(),
+                recoveryEnd,
+                false);
+
+        assertThat(log.writerStateManager().lastFencedEntry(writerKey))
+                .get()
+                .extracting(FencedWriterStateEntry::lastSequence)
+                .isEqualTo(100L);
+        assertThat(log.writerStateManager().mapEndOffset()).isEqualTo(recoveryEnd);
+        assertThat(FlussPaths.writerSnapshotFile(logDir, 1L)).exists();
+        log.close();
+    }
+
+    @Test
     void testV1CleanShutdownWithoutSnapshotFailsWhenRetainedWalStartsAfterZero()
             throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
@@ -757,6 +815,11 @@ final class LogLoaderTest extends LogTestBase {
 
     private static void appendFenced(LogTablet log, WriterKey writerKey, long sequence)
             throws Exception {
+        appendFencedBatch(log, writerKey, sequence, 1);
+    }
+
+    private static void appendFencedBatch(
+            LogTablet log, WriterKey writerKey, long sequence, int recordCount) throws Exception {
         MemoryLogRecordsCompactedBuilder builder =
                 MemoryLogRecordsCompactedBuilder.fencedBuilder(
                         DEFAULT_SCHEMA_ID,
@@ -764,12 +827,36 @@ final class LogLoaderTest extends LogTestBase {
                         new UnmanagedPagedOutputView(128),
                         false);
         builder.setFencedWriterState(writerKey, sequence);
-        builder.append(
-                ChangeType.INSERT,
-                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "fenced-" + sequence}));
+        for (int recordIndex = 0; recordIndex < recordCount; recordIndex++) {
+            builder.append(
+                    ChangeType.INSERT,
+                    compactedRow(
+                            DATA1_ROW_TYPE,
+                            new Object[] {recordIndex, "fenced-" + sequence}));
+        }
         builder.close();
         log.appendAsLeader(
                 MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer()));
+    }
+
+    private void writeFencedSnapshot(
+            long snapshotOffset,
+            WriterKey writerKey,
+            long sequence,
+            long dominatingTargetWalOffset)
+            throws Exception {
+        FlussPaths.writerSnapshotFile(logDir, snapshotOffset).delete();
+        WriterStateManager snapshotWriter =
+                new WriterStateManager(
+                        new TableBucket(DATA1_TABLE_ID, 0),
+                        logDir,
+                        (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis(),
+                        KvIdempotenceProtocol.V1_FENCED);
+        FencedWriterAppendInfo appendInfo = snapshotWriter.prepareFencedUpdate(writerKey);
+        appendInfo.append(sequence, dominatingTargetWalOffset, 1L);
+        snapshotWriter.updateFenced(appendInfo);
+        snapshotWriter.updateMapEndOffset(snapshotOffset);
+        snapshotWriter.takeSnapshot();
     }
 
     private void appendRecords(LogTablet logTablet, int numRecords) throws Exception {

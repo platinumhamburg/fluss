@@ -206,6 +206,8 @@ public final class Replica {
     private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
     private final RemoteLogManager remoteLogManager;
+    private KvRecoverHelper.RecoveryFaultInjector kvRecoveryFaultInjector =
+            KvRecoverHelper.RecoveryFaultInjector.NO_OP;
 
     private static final int INIT_KV_TABLET_MAX_RETRY_TIMES = 5;
     /**
@@ -815,34 +817,48 @@ public final class Replica {
     }
 
     private void createKv() {
-        try {
-            // create a closeable registry for the closable related to kv
-            closeableRegistryForKv = new CloseableRegistry();
-            // resister the closeable registry for kv
-            closeableRegistry.registerCloseable(closeableRegistryForKv);
-        } catch (IOException e) {
-            LOG.warn(
-                    "Fail to registry closeable registry for kv for bucket {}, it may cause resource leak.",
-                    tableBucket,
-                    e);
-        }
-
-        // init kv tablet and get the snapshot it uses to init if have any
-        Optional<CompletedSnapshot> snapshotUsed = Optional.empty();
+        RuntimeException lastFailure = null;
         for (int i = 1; i <= INIT_KV_TABLET_MAX_RETRY_TIMES; i++) {
+            initializeKvAttempt();
             try {
-                snapshotUsed = initKvTablet();
-                break;
-            } catch (Exception e) {
+                Optional<CompletedSnapshot> snapshotUsed = initKvTablet();
+                startPeriodicKvSnapshot(snapshotUsed.orElse(null));
+                return;
+            } catch (Error error) {
+                cleanupFailedKvAttempt(error);
+                throw error;
+            } catch (RuntimeException failure) {
+                cleanupFailedKvAttempt(failure);
+                lastFailure = failure;
                 LOG.warn(
                         "Fail to init kv tablet for bucket {}, retrying for {} times",
                         tableBucket,
                         i,
-                        e);
+                        failure);
             }
         }
-        // start periodic kv snapshot
-        startPeriodicKvSnapshot(snapshotUsed.orElse(null));
+        throw checkNotNull(lastFailure, "KV recovery failed without an exception");
+    }
+
+    private void initializeKvAttempt() {
+        closeableRegistryForKv = new CloseableRegistry();
+        kvSnapshotManager = null;
+        try {
+            closeableRegistry.registerCloseable(closeableRegistryForKv);
+        } catch (IOException failure) {
+            IOUtils.closeQuietly(closeableRegistryForKv);
+            closeableRegistryForKv = null;
+            throw new KvStorageException(
+                    "Failed to register KV recovery resources for " + tableBucket, failure);
+        }
+    }
+
+    private void cleanupFailedKvAttempt(Throwable recoveryFailure) {
+        try {
+            dropKv();
+        } catch (Throwable cleanupFailure) {
+            recoveryFailure.addSuppressed(cleanupFailure);
+        }
     }
 
     private void dropKv() {
@@ -850,14 +866,23 @@ public final class Replica {
         // blocks waiting for them. Runs under leaderIsrUpdateLock(W), so no concurrent register.
         scannerManager.closeScannersForBucket(tableBucket);
 
-        if (closeableRegistry.unregisterCloseable(closeableRegistryForKv)) {
-            IOUtils.closeQuietly(closeableRegistryForKv);
+        CloseableRegistry kvRegistry = closeableRegistryForKv;
+        closeableRegistryForKv = null;
+        kvSnapshotManager = null;
+        if (kvRegistry != null && closeableRegistry.unregisterCloseable(kvRegistry)) {
+            IOUtils.closeQuietly(kvRegistry);
         }
-        if (kvTablet != null) {
-            bucketMetricGroup.unregisterRocksDBStatistics();
+        KvTablet tablet = kvTablet;
+        try {
+            if (tablet != null) {
+                bucketMetricGroup.unregisterRocksDBStatistics();
+            }
 
             checkNotNull(kvManager);
-            kvManager.dropKv(tableBucket);
+            if (tablet != null || kvManager.getKv(tableBucket).isPresent()) {
+                kvManager.dropKv(tableBucket);
+            }
+        } finally {
             kvTablet = null;
         }
     }
@@ -1127,7 +1152,8 @@ public final class Replica {
                                 tableConfig.getLogFormat(),
                                 schemaGetter,
                                 remoteLogFetcher,
-                                kvTablet.getValueEncoder());
+                                kvTablet.getValueEncoder(),
+                                kvRecoveryFaultInjector);
                 kvRecoverHelper.recover();
             } finally {
                 remoteLogFetcher.close();
@@ -2506,6 +2532,12 @@ public final class Replica {
     @VisibleForTesting
     void setAfterPutAdmission(@Nullable Runnable afterPutAdmission) {
         this.afterPutAdmission = afterPutAdmission;
+    }
+
+    @VisibleForTesting
+    void setKvRecoveryFaultInjector(
+            KvRecoverHelper.RecoveryFaultInjector kvRecoveryFaultInjector) {
+        this.kvRecoveryFaultInjector = kvRecoveryFaultInjector;
     }
 
     private void failStop(Throwable failure) {

@@ -1543,78 +1543,37 @@ public final class LogTablet {
             boolean isEmptyBeforeTruncation =
                     writerStateManager.isEmpty() && writerStateManager.mapEndOffset() >= lastOffset;
             long writerStateLoadStart = System.currentTimeMillis();
-            WriterStateManager recoveryStateManager;
             if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
-                recoveryStateManager =
-                        writerStateManager.fencedRecoveryCandidate(logStartOffset, lastOffset);
-            } else {
-                writerStateManager.truncateAndReload(
-                        logStartOffset, lastOffset, System.currentTimeMillis());
-                recoveryStateManager = writerStateManager;
+                rebuildFencedWriterState(
+                        writerStateManager,
+                        segments,
+                        logStartOffset,
+                        lastOffset,
+                        recoveryFaultInjector);
+                writerStateManager.takeSnapshot();
+                LOG.info(
+                        "Writer state recovery took {} ms for bucket {} from offset {}",
+                        System.currentTimeMillis() - writerStateLoadStart,
+                        segments.getTableBucket(),
+                        lastOffset);
+                return;
             }
+
+            writerStateManager.truncateAndReload(
+                    logStartOffset, lastOffset, System.currentTimeMillis());
             long segmentRecoveryStart = System.currentTimeMillis();
-
-            // Only do the potentially expensive reloading if the last snapshot offset is lower than
-            // the log end offset (which would be the case on first startup) and there were active
-            // writers prior to truncation (which could be the case if truncating after initial
-            // loading). If there weren't, then truncating shouldn't change that fact (although it
-            // could cause a writer id to expire earlier than expected), and we can skip the
-            // loading. This is an optimization for users which are not yet using idempotent
-            // features yet.
-            if (lastOffset > recoveryStateManager.mapEndOffset()
-                    && (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
-                            || !isEmptyBeforeTruncation)) {
-                Optional<LogSegment> segmentOfLastOffset = segments.floorSegment(lastOffset);
-
-                List<LogSegment> segmentsList =
-                        segments.values(recoveryStateManager.mapEndOffset(), lastOffset);
-                for (LogSegment segment : segmentsList) {
-                    long startOffset =
-                            Math.max(
-                                    Math.max(
-                                            segment.getBaseOffset(),
-                                            recoveryStateManager.mapEndOffset()),
-                                    logStartOffset);
-                    if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
-                        if (startOffset > recoveryStateManager.mapEndOffset()) {
-                            throw recoveryGap(recoveryStateManager, startOffset, lastOffset);
-                        }
-                    } else {
-                        recoveryStateManager.updateMapEndOffset(startOffset);
-                    }
-
-                    if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT
-                            && offsetsToSnapshot.contains(
-                                    Optional.of(segment.getBaseOffset()))) {
-                        recoveryStateManager.takeSnapshot();
-                    }
-
-                    int maxPosition = segment.getSizeInBytes();
-                    if (segmentOfLastOffset.isPresent() && segmentOfLastOffset.get() == segment) {
-                        FileLogRecords.LogOffsetPosition logOffsetPosition =
-                                segment.translateOffset(lastOffset);
-                        if (logOffsetPosition != null) {
-                            maxPosition = logOffsetPosition.position;
-                        }
-                    }
-
-                    FetchDataInfo fetchDataInfo =
-                            segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
-                    if (fetchDataInfo != null) {
-                        loadWritersFromRecords(
-                                recoveryStateManager,
-                                fetchDataInfo.getRecords(),
-                                recoveryFaultInjector);
-                    }
-                }
+            // This optimization applies only to the legacy writer map. V1 recovery always scans
+            // the complete candidate range so that coverage is proved before publication.
+            if (lastOffset > writerStateManager.mapEndOffset() && !isEmptyBeforeTruncation) {
+                reloadWriterStateFromLog(
+                        writerStateManager,
+                        segments,
+                        logStartOffset,
+                        lastOffset,
+                        offsetsToSnapshot,
+                        recoveryFaultInjector);
             }
-
-            if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
-                recoveryStateManager.validateRecoveryCoverage(logStartOffset, lastOffset);
-                writerStateManager.publishFencedRecovery(recoveryStateManager, lastOffset);
-            } else {
-                writerStateManager.updateMapEndOffset(lastOffset);
-            }
+            writerStateManager.updateMapEndOffset(lastOffset);
             writerStateManager.takeSnapshot();
             LOG.info(
                     "Writer state recovery took {} ms for snapshot load and {} ms for segment recovery for bucket {} from offset {}",
@@ -1622,6 +1581,105 @@ public final class LogTablet {
                     System.currentTimeMillis() - segmentRecoveryStart,
                     segments.getTableBucket(),
                     lastOffset);
+        }
+    }
+
+    private static void rebuildFencedWriterState(
+            WriterStateManager writerStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long recoveryEndOffset,
+            AppendFaultInjector recoveryFaultInjector)
+            throws IOException {
+        RuntimeException latestSemanticFailure = null;
+        for (Optional<Long> snapshotOffset :
+                writerStateManager.fencedRecoveryCandidateOffsets(
+                        logStartOffset, recoveryEndOffset)) {
+            try {
+                WriterStateManager candidate =
+                        writerStateManager.fencedRecoveryCandidate(
+                                logStartOffset, recoveryEndOffset, snapshotOffset);
+                reloadWriterStateFromLog(
+                        candidate,
+                        segments,
+                        logStartOffset,
+                        recoveryEndOffset,
+                        Collections.emptyList(),
+                        recoveryFaultInjector);
+                candidate.validateRecoveryCoverage(logStartOffset, recoveryEndOffset);
+                writerStateManager.publishFencedRecovery(candidate, recoveryEndOffset);
+                return;
+            } catch (CorruptSnapshotException | CorruptRecordException semanticFailure) {
+                latestSemanticFailure = semanticFailure;
+                LOG.warn(
+                        "Ignoring invalid V1 writer recovery candidate {} for bucket {}",
+                        snapshotOffset,
+                        segments.getTableBucket(),
+                        semanticFailure);
+            }
+        }
+        String failureDetail =
+                latestSemanticFailure == null
+                        ? "no snapshot is allowed because retained WAL starts at " + logStartOffset
+                        : latestSemanticFailure.getMessage();
+        throw new CorruptSnapshotException(
+                String.format(
+                        "No V1 writer snapshot and retained WAL provide continuous recovery over [%d,%d): %s",
+                        logStartOffset, recoveryEndOffset, failureDetail),
+                latestSemanticFailure);
+    }
+
+    private static void reloadWriterStateFromLog(
+            WriterStateManager recoveryStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long recoveryEndOffset,
+            List<Optional<Long>> offsetsToSnapshot,
+            AppendFaultInjector recoveryFaultInjector)
+            throws IOException {
+        if (recoveryEndOffset <= recoveryStateManager.mapEndOffset()) {
+            return;
+        }
+
+        Optional<LogSegment> segmentOfLastOffset = segments.floorSegment(recoveryEndOffset);
+        List<LogSegment> segmentsList =
+                segments.values(recoveryStateManager.mapEndOffset(), recoveryEndOffset);
+        for (LogSegment segment : segmentsList) {
+            long startOffset =
+                    Math.max(
+                            Math.max(
+                                    segment.getBaseOffset(),
+                                    recoveryStateManager.mapEndOffset()),
+                            logStartOffset);
+            if (recoveryStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
+                if (startOffset > recoveryStateManager.mapEndOffset()) {
+                    throw recoveryGap(
+                            recoveryStateManager, startOffset, recoveryEndOffset);
+                }
+            } else {
+                recoveryStateManager.updateMapEndOffset(startOffset);
+                if (offsetsToSnapshot.contains(Optional.of(segment.getBaseOffset()))) {
+                    recoveryStateManager.takeSnapshot();
+                }
+            }
+
+            int maxPosition = segment.getSizeInBytes();
+            if (segmentOfLastOffset.isPresent() && segmentOfLastOffset.get() == segment) {
+                FileLogRecords.LogOffsetPosition logOffsetPosition =
+                        segment.translateOffset(recoveryEndOffset);
+                if (logOffsetPosition != null) {
+                    maxPosition = logOffsetPosition.position;
+                }
+            }
+
+            FetchDataInfo fetchDataInfo =
+                    segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
+            if (fetchDataInfo != null) {
+                loadWritersFromRecords(
+                        recoveryStateManager,
+                        fetchDataInfo.getRecords(),
+                        recoveryFaultInjector);
+            }
         }
     }
 

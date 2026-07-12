@@ -69,6 +69,7 @@ public class LogTieringTask implements Runnable {
     // The copied offset is empty initially for a new leader LogTieringTask, and needs to
     // be fetched inside the task's run() method.
     private volatile Long copiedOffset = null;
+    private volatile PendingManifestAttempt pendingManifestAttempt;
 
     private volatile boolean cancelled = false;
 
@@ -134,6 +135,10 @@ public class LogTieringTask implements Runnable {
             LogTablet logTablet = replica.getLogTablet();
             TableMetricGroup metricGroup = replica.tableMetrics();
             maybeUpdateCopiedOffset(logTablet);
+            if (pendingManifestAttempt != null) {
+                reconcilePendingManifestAttempt(metricGroup);
+                return;
+            }
 
             // Get these candidate log segments to copy and these expired remote log segments to
             // clean up.
@@ -457,6 +462,14 @@ public class LogTieringTask implements Runnable {
 
         RemoteLogManifestHandle attemptedHandle =
                 new RemoteLogManifestHandle(remoteLogManifestPath, newRemoteLogEndOffset);
+        PendingManifestAttempt attempt =
+                new PendingManifestAttempt(
+                        attemptedHandle,
+                        expiredSegments,
+                        newAddedSegments,
+                        newRemoteLogStartOffset,
+                        newRemoteLogEndOffset,
+                        newRemoteLogSize);
         try {
             Optional<RemoteLogManifestHandle> authoritativeHandle = manifestHandleResolver.resolve();
             if (authoritativeHandle.filter(attemptedHandle::equals).isPresent()) {
@@ -474,6 +487,7 @@ public class LogTieringTask implements Runnable {
                 remoteLogStorage.deleteRemoteLogManifestSnapshot(remoteLogManifestPath);
                 return ManifestCommitResult.NOT_COMMITTED;
             }
+            pendingManifestAttempt = attempt;
             return ManifestCommitResult.UNKNOWN;
         } catch (Exception resolutionFailure) {
             LOG.error(
@@ -481,8 +495,69 @@ public class LogTieringTask implements Runnable {
                             + "V1 commit for table-bucket {}.",
                     tableBucket,
                     resolutionFailure);
+            pendingManifestAttempt = attempt;
             return ManifestCommitResult.UNKNOWN;
         }
+    }
+
+    private void reconcilePendingManifestAttempt(TableMetricGroup metricGroup) {
+        PendingManifestAttempt attempt = pendingManifestAttempt;
+        if (attempt == null) {
+            return;
+        }
+
+        final Optional<RemoteLogManifestHandle> authoritativeHandle;
+        try {
+            authoritativeHandle = manifestHandleResolver.resolve();
+        } catch (Exception resolutionFailure) {
+            LOG.warn(
+                    "Unable to reconcile pending V1 remote log manifest {} for bucket {}.",
+                    attempt.handle,
+                    tableBucket,
+                    resolutionFailure);
+            return;
+        }
+
+        if (authoritativeHandle.filter(attempt.handle::equals).isPresent()) {
+            publishCommittedManifest(
+                    remoteLog,
+                    attempt.expiredSegments,
+                    attempt.copiedSegments,
+                    attempt.remoteLogStartOffset,
+                    attempt.remoteLogEndOffset,
+                    attempt.remoteLogSize);
+            if (!attempt.expiredSegments.isEmpty()) {
+                deleteRemoteLogSegmentFiles(attempt.expiredSegments, metricGroup);
+            }
+            if (attempt.copiedEndOffset > 0L) {
+                copiedOffset = attempt.copiedEndOffset - 1L;
+            }
+            pendingManifestAttempt = null;
+            return;
+        }
+
+        if (!authoritativeHandle.isPresent()) {
+            try {
+                remoteLogStorage.deleteRemoteLogManifestSnapshot(
+                        attempt.handle.getRemoteLogManifestPath());
+            } catch (Exception deletionFailure) {
+                LOG.warn(
+                        "Unable to roll back pending V1 remote log manifest {} for bucket {}.",
+                        attempt.handle,
+                        tableBucket,
+                        deletionFailure);
+                return;
+            }
+            deleteRemoteLogSegmentFiles(attempt.copiedSegments, metricGroup);
+            pendingManifestAttempt = null;
+            return;
+        }
+
+        LOG.warn(
+                "Pending V1 remote log manifest {} for bucket {} does not match authoritative handle {}. Pausing tiering.",
+                attempt.handle,
+                tableBucket,
+                authoritativeHandle.get());
     }
 
     private void publishCommittedManifest(
@@ -644,6 +719,35 @@ public class LogTieringTask implements Runnable {
                     + ", nextSegmentOffset="
                     + nextSegmentOffset
                     + '}';
+        }
+    }
+
+    private static class PendingManifestAttempt {
+        private final RemoteLogManifestHandle handle;
+        private final List<RemoteLogSegment> expiredSegments;
+        private final List<RemoteLogSegment> copiedSegments;
+        private final long remoteLogStartOffset;
+        private final long remoteLogEndOffset;
+        private final long remoteLogSize;
+        private final long copiedEndOffset;
+
+        private PendingManifestAttempt(
+                RemoteLogManifestHandle handle,
+                List<RemoteLogSegment> expiredSegments,
+                List<RemoteLogSegment> copiedSegments,
+                long remoteLogStartOffset,
+                long remoteLogEndOffset,
+                long remoteLogSize) {
+            this.handle = handle;
+            this.expiredSegments = new ArrayList<>(expiredSegments);
+            this.copiedSegments = new ArrayList<>(copiedSegments);
+            this.remoteLogStartOffset = remoteLogStartOffset;
+            this.remoteLogEndOffset = remoteLogEndOffset;
+            this.remoteLogSize = remoteLogSize;
+            this.copiedEndOffset =
+                    copiedSegments.isEmpty()
+                            ? -1L
+                            : copiedSegments.get(copiedSegments.size() - 1).remoteLogEndOffset();
         }
     }
 

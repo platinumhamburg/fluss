@@ -36,10 +36,12 @@ import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -197,11 +199,9 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         assertThat(zkClient.getRemoteLogManifestHandle(tb)).isPresent();
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testV1AmbiguousCommitDoesNotDeleteFilesAfterAuthoritativeReplacement(boolean retry)
-            throws Exception {
-        TableBucket tb = makeIndexTableAsLeader(retry ? 9915L : 9916L);
+    @Test
+    void testV1AmbiguousCommitIsBoundedAndReconcilesBeforeNewUpload() throws Exception {
+        TableBucket tb = makeIndexTableAsLeader(9915L);
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
         addFencedSegments(log, 4);
         RemoteLogManifestHandle authoritativeReplacement =
@@ -210,16 +210,35 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         testCoordinatorGateway.authoritativeManifestOverride.set(authoritativeReplacement);
         testCoordinatorGateway.loseRemoteLogManifestResponseAfterCommit.set(true);
 
-        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
-        if (retry) {
+        for (int run = 0; run < 5; run++) {
             remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
         }
 
         RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
         assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
         assertThat(remoteLog.getRemoteLogEndOffset()).isEmpty();
-        assertThat(listIndexRemoteLogFiles(tb)).hasSize(retry ? 6 : 3);
+        assertThat(remoteLogStorage.copiedSegmentCount()).isEqualTo(3);
+        assertThat(listIndexRemoteLogFiles(tb)).hasSize(3);
         assertThat(zkClient.getRemoteLogManifestHandle(tb)).contains(authoritativeReplacement);
+
+        zkClient.getCuratorClient()
+                .delete()
+                .forPath(ZkData.BucketRemoteLogsZNode.path(tb));
+        testCoordinatorGateway.authoritativeManifestOverride.set(null);
+        testCoordinatorGateway.loseRemoteLogManifestResponseAfterCommit.set(false);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        assertThat(remoteLogStorage.copiedSegmentCount()).isEqualTo(3);
+        assertThat(listIndexRemoteLogFiles(tb)).isEmpty();
+        assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
+        assertThat(remoteLog.getRemoteLogEndOffset()).isEmpty();
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        assertThat(remoteLogStorage.copiedSegmentCount()).isEqualTo(6);
+        assertThat(remoteLog.allRemoteLogSegments()).hasSize(3);
+        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(3L);
+        assertThat(listIndexRemoteLogFiles(tb)).hasSize(3);
     }
 
     private Set<String> listIndexRemoteLogFiles(TableBucket tableBucket) throws Exception {

@@ -68,6 +68,7 @@ public class KvRecoverHelper {
     private final LogFormat logFormat;
     private final RemoteLogFetcher remoteLogFetcher;
     private final ValueEncoder valueEncoder;
+    private final RecoveryFaultInjector recoveryFaultInjector;
 
     // will be initialized when first encounter a log record during recovering from log
     private Integer currentSchemaId;
@@ -91,6 +92,34 @@ public class KvRecoverHelper {
             SchemaGetter schemaGetter,
             RemoteLogFetcher remoteLogFetcher,
             ValueEncoder valueEncoder) {
+        this(
+                kvTablet,
+                logTablet,
+                recoverPointOffset,
+                recoverPointRowCount,
+                autoIncRange,
+                recoverContext,
+                kvFormat,
+                logFormat,
+                schemaGetter,
+                remoteLogFetcher,
+                valueEncoder,
+                RecoveryFaultInjector.NO_OP);
+    }
+
+    public KvRecoverHelper(
+            KvTablet kvTablet,
+            LogTablet logTablet,
+            long recoverPointOffset,
+            @Nullable Long recoverPointRowCount,
+            @Nullable AutoIncIDRange autoIncRange,
+            KvRecoverContext recoverContext,
+            KvFormat kvFormat,
+            LogFormat logFormat,
+            SchemaGetter schemaGetter,
+            RemoteLogFetcher remoteLogFetcher,
+            ValueEncoder valueEncoder,
+            RecoveryFaultInjector recoveryFaultInjector) {
         this.kvTablet = kvTablet;
         this.logTablet = logTablet;
         this.recoverPointOffset = recoverPointOffset;
@@ -102,6 +131,7 @@ public class KvRecoverHelper {
         this.schemaGetter = schemaGetter;
         this.remoteLogFetcher = remoteLogFetcher;
         this.valueEncoder = valueEncoder;
+        this.recoveryFaultInjector = recoveryFaultInjector;
     }
 
     public void recover() throws Exception {
@@ -238,10 +268,19 @@ public class KvRecoverHelper {
                                     rowCountUpdater,
                                     autoIncIdRangeUpdater,
                                     resumeRecordConsumer);
+                    recoveryFaultInjector.afterBatch(nextFetchOffset);
                 }
             }
             return nextFetchOffset;
         }
+    }
+
+    /** Test hook invoked after a WAL batch has been applied during KV recovery. */
+    @FunctionalInterface
+    public interface RecoveryFaultInjector {
+        RecoveryFaultInjector NO_OP = ignored -> {};
+
+        void afterBatch(long nextOffset) throws Exception;
     }
 
     /**
