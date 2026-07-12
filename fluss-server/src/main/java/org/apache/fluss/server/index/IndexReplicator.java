@@ -54,6 +54,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * WAL-driven index replicator that reads committed WAL entries, derives index mutations, and stages
@@ -96,6 +97,7 @@ public final class IndexReplicator implements AutoCloseable {
 
     private final AtomicBoolean closed;
     private final AtomicReference<Throwable> terminalFailure;
+    private final ReentrantLock lifecycleLock;
 
     @Nullable private volatile CompletableFuture<IndexSourceReader.ReadResult> pendingRead;
     @Nullable private volatile IndexProgressState pendingReadState;
@@ -194,6 +196,7 @@ public final class IndexReplicator implements AutoCloseable {
         this.preferredMaxRequestBytes = preferredMaxRequestBytes;
         this.closed = new AtomicBoolean(false);
         this.terminalFailure = new AtomicReference<>();
+        this.lifecycleLock = new ReentrantLock();
         this.onProgress = onProgress;
     }
 
@@ -254,6 +257,20 @@ public final class IndexReplicator implements AutoCloseable {
      * @return {@code true} if a window was read (work was done), {@code false} otherwise
      */
     public boolean poll() {
+        lifecycleLock.lock();
+        try {
+            try {
+                return pollLocked();
+            } catch (IndexSourceWalCorruptionException failure) {
+                transitionToTerminalLocked(failure);
+                throw failure;
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
+    private boolean pollLocked() {
         if (closed.get() || terminalFailure.get() != null) {
             return false;
         }
@@ -314,7 +331,7 @@ public final class IndexReplicator implements AutoCloseable {
             }
             return consumePendingRead();
         } catch (IndexSourceWalCorruptionException failure) {
-            terminalFailure.compareAndSet(null, failure);
+            transitionToTerminalLocked(failure);
             throw failure;
         } catch (RuntimeException failure) {
             LOG.warn("Failed to start WAL read at offset {}: {}", readOffset, failure.getMessage());
@@ -336,7 +353,7 @@ public final class IndexReplicator implements AutoCloseable {
             clearPendingRead(future);
             Throwable cause = failure.getCause() == null ? failure : failure.getCause();
             if (cause instanceof IndexSourceWalCorruptionException) {
-                terminalFailure.compareAndSet(null, cause);
+                transitionToTerminalLocked(cause);
                 throw (IndexSourceWalCorruptionException) cause;
             }
             LOG.warn(
@@ -511,24 +528,40 @@ public final class IndexReplicator implements AutoCloseable {
     }
 
     void onWindowFailed(String indexName, IndexWindow window, Throwable failure) {
-        boolean firstFailure = terminalFailure.compareAndSet(null, failure);
-        IndexProgressState state = indexStatesByName.get(indexName);
-        if (state != null && state.inFlightWindow == window) {
-            state.inFlightWindow = null;
+        lifecycleLock.lock();
+        try {
+            IndexProgressState state = indexStatesByName.get(indexName);
+            if (state != null && state.inFlightWindow == window) {
+                state.inFlightWindow = null;
+            }
+            transitionToTerminalLocked(failure);
+        } finally {
+            lifecycleLock.unlock();
         }
-        if (firstFailure) {
-            LOG.error(
-                    "Index replication for source bucket {} failed terminally at pushed offset {}",
-                    sourceReader.tableBucket(),
-                    getAllIndexPushedOffset(),
-                    failure);
+    }
+
+    private void transitionToTerminalLocked(Throwable failure) {
+        if (!terminalFailure.compareAndSet(null, failure)) {
+            return;
         }
+        retirePendingReadLocked();
+        sourceReader.close();
+        LOG.error(
+                "Index replication for source bucket {} failed terminally at pushed offset {}",
+                sourceReader.tableBucket(),
+                getAllIndexPushedOffset(),
+                failure);
     }
 
     @VisibleForTesting
     @Nullable
     Throwable terminalFailure() {
         return terminalFailure.get();
+    }
+
+    @VisibleForTesting
+    boolean hasPendingRead() {
+        return pendingRead != null;
     }
 
     @VisibleForTesting
@@ -588,7 +621,6 @@ public final class IndexReplicator implements AutoCloseable {
         IndexSourceWalCorruptionException failure =
                 new IndexSourceWalCorruptionException(
                         "Corrupt source WAL for " + sourceReader.tableBucket() + ": " + message);
-        terminalFailure.compareAndSet(null, failure);
         return failure;
     }
 
@@ -597,7 +629,6 @@ public final class IndexReplicator implements AutoCloseable {
                 new IndexSourceWalCorruptionException(
                         "Corrupt source WAL for " + sourceReader.tableBucket() + ": " + message,
                         cause);
-        terminalFailure.compareAndSet(null, failure);
         return failure;
     }
 
@@ -695,24 +726,36 @@ public final class IndexReplicator implements AutoCloseable {
 
     @Override
     public void close() {
-        if (closed.compareAndSet(false, true)) {
-            CompletableFuture<IndexSourceReader.ReadResult> future = pendingRead;
-            pendingRead = null;
-            pendingReadState = null;
-            if (future != null) {
-                if (future.isDone()
-                        && !future.isCompletedExceptionally()
-                        && !future.isCancelled()) {
-                    IndexSourceReader.ReadResult result = future.getNow(null);
-                    if (result != null) {
-                        result.close();
-                    }
-                }
-                future.cancel(true);
+        lifecycleLock.lock();
+        try {
+            if (!closed.compareAndSet(false, true)) {
+                return;
             }
+            retirePendingReadLocked();
             sourceReader.close();
             if (readContext != null) {
                 readContext.close();
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
+    private void retirePendingReadLocked() {
+        CompletableFuture<IndexSourceReader.ReadResult> future = pendingRead;
+        pendingRead = null;
+        pendingReadState = null;
+        if (future == null) {
+            return;
+        }
+        boolean cancelled = future.cancel(true);
+        if (!cancelled
+                && future.isDone()
+                && !future.isCompletedExceptionally()
+                && !future.isCancelled()) {
+            IndexSourceReader.ReadResult result = future.getNow(null);
+            if (result != null) {
+                result.close();
             }
         }
     }

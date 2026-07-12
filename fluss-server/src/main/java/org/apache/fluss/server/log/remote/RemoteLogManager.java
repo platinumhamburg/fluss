@@ -29,6 +29,7 @@ import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.remote.RemoteLogTablet.RemoteLogSegmentPage;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -279,6 +280,17 @@ public class RemoteLogManager implements Closeable {
      */
     public List<RemoteLogSegment> relevantRemoteLogSegments(TableBucket tableBucket, long offset) {
         return remoteLogTablet(tableBucket).relevantRemoteLogSegments(offset);
+    }
+
+    /** Returns one bounded cursor page of generic remote log segment metadata. */
+    public RemoteLogSegmentPage relevantRemoteLogSegmentPage(
+            TableBucket tableBucket,
+            long offset,
+            @Nullable Long afterStartOffset,
+            int maxSegmentsToExamine) {
+        return remoteLogTablet(tableBucket)
+                .relevantRemoteLogSegmentPage(
+                        offset, afterStartOffset, maxSegmentsToExamine);
     }
 
     private boolean remoteDisabled() {

@@ -19,23 +19,40 @@ package org.apache.fluss.server.kv;
 
 import org.apache.fluss.exception.RemoteStorageException;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.remote.RemoteLogTestBase;
+import org.apache.fluss.server.log.remote.RemoteLogTablet.RemoteLogSegmentPage;
 import org.apache.fluss.server.replica.Replica;
 
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
 
 /** Test for {@link RemoteLogFetcher}. */
 class RemoteLogFetcherTest extends RemoteLogTestBase {
@@ -319,6 +336,136 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
             for (File file : downloadedFiles) {
                 assertThat(file.getName()).endsWith(".log");
             }
+        }
+    }
+
+    @Test
+    void testCloseOwnsFileOpenedAfterIteratorClose() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, false);
+        Replica replica = replicaManager.getReplicaOrException(tb);
+        LogTablet logTablet = replica.getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        List<RemoteLogSegment> segments = remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        long remoteEndOffset = segments.get(segments.size() - 1).remoteLogEndOffset();
+        CountDownLatch opened = new CountDownLatch(1);
+        CountDownLatch releaseOpen = new CountDownLatch(1);
+        AtomicReference<FileLogRecords> acquired = new AtomicReference<>();
+        RemoteLogFetcher fetcher =
+                new RemoteLogFetcher(remoteLogManager, tb, logTablet.getLogDir()) {
+                    @Override
+                    protected FileLogRecords openDownloadedSegment(File localFile)
+                            throws IOException {
+                        FileLogRecords records = super.openDownloadedSegment(localFile);
+                        acquired.set(records);
+                        opened.countDown();
+                        awaitUninterruptibly(releaseOpen);
+                        return records;
+                    }
+                };
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<Boolean> hasNext =
+                executor.submit(() -> fetcher.fetch(0, remoteEndOffset).iterator().hasNext());
+        try {
+            assertThat(opened.await(30, TimeUnit.SECONDS)).isTrue();
+            fetcher.close();
+            releaseOpen.countDown();
+
+            assertThat(hasNext.get(30, TimeUnit.SECONDS)).isFalse();
+            assertThat(acquired.get().channel().isOpen()).isFalse();
+            assertThat(Files.exists(fetcher.getTempDir())).isFalse();
+        } finally {
+            releaseOpen.countDown();
+            FileLogRecords records = acquired.get();
+            if (records != null && records.channel().isOpen()) {
+                records.close();
+            }
+            fetcher.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void testBoundedSegmentDiscoveryIsLinearAcrossTinyCatchUpReads() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 32);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        List<RemoteLogSegment> segments = remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        long remoteEndOffset = segments.get(segments.size() - 1).remoteLogEndOffset();
+        org.apache.fluss.server.log.remote.RemoteLogManager countingManager =
+                spy(remoteLogManager);
+        AtomicInteger pageCalls = new AtomicInteger();
+        AtomicInteger examinedMetadata = new AtomicInteger();
+        doAnswer(
+                        invocation -> {
+                            RemoteLogSegmentPage page =
+                                    (RemoteLogSegmentPage) invocation.callRealMethod();
+                            int requestedLimit = invocation.getArgument(3);
+                            assertThat(page.examinedSegmentCount())
+                                    .isLessThanOrEqualTo(requestedLimit);
+                            assertThat(page.segments()).hasSizeLessThanOrEqualTo(requestedLimit);
+                            pageCalls.incrementAndGet();
+                            examinedMetadata.addAndGet(page.examinedSegmentCount());
+                            return page;
+                        })
+                .when(countingManager)
+                .relevantRemoteLogSegmentPage(eq(tb), anyLong(), any(), anyInt());
+
+        List<FileLogRecords> openedRecords = new ArrayList<>();
+        AtomicInteger maxOpenHandles = new AtomicInteger();
+        try (RemoteLogFetcher fetcher =
+                new RemoteLogFetcher(countingManager, tb, logTablet.getLogDir()) {
+                    @Override
+                    protected FileLogRecords openDownloadedSegment(File localFile)
+                            throws IOException {
+                        FileLogRecords records = super.openDownloadedSegment(localFile);
+                        openedRecords.add(records);
+                        int openHandles =
+                                (int)
+                                        openedRecords.stream()
+                                                .filter(opened -> opened.channel().isOpen())
+                                                .count();
+                        maxOpenHandles.accumulateAndGet(openHandles, Math::max);
+                        return records;
+                    }
+                }) {
+            long offset = 0L;
+            int reads = 0;
+            while (offset < remoteEndOffset) {
+                Iterator<LogRecordBatch> batches =
+                        fetcher.fetch(offset, remoteEndOffset, 1).iterator();
+                assertThat(batches.hasNext()).isTrue();
+                offset = batches.next().nextLogOffset();
+                assertThat(batches.hasNext()).isFalse();
+                reads++;
+            }
+
+            assertThat(reads).isPositive();
+            assertThat(pageCalls).hasValueLessThanOrEqualTo(reads * 2);
+            assertThat(examinedMetadata).hasValueLessThanOrEqualTo(reads * 16);
+            assertThat(maxOpenHandles).hasValue(1);
+            assertThat(openedRecords).hasSizeLessThanOrEqualTo(reads);
+        }
+        assertThat(openedRecords).allMatch(records -> !records.channel().isOpen());
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 }

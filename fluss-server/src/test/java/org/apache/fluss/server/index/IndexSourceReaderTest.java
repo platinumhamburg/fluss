@@ -99,6 +99,48 @@ final class IndexSourceReaderTest {
     }
 
     @Test
+    void testReturnsRemoteOnlyResultWhenLocalHandoffBatchExceedsRemainingBudget() {
+        TestingSourceWal sourceWal =
+                new TestingSourceWal(
+                        REMOTE_BUCKET, 0L, 10L, 20L, batches(batch(10L, 20L)));
+        ControllableExecutor executor = new ControllableExecutor();
+        IndexSourceReader reader =
+                reader(
+                        sourceWal,
+                        () ->
+                                new TestingRemoteFetcher(
+                                        Collections.singletonList(batch(0L, 10L))),
+                        executor);
+
+        CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 20L, 15);
+        executor.runNext();
+
+        try (IndexSourceReader.ReadResult result = future.join()) {
+            assertThat(offsets(result)).containsExactlyElementsOf(offsets(0L, 10L));
+            assertThat(result.nextOffset()).isEqualTo(10L);
+        }
+        assertThat(sourceWal.readOffsets).containsExactly(10L);
+        assertThat(sourceWal.readMaxBytes).containsExactly(5);
+        assertThat(sourceWal.readMinOneMessage).containsExactly(true);
+    }
+
+    @Test
+    void testLocalFirstBatchMayExceedBudgetWithMinOneMessage() {
+        TestingSourceWal sourceWal =
+                new TestingSourceWal(
+                        LOCAL_BUCKET, 10L, 10L, 20L, batches(batch(10L, 20L)));
+        IndexSourceReader reader = reader(sourceWal, null, Executors.directExecutor());
+
+        try (IndexSourceReader.ReadResult result = reader.read(10L, 20L, 5).join()) {
+            assertThat(offsets(result)).containsExactlyElementsOf(offsets(10L, 20L));
+            assertThat(result.nextOffset()).isEqualTo(20L);
+        }
+        assertThat(sourceWal.readOffsets).containsExactly(10L);
+        assertThat(sourceWal.readMaxBytes).containsExactly(5);
+        assertThat(sourceWal.readMinOneMessage).containsExactly(true);
+    }
+
+    @Test
     void testDeduplicatesOverlappingRemoteRecordsWithoutCopying() {
         LogRecordBatch first = batch(0L, 10L);
         LogRecordBatch overlapping = batch(5L, 20L);
@@ -429,6 +471,8 @@ final class IndexSourceReaderTest {
         private final long highWatermark;
         private final LogRecords localRecords;
         private final List<Long> readOffsets = new ArrayList<>();
+        private final List<Integer> readMaxBytes = new ArrayList<>();
+        private final List<Boolean> readMinOneMessage = new ArrayList<>();
 
         private TestingSourceWal(
                 TableBucket tableBucket,
@@ -468,6 +512,8 @@ final class IndexSourceReaderTest {
                 long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage)
                 throws IOException {
             readOffsets.add(offset);
+            readMaxBytes.add(maxBytes);
+            readMinOneMessage.add(minOneMessage);
             return new FetchDataInfo(localRecords);
         }
     }

@@ -25,13 +25,14 @@ import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.log.remote.RemoteLogStorage;
+import org.apache.fluss.server.log.remote.RemoteLogTablet.RemoteLogSegmentPage;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.concurrent.NotThreadSafe;
+import javax.annotation.Nullable;
 
 import java.io.Closeable;
 import java.io.File;
@@ -65,21 +66,23 @@ import static org.apache.fluss.utils.FileUtils.deleteDirectoryQuietly;
  * }
  * }</pre>
  *
- * <p><b>Note:</b> This class is NOT thread-safe. Each instance should be used by a single thread
- * only.
+ * <p>Iteration remains single-threaded, but {@link #close()} may run concurrently and takes
+ * ownership of resources acquired by an in-progress iteration.
  */
-@NotThreadSafe
 public class RemoteLogFetcher implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(RemoteLogFetcher.class);
 
     private static final String REMOTE_LOG_RECOVERY_DIR_PREFIX = "remote-log-recovery-";
+    private static final int MAX_SEGMENT_METADATA_PER_PAGE = 16;
 
     private final RemoteLogManager remoteLogManager;
     private final TableBucket tableBucket;
     private final Path tempDir;
+    private final Object lifecycleLock = new Object();
 
     /** Tracks the currently active iterator to ensure proper cleanup on close. */
-    private volatile RemoteLogBatchIterator activeIterator;
+    private RemoteLogBatchIterator activeIterator;
+    private boolean closed;
 
     public RemoteLogFetcher(
             RemoteLogManager remoteLogManager, TableBucket tableBucket, File logTabletDir) {
@@ -115,47 +118,88 @@ public class RemoteLogFetcher implements Closeable {
      */
     public Iterable<LogRecordBatch> fetch(long startOffset, long localLogStartOffset)
             throws Exception {
-        // Lazily create the temp directory on first fetch.
-        if (!Files.exists(tempDir)) {
-            Files.createDirectories(tempDir);
+        return fetchInternal(startOffset, localLogStartOffset, Long.MAX_VALUE);
+    }
+
+    /**
+     * Fetches a byte-bounded range while retaining at most one small page of segment metadata.
+     * The first batch may exceed {@code maxBytes}, matching local log min-one-message behavior.
+     */
+    public Iterable<LogRecordBatch> fetch(
+            long startOffset, long localLogStartOffset, int maxBytes) throws Exception {
+        if (maxBytes <= 0) {
+            throw new IllegalArgumentException("maxBytes must be positive");
         }
+        return fetchInternal(startOffset, localLogStartOffset, maxBytes);
+    }
 
-        // Close any previously active iterator before creating a new one to avoid leaking file
-        // descriptors.
-        RemoteLogBatchIterator prev = this.activeIterator;
-        if (prev != null) {
-            prev.close();
+    private Iterable<LogRecordBatch> fetchInternal(
+            long startOffset, long localLogStartOffset, long maxBytes) throws Exception {
+        synchronized (lifecycleLock) {
+            if (closed) {
+                throw new IllegalStateException("RemoteLogFetcher is closed");
+            }
+            // Lazily create the temp directory on first fetch.
+            if (!Files.exists(tempDir)) {
+                Files.createDirectories(tempDir);
+            }
+
+            // Close any previously active iterator before creating a new one to avoid leaking file
+            // descriptors.
+            RemoteLogBatchIterator prev = this.activeIterator;
+            if (prev != null) {
+                prev.close();
+            }
+
+            RemoteLogSegmentPage firstPage =
+                    remoteLogManager.relevantRemoteLogSegmentPage(
+                            tableBucket,
+                            startOffset,
+                            null,
+                            MAX_SEGMENT_METADATA_PER_PAGE);
+            if (firstPage.segments().isEmpty() && !firstPage.hasMore()) {
+                throw new RemoteStorageException(
+                        String.format(
+                                "No remote log segments found for table bucket %s at offset %d",
+                                tableBucket, startOffset));
+            }
+
+            LOG.info(
+                    "Found first remote log metadata page with {} segments for table bucket {} from offset {} to localLogStartOffset {}",
+                    firstPage.segments().size(),
+                    tableBucket,
+                    startOffset,
+                    localLogStartOffset);
+
+            RemoteLogBatchIterator iterator =
+                    new RemoteLogBatchIterator(
+                            firstPage,
+                            startOffset,
+                            localLogStartOffset,
+                            maxBytes);
+            this.activeIterator = iterator;
+            return () -> iterator;
         }
-
-        List<RemoteLogSegment> segments =
-                remoteLogManager.relevantRemoteLogSegments(tableBucket, startOffset);
-        if (segments.isEmpty()) {
-            throw new RemoteStorageException(
-                    String.format(
-                            "No remote log segments found for table bucket %s at offset %d",
-                            tableBucket, startOffset));
-        }
-
-        LOG.info(
-                "Found {} remote log segments for table bucket {} from offset {} to localLogStartOffset {}",
-                segments.size(),
-                tableBucket,
-                startOffset,
-                localLogStartOffset);
-
-        RemoteLogBatchIterator iterator =
-                new RemoteLogBatchIterator(segments, startOffset, localLogStartOffset);
-        this.activeIterator = iterator;
-        return () -> iterator;
     }
 
     @Override
     public void close() {
-        // Close any active iterator to release file handles
-        if (activeIterator != null) {
-            activeIterator.close();
+        RemoteLogBatchIterator iterator;
+        synchronized (lifecycleLock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            iterator = activeIterator;
             activeIterator = null;
         }
+        if (iterator != null) {
+            iterator.close();
+        }
+        cleanupTempDirectory();
+    }
+
+    private void cleanupTempDirectory() {
         // Remove the entire "tmp" parent directory to clean up our subdirectory as well
         // as any stale recovery directories left by a previous failed recovery.
         Path tmpDir = tempDir.getParent();
@@ -200,17 +244,26 @@ public class RemoteLogFetcher implements Closeable {
         return localFile;
     }
 
+    /** Opens downloaded records before the iterator atomically registers their ownership. */
+    protected FileLogRecords openDownloadedSegment(File localFile) throws IOException {
+        return FileLogRecords.open(localFile, false);
+    }
+
     /**
      * An iterator that lazily downloads remote log segments and iterates over their batches in
      * order. It respects the startOffset and localLogStartOffset boundaries, yielding only batches
      * within [startOffset, localLogStartOffset).
      */
     private class RemoteLogBatchIterator implements Iterator<LogRecordBatch> {
-        private final List<RemoteLogSegment> segments;
         private final long localLogStartOffset;
+        private final long maxBytes;
+        private List<RemoteLogSegment> segments;
+        @Nullable private Long metadataCursor;
+        private boolean hasMoreMetadata;
 
         /** Tracks the current read offset, advancing as batches are consumed. */
         private long currentOffset;
+        private long returnedBytes;
 
         private int currentSegmentIndex = 0;
         private FileLogRecords currentFileLogRecords;
@@ -221,22 +274,43 @@ public class RemoteLogFetcher implements Closeable {
         private volatile boolean closed = false;
 
         RemoteLogBatchIterator(
-                List<RemoteLogSegment> segments, long startOffset, long localLogStartOffset) {
-            this.segments = segments;
+                RemoteLogSegmentPage firstPage,
+                long startOffset,
+                long localLogStartOffset,
+                long maxBytes) {
+            this.segments = firstPage.segments();
+            this.metadataCursor = firstPage.nextStartOffsetExclusive();
+            this.hasMoreMetadata = firstPage.hasMore();
             this.currentOffset = startOffset;
             this.localLogStartOffset = localLogStartOffset;
+            this.maxBytes = maxBytes;
         }
 
         /** Closes this iterator and releases all held resources. */
         public void close() {
-            if (!closed) {
+            List<FileLogRecords> recordsToClose;
+            synchronized (this) {
+                if (closed) {
+                    return;
+                }
                 closed = true;
-                closeOpenedFileLogRecords();
+                recordsToClose = new ArrayList<>(openedFileLogRecords);
+                openedFileLogRecords.clear();
+                currentFileLogRecords = null;
+                currentBatchIterator = null;
             }
+            closeFileLogRecords(recordsToClose);
         }
 
         @Override
         public boolean hasNext() {
+            if (closed) {
+                return false;
+            }
+            if (nextBatch == null && returnedBytes >= maxBytes) {
+                finished = true;
+                return false;
+            }
             // Lazily advance while retaining opened files until close. Index replay may collect
             // lightweight batch views whose bytes must stay owned by its ReadResult.
             if (nextBatch == null && !finished) {
@@ -258,6 +332,10 @@ public class RemoteLogFetcher implements Closeable {
         private void advance() {
             nextBatch = null;
             while (!finished) {
+                if (closed) {
+                    finished = true;
+                    return;
+                }
                 // try to get next batch from current iterator
                 if (currentBatchIterator != null && currentBatchIterator.hasNext()) {
                     LogRecordBatch batch = currentBatchIterator.next();
@@ -270,7 +348,13 @@ public class RemoteLogFetcher implements Closeable {
                         finished = true;
                         return;
                     }
+                    if (returnedBytes > 0
+                            && returnedBytes + batch.sizeInBytes() > maxBytes) {
+                        finished = true;
+                        return;
+                    }
                     nextBatch = batch;
+                    returnedBytes += batch.sizeInBytes();
                     // advance currentOffset so subsequent segments use updated position
                     currentOffset = batch.nextLogOffset();
                     return;
@@ -280,7 +364,7 @@ public class RemoteLogFetcher implements Closeable {
                 currentBatchIterator = null;
 
                 // move to next segment
-                if (currentSegmentIndex >= segments.size()) {
+                if (currentSegmentIndex >= segments.size() && !loadNextMetadataPage()) {
                     finished = true;
                     return;
                 }
@@ -302,8 +386,14 @@ public class RemoteLogFetcher implements Closeable {
                     // by the download time of remote segments, especially when there are many
                     // segments to fetch. trace by: https://github.com/apache/fluss/issues/3091
                     File localFile = downloadSegment(segment);
-                    currentFileLogRecords = FileLogRecords.open(localFile, false);
-                    openedFileLogRecords.add(currentFileLogRecords);
+                    FileLogRecords openedRecords = openDownloadedSegment(localFile);
+                    if (!registerOpenedFileLogRecords(openedRecords)) {
+                        IOUtils.closeQuietly(openedRecords, "FileLogRecords");
+                        cleanupTempDirectory();
+                        finished = true;
+                        return;
+                    }
+                    currentFileLogRecords = openedRecords;
                     int startPosition = 0;
                     // if this segment contains data before currentOffset, find the right position
                     if (segment.remoteLogStartOffset() < currentOffset) {
@@ -327,6 +417,11 @@ public class RemoteLogFetcher implements Closeable {
                 } catch (Exception e) {
                     // Ensure resources are cleaned up if an exception occurs during segment loading
                     closeOpenedFileLogRecords();
+                    if (closed) {
+                        cleanupTempDirectory();
+                        finished = true;
+                        return;
+                    }
                     throw new RuntimeException(
                             "Failed to fetch remote log segment: " + segment.remoteLogSegmentId(),
                             e);
@@ -334,13 +429,45 @@ public class RemoteLogFetcher implements Closeable {
             }
         }
 
+        private boolean loadNextMetadataPage() {
+            while (currentSegmentIndex >= segments.size() && hasMoreMetadata) {
+                RemoteLogSegmentPage page =
+                        remoteLogManager.relevantRemoteLogSegmentPage(
+                                tableBucket,
+                                currentOffset,
+                                metadataCursor,
+                                MAX_SEGMENT_METADATA_PER_PAGE);
+                segments = page.segments();
+                currentSegmentIndex = 0;
+                metadataCursor = page.nextStartOffsetExclusive();
+                hasMoreMetadata = page.hasMore();
+            }
+            return currentSegmentIndex < segments.size();
+        }
+
+        private synchronized boolean registerOpenedFileLogRecords(FileLogRecords records) {
+            if (closed) {
+                return false;
+            }
+            openedFileLogRecords.add(records);
+            return true;
+        }
+
         private void closeOpenedFileLogRecords() {
-            for (FileLogRecords records : openedFileLogRecords) {
+            List<FileLogRecords> recordsToClose;
+            synchronized (this) {
+                recordsToClose = new ArrayList<>(openedFileLogRecords);
+                openedFileLogRecords.clear();
+                currentFileLogRecords = null;
+                currentBatchIterator = null;
+            }
+            closeFileLogRecords(recordsToClose);
+        }
+
+        private void closeFileLogRecords(List<FileLogRecords> recordsToClose) {
+            for (FileLogRecords records : recordsToClose) {
                 IOUtils.closeQuietly(records, "FileLogRecords");
             }
-            openedFileLogRecords.clear();
-            currentFileLogRecords = null;
-            currentBatchIterator = null;
         }
     }
 }
