@@ -27,6 +27,9 @@ import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableBucketReplica;
@@ -58,6 +61,7 @@ import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
 import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
 import org.apache.fluss.server.entity.TablePropertyChanges;
+import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.metadata.BucketMetadata;
@@ -83,6 +87,7 @@ import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.types.Tuple2;
@@ -299,6 +304,72 @@ class CoordinatorEventProcessorTest {
         Set<TableBucketReplica> tableBucketReplicas =
                 fromCtx(ctx -> ctx.getAllReplicasForTable(t2Id));
         assertThat(tableBucketReplicas).isEmpty();
+    }
+
+    @Test
+    void testCreatePublishesOnlyNewlyRequiredIndexBaseline() throws Exception {
+        initCoordinatorChannel();
+        TablePath mainPath = TablePath.of(defaultDatabase, "baseline_main");
+        TableDescriptor mainDescriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("region", DataTypes.STRING())
+                                        .primaryKey("id", "region")
+                                        .index(
+                                                "idx_id",
+                                                IndexType.SECONDARY,
+                                                Collections.singletonList("id"),
+                                                IndexVisibility.SYNC,
+                                                1)
+                                        .build())
+                        .partitionedBy("region")
+                        .distributedBy(1, "id")
+                        .build()
+                        .withReplicationFactor(1);
+        long mainTableId = metadataManager.createTable(mainPath, mainDescriptor, null, false);
+        retryVerifyContext(ctx -> assertThat(ctx.getTablePathById(mainTableId)).isEqualTo(mainPath));
+
+        assertThat(lastTombstoneUpdate(0)).isEmpty();
+
+        TableDescriptor indexDescriptor =
+                IndexTableDescriptorFactory.derive(
+                                mainDescriptor,
+                                mainTableId,
+                                defaultDatabase + ".baseline_main",
+                                "idx_id")
+                        .withReplicationFactor(1);
+        TablePath indexPath =
+                TablePath.of(
+                        defaultDatabase,
+                        IndexTableUtils.indexTableName("baseline_main", "idx_id"));
+        TableAssignment indexAssignment =
+                generateAssignment(
+                        1,
+                        1,
+                        new TabletServerInfo[] {
+                            new TabletServerInfo(0, "rack0"),
+                            new TabletServerInfo(1, "rack1"),
+                            new TabletServerInfo(2, "rack2")
+                        });
+        long indexTableId =
+                metadataManager.createTable(indexPath, indexDescriptor, indexAssignment, false);
+        retryVerifyContext(
+                ctx -> assertThat(ctx.getTablePathById(indexTableId)).isEqualTo(indexPath));
+
+        assertThat(lastTombstoneUpdate(0))
+                .containsExactlyEntriesOf(
+                        Collections.singletonMap(mainTableId, PartitionTombstone.EMPTY));
+
+        TablePath unrelatedPath = TablePath.of(defaultDatabase, "baseline_unrelated");
+        long unrelatedId =
+                metadataManager.createTable(
+                        unrelatedPath, TEST_TABLE, indexAssignment, false);
+        retryVerifyContext(
+                ctx -> assertThat(ctx.getTablePathById(unrelatedId)).isEqualTo(unrelatedPath));
+
+        assertThat(lastTombstoneUpdate(0)).isEmpty();
     }
 
     @Test
@@ -1477,6 +1548,16 @@ class CoordinatorEventProcessorTest {
                     getUpdateMetadataRequestData((UpdateMetadataRequest) lastRequest);
             assertThat(clusterMetadata.getTableMetadataList()).containsExactly(tableMetadata);
         }
+    }
+
+    private Map<Long, PartitionTombstone> lastTombstoneUpdate(int serverId) {
+        TestTabletServerGateway gateway =
+                (TestTabletServerGateway)
+                        testCoordinatorChannelManager.getTabletServerGateway(serverId).get();
+        ApiMessage request = gateway.getRequest(gateway.pendingRequestSize() - 1);
+        assertThat(request).isInstanceOf(UpdateMetadataRequest.class);
+        return getUpdateMetadataRequestData((UpdateMetadataRequest) request)
+                .getPartitionTombstones();
     }
 
     private void retryVerifyContext(Consumer<CoordinatorContext> verifyFunction) {

@@ -520,13 +520,16 @@ public final class KvTablet {
 
                     if (kvRecords.idempotenceProtocolVersion() == 1) {
                         WriterKey writerKey = kvRecords.fencedWriterKey();
+                        long fencedSequence = kvRecords.fencedSequence();
+                        if (fencedSequence < 0L) {
+                            throw new IllegalArgumentException("sequence must be non-negative");
+                        }
                         if (writeGuard.beforeWriterState(writerKey)
                                 == KvWriteGuard.Decision.NO_OP) {
                             return LogAppendInfo.noAppend();
                         }
                         Optional<FencedWriterStateEntry> stale =
-                                logTablet.findStaleFencedBatch(
-                                        writerKey, kvRecords.fencedSequence());
+                                logTablet.findStaleFencedBatch(writerKey, fencedSequence);
                         if (stale.isPresent()) {
                             FencedWriterStateEntry entry = stale.get();
                             return LogAppendInfo.duplicatedAt(

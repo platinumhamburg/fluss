@@ -39,19 +39,23 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
+import org.apache.fluss.server.log.FencedWriterAppendInfo;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestBase;
+import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.UnsafeUtils;
+import org.apache.fluss.utils.crc.Crc32C;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -59,6 +63,9 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -71,6 +78,7 @@ import java.util.stream.Stream;
 
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.row.BinaryString.fromString;
+import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -82,6 +90,9 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     private static final long INDEX_TABLE_ID = 9200L;
     private static final long PARTITION_ID = 10L;
     private static final short SCHEMA_ID = 1;
+    private static final int FENCED_KV_CRC_OFFSET = 5;
+    private static final int FENCED_KV_SCHEMA_ID_OFFSET = 9;
+    private static final int FENCED_KV_SEQUENCE_OFFSET = 28;
 
     @Test
     void testUninitializedPartitionedIndexRejectsBeforePrewrite() throws Exception {
@@ -185,7 +196,26 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         LogAppendInfo result =
                 fixture.put(mutation(writerKey, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
 
+        assertThat(result.hasNoAppend()).isTrue();
         assertThat(result.lastOffset()).isEqualTo(-1L);
+        assertNoMutation(fixture, writerKey, 0L);
+    }
+
+    @Test
+    void testTombstonedNegativeSequenceIsRejectedBeforeNoAppend() throws Exception {
+        Fixture fixture = createFixture("negative_sequence");
+        publishDirect(tombstone(PARTITION_ID));
+        WriterKey writerKey = writerKey(PARTITION_ID);
+        KvRecordBatch invalid =
+                crcValidNegativeSequenceMutation(
+                        writerKey, physicalRow(PARTITION_ID), PARTITION_ID);
+
+        assertThat(invalid.fencedSequence()).isEqualTo(-1L);
+        assertThat(invalid.isValid()).isTrue();
+        assertThatThrownBy(() -> fixture.put(invalid))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("sequence must be non-negative");
+
         assertNoMutation(fixture, writerKey, 0L);
     }
 
@@ -230,6 +260,123 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     }
 
     @Test
+    void testFollowerRetiresAndPromotionRechecksPublishedTombstone() throws Exception {
+        Fixture fixture = createInitializedFixture("follower_lifecycle");
+        WriterKey writerKey = writerKey(PARTITION_ID);
+        fixture.put(mutation(writerKey, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
+
+        makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
+        assertThat(fixture.replica.getKvTablet()).isNull();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+
+        // Model a follower replay that wins after publication. Promotion must catch it up against
+        // the already-published authoritative baseline before accepting leader writes.
+        putWriterState(fixture.log, writerKey, 101L);
+        makeLeader(fixture, INITIAL_LEADER_EPOCH + 2);
+
+        assertThat(fixture.replica.getKvTablet()).isNotNull();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @MethodSource("retirementKeyOrders")
+    void testRetirementSkipsUnattributableKeysAndStillRetiresValidWriter(
+            List<WriterKey> insertionOrder) throws Exception {
+        Fixture fixture = createInitializedFixture("unattributable_" + insertionOrder.hashCode());
+        WriterKey tombstoned = writerKey(PARTITION_ID);
+        WriterKey live = writerKey(PARTITION_ID + 1);
+        WriterKey unpartitioned = IndexWriterKey.encode(new TableBucket(MAIN_TABLE_ID, 0));
+        WriterKey reserved = new WriterKey(0L, 1L << 40);
+        WriterKey negativePartition = new WriterKey(-1L, Long.MIN_VALUE);
+
+        for (WriterKey key : insertionOrder) {
+            putWriterState(fixture.log, key, 1L);
+        }
+        putWriterState(fixture.log, live, 1L);
+
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+
+        assertThat(serverMetadataCache.getPartitionTombstone(MAIN_TABLE_ID))
+                .isEqualTo(tombstone(PARTITION_ID));
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(unpartitioned)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(reserved)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(negativePartition)).isPresent();
+    }
+
+    private static Stream<Arguments> retirementKeyOrders() {
+        WriterKey valid = writerKey(PARTITION_ID);
+        WriterKey unpartitioned = IndexWriterKey.encode(new TableBucket(MAIN_TABLE_ID, 0));
+        WriterKey reserved = new WriterKey(0L, 1L << 40);
+        WriterKey negativePartition = new WriterKey(-1L, Long.MIN_VALUE);
+        return Stream.of(
+                Arguments.of(
+                        Arrays.asList(unpartitioned, reserved, negativePartition, valid)),
+                Arguments.of(
+                        Arrays.asList(valid, negativePartition, reserved, unpartitioned)));
+    }
+
+    @Test
+    void testUnchangedTombstoneReplayDoesNotRescanWriterState() throws Exception {
+        Fixture fixture = createInitializedFixture("unchanged_replay");
+        WriterKey writerKey = writerKey(PARTITION_ID);
+        PartitionTombstone tombstone = tombstone(PARTITION_ID);
+        publishThroughReplicaManager(tombstone);
+
+        putWriterState(fixture.log, writerKey, 100L);
+        publishThroughReplicaManager(
+                new PartitionTombstone(
+                        tombstone.getFloor(), tombstone.getExplicitSet(), 2L));
+
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+    }
+
+    @Test
+    void testFirstEmptyInitializationPreservesWriterStateAndEstablishesReadiness() throws Exception {
+        Fixture fixture = createFixture("first_empty");
+        WriterKey writerKey = writerKey(PARTITION_ID);
+        putWriterState(fixture.log, writerKey, 100L);
+
+        publishThroughReplicaManager(PartitionTombstone.EMPTY);
+
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(MAIN_TABLE_ID))
+                .contains(PartitionTombstone.EMPTY);
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+    }
+
+    @Test
+    void testGenuineAdvanceRetiresOnlyMatchingLocalIndexReplica() throws Exception {
+        long otherMainTableId = MAIN_TABLE_ID + 100;
+        Fixture matching = createInitializedFixture("matching_replica");
+        Fixture unrelated =
+                createInitializedFixture(
+                        "unrelated_replica", otherMainTableId, INDEX_TABLE_ID + 100);
+        WriterKey matchingWriter = writerKey(MAIN_TABLE_ID, PARTITION_ID);
+        WriterKey unrelatedWriter = writerKey(otherMainTableId, PARTITION_ID);
+        matching.put(
+                mutation(
+                        matchingWriter,
+                        100L,
+                        physicalRow(PARTITION_ID),
+                        PARTITION_ID));
+        unrelated.put(
+                mutation(
+                        unrelatedWriter,
+                        100L,
+                        physicalRow(PARTITION_ID),
+                        PARTITION_ID));
+
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+
+        assertThat(matching.log.writerStateManager().lastFencedEntry(matchingWriter)).isEmpty();
+        assertThat(unrelated.log.writerStateManager().lastFencedEntry(unrelatedWriter)).isPresent();
+    }
+
+    @Test
     void testApplyHoldingKvLockFinishesBeforePublicationRetiresWriter() throws Exception {
         Fixture fixture = createInitializedFixture("apply_first");
         WriterKey writerKey = writerKey(PARTITION_ID);
@@ -256,8 +403,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                                                     key)));
             await(applyHasLock);
             PartitionTombstone tombstone = tombstone(PARTITION_ID);
-            publishDirect(tombstone);
             Future<?> retirement = executor.submit(() -> publishThroughReplicaManager(tombstone));
+            awaitPublished(tombstone);
 
             releaseApply.countDown();
             assertThat(apply.get(10, TimeUnit.SECONDS).lastOffset()).isZero();
@@ -320,25 +467,34 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     }
 
     private Fixture createInitializedFixture(String name) throws Exception {
-        Fixture fixture = createFixture(name);
-        publishDirect(PartitionTombstone.EMPTY);
+        return createInitializedFixture(name, MAIN_TABLE_ID, INDEX_TABLE_ID);
+    }
+
+    private Fixture createInitializedFixture(String name, long mainTableId, long indexTableId)
+            throws Exception {
+        Fixture fixture = createFixture(name, mainTableId, indexTableId);
+        serverMetadataCache.updatePartitionTombstone(mainTableId, PartitionTombstone.EMPTY);
         return fixture;
     }
 
     private Fixture createFixture(String name) throws Exception {
+        return createFixture(name, MAIN_TABLE_ID, INDEX_TABLE_ID);
+    }
+
+    private Fixture createFixture(String name, long mainTableId, long indexTableId) throws Exception {
         TableDescriptor mainDescriptor = partitionedMainTableDescriptor();
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(
-                        mainDescriptor, MAIN_TABLE_ID, "test_db.orders", "idx_user");
+                        mainDescriptor, mainTableId, "test_db.orders", "idx_user");
         TablePath indexPath =
                 TablePath.of(
                         "test_db", IndexTableUtils.indexTableName("orders_" + name, "idx_user"));
         zkClient.registerTable(
                 indexPath,
                 TableRegistration.newTable(
-                        INDEX_TABLE_ID, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
+                        indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
         zkClient.registerFirstSchema(indexPath, indexDescriptor.getSchema());
-        TableBucket indexBucket = new TableBucket(INDEX_TABLE_ID, 0);
+        TableBucket indexBucket = new TableBucket(indexTableId, 0);
         makeKvTableAsLeader(indexBucket, indexPath, INITIAL_LEADER_EPOCH, false);
         Replica replica = replicaManager.getReplicaOrException(indexBucket);
         return new Fixture(replica, replica.getKvTablet(), replica.getLogTablet());
@@ -366,7 +522,11 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     }
 
     private static WriterKey writerKey(long partitionId) {
-        return IndexWriterKey.encode(new TableBucket(MAIN_TABLE_ID, partitionId, 0));
+        return writerKey(MAIN_TABLE_ID, partitionId);
+    }
+
+    private static WriterKey writerKey(long mainTableId, long partitionId) {
+        return IndexWriterKey.encode(new TableBucket(mainTableId, partitionId, 0));
     }
 
     private static AlignedRow physicalRow(long partitionId) {
@@ -407,6 +567,64 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         builder.append(key, row);
         builder.setWriterState(writerKey, sequence);
         return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
+    }
+
+    private static KvRecordBatch crcValidNegativeSequenceMutation(
+            WriterKey writerKey, BinaryRow row, long keyPartitionId) throws Exception {
+        FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        SCHEMA_ID, 1024, new UnmanagedPagedOutputView(256), KvFormat.ALIGNED);
+        builder.append(physicalKey(physicalRow(keyPartitionId)), row);
+        builder.setWriterState(writerKey, 0L);
+        ByteBuffer source = builder.build().getByteBuf().nioBuffer();
+        byte[] bytes = new byte[source.remaining()];
+        source.get(bytes);
+        ByteBuffer littleEndian = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        littleEndian.putLong(FENCED_KV_SEQUENCE_OFFSET, -1L);
+        long crc =
+                Crc32C.compute(
+                        bytes,
+                        FENCED_KV_SCHEMA_ID_OFFSET,
+                        bytes.length - FENCED_KV_SCHEMA_ID_OFFSET);
+        littleEndian.putInt(FENCED_KV_CRC_OFFSET, (int) crc);
+        return KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
+    }
+
+    private static void putWriterState(LogTablet logTablet, WriterKey writerKey, long sequence) {
+        FencedWriterAppendInfo update =
+                logTablet.writerStateManager().prepareFencedUpdate(writerKey);
+        update.append(sequence, sequence, sequence);
+        logTablet.writerStateManager().updateFenced(update);
+    }
+
+    private static void makeFollower(Fixture fixture, int leaderEpoch) {
+        fixture.replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        fixture.replica.getPhysicalTablePath(),
+                        fixture.log.getTableBucket(),
+                        Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID + 1,
+                                leaderEpoch,
+                                Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                leaderEpoch)));
+    }
+
+    private static void makeLeader(Fixture fixture, int leaderEpoch) throws Exception {
+        fixture.replica.makeLeader(
+                new NotifyLeaderAndIsrData(
+                        fixture.replica.getPhysicalTablePath(),
+                        fixture.log.getTableBucket(),
+                        Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID,
+                                leaderEpoch,
+                                Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                leaderEpoch)));
     }
 
     private void publishDirect(PartitionTombstone tombstone) {
@@ -451,6 +669,16 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException(e);
+        }
+    }
+
+    private void awaitPublished(PartitionTombstone expected) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!expected.equals(serverMetadataCache.getPartitionTombstone(MAIN_TABLE_ID))) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("Tombstone publication did not complete");
+            }
+            Thread.yield();
         }
     }
 

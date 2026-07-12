@@ -38,6 +38,7 @@ import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -434,32 +435,51 @@ public final class Replica {
         return kvTablet;
     }
 
-    /** Retires writers for a newly tombstoned source partition under the KV write lock. */
+    /** Retires writers for a tombstoned source partition under the applicable tablet lock. */
     public void retireTombstonedIndexWriters(long mainTableId) {
         if (!tableInfo.isIndexTable()
                 || !tableInfo.getMainTableId().isPresent()
                 || tableInfo.getMainTableId().getAsLong() != mainTableId) {
             return;
         }
+        Runnable retirement =
+                () ->
+                        metadataCache
+                                .getInitializedPartitionTombstone(mainTableId)
+                                .filter(tombstone -> !tombstone.isEmpty())
+                                .ifPresent(this::removeTombstonedIndexWriters);
         KvTablet kv = kvTablet;
-        if (kv == null) {
-            return;
+        if (kv != null) {
+            kv.getGuardedExecutor().execute(retirement);
+        } else {
+            // Followers have no KvTablet. LogTablet's lock serializes this scan with replay.
+            retirement.run();
         }
-        kv.getGuardedExecutor()
-                .execute(
-                        () ->
-                                metadataCache
-                                        .getInitializedPartitionTombstone(mainTableId)
-                                        .ifPresent(
-                                                tombstone ->
-                                                        logTablet.removeFencedWriters(
-                                                                writerKey ->
-                                                                        tombstone.isTombstoned(
-                                                                                IndexWriterKey
-                                                                                        .decode(
-                                                                                                writerKey)
-                                                                                        .getPartitionId()
-                                                                                        .getAsLong()))));
+    }
+
+    private void removeTombstonedIndexWriters(PartitionTombstone tombstone) {
+        int[] skipped = {0};
+        logTablet.removeFencedWriters(
+                writerKey -> {
+                    try {
+                        OptionalLong partitionId =
+                                IndexWriterKey.decode(writerKey).getPartitionId();
+                        if (!partitionId.isPresent()) {
+                            skipped[0]++;
+                            return false;
+                        }
+                        return tombstone.isTombstoned(partitionId.getAsLong());
+                    } catch (IllegalArgumentException e) {
+                        skipped[0]++;
+                        return false;
+                    }
+                });
+        if (skipped[0] > 0) {
+            LOG.warn(
+                    "Skipped {} unattributable V1 writer keys while retiring tombstoned writers for {}",
+                    skipped[0],
+                    tableBucket);
+        }
     }
 
     public TablePath getTablePath() {
@@ -651,6 +671,9 @@ public final class Replica {
             dropKv();
             // now, we can create a new kv tablet
             createKv();
+            tableInfo
+                    .getMainTableId()
+                    .ifPresent(this::retireTombstonedIndexWriters);
             indexManager.onLeaderKvReady(
                     logTablet,
                     schemaGetter,

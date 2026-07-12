@@ -690,7 +690,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     null,
                     null,
                     tableBuckets,
-                    collectPartitionTombstonesForIndexedTables());
+                    partitionTombstoneRequiredByCreatedTable(tableInfo));
 
             // register table metrics.
             coordinatorMetricGroup.addTableBucketMetricGroup(
@@ -705,7 +705,31 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     tableId,
                     null,
                     Collections.emptySet(),
-                    collectPartitionTombstonesForIndexedTables());
+                    partitionTombstoneRequiredByCreatedTable(tableInfo));
+        }
+    }
+
+    private Map<Long, PartitionTombstone> partitionTombstoneRequiredByCreatedTable(
+            TableInfo createdTable) {
+        if (!createdTable.isIndexTable() || !createdTable.getMainTableId().isPresent()) {
+            return Collections.emptyMap();
+        }
+        long mainTableId = createdTable.getMainTableId().getAsLong();
+        TableInfo mainTable = coordinatorContext.getTableInfoById(mainTableId);
+        if (mainTable == null
+                || !mainTable.isPartitioned()
+                || coordinatorContext.isTableQueuedForDeletion(mainTableId)) {
+            return Collections.emptyMap();
+        }
+        try {
+            return Collections.singletonMap(
+                    mainTableId,
+                    zooKeeperClient.getPartitionTombstone(mainTable.getTablePath()));
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to load PartitionTombstone for newly created Index Table "
+                            + createdTable.getTablePath(),
+                    e);
         }
     }
 

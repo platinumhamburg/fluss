@@ -221,6 +221,10 @@ public class TabletServerMetadataCacheTest {
                 initialBucketMetadata);
 
         // test delete one table.
+        serverMetadataCache.updatePartitionTombstone(
+                DATA1_TABLE_ID,
+                new PartitionTombstone(-1L, Collections.singleton(10L), 1L));
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(DATA1_TABLE_ID)).isPresent();
         serverMetadataCache.updateClusterMetadata(
                 new ClusterMetadata(
                         coordinatorServer,
@@ -239,6 +243,7 @@ public class TabletServerMetadataCacheTest {
                                         changedBucket1BucketMetadata)),
                         Collections.emptyList()));
         assertThat(serverMetadataCache.getTablePath(DATA1_TABLE_ID)).isEmpty();
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(DATA1_TABLE_ID)).isEmpty();
 
         // test delete one partition.
         serverMetadataCache.updateClusterMetadata(

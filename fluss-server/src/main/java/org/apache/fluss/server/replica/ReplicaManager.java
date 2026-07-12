@@ -582,11 +582,61 @@ public class ReplicaManager implements ServerReconfigurable {
                 () -> {
                     // check or apply coordinator epoch.
                     validateAndApplyCoordinatorEpoch(coordinatorEpoch, "updateMetadataCache");
+                    Map<Long, Optional<PartitionTombstone>> previousTombstones =
+                            capturePreviousTombstones(clusterMetadata.getPartitionTombstones());
                     metadataCache.updateClusterMetadata(clusterMetadata);
-                    retireTombstonedIndexWriters(clusterMetadata.getPartitionTombstones());
+                    retireTombstonedIndexWriters(
+                            advancedTombstones(
+                                    clusterMetadata.getPartitionTombstones(), previousTombstones));
                     updateReplicaTableConfig(clusterMetadata);
                     retryDeferredIndexReplicators();
                 });
+    }
+
+    private Map<Long, Optional<PartitionTombstone>> capturePreviousTombstones(
+            Map<Long, PartitionTombstone> incoming) {
+        if (incoming == null || incoming.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<Long, Optional<PartitionTombstone>> previous = new HashMap<>();
+        for (long mainTableId : incoming.keySet()) {
+            previous.put(
+                    mainTableId,
+                    metadataCache.getInitializedPartitionTombstone(mainTableId));
+        }
+        return previous;
+    }
+
+    private Map<Long, PartitionTombstone> advancedTombstones(
+            Map<Long, PartitionTombstone> incoming,
+            Map<Long, Optional<PartitionTombstone>> previousTombstones) {
+        if (incoming == null || incoming.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<Long, PartitionTombstone> advanced = new HashMap<>();
+        for (long mainTableId : incoming.keySet()) {
+            Optional<PartitionTombstone> current =
+                    metadataCache.getInitializedPartitionTombstone(mainTableId);
+            if (!current.isPresent()) {
+                continue;
+            }
+            PartitionTombstone previous =
+                    previousTombstones
+                            .getOrDefault(mainTableId, Optional.empty())
+                            .orElse(PartitionTombstone.EMPTY);
+            if (hasNewlyTombstonedPartition(previous, current.get())) {
+                advanced.put(mainTableId, current.get());
+            }
+        }
+        return advanced;
+    }
+
+    private static boolean hasNewlyTombstonedPartition(
+            PartitionTombstone previous, PartitionTombstone current) {
+        if (current.getFloor() > previous.getFloor()) {
+            return true;
+        }
+        return current.getExplicitSet().stream().anyMatch(pid -> !previous.isTombstoned(pid));
     }
 
     private void retireTombstonedIndexWriters(Map<Long, PartitionTombstone> tombstones) {
