@@ -74,9 +74,7 @@ class KvSnapshotFileRuleTest {
     @Test
     void recognizesRemoteSnapshotUuidFileName() {
         FileMeta file =
-                file(
-                        "/kv/db/t-1/0/snap-5/9ba9895d-2c2f-4fba-9e47-1961f30aa90f",
-                        NOW - 2 * DAY_MS);
+                file("/kv/db/t-1/0/snap-5/9ba9895d-2c2f-4fba-9e47-1961f30aa90f", NOW - 2 * DAY_MS);
 
         assertThat(rule.evaluate(file, BucketActiveRefs.empty(), CUTOFF_MS))
                 .isEqualTo(Decision.DELETE);
@@ -85,9 +83,7 @@ class KvSnapshotFileRuleTest {
     @Test
     void rejectsMalformedRemoteSnapshotUuidFileName() {
         FileMeta file =
-                file(
-                        "/kv/db/t-1/0/snap-5/9ba9895d-2c2f-4fba-9e47-1961f30aa90x",
-                        NOW - 2 * DAY_MS);
+                file("/kv/db/t-1/0/snap-5/9ba9895d-2c2f-4fba-9e47-1961f30aa90x", NOW - 2 * DAY_MS);
 
         assertThat(rule.evaluate(file, BucketActiveRefs.empty(), CUTOFF_MS))
                 .isEqualTo(Decision.SKIP_UNKNOWN);
