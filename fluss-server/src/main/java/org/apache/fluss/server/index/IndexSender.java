@@ -326,6 +326,7 @@ public final class IndexSender implements AutoCloseable {
             this.workers[i] = new SenderWorker("index-sender-" + i, i, backoffMs);
         }
         accumulator.setAppendListener(this::enqueueReadyBucket);
+        accumulator.setDropListener(this::relinquishDroppedBatch);
         for (TableBucket bucket : accumulator.buckets()) {
             enqueueReadyBucket(bucket);
         }
@@ -1386,6 +1387,19 @@ public final class IndexSender implements AutoCloseable {
         accumulator.release(batch);
     }
 
+    private void relinquishDroppedBatch(IndexBatch batch) {
+        lifecycleLock.lock();
+        try {
+            ownedBatches.remove(batch);
+            TableBucket bucket = batch.targetBucket();
+            if (inFlightBatches.remove(bucket, batch)) {
+                inFlightSinceMs.remove(bucket);
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
     private void reEnqueueOwnedBatch(IndexBatch batch) {
         List<BatchAction> actions = new ArrayList<>();
         lifecycleLock.lock();
@@ -1548,6 +1562,20 @@ public final class IndexSender implements AutoCloseable {
         lifecycleLock.lock();
         try {
             return ownedBatches.size();
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
+    @VisibleForTesting
+    long ownedBatchPayloadBytesForTesting() {
+        lifecycleLock.lock();
+        try {
+            long bytes = 0L;
+            for (IndexBatch batch : ownedBatches) {
+                bytes += batch.encoded().getBytesLength();
+            }
+            return bytes;
         } finally {
             lifecycleLock.unlock();
         }

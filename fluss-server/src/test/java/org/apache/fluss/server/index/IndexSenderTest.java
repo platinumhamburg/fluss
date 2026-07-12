@@ -1119,6 +1119,50 @@ public class IndexSenderTest {
     }
 
     @Test
+    void droppingPublishedRetryRelinquishesSenderOwnership() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        TableBucket bucket = new TableBucket(492L, 0);
+        IndexReplicator owner = owner(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexBatch batch = batchOfSize(bucket, window, 64 * 1024);
+        accumulator.append(batch);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        TimeUnit.MINUTES.toMillis(1),
+                        TimeUnit.MINUTES.toMillis(1),
+                        1024L * 1024L,
+                        5_000L);
+        try {
+            await(() -> gateway.pending.size() == 1);
+            completePutKv(gateway, 0, false);
+            await(() -> batch.attempts() == 1);
+
+            assertThat(accumulator.hasUnsent()).isTrue();
+            assertThat(sender.ownedBatchCountForTesting()).isEqualTo(1);
+            assertThat(sender.ownedBatchPayloadBytesForTesting()).isEqualTo(64L * 1024L);
+
+            owner.close();
+            assertThat(accumulator.dropForReplicator(owner)).isEqualTo(1);
+
+            assertThat(accumulator.hasUnsent()).isFalse();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(sender.ownedBatchCountForTesting())
+                    .as("no sender root may retain the dropped batch payload")
+                    .isZero();
+            assertThat(sender.ownedBatchPayloadBytesForTesting()).isZero();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
     void oversizedSingletonFailsBeforeIncompatibleCapabilityProbe() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();

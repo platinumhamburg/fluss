@@ -66,6 +66,12 @@ public final class IndexAccumulator {
     /** Optional callback fired on each append to promptly wake the owning sender worker. */
     @Nullable private volatile Consumer<TableBucket> appendListener;
 
+    /**
+     * Optional callback fired after a queued batch is dropped for a stopped replicator, outside
+     * deque and accounting locks.
+     */
+    @Nullable private volatile Consumer<IndexBatch> dropListener;
+
     /** Creates an accumulator with no back-pressure bound (primarily for tests). */
     public IndexAccumulator() {
         this(Long.MAX_VALUE);
@@ -79,6 +85,13 @@ public final class IndexAccumulator {
     /** Registers a listener invoked after every {@link #append(IndexBatch)} to wake consumers. */
     public void setAppendListener(Consumer<TableBucket> appendListener) {
         this.appendListener = appendListener;
+    }
+
+    /**
+     * Registers a listener invoked after a queued batch is dropped and its accounting is released.
+     */
+    public void setDropListener(Consumer<IndexBatch> dropListener) {
+        this.dropListener = dropListener;
     }
 
     /** Append a batch to the tail of its target bucket's queue. */
@@ -293,6 +306,12 @@ public final class IndexAccumulator {
         }
         for (IndexBatch batch : droppedBatches) {
             release(batch);
+        }
+        Consumer<IndexBatch> listener = this.dropListener;
+        if (listener != null) {
+            for (IndexBatch batch : droppedBatches) {
+                listener.accept(batch);
+            }
         }
         pendingBytesByReplicator.remove(owner);
         return dropped;
