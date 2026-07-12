@@ -72,6 +72,15 @@ class KvSharedSstRuleTest {
     }
 
     @Test
+    void keepsRemoteSharedUuidFile() {
+        FileMeta file =
+                file("/kv/db/t-1/0/shared/83cc543d-5050-4f75-b15d-3f8a466cf107", NOW - 2 * DAY_MS);
+
+        assertThat(rule.evaluate(file, BucketActiveRefs.empty(), CUTOFF_MS))
+                .isEqualTo(Decision.KEEP_ACTIVE);
+    }
+
+    @Test
     void skipsUnknownNonSstFileUnderSharedDirectory() {
         FileMeta file = file("/kv/db/t-1/0/shared/abc-001.meta", NOW - 2 * DAY_MS);
 
