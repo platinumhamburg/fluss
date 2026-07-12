@@ -31,6 +31,7 @@ import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.TooManyScannersException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
@@ -116,6 +117,7 @@ import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.function.SupplierWithException;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
@@ -516,6 +518,7 @@ public final class Replica {
                 inWriteLock(
                         leaderIsrUpdateLock,
                         () -> {
+                            ensureOnline();
                             int requestBucketEpoch = data.getBucketEpoch();
                             validateBucketEpoch(requestBucketEpoch);
 
@@ -574,6 +577,7 @@ public final class Replica {
         return inWriteLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureOnline();
                     int requestBucketEpoch = data.getBucketEpoch();
                     validateBucketEpoch(requestBucketEpoch);
 
@@ -1892,6 +1896,21 @@ public final class Replica {
                 });
     }
 
+    /** Execute remote follower recovery while preventing promotion from racing a failed rebuild. */
+    public <T> T executeFollowerRecovery(SupplierWithException<T, Throwable> recovery)
+            throws Throwable {
+        leaderIsrUpdateLock.readLock().lock();
+        try {
+            ensureOnline();
+            return recovery.get();
+        } catch (Throwable failure) {
+            failIndexFollowerRecovery(failure);
+            throw failure;
+        } finally {
+            leaderIsrUpdateLock.readLock().unlock();
+        }
+    }
+
     private LogReadInfo readRecords(FetchParams fetchParams, LogTablet logTablet)
             throws IOException {
         // Note we use the log end offset prior to the read. This ensures that any appends following
@@ -2435,6 +2454,22 @@ public final class Replica {
     @VisibleForTesting
     boolean isOnline() {
         return online.get();
+    }
+
+    private void ensureOnline() {
+        if (!online.get()) {
+            throw new StorageException("Replica " + tableBucket + " is offline");
+        }
+    }
+
+    private void failIndexFollowerRecovery(Throwable failure) {
+        if (tableInfo.isIndexTable() && online.compareAndSet(true, false)) {
+            leaderReplicaIdOpt.set(null);
+            LOG.error(
+                    "Failing Index Table replica {} after remote WriterState recovery failure",
+                    tableBucket,
+                    failure);
+        }
     }
 
     @VisibleForTesting
