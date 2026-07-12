@@ -24,11 +24,17 @@ import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
@@ -191,6 +197,103 @@ public class IndexAccumulatorTest {
     }
 
     @Test
+    void ownerCleanupCannotDetachConcurrentInitialAppend() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator stoppingOwner = replicator(accumulator);
+        IndexReplicator publishingOwner = replicator(accumulator);
+        TableBucket bucket = new TableBucket(502L, 0);
+        IndexBatch seed =
+                batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
+        accumulator.append(seed);
+        assertThat(accumulator.pollFirst(bucket)).isSameAs(seed);
+        accumulator.release(seed);
+        seed.window().onBatchAcked(seed);
+
+        Deque<IndexBatch> deque = queue(accumulator, bucket);
+        IndexBatch published =
+                batch(bucket, new IndexWindow("idx", 10L, 1, publishingOwner), 7);
+        AtomicReference<Throwable> appendFailure = new AtomicReference<>();
+        Thread appendThread =
+                new Thread(
+                        () -> {
+                            try {
+                                accumulator.append(published);
+                            } catch (Throwable t) {
+                                appendFailure.set(t);
+                            }
+                        },
+                        "index-initial-publisher");
+
+        synchronized (deque) {
+            appendThread.start();
+            awaitBlocked(appendThread);
+            stoppingOwner.close();
+            assertThat(accumulator.dropForReplicator(stoppingOwner)).isZero();
+        }
+        appendThread.join(5_000L);
+
+        assertThat(appendThread.isAlive()).isFalse();
+        assertThat(appendFailure.get()).isNull();
+        assertThat(accumulator.pollFirst(bucket)).isSameAs(published);
+        accumulator.release(published);
+        published.window().onBatchAcked(published);
+        assertThat(publishingOwner.getSyncIndexPushedOffset()).isEqualTo(10L);
+        assertThat(published.window().registeredBatchCount()).isZero();
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(publishingOwner)).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
+    }
+
+    @Test
+    void ownerCleanupCannotDetachConcurrentRetryPublication() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator stoppingOwner = replicator(accumulator);
+        IndexReplicator retryingOwner = replicator(accumulator);
+        TableBucket bucket = new TableBucket(503L, 0);
+        IndexBatch retry =
+                batch(bucket, new IndexWindow("idx", 10L, 1, retryingOwner), 11);
+        accumulator.append(retry);
+        assertThat(accumulator.pollFirst(bucket)).isSameAs(retry);
+
+        Deque<IndexBatch> deque = queue(accumulator, bucket);
+        AtomicReference<Boolean> reEnqueued = new AtomicReference<>();
+        AtomicReference<Throwable> retryFailure = new AtomicReference<>();
+        Thread retryThread =
+                new Thread(
+                        () -> {
+                            try {
+                                reEnqueued.set(accumulator.reEnqueueIfActive(retry, 0L));
+                            } catch (Throwable t) {
+                                retryFailure.set(t);
+                            }
+                        },
+                        "index-retry-publisher");
+
+        synchronized (deque) {
+            retryThread.start();
+            awaitBlocked(retryThread);
+            stoppingOwner.close();
+            assertThat(accumulator.dropForReplicator(stoppingOwner)).isZero();
+        }
+        retryThread.join(5_000L);
+
+        assertThat(retryThread.isAlive()).isFalse();
+        assertThat(retryFailure.get()).isNull();
+        assertThat(reEnqueued.get()).isTrue();
+        assertThat(retry.attempts()).isEqualTo(1);
+        assertThat(accumulator.pollFirst(bucket)).isSameAs(retry);
+        accumulator.release(retry);
+        retry.window().onBatchAcked(retry);
+        assertThat(retryingOwner.getSyncIndexPushedOffset()).isEqualTo(10L);
+        assertThat(retry.window().registeredBatchCount()).isZero();
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(retryingOwner)).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
+    }
+
+    @Test
     void backPressureIsScopedToProducingReplicator() {
         IndexAccumulator accumulator = new IndexAccumulator(3);
         IndexReplicator ownerA = replicator(accumulator);
@@ -216,5 +319,22 @@ public class IndexAccumulatorTest {
         assertThat(accumulator.pendingBytes(ownerA)).isZero();
         assertThat(accumulator.pendingBytes()).isZero();
         assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+    }
+
+    private static void awaitBlocked(Thread thread) {
+        waitUntil(
+                () -> thread.getState() == Thread.State.BLOCKED,
+                Duration.ofSeconds(5),
+                "Publisher did not block on the target deque");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Deque<IndexBatch> queue(IndexAccumulator accumulator, TableBucket bucket)
+            throws Exception {
+        Field field = IndexAccumulator.class.getDeclaredField("batches");
+        field.setAccessible(true);
+        Map<TableBucket, Deque<IndexBatch>> batches =
+                (Map<TableBucket, Deque<IndexBatch>>) field.get(accumulator);
+        return batches.get(bucket);
     }
 }

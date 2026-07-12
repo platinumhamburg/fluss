@@ -561,6 +561,10 @@ public final class IndexSender implements AutoCloseable {
         public void doWork() {
             boolean didWork = drainAndSend();
             if (!didWork) {
+                discoverPendingBuckets();
+                didWork = drainAndSend();
+            }
+            if (!didWork) {
                 inLock(
                         lock,
                         () -> {
@@ -570,6 +574,18 @@ public final class IndexSender implements AutoCloseable {
                                 Thread.currentThread().interrupt();
                             }
                         });
+            }
+        }
+
+        /** Recover work when append notification failed before this worker was woken. */
+        private void discoverPendingBuckets() {
+            if (lifecyclePhase != LifecyclePhase.OPEN) {
+                return;
+            }
+            for (TableBucket bucket : accumulator.buckets()) {
+                if (ownerOf(bucket) == workerId && accumulator.hasPending(bucket)) {
+                    enqueueReadyBucket(bucket);
+                }
             }
         }
 

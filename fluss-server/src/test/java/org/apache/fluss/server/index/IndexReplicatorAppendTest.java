@@ -321,6 +321,15 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
+    void appendOnlyFailsClosedWithoutAdvancingOrStaging() throws Exception {
+        assertCorrupt(
+                5L,
+                Collections.singletonList(
+                        Collections.singletonList(
+                                record(5L, ChangeType.APPEND_ONLY, row(1L, 10L, 100L)))));
+    }
+
+    @Test
     void resumeInsideSourceBatchSkipsRecordsBelowRequestedBoundary() throws Exception {
         PollFixture fixture =
                 pollFixture(

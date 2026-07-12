@@ -34,7 +34,6 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -147,7 +146,14 @@ public final class IndexAccumulator {
         }
         Consumer<TableBucket> listener = this.appendListener;
         if (listener != null) {
-            listener.accept(batch.targetBucket());
+            try {
+                listener.accept(batch.targetBucket());
+            } catch (Throwable t) {
+                LOG.warn(
+                        "Error notifying appended index batch for target bucket {}",
+                        batch.targetBucket(),
+                        t);
+            }
         }
     }
 
@@ -321,9 +327,9 @@ public final class IndexAccumulator {
     public int dropForReplicator(IndexReplicator owner) {
         int dropped = 0;
         Set<IndexBatch> droppedBatches = new HashSet<>();
-        Iterator<Map.Entry<TableBucket, Deque<IndexBatch>>> mapIt = batches.entrySet().iterator();
-        while (mapIt.hasNext()) {
-            Deque<IndexBatch> deque = mapIt.next().getValue();
+        // Keep deque identities stable for the accumulator lifetime. A concurrent publisher may
+        // already hold this deque reference before taking its monitor.
+        for (Deque<IndexBatch> deque : batches.values()) {
             synchronized (deque) {
                 Iterator<IndexBatch> it = deque.iterator();
                 while (it.hasNext()) {
@@ -334,9 +340,6 @@ public final class IndexAccumulator {
                         droppedBatches.add(batch);
                         dropped++;
                     }
-                }
-                if (deque.isEmpty()) {
-                    mapIt.remove();
                 }
             }
         }

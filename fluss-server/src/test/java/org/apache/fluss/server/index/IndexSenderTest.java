@@ -1166,6 +1166,47 @@ public class IndexSenderTest {
     }
 
     @Test
+    void throwingAppendListenerKeepsPublishedBatchDiscoverableToSender() {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        TableBucket bucket = new TableBucket(494L, 0);
+        IndexReplicator owner = owner(accumulator);
+        IndexBatch batch = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.autoCompleteSuccess = true;
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L);
+        accumulator.setAppendListener(
+                ignored -> {
+                    throw new RuntimeException("injected append listener failure");
+                });
+        try {
+            accumulator.append(batch);
+
+            assertThat(accumulator.hasPending(bucket)).isTrue();
+            assertThat(accumulator.pendingBytes(owner))
+                    .isEqualTo(batch.encoded().getBytesLength());
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+
+            assertThat(gateway.requests).hasSize(1);
+            assertThat(batch.window().registeredBatchCount()).isZero();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.pendingBytes(owner)).isZero();
+            assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+            assertThat(sender.ownedBatchCountForTesting()).isZero();
+            assertThat(sender.ownedBatchPayloadBytesForTesting()).isZero();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
     void droppingPublishedRetryRelinquishesSenderOwnership() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();

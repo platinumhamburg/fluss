@@ -423,14 +423,30 @@ public final class IndexReplicator implements AutoCloseable {
     private MutationGroup readMutationGroup(
             IndexSpec spec, CloseableIterator<LogRecord> records, LogRecord first) {
         ChangeType changeType = first.getChangeType();
-        if (changeType == ChangeType.UPDATE_AFTER) {
-            throw corruption(
-                    "UPDATE_AFTER at offset "
-                            + first.logOffset()
-                            + " has no adjacent UPDATE_BEFORE in the same source batch");
+        if (changeType == null) {
+            throw corruption("record at offset " + first.logOffset() + " has no change type");
         }
-        if (changeType != ChangeType.UPDATE_BEFORE) {
-            return MutationGroup.single(spec, first);
+        switch (changeType) {
+            case INSERT:
+            case DELETE:
+                return MutationGroup.single(spec, first);
+            case UPDATE_AFTER:
+                throw corruption(
+                        "UPDATE_AFTER at offset "
+                                + first.logOffset()
+                                + " has no adjacent UPDATE_BEFORE in the same source batch");
+            case APPEND_ONLY:
+                throw corruption(
+                        "unsupported source change type APPEND_ONLY at offset "
+                                + first.logOffset());
+            case UPDATE_BEFORE:
+                break;
+            default:
+                throw corruption(
+                        "unsupported source change type "
+                                + changeType
+                                + " at offset "
+                                + first.logOffset());
         }
         OldIndexEntry oldEntry = OldIndexEntry.from(spec, first.getRow());
         if (!records.hasNext()) {
@@ -495,7 +511,7 @@ public final class IndexReplicator implements AutoCloseable {
             case DELETE:
                 return deriveMutationPlan(spec, group.oldEntry, null);
             default:
-                return new MutationPlan();
+                throw corruption("unsupported source change type " + group.changeType);
         }
     }
 
