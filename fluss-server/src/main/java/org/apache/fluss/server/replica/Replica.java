@@ -37,8 +37,8 @@ import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.IndexVisibility;
-import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
+import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -248,9 +248,7 @@ public final class Replica {
      */
     private final boolean hasSyncIndexes;
 
-    /**
-     * Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements.
-     */
+    /** Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements. */
     private volatile long syncIndexPushedOffset = -1L;
 
     /**
@@ -433,6 +431,18 @@ public final class Replica {
 
     public int writerIdCount() {
         return logTablet.getWriterIdCount();
+    }
+
+    public long fencedWriterStateEntryCount() {
+        return logTablet.getWriterStateProtocol() == KvIdempotenceProtocol.V1_FENCED
+                ? logTablet.getWriterIdCount()
+                : 0L;
+    }
+
+    public long fencedWriterStateSnapshotBytes() {
+        return logTablet.getWriterStateProtocol() == KvIdempotenceProtocol.V1_FENCED
+                ? logTablet.getWriterStateSnapshotBytes()
+                : 0L;
     }
 
     public Path getTabletParentDir() {
@@ -856,7 +866,8 @@ public final class Replica {
         if (isKvTable()) {
             KvTablet currentTablet = kvTablet;
             if (currentTablet == null
-                    || !kvManager.getKv(tableBucket)
+                    || !kvManager
+                            .getKv(tableBucket)
                             .filter(registeredTablet -> registeredTablet == currentTablet)
                             .isPresent()
                     || !hasReadyKvSnapshotManager()) {
@@ -1366,8 +1377,7 @@ public final class Replica {
 
     public LogAppendInfo appendRecordsToFollower(MemoryLogRecords memoryLogRecords)
             throws Exception {
-        return logTablet.appendAsFollower(
-                memoryLogRecords, this::retainFollowerFencedWriterState);
+        return logTablet.appendAsFollower(memoryLogRecords, this::retainFollowerFencedWriterState);
     }
 
     private boolean retainFollowerFencedWriterState(WriterKey writerKey) {
@@ -2597,8 +2607,7 @@ public final class Replica {
     }
 
     @VisibleForTesting
-    void setKvRecoveryFaultInjector(
-            KvRecoverHelper.RecoveryFaultInjector kvRecoveryFaultInjector) {
+    void setKvRecoveryFaultInjector(KvRecoverHelper.RecoveryFaultInjector kvRecoveryFaultInjector) {
         this.kvRecoveryFaultInjector = kvRecoveryFaultInjector;
     }
 

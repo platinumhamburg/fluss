@@ -141,6 +141,20 @@ public class MetricNames {
     public static final String INDEX_PUSH_PENDING_BYTES = "indexPushPendingBytes";
     public static final String INDEX_PUSH_IN_FLIGHT_REQUESTS = "indexPushInFlightRequests";
     public static final String INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS = "indexPushOldestInFlightAgeMs";
+    public static final String INDEX_PUSH_STALE_V1_BATCHES_RATE =
+            "indexPushStaleV1BatchesPerSecond";
+    public static final String INDEX_WRITER_STATE_ENTRIES = "indexWriterStateEntries";
+    public static final String INDEX_WRITER_STATE_SNAPSHOT_BYTES = "indexWriterStateSnapshotBytes";
+    public static final String INDEX_SOURCE_REMOTE_READ_BYTES_RATE =
+            "indexSourceRemoteReadBytesPerSecond";
+    public static final String INDEX_SOURCE_REMOTE_READ_FAILURES_RATE =
+            "indexSourceRemoteReadFailuresPerSecond";
+    public static final String INDEX_PUSH_RECORD_TOO_LARGE_FAILURES_RATE =
+            "indexPushRecordTooLargeFailuresPerSecond";
+    public static final String INDEX_PUSH_TOMBSTONE_NO_OP_BATCHES_RATE =
+            "indexPushTombstoneNoOpBatchesPerSecond";
+    public static final String INDEX_WRITER_STATE_RECOVERY_COVERAGE_FAILURES_RATE =
+            "indexWriterStateRecoveryCoverageFailuresPerSecond";
 
     // for replica
     public static final String UNDER_REPLICATED = "underReplicated";

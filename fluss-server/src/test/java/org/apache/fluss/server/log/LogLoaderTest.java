@@ -65,8 +65,8 @@ import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
-import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
+import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -536,8 +536,7 @@ final class LogLoaderTest extends LogTestBase {
     }
 
     @Test
-    void testV1RecoveryFallsBackFromEntryValidNewestWithIncompatibleSequence()
-            throws Exception {
+    void testV1RecoveryFallsBackFromEntryValidNewestWithIncompatibleSequence() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
         LogTablet log = createFencedLogTablet(true);
         appendFenced(log, writerKey, 100L);
@@ -593,8 +592,7 @@ final class LogLoaderTest extends LogTestBase {
     }
 
     @Test
-    void testV1CleanShutdownWithoutSnapshotFailsWhenRetainedWalStartsAfterZero()
-            throws Exception {
+    void testV1CleanShutdownWithoutSnapshotFailsWhenRetainedWalStartsAfterZero() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
         LogTablet log = createFencedLogTablet(true);
         appendFenced(log, writerKey, 100L);
@@ -608,9 +606,18 @@ final class LogLoaderTest extends LogTestBase {
             snapshot.deleteIfExists();
         }
 
+        long failuresBefore =
+                TestingMetricGroups.TABLET_SERVER_METRICS
+                        .indexWriterStateRecoveryCoverageFailures()
+                        .getCount();
         assertThatThrownBy(() -> createFencedLogTablet(true))
                 .isInstanceOf(CorruptSnapshotException.class)
                 .hasMessageContaining("retained WAL starts at 1");
+        assertThat(
+                        TestingMetricGroups.TABLET_SERVER_METRICS
+                                .indexWriterStateRecoveryCoverageFailures()
+                                .getCount())
+                .isEqualTo(failuresBefore + 1L);
     }
 
     @Test
@@ -822,17 +829,12 @@ final class LogLoaderTest extends LogTestBase {
             LogTablet log, WriterKey writerKey, long sequence, int recordCount) throws Exception {
         MemoryLogRecordsCompactedBuilder builder =
                 MemoryLogRecordsCompactedBuilder.fencedBuilder(
-                        DEFAULT_SCHEMA_ID,
-                        1024,
-                        new UnmanagedPagedOutputView(128),
-                        false);
+                        DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
         builder.setFencedWriterState(writerKey, sequence);
         for (int recordIndex = 0; recordIndex < recordCount; recordIndex++) {
             builder.append(
                     ChangeType.INSERT,
-                    compactedRow(
-                            DATA1_ROW_TYPE,
-                            new Object[] {recordIndex, "fenced-" + sequence}));
+                    compactedRow(DATA1_ROW_TYPE, new Object[] {recordIndex, "fenced-" + sequence}));
         }
         builder.close();
         log.appendAsLeader(
@@ -840,10 +842,7 @@ final class LogLoaderTest extends LogTestBase {
     }
 
     private void writeFencedSnapshot(
-            long snapshotOffset,
-            WriterKey writerKey,
-            long sequence,
-            long dominatingTargetWalOffset)
+            long snapshotOffset, WriterKey writerKey, long sequence, long dominatingTargetWalOffset)
             throws Exception {
         FlussPaths.writerSnapshotFile(logDir, snapshotOffset).delete();
         WriterStateManager snapshotWriter =

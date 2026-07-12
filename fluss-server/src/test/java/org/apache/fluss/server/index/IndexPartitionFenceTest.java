@@ -27,6 +27,9 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.Gauge;
+import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.DefaultLogRecordBatch;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
@@ -45,12 +48,14 @@ import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
 import org.apache.fluss.server.log.FencedWriterAppendInfo;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestBase;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
@@ -131,6 +136,40 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                 .isEqualTo(PARTITION_ID);
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
         assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+
+        fixture.log.writerStateManager().updateMapEndOffset(1L);
+        fixture.log.writerStateManager().takeSnapshot();
+        TabletServerMetricGroup metrics =
+                new TabletServerMetricGroup(
+                        NOPMetricRegistry.INSTANCE, "gauge-test", "rack", "host", 1);
+        metrics.registerIndexWriterStateGauges(
+                fixture.log.writerStateManager()::writerIdCount,
+                fixture.log.writerStateManager()::latestSnapshotBytes);
+        assertThat(metricValue(metrics, MetricNames.INDEX_WRITER_STATE_ENTRIES, Long.class))
+                .isEqualTo(1L);
+        assertThat(metricValue(metrics, MetricNames.INDEX_WRITER_STATE_SNAPSHOT_BYTES, Long.class))
+                .isGreaterThan(0L);
+    }
+
+    @Test
+    void testStaleRequestIncrementsMetricWithoutMutationOrWalAppend() throws Exception {
+        Fixture fixture = createInitializedFixture("stale_metric");
+        WriterKey writerKey = writerKey(PARTITION_ID);
+        byte[] key = physicalKey(physicalRow(PARTITION_ID));
+        fixture.put(mutation(writerKey, 200L, physicalRow(PARTITION_ID), key));
+        long staleBefore =
+                replicaManager.getServerMetricGroup().indexPushStaleV1Batches().getCount();
+        long walEndBefore = fixture.log.localLogEndOffset();
+        KvPreWriteBuffer.Value valueBefore = fixture.kv.getKvPreWriteBuffer().get(Key.of(key));
+
+        LogAppendInfo result = fixture.put(mutation(writerKey, 100L, null, key));
+
+        assertThat(result.duplicated()).isTrue();
+        assertThat(result.lastOffset()).isZero();
+        assertThat(fixture.log.localLogEndOffset()).isEqualTo(walEndBefore);
+        assertThat(fixture.kv.getKvPreWriteBuffer().get(Key.of(key))).isEqualTo(valueBefore);
+        assertThat(replicaManager.getServerMetricGroup().indexPushStaleV1Batches().getCount())
+                .isEqualTo(staleBefore + 1L);
     }
 
     @ParameterizedTest(name = "writerPid={0}, keyPid={1}, valuePid={2}")
@@ -196,6 +235,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         Fixture fixture = createFixture("tombstoned_no_append");
         publishDirect(tombstone(PARTITION_ID));
         WriterKey writerKey = writerKey(PARTITION_ID);
+        long noOpsBefore =
+                replicaManager.getServerMetricGroup().indexPushTombstoneNoOpBatches().getCount();
 
         LogAppendInfo result =
                 fixture.put(mutation(writerKey, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
@@ -203,6 +244,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(result.hasNoAppend()).isTrue();
         assertThat(result.lastOffset()).isEqualTo(-1L);
         assertNoMutation(fixture, writerKey, 0L);
+        assertThat(replicaManager.getServerMetricGroup().indexPushTombstoneNoOpBatches().getCount())
+                .isEqualTo(noOpsBefore + 1L);
     }
 
     @Test
@@ -349,12 +392,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         WriterKey truncated = writerKey(PARTITION_ID + 2);
         fixture.put(mutation(tombstoned, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
         fixture.put(mutation(live, 100L, physicalRow(PARTITION_ID + 1), PARTITION_ID + 1));
-        fixture.put(
-                mutation(
-                        truncated,
-                        100L,
-                        physicalRow(PARTITION_ID + 2),
-                        PARTITION_ID + 2));
+        fixture.put(mutation(truncated, 100L, physicalRow(PARTITION_ID + 2), PARTITION_ID + 2));
         publishThroughReplicaManager(tombstone(PARTITION_ID));
         makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
 
@@ -421,10 +459,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         WriterKey reserved = new WriterKey(0L, 1L << 40);
         WriterKey negativePartition = new WriterKey(-1L, Long.MIN_VALUE);
         return Stream.of(
-                Arguments.of(
-                        Arrays.asList(unpartitioned, reserved, negativePartition, valid)),
-                Arguments.of(
-                        Arrays.asList(valid, negativePartition, reserved, unpartitioned)));
+                Arguments.of(Arrays.asList(unpartitioned, reserved, negativePartition, valid)),
+                Arguments.of(Arrays.asList(valid, negativePartition, reserved, unpartitioned)));
     }
 
     @Test
@@ -436,14 +472,14 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         putWriterState(fixture.log, writerKey, 100L);
         publishThroughReplicaManager(
-                new PartitionTombstone(
-                        tombstone.getFloor(), tombstone.getExplicitSet(), 2L));
+                new PartitionTombstone(tombstone.getFloor(), tombstone.getExplicitSet(), 2L));
 
         assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
     }
 
     @Test
-    void testFirstEmptyInitializationPreservesWriterStateAndEstablishesReadiness() throws Exception {
+    void testFirstEmptyInitializationPreservesWriterStateAndEstablishesReadiness()
+            throws Exception {
         Fixture fixture = createFixture("first_empty");
         WriterKey writerKey = writerKey(PARTITION_ID);
         putWriterState(fixture.log, writerKey, 100L);
@@ -464,18 +500,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                         "unrelated_replica", otherMainTableId, INDEX_TABLE_ID + 100);
         WriterKey matchingWriter = writerKey(MAIN_TABLE_ID, PARTITION_ID);
         WriterKey unrelatedWriter = writerKey(otherMainTableId, PARTITION_ID);
-        matching.put(
-                mutation(
-                        matchingWriter,
-                        100L,
-                        physicalRow(PARTITION_ID),
-                        PARTITION_ID));
-        unrelated.put(
-                mutation(
-                        unrelatedWriter,
-                        100L,
-                        physicalRow(PARTITION_ID),
-                        PARTITION_ID));
+        matching.put(mutation(matchingWriter, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
+        unrelated.put(mutation(unrelatedWriter, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
 
         publishThroughReplicaManager(tombstone(PARTITION_ID));
 
@@ -588,7 +614,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         return createFixture(name, MAIN_TABLE_ID, INDEX_TABLE_ID);
     }
 
-    private Fixture createFixture(String name, long mainTableId, long indexTableId) throws Exception {
+    private Fixture createFixture(String name, long mainTableId, long indexTableId)
+            throws Exception {
         TableDescriptor mainDescriptor = partitionedMainTableDescriptor();
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(
@@ -598,8 +625,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                         "test_db", IndexTableUtils.indexTableName("orders_" + name, "idx_user"));
         zkClient.registerTable(
                 indexPath,
-                TableRegistration.newTable(
-                        indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
+                TableRegistration.newTable(indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
         zkClient.registerFirstSchema(indexPath, indexDescriptor.getSchema());
         TableBucket indexBucket = new TableBucket(indexTableId, 0);
         makeKvTableAsLeader(indexBucket, indexPath, INITIAL_LEADER_EPOCH, false);
@@ -697,8 +723,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         return KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
     }
 
-    private static MemoryLogRecords followerWal(
-            WriterKey writerKey, long sequence, long baseOffset) throws Exception {
+    private static MemoryLogRecords followerWal(WriterKey writerKey, long sequence, long baseOffset)
+            throws Exception {
         MemoryLogRecordsCompactedBuilder builder =
                 MemoryLogRecordsCompactedBuilder.fencedBuilder(
                         SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
@@ -775,6 +801,12 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(fixture.kv.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(logEndOffset);
         assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+    }
+
+    private static <T> T metricValue(TabletServerMetricGroup metrics, String name, Class<T> type) {
+        Gauge<?> gauge = (Gauge<?>) metrics.getMetrics().get(name);
+        assertThat(gauge).as("registered gauge %s", name).isNotNull();
+        return type.cast(gauge.getValue());
     }
 
     private static void setKvHook(KvTablet kvTablet, String methodName, Runnable hook)

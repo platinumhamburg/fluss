@@ -82,6 +82,12 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter indexPushErrors;
     private final Histogram indexPushLatencyHistogram;
     private final Counter partitionTombstoneApplyDrops;
+    private final Counter indexPushStaleV1Batches;
+    private final Counter indexSourceRemoteReadBytes;
+    private final Counter indexSourceRemoteReadFailures;
+    private final Counter indexPushRecordTooLargeFailures;
+    private final Counter indexPushTombstoneNoOpBatches;
+    private final Counter indexWriterStateRecoveryCoverageFailures;
 
     public TabletServerMetricGroup(
             MetricRegistry registry, String clusterId, String rack, String hostname, int serverId) {
@@ -153,6 +159,28 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(
                 MetricNames.PARTITION_TOMBSTONE_APPLY_DROPS_RATE,
                 new MeterView(partitionTombstoneApplyDrops));
+        indexPushStaleV1Batches = new ThreadSafeSimpleCounter();
+        meter(MetricNames.INDEX_PUSH_STALE_V1_BATCHES_RATE, new MeterView(indexPushStaleV1Batches));
+        indexSourceRemoteReadBytes = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.INDEX_SOURCE_REMOTE_READ_BYTES_RATE,
+                new MeterView(indexSourceRemoteReadBytes));
+        indexSourceRemoteReadFailures = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.INDEX_SOURCE_REMOTE_READ_FAILURES_RATE,
+                new MeterView(indexSourceRemoteReadFailures));
+        indexPushRecordTooLargeFailures = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.INDEX_PUSH_RECORD_TOO_LARGE_FAILURES_RATE,
+                new MeterView(indexPushRecordTooLargeFailures));
+        indexPushTombstoneNoOpBatches = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.INDEX_PUSH_TOMBSTONE_NO_OP_BATCHES_RATE,
+                new MeterView(indexPushTombstoneNoOpBatches));
+        indexWriterStateRecoveryCoverageFailures = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.INDEX_WRITER_STATE_RECOVERY_COVERAGE_FAILURES_RATE,
+                new MeterView(indexWriterStateRecoveryCoverageFailures));
 
         // Register server-level RocksDB aggregated metrics
         registerServerRocksDBMetrics();
@@ -275,6 +303,30 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         return partitionTombstoneApplyDrops;
     }
 
+    public Counter indexPushStaleV1Batches() {
+        return indexPushStaleV1Batches;
+    }
+
+    public Counter indexSourceRemoteReadBytes() {
+        return indexSourceRemoteReadBytes;
+    }
+
+    public Counter indexSourceRemoteReadFailures() {
+        return indexSourceRemoteReadFailures;
+    }
+
+    public Counter indexPushRecordTooLargeFailures() {
+        return indexPushRecordTooLargeFailures;
+    }
+
+    public Counter indexPushTombstoneNoOpBatches() {
+        return indexPushTombstoneNoOpBatches;
+    }
+
+    public Counter indexWriterStateRecoveryCoverageFailures() {
+        return indexWriterStateRecoveryCoverageFailures;
+    }
+
     public void registerIndexPushGauges(
             LongSupplier pendingBytesSupplier,
             IntSupplier inFlightRequestsSupplier,
@@ -284,6 +336,12 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         gauge(
                 MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS,
                 oldestInFlightAgeMsSupplier::getAsLong);
+    }
+
+    public void registerIndexWriterStateGauges(
+            LongSupplier entryCountSupplier, LongSupplier snapshotBytesSupplier) {
+        gauge(MetricNames.INDEX_WRITER_STATE_ENTRIES, entryCountSupplier::getAsLong);
+        gauge(MetricNames.INDEX_WRITER_STATE_SNAPSHOT_BYTES, snapshotBytesSupplier::getAsLong);
     }
 
     // ------------------------------------------------------------------------

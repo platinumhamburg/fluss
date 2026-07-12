@@ -29,6 +29,7 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
+import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.concurrent.Executors;
 
@@ -79,12 +80,13 @@ final class IndexSourceReaderTest {
     @Test
     void testReadsExactRemoteSegmentsAndLocalHandoff() {
         TestingSourceWal sourceWal =
-                new TestingSourceWal(
-                        REMOTE_BUCKET, 0L, 20L, 30L, batches(batch(20L, 30L)));
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 30L, batches(batch(20L, 30L)));
         TestingRemoteFetcher remote =
                 new TestingRemoteFetcher(Arrays.asList(batch(0L, 10L), batch(10L, 20L)));
         ControllableExecutor executor = new ControllableExecutor();
-        IndexSourceReader reader = reader(sourceWal, () -> remote, executor);
+        long bytesBefore =
+                TestingMetricGroups.TABLET_SERVER_METRICS.indexSourceRemoteReadBytes().getCount();
+        IndexSourceReader reader = readerWithMetrics(sourceWal, () -> remote, executor);
 
         CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 30L, 1024);
         assertThat(future).isNotDone();
@@ -95,6 +97,11 @@ final class IndexSourceReaderTest {
             assertThat(result.nextOffset()).isEqualTo(30L);
             assertThat(remote.closed.get()).isFalse();
         }
+        assertThat(
+                        TestingMetricGroups.TABLET_SERVER_METRICS
+                                .indexSourceRemoteReadBytes()
+                                .getCount())
+                .isEqualTo(bytesBefore + 20L);
         assertThat(remote.closed.get()).isTrue();
         reader.close();
         assertThat(remote.closed.get()).isTrue();
@@ -104,15 +111,12 @@ final class IndexSourceReaderTest {
     @Test
     void testReturnsRemoteOnlyResultWhenLocalHandoffBatchExceedsRemainingBudget() {
         TestingSourceWal sourceWal =
-                new TestingSourceWal(
-                        REMOTE_BUCKET, 0L, 10L, 20L, batches(batch(10L, 20L)));
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 10L, 20L, batches(batch(10L, 20L)));
         ControllableExecutor executor = new ControllableExecutor();
         IndexSourceReader reader =
                 reader(
                         sourceWal,
-                        () ->
-                                new TestingRemoteFetcher(
-                                        Collections.singletonList(batch(0L, 10L))),
+                        () -> new TestingRemoteFetcher(Collections.singletonList(batch(0L, 10L))),
                         executor);
 
         CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 20L, 15);
@@ -129,16 +133,14 @@ final class IndexSourceReaderTest {
 
     @Test
     void testRemoteByteLimitReturnsHealthyPrefixWithoutPrematureEnd() {
-        TestingSourceWal sourceWal =
-                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        TestingSourceWal sourceWal = new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
         ControllableExecutor executor = new ControllableExecutor();
         TestingRemoteFetcher remote =
                 new TestingRemoteFetcher(Arrays.asList(batch(0L, 10L), batch(10L, 20L))) {
                     @Override
                     public IndexSourceReader.RemoteRead fetchBounded(
                             long startOffset, long localLogStartOffset, int maxBytes) {
-                        return remoteRead(
-                                Collections.singletonList(batch(0L, 10L)), true);
+                        return remoteRead(Collections.singletonList(batch(0L, 10L)), true);
                     }
                 };
         IndexSourceReader reader = reader(sourceWal, () -> remote, executor);
@@ -155,8 +157,7 @@ final class IndexSourceReaderTest {
 
     @Test
     void testReusesRemoteSessionAcrossBoundedReadResults() {
-        TestingSourceWal sourceWal =
-                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        TestingSourceWal sourceWal = new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
         ControllableExecutor executor = new ControllableExecutor();
         AtomicInteger opens = new AtomicInteger();
         TestingRemoteFetcher remote =
@@ -203,8 +204,7 @@ final class IndexSourceReaderTest {
     @Test
     void testLocalFirstBatchMayExceedBudgetWithMinOneMessage() {
         TestingSourceWal sourceWal =
-                new TestingSourceWal(
-                        LOCAL_BUCKET, 10L, 10L, 20L, batches(batch(10L, 20L)));
+                new TestingSourceWal(LOCAL_BUCKET, 10L, 10L, 20L, batches(batch(10L, 20L)));
         IndexSourceReader reader = reader(sourceWal, null, Executors.directExecutor());
 
         try (IndexSourceReader.ReadResult result = reader.read(10L, 20L, 5).join()) {
@@ -221,8 +221,7 @@ final class IndexSourceReaderTest {
         LogRecordBatch first = batch(0L, 10L);
         LogRecordBatch overlapping = batch(5L, 20L);
         TestingSourceWal sourceWal =
-                new TestingSourceWal(
-                        REMOTE_BUCKET, 0L, 20L, 25L, batches(batch(20L, 25L)));
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 25L, batches(batch(20L, 25L)));
         ControllableExecutor executor = new ControllableExecutor();
         IndexSourceReader reader =
                 reader(
@@ -271,8 +270,7 @@ final class IndexSourceReaderTest {
                         ignored ->
                                 CloseableIterator.wrap(
                                         Arrays.asList(record(0L), record(2L)).iterator()));
-        TestingSourceWal sourceWal =
-                new TestingSourceWal(LOCAL_BUCKET, 0L, 0L, 3L, batches(batch));
+        TestingSourceWal sourceWal = new TestingSourceWal(LOCAL_BUCKET, 0L, 0L, 3L, batches(batch));
         IndexSourceReader reader = reader(sourceWal, null, Executors.directExecutor());
 
         try (IndexSourceReader.ReadResult result = reader.read(0L, 3L, 1024).join()) {
@@ -287,20 +285,16 @@ final class IndexSourceReaderTest {
         MemoryLogRecords records =
                 genMemoryLogRecordsByObject(Collections.singletonList(DATA1.get(0)));
         byte[] corruptBytes = new byte[records.sizeInBytes()];
-        records.getMemorySegment()
-                .get(records.getPosition(), corruptBytes, 0, corruptBytes.length);
+        records.getMemorySegment().get(records.getPosition(), corruptBytes, 0, corruptBytes.length);
         corruptBytes[corruptBytes.length - 1] ^= 1;
         LogRecordBatch corruptBatch =
                 MemoryLogRecords.pointToBytes(corruptBytes).batches().iterator().next();
-        TestingSourceWal sourceWal =
-                new TestingSourceWal(REMOTE_BUCKET, 0L, 1L, 1L, batches());
+        TestingSourceWal sourceWal = new TestingSourceWal(REMOTE_BUCKET, 0L, 1L, 1L, batches());
         ControllableExecutor executor = new ControllableExecutor();
         IndexSourceReader reader =
                 reader(
                         sourceWal,
-                        () ->
-                                new TestingRemoteFetcher(
-                                        Collections.singletonList(corruptBatch)),
+                        () -> new TestingRemoteFetcher(Collections.singletonList(corruptBatch)),
                         executor);
 
         CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 1L, 1024);
@@ -322,8 +316,7 @@ final class IndexSourceReaderTest {
 
     @Test
     void testRejectsSecondRemoteReadWhileFirstIsPending() {
-        TestingSourceWal sourceWal =
-                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        TestingSourceWal sourceWal = new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
         ControllableExecutor executor = new ControllableExecutor();
         IndexSourceReader reader =
                 reader(
@@ -358,8 +351,7 @@ final class IndexSourceReaderTest {
                     executor.shutdownNow();
                     executor.awaitTermination(10, TimeUnit.SECONDS);
                 });
-        TestingSourceWal sourceWal =
-                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        TestingSourceWal sourceWal = new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
         IndexSourceReader reader = reader(sourceWal, () -> remote, executor);
 
         CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 20L, 1024);
@@ -376,8 +368,7 @@ final class IndexSourceReaderTest {
         ControllableExecutor executor = new ControllableExecutor();
         TestingRemoteFetcher remote =
                 new TestingRemoteFetcher(Collections.singletonList(batch(0L, 20L)));
-        TestingSourceWal sourceWal =
-                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        TestingSourceWal sourceWal = new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
         IndexSourceReader reader = reader(sourceWal, () -> remote, executor);
 
         CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 20L, 1024);
@@ -391,8 +382,7 @@ final class IndexSourceReaderTest {
     @Test
     void testPendingRemoteFetchDoesNotBlockAnotherReplicatorOnSharedWorker() throws Exception {
         ControllableExecutor remoteExecutor = new ControllableExecutor();
-        TestingSourceWal remoteWal =
-                new TestingSourceWal(REMOTE_BUCKET, 0L, 1L, 1L, batches());
+        TestingSourceWal remoteWal = new TestingSourceWal(REMOTE_BUCKET, 0L, 1L, 1L, batches());
         IndexSourceReader remoteReader =
                 reader(
                         remoteWal,
@@ -460,16 +450,40 @@ final class IndexSourceReaderTest {
     private void assertRemoteReadFails(
             List<LogRecordBatch> remoteBatches, long localStart, String message) {
         TestingSourceWal sourceWal =
-                new TestingSourceWal(
-                        REMOTE_BUCKET, 0L, localStart, localStart + 10L, batches());
+                new TestingSourceWal(REMOTE_BUCKET, 0L, localStart, localStart + 10L, batches());
         ControllableExecutor executor = new ControllableExecutor();
+        long failuresBefore =
+                TestingMetricGroups.TABLET_SERVER_METRICS
+                        .indexSourceRemoteReadFailures()
+                        .getCount();
         IndexSourceReader reader =
-                reader(sourceWal, () -> new TestingRemoteFetcher(remoteBatches), executor);
+                readerWithMetrics(
+                        sourceWal, () -> new TestingRemoteFetcher(remoteBatches), executor);
 
         CompletableFuture<IndexSourceReader.ReadResult> future =
                 reader.read(0L, localStart + 10L, 1024);
         executor.runNext();
         assertCorruption(future, message);
+        assertThat(
+                        TestingMetricGroups.TABLET_SERVER_METRICS
+                                .indexSourceRemoteReadFailures()
+                                .getCount())
+                .isEqualTo(failuresBefore + 1L);
+    }
+
+    private IndexSourceReader readerWithMetrics(
+            TestingSourceWal sourceWal,
+            IndexSourceReader.RemoteFetcherFactory remoteFetcherFactory,
+            Executor executor) {
+        IndexSourceReader reader =
+                new IndexSourceReader(
+                        sourceWal,
+                        remoteFetcherFactory,
+                        executor,
+                        readContext,
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
+        closeables.add(reader);
+        return reader;
     }
 
     private static void assertCorruption(

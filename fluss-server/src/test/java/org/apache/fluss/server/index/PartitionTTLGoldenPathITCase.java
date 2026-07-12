@@ -20,7 +20,6 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
@@ -30,15 +29,24 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.DefaultKvRecordBatch;
-import org.apache.fluss.record.KvRecordBatch;
-import org.apache.fluss.record.KvRecordBatchBuilder;
+import org.apache.fluss.record.FencedKvRecordBatchBuilder;
+import org.apache.fluss.record.WriterKey;
+import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.aligned.AlignedRowWriter;
+import org.apache.fluss.row.decode.CompactedKeyDecoder;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
+import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.rpc.messages.PutKvResponse;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.Replica;
@@ -48,11 +56,13 @@ import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
+import org.apache.fluss.utils.UnsafeUtils;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
-import java.io.IOException;
+import javax.annotation.Nullable;
+
 import java.time.Duration;
 import java.util.Collections;
 import java.util.Map;
@@ -61,7 +71,6 @@ import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createPartition;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newDropPartitionRequest;
-import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -183,17 +192,41 @@ class PartitionTTLGoldenPathITCase {
         // ----
         // These simulate what IndexReplicator would push. The Index Table's KvTablet encodes them
         // in v3 format with the __partition_id as the tag via its installed tagExtractor.
-        byte[] keyP0 = encodeIndexKey("alpha", 1);
-        byte[] keyP1 = encodeIndexKey("beta", 2);
-        byte[] keyP2 = encodeIndexKey("gamma", 3);
+        AlignedRow rowP0 = encodeIndexRow("alpha", 1, "p0", partitionId0);
+        AlignedRow rowP1 = encodeIndexRow("beta", 2, "p1", partitionId1);
+        AlignedRow rowP2 = encodeIndexRow("gamma", 3, "p2", partitionId2);
+        byte[] keyP0 = encodeIndexKey(rowP0);
+        byte[] keyP1 = encodeIndexKey(rowP1);
+        byte[] keyP2 = encodeIndexKey(rowP2);
 
         int bucketP0 = computeIndexBucket("alpha");
         int bucketP1 = computeIndexBucket("beta");
         int bucketP2 = computeIndexBucket("gamma");
 
-        writeIndexEntry(indexTableId, bucketP0, keyP0, partitionId0);
-        writeIndexEntry(indexTableId, bucketP1, keyP1, partitionId1);
-        writeIndexEntry(indexTableId, bucketP2, keyP2, partitionId2);
+        writeIndexEntry(mainTableId, indexTableId, bucketP0, keyP0, rowP0, partitionId0, 1L);
+        writeIndexEntry(mainTableId, indexTableId, bucketP1, keyP1, rowP1, partitionId1, 1L);
+        writeIndexEntry(mainTableId, indexTableId, bucketP2, keyP2, rowP2, partitionId2, 1L);
+
+        InternalRow decodedP1 =
+                new CompactedKeyDecoder(INDEX_VALUE_ROW_TYPE, new int[] {0, 1, 2, 3})
+                        .decodeKey(keyP1);
+        assertThat(decodedP1.getLong(3))
+                .as("physical index key must carry the old partition incarnation")
+                .isEqualTo(partitionId1);
+        Replica p1IndexReplica =
+                FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(
+                        new TableBucket(indexTableId, bucketP1));
+        KvTablet p1KvTablet = p1IndexReplica.getKvTablet();
+        KvPreWriteBuffer.Value bufferedP1Value =
+                p1KvTablet.getKvPreWriteBuffer().get(Key.of(keyP1));
+        byte[] encodedP1Value =
+                bufferedP1Value == null
+                        ? p1KvTablet.getRocksDBKv().get(keyP1)
+                        : bufferedP1Value.get();
+        assertThat(encodedP1Value).isNotNull();
+        assertThat(UnsafeUtils.getLong(encodedP1Value, ValueEncoder.TAG_OFFSET))
+                .as("v3 index value tag must carry the old partition incarnation")
+                .isEqualTo(partitionId1);
 
         // Verify all entries are visible
         assertIndexEntryPresent(indexTableId, bucketP0, keyP0, true, "p0 entry must be visible");
@@ -201,10 +234,6 @@ class PartitionTTLGoldenPathITCase {
         assertIndexEntryPresent(indexTableId, bucketP2, keyP2, true, "p2 entry must be visible");
 
         // Flush pre-write buffer to RocksDB so data is durable before the drop
-        Replica p1IndexReplica =
-                FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(
-                        new TableBucket(indexTableId, bucketP1));
-        KvTablet p1KvTablet = p1IndexReplica.getKvTablet();
         p1KvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
 
         // Also flush other buckets that hold entries
@@ -237,10 +266,69 @@ class PartitionTTLGoldenPathITCase {
                 .as("tombstone version must be > 0 after DROP PARTITION propagation")
                 .isGreaterThan(0L);
 
+        WriterKey oldWriter = IndexWriterKey.encode(new TableBucket(mainTableId, partitionId1, 0));
+        waitUntil(
+                () ->
+                        !p1IndexReplica
+                                .getLogTablet()
+                                .writerStateManager()
+                                .lastFencedEntry(oldWriter)
+                                .isPresent(),
+                Duration.ofSeconds(30),
+                "wait for tombstone publication to retire the old partition writer");
+        assertThat(p1IndexReplica.getLogTablet().writerStateManager().lastFencedEntry(oldWriter))
+                .as("drop must retire the old partition writer")
+                .isEmpty();
+
+        assertIndexEntryPresent(
+                indexTableId,
+                bucketP1,
+                keyP1,
+                false,
+                "old partition row must be filtered immediately after tombstone publication");
+        assertThat(p1KvTablet.getRocksDBKv().get(keyP1))
+                .as("old row must still be physically present before compaction")
+                .isNotNull();
+
+        // Recreate the same logical partition. Its immutable partition ID is a new incarnation.
+        createPartition(
+                FLUSS_CLUSTER_EXTENSION,
+                mainPath,
+                new PartitionSpec(Collections.singletonMap("p", "p1")),
+                false);
+        long recreatedPartitionId = waitForRecreatedPartition(mainPath, "p1", partitionId1);
+        assertThat(recreatedPartitionId).isNotEqualTo(partitionId1);
+        AlignedRow recreatedRow = encodeIndexRow("epsilon", 5, "p1", recreatedPartitionId);
+        byte[] recreatedKey = encodeIndexKey(recreatedRow);
+        int recreatedBucket = computeIndexBucket("epsilon");
+        writeIndexEntry(
+                mainTableId,
+                indexTableId,
+                recreatedBucket,
+                recreatedKey,
+                recreatedRow,
+                recreatedPartitionId,
+                1L);
+        assertIndexEntryPresent(
+                indexTableId,
+                recreatedBucket,
+                recreatedKey,
+                true,
+                "recreated partition row must be visible");
+
         // ---- Phase 5: Write-path filter — new write for p1 must be silently dropped ----
-        byte[] newKeyP1 = encodeIndexKey("delta", 4);
+        AlignedRow delayedOldRow = encodeIndexRow("delta", 4, "p1", partitionId1);
+        byte[] newKeyP1 = encodeIndexKey(delayedOldRow);
         int newBucketP1 = computeIndexBucket("delta");
-        writeIndexEntry(indexTableId, newBucketP1, newKeyP1, partitionId1);
+        long oldWalEndBeforeDelayed =
+                FLUSS_CLUSTER_EXTENSION
+                        .waitAndGetLeaderReplica(new TableBucket(indexTableId, newBucketP1))
+                        .getLogTablet()
+                        .localLogEndOffset();
+        long oldDeleteWalEndBeforeDelayed = p1IndexReplica.getLogTablet().localLogEndOffset();
+        writeIndexEntry(
+                mainTableId, indexTableId, newBucketP1, newKeyP1, delayedOldRow, partitionId1, 2L);
+        writeIndexEntry(mainTableId, indexTableId, bucketP1, keyP1, null, partitionId1, 3L);
 
         // The write was silently dropped — the entry must be absent
         assertIndexEntryPresent(
@@ -249,6 +337,22 @@ class PartitionTTLGoldenPathITCase {
                 newKeyP1,
                 false,
                 "new write for tombstoned partition must be filtered at write-path");
+        assertThat(
+                        FLUSS_CLUSTER_EXTENSION
+                                .waitAndGetLeaderReplica(new TableBucket(indexTableId, newBucketP1))
+                                .getLogTablet()
+                                .localLogEndOffset())
+                .as("delayed old-incarnation requests must not append target WAL")
+                .isEqualTo(oldWalEndBeforeDelayed);
+        assertThat(p1IndexReplica.getLogTablet().localLogEndOffset())
+                .as("delayed old-incarnation DELETE must not append target WAL")
+                .isEqualTo(oldDeleteWalEndBeforeDelayed);
+        assertIndexEntryPresent(
+                indexTableId,
+                recreatedBucket,
+                recreatedKey,
+                true,
+                "delayed old UPSERT and DELETE must not affect the recreated incarnation");
 
         // ---- Phase 6: Trigger compaction on p1's bucket → physical deletion ----
         RocksDBKv rocksDBKv = p1KvTablet.getRocksDBKv();
@@ -261,6 +365,7 @@ class PartitionTTLGoldenPathITCase {
                 keyP1,
                 false,
                 "p1's old entry must be physically removed after compaction");
+        assertThat(rocksDBKv.get(keyP1)).isNull();
 
         // ---- Phase 8: Other partitions must survive compaction ----
         assertIndexEntryPresent(
@@ -282,17 +387,29 @@ class PartitionTTLGoldenPathITCase {
     private static final RowType INDEX_VALUE_ROW_TYPE =
             DataTypes.ROW(
                     new DataField("b", DataTypes.STRING().copy(false)),
-                    new DataField("a", DataTypes.INT().copy(false)));
+                    new DataField("a", DataTypes.INT().copy(false)),
+                    new DataField("p", DataTypes.STRING().copy(false)),
+                    new DataField(
+                            IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN,
+                            DataTypes.BIGINT().copy(false)));
 
     private static final RowType INDEX_BUCKET_KEY_TYPE =
             DataTypes.ROW(new DataField("b", DataTypes.STRING().copy(false)));
 
-    private static byte[] encodeIndexKey(String b, int a) {
-        CompactedKeyEncoder encoder = new CompactedKeyEncoder(INDEX_VALUE_ROW_TYPE);
-        GenericRow row = new GenericRow(2);
-        row.setField(0, fromString(b));
-        row.setField(1, a);
-        return encoder.encodeKey(row);
+    private static AlignedRow encodeIndexRow(String b, int a, String p, long partitionId) {
+        AlignedRow row = new AlignedRow(INDEX_VALUE_ROW_TYPE.getFieldCount());
+        AlignedRowWriter writer = new AlignedRowWriter(row);
+        writer.reset();
+        writer.writeString(0, fromString(b));
+        writer.writeInt(1, a);
+        writer.writeString(2, fromString(p));
+        writer.writeLong(3, partitionId);
+        writer.complete();
+        return row;
+    }
+
+    private static byte[] encodeIndexKey(AlignedRow row) {
+        return new CompactedKeyEncoder(INDEX_VALUE_ROW_TYPE).encodeKey(row);
     }
 
     private static int computeIndexBucket(String bValue) {
@@ -303,22 +420,41 @@ class PartitionTTLGoldenPathITCase {
         return new FlussBucketingFunction().bucketing(bucketKey, INDEX_BUCKET_COUNT);
     }
 
-    /**
-     * Writes a synthetic entry to the Index Table whose value carries the given partitionId in the
-     * __partition_id column. The Index Table's KvTablet encodes this as v3 format with tag =
-     * partitionId via its installed tagExtractor.
-     */
-    private void writeIndexEntry(long indexTableId, int bucket, byte[] key, long partitionId)
+    private void writeIndexEntry(
+            long mainTableId,
+            long indexTableId,
+            int bucket,
+            byte[] key,
+            @Nullable AlignedRow row,
+            long partitionId,
+            long sequence)
             throws Exception {
-        // Partitioned Index Table schema: [b STRING, a INT, p STRING, __partition_id BIGINT]
-        byte[] valueBytes = encodeAlignedValueWithPartitionId(partitionId);
-        KvRecordBatch batch = synthesizeIndexBatch(key, valueBytes);
         int leaderId =
                 FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(indexTableId, bucket));
-        FLUSS_CLUSTER_EXTENSION
-                .newTabletServerClientForNode(leaderId)
-                .putKv(newPutKvRequest(indexTableId, bucket, 1, batch))
-                .get();
+        WriterKey writerKey = IndexWriterKey.encode(new TableBucket(mainTableId, partitionId, 0));
+        try (FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        1,
+                        Integer.MAX_VALUE,
+                        new UnmanagedPagedOutputView(4096),
+                        KvFormat.ALIGNED)) {
+            builder.append(key, row);
+            builder.setWriterState(writerKey, sequence);
+            BytesView batch = builder.build();
+            PutKvRequest request =
+                    new PutKvRequest().setTableId(indexTableId).setAcks(-1).setTimeoutMs(10_000);
+            request.setAggMode(MergeMode.OVERWRITE.getProtoValue());
+            PbPutKvReqForBucket bucketRequest = request.addBucketsReq().setBucketId(bucket);
+            bucketRequest.setRecordsBytesView(batch);
+            PutKvResponse response =
+                    FLUSS_CLUSTER_EXTENSION
+                            .newTabletServerClientForNode(leaderId)
+                            .putKv(request)
+                            .get();
+            assertThat(response.getBucketsRespsList())
+                    .singleElement()
+                    .satisfies(result -> assertThat(result.hasErrorCode()).isFalse());
+        }
     }
 
     private void flushIndexBucket(long indexTableId, int bucket) throws Exception {
@@ -338,9 +474,7 @@ class PartitionTTLGoldenPathITCase {
         waitUntil(
                 () -> {
                     try {
-                        java.util.List<byte[]> result =
-                                replica.lookups(Collections.singletonList(key));
-                        boolean present = result.get(0) != null;
+                        boolean present = !replica.prefixLookup(key).isEmpty();
                         return present == expectPresent;
                     } catch (Exception e) {
                         return false;
@@ -350,39 +484,12 @@ class PartitionTTLGoldenPathITCase {
                 description);
     }
 
-    private static byte[] encodeAlignedValueWithPartitionId(long partitionId) {
-        // Partitioned Index Table schema: [b STRING, a INT, p STRING, __partition_id BIGINT]
-        int arity = 4;
-        AlignedRow row = new AlignedRow(arity);
-        AlignedRowWriter writer = new AlignedRowWriter(row);
-        writer.reset();
-        writer.writeString(0, fromString("dummy"));
-        writer.writeInt(1, 0);
-        writer.writeString(2, fromString("px"));
-        writer.writeLong(3, partitionId);
-        writer.complete();
-        byte[] body = new byte[row.getSizeInBytes()];
-        row.copyTo(body, 0);
-        return body;
-    }
-
-    private static KvRecordBatch synthesizeIndexBatch(byte[] key, byte[] valueBytes)
-            throws IOException {
-        KvRecordBatchBuilder builder =
-                KvRecordBatchBuilder.builder(
-                        /* schemaId */ 1,
-                        Integer.MAX_VALUE,
-                        new UnmanagedPagedOutputView(4096),
-                        KvFormat.ALIGNED);
-        try {
-            AlignedRow row = new AlignedRow(0);
-            row.pointTo(MemorySegment.wrap(valueBytes), 0, valueBytes.length);
-            builder.append(key, row);
-            KvRecordBatch batch = DefaultKvRecordBatch.pointToBytesView(builder.build());
-            batch.ensureValid();
-            return batch;
-        } finally {
-            builder.close();
-        }
+    private static long waitForRecreatedPartition(
+            TablePath mainPath, String partitionName, long oldPartitionId) {
+        Map<String, Long> partitions =
+                FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(mainPath, 3);
+        Long recreated = partitions.get(partitionName);
+        assertThat(recreated).isNotNull().isNotEqualTo(oldPartitionId);
+        return recreated;
     }
 }

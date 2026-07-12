@@ -71,8 +71,8 @@ import org.apache.fluss.server.kv.wal.ArrowWalBuilder;
 import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.kv.wal.IndexWalBuilder;
 import org.apache.fluss.server.kv.wal.WalBuilder;
-import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
+import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
@@ -526,12 +526,14 @@ public final class KvTablet {
                         }
                         if (writeGuard.beforeWriterState(writerKey)
                                 == KvWriteGuard.Decision.NO_OP) {
+                            serverMetricGroup.indexPushTombstoneNoOpBatches().inc();
                             return LogAppendInfo.noAppend();
                         }
                         Optional<FencedWriterStateEntry> stale =
                                 logTablet.findStaleFencedBatch(writerKey, fencedSequence);
                         if (stale.isPresent()) {
                             FencedWriterStateEntry entry = stale.get();
+                            serverMetricGroup.indexPushStaleV1Batches().inc();
                             return LogAppendInfo.duplicatedAt(
                                     entry.dominatingTargetWalOffset(), entry.lastTimestamp());
                         }
@@ -561,14 +563,12 @@ public final class KvTablet {
 
                     RowType latestRowType = latestSchema.getRowType();
                     boolean fenced = kvRecords.idempotenceProtocolVersion() == 1;
-                    WalBuilder walBuilder =
-                            createWalBuilder(latestSchemaId, latestRowType, fenced);
+                    WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType, fenced);
                     if (fenced) {
                         walBuilder.setFencedWriterState(
                                 kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
                     } else {
-                        walBuilder.setWriterState(
-                                kvRecords.writerId(), kvRecords.batchSequence());
+                        walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
                     }
                     // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
                     // only has fewer ending columns than latest schema, so we pad nulls to
@@ -610,6 +610,9 @@ public final class KvTablet {
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
                         if (logAppendInfo.duplicated()) {
+                            if (fenced) {
+                                serverMetricGroup.indexPushStaleV1Batches().inc();
+                            }
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
                         }

@@ -166,10 +166,7 @@ public class WriterStateManager {
             throw new CorruptSnapshotException(
                     String.format(
                             "WriterState recovery ends at %d, not recovery end %d; WAL coverage has gap [%d,%d)",
-                            lastMapOffset,
-                            recoveryEndOffset,
-                            lastMapOffset,
-                            recoveryEndOffset));
+                            lastMapOffset, recoveryEndOffset, lastMapOffset, recoveryEndOffset));
         }
     }
 
@@ -290,8 +287,7 @@ public class WriterStateManager {
         throw noFencedRecoveryCandidate(logStartOffset, logEndOffset, latestFailure);
     }
 
-    List<Optional<Long>> fencedRecoveryCandidateOffsets(
-            long logStartOffset, long logEndOffset) {
+    List<Optional<Long>> fencedRecoveryCandidateOffsets(long logStartOffset, long logEndOffset) {
         validateFencedRecoveryRange(logStartOffset, logEndOffset);
         List<Optional<Long>> candidateOffsets = new ArrayList<>();
         for (SnapshotFile snapshot :
@@ -312,8 +308,7 @@ public class WriterStateManager {
             throws IOException {
         requireProtocol(KvIdempotenceProtocol.V1_FENCED);
         WriterStateManager candidate =
-                new WriterStateManager(
-                        tableBucket, logTabletDir, writerExpirationMs, protocol);
+                new WriterStateManager(tableBucket, logTabletDir, writerExpirationMs, protocol);
         candidate.loadFencedRecoveryCandidate(logStartOffset, logEndOffset, snapshotOffset);
         return candidate;
     }
@@ -481,6 +476,11 @@ public class WriterStateManager {
     /** Fetch the snapshot file for the end offset of the log segment. */
     public Optional<File> fetchSnapshot(long offset) {
         return Optional.ofNullable(snapshots.get(offset)).map(SnapshotFile::file);
+    }
+
+    /** Returns the bytes retained by the latest WriterState snapshot file. */
+    public long latestSnapshotBytes() {
+        return latestSnapshotFile().map(snapshot -> snapshot.file().length()).orElse(0L);
     }
 
     public WriterAppendInfo prepareUpdate(long writerId) {

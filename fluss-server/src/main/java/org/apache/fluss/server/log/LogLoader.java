@@ -26,6 +26,7 @@ import org.apache.fluss.exception.LogSegmentOffsetOverflowException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.types.Tuple2;
@@ -59,6 +60,7 @@ final class LogLoader {
     private final LogFormat logFormat;
     private final WriterStateManager writerStateManager;
     private final boolean isCleanShutdown;
+    private final Counter recoveryCoverageFailures;
     private final List<LogSegment> segmentsWithInvalidIndex = new ArrayList<>();
 
     public LogLoader(
@@ -68,7 +70,8 @@ final class LogLoader {
             long recoveryPointCheckpoint,
             LogFormat logFormat,
             WriterStateManager writerStateManager,
-            boolean isCleanShutdown) {
+            boolean isCleanShutdown,
+            Counter recoveryCoverageFailures) {
         this.logTabletDir = logTabletDir;
         this.conf = conf;
         this.logSegments = logSegments;
@@ -76,6 +79,7 @@ final class LogLoader {
         this.logFormat = logFormat;
         this.writerStateManager = writerStateManager;
         this.isCleanShutdown = isCleanShutdown;
+        this.recoveryCoverageFailures = recoveryCoverageFailures;
     }
 
     /**
@@ -123,7 +127,8 @@ final class LogLoader {
                 logSegments,
                 retainedLogStartOffset,
                 nextOffset,
-                isCleanShutdown);
+                isCleanShutdown,
+                recoveryCoverageFailures);
 
         LogSegment activeSegment = logSegments.lastSegment().get();
         activeSegment.resizeIndexes((int) conf.get(ConfigOptions.LOG_INDEX_FILE_SIZE).getBytes());
@@ -314,7 +319,8 @@ final class LogLoader {
                 logSegments,
                 retainedLogStartOffset,
                 segment.getBaseOffset(),
-                false);
+                false,
+                recoveryCoverageFailures);
         int bytesTruncated = segment.recover();
         // once we have recovered the segment's data, take a snapshot to ensure that we won't
         // need to reload the same segment again while recovering another segment.

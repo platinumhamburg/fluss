@@ -110,10 +110,7 @@ class IndexPushFailoverITCase {
                                 3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "a")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
         long indexTableId =
@@ -272,10 +269,7 @@ class IndexPushFailoverITCase {
                                 3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "a")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
         long indexTableId =
@@ -366,13 +360,13 @@ class IndexPushFailoverITCase {
                 TIMEOUT,
                 "wait for index entry after index table leader failover");
 
-        // The retried push must have actually advanced the pushed offset off its -1 sentinel —
-        // proving the entry appeared because the push pipeline completed, not via any unrelated
-        // path. (Combined with the pre-write -1 assertion this cannot be vacuously true.)
+        // One source row at offset 0 advances the exact completed prefix to 1. An exact check
+        // catches both a retry that never completed and an accidental skip past source WAL.
         waitUntil(
-                () -> mainReplica.getSyncIndexPushedOffset() >= 0L,
+                () -> mainReplica.getSyncIndexPushedOffset() == 1L,
                 TIMEOUT,
-                "pushed offset must advance after the retried push completes");
+                "pushed offset must equal the one-row source WAL end after retry");
+        assertThat(mainReplica.getSyncIndexPushedOffset()).isEqualTo(1L);
 
         // Restart the stopped server
         FLUSS_CLUSTER_EXTENSION.startTabletServer(stoppedServer);

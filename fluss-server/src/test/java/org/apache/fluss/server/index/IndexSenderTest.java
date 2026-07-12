@@ -29,16 +29,16 @@ import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
-import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
-import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
 import org.apache.fluss.rpc.messages.PbApiVersion;
+import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
+import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
-import org.apache.fluss.rpc.gateway.TabletServerGateway;
-import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.ApiKeys;
+import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.protocol.MessageCodec;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
@@ -61,8 +61,8 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -288,9 +288,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(39L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(39L, 0), new IndexWindow("idx", 10L, 1, owner)));
 
             await(() -> owner.getSyncIndexPushedOffset() == 10L);
             assertThat(delegate.apiVersionsCalls).isEqualTo(1);
@@ -316,17 +314,13 @@ public class IndexSenderTest {
         IndexSender sender =
                 sender(
                         accumulator,
-                        ignored ->
-                                freshProxy(
-                                        factoryCalls.getAndIncrement() == 0 ? first : second),
+                        ignored -> freshProxy(factoryCalls.getAndIncrement() == 0 ? first : second),
                         ignored -> 1,
                         IndexSender.LifecycleHooks.NO_OP);
         try {
             IndexReplicator owner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(38L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(38L, 0), new IndexWindow("idx", 10L, 1, owner)));
 
             await(() -> owner.getSyncIndexPushedOffset() == 10L);
             assertThat(first.requests).hasSize(1);
@@ -352,18 +346,14 @@ public class IndexSenderTest {
         IndexSender sender =
                 sender(
                         accumulator,
-                        ignored ->
-                                freshProxy(
-                                        factoryCalls.getAndIncrement() == 0 ? first : second),
+                        ignored -> freshProxy(factoryCalls.getAndIncrement() == 0 ? first : second),
                         ignored -> 1,
                         IndexSender.LifecycleHooks.NO_OP);
         try {
             IndexReplicator firstOwner = owner(accumulator);
             IndexReplicator secondOwner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(381L, 0),
-                            new IndexWindow("first", 10L, 1, firstOwner)));
+                    batch(new TableBucket(381L, 0), new IndexWindow("first", 10L, 1, firstOwner)));
             accumulator.append(
                     batch(
                             new TableBucket(382L, 0),
@@ -418,9 +408,7 @@ public class IndexSenderTest {
         senderRef.set(sender);
         try {
             accumulator.append(
-                    batch(
-                            new TableBucket(37L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(37L, 0), new IndexWindow("idx", 10L, 1, owner)));
 
             assertThat(progress.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(closeReturned).isTrue();
@@ -438,8 +426,7 @@ public class IndexSenderTest {
     void admittedProgressCallbackCanReentrantlyCloseWhileNormalCloseWaits() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.PROGRESS_CALLBACK);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.PROGRESS_CALLBACK);
         AtomicReference<IndexSender> senderRef = new AtomicReference<>();
         AtomicBoolean callbackCloseReturned = new AtomicBoolean();
         IndexReplicator owner =
@@ -454,9 +441,7 @@ public class IndexSenderTest {
         ExecutorService executor = Executors.newCachedThreadPool();
         try {
             accumulator.append(
-                    batch(
-                            new TableBucket(36L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(36L, 0), new IndexWindow("idx", 10L, 1, owner)));
             await(() -> gateway.pending.size() == 1);
 
             Future<?> completion = executor.submit(() -> completePutKv(gateway, 0, true));
@@ -503,9 +488,7 @@ public class IndexSenderTest {
         ExecutorService executor = Executors.newCachedThreadPool();
         try {
             accumulator.append(
-                    batch(
-                            new TableBucket(35L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(35L, 0), new IndexWindow("idx", 10L, 1, owner)));
             await(() -> gateway.pending.size() == 1);
             Future<?> completion = executor.submit(() -> completePutKv(gateway, 0, true));
             assertThat(reentrantCloseReturned.await(5, TimeUnit.SECONDS)).isTrue();
@@ -537,18 +520,14 @@ public class IndexSenderTest {
     }
 
     @Test
-    void closeDrainsBatchWhoseAdmittedFailureActionRequeuesAfterClosingStarts()
-            throws Exception {
+    void closeDrainsBatchWhoseAdmittedFailureActionRequeuesAfterClosingStarts() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.BATCH_REQUEUE);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.BATCH_REQUEUE);
         IndexSender sender = sender(accumulator, ignored -> gateway, ignored -> 1, hooks);
         ExecutorService executor = Executors.newCachedThreadPool();
         IndexBatch claimed =
-                batch(
-                        new TableBucket(34L, 0),
-                        new IndexWindow("idx", 10L, 1, owner(accumulator)));
+                batch(new TableBucket(34L, 0), new IndexWindow("idx", 10L, 1, owner(accumulator)));
         try {
             accumulator.append(claimed);
             await(() -> gateway.pending.size() == 1);
@@ -619,16 +598,13 @@ public class IndexSenderTest {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
         gateway.pendingApiVersions = new CompletableFuture<>();
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
         IndexSender sender = sender(accumulator, ignored -> gateway, ignored -> 1, hooks);
         ExecutorService lifecycleExecutor = Executors.newCachedThreadPool();
         try {
             IndexReplicator owner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(44L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(44L, 0), new IndexWindow("idx", 10L, 1, owner)));
             await(() -> gateway.apiVersionsCalls == 1);
 
             Future<?> probeCompletion =
@@ -658,21 +634,17 @@ public class IndexSenderTest {
     void closeWaitsForLatePutKvCallbackAndFencesItsSideEffects(boolean success) throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_COMPLETION);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_COMPLETION);
         IndexSender sender = sender(accumulator, ignored -> gateway, ignored -> 1, hooks);
         ExecutorService lifecycleExecutor = Executors.newCachedThreadPool();
         try {
             IndexReplicator owner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(45L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(45L, 0), new IndexWindow("idx", 10L, 1, owner)));
             await(() -> gateway.pending.size() == 1);
 
             Future<?> requestCompletion =
-                    lifecycleExecutor.submit(
-                            () -> completePutKv(gateway, 0, success));
+                    lifecycleExecutor.submit(() -> completePutKv(gateway, 0, success));
             hooks.awaitReached();
             Future<?> close = lifecycleExecutor.submit(sender::close);
             await(sender::isClosingForTesting);
@@ -696,15 +668,13 @@ public class IndexSenderTest {
     }
 
     @Test
-    void leaderReplacementBeforePutKvInvocationRetriesWithoutSendingToOldTarget()
-            throws Exception {
+    void leaderReplacementBeforePutKvInvocationRetriesWithoutSendingToOldTarget() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway first = new RecordingGateway();
         RecordingGateway second = new RecordingGateway();
         second.autoCompleteSuccess = true;
         AtomicInteger leader = new AtomicInteger(1);
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
         IndexSender sender =
                 sender(
                         accumulator,
@@ -714,9 +684,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(47L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(47L, 0), new IndexWindow("idx", 10L, 1, owner)));
             hooks.awaitReached();
             leader.set(2);
             hooks.release();
@@ -743,8 +711,7 @@ public class IndexSenderTest {
         RecordingGateway second = new RecordingGateway();
         second.autoCompleteSuccess = true;
         AtomicInteger leader = new AtomicInteger(1);
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_COMPLETION);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_COMPLETION);
         IndexSender sender =
                 sender(
                         accumulator,
@@ -755,9 +722,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(46L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(46L, 0), new IndexWindow("idx", 10L, 1, owner)));
             await(() -> first.pending.size() == 1);
 
             Future<?> completion =
@@ -806,9 +771,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(accumulator);
             accumulator.append(
-                    batch(
-                            new TableBucket(41L, 0),
-                            new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(41L, 0), new IndexWindow("idx", 10L, 1, owner)));
             await(() -> first.apiVersionsCalls == 1);
 
             leader.set(2);
@@ -843,8 +806,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(42L, 0);
             IndexReplicator owner = owner(accumulator);
-            IndexBatch encodedBatch =
-                    v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+            IndexBatch encodedBatch = v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
             byte[] expected = bytes(encodedBatch.encoded());
             KvRecordBatch parsed =
                     KvRecordBatchReader.pointToByteBuffer(
@@ -922,6 +884,10 @@ public class IndexSenderTest {
         IndexBatch encodedBatch = v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
         long exactRequestBytes = exactRequestBytes(bucket, encodedBatch);
         long errorsBefore = TestingMetricGroups.TABLET_SERVER_METRICS.indexPushErrors().getCount();
+        long tooLargeBefore =
+                TestingMetricGroups.TABLET_SERVER_METRICS
+                        .indexPushRecordTooLargeFailures()
+                        .getCount();
         accumulator.append(encodedBatch);
         IndexSender sender =
                 new IndexSender(
@@ -949,14 +915,18 @@ public class IndexSenderTest {
             assertThat(accumulator.hasUnsent()).isFalse();
             assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexPushErrors().getCount())
                     .isEqualTo(errorsBefore + 1);
+            assertThat(
+                            TestingMetricGroups.TABLET_SERVER_METRICS
+                                    .indexPushRecordTooLargeFailures()
+                                    .getCount())
+                    .isEqualTo(tooLargeBefore + 1L);
         } finally {
             sender.close();
         }
     }
 
     @Test
-    void oversizedSingletonFailsBeforeUnresolvedLeaderAndReleasesQueuedSibling()
-            throws Exception {
+    void oversizedSingletonFailsBeforeUnresolvedLeaderAndReleasesQueuedSibling() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         TableBucket largeBucket = new TableBucket(45L, 0);
         TableBucket siblingBucket = new TableBucket(45L, 1);
@@ -1023,8 +993,7 @@ public class IndexSenderTest {
         owner.registerInFlightWindow("idx", window);
         IndexBatch retry = batchOfSize(retryBucket, window, 1);
         IndexBatch oversized = batchOfSize(oversizedBucket, window, 1024 * 1024);
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.RETRY_PUBLICATION);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.RETRY_PUBLICATION);
         accumulator.append(retry);
         IndexSender sender =
                 new IndexSender(
@@ -1044,8 +1013,7 @@ public class IndexSenderTest {
         try {
             assertThat(owner.inFlightWindow("idx")).isSameAs(window);
             await(() -> gateway.pending.size() == 1);
-            Future<?> failedRequest =
-                    executor.submit(() -> completePutKv(gateway, 0, false));
+            Future<?> failedRequest = executor.submit(() -> completePutKv(gateway, 0, false));
             hooks.awaitReached();
 
             accumulator.append(oversized);
@@ -1071,16 +1039,14 @@ public class IndexSenderTest {
     }
 
     @Test
-    void ownerCloseAtFinalRetryPublicationReleasesSenderOwnershipAndAllowsClose()
-            throws Exception {
+    void ownerCloseAtFinalRetryPublicationReleasesSenderOwnershipAndAllowsClose() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
         TableBucket bucket = new TableBucket(491L, 0);
         IndexReplicator owner = owner(accumulator);
         IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
         IndexBatch batch = batchOfSize(bucket, window, 17);
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.RETRY_PUBLICATION);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.RETRY_PUBLICATION);
         accumulator.append(batch);
         IndexSender sender =
                 new IndexSender(
@@ -1098,8 +1064,7 @@ public class IndexSenderTest {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
             await(() -> gateway.pending.size() == 1);
-            Future<?> failedRequest =
-                    executor.submit(() -> completePutKv(gateway, 0, false));
+            Future<?> failedRequest = executor.submit(() -> completePutKv(gateway, 0, false));
             hooks.awaitReached();
 
             owner.close();
@@ -1401,8 +1366,7 @@ public class IndexSenderTest {
         IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
+        BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
         accumulator.append(small);
         IndexSender sender =
                 new IndexSender(
@@ -1435,8 +1399,7 @@ public class IndexSenderTest {
     }
 
     @Test
-    void terminalizationAtFinalPutKvRegistrationPreventsAsyncOperationAndSend()
-            throws Exception {
+    void terminalizationAtFinalPutKvRegistrationPreventsAsyncOperationAndSend() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
         long tableId = 481L;
@@ -1499,20 +1462,9 @@ public class IndexSenderTest {
     @Test
     void exactSizerMatchesGeneratedCodecAcrossVarintAndRecordBoundaries() {
         long[] tableIds =
-                new long[] {
-                    Long.MIN_VALUE, -1L, 0L, 127L, 128L, 16_383L, 16_384L, Long.MAX_VALUE
-                };
+                new long[] {Long.MIN_VALUE, -1L, 0L, 127L, 128L, 16_383L, 16_384L, Long.MAX_VALUE};
         int[] bucketIds =
-                new int[] {
-                    Integer.MIN_VALUE,
-                    -1,
-                    0,
-                    127,
-                    128,
-                    16_383,
-                    16_384,
-                    Integer.MAX_VALUE
-                };
+                new int[] {Integer.MIN_VALUE, -1, 0, 127, 128, 16_383, 16_384, Integer.MAX_VALUE};
         int[] recordLengths = new int[] {0, 1, 127, 128, 16_383, 16_384};
 
         for (long tableId : tableIds) {
@@ -1542,9 +1494,7 @@ public class IndexSenderTest {
                     assertThat(size.framedBytes())
                             .as(
                                     "tableId=%s, bucketId=%s, records=%s",
-                                    tableId,
-                                    bucketId,
-                                    recordLength)
+                                    tableId, bucketId, recordLength)
                             .isEqualTo(
                                     Integer.BYTES
                                             + MessageCodec.REQUEST_HEADER_LENGTH
@@ -1595,8 +1545,7 @@ public class IndexSenderTest {
     @Test
     void manySmallBucketsUseOneIncrementalSizingContributionEach() {
         int bucketCount = 10_000;
-        IndexSender.RequestSizeAccumulator size =
-                IndexSender.newRequestSizeAccumulator(1L, 5_000L);
+        IndexSender.RequestSizeAccumulator size = IndexSender.newRequestSizeAccumulator(1L, 5_000L);
         for (int bucket = 0; bucket < bucketCount; bucket++) {
             size.addBucket(bucket, 1L);
         }
@@ -1612,8 +1561,7 @@ public class IndexSenderTest {
         return new IndexBatch(targetBucket, encoded, window);
     }
 
-    private static IndexBatch batchOfSize(
-            TableBucket targetBucket, IndexWindow window, int size) {
+    private static IndexBatch batchOfSize(TableBucket targetBucket, IndexWindow window, int size) {
         byte[] bytes = new byte[size];
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, size);
         return new IndexBatch(targetBucket, encoded, window);
@@ -1623,10 +1571,7 @@ public class IndexSenderTest {
             throws Exception {
         FencedKvRecordBatchBuilder builder =
                 FencedKvRecordBatchBuilder.builder(
-                        1,
-                        1024,
-                        new UnmanagedPagedOutputView(128),
-                        KvFormat.COMPACTED);
+                        1, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
         builder.append(new byte[] {7, 8, 9}, null);
         builder.setWriterState(new WriterKey(9L, 3L), 10L);
         return new IndexBatch(targetBucket, builder.build(), window);
@@ -1732,8 +1677,7 @@ public class IndexSenderTest {
         }
     }
 
-    private static void assertClosedAndDrained(
-            IndexSender sender, IndexAccumulator accumulator) {
+    private static void assertClosedAndDrained(IndexSender sender, IndexAccumulator accumulator) {
         assertThat(sender.isClosedForTesting()).isTrue();
         assertThat(sender.inFlightRequestCount()).isZero();
         assertThat(sender.outstandingAsyncOperationCount()).isZero();
@@ -1767,8 +1711,8 @@ public class IndexSenderTest {
         }
     }
 
-    private static void replaceQueueRegistry(
-            IndexAccumulator accumulator, CountingBucketMap queues) throws Exception {
+    private static void replaceQueueRegistry(IndexAccumulator accumulator, CountingBucketMap queues)
+            throws Exception {
         Field field = IndexAccumulator.class.getDeclaredField("batches");
         field.setAccessible(true);
         field.set(accumulator, queues);

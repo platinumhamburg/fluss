@@ -395,7 +395,8 @@ public final class ReplicaIndexController {
                         logTablet,
                         remoteLogManager,
                         remoteLogManager.remoteLogExecutor(),
-                        readContext);
+                        readContext,
+                        metrics);
         // Use the already-seeded offset (from snapshot restore or -1) as the starting point.
         IndexReplicator replicator =
                 new IndexReplicator(

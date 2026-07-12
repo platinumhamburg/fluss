@@ -28,12 +28,14 @@ import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
-import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
+import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.metrics.SimpleCounter;
 import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.record.DefaultLogRecordBatch;
 import org.apache.fluss.record.FileLogProjection;
@@ -115,6 +117,7 @@ public final class LogTablet {
     private final Clock clock;
     private volatile AppendFaultInjector appendFaultInjector = AppendFaultInjector.NO_OP;
     private final boolean isChangeLog;
+    private final TabletServerMetricGroup serverMetricGroup;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -151,7 +154,8 @@ public final class LogTablet {
             LogFormat logFormat,
             int tieredLogLocalSegments,
             boolean isChangelog,
-            Clock clock) {
+            Clock clock,
+            TabletServerMetricGroup serverMetricGroup) {
         this.dataDir = dataDir;
         this.physicalPath = physicalPath;
         this.localLog = localLog;
@@ -178,6 +182,7 @@ public final class LogTablet {
 
         this.clock = clock;
         this.isChangeLog = isChangelog;
+        this.serverMetricGroup = serverMetricGroup;
         // Default value to 0L for changelog to avoid cleaning up any segments in case of not
         // updating this value in time. Default value to Long.MAX_VALUE for normal log table,
         // as we don't need to retain logs for kv recovery.
@@ -289,6 +294,14 @@ public final class LogTablet {
         return writerStateManager.writerIdCount();
     }
 
+    public KvIdempotenceProtocol getWriterStateProtocol() {
+        return writerStateManager.protocol();
+    }
+
+    public long getWriterStateSnapshotBytes() {
+        return writerStateManager.latestSnapshotBytes();
+    }
+
     public Map<Long, WriterStateEntry> activeWriters() {
         return writerStateManager.activeWriters();
     }
@@ -392,7 +405,8 @@ public final class LogTablet {
                                 recoveryPoint,
                                 logFormat,
                                 writerStateManager,
-                                isCleanShutdown)
+                                isCleanShutdown,
+                                serverMetricGroup.indexWriterStateRecoveryCoverageFailures())
                         .load();
 
         LocalLog log =
@@ -416,7 +430,8 @@ public final class LogTablet {
                 logFormat,
                 tieredLogLocalSegments,
                 isChangelog,
-                clock);
+                clock,
+                serverMetricGroup);
     }
 
     /** Register metrics for this log tablet in the metric group. */
@@ -466,7 +481,8 @@ public final class LogTablet {
     }
 
     /**
-     * Append this message set as a follower and retain matching V1 WriterState after the WAL append.
+     * Append this message set as a follower and retain matching V1 WriterState after the WAL
+     * append.
      */
     public LogAppendInfo appendAsFollower(
             MemoryLogRecords records, Predicate<WriterKey> retainFencedWriterState)
@@ -850,8 +866,7 @@ public final class LogTablet {
                     throw new DuplicateSequenceException(
                             String.format(
                                     "Found all-stale fenced append for table bucket %s, dominating offset %s",
-                                    getTableBucket(),
-                                    validateResult.dominatingTargetWalOffset()));
+                                    getTableBucket(), validateResult.dominatingTargetWalOffset()));
                 }
                 updatedFencedWriters = validateResult.updates();
                 // A stale V1 batch returned above without rolling or otherwise mutating the WAL.
@@ -1273,13 +1288,9 @@ public final class LogTablet {
             FencedWriterStateEntry committed =
                     writerStateManager.lastFencedEntry(writerKey).orElse(null);
             FencedWriterStateEntry stagedCurrent = staged.get(writerKey);
-            if (stagedCurrent != null
-                    && batch.fencedSequence() <= stagedCurrent.lastSequence()) {
+            if (stagedCurrent != null && batch.fencedSequence() <= stagedCurrent.lastSequence()) {
                 throw fencedOrderingError(
-                        writerKey,
-                        batch.fencedSequence(),
-                        stagedCurrent.lastSequence(),
-                        "staged");
+                        writerKey, batch.fencedSequence(), stagedCurrent.lastSequence(), "staged");
             }
             if (committed != null && batch.fencedSequence() <= committed.lastSequence()) {
                 if (sawFresh) {
@@ -1299,8 +1310,7 @@ public final class LogTablet {
             FencedWriterStateEntry current = stagedCurrent != null ? stagedCurrent : committed;
             FencedWriterAppendInfo update =
                     new FencedWriterAppendInfo(writerKey, getTableBucket(), current);
-            update.append(
-                    batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
+            update.append(batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
             updates.add(update);
             staged.put(writerKey, update.updatedEntry());
         }
@@ -1309,8 +1319,7 @@ public final class LogTablet {
                 : FencedValidationResult.allFresh(updates);
     }
 
-    private void validateWalProtocol(
-            LogRecordBatch batch, KvIdempotenceProtocol expectedProtocol) {
+    private void validateWalProtocol(LogRecordBatch batch, KvIdempotenceProtocol expectedProtocol) {
         if (batch.idempotenceProtocolVersion() != expectedProtocol.version()) {
             throw new CorruptRecordException(
                     String.format(
@@ -1347,8 +1356,7 @@ public final class LogTablet {
             this.dominatingTimestamp = dominatingTimestamp;
         }
 
-        private static FencedValidationResult allFresh(
-                Collection<FencedWriterAppendInfo> updates) {
+        private static FencedValidationResult allFresh(Collection<FencedWriterAppendInfo> updates) {
             return new FencedValidationResult(updates, -1L, -1L);
         }
 
@@ -1390,8 +1398,7 @@ public final class LogTablet {
             localLog.checkIfMemoryMappedBufferClosed();
             long retainedLogStartOffset =
                     writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
-                            ? localLog
-                                    .getSegments()
+                            ? localLog.getSegments()
                                     .firstSegment()
                                     .map(LogSegment::getBaseOffset)
                                     .orElse(lastOffset)
@@ -1402,7 +1409,8 @@ public final class LogTablet {
                     retainedLogStartOffset,
                     lastOffset,
                     false,
-                    appendFaultInjector);
+                    appendFaultInjector,
+                    serverMetricGroup.indexWriterStateRecoveryCoverageFailures());
         }
     }
 
@@ -1484,7 +1492,26 @@ public final class LogTablet {
                 logStartOffset,
                 lastOffset,
                 reloadFromCleanShutdown,
-                AppendFaultInjector.NO_OP);
+                AppendFaultInjector.NO_OP,
+                new SimpleCounter());
+    }
+
+    static void rebuildWriterState(
+            WriterStateManager writerStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long lastOffset,
+            boolean reloadFromCleanShutdown,
+            Counter recoveryCoverageFailures)
+            throws IOException {
+        rebuildWriterState(
+                writerStateManager,
+                segments,
+                logStartOffset,
+                lastOffset,
+                reloadFromCleanShutdown,
+                AppendFaultInjector.NO_OP,
+                recoveryCoverageFailures);
     }
 
     private static void rebuildWriterState(
@@ -1493,7 +1520,8 @@ public final class LogTablet {
             long logStartOffset,
             long lastOffset,
             boolean reloadFromCleanShutdown,
-            AppendFaultInjector recoveryFaultInjector)
+            AppendFaultInjector recoveryFaultInjector,
+            Counter recoveryCoverageFailures)
             throws IOException {
         List<Optional<Long>> offsetsToSnapshot = new ArrayList<>();
         if (!segments.isEmpty()) {
@@ -1544,12 +1572,17 @@ public final class LogTablet {
                     writerStateManager.isEmpty() && writerStateManager.mapEndOffset() >= lastOffset;
             long writerStateLoadStart = System.currentTimeMillis();
             if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
-                rebuildFencedWriterState(
-                        writerStateManager,
-                        segments,
-                        logStartOffset,
-                        lastOffset,
-                        recoveryFaultInjector);
+                try {
+                    rebuildFencedWriterState(
+                            writerStateManager,
+                            segments,
+                            logStartOffset,
+                            lastOffset,
+                            recoveryFaultInjector);
+                } catch (CorruptSnapshotException | CorruptRecordException failure) {
+                    recoveryCoverageFailures.inc();
+                    throw failure;
+                }
                 writerStateManager.takeSnapshot();
                 LOG.info(
                         "Writer state recovery took {} ms for bucket {} from offset {}",
@@ -1647,14 +1680,11 @@ public final class LogTablet {
         for (LogSegment segment : segmentsList) {
             long startOffset =
                     Math.max(
-                            Math.max(
-                                    segment.getBaseOffset(),
-                                    recoveryStateManager.mapEndOffset()),
+                            Math.max(segment.getBaseOffset(), recoveryStateManager.mapEndOffset()),
                             logStartOffset);
             if (recoveryStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
                 if (startOffset > recoveryStateManager.mapEndOffset()) {
-                    throw recoveryGap(
-                            recoveryStateManager, startOffset, recoveryEndOffset);
+                    throw recoveryGap(recoveryStateManager, startOffset, recoveryEndOffset);
                 }
             } else {
                 recoveryStateManager.updateMapEndOffset(startOffset);
@@ -1676,9 +1706,7 @@ public final class LogTablet {
                     segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
             if (fetchDataInfo != null) {
                 loadWritersFromRecords(
-                        recoveryStateManager,
-                        fetchDataInfo.getRecords(),
-                        recoveryFaultInjector);
+                        recoveryStateManager, fetchDataInfo.getRecords(), recoveryFaultInjector);
             }
         }
     }
@@ -1724,9 +1752,7 @@ public final class LogTablet {
                 FencedWriterAppendInfo update =
                         writerStateManager.prepareFencedUpdate(batch.fencedWriterKey());
                 update.append(
-                        batch.fencedSequence(),
-                        batch.lastLogOffset(),
-                        batch.commitTimestamp());
+                        batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
                 writerStateManager.updateFenced(update);
                 writerStateManager.updateMapEndOffset(batch.nextLogOffset());
                 try {
@@ -1745,9 +1771,7 @@ public final class LogTablet {
         return new CorruptSnapshotException(
                 String.format(
                         "V1 WriterState recovery has a WAL gap [%d,%d) before recovery end %d",
-                        writerStateManager.mapEndOffset(),
-                        nextOffset,
-                        recoveryEnd));
+                        writerStateManager.mapEndOffset(), nextOffset, recoveryEnd));
     }
 
     public static void deleteWriterSnapshots(

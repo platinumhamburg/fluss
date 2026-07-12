@@ -328,6 +328,8 @@ public class ReplicaManager implements ServerReconfigurable {
                 indexAccumulator::pendingBytes,
                 indexSender::inFlightRequestCount,
                 indexSender::oldestInFlightAgeMs);
+        serverMetricGroup.registerIndexWriterStateGauges(
+                this::fencedWriterStateEntryCount, this::fencedWriterStateSnapshotBytes);
 
         this.highWatermarkCheckpoints = new HashMap<>();
         for (File dataDir : localDiskManager.dataDirs()) {
@@ -499,6 +501,14 @@ public class ReplicaManager implements ServerReconfigurable {
         return onlineReplicas().map(Replica::writerIdCount).reduce(0, Integer::sum);
     }
 
+    private long fencedWriterStateEntryCount() {
+        return onlineReplicas().mapToLong(Replica::fencedWriterStateEntryCount).sum();
+    }
+
+    private long fencedWriterStateSnapshotBytes() {
+        return onlineReplicas().mapToLong(Replica::fencedWriterStateSnapshotBytes).sum();
+    }
+
     private long logicalStorageLogSize() {
         return onlineReplicas().map(Replica::logicalStorageLogSize).reduce(0L, Long::sum);
     }
@@ -600,9 +610,7 @@ public class ReplicaManager implements ServerReconfigurable {
         }
         Map<Long, Optional<PartitionTombstone>> previous = new HashMap<>();
         for (long mainTableId : incoming.keySet()) {
-            previous.put(
-                    mainTableId,
-                    metadataCache.getInitializedPartitionTombstone(mainTableId));
+            previous.put(mainTableId, metadataCache.getInitializedPartitionTombstone(mainTableId));
         }
         return previous;
     }

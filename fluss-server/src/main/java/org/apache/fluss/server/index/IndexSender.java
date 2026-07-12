@@ -151,6 +151,7 @@ public final class IndexSender implements AutoCloseable {
 
     /** Buckets with an in-flight request; value is the request send timestamp in millis. */
     private final ConcurrentMap<TableBucket, Long> inFlightSinceMs = MapUtils.newConcurrentMap();
+
     private final ConcurrentMap<TableBucket, IndexBatch> inFlightBatches =
             MapUtils.newConcurrentMap();
     private final ConcurrentMap<TableBucket, Integer> resolvedLeaders = MapUtils.newConcurrentMap();
@@ -158,8 +159,7 @@ public final class IndexSender implements AutoCloseable {
     private final Condition lifecycleDrained = lifecycleLock.newCondition();
     private final Map<Integer, TargetContext> targetsByServer = new HashMap<>();
     private final Set<Integer> creatingTargets = new HashSet<>();
-    private final Set<IndexBatch> ownedBatches =
-            Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<IndexBatch> ownedBatches = Collections.newSetFromMap(new IdentityHashMap<>());
     private final ThreadLocal<Integer> activeExternalCallbackDepth =
             ThreadLocal.withInitial(() -> 0);
     private final LifecycleHooks lifecycleHooks;
@@ -668,8 +668,7 @@ public final class IndexSender implements AutoCloseable {
                     } finally {
                         lifecycleLock.unlock();
                     }
-                    byServer.computeIfAbsent(leader, k -> new ArrayList<>())
-                            .add(batch);
+                    byServer.computeIfAbsent(leader, k -> new ArrayList<>()).add(batch);
                 } else {
                     reEnqueueOwnedBatch(batch);
                 }
@@ -702,8 +701,7 @@ public final class IndexSender implements AutoCloseable {
                         if (creatingTargets.add(serverId)) {
                             createTarget = true;
                         } else {
-                            addOwnedBatchActionsLocked(
-                                    actions, batches, BatchDisposition.REQUEUE);
+                            addOwnedBatchActionsLocked(actions, batches, BatchDisposition.REQUEUE);
                         }
                     } else if (target.compatible) {
                         dispatch = true;
@@ -786,8 +784,7 @@ public final class IndexSender implements AutoCloseable {
                                 "Index push ApiVersions timed out for serverId=" + target.serverId)
                         .whenComplete(
                                 (response, error) ->
-                                        completeCapabilityQuery(
-                                                target, batches, response, error));
+                                        completeCapabilityQuery(target, batches, response, error));
             } catch (Throwable t) {
                 completeCapabilityQuery(target, batches, null, t);
             }
@@ -830,8 +827,7 @@ public final class IndexSender implements AutoCloseable {
                         LOG.warn(
                                 "Target server {} does not currently advertise PutKv API v2",
                                 target.serverId);
-                        addOwnedBatchActionsLocked(
-                                actions, batches, BatchDisposition.REQUEUE);
+                        addOwnedBatchActionsLocked(actions, batches, BatchDisposition.REQUEUE);
                     }
                     beginAccountingLocked(actions);
                 } finally {
@@ -921,12 +917,7 @@ public final class IndexSender implements AutoCloseable {
                                 (resp, err) -> {
                                     lifecycleHooks.beforePutKvCompletion();
                                     completePutKvRequest(
-                                            target,
-                                            tableId,
-                                            requestBatches,
-                                            startNs,
-                                            resp,
-                                            err);
+                                            target, tableId, requestBatches, startNs, resp, err);
                                 });
             } catch (Throwable t) {
                 completePutKvRequest(target, tableId, requestBatches, startNs, null, t);
@@ -990,8 +981,7 @@ public final class IndexSender implements AutoCloseable {
             } finally {
                 lifecycleLock.unlock();
             }
-            metrics.indexPushLatencyHistogram()
-                    .update((System.nanoTime() - startNs) / 1_000_000L);
+            metrics.indexPushLatencyHistogram().update((System.nanoTime() - startNs) / 1_000_000L);
             try {
                 runAccountingAndCallbacks(actions);
             } finally {
@@ -1023,8 +1013,7 @@ public final class IndexSender implements AutoCloseable {
 
     private boolean batchesActiveAndOwnedLocked(List<IndexBatch> batches) {
         for (IndexBatch batch : batches) {
-            if (!batch.ownerActive()
-                    || inFlightBatches.get(batch.targetBucket()) != batch) {
+            if (!batch.ownerActive() || inFlightBatches.get(batch.targetBucket()) != batch) {
                 return false;
             }
         }
@@ -1075,8 +1064,11 @@ public final class IndexSender implements AutoCloseable {
     private static final class TargetContext {
         private final int serverId;
         private final TabletServerGateway gateway;
-        /** Sender-local identity; a new value is allocated only after exact-context invalidation. */
+        /**
+         * Sender-local identity; a new value is allocated only after exact-context invalidation.
+         */
         private final long generation;
+
         private boolean compatible;
         private boolean queryInFlight;
         private long retryAtMs;
@@ -1122,17 +1114,12 @@ public final class IndexSender implements AutoCloseable {
             try {
                 bodyBytes = checkedAdd(bodyBytes, 1L + signedIntVarintSize(DEFAULT_ACKS));
                 bodyBytes = checkedAdd(bodyBytes, 1L + signedLongVarintSize(tableId));
-                bodyBytes =
-                        checkedAdd(
-                                bodyBytes,
-                                1L + signedIntVarintSize((int) requestTimeoutMs));
+                bodyBytes = checkedAdd(bodyBytes, 1L + signedIntVarintSize((int) requestTimeoutMs));
                 bodyBytes = checkedAdd(bodyBytes, 2L); // empty packed target_columns
                 bodyBytes =
                         checkedAdd(
                                 bodyBytes,
-                                1L
-                                        + signedIntVarintSize(
-                                                MergeMode.OVERWRITE.getProtoValue()));
+                                1L + signedIntVarintSize(MergeMode.OVERWRITE.getProtoValue()));
                 refreshCodecRepresentability();
             } catch (ArithmeticException e) {
                 overflow = true;
@@ -1158,8 +1145,7 @@ public final class IndexSender implements AutoCloseable {
             }
             try {
                 long bucketBody = 0L;
-                bucketBody =
-                        checkedAdd(bucketBody, 1L + signedIntVarintSize(bucketId));
+                bucketBody = checkedAdd(bucketBody, 1L + signedIntVarintSize(bucketId));
                 bucketBody = checkedAdd(bucketBody, 1L + unsignedVarintSize(recordsBytes));
                 bucketBody = checkedAdd(bucketBody, recordsBytes);
                 if (recordsBytes > Integer.MAX_VALUE || bucketBody > Integer.MAX_VALUE) {
@@ -1184,8 +1170,7 @@ public final class IndexSender implements AutoCloseable {
 
         boolean arithmeticOverflow() {
             return overflow
-                    || bodyBytes
-                            > Long.MAX_VALUE - REQUEST_HEADER_LENGTH - LENGTH_PREFIX_BYTES;
+                    || bodyBytes > Long.MAX_VALUE - REQUEST_HEADER_LENGTH - LENGTH_PREFIX_BYTES;
         }
 
         boolean codecRepresentable() {
@@ -1212,8 +1197,7 @@ public final class IndexSender implements AutoCloseable {
     }
 
     @VisibleForTesting
-    static RequestSizeAccumulator newRequestSizeAccumulator(
-            long tableId, long requestTimeoutMs) {
+    static RequestSizeAccumulator newRequestSizeAccumulator(long tableId, long requestTimeoutMs) {
         return new RequestSizeAccumulator(tableId, requestTimeoutMs);
     }
 
@@ -1253,8 +1237,7 @@ public final class IndexSender implements AutoCloseable {
         List<RequestChunk> chunks = new ArrayList<>();
         List<IndexBatch> current = new ArrayList<>();
         long currentPayloadBytes = 0L;
-        RequestSizeAccumulator currentSize =
-                newRequestSizeAccumulator(tableId, requestTimeoutMs);
+        RequestSizeAccumulator currentSize = newRequestSizeAccumulator(tableId, requestTimeoutMs);
         for (IndexBatch batch : batches) {
             long batchBytes = batch.encoded().getBytesLength();
             RequestSizeAccumulator candidate = currentSize.copy();
@@ -1283,8 +1266,8 @@ public final class IndexSender implements AutoCloseable {
      * Completes a chunk against the per-bucket outcomes carried in the PutKv response. A bucket is
      * acked only when the response reports no error for it; a bucket that reports an error (or is
      * absent from the response) is re-enqueued for retry. This keeps a failed index mutation from
-     * advancing its window's pushed offset, so SYNC visibility never releases a main-table
-     * write whose index push has not actually landed.
+     * advancing its window's pushed offset, so SYNC visibility never releases a main-table write
+     * whose index push has not actually landed.
      */
     private void addResponseActionsLocked(
             List<BatchAction> actions, List<IndexBatch> batches, PutKvResponse response) {
@@ -1325,6 +1308,7 @@ public final class IndexSender implements AutoCloseable {
             return;
         }
         metrics.indexPushErrors().inc();
+        metrics.indexPushRecordTooLargeFailures().inc();
         releaseWindowBatches(siblings);
     }
 
@@ -1434,8 +1418,7 @@ public final class IndexSender implements AutoCloseable {
         }
     }
 
-    private void addRetryOrReleaseActionLocked(
-            List<BatchAction> actions, IndexBatch batch) {
+    private void addRetryOrReleaseActionLocked(List<BatchAction> actions, IndexBatch batch) {
         addOwnedBatchActionLocked(
                 actions,
                 batch,
@@ -1445,9 +1428,7 @@ public final class IndexSender implements AutoCloseable {
     }
 
     private void addOwnedBatchActionsLocked(
-            List<BatchAction> actions,
-            List<IndexBatch> batches,
-            BatchDisposition disposition) {
+            List<BatchAction> actions, List<IndexBatch> batches, BatchDisposition disposition) {
         for (IndexBatch batch : batches) {
             addOwnedBatchActionLocked(actions, batch, disposition);
         }
@@ -1489,8 +1470,7 @@ public final class IndexSender implements AutoCloseable {
                     IndexBatch batch = action.batch;
                     lifecycleHooks.beforeBatchRequeue();
                     long readyAtMs =
-                            System.currentTimeMillis()
-                                    + retryDelayMs(batch.attempts() + 1);
+                            System.currentTimeMillis() + retryDelayMs(batch.attempts() + 1);
                     lifecycleHooks.beforeRetryPublication();
                     if (!accumulator.reEnqueueIfActive(batch, readyAtMs)) {
                         releaseRejectedRetry(batch);
@@ -1636,5 +1616,4 @@ public final class IndexSender implements AutoCloseable {
         }
         return req;
     }
-
 }
