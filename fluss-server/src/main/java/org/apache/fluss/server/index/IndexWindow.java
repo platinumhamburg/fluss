@@ -101,16 +101,26 @@ final class IndexWindow {
         return batches.size();
     }
 
+    synchronized long registeredPayloadBytes() {
+        long bytes = 0L;
+        for (IndexBatch batch : batches) {
+            bytes += batch.encoded().getBytesLength();
+        }
+        return bytes;
+    }
+
     /**
      * Acknowledge one batch belonging to this window. When the last outstanding batch is
      * acknowledged, the window is complete and the owning replicator's pushed offset is advanced.
-     * The advance is guarded by a one-shot flag so it fires exactly once even under unexpected
-     * over-acknowledgement.
+     * Removing the exact batch from the registry makes duplicate and late acknowledgements no-ops.
      */
-    void onBatchAcked() {
+    void onBatchAcked(IndexBatch batch) {
         boolean completed = false;
         synchronized (this) {
-            if (!terminal && --remaining == 0) {
+            if (terminal || !batches.remove(batch)) {
+                return;
+            }
+            if (--remaining == 0) {
                 terminal = true;
                 batches.clear();
                 completed = true;

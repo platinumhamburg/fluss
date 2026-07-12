@@ -18,8 +18,11 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.exception.RecordTooLargeException;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.types.DataType;
@@ -83,22 +86,33 @@ public class IndexWindowTest {
                 });
     }
 
+    private static IndexBatch batch(IndexWindow window, int bucket) {
+        byte[] bytes = new byte[] {1};
+        return new IndexBatch(
+                new TableBucket(1L, bucket),
+                new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length),
+                window);
+    }
+
     @Test
     void offsetAdvancesOnlyAfterAllBatchesAcked() {
         AtomicLong advanced = new AtomicLong(-1L);
         IndexReplicator replicator = newReplicator(0L, (sync, all) -> advanced.set(sync));
         IndexWindow window = new IndexWindow("idx", 100L, 3, replicator);
+        IndexBatch first = batch(window, 0);
+        IndexBatch second = batch(window, 1);
+        IndexBatch third = batch(window, 2);
 
-        window.onBatchAcked();
+        window.onBatchAcked(first);
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(0L);
         assertThat(advanced.get()).isEqualTo(-1L);
 
-        window.onBatchAcked();
+        window.onBatchAcked(second);
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(0L);
         assertThat(advanced.get()).isEqualTo(-1L);
 
         // The final ack completes the window and advances the pushed offset.
-        window.onBatchAcked();
+        window.onBatchAcked(third);
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(100L);
         assertThat(replicator.getAllIndexPushedOffset()).isEqualTo(100L);
         assertThat(advanced.get()).isEqualTo(100L);
@@ -109,8 +123,9 @@ public class IndexWindowTest {
         AtomicLong advanced = new AtomicLong(-1L);
         IndexReplicator replicator = newReplicator(10L, (sync, all) -> advanced.set(sync));
         IndexWindow window = new IndexWindow("idx", 42L, 1, replicator);
+        IndexBatch batch = batch(window, 0);
 
-        window.onBatchAcked();
+        window.onBatchAcked(batch);
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(42L);
         assertThat(replicator.getAllIndexPushedOffset()).isEqualTo(42L);
         assertThat(advanced.get()).isEqualTo(42L);
@@ -120,10 +135,11 @@ public class IndexWindowTest {
     void terminalBatchFailurePreventsWindowFromAdvancing() {
         IndexReplicator replicator = newReplicator(10L, (sync, all) -> {});
         IndexWindow window = new IndexWindow("idx", 42L, 1, replicator);
+        IndexBatch batch = batch(window, 0);
         RecordTooLargeException failure = new RecordTooLargeException("too large");
 
-        assertThat(window.tryFailAndDrain(failure)).isEmpty();
-        window.onBatchAcked();
+        assertThat(window.tryFailAndDrain(failure)).containsExactly(batch);
+        window.onBatchAcked(batch);
 
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(10L);
         assertThat(replicator.terminalFailure()).isSameAs(failure);
@@ -136,7 +152,7 @@ public class IndexWindowTest {
         replicator.setWakeupSignal(() -> woke.set(true));
 
         IndexWindow window = new IndexWindow("idx", 7L, 1, replicator);
-        window.onBatchAcked();
+        window.onBatchAcked(batch(window, 0));
 
         assertThat(woke).isTrue();
     }
@@ -155,7 +171,8 @@ public class IndexWindowTest {
                             allProgress.set(all);
                         });
 
-        new IndexWindow("idx_sync", 100L, 1, replicator).onBatchAcked();
+        IndexWindow window = new IndexWindow("idx_sync", 100L, 1, replicator);
+        window.onBatchAcked(batch(window, 0));
 
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(100L);
         assertThat(replicator.getAllIndexPushedOffset()).isEqualTo(0L);
@@ -172,8 +189,10 @@ public class IndexWindowTest {
                         spec("idx_sync_b", IndexVisibility.SYNC),
                         (sync, all) -> {});
 
-        new IndexWindow("idx_sync_a", 20L, 1, replicator).onBatchAcked();
-        new IndexWindow("idx_sync_b", 10L, 1, replicator).onBatchAcked();
+        IndexWindow first = new IndexWindow("idx_sync_a", 20L, 1, replicator);
+        first.onBatchAcked(batch(first, 0));
+        IndexWindow second = new IndexWindow("idx_sync_b", 10L, 1, replicator);
+        second.onBatchAcked(batch(second, 1));
 
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(10L);
         assertThat(replicator.getAllIndexPushedOffset()).isEqualTo(10L);

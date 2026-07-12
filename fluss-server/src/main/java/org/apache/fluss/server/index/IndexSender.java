@@ -104,6 +104,8 @@ public final class IndexSender implements AutoCloseable {
 
         default void beforePutKvInvocation() {}
 
+        default void beforeFinalPutKvRegistration() {}
+
         default void beforePutKvCompletion() {}
 
         default void beforeProgressCallback() {}
@@ -868,10 +870,13 @@ public final class IndexSender implements AutoCloseable {
             boolean leadersCurrent = leadersMatch(target.serverId, requestBatches);
             List<BatchAction> actions = new ArrayList<>();
             boolean registered = false;
+            lifecycleHooks.beforeFinalPutKvRegistration();
             lifecycleLock.lock();
             try {
                 if (!targetIsCurrentLocked(target) || !leadersCurrent) {
                     invalidateTargetLocked(target);
+                    addRetryOrReleaseActionsLocked(actions, requestBatches);
+                } else if (!batchesActiveAndOwnedLocked(requestBatches)) {
                     addRetryOrReleaseActionsLocked(actions, requestBatches);
                 } else {
                     registerAsyncOperationLocked();
@@ -995,6 +1000,16 @@ public final class IndexSender implements AutoCloseable {
     private boolean targetIsCurrentLocked(TargetContext target) {
         return lifecyclePhase == LifecyclePhase.OPEN
                 && targetsByServer.get(target.serverId) == target;
+    }
+
+    private boolean batchesActiveAndOwnedLocked(List<IndexBatch> batches) {
+        for (IndexBatch batch : batches) {
+            if (!batch.ownerActive()
+                    || inFlightBatches.get(batch.targetBucket()) != batch) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void invalidateTargetLocked(TargetContext target) {
@@ -1358,6 +1373,16 @@ public final class IndexSender implements AutoCloseable {
         runAccounting(actions);
     }
 
+    private void releaseRejectedRetry(IndexBatch batch) {
+        lifecycleLock.lock();
+        try {
+            ownedBatches.remove(batch);
+        } finally {
+            lifecycleLock.unlock();
+        }
+        accumulator.release(batch);
+    }
+
     private void reEnqueueOwnedBatch(IndexBatch batch) {
         List<BatchAction> actions = new ArrayList<>();
         lifecycleLock.lock();
@@ -1436,7 +1461,7 @@ public final class IndexSender implements AutoCloseable {
                                     + retryDelayMs(batch.attempts() + 1);
                     lifecycleHooks.beforeRetryPublication();
                     if (!accumulator.reEnqueueIfActive(batch, readyAtMs)) {
-                        accumulator.release(batch);
+                        releaseRejectedRetry(batch);
                     }
                 } else {
                     accumulator.release(action.batch);
@@ -1478,7 +1503,7 @@ public final class IndexSender implements AutoCloseable {
             activeExternalCallbackDepth.set(previousDepth + 1);
             try {
                 lifecycleHooks.beforeProgressCallback();
-                action.batch.window().onBatchAcked();
+                action.batch.window().onBatchAcked(action.batch);
             } finally {
                 activeExternalCallbackDepth.set(previousDepth);
             }
@@ -1510,6 +1535,16 @@ public final class IndexSender implements AutoCloseable {
         lifecycleLock.lock();
         try {
             return outstandingAsyncOperations;
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
+    @VisibleForTesting
+    int ownedBatchCountForTesting() {
+        lifecycleLock.lock();
+        try {
+            return ownedBatches.size();
         } finally {
             lifecycleLock.unlock();
         }

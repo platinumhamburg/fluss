@@ -737,7 +737,7 @@ public class IndexReplicatorAppendTest {
 
     private static void acknowledge(IndexAccumulator accumulator, IndexBatch batch) {
         accumulator.release(batch);
-        batch.window().onBatchAcked();
+        batch.window().onBatchAcked(batch);
     }
 
     private static final class PollFixture {
