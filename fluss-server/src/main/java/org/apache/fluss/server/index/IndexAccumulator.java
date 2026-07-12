@@ -68,7 +68,7 @@ public final class IndexAccumulator {
     private final AtomicLong pendingBytes = new AtomicLong(0L);
 
     /** Pending encoded bytes grouped by the leader-side replicator that produced the batches. */
-    private final ConcurrentMap<IndexReplicator, AtomicLong> pendingBytesByReplicator =
+    private final ConcurrentMap<IndexReplicator, Long> pendingBytesByReplicator =
             MapUtils.newConcurrentMap();
 
     /** Optional callback fired on each append to promptly wake the owning sender worker. */
@@ -79,6 +79,8 @@ public final class IndexAccumulator {
      * deque and accounting locks.
      */
     @Nullable private volatile Consumer<IndexBatch> dropListener;
+
+    @Nullable private volatile Runnable afterAppendAdmissionHook;
 
     /** Creates an accumulator with no back-pressure bound (primarily for tests). */
     public IndexAccumulator() {
@@ -102,8 +104,14 @@ public final class IndexAccumulator {
         this.dropListener = dropListener;
     }
 
+    @VisibleForTesting
+    void setAfterAppendAdmissionHook(Runnable afterAppendAdmissionHook) {
+        this.afterAppendAdmissionHook = afterAppendAdmissionHook;
+    }
+
     /** Append a batch to the tail of its target bucket's queue. */
     public void append(IndexBatch batch) {
+        boolean published;
         // Publication order is window -> batch -> deque. Sender lifecycle code never acquires its
         // lifecycle lock while holding any of these monitors.
         synchronized (batch.window()) {
@@ -111,18 +119,31 @@ public final class IndexAccumulator {
                 if (!batch.ownerActive() || batch.isReleased()) {
                     return;
                 }
+                Runnable hook = afterAppendAdmissionHook;
+                if (hook != null) {
+                    hook.run();
+                }
                 Deque<IndexBatch> deque =
                         batches.computeIfAbsent(batch.targetBucket(), k -> new ArrayDeque<>());
                 synchronized (deque) {
                     deque.addLast(batch);
+                    long bytes = batch.encoded().getBytesLength();
+                    pendingBytes.addAndGet(bytes);
+                    pendingBytesByReplicator.compute(
+                            batch.window().owner(),
+                            (ignored, current) -> current == null ? bytes : current + bytes);
+                    batch.markAccounted();
+
+                    published = batch.ownerActive();
+                    if (!published) {
+                        removeExact(deque, batch);
+                        release(batch);
+                    }
                 }
-                long bytes = batch.encoded().getBytesLength();
-                pendingBytes.addAndGet(bytes);
-                pendingBytesByReplicator
-                        .computeIfAbsent(batch.window().owner(), ignored -> new AtomicLong())
-                        .addAndGet(bytes);
-                batch.markAccounted();
             }
+        }
+        if (!published) {
+            return;
         }
         Consumer<TableBucket> listener = this.appendListener;
         if (listener != null) {
@@ -155,8 +176,8 @@ public final class IndexAccumulator {
 
     /** Encoded bytes currently pending for the given producing replicator. */
     public long pendingBytes(IndexReplicator owner) {
-        AtomicLong ownerPendingBytes = pendingBytesByReplicator.get(owner);
-        return ownerPendingBytes == null ? 0L : ownerPendingBytes.get();
+        Long ownerPendingBytes = pendingBytesByReplicator.get(owner);
+        return ownerPendingBytes == null ? 0L : ownerPendingBytes;
     }
 
     @VisibleForTesting
@@ -249,15 +270,8 @@ public final class IndexAccumulator {
             return false;
         }
         synchronized (deque) {
-            Iterator<IndexBatch> iterator = deque.iterator();
-            while (iterator.hasNext()) {
-                if (iterator.next() == batch) {
-                    iterator.remove();
-                    return true;
-                }
-            }
+            return removeExact(deque, batch);
         }
-        return false;
     }
 
     /** Release pending-byte accounting for a batch that reached a terminal state. */
@@ -266,13 +280,22 @@ public final class IndexAccumulator {
             if (batch.markReleased() && batch.wasAccounted()) {
                 long bytes = batch.encoded().getBytesLength();
                 pendingBytes.addAndGet(-bytes);
-                AtomicLong ownerPendingBytes =
-                        pendingBytesByReplicator.get(batch.window().owner());
-                if (ownerPendingBytes != null) {
-                    ownerPendingBytes.addAndGet(-bytes);
-                }
+                pendingBytesByReplicator.computeIfPresent(
+                        batch.window().owner(),
+                        (ignored, current) -> current == bytes ? null : current - bytes);
             }
         }
+    }
+
+    private static boolean removeExact(Deque<IndexBatch> deque, IndexBatch batch) {
+        Iterator<IndexBatch> iterator = deque.iterator();
+        while (iterator.hasNext()) {
+            if (iterator.next() == batch) {
+                iterator.remove();
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Returns {@code true} if any bucket still has pending batches. */
@@ -320,7 +343,6 @@ public final class IndexAccumulator {
         for (IndexBatch batch : droppedBatches) {
             release(batch);
         }
-        pendingBytesByReplicator.remove(owner);
         Consumer<IndexBatch> listener = this.dropListener;
         if (listener != null) {
             List<Throwable> listenerFailures = new ArrayList<>();

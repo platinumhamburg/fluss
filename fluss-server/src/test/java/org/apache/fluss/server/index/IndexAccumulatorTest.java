@@ -215,5 +215,6 @@ public class IndexAccumulatorTest {
         assertThat(accumulator.isFull(ownerA)).isFalse();
         assertThat(accumulator.pendingBytes(ownerA)).isZero();
         assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
     }
 }

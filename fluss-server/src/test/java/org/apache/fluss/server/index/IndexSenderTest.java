@@ -1119,6 +1119,53 @@ public class IndexSenderTest {
     }
 
     @Test
+    void ownerCloseAfterAppendAdmissionDoesNotPublishOrTransferOwnership() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        TimeUnit.MINUTES.toMillis(1));
+        CountDownLatch admitted = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        AtomicInteger appendNotifications = new AtomicInteger();
+        accumulator.setAppendListener(ignored -> appendNotifications.incrementAndGet());
+        accumulator.setAfterAppendAdmissionHook(
+                () -> {
+                    admitted.countDown();
+                    awaitLatch(resume);
+                });
+        TableBucket bucket = new TableBucket(493L, 0);
+        IndexReplicator owner = owner(accumulator);
+        IndexBatch batch = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> append = executor.submit(() -> accumulator.append(batch));
+            assertThat(admitted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            owner.close();
+            assertThat(accumulator.dropForReplicator(owner)).isZero();
+            resume.countDown();
+            append.get(5, TimeUnit.SECONDS);
+
+            assertThat(accumulator.hasPending(bucket)).isFalse();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.pendingBytes(owner)).isZero();
+            assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+            assertThat(appendNotifications).hasValue(0);
+            assertThat(sender.ownedBatchCountForTesting()).isZero();
+        } finally {
+            resume.countDown();
+            executor.shutdownNow();
+            sender.close();
+        }
+    }
+
+    @Test
     void droppingPublishedRetryRelinquishesSenderOwnership() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
