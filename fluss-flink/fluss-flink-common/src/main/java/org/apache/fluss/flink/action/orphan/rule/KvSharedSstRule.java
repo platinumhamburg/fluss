@@ -57,7 +57,6 @@ public final class KvSharedSstRule implements FileRule {
             return Decision.SKIP_UNKNOWN;
         }
 
-        String fileName = file.path().getName();
         if (activeRefs.kvSharedSstFileNames().contains(fileName)) {
             return Decision.KEEP_ACTIVE;
         }
