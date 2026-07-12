@@ -54,28 +54,7 @@ class OrphanCleanConfigTest {
         assertThat(config.allowDeleteManifest()).isFalse();
         assertThat(config.allowCleanOrphanTables()).isFalse();
         assertThat(config.allowCleanOrphanPartitions()).isFalse();
-        assertThat(config.postRunWait()).isEqualTo(Duration.ZERO);
         assertThat(config.progressLogInterval()).isEqualTo(Duration.ZERO);
-    }
-
-    @Test
-    void parsesPostRunWait() {
-        assertThat(config("--all-databases", "--post-run-wait", "10m").postRunWait())
-                .isEqualTo(Duration.ofMinutes(10));
-    }
-
-    @Test
-    void rejectsNegativePostRunWait() {
-        assertThatThrownBy(() -> config("--all-databases", "--post-run-wait", "-1s"))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("--post-run-wait must be between 0ms and 1h");
-    }
-
-    @Test
-    void rejectsPostRunWaitAboveOneHour() {
-        assertThatThrownBy(() -> config("--all-databases", "--post-run-wait", "61m"))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("--post-run-wait must be between 0ms and 1h");
     }
 
     @Test

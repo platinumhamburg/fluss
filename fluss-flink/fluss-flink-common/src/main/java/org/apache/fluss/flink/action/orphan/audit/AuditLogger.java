@@ -31,6 +31,8 @@ import org.apache.fluss.fs.FsPath;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -86,7 +88,7 @@ public final class AuditLogger {
                         + " scope={} older_than_ms={} dry_run={} parallelism={}"
                         + " remote_fs_rate_limit={} allow_delete_manifest={}"
                         + " allow_clean_orphan_tables={} allow_clean_orphan_partitions={}"
-                        + " progress_log_interval_ms={} post_run_wait_ms={} ts={}",
+                        + " progress_log_interval_ms={} ts={}",
                 runId,
                 scope,
                 config.olderThanMillis(),
@@ -97,7 +99,6 @@ public final class AuditLogger {
                 config.allowCleanOrphanTables(),
                 config.allowCleanOrphanPartitions(),
                 config.progressLogInterval().toMillis(),
-                config.postRunWait().toMillis(),
                 Instant.now());
     }
 
@@ -252,7 +253,7 @@ public final class AuditLogger {
                 Instant.now());
     }
 
-    public void logScanProgress(
+    public void logScanHeartbeat(
             String runId,
             boolean dryRun,
             int subtask,
@@ -260,17 +261,44 @@ public final class AuditLogger {
             int attempt,
             long tasksCompleted,
             CleanupCounters counters,
-            long elapsedMillis) {
-        logScanCounters(
-                "scan_progress",
+            @Nullable ScopeIdentity currentScope,
+            long currentTaskElapsedMillis) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage=scan action=scan_heartbeat dry_run={}"
+                        + " subtask={} parallelism={} attempt={} tasks_completed={}"
+                        + " current_scope_kind={} current_database={} current_table={}"
+                        + " current_table_id={} current_partition_id={} current_bucket_id={}"
+                        + " current_task_elapsed_ms={} scanned_files={} planned_files={}"
+                        + " planned_dirs={} planned_bytes={} deleted_files={}"
+                        + " empty_dirs_removed={} delete_failures={} bytes_reclaimed={} ts={}",
                 runId,
                 dryRun,
                 subtask,
                 parallelism,
                 attempt,
                 tasksCompleted,
-                counters,
-                elapsedMillis);
+                currentScope == null ? "none" : lower(currentScope.kind().name()),
+                currentScope == null ? "none" : currentScope.database(),
+                currentScope == null ? "none" : currentScope.table(),
+                currentScope == null || currentScope.tableId() == null
+                        ? "none"
+                        : currentScope.tableId(),
+                currentScope == null || currentScope.partitionId() == null
+                        ? "none"
+                        : currentScope.partitionId(),
+                currentScope == null || currentScope.bucketId() == null
+                        ? "none"
+                        : currentScope.bucketId(),
+                currentTaskElapsedMillis,
+                counters.scannedFiles(),
+                counters.plannedFiles(),
+                counters.plannedDirs(),
+                counters.plannedBytes(),
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed(),
+                Instant.now());
     }
 
     public void logScanSubtaskSummary(
@@ -812,32 +840,6 @@ public final class AuditLogger {
                         + report.metadataFailures(),
                 report.global(),
                 dryRun);
-    }
-
-    public void logRetentionWaitStart(String runId, long waitMillis) {
-        AUDIT.info(
-                "audit_version=1 run_id={} stage=aggregate action=retention_wait_start"
-                        + " wait_ms={} ts={}",
-                runId,
-                waitMillis,
-                Instant.now());
-    }
-
-    public void logRetentionWaitEnd(String runId, long waitMillis) {
-        AUDIT.info(
-                "audit_version=1 run_id={} stage=aggregate action=retention_wait_end"
-                        + " wait_ms={} ts={}",
-                runId,
-                waitMillis,
-                Instant.now());
-    }
-
-    public void logRetentionWaitStart(long waitMillis) {
-        AUDIT.info("action=retention_wait_start wait_ms={} ts={}", waitMillis, Instant.now());
-    }
-
-    public void logRetentionWaitEnd(long waitMillis) {
-        AUDIT.info("action=retention_wait_end wait_ms={} ts={}", waitMillis, Instant.now());
     }
 
     private static void logCounters(

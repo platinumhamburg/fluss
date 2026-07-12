@@ -171,8 +171,9 @@ public final class ActiveRefsFetcher {
                                     RpcErrorClassifier.classify(e)
                                             != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
+            RpcErrorClassifier.Category category = RpcErrorClassifier.classify(e.getCause());
             return LogActiveRefsFetchResult.listFailed(
-                    formatRpcFailureReason(tableId, partitionId, e.getCause()));
+                    category, formatRpcFailureReason(tableId, partitionId, e.getCause()));
         }
 
         Map<Integer, List<RemoteLogManifestInfo>> entriesByBucket = new HashMap<>();
@@ -239,8 +240,9 @@ public final class ActiveRefsFetcher {
                                     RpcErrorClassifier.classify(e)
                                             != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
+            RpcErrorClassifier.Category category = RpcErrorClassifier.classify(e.getCause());
             return KvActiveRefsFetchResult.listFailed(
-                    formatRpcFailureReason(tableId, partitionId, e.getCause()));
+                    category, formatRpcFailureReason(tableId, partitionId, e.getCause()));
         }
         Map<Integer, Set<String>> dirsByBucket = new HashMap<>();
         for (Map.Entry<Integer, Set<Long>> entry :

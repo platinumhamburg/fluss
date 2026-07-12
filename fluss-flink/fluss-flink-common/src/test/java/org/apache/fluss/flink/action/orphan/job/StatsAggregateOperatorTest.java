@@ -31,26 +31,20 @@ import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.LoggerConfig;
 import org.junit.jupiter.api.Test;
 
-import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class StatsAggregateOperatorTest {
 
     @Test
-    void logsSummaryBeforeRetentionWaitAndThenEmitsTotals() throws Exception {
+    void logsSummaryAndImmediatelyEmitsTotals() throws Exception {
         List<String> events = new CopyOnWriteArrayList<String>();
         try (AuditCapture capture = new AuditCapture(events);
                 OneInputStreamOperatorTestHarness<CleanupReportInput, CleanupReport> harness =
                         new OneInputStreamOperatorTestHarness<>(
-                                new StatsAggregateOperator(
-                                        "run-1",
-                                        false,
-                                        Duration.ofMillis(5),
-                                        millis -> events.add("sleeper")))) {
+                                new StatsAggregateOperator("run-1", false))) {
             harness.open();
             ScopeIdentity orders = ScopeIdentity.table("db", "orders", 7L);
             harness.processElement(
@@ -94,12 +88,8 @@ class StatsAggregateOperatorTest {
             assertThat(result.tasksPlanned()).isEqualTo(2L);
             assertThat(result.metadataFailures()).isEqualTo(1L);
 
-            assertThat(indexOf(events, "action=summary"))
-                    .isLessThan(indexOf(events, "action=retention_wait_start"));
-            assertThat(indexOf(events, "action=retention_wait_start"))
-                    .isLessThan(events.indexOf("sleeper"));
-            assertThat(events.indexOf("sleeper"))
-                    .isLessThan(indexOf(events, "action=retention_wait_end"));
+            assertThat(indexOf(events, "action=summary")).isGreaterThanOrEqualTo(0);
+            assertThat(events).noneMatch(event -> event.contains("action=retention_wait_"));
             assertThat(events)
                     .anyMatch(
                             event ->
@@ -118,19 +108,6 @@ class StatsAggregateOperatorTest {
             assertThat(events).anyMatch(event -> event.contains("action=summary_by_reason"));
             assertThat(events).anyMatch(event -> event.contains("action=audit_integrity"));
         }
-    }
-
-    @Test
-    void zeroWaitDoesNotCallSleeper() throws Exception {
-        AtomicBoolean slept = new AtomicBoolean();
-        try (OneInputStreamOperatorTestHarness<CleanupReportInput, CleanupReport> harness =
-                new OneInputStreamOperatorTestHarness<>(
-                        new StatsAggregateOperator(
-                                "run-1", true, Duration.ZERO, millis -> slept.set(true)))) {
-            harness.open();
-            harness.endInput();
-        }
-        assertThat(slept).isFalse();
     }
 
     private static int indexOf(List<String> events, String marker) {

@@ -29,7 +29,7 @@ public enum SkipReasonCode {
     EMPTY_KV_ACTIVE_SET(SkipCategory.SAFETY_SKIP, true, false),
     UNKNOWN_FILE_TYPE(SkipCategory.SAFETY_SKIP, false, true),
     OUT_OF_SCOPE_ROOT(SkipCategory.OUT_OF_SCOPE, false, true),
-    PARTITION_NOT_EXIST(SkipCategory.EXPECTED_SKIP, false, false),
+    STALE_PARTITION(SkipCategory.EXPECTED_SKIP, false, false),
     TABLE_NOT_EXIST(SkipCategory.EXPECTED_SKIP, false, false),
     RPC_ERROR(SkipCategory.DEGRADED_SKIP, true, true),
     METADATA_READ_FAILED(SkipCategory.DEGRADED_SKIP, true, true),

@@ -27,7 +27,6 @@ import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
 import java.io.Serializable;
-import java.time.Duration;
 
 /** Per-scan-subtask pass-through operator that emits bounded cumulative audit statistics. */
 @Internal
@@ -38,30 +37,23 @@ public final class ScanProgressOperator extends AbstractStreamOperator<CleanStat
 
     private final String runId;
     private final boolean dryRun;
-    private final Duration progressInterval;
     private final SerializableLongSupplier clock;
 
     private transient AuditLogger audit;
     private transient CleanupCounters counters;
     private transient long tasksCompleted;
     private transient long startMillis;
-    private transient long lastProgressMillis;
     private transient int subtask;
     private transient int parallelism;
     private transient int attempt;
 
-    public ScanProgressOperator(String runId, boolean dryRun, Duration progressInterval) {
-        this(runId, dryRun, progressInterval, System::currentTimeMillis);
+    public ScanProgressOperator(String runId, boolean dryRun) {
+        this(runId, dryRun, System::currentTimeMillis);
     }
 
-    ScanProgressOperator(
-            String runId,
-            boolean dryRun,
-            Duration progressInterval,
-            SerializableLongSupplier clock) {
+    ScanProgressOperator(String runId, boolean dryRun, SerializableLongSupplier clock) {
         this.runId = runId;
         this.dryRun = dryRun;
-        this.progressInterval = progressInterval;
         this.clock = clock;
     }
 
@@ -72,31 +64,15 @@ public final class ScanProgressOperator extends AbstractStreamOperator<CleanStat
         counters = CleanupCounters.empty();
         tasksCompleted = 0L;
         startMillis = clock.getAsLong();
-        lastProgressMillis = startMillis;
         subtask = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
         parallelism = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         attempt = RuntimeContextAdapter.getAttemptNumber(getRuntimeContext());
-        audit.logScanStart(
-                runId, dryRun, subtask, parallelism, attempt, progressInterval.toMillis());
     }
 
     @Override
     public void processElement(StreamRecord<CleanStats> element) {
         counters = counters.add(element.getValue().counters());
         tasksCompleted++;
-        long now = clock.getAsLong();
-        if (!progressInterval.isZero() && now - lastProgressMillis >= progressInterval.toMillis()) {
-            audit.logScanProgress(
-                    runId,
-                    dryRun,
-                    subtask,
-                    parallelism,
-                    attempt,
-                    tasksCompleted,
-                    counters,
-                    now - startMillis);
-            lastProgressMillis = now;
-        }
         output.collect(element);
     }
 

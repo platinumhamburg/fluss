@@ -29,6 +29,7 @@ import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
+import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -40,6 +41,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Map;
@@ -71,15 +73,24 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     private final long remoteFsOpRateLimitPerSecond;
     private final Map<String, String> extraConfigs;
     private final String runId;
+    private final boolean dryRun;
+    private final Duration progressInterval;
 
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
+    private transient ScanHeartbeat heartbeat;
 
     public ScanAndCleanFunction(
-            long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs, String runId) {
+            long remoteFsOpRateLimitPerSecond,
+            Map<String, String> extraConfigs,
+            String runId,
+            boolean dryRun,
+            Duration progressInterval) {
         this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
         this.extraConfigs = extraConfigs;
         this.runId = runId;
+        this.dryRun = dryRun;
+        this.progressInterval = progressInterval;
     }
 
     @Override
@@ -92,6 +103,26 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         audit = new AuditLogger();
         int parallelism = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
+        int attempt = RuntimeContextAdapter.getAttemptNumber(getRuntimeContext());
+        audit.logScanStart(
+                runId, dryRun, subtaskIndex, parallelism, attempt, progressInterval.toMillis());
+        heartbeat =
+                new ScanHeartbeat(
+                        progressInterval,
+                        subtaskIndex,
+                        parallelism,
+                        attempt,
+                        snapshot ->
+                                audit.logScanHeartbeat(
+                                        runId,
+                                        dryRun,
+                                        snapshot.subtask(),
+                                        snapshot.parallelism(),
+                                        snapshot.attempt(),
+                                        snapshot.tasksCompleted(),
+                                        snapshot.counters(),
+                                        snapshot.currentScope(),
+                                        snapshot.currentTaskElapsedMillis()));
         // Distribute the configured rate as base + 1 extra for the first `remainder` subtasks.
         // Flink does not provide a cross-JVM limiter here, so this is a best-effort job-level
         // target. Each subtask gets at least 1/s; if parallelism exceeds the configured rate, the
@@ -104,11 +135,31 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     @Override
     public void processElement(CleanTask task, Context ctx, Collector<CleanStats> out)
             throws Exception {
-        if (task instanceof BucketCleanTask) {
-            out.collect(processBucketTask((BucketCleanTask) task));
-        } else if (task instanceof OrphanDirCleanTask) {
-            out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
+        heartbeat.taskStart(task.scope());
+        try {
+            CleanStats stats;
+            if (task instanceof BucketCleanTask) {
+                stats = processBucketTask((BucketCleanTask) task);
+            } else if (task instanceof OrphanDirCleanTask) {
+                stats = processOrphanDirTask((OrphanDirCleanTask) task);
+            } else {
+                heartbeat.taskFailed();
+                return;
+            }
+            heartbeat.taskComplete(stats);
+            out.collect(stats);
+        } catch (Exception e) {
+            heartbeat.taskFailed();
+            throw e;
         }
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (heartbeat != null) {
+            heartbeat.close();
+        }
+        super.close();
     }
 
     // -------------------------------------------------------------------------

@@ -54,8 +54,6 @@ public final class OrphanCleanConfig implements Serializable {
 
     private static final long DEFAULT_REMOTE_FS_OP_RATE_LIMIT_PER_SECOND = 100L;
 
-    private static final Duration MAX_POST_RUN_WAIT = Duration.ofHours(1);
-
     private static final Duration MIN_PROGRESS_LOG_INTERVAL = Duration.ofSeconds(1);
 
     private static final Duration MAX_PROGRESS_LOG_INTERVAL = Duration.ofHours(1);
@@ -71,7 +69,6 @@ public final class OrphanCleanConfig implements Serializable {
     private final boolean allowDeleteManifest;
     private final boolean allowCleanOrphanTables;
     private final boolean allowCleanOrphanPartitions;
-    private final Duration postRunWait;
     private final Duration progressLogInterval;
     private final Map<String, String> extraConfigs;
 
@@ -87,7 +84,6 @@ public final class OrphanCleanConfig implements Serializable {
             boolean allowDeleteManifest,
             boolean allowCleanOrphanTables,
             boolean allowCleanOrphanPartitions,
-            Duration postRunWait,
             Duration progressLogInterval,
             Map<String, String> extraConfigs) {
         this.bootstrapServer = bootstrapServer;
@@ -101,7 +97,6 @@ public final class OrphanCleanConfig implements Serializable {
         this.allowDeleteManifest = allowDeleteManifest;
         this.allowCleanOrphanTables = allowCleanOrphanTables;
         this.allowCleanOrphanPartitions = allowCleanOrphanPartitions;
-        this.postRunWait = postRunWait;
         this.progressLogInterval = progressLogInterval;
         this.extraConfigs = Collections.unmodifiableMap(new HashMap<>(extraConfigs));
     }
@@ -153,7 +148,6 @@ public final class OrphanCleanConfig implements Serializable {
                 allowDeleteManifest,
                 allowCleanOrphanTables,
                 allowCleanOrphanPartitions,
-                parsePostRunWait(params.get("post-run-wait")),
                 parseProgressLogInterval(params.get("progress-log-interval")),
                 parseExtraConfigs(params.getMultiParameter("conf")));
     }
@@ -177,22 +171,6 @@ public final class OrphanCleanConfig implements Serializable {
                 || duration.compareTo(MAX_PROGRESS_LOG_INTERVAL) > 0) {
             throw new IllegalArgumentException(
                     "--progress-log-interval must be 0ms or between 1s and 1h");
-        }
-        return duration;
-    }
-
-    private static Duration parsePostRunWait(@Nullable String value) {
-        if (StringUtils.isNullOrWhitespaceOnly(value)) {
-            return Duration.ZERO;
-        }
-        final Duration duration;
-        try {
-            duration = TimeUtils.parseDuration(value);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("--post-run-wait must be between 0ms and 1h", e);
-        }
-        if (duration.isNegative() || duration.compareTo(MAX_POST_RUN_WAIT) > 0) {
-            throw new IllegalArgumentException("--post-run-wait must be between 0ms and 1h");
         }
         return duration;
     }
@@ -351,11 +329,6 @@ public final class OrphanCleanConfig implements Serializable {
      */
     public boolean allowCleanOrphanPartitions() {
         return allowCleanOrphanPartitions;
-    }
-
-    /** Returns how long the final TaskManager stage remains alive after logging its summary. */
-    public Duration postRunWait() {
-        return postRunWait;
     }
 
     /** Returns how often each scan subtask emits cumulative progress; zero disables progress. */
