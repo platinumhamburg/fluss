@@ -633,7 +633,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
             // truncateFullyAndReloadSnapshots() here to avoid  deleting the newly downloaded
             // writerId snapshot file.
             log.writerStateManager().reloadSnapshots();
-            log.loadWriterSnapshot(nextFetchOffset);
+            replica.loadWriterSnapshot(nextFetchOffset);
             LOG.info(
                     "Build the writer snapshots from remote storage for {} with active "
                             + "writer size: {} and remoteLogEndOffset: {}",

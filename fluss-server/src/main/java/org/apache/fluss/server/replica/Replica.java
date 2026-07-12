@@ -458,6 +458,10 @@ public final class Replica {
         }
     }
 
+    private void retireCurrentTombstonedIndexWriters() {
+        tableInfo.getMainTableId().ifPresent(this::retireTombstonedIndexWriters);
+    }
+
     private void removeTombstonedIndexWriters(PartitionTombstone tombstone) {
         int[] skipped = {0};
         logTablet.removeFencedWriters(
@@ -672,9 +676,7 @@ public final class Replica {
             dropKv();
             // now, we can create a new kv tablet
             createKv();
-            tableInfo
-                    .getMainTableId()
-                    .ifPresent(this::retireTombstonedIndexWriters);
+            retireCurrentTombstonedIndexWriters();
             indexManager.onLeaderKvReady(
                     logTablet,
                     schemaGetter,
@@ -732,6 +734,10 @@ public final class Replica {
             // it should be from leader to follower, we need to destroy the kv tablet
             dropKv();
         }
+
+        // Recovered logs are attached before the follower role is activated. Catch up against an
+        // already-published baseline before the replica can be handed to a fetcher.
+        retireCurrentTombstonedIndexWriters();
 
         if (lakeTieringMetricGroup != null) {
             lakeTieringMetricGroup.close();
@@ -1858,14 +1864,32 @@ public final class Replica {
      * @param offset offset to be used for truncation.
      */
     public void truncateTo(long offset) throws LogStorageException {
-        inReadLock(leaderIsrUpdateLock, () -> logManager.truncateTo(tableBucket, offset));
+        inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    logManager.truncateTo(tableBucket, offset);
+                    retireCurrentTombstonedIndexWriters();
+                });
     }
 
     /** Delete all data in the local log of this bucket and start the log at the new offset. */
     public void truncateFullyAndStartAt(long newOffset) {
         inReadLock(
                 leaderIsrUpdateLock,
-                () -> logManager.truncateFullyAndStartAt(tableBucket, newOffset));
+                () -> {
+                    logManager.truncateFullyAndStartAt(tableBucket, newOffset);
+                    retireCurrentTombstonedIndexWriters();
+                });
+    }
+
+    /** Load recovered WriterState and apply follower lifecycle retirement before fetch resumes. */
+    public void loadWriterSnapshot(long lastOffset) throws IOException {
+        inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    logTablet.loadWriterSnapshot(lastOffset);
+                    retireCurrentTombstonedIndexWriters();
+                });
     }
 
     private LogReadInfo readRecords(FetchParams fetchParams, LogTablet logTablet)

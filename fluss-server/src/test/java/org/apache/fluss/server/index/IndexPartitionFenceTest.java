@@ -341,6 +341,53 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(fixture.log.writerStateManager().lastFencedEntry(malformed)).isPresent();
     }
 
+    @Test
+    void testFollowerTruncationRetiresRebuiltTombstonedWriterState() throws Exception {
+        Fixture fixture = createInitializedFixture("follower_truncation");
+        WriterKey tombstoned = writerKey(PARTITION_ID);
+        WriterKey live = writerKey(PARTITION_ID + 1);
+        WriterKey truncated = writerKey(PARTITION_ID + 2);
+        fixture.put(mutation(tombstoned, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
+        fixture.put(mutation(live, 100L, physicalRow(PARTITION_ID + 1), PARTITION_ID + 1));
+        fixture.put(
+                mutation(
+                        truncated,
+                        100L,
+                        physicalRow(PARTITION_ID + 2),
+                        PARTITION_ID + 2));
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+        makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
+
+        fixture.replica.truncateTo(2L);
+
+        assertThat(fixture.replica.getKvTablet()).isNull();
+        assertThat(fixture.log.localLogEndOffset()).isEqualTo(2L);
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(truncated)).isEmpty();
+    }
+
+    @Test
+    void testFollowerActivationRetiresRecoveredTombstonedWriterState() throws Exception {
+        Fixture fixture = createInitializedFixture("follower_activation");
+        WriterKey tombstoned = writerKey(PARTITION_ID);
+        WriterKey live = writerKey(PARTITION_ID + 1);
+        fixture.put(mutation(tombstoned, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
+        fixture.put(mutation(live, 100L, physicalRow(PARTITION_ID + 1), PARTITION_ID + 1));
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+
+        fixture.log.writerStateManager().truncateFullyAndStartAt(0L);
+        fixture.log.loadWriterSnapshot(2L);
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
+
+        makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
+
+        assertThat(fixture.replica.getKvTablet()).isNull();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
+    }
+
     @ParameterizedTest
     @MethodSource("retirementKeyOrders")
     void testRetirementSkipsUnattributableKeysAndStillRetiresValidWriter(
