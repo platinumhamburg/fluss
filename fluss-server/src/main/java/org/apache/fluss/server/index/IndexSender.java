@@ -106,6 +106,8 @@ public final class IndexSender implements AutoCloseable {
 
         default void beforeFinalPutKvRegistration() {}
 
+        default void afterFinalPutKvRegistrationDecision() {}
+
         default void beforePutKvCompletion() {}
 
         default void beforeProgressCallback() {}
@@ -886,6 +888,7 @@ public final class IndexSender implements AutoCloseable {
             } finally {
                 lifecycleLock.unlock();
             }
+            lifecycleHooks.afterFinalPutKvRegistrationDecision();
             runAccounting(actions);
             if (!registered) {
                 return;

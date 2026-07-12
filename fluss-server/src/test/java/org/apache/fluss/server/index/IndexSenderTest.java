@@ -146,6 +146,49 @@ public class IndexSenderTest {
         }
     }
 
+    private static final class FinalPutKvRegistrationHooks implements IndexSender.LifecycleHooks {
+        private final CountDownLatch beforeDecisionReached = new CountDownLatch(1);
+        private final CountDownLatch beforeDecisionRelease = new CountDownLatch(1);
+        private final CountDownLatch afterDecisionReached = new CountDownLatch(1);
+        private final CountDownLatch afterDecisionRelease = new CountDownLatch(1);
+
+        @Override
+        public void beforeFinalPutKvRegistration() {
+            await(beforeDecisionReached, beforeDecisionRelease);
+        }
+
+        @Override
+        public void afterFinalPutKvRegistrationDecision() {
+            await(afterDecisionReached, afterDecisionRelease);
+        }
+
+        private void awaitBeforeDecision() throws InterruptedException {
+            assertThat(beforeDecisionReached.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+
+        private void releaseBeforeDecision() {
+            beforeDecisionRelease.countDown();
+        }
+
+        private void awaitAfterDecision() throws InterruptedException {
+            assertThat(afterDecisionReached.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+
+        private void releaseAfterDecision() {
+            afterDecisionRelease.countDown();
+        }
+
+        private static void await(CountDownLatch reached, CountDownLatch release) {
+            reached.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
     /** Gateway that records every {@code putKv} call and lets the test control completion. */
     private static final class RecordingGateway extends TestTabletServerGateway {
         private final List<CompletableFuture<PutKvResponse>> pending = new CopyOnWriteArrayList<>();
@@ -1223,8 +1266,7 @@ public class IndexSenderTest {
         owner.registerInFlightWindow("idx", window);
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
-        BlockingLifecycleHooks hooks =
-                new BlockingLifecycleHooks(LifecyclePoint.FINAL_PUT_KV_REGISTRATION);
+        FinalPutKvRegistrationHooks hooks = new FinalPutKvRegistrationHooks();
         accumulator.append(small);
         IndexSender sender =
                 new IndexSender(
@@ -1241,24 +1283,28 @@ public class IndexSenderTest {
                         5_000L,
                         hooks);
         try {
-            hooks.awaitReached();
+            hooks.awaitBeforeDecision();
             accumulator.append(large);
             await(() -> owner.terminalFailure() != null);
-            await(() -> accumulator.pendingBytes() == 0L);
             assertThat(owner.inFlightWindow("idx")).isNull();
 
-            hooks.release();
+            hooks.releaseBeforeDecision();
+            hooks.awaitAfterDecision();
+            hooks.releaseAfterDecision();
             await(() -> sender.outstandingAsyncOperationCount() == 0);
 
             assertThat(gateway.requests).isEmpty();
             assertThat(sender.inFlightRequestCount()).isZero();
             assertThat(sender.outstandingAsyncOperationCount()).isZero();
+            assertThat(sender.ownedBatchCountForTesting()).isZero();
+            assertThat(accumulator.pendingBytes()).isZero();
             assertThat(small.attempts()).isZero();
             assertThat(large.attempts()).isZero();
             assertThat(accumulator.hasUnsent()).isFalse();
             assertThat(owner.getSyncIndexPushedOffset()).isZero();
         } finally {
-            hooks.release();
+            hooks.releaseBeforeDecision();
+            hooks.releaseAfterDecision();
             sender.close();
         }
     }
