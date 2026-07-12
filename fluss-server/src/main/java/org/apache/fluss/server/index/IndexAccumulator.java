@@ -18,16 +18,22 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.utils.MapUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
@@ -49,6 +55,8 @@ import java.util.function.Consumer;
 @Internal
 @ThreadSafe
 public final class IndexAccumulator {
+
+    private static final Logger LOG = LoggerFactory.getLogger(IndexAccumulator.class);
 
     private final ConcurrentMap<TableBucket, Deque<IndexBatch>> batches =
             MapUtils.newConcurrentMap();
@@ -149,6 +157,11 @@ public final class IndexAccumulator {
     public long pendingBytes(IndexReplicator owner) {
         AtomicLong ownerPendingBytes = pendingBytesByReplicator.get(owner);
         return ownerPendingBytes == null ? 0L : ownerPendingBytes.get();
+    }
+
+    @VisibleForTesting
+    int pendingOwnerCountForTesting() {
+        return pendingBytesByReplicator.size();
     }
 
     /** Snapshot of the buckets currently tracked. May include buckets that have just drained. */
@@ -307,13 +320,21 @@ public final class IndexAccumulator {
         for (IndexBatch batch : droppedBatches) {
             release(batch);
         }
+        pendingBytesByReplicator.remove(owner);
         Consumer<IndexBatch> listener = this.dropListener;
         if (listener != null) {
+            List<Throwable> listenerFailures = new ArrayList<>();
             for (IndexBatch batch : droppedBatches) {
-                listener.accept(batch);
+                try {
+                    listener.accept(batch);
+                } catch (Throwable t) {
+                    listenerFailures.add(t);
+                }
+            }
+            for (Throwable failure : listenerFailures) {
+                LOG.warn("Error notifying dropped index batch for replicator {}", owner, failure);
             }
         }
-        pendingBytesByReplicator.remove(owner);
         return dropped;
     }
 }

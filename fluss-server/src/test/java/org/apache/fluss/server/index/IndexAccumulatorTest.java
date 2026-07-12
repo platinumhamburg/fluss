@@ -24,10 +24,13 @@ import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 /** Unit tests for {@link IndexAccumulator} per-bucket queue, re-enqueue ordering and listener. */
 public class IndexAccumulatorTest {
@@ -152,6 +155,39 @@ public class IndexAccumulatorTest {
         assertThat(accumulator.pollFirst(otherBucket)).isNull();
         assertThat(accumulator.hasUnsent()).isFalse();
         assertThat(accumulator.pendingBytes()).isZero();
+    }
+
+    @Test
+    void dropForReplicatorContinuesAfterDropListenerFailure() {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator owner = replicator(accumulator);
+        IndexBatch first =
+                batch(new TableBucket(501L, 0), new IndexWindow("idx", 1L, 1, owner));
+        IndexBatch second =
+                batch(new TableBucket(501L, 1), new IndexWindow("idx", 2L, 1, owner));
+        accumulator.append(first);
+        accumulator.append(second);
+
+        List<IndexBatch> observed = new ArrayList<>();
+        AtomicInteger callbacks = new AtomicInteger();
+        accumulator.setDropListener(
+                batch -> {
+                    observed.add(batch);
+                    if (callbacks.getAndIncrement() == 0) {
+                        throw new RuntimeException("expected listener failure");
+                    }
+                });
+
+        AtomicInteger dropped = new AtomicInteger(-1);
+        assertThatCode(() -> dropped.set(accumulator.dropForReplicator(owner)))
+                .doesNotThrowAnyException();
+
+        assertThat(dropped.get()).isEqualTo(2);
+        assertThat(observed).containsExactlyInAnyOrder(first, second);
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(owner)).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
     }
 
     @Test
