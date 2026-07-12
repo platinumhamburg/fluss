@@ -66,6 +66,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ScheduledFuture;
 import java.util.function.Predicate;
@@ -87,6 +88,7 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 public final class LogTablet {
 
     private static final Logger LOG = LoggerFactory.getLogger(LogTablet.class);
+    private static final Predicate<WriterKey> RETAIN_ALL_FENCED_WRITERS = ignored -> true;
 
     // Configured local storage root that owns this tablet, for example /data-0.
     private final File dataDir;
@@ -454,12 +456,21 @@ public final class LogTablet {
      * Leader Epochs.
      */
     public LogAppendInfo appendAsLeader(MemoryLogRecords records) throws Exception {
-        return append(records, true);
+        return append(records, true, RETAIN_ALL_FENCED_WRITERS);
     }
 
     /** Append this message set to the active segment of the local log without assigning offsets. */
     public LogAppendInfo appendAsFollower(MemoryLogRecords records) throws Exception {
-        return append(records, false);
+        return appendAsFollower(records, RETAIN_ALL_FENCED_WRITERS);
+    }
+
+    /**
+     * Append this message set as a follower and retain matching V1 WriterState after the WAL append.
+     */
+    public LogAppendInfo appendAsFollower(
+            MemoryLogRecords records, Predicate<WriterKey> retainFencedWriterState)
+            throws Exception {
+        return append(records, false, Objects.requireNonNull(retainFencedWriterState));
     }
 
     /** Read messages from the local log without projection or filter. */
@@ -756,7 +767,10 @@ public final class LogTablet {
      * if the appendAsLeader=false flag is passed we will only check that the existing offsets are
      * valid.
      */
-    private LogAppendInfo append(MemoryLogRecords records, boolean appendAsLeader)
+    private LogAppendInfo append(
+            MemoryLogRecords records,
+            boolean appendAsLeader,
+            Predicate<WriterKey> retainFencedWriterState)
             throws Exception {
         LogAppendInfo appendInfo = analyzeAndValidateRecords(records);
 
@@ -853,7 +867,9 @@ public final class LogTablet {
             appendFaultInjector.inject(AppendPhase.AFTER_LOCAL_APPEND);
             updateHighWatermarkWithLogEndOffset();
             updatedWriters.forEach(writerStateManager::update);
-            updatedFencedWriters.forEach(writerStateManager::updateFenced);
+            updatedFencedWriters.stream()
+                    .filter(update -> retainFencedWriterState.test(update.writerKey()))
+                    .forEach(writerStateManager::updateFenced);
             if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
                 appendFaultInjector.inject(AppendPhase.AFTER_WRITER_STATE_UPDATE);
             }

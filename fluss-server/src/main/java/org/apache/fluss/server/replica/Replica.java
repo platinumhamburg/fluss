@@ -54,6 +54,7 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
@@ -1266,7 +1267,27 @@ public final class Replica {
 
     public LogAppendInfo appendRecordsToFollower(MemoryLogRecords memoryLogRecords)
             throws Exception {
-        return logTablet.appendAsFollower(memoryLogRecords);
+        return logTablet.appendAsFollower(
+                memoryLogRecords, this::retainFollowerFencedWriterState);
+    }
+
+    private boolean retainFollowerFencedWriterState(WriterKey writerKey) {
+        if (!tableInfo.isIndexTable() || !tableInfo.getMainTableId().isPresent()) {
+            return true;
+        }
+        Optional<PartitionTombstone> tombstone =
+                metadataCache.getInitializedPartitionTombstone(
+                        tableInfo.getMainTableId().getAsLong());
+        if (!tombstone.isPresent() || tombstone.get().isEmpty()) {
+            return true;
+        }
+        try {
+            OptionalLong partitionId = IndexWriterKey.decode(writerKey).getPartitionId();
+            return !partitionId.isPresent()
+                    || !tombstone.get().isTombstoned(partitionId.getAsLong());
+        } catch (IllegalArgumentException e) {
+            return true;
+        }
     }
 
     public LogAppendInfo putRecordsToLeader(

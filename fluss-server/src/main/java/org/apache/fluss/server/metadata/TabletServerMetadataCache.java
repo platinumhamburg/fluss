@@ -262,7 +262,7 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                 bucketMetadataMapForTables.remove(removedTableId);
                                 removePartitionTombstone(removedTableId);
                             }
-                        } else if (tablePath == DELETED_TABLE_PATH) {
+                        } else if (DELETED_TABLE_PATH.equals(tablePath)) {
                             serverMetadataSnapshot
                                     .getTablePath(tableId)
                                     .ifPresent(tableIdByPath::remove);
@@ -338,9 +338,8 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                     bucketMetadataMapForTables,
                                     bucketMetadataMapForPartitions);
 
-                    // 5. apply partition tombstones (partial update). Delegated to
-                    // updatePartitionTombstone so the remove-on-EMPTY semantics is shared
-                    // with the direct-write entry point used by tests.
+                    // 5. apply authoritative partition tombstones (partial update). Delegated to
+                    // updatePartitionTombstone so version handling is shared with direct updates.
                     Map<Long, PartitionTombstone> incomingTombstones =
                             clusterMetadata.getPartitionTombstones();
                     if (incomingTombstones != null && !incomingTombstones.isEmpty()) {

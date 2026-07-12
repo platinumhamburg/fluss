@@ -27,9 +27,13 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.DefaultLogRecordBatch;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.MemoryLogRecordsCompactedBuilder;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.aligned.AlignedRow;
@@ -279,6 +283,62 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         assertThat(fixture.replica.getKvTablet()).isNotNull();
         assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+    }
+
+    @Test
+    void testLateTombstonedFollowerAppendAdvancesWalWithoutPublishingWriterState()
+            throws Exception {
+        Fixture fixture = createInitializedFixture("late_follower_tombstone");
+        WriterKey writerKey = writerKey(PARTITION_ID);
+        makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
+
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+        fixture.replica.appendRecordsToFollower(followerWal(writerKey, 100L, 0L));
+
+        assertThat(fixture.replica.getKvTablet()).isNull();
+        assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+    }
+
+    @Test
+    void testFollowerAppendPublishesNonTombstonedWriterState() throws Exception {
+        Fixture fixture = createInitializedFixture("live_follower_partition");
+        WriterKey liveWriter = writerKey(PARTITION_ID + 1);
+        makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
+
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+        fixture.replica.appendRecordsToFollower(followerWal(liveWriter, 100L, 0L));
+
+        assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(liveWriter)).isPresent();
+    }
+
+    @Test
+    void testFollowerAppendPublishesWriterStateWhenBaselineUnknown() throws Exception {
+        Fixture fixture = createFixture("unknown_follower_baseline");
+        WriterKey writerKey = writerKey(PARTITION_ID);
+        makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
+
+        fixture.replica.appendRecordsToFollower(followerWal(writerKey, 100L, 0L));
+
+        assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+    }
+
+    @Test
+    void testFollowerAppendPublishesUnattributableWriterState() throws Exception {
+        Fixture fixture = createInitializedFixture("unattributable_follower_writer");
+        WriterKey unpartitioned = IndexWriterKey.encode(new TableBucket(MAIN_TABLE_ID, 0));
+        WriterKey malformed = new WriterKey(0L, 1L << 40);
+        makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
+
+        publishThroughReplicaManager(tombstone(PARTITION_ID));
+        fixture.replica.appendRecordsToFollower(followerWal(unpartitioned, 100L, 0L));
+        fixture.replica.appendRecordsToFollower(followerWal(malformed, 100L, 1L));
+
+        assertThat(fixture.log.localLogEndOffset()).isEqualTo(2L);
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(unpartitioned)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastFencedEntry(malformed)).isPresent();
     }
 
     @ParameterizedTest
@@ -588,6 +648,24 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                         bytes.length - FENCED_KV_SCHEMA_ID_OFFSET);
         littleEndian.putInt(FENCED_KV_CRC_OFFSET, (int) crc);
         return KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
+    }
+
+    private static MemoryLogRecords followerWal(
+            WriterKey writerKey, long sequence, long baseOffset) throws Exception {
+        MemoryLogRecordsCompactedBuilder builder =
+                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                        SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
+        builder.setFencedWriterState(writerKey, sequence);
+        builder.close();
+        MemoryLogRecords records =
+                MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
+        long offset = baseOffset;
+        for (LogRecordBatch batch : records.batches()) {
+            DefaultLogRecordBatch mutable = (DefaultLogRecordBatch) batch;
+            mutable.setBaseLogOffset(offset++);
+            mutable.setCommitTimestamp(1_000L + offset);
+        }
+        return records;
     }
 
     private static void putWriterState(LogTablet logTablet, WriterKey writerKey, long sequence) {
