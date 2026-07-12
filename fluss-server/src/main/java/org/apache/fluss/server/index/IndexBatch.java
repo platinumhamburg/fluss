@@ -54,6 +54,7 @@ final class IndexBatch {
 
     /** One-shot guard ensuring pending-byte accounting is released at most once. */
     private final AtomicBoolean released = new AtomicBoolean(false);
+    private boolean accounted;
 
     IndexBatch(TableBucket targetBucket, BytesView encoded, IndexWindow window) {
         this.targetBucket = checkNotNull(targetBucket, "targetBucket");
@@ -61,6 +62,8 @@ final class IndexBatch {
         this.window = checkNotNull(window, "window");
         this.attempts = 0;
         this.readyAtMs = 0L;
+        this.accounted = false;
+        window.register(this);
     }
 
     TableBucket targetBucket() {
@@ -99,11 +102,23 @@ final class IndexBatch {
         return acked.compareAndSet(false, true);
     }
 
-    boolean ownerClosed() {
-        return window.owner().isClosed();
+    boolean ownerActive() {
+        return window.isActive() && !window.owner().isClosed();
     }
 
     boolean markReleased() {
         return released.compareAndSet(false, true);
+    }
+
+    boolean isReleased() {
+        return released.get();
+    }
+
+    void markAccounted() {
+        accounted = true;
+    }
+
+    boolean wasAccounted() {
+        return accounted;
     }
 }

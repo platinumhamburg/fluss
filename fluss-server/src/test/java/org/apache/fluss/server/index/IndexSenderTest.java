@@ -890,9 +890,269 @@ public class IndexSenderTest {
         }
     }
 
+    @Test
+    void oversizedSingletonFailsBeforeUnresolvedLeaderAndReleasesQueuedSibling()
+            throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        TableBucket largeBucket = new TableBucket(45L, 0);
+        TableBucket siblingBucket = new TableBucket(45L, 1);
+        IndexReplicator owner = owner(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch large = batchOfSize(largeBucket, window, 128);
+        IndexBatch sibling = batchOfSize(siblingBucket, window, 1);
+        long hardLimit = exactRequestBytes(siblingBucket, sibling);
+        AtomicInteger leaderResolutions = new AtomicInteger();
+        AtomicInteger gatewayCreations = new AtomicInteger();
+        accumulator.append(large);
+        accumulator.append(sibling);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, targetBucket) -> {
+                            leaderResolutions.incrementAndGet();
+                            return OptionalInt.empty();
+                        },
+                        serverId -> {
+                            gatewayCreations.incrementAndGet();
+                            return new RecordingGateway();
+                        },
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        hardLimit,
+                        5_000L,
+                        IndexSender.LifecycleHooks.NO_OP);
+        try {
+            await(() -> owner.terminalFailure() != null);
+            await(() -> accumulator.pendingBytes() == 0L);
+
+            assertThat(owner.terminalFailure()).isInstanceOf(RecordTooLargeException.class);
+            assertThat(leaderResolutions).hasValue(0);
+            assertThat(gatewayCreations).hasValue(0);
+            assertThat(large.attempts()).isZero();
+            assertThat(sibling.attempts()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void oversizedSingletonFailsBeforeIncompatibleCapabilityProbe() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.putKvMaxVersion = 1;
+        TableBucket bucket = new TableBucket(46L, 0);
+        IndexReplicator owner = owner(accumulator);
+        IndexBatch batch = batchOfSize(bucket, new IndexWindow("idx", 10L, 1, owner), 64);
+        accumulator.append(batch);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, targetBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        exactRequestBytes(bucket, batch) - 1,
+                        5_000L,
+                        IndexSender.LifecycleHooks.NO_OP);
+        try {
+            await(() -> owner.terminalFailure() != null);
+
+            assertThat(gateway.apiVersionsCalls).isZero();
+            assertThat(gateway.requests).isEmpty();
+            assertThat(batch.attempts()).isZero();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void oversizedSiblingCancelsInFlightBatchAndIgnoresLateCompletion() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        TableBucket smallBucket = new TableBucket(47L, 0);
+        TableBucket largeBucket = new TableBucket(47L, 1);
+        IndexReplicator owner = owner(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch small = batchOfSize(smallBucket, window, 1);
+        IndexBatch large = batchOfSize(largeBucket, window, 128);
+        long hardLimit = exactRequestBytes(smallBucket, small);
+        accumulator.append(small);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, targetBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        hardLimit,
+                        5_000L,
+                        IndexSender.LifecycleHooks.NO_OP);
+        try {
+            await(() -> gateway.requests.size() == 1);
+            accumulator.append(large);
+            await(() -> owner.terminalFailure() != null);
+            await(() -> sender.inFlightRequestCount() == 0);
+
+            completePutKv(gateway, 0, true);
+            await(() -> accumulator.pendingBytes() == 0L);
+
+            assertThat(owner.getSyncIndexPushedOffset()).isZero();
+            assertThat(gateway.requests).hasSize(1);
+            assertThat(small.attempts()).isZero();
+            assertThat(large.attempts()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void oversizedSiblingStopsRequestPausedBeforeRpcRegistration() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        long tableId = 48L;
+        int smallBucketId = 0;
+        int largeBucketId = 1;
+        while (Math.floorMod(new TableBucket(tableId, smallBucketId).hashCode(), 2)
+                == Math.floorMod(new TableBucket(tableId, largeBucketId).hashCode(), 2)) {
+            largeBucketId++;
+        }
+        TableBucket smallBucket = new TableBucket(tableId, smallBucketId);
+        TableBucket largeBucket = new TableBucket(tableId, largeBucketId);
+        IndexReplicator owner = owner(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch small = batchOfSize(smallBucket, window, 1);
+        IndexBatch large = batchOfSize(largeBucket, window, 128);
+        BlockingLifecycleHooks hooks =
+                new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
+        accumulator.append(small);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        2,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        exactRequestBytes(smallBucket, small),
+                        5_000L,
+                        hooks);
+        try {
+            hooks.awaitReached();
+            accumulator.append(large);
+            await(() -> owner.terminalFailure() != null);
+            hooks.release();
+            await(() -> sender.inFlightRequestCount() == 0);
+
+            assertThat(gateway.requests).isEmpty();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(owner.getSyncIndexPushedOffset()).isZero();
+        } finally {
+            hooks.release();
+            sender.close();
+        }
+    }
+
+    @Test
+    void exactSizerMatchesGeneratedCodecForLargeVarintWidths() {
+        long tableId = Long.MAX_VALUE;
+        int bucketId = Integer.MAX_VALUE;
+        IndexSender.RequestSizeAccumulator size =
+                IndexSender.newRequestSizeAccumulator(tableId, 5_000L);
+        size.addBucket(bucketId, 17L);
+        PutKvRequest request =
+                new PutKvRequest()
+                        .setTableId(tableId)
+                        .setAcks(-1)
+                        .setTimeoutMs(5_000)
+                        .setAggMode(MergeMode.OVERWRITE.getProtoValue());
+        request.addBucketsReq()
+                .setBucketId(bucketId)
+                .setRecordsBytesView(
+                        new MemorySegmentBytesView(MemorySegment.wrap(new byte[17]), 0, 17));
+
+        assertThat(size.framedBytes()).isEqualTo(IndexSender.serializedRequestSize(request));
+        assertThat(size.codecRepresentable()).isTrue();
+    }
+
+    @Test
+    void exactSizerRejectsCodecCeilingAndLongArithmeticOverflow() {
+        long low = 0L;
+        long high = Integer.MAX_VALUE;
+        while (low < high) {
+            long candidateLength = low + (high - low + 1L) / 2L;
+            IndexSender.RequestSizeAccumulator candidate =
+                    IndexSender.newRequestSizeAccumulator(1L, 5_000L);
+            candidate.addBucket(0, candidateLength);
+            if (candidate.codecRepresentable()) {
+                low = candidateLength;
+            } else {
+                high = candidateLength - 1L;
+            }
+        }
+        IndexSender.RequestSizeAccumulator atCodecCeiling =
+                IndexSender.newRequestSizeAccumulator(1L, 5_000L);
+        atCodecCeiling.addBucket(0, low);
+        IndexSender.RequestSizeAccumulator aboveCodecCeiling =
+                IndexSender.newRequestSizeAccumulator(1L, 5_000L);
+        aboveCodecCeiling.addBucket(0, low + 1L);
+        assertThat(atCodecCeiling.codecRepresentable()).isTrue();
+        assertThat(atCodecCeiling.framedBytes()).isLessThanOrEqualTo(Integer.MAX_VALUE);
+        assertThat(aboveCodecCeiling.codecRepresentable()).isFalse();
+
+        IndexSender.RequestSizeAccumulator codecCeiling =
+                IndexSender.newRequestSizeAccumulator(1L, 5_000L);
+        codecCeiling.addBucket(0, Integer.MAX_VALUE);
+        assertThat(codecCeiling.arithmeticOverflow()).isFalse();
+        assertThat(codecCeiling.codecRepresentable()).isFalse();
+
+        IndexSender.RequestSizeAccumulator overflow =
+                IndexSender.newRequestSizeAccumulator(1L, 5_000L);
+        overflow.addBucket(0, Long.MAX_VALUE);
+        assertThat(overflow.arithmeticOverflow()).isTrue();
+        assertThat(overflow.codecRepresentable()).isFalse();
+    }
+
+    @Test
+    void manySmallBucketsUseOneIncrementalSizingContributionEach() {
+        int bucketCount = 10_000;
+        IndexSender.RequestSizeAccumulator size =
+                IndexSender.newRequestSizeAccumulator(1L, 5_000L);
+        for (int bucket = 0; bucket < bucketCount; bucket++) {
+            size.addBucket(bucket, 1L);
+        }
+
+        assertThat(size.bucketCount()).isEqualTo(bucketCount);
+        assertThat(size.sizingOperations()).isEqualTo(bucketCount);
+        assertThat(size.codecRepresentable()).isTrue();
+    }
+
     private static IndexBatch batch(TableBucket targetBucket, IndexWindow window) {
         byte[] bytes = new byte[] {1, 2, 3};
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length);
+        return new IndexBatch(targetBucket, encoded, window);
+    }
+
+    private static IndexBatch batchOfSize(
+            TableBucket targetBucket, IndexWindow window, int size) {
+        byte[] bytes = new byte[size];
+        BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, size);
         return new IndexBatch(targetBucket, encoded, window);
     }
 

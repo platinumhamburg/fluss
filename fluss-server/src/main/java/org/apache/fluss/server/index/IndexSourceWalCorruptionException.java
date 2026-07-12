@@ -25,4 +25,8 @@ final class IndexSourceWalCorruptionException extends RuntimeException {
     IndexSourceWalCorruptionException(String message) {
         super(message);
     }
+
+    IndexSourceWalCorruptionException(String message, Throwable cause) {
+        super(message, cause);
+    }
 }

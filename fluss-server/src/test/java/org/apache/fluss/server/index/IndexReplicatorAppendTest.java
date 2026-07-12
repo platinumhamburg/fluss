@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
@@ -54,10 +55,14 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -363,6 +368,112 @@ public class IndexReplicatorAppendTest {
         assertThat(replicator.poll()).isTrue();
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(1L);
         assertThat(sourceWal.readOffsets).containsExactly(0L);
+        verify(batch).ensureValid();
+    }
+
+    @Test
+    void corruptEmptySourceBatchFailsBeforeIterationOrAdvance() throws Exception {
+        assertIntegrityFailureFailsClosed(Collections.emptyList());
+    }
+
+    @Test
+    void corruptNonEmptySourceBatchFailsBeforeIterationOrAdvance() throws Exception {
+        assertIntegrityFailureFailsClosed(
+                Collections.singletonList(record(0L, ChangeType.INSERT, row(1L, 10L, 100L))));
+    }
+
+    @Test
+    void eachSourceRowIsEncodedOnceWithoutTemporaryBucketBuilders() throws Exception {
+        AtomicInteger encodes = new AtomicInteger();
+        IndexSpec delegate = spec();
+        IndexSpec countingSpec =
+                new IndexSpec(
+                        delegate.getIndexName(),
+                        delegate.getVisibility(),
+                        delegate.getIndexTableId(),
+                        delegate.getIndexSchemaId(),
+                        delegate.getIndexKvFormat(),
+                        delegate.getIdxColumnIndices(),
+                        row -> {
+                            encodes.incrementAndGet();
+                            return delegate.encodeEntry(row);
+                        });
+        PollFixture fixture =
+                pollFixture(
+                        0L,
+                        1024,
+                        countingSpec,
+                        Collections.singletonList(
+                                Arrays.asList(
+                                        record(0L, ChangeType.INSERT, row(1L, 10L, 100L)),
+                                        record(1L, ChangeType.INSERT, row(2L, 20L, 100L)))));
+
+        assertThat(fixture.replicator.poll()).isTrue();
+
+        assertThat(encodes).hasValue(2);
+        assertThat(fixture.accumulator.buckets()).hasSize(1);
+    }
+
+    @Test
+    void capturesOldUpdateMetadataBeforeAdvancingReusableSourceIterator() throws Exception {
+        GenericRow reusedOldRow = row(1L, 10L, 100L);
+        LogRecord before = record(0L, ChangeType.UPDATE_BEFORE, reusedOldRow);
+        LogRecord after = record(1L, ChangeType.UPDATE_AFTER, row(1L, 11L, 100L));
+        LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        LogRecordBatch batch = mock(LogRecordBatch.class);
+        when(batch.baseLogOffset()).thenReturn(0L);
+        when(batch.nextLogOffset()).thenReturn(2L);
+        when(batch.records(readContext))
+                .thenAnswer(
+                        ignored ->
+                                CloseableIterator.wrap(
+                                        new Iterator<LogRecord>() {
+                                            private int next;
+
+                                            @Override
+                                            public boolean hasNext() {
+                                                return next < 2;
+                                            }
+
+                                            @Override
+                                            public LogRecord next() {
+                                                if (next++ == 0) {
+                                                    return before;
+                                                }
+                                                reusedOldRow.setField(0, 999L);
+                                                reusedOldRow.setField(1, 99L);
+                                                return after;
+                                            }
+                                        }));
+        LogRecords records = mock(LogRecords.class);
+        when(records.batches()).thenReturn(Collections.singletonList(batch));
+        TestingSourceWal sourceWal = new TestingSourceWal(2L, records);
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator replicator =
+                IndexReplicator.forTesting(
+                        sourceWal,
+                        Collections.singletonList(spec()),
+                        accumulator,
+                        readContext,
+                        0L,
+                        1024,
+                        1024,
+                        (sync, all) -> {});
+
+        assertThat(replicator.poll()).isTrue();
+
+        KvRecord delete =
+                onlyRecords(
+                                accumulator
+                                        .pollFirst(new TableBucket(INDEX_TABLE_ID, 0))
+                                        .encoded())
+                        .get(0);
+        byte[] expectedOldKey =
+                new CompactedKeyEncoder(
+                                RowType.of(DataTypes.BIGINT(), DataTypes.BIGINT()),
+                                new int[] {0, 1})
+                        .encodeKey(GenericRow.of(10L, 1L));
+        assertThat(delete.getKey()).isEqualTo(ByteBuffer.wrap(expectedOldKey));
     }
 
     @Test
@@ -494,8 +605,53 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.sourceWal.readOffsets).containsExactly(initialOffset);
     }
 
+    private static void assertIntegrityFailureFailsClosed(List<LogRecord> sourceBatch)
+            throws Exception {
+        LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        LogRecordBatch batch = mock(LogRecordBatch.class);
+        when(batch.baseLogOffset()).thenReturn(0L);
+        when(batch.nextLogOffset()).thenReturn(1L);
+        when(batch.records(readContext))
+                .thenAnswer(
+                        ignored ->
+                                CloseableIterator.wrap(new ArrayList<>(sourceBatch).iterator()));
+        doThrow(new CorruptRecordException("injected crc failure")).when(batch).ensureValid();
+        LogRecords records = mock(LogRecords.class);
+        when(records.batches()).thenReturn(Collections.singletonList(batch));
+        TestingSourceWal sourceWal = new TestingSourceWal(1L, records);
+        IndexReplicator replicator =
+                IndexReplicator.forTesting(
+                        sourceWal,
+                        Collections.singletonList(spec()),
+                        new IndexAccumulator(),
+                        readContext,
+                        0L,
+                        1024,
+                        1024,
+                        (sync, all) -> {});
+
+        assertThatThrownBy(replicator::poll)
+                .isInstanceOf(IndexSourceWalCorruptionException.class)
+                .hasCauseInstanceOf(CorruptRecordException.class);
+        assertThat(replicator.getSyncIndexPushedOffset()).isZero();
+        assertThat(replicator.terminalFailure())
+                .isInstanceOf(IndexSourceWalCorruptionException.class);
+        verify(batch, never()).records(readContext);
+        verify(batch, never()).nextLogOffset();
+        assertThat(replicator.poll()).isFalse();
+    }
+
     private static PollFixture pollFixture(
             long initialOffset, int preferredMaxRequestBytes, List<List<LogRecord>> sourceBatches)
+            throws Exception {
+        return pollFixture(initialOffset, preferredMaxRequestBytes, spec(), sourceBatches);
+    }
+
+    private static PollFixture pollFixture(
+            long initialOffset,
+            int preferredMaxRequestBytes,
+            IndexSpec spec,
+            List<List<LogRecord>> sourceBatches)
             throws Exception {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
         LogRecords logRecords = mock(LogRecords.class);
@@ -521,7 +677,7 @@ public class IndexReplicatorAppendTest {
         IndexReplicator replicator =
                 IndexReplicator.forTesting(
                         sourceWal,
-                        Collections.singletonList(spec()),
+                        Collections.singletonList(spec),
                         accumulator,
                         readContext,
                         initialOffset,
@@ -533,6 +689,18 @@ public class IndexReplicatorAppendTest {
 
     private static KvRecordBatch decode(IndexBatch batch) {
         return KvRecordBatchReader.pointToByteBuffer(batch.encoded().getByteBuf().nioBuffer());
+    }
+
+    private static List<KvRecord> onlyRecords(BytesView encoded) {
+        KvRecordBatch batch =
+                KvRecordBatchReader.pointToByteBuffer(encoded.getByteBuf().nioBuffer());
+        List<KvRecord> records = new ArrayList<>();
+        batch.records(
+                        KvRecordReadContext.createReadContext(
+                                KvFormat.COMPACTED,
+                                new TestingSchemaGetter(INDEX_SCHEMA_ID, INDEX_SCHEMA)))
+                .forEach(records::add);
+        return records;
     }
 
     private static void acknowledge(IndexAccumulator accumulator, IndexBatch batch) {

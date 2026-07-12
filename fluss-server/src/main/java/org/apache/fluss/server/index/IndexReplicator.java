@@ -251,24 +251,27 @@ public final class IndexReplicator implements AutoCloseable {
         LogRecords records = fetchData.getRecords();
         Map<TableBucket, BucketBatchBuilder> builders = new HashMap<>();
         long lastProcessedOffset = state.pushedOffset;
+        long currentWindowEncodedSize = 0L;
         boolean windowFull = false;
         for (LogRecordBatch batch : records.batches()) {
+            validateSourceBatch(batch);
             try (CloseableIterator<LogRecord> iter = batch.records(readContext)) {
                 while (iter.hasNext()) {
                     LogRecord record = iter.next();
                     if (record.logOffset() < readOffset) {
                         continue;
                     }
-                    MutationGroup group = readMutationGroup(iter, record);
-                    Map<TableBucket, BucketBatchBuilder> staged = new HashMap<>();
-                    appendMutationGroup(state.spec, group, staged);
-                    long projectedSize = projectedEncodedSize(builders, staged);
+                    MutationGroup group = readMutationGroup(state.spec, iter, record);
+                    MutationPlan plan = deriveMutationPlan(state.spec, group);
+                    long groupEncodedDelta = plan.encodedDelta(builders);
+                    long projectedSize = saturatedAdd(currentWindowEncodedSize, groupEncodedDelta);
                     if (lastProcessedOffset > state.pushedOffset
                             && projectedSize > preferredMaxRequestBytes) {
                         windowFull = true;
                         break;
                     }
-                    appendMutationGroup(state.spec, group, builders);
+                    plan.appendTo(state.spec, builders);
+                    currentWindowEncodedSize = projectedSize;
                     lastProcessedOffset = group.endOffset;
                 }
             }
@@ -319,10 +322,22 @@ public final class IndexReplicator implements AutoCloseable {
                 new IndexWindow(
                         state.spec.getIndexName(), lastProcessedOffset, encoded.size(), this);
         state.inFlightWindow = window;
+        List<IndexBatch> batches = new ArrayList<>(encoded.size());
         for (Map.Entry<TableBucket, BytesView> entry : encoded.entrySet()) {
-            accumulator.append(new IndexBatch(entry.getKey(), entry.getValue(), window));
+            batches.add(new IndexBatch(entry.getKey(), entry.getValue(), window));
+        }
+        for (IndexBatch batch : batches) {
+            accumulator.append(batch);
         }
         return true;
+    }
+
+    private void validateSourceBatch(LogRecordBatch batch) {
+        try {
+            batch.ensureValid();
+        } catch (RuntimeException failure) {
+            throw corruption("record batch failed integrity validation", failure);
+        }
     }
 
     private void advanceOnEmptyWindow(IndexProgressState state, long windowEndOffset) {
@@ -381,7 +396,8 @@ public final class IndexReplicator implements AutoCloseable {
         return terminalFailure.get();
     }
 
-    private MutationGroup readMutationGroup(CloseableIterator<LogRecord> records, LogRecord first) {
+    private MutationGroup readMutationGroup(
+            IndexSpec spec, CloseableIterator<LogRecord> records, LogRecord first) {
         ChangeType changeType = first.getChangeType();
         if (changeType == ChangeType.UPDATE_AFTER) {
             throw corruption(
@@ -390,8 +406,9 @@ public final class IndexReplicator implements AutoCloseable {
                             + " has no adjacent UPDATE_BEFORE in the same source batch");
         }
         if (changeType != ChangeType.UPDATE_BEFORE) {
-            return MutationGroup.single(first);
+            return MutationGroup.single(spec, first);
         }
+        OldIndexEntry oldEntry = OldIndexEntry.from(spec, first.getRow());
         if (!records.hasNext()) {
             throw corruption(
                     "UPDATE_BEFORE at offset "
@@ -406,7 +423,7 @@ public final class IndexReplicator implements AutoCloseable {
                             + first.logOffset()
                             + " is not followed by adjacent UPDATE_AFTER in the same source batch");
         }
-        return MutationGroup.update(first, after);
+        return MutationGroup.update(oldEntry, after);
     }
 
     private IndexSourceWalCorruptionException corruption(String message) {
@@ -417,38 +434,21 @@ public final class IndexReplicator implements AutoCloseable {
         return failure;
     }
 
-    private void appendMutationGroup(
-            IndexSpec spec, MutationGroup group, Map<TableBucket, BucketBatchBuilder> builders) {
-        switch (group.changeType) {
-            case INSERT:
-                appendOneSpec(spec, (InternalRow) null, group.newRow, builders);
-                break;
-            case UPDATE_BEFORE:
-                appendOneSpec(spec, group.oldRow, group.newRow, builders);
-                break;
-            case DELETE:
-                appendOneSpec(spec, group.oldRow, null, builders);
-                break;
-            default:
-                // Other complete mutation types do not project into secondary-index KV writes.
-        }
+    private IndexSourceWalCorruptionException corruption(String message, Throwable cause) {
+        IndexSourceWalCorruptionException failure =
+                new IndexSourceWalCorruptionException(
+                        "Corrupt source WAL for " + sourceWal.tableBucket() + ": " + message,
+                        cause);
+        terminalFailure.compareAndSet(null, failure);
+        return failure;
     }
 
-    private long projectedEncodedSize(
-            Map<TableBucket, BucketBatchBuilder> builders,
-            Map<TableBucket, BucketBatchBuilder> staged) {
-        long projected = 0L;
-        for (BucketBatchBuilder builder : builders.values()) {
-            projected += builder.encodedSize();
+    private static long saturatedAdd(long left, long right) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException ignored) {
+            return Long.MAX_VALUE;
         }
-        for (Map.Entry<TableBucket, BucketBatchBuilder> entry : staged.entrySet()) {
-            BucketBatchBuilder current = builders.get(entry.getKey());
-            projected +=
-                    current == null
-                            ? entry.getValue().encodedSize()
-                            : entry.getValue().payloadSize();
-        }
-        return projected;
     }
 
     @VisibleForTesting
@@ -457,14 +457,26 @@ public final class IndexReplicator implements AutoCloseable {
             @Nullable InternalRow oldRow,
             @Nullable InternalRow newRow,
             Map<TableBucket, BucketBatchBuilder> builders) {
-        return appendOneSpec(spec, OldIndexEntry.fromNullable(spec, oldRow), newRow, builders);
+        MutationPlan plan =
+                deriveMutationPlan(spec, OldIndexEntry.fromNullable(spec, oldRow), newRow);
+        plan.appendTo(spec, builders);
+        return plan.operationCount();
     }
 
-    private int appendOneSpec(
-            IndexSpec spec,
-            OldIndexEntry oldEntry,
-            @Nullable InternalRow newRow,
-            Map<TableBucket, BucketBatchBuilder> builders) {
+    private MutationPlan deriveMutationPlan(IndexSpec spec, MutationGroup group) {
+        switch (group.changeType) {
+            case INSERT:
+            case UPDATE_BEFORE:
+                return deriveMutationPlan(spec, group.oldEntry, group.newRow);
+            case DELETE:
+                return deriveMutationPlan(spec, group.oldEntry, null);
+            default:
+                return new MutationPlan();
+        }
+    }
+
+    private MutationPlan deriveMutationPlan(
+            IndexSpec spec, OldIndexEntry oldEntry, @Nullable InternalRow newRow) {
         boolean oldHasIdx = oldEntry.hasIndexColumns;
         boolean newHasIdx = newRow != null && spec.hasIndexColumns(newRow);
 
@@ -473,27 +485,16 @@ public final class IndexReplicator implements AutoCloseable {
                 oldEntry.key != null
                         && (newEntry == null || !Arrays.equals(oldEntry.key, newEntry.key()));
 
-        int count = 0;
+        MutationPlan plan = new MutationPlan();
         if (oldHasIdx && keysDiffer) {
             TableBucket tb = new TableBucket(spec.getIndexTableId(), oldEntry.targetBucket);
-            getBuilder(tb, spec, builders).appendDelete(oldEntry.key);
-            count++;
+            plan.addDelete(tb, oldEntry.key);
         }
         if (newEntry != null && (!oldHasIdx || keysDiffer)) {
             TableBucket tb = new TableBucket(spec.getIndexTableId(), newEntry.targetBucket());
-            getBuilder(tb, spec, builders).appendUpsert(newEntry.key(), newEntry.value());
-            count++;
+            plan.addUpsert(tb, newEntry.key(), newEntry.value());
         }
-        return count;
-    }
-
-    private BucketBatchBuilder getBuilder(
-            TableBucket tb, IndexSpec spec, Map<TableBucket, BucketBatchBuilder> builders) {
-        return builders.computeIfAbsent(
-                tb,
-                k ->
-                        new BucketBatchBuilder(
-                                (short) spec.getIndexSchemaId(), spec.getIndexKvFormat()));
+        return plan;
     }
 
     public long getSyncIndexPushedOffset() {
@@ -601,39 +602,47 @@ public final class IndexReplicator implements AutoCloseable {
 
     private static final class MutationGroup {
         private final ChangeType changeType;
-        @Nullable private final InternalRow oldRow;
+        private final OldIndexEntry oldEntry;
         @Nullable private final InternalRow newRow;
         private final long endOffset;
 
         private MutationGroup(
                 ChangeType changeType,
-                @Nullable InternalRow oldRow,
+                OldIndexEntry oldEntry,
                 @Nullable InternalRow newRow,
                 long endOffset) {
             this.changeType = changeType;
-            this.oldRow = oldRow;
+            this.oldEntry = oldEntry;
             this.newRow = newRow;
             this.endOffset = endOffset;
         }
 
-        private static MutationGroup single(LogRecord record) {
+        private static MutationGroup single(IndexSpec spec, LogRecord record) {
             return record.getChangeType() == ChangeType.DELETE
                     ? new MutationGroup(
-                            ChangeType.DELETE, record.getRow(), null, record.logOffset() + 1)
+                            ChangeType.DELETE,
+                            OldIndexEntry.from(spec, record.getRow()),
+                            null,
+                            record.logOffset() + 1)
                     : new MutationGroup(
-                            record.getChangeType(), null, record.getRow(), record.logOffset() + 1);
+                            record.getChangeType(),
+                            OldIndexEntry.EMPTY,
+                            record.getRow(),
+                            record.logOffset() + 1);
         }
 
-        private static MutationGroup update(LogRecord before, LogRecord after) {
+        private static MutationGroup update(OldIndexEntry oldEntry, LogRecord after) {
             return new MutationGroup(
                     ChangeType.UPDATE_BEFORE,
-                    before.getRow(),
+                    oldEntry,
                     after.getRow(),
                     after.logOffset() + 1);
         }
     }
 
     private static final class OldIndexEntry {
+        private static final OldIndexEntry EMPTY = new OldIndexEntry(false, null, -1);
+
         private final boolean hasIndexColumns;
         @Nullable private final byte[] key;
         private final int targetBucket;
@@ -654,32 +663,96 @@ public final class IndexReplicator implements AutoCloseable {
 
         private static OldIndexEntry fromNullable(IndexSpec spec, @Nullable InternalRow row) {
             if (row == null) {
-                return new OldIndexEntry(false, null, -1);
+                return EMPTY;
             }
             return from(spec, row);
+        }
+    }
+
+    private static final class MutationPlan {
+        private final List<Mutation> operations = new ArrayList<>(2);
+
+        private void addDelete(TableBucket targetBucket, byte[] key) {
+            operations.add(
+                    new Mutation(
+                            targetBucket, key, null, DefaultKvRecord.sizeOf(key, null)));
+        }
+
+        private void addUpsert(TableBucket targetBucket, byte[] key, BinaryRow value) {
+            operations.add(
+                    new Mutation(
+                            targetBucket, key, value, DefaultKvRecord.sizeOf(key, value)));
+        }
+
+        private int operationCount() {
+            return operations.size();
+        }
+
+        private long encodedDelta(Map<TableBucket, BucketBatchBuilder> builders) {
+            long delta = 0L;
+            TableBucket firstNewBucket = null;
+            for (Mutation operation : operations) {
+                if (!builders.containsKey(operation.targetBucket)
+                        && !operation.targetBucket.equals(firstNewBucket)) {
+                    delta += FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
+                    firstNewBucket = operation.targetBucket;
+                }
+                delta += operation.recordSize;
+            }
+            return delta;
+        }
+
+        private void appendTo(
+                IndexSpec spec, Map<TableBucket, BucketBatchBuilder> builders) {
+            for (Mutation operation : operations) {
+                BucketBatchBuilder builder =
+                        builders.computeIfAbsent(
+                                operation.targetBucket,
+                                ignored ->
+                                        new BucketBatchBuilder(
+                                                (short) spec.getIndexSchemaId(),
+                                                spec.getIndexKvFormat()));
+                if (operation.value == null) {
+                    builder.appendDelete(operation.key);
+                } else {
+                    builder.appendUpsert(operation.key, operation.value);
+                }
+            }
+        }
+    }
+
+    private static final class Mutation {
+        private final TableBucket targetBucket;
+        private final byte[] key;
+        @Nullable private final BinaryRow value;
+        private final int recordSize;
+
+        private Mutation(
+                TableBucket targetBucket,
+                byte[] key,
+                @Nullable BinaryRow value,
+                int recordSize) {
+            this.targetBucket = targetBucket;
+            this.key = key;
+            this.value = value;
+            this.recordSize = recordSize;
         }
     }
 
     /** Per-target-bucket builder that directly encodes KV records. */
     static final class BucketBatchBuilder {
         final FencedKvRecordBatchBuilder builder;
-        int count;
-        int encodedSize;
 
         BucketBatchBuilder(short schemaId, KvFormat kvFormat) {
             UnmanagedPagedOutputView output = new UnmanagedPagedOutputView(PAGE_SIZE);
             this.builder =
                     FencedKvRecordBatchBuilder.builder(
                             schemaId, Integer.MAX_VALUE, output, kvFormat);
-            this.count = 0;
-            this.encodedSize = FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
         }
 
         void appendUpsert(byte[] key, BinaryRow value) {
             try {
                 builder.append(key, value);
-                encodedSize += DefaultKvRecord.sizeOf(key, value);
-                count++;
             } catch (IOException e) {
                 throw new RuntimeException("Failed to append upsert to batch", e);
             }
@@ -688,19 +761,9 @@ public final class IndexReplicator implements AutoCloseable {
         void appendDelete(byte[] key) {
             try {
                 builder.append(key, null);
-                encodedSize += DefaultKvRecord.sizeOf(key, null);
-                count++;
             } catch (IOException e) {
                 throw new RuntimeException("Failed to append delete to batch", e);
             }
-        }
-
-        int encodedSize() {
-            return encodedSize;
-        }
-
-        int payloadSize() {
-            return encodedSize - FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
         }
 
         BytesView finish(WriterKey writerKey, long windowEndOffset) throws IOException {

@@ -19,8 +19,8 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A deterministic replication window produced by a single {@link IndexReplicator#poll()} cycle.
@@ -40,17 +40,17 @@ final class IndexWindow {
 
     private final String indexName;
     private final long windowEndOffset;
-    private final AtomicInteger remaining;
+    private int remaining;
     private final IndexReplicator owner;
-
-    /** One-shot guard for the mutually exclusive completed or failed terminal transition. */
-    private final AtomicBoolean terminal = new AtomicBoolean(false);
+    private final List<IndexBatch> batches;
+    private boolean terminal;
 
     IndexWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
         this.indexName = indexName;
         this.windowEndOffset = windowEndOffset;
-        this.remaining = new AtomicInteger(batchCount);
+        this.remaining = batchCount;
         this.owner = owner;
+        this.batches = new ArrayList<>(batchCount);
     }
 
     String indexName() {
@@ -66,6 +66,18 @@ final class IndexWindow {
         return owner;
     }
 
+    synchronized void register(IndexBatch batch) {
+        batches.add(batch);
+    }
+
+    synchronized List<IndexBatch> batches() {
+        return new ArrayList<>(batches);
+    }
+
+    synchronized boolean isActive() {
+        return !terminal;
+    }
+
     /**
      * Acknowledge one batch belonging to this window. When the last outstanding batch is
      * acknowledged, the window is complete and the owning replicator's pushed offset is advanced.
@@ -73,15 +85,33 @@ final class IndexWindow {
      * over-acknowledgement.
      */
     void onBatchAcked() {
-        if (remaining.decrementAndGet() == 0 && terminal.compareAndSet(false, true)) {
+        boolean completed = false;
+        synchronized (this) {
+            if (!terminal && --remaining == 0) {
+                terminal = true;
+                completed = true;
+            }
+        }
+        if (completed) {
             owner.onWindowComplete(indexName, windowEndOffset);
         }
     }
 
     /** Fail this window terminally without advancing its source pushed offset. */
     void onBatchFailed(Throwable failure) {
-        if (terminal.compareAndSet(false, true)) {
+        tryFail(failure);
+    }
+
+    boolean tryFail(Throwable failure) {
+        synchronized (this) {
+            if (terminal) {
+                return false;
+            }
+            terminal = true;
+        }
+        if (failure != null) {
             owner.onWindowFailed(failure);
         }
+        return true;
     }
 }
