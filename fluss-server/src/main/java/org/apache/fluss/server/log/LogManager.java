@@ -392,6 +392,15 @@ public final class LogManager extends TabletManagerBase {
         }
     }
 
+    /** Truncate local WAL while deferring WriterState rebuild for remote snapshot restore. */
+    public void prepareRemoteWriterStateRecovery(TableBucket tableBucket, long newOffset) {
+        LogTablet logTablet = currentLogs.get(tableBucket);
+        if (logTablet != null) {
+            logTablet.prepareRemoteWriterStateRecovery(newOffset);
+            checkpointRecoveryOffsets(logTablet.getDataDir());
+        }
+    }
+
     private LogTablet loadLog(
             File dataDir,
             File tabletDir,

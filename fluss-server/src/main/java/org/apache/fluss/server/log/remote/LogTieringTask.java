@@ -17,9 +17,11 @@
 
 package org.apache.fluss.server.log.remote;
 
+import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.RemoteStorageException;
 import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.remote.RemoteLogSegment;
@@ -251,7 +253,24 @@ public class LogTieringTask implements Runnable {
             TableMetricGroup metricGroup)
             throws Exception {
         long endOffset = -1;
-        for (EnrichedLogSegment enrichedSegment : segments) {
+        List<Path> requiredWriterSnapshots = new ArrayList<>(segments.size());
+        if (log.writerStateManager().protocol() == KvIdempotenceProtocol.V1_FENCED) {
+            for (EnrichedLogSegment segment : segments) {
+                long segmentEndOffset = segment.nextSegmentOffset;
+                requiredWriterSnapshots.add(
+                        log.writerStateManager()
+                                .fetchSnapshot(segmentEndOffset)
+                                .map(File::toPath)
+                                .orElseThrow(
+                                        () ->
+                                                new LogStorageException(
+                                                        "Missing V1 writer snapshot at "
+                                                                + segmentEndOffset)));
+            }
+        }
+
+        for (int segmentIndex = 0; segmentIndex < segments.size(); segmentIndex++) {
+            EnrichedLogSegment enrichedSegment = segments.get(segmentIndex);
             LogSegment segment = enrichedSegment.logSegment;
             File logFile = segment.getFileLogRecords().file();
             String logFileName = logFile.getName();
@@ -262,14 +281,19 @@ public class LogTieringTask implements Runnable {
                     tableBucket.getBucket());
             long segmentEndOffset = enrichedSegment.nextSegmentOffset;
 
-            File writerIdSnapshotFile =
-                    log.writerStateManager().fetchSnapshot(segmentEndOffset).orElse(null);
+            Path writerSnapshot =
+                    log.writerStateManager().protocol() == KvIdempotenceProtocol.V1_FENCED
+                            ? requiredWriterSnapshots.get(segmentIndex)
+                            : log.writerStateManager()
+                                    .fetchSnapshot(segmentEndOffset)
+                                    .map(File::toPath)
+                                    .orElse(null);
             LogSegmentFiles logSegmentFiles =
                     new LogSegmentFiles(
                             logFile.toPath(),
                             toPathIfExists(segment.offsetIndex().file()),
                             toPathIfExists(segment.timeIndex().file()),
-                            writerIdSnapshotFile != null ? writerIdSnapshotFile.toPath() : null);
+                            writerSnapshot);
 
             UUID remoteLogSegmentId = UUID.randomUUID();
             int sizeInBytes = segment.getFileLogRecords().sizeInBytes();
@@ -287,6 +311,14 @@ public class LogTieringTask implements Runnable {
                 remoteLogStorage.copyLogSegmentFiles(copyRemoteLogSegment, logSegmentFiles);
             } catch (RemoteStorageException e) {
                 metricGroup.remoteLogCopyErrors().inc();
+                if (log.writerStateManager().protocol()
+                        == KvIdempotenceProtocol.V1_FENCED) {
+                    if (!copiedSegments.isEmpty()) {
+                        deleteRemoteLogSegmentFiles(copiedSegments, metricGroup);
+                        copiedSegments.clear();
+                    }
+                    throw e;
+                }
                 LOG.warn(
                         "Failed to copy {} of table {} bucket {} to remote storage. "
                                 + "Stopping further segment copies. "

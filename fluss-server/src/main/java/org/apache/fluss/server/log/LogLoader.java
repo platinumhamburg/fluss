@@ -24,6 +24,7 @@ import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.InvalidOffsetException;
 import org.apache.fluss.exception.LogSegmentOffsetOverflowException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.utils.FlussPaths;
@@ -110,16 +111,19 @@ final class LogLoader {
         // LogLoader.writerStateManager instance witnessing the deletion.
         writerStateManager.removeStraySnapshots(logSegments.baseOffsets());
 
-        // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
-        // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
-        // there may be cases where logStartOffset is not updated. As a result, logStartOffset is
-        // not yet reliable. Once the issue with correctly updating logStartOffset is resolved in
-        // issue https://github.com/apache/fluss/issues/744, we can use logStartOffset here.
-        // Additionally, using 0 versus using logStartOffset does not affect correctness—they both
-        // can restore the complete WriterState. The only difference is that using logStartOffset
-        // can potentially skip over more segments.
+        long retainedLogStartOffset =
+                writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
+                        ? logSegments
+                                .firstSegment()
+                                .map(LogSegment::getBaseOffset)
+                                .orElse(nextOffset)
+                        : 0L;
         LogTablet.rebuildWriterState(
-                writerStateManager, logSegments, 0, nextOffset, isCleanShutdown);
+                writerStateManager,
+                logSegments,
+                retainedLogStartOffset,
+                nextOffset,
+                isCleanShutdown);
 
         LogSegment activeSegment = logSegments.lastSegment().get();
         activeSegment.resizeIndexes((int) conf.get(ConfigOptions.LOG_INDEX_FILE_SIZE).getBytes());
@@ -298,16 +302,19 @@ final class LogLoader {
                         logTabletDir,
                         this.writerStateManager.writerExpirationMs(),
                         this.writerStateManager.protocol());
-        // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason is
-        // that the current implementation of logStartOffset in Fluss is not yet fully refined, and
-        // there may be cases where logStartOffset is not updated. As a result, logStartOffset is
-        // not yet reliable. Once the issue with correctly updating logStartOffset is resolved in
-        // issue https://github.com/apache/fluss/issues/744, we can use logStartOffset here.
-        // Additionally, using 0 versus using logStartOffset does not affect correctness—they both
-        // can restore the complete WriterState. The only difference is that using logStartOffset
-        // can potentially skip over more segments.
+        long retainedLogStartOffset =
+                writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
+                        ? logSegments
+                                .firstSegment()
+                                .map(LogSegment::getBaseOffset)
+                                .orElse(segment.getBaseOffset())
+                        : 0L;
         LogTablet.rebuildWriterState(
-                writerStateManager, logSegments, 0, segment.getBaseOffset(), false);
+                writerStateManager,
+                logSegments,
+                retainedLogStartOffset,
+                segment.getBaseOffset(),
+                false);
         int bytesTruncated = segment.recover();
         // once we have recovered the segment's data, take a snapshot to ensure that we won't
         // need to reload the same segment again while recovering another segment.

@@ -231,7 +231,7 @@ public class WriterStateManagerTest {
 
         Files.write(writerSnapshotFile(logDir, 2L).toPath(), V0_SNAPSHOT_FIXTURE);
         WriterStateManager fenced = fencedManager();
-        assertThatThrownBy(() -> fenced.truncateAndReload(0L, 2L, Long.MAX_VALUE))
+        assertThatThrownBy(() -> fenced.truncateAndReload(1L, 2L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class);
         assertThat(writerSnapshotFile(logDir, 2L)).exists();
     }
@@ -242,9 +242,88 @@ public class WriterStateManagerTest {
         Files.write(snapshot.toPath(), "{\"version\":2}".getBytes(StandardCharsets.UTF_8));
         WriterStateManager fenced = fencedManager();
 
-        assertThatThrownBy(() -> fenced.truncateAndReload(0L, 1L, Long.MAX_VALUE))
+        assertThatThrownBy(() -> fenced.truncateAndReload(1L, 1L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class);
         assertThat(snapshot).exists();
+    }
+
+    @Test
+    void testV1RecoveryCoverageUsesHalfOpenOffsets() throws Exception {
+        WriterStateManager empty = fencedManager();
+
+        assertThatThrownBy(() -> empty.validateRecoveryCoverage(1L, 1L))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("retained WAL starts at 1");
+        empty.validateRecoveryCoverage(0L, 0L);
+        empty.updateMapEndOffset(5L);
+        empty.validateRecoveryCoverage(0L, 5L);
+
+        WriterStateManager snapshotWriter = fencedManager();
+        appendFenced(snapshotWriter, new WriterKey(4L, 5L), 100L, 4L, 1L);
+        snapshotWriter.updateMapEndOffset(5L);
+        snapshotWriter.takeSnapshot();
+
+        WriterStateManager exactEnd = fencedManager();
+        exactEnd.truncateAndReload(5L, 5L, Long.MAX_VALUE);
+        exactEnd.validateRecoveryCoverage(5L, 5L);
+
+        assertThatThrownBy(() -> exactEnd.validateRecoveryCoverage(0L, 6L))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("ends at 5")
+                .hasMessageContaining("recovery end 6");
+    }
+
+    @Test
+    void testV1FallsBackToOlderValidSnapshotWithoutDeletingCorruptLatest() throws Exception {
+        WriterKey olderKey = new WriterKey(4L, 5L);
+        WriterStateManager snapshotWriter = fencedManager();
+        appendFenced(snapshotWriter, olderKey, 100L, 4L, 1L);
+        snapshotWriter.updateMapEndOffset(5L);
+        snapshotWriter.takeSnapshot();
+
+        File corruptLatest = writerSnapshotFile(logDir, 10L);
+        byte[] corruptBytes = "{\"version\":2}".getBytes(StandardCharsets.UTF_8);
+        Files.write(corruptLatest.toPath(), corruptBytes);
+
+        WriterStateManager recovered = fencedManager();
+        recovered.truncateAndReload(5L, 10L, Long.MAX_VALUE);
+
+        assertThat(recovered.lastFencedEntry(olderKey)).isPresent();
+        assertThat(recovered.mapEndOffset()).isEqualTo(5L);
+        assertThat(recovered.fetchSnapshot(10L)).contains(corruptLatest);
+        assertThat(Files.readAllBytes(corruptLatest.toPath())).isEqualTo(corruptBytes);
+    }
+
+    @Test
+    void testV1RejectsFallbackWhoseReplayRangeStartsBeforeRetainedWal() throws Exception {
+        WriterStateManager snapshotWriter = fencedManager();
+        appendFenced(snapshotWriter, new WriterKey(4L, 5L), 100L, 3L, 1L);
+        snapshotWriter.updateMapEndOffset(4L);
+        snapshotWriter.takeSnapshot();
+
+        File corruptLatest = writerSnapshotFile(logDir, 10L);
+        Files.write(corruptLatest.toPath(), "{\"version\":2}".getBytes(StandardCharsets.UTF_8));
+
+        WriterStateManager recovered = fencedManager();
+        assertThatThrownBy(() -> recovered.truncateAndReload(5L, 10L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("continuous WriterState recovery");
+        assertThat(corruptLatest).exists();
+        assertThat(writerSnapshotFile(logDir, 4L)).exists();
+    }
+
+    @Test
+    void testV1RejectsSnapshotAfterTruncationTarget() throws Exception {
+        WriterStateManager snapshotWriter = fencedManager();
+        appendFenced(snapshotWriter, new WriterKey(4L, 5L), 100L, 9L, 1L);
+        snapshotWriter.updateMapEndOffset(10L);
+        snapshotWriter.takeSnapshot();
+
+        WriterStateManager recovered = fencedManager();
+        assertThatThrownBy(() -> recovered.truncateAndReload(5L, 8L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("recovery end 8");
+        assertThat(writerSnapshotFile(logDir, 10L)).exists();
     }
 
     @Test
@@ -266,7 +345,7 @@ public class WriterStateManagerTest {
         Optional<Long> latestSnapshotOffset = manager.latestSnapshotOffset();
         Optional<Long> oldestSnapshotOffset = manager.oldestSnapshotOffset();
 
-        assertThatThrownBy(() -> manager.truncateAndReload(0L, 15L, Long.MAX_VALUE))
+        assertThatThrownBy(() -> manager.truncateAndReload(1L, 15L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class);
 
         assertThat(manager.lastFencedEntry(liveKey)).isEqualTo(liveEntry);

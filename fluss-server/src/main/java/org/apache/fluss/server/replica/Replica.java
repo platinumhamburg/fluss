@@ -1887,6 +1887,13 @@ public final class Replica {
                 });
     }
 
+    /** Truncate local state while deferring WriterState rebuild until remote snapshot restore. */
+    public void prepareRemoteWriterStateRecovery(long newOffset) {
+        inReadLock(
+                leaderIsrUpdateLock,
+                () -> logManager.prepareRemoteWriterStateRecovery(tableBucket, newOffset));
+    }
+
     /** Load recovered WriterState and apply follower lifecycle retirement before fetch resumes. */
     public void loadWriterSnapshot(long lastOffset) throws IOException {
         inReadLock(
@@ -2464,10 +2471,11 @@ public final class Replica {
     }
 
     private void failIndexFollowerRecovery(Throwable failure) {
-        if (tableInfo.isIndexTable() && online.compareAndSet(true, false)) {
+        if (tableInfo.getKvIdempotenceProtocol() == KvIdempotenceProtocol.V1_FENCED
+                && online.compareAndSet(true, false)) {
             leaderReplicaIdOpt.set(null);
             LOG.error(
-                    "Failing Index Table replica {} after remote WriterState recovery failure",
+                    "Failing V1 target replica {} after remote WriterState recovery failure",
                     tableBucket,
                     failure);
         }

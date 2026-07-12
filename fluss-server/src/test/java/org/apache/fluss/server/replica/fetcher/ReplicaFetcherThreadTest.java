@@ -21,6 +21,7 @@ import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.metadata.IndexType;
@@ -72,6 +73,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
@@ -561,6 +564,65 @@ public class ReplicaFetcherThreadTest {
         fetcher.doWork();
         assertThat(endpoint.requestsFor(indexBucket)).isEqualTo(1);
         assertThat(fetcher.fetchStatus(tb).get().fetchOffset()).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"download", "parse", "reload", "coverage"})
+    void testV1RemoteWriterSnapshotFailureSchedulesDoNotAdvanceOrPermitPromotion(
+            String failureStage) throws Exception {
+        long initialOffset = 7L;
+        long remoteEndOffset = 50L;
+        long tableId = 9910L + Math.abs(failureStage.hashCode() % 100);
+        TablePath indexPath = TablePath.of("test_db", "remote_" + failureStage + "_index");
+        TableBucket indexBucket = registerIndexTableFollower(indexPath, tableId);
+        Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
+        ScriptedRemoteLeaderEndpoint endpoint =
+                new ScriptedRemoteLeaderEndpoint(
+                        new Configuration(), leaderRM, followerServerId);
+        endpoint.addResponse(
+                indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
+        ReplicaFetcherThread fetcher =
+                new ReplicaFetcherThread(
+                        "index-remote-" + failureStage, followerRM, endpoint, 1000);
+        fetcher.setRemoteWriterStateRecovery(
+                (ignoredReplica, ignoredFetchInfo, ignoredOffset) -> {
+                    if ("parse".equals(failureStage) || "coverage".equals(failureStage)) {
+                        throw new CorruptSnapshotException(failureStage + " failure");
+                    }
+                    throw new IOException(failureStage + " failure");
+                });
+        fetcher.addBuckets(
+                Collections.singletonMap(
+                        indexBucket,
+                        new InitialFetchStatus(
+                                tableId, indexPath, leader.id(), initialOffset)));
+
+        fetcher.doWork();
+
+        assertThat(fetcher.fetchStatus(indexBucket)).isEmpty();
+        assertThat(endpoint.requestsFor(indexBucket)).isEqualTo(1);
+        assertThatThrownBy(() -> followerRM.getReplicaOrException(indexBucket))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+        assertThatThrownBy(
+                        () ->
+                                failedReplica.makeLeader(
+                                        new NotifyLeaderAndIsrData(
+                                                PhysicalTablePath.of(indexPath),
+                                                indexBucket,
+                                                Arrays.asList(
+                                                        leaderServerId, followerServerId),
+                                                new LeaderAndIsr(
+                                                        followerServerId,
+                                                        INITIAL_LEADER_EPOCH + 1,
+                                                        Arrays.asList(
+                                                                leaderServerId,
+                                                                followerServerId),
+                                                        Collections.emptyList(),
+                                                        INITIAL_COORDINATOR_EPOCH,
+                                                        INITIAL_BUCKET_EPOCH + 1))))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
     }
 
     @Test

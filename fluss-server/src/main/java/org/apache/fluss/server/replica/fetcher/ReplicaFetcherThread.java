@@ -24,6 +24,7 @@ import org.apache.fluss.exception.InvalidRecordException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.RemoteStorageException;
 import org.apache.fluss.exception.StorageException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -625,16 +626,18 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                     "Failed to truncate and restore writer snapshot for {} while log hash been moved to remote",
                     tb,
                     e);
-            boolean indexTable = replica.getTableInfo().isIndexTable();
-            if (indexTable) {
+            boolean fencedTarget =
+                    replica.getTableInfo().getKvIdempotenceProtocol()
+                            == KvIdempotenceProtocol.V1_FENCED;
+            if (fencedTarget) {
                 replicaManager.markReplicaOffline(tb, replica);
             }
             if (e instanceof Error) {
                 throw (Error) e;
             }
-            if (indexTable) {
+            if (fencedTarget) {
                 throw new StorageException(
-                        "Remote WriterState recovery failed for Index Table bucket " + tb, e);
+                        "Remote WriterState recovery failed for V1 target bucket " + tb, e);
             }
             return -1L;
         }
@@ -650,20 +653,16 @@ final class ReplicaFetcherThread extends ShutdownableThread {
         RemoteLogManager rlm = replicaManager.getRemoteLogManager();
 
         // Truncate the existing local log before restoring the writer id snapshots.
-        replica.truncateFullyAndStartAt(nextFetchOffset);
+        replica.prepareRemoteWriterStateRecovery(nextFetchOffset);
 
         // TODO maybe need increase log start offset.
 
         LogTablet log = replica.getLogTablet();
-        // 1. Perform a truncate before calling buildWriterIdSnapshotFile() to ensure that all
-        // historical data is completely cleaned up.
-        log.writerStateManager().truncateFullyAndStartAt(0L);
-
-        // 2. download writer id snapshots from remote storage.
+        // 1. Download the exact-end writer snapshot after local state has been cleared.
         File snapshotFile = FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
         buildWriterIdSnapshotFile(snapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
 
-        // 3. Perform a reloadSnapshots after buildWriterIdSnapshotFile() to load the latest
+        // 2. Perform a reloadSnapshots after buildWriterIdSnapshotFile() to load the latest
         // downloaded writerId snapshot file into the writerStateManager.
         // Note: This must occur after the file is downloaded, so we cannot call
         // truncateFullyAndReloadSnapshots() here to avoid deleting the newly downloaded
@@ -674,7 +673,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                 "Build the writer snapshots from remote storage for {} with active "
                         + "writer size: {} and remoteLogEndOffset: {}",
                 replica.getTableBucket(),
-                log.writerStateManager().activeWriters().size(),
+                log.writerStateManager().writerIdCount(),
                 nextFetchOffset);
     }
 

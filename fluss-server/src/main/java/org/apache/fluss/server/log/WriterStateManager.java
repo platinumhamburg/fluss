@@ -95,6 +95,7 @@ public class WriterStateManager {
     private ConcurrentSkipListMap<Long, SnapshotFile> snapshots;
     private long lastMapOffset = 0L;
     private long lastSnapOffset = 0L;
+    @Nullable private Long loadedSnapshotOffset;
 
     public WriterStateManager(TableBucket tableBucket, File logTabletDir, int writerExpirationMs)
             throws IOException {
@@ -135,6 +136,41 @@ public class WriterStateManager {
 
     public void updateMapEndOffset(long lastOffset) {
         lastMapOffset = lastOffset;
+    }
+
+    /** Validate continuous V1 WriterState coverage over the half-open recovery range. */
+    public void validateRecoveryCoverage(long logStartOffset, long recoveryEndOffset)
+            throws CorruptSnapshotException {
+        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        if (logStartOffset < 0L || recoveryEndOffset < logStartOffset) {
+            throw new CorruptSnapshotException(
+                    String.format(
+                            "Invalid WriterState recovery range [%d,%d)",
+                            logStartOffset, recoveryEndOffset));
+        }
+        if (loadedSnapshotOffset == null && logStartOffset > 0L) {
+            throw new CorruptSnapshotException(
+                    String.format(
+                            "No V1 WriterState snapshot covers recovery end %d and retained WAL starts at %d",
+                            recoveryEndOffset, logStartOffset));
+        }
+        if (loadedSnapshotOffset != null
+                && (loadedSnapshotOffset < logStartOffset
+                        || loadedSnapshotOffset > recoveryEndOffset)) {
+            throw new CorruptSnapshotException(
+                    String.format(
+                            "V1 WriterState snapshot at %d does not cover retained WAL range [%d,%d)",
+                            loadedSnapshotOffset, logStartOffset, recoveryEndOffset));
+        }
+        if (lastMapOffset != recoveryEndOffset) {
+            throw new CorruptSnapshotException(
+                    String.format(
+                            "WriterState recovery ends at %d, not recovery end %d; WAL coverage has gap [%d,%d)",
+                            lastMapOffset,
+                            recoveryEndOffset,
+                            lastMapOffset,
+                            recoveryEndOffset));
+        }
     }
 
     /** Get the last written entry for the given writer id. */
@@ -178,7 +214,7 @@ public class WriterStateManager {
      */
     public void truncateAndReload(long logStartOffset, long logEndOffset, long currentTimeMs)
             throws IOException {
-        if (protocol == KvIdempotenceProtocol.V1_FENCED && logEndOffset != mapEndOffset()) {
+        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
             truncateAndReloadFenced(logStartOffset, logEndOffset);
             return;
         }
@@ -203,37 +239,66 @@ public class WriterStateManager {
 
     private void truncateAndReloadFenced(long logStartOffset, long logEndOffset)
             throws IOException {
-        Optional<SnapshotFile> snapshotToLoad =
-                Optional.ofNullable(
-                                snapshots
-                                        .subMap(logStartOffset, false, logEndOffset, true)
-                                        .lastEntry())
-                        .map(Map.Entry::getValue);
+        if (logStartOffset < 0L || logEndOffset < logStartOffset) {
+            throw new CorruptSnapshotException(
+                    String.format(
+                            "Invalid WriterState recovery range [%d,%d)",
+                            logStartOffset, logEndOffset));
+        }
 
-        Map<WriterKey, FencedWriterStateEntry> reloadedWriters = new HashMap<>();
-        if (snapshotToLoad.isPresent()) {
-            SnapshotFile snapshot = snapshotToLoad.get();
-            LOG.info("Loading fenced writer state from snapshot file '{}'", snapshot);
-            for (FencedWriterStateEntry entry : readFencedSnapshot(snapshot.file())) {
-                FencedWriterStateEntry previous =
-                        reloadedWriters.put(entry.writerKey(), entry);
-                if (previous != null) {
-                    throw new CorruptSnapshotException(
-                            "Duplicate fenced writer key in snapshot: " + entry.writerKey());
+        SnapshotFile selectedSnapshot = null;
+        Map<WriterKey, FencedWriterStateEntry> reloadedWriters = null;
+        CorruptSnapshotException latestFailure = null;
+        for (SnapshotFile snapshot :
+                snapshots.headMap(logEndOffset, true).descendingMap().values()) {
+            if (snapshot.offset < logStartOffset) {
+                break;
+            }
+            try {
+                LOG.info("Loading fenced writer state from snapshot file '{}'", snapshot);
+                Map<WriterKey, FencedWriterStateEntry> candidateWriters = new HashMap<>();
+                for (FencedWriterStateEntry entry : readFencedSnapshot(snapshot.file())) {
+                    FencedWriterStateEntry previous =
+                            candidateWriters.put(entry.writerKey(), entry);
+                    if (previous != null) {
+                        throw new CorruptSnapshotException(
+                                "Duplicate fenced writer key in snapshot: " + entry.writerKey());
+                    }
                 }
+                selectedSnapshot = snapshot;
+                reloadedWriters = candidateWriters;
+                break;
+            } catch (CorruptSnapshotException failure) {
+                if (latestFailure == null) {
+                    latestFailure = failure;
+                }
+                LOG.warn(
+                        "Ignoring corrupt V1 writer snapshot '{}' while looking for a covering snapshot",
+                        snapshot.file(),
+                        failure);
             }
         }
 
-        for (SnapshotFile snapshot : snapshots.values()) {
-            if (snapshot.offset > logEndOffset || snapshot.offset <= logStartOffset) {
-                removeAndDeleteSnapshot(snapshot.offset);
+        if (selectedSnapshot == null) {
+            if (logStartOffset > 0L) {
+                throw new CorruptSnapshotException(
+                        String.format(
+                                "No snapshot can provide continuous WriterState recovery to recovery end %d because retained WAL starts at %d",
+                                logEndOffset, logStartOffset),
+                        latestFailure);
             }
+            reloadedWriters = new HashMap<>();
         }
 
         fencedWriters = reloadedWriters;
         writerIdCount = fencedWriters.size();
-        lastSnapOffset = snapshotToLoad.map(snapshot -> snapshot.offset).orElse(logStartOffset);
+        loadedSnapshotOffset = selectedSnapshot == null ? null : selectedSnapshot.offset;
+        lastSnapOffset = selectedSnapshot == null ? 0L : selectedSnapshot.offset;
         lastMapOffset = lastSnapOffset;
+
+        for (SnapshotFile snapshot : snapshots.tailMap(logEndOffset, false).values()) {
+            removeAndDeleteSnapshot(snapshot.offset);
+        }
     }
 
     public void truncateFullyAndStartAt(long offset) throws IOException {
@@ -243,6 +308,7 @@ public class WriterStateManager {
         }
         lastSnapOffset = 0L;
         lastMapOffset = offset;
+        loadedSnapshotOffset = null;
     }
 
     public void reloadSnapshots() throws IOException {

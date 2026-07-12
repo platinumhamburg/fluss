@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.CorruptRecordException;
+import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidTimestampException;
@@ -1102,6 +1103,23 @@ public final class LogTablet {
         }
     }
 
+    /** Prepare remote WriterState restore without rebuilding before its snapshot is downloaded. */
+    public void prepareRemoteWriterStateRecovery(long newOffset) throws LogStorageException {
+        synchronized (lock) {
+            try {
+                localLog.truncateFullyAndStartAt(newOffset);
+                writerStateManager.truncateFullyAndStartAt(0L);
+                updateHighWatermark(localLog.getLocalLogEndOffset());
+            } catch (IOException e) {
+                throw new LogStorageException(
+                        String.format(
+                                "Error while preparing remote WriterState recovery for bucket %s at offset %s.",
+                                getTableBucket(), newOffset),
+                        e);
+            }
+        }
+    }
+
     /**
      * Completely delete the local log directory and all contents form the file system with no
      * delay.
@@ -1369,16 +1387,20 @@ public final class LogTablet {
             throws IOException {
         synchronized (lock) {
             localLog.checkIfMemoryMappedBufferClosed();
-            // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason
-            // is that the current implementation of logStartOffset in Fluss is not yet fully
-            // refined, and there may be cases where logStartOffset is not updated. As a result,
-            // logStartOffset is not yet reliable. Once the issue with correctly updating
-            // logStartOffset is resolved in issue https://github.com/apache/fluss/issues/744, we
-            // can use logStartOffset here.
-            // Additionally, using 0 versus using logStartOffset does not affect correctness—they
-            // both can restore the complete WriterState. The only difference is that using
-            // logStartOffset can potentially skip over more segments.
-            rebuildWriterState(writerStateManager, localLog.getSegments(), 0, lastOffset, false);
+            long retainedLogStartOffset =
+                    writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
+                            ? localLog
+                                    .getSegments()
+                                    .firstSegment()
+                                    .map(LogSegment::getBaseOffset)
+                                    .orElse(lastOffset)
+                            : 0L;
+            rebuildWriterState(
+                    writerStateManager,
+                    localLog.getSegments(),
+                    retainedLogStartOffset,
+                    lastOffset,
+                    false);
         }
     }
 
@@ -1513,7 +1535,9 @@ public final class LogTablet {
             // could cause a writer id to expire earlier than expected), and we can skip the
             // loading. This is an optimization for users which are not yet using idempotent
             // features yet.
-            if (lastOffset > writerStateManager.mapEndOffset() && !isEmptyBeforeTruncation) {
+            if (lastOffset > writerStateManager.mapEndOffset()
+                    && (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
+                            || !isEmptyBeforeTruncation)) {
                 Optional<LogSegment> segmentOfLastOffset = segments.floorSegment(lastOffset);
 
                 List<LogSegment> segmentsList =
@@ -1525,9 +1549,17 @@ public final class LogTablet {
                                             segment.getBaseOffset(),
                                             writerStateManager.mapEndOffset()),
                                     logStartOffset);
-                    writerStateManager.updateMapEndOffset(startOffset);
+                    if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
+                        if (startOffset > writerStateManager.mapEndOffset()) {
+                            throw recoveryGap(writerStateManager, startOffset, lastOffset);
+                        }
+                    } else {
+                        writerStateManager.updateMapEndOffset(startOffset);
+                    }
 
-                    if (offsetsToSnapshot.contains(Optional.of(segment.getBaseOffset()))) {
+                    if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT
+                            && offsetsToSnapshot.contains(
+                                    Optional.of(segment.getBaseOffset()))) {
                         writerStateManager.takeSnapshot();
                     }
 
@@ -1548,7 +1580,11 @@ public final class LogTablet {
                 }
             }
 
-            writerStateManager.updateMapEndOffset(lastOffset);
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
+                writerStateManager.validateRecoveryCoverage(logStartOffset, lastOffset);
+            } else {
+                writerStateManager.updateMapEndOffset(lastOffset);
+            }
             writerStateManager.takeSnapshot();
             LOG.info(
                     "Writer state recovery took {} ms for snapshot load and {} ms for segment recovery for bucket {} from offset {}",
@@ -1575,6 +1611,14 @@ public final class LogTablet {
             loadedWriters.values().forEach(writerStateManager::update);
         } else {
             for (LogRecordBatch batch : records.batches()) {
+                long expectedOffset = writerStateManager.mapEndOffset();
+                if (batch.lastLogOffset() < expectedOffset) {
+                    continue;
+                }
+                if (batch.baseLogOffset() != expectedOffset) {
+                    throw recoveryGap(
+                            writerStateManager, batch.baseLogOffset(), batch.nextLogOffset());
+                }
                 if (batch.idempotenceProtocolVersion() != 1) {
                     throw new CorruptRecordException(
                             "Compact target WAL found while recovering a V1 table");
@@ -1593,8 +1637,19 @@ public final class LogTablet {
                         batch.lastLogOffset(),
                         batch.commitTimestamp());
                 writerStateManager.updateFenced(update);
+                writerStateManager.updateMapEndOffset(batch.nextLogOffset());
             }
         }
+    }
+
+    private static CorruptSnapshotException recoveryGap(
+            WriterStateManager writerStateManager, long nextOffset, long recoveryEnd) {
+        return new CorruptSnapshotException(
+                String.format(
+                        "V1 WriterState recovery has a WAL gap [%d,%d) before recovery end %d",
+                        writerStateManager.mapEndOffset(),
+                        nextOffset,
+                        recoveryEnd));
     }
 
     public static void deleteWriterSnapshots(

@@ -20,11 +20,16 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.CorruptSnapshotException;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.MemoryLogRecordsCompactedBuilder;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.server.exception.CorruptIndexException;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.utils.FlussPaths;
@@ -60,6 +65,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
+import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -504,6 +510,78 @@ final class LogLoaderTest extends LogTestBase {
     }
 
     @Test
+    void testV1RecoveryFallsBackFromCorruptLatestWithContinuousWal() throws Exception {
+        WriterKey writerKey = new WriterKey(7L, 8L);
+        LogTablet log = createFencedLogTablet(true);
+        appendFenced(log, writerKey, 100L);
+        log.roll(Optional.empty());
+        appendFenced(log, writerKey, 500L);
+        log.roll(Optional.empty());
+        appendFenced(log, writerKey, 900L);
+        long recoveryEnd = log.localLogEndOffset();
+        log.close();
+
+        File corruptLatest = FlussPaths.writerSnapshotFile(logDir, recoveryEnd);
+        Files.write(corruptLatest.toPath(), "{\"version\":2}".getBytes());
+
+        LogTablet recovered = createFencedLogTablet(false);
+
+        assertThat(recovered.writerStateManager().lastFencedEntry(writerKey))
+                .get()
+                .extracting(FencedWriterStateEntry::lastSequence)
+                .isEqualTo(900L);
+        assertThat(recovered.writerStateManager().mapEndOffset()).isEqualTo(recoveryEnd);
+        recovered.close();
+    }
+
+    @Test
+    void testV1CleanShutdownWithoutSnapshotFailsWhenRetainedWalStartsAfterZero()
+            throws Exception {
+        WriterKey writerKey = new WriterKey(7L, 8L);
+        LogTablet log = createFencedLogTablet(true);
+        appendFenced(log, writerKey, 100L);
+        log.roll(Optional.empty());
+        appendFenced(log, writerKey, 500L);
+        LogSegment deletedPrefix = log.getSegments().get(0);
+        log.close();
+
+        deletedPrefix.deleteIfExists();
+        for (SnapshotFile snapshot : WriterStateManager.listSnapshotFiles(logDir)) {
+            snapshot.deleteIfExists();
+        }
+
+        assertThatThrownBy(() -> createFencedLogTablet(true))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("retained WAL starts at 1");
+    }
+
+    @Test
+    void testV1CorruptFallbackFailsWhenRetainedWalHasGap() throws Exception {
+        WriterKey writerKey = new WriterKey(7L, 8L);
+        LogTablet log = createFencedLogTablet(true);
+        appendFenced(log, writerKey, 100L);
+        log.roll(Optional.empty());
+        appendFenced(log, writerKey, 500L);
+        log.roll(Optional.empty());
+        appendFenced(log, writerKey, 900L);
+        long recoveryEnd = log.localLogEndOffset();
+        LogSegment missingMiddle = log.getSegments().get(1);
+        log.close();
+
+        Files.write(
+                FlussPaths.writerSnapshotFile(logDir, recoveryEnd).toPath(),
+                "{\"version\":2}".getBytes());
+        FlussPaths.writerSnapshotFile(logDir, 2L).delete();
+        missingMiddle.deleteIfExists();
+
+        assertThatThrownBy(() -> createFencedLogTablet(false))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("gap")
+                .hasMessageContaining("1")
+                .hasMessageContaining("2");
+    }
+
+    @Test
     void testLoadingLogKeepsLargestStrayWriterStateSnapshot() throws Exception {
         LogTablet log = createLogTablet(true);
         long wid1 = 1L;
@@ -658,6 +736,40 @@ final class LogLoaderTest extends LogTestBase {
                 false,
                 SystemClock.getInstance(),
                 isCleanShutdown);
+    }
+
+    private LogTablet createFencedLogTablet(boolean isCleanShutdown) throws Exception {
+        return LogTablet.create(
+                tempDir,
+                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                logDir,
+                conf,
+                TestingMetricGroups.TABLET_SERVER_METRICS,
+                0,
+                scheduler,
+                LogFormat.COMPACTED,
+                1,
+                true,
+                SystemClock.getInstance(),
+                isCleanShutdown,
+                KvIdempotenceProtocol.V1_FENCED);
+    }
+
+    private static void appendFenced(LogTablet log, WriterKey writerKey, long sequence)
+            throws Exception {
+        MemoryLogRecordsCompactedBuilder builder =
+                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                        DEFAULT_SCHEMA_ID,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        false);
+        builder.setFencedWriterState(writerKey, sequence);
+        builder.append(
+                ChangeType.INSERT,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "fenced-" + sequence}));
+        builder.close();
+        log.appendAsLeader(
+                MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer()));
     }
 
     private void appendRecords(LogTablet logTablet, int numRecords) throws Exception {
