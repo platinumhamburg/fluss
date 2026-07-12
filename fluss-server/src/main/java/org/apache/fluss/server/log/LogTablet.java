@@ -68,6 +68,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ScheduledFuture;
+import java.util.function.Predicate;
 
 import static org.apache.fluss.utils.FileUtils.flushFileIfExists;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
@@ -311,6 +312,13 @@ public final class LogTablet {
             WriterKey writerKey, long sequence) {
         synchronized (lock) {
             return writerStateManager.findStaleFencedBatch(writerKey, sequence);
+        }
+    }
+
+    /** Retires V1 writer state while preserving the LogTablet lock boundary. */
+    public void removeFencedWriters(Predicate<WriterKey> predicate) {
+        synchronized (lock) {
+            writerStateManager.removeFencedWriters(predicate);
         }
     }
 

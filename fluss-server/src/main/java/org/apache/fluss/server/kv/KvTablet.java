@@ -42,6 +42,7 @@ import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
@@ -159,6 +160,8 @@ public final class KvTablet {
     /** Version-aware encoder that encapsulates format version and tag extraction. */
     private final ValueEncoder valueEncoder;
 
+    private final KvWriteGuard writeGuard;
+
     // the changelog image mode for this tablet
     private final ChangelogImage changelogImage;
 
@@ -199,7 +202,8 @@ public final class KvTablet {
             int kvFormatVersion,
             @Nullable RocksDBStatistics rocksDBStatistics,
             AutoIncrementManager autoIncrementManager,
-            @Nullable ToLongFunction<BinaryRow> tagExtractor) {
+            @Nullable ToLongFunction<BinaryRow> tagExtractor,
+            KvWriteGuard writeGuard) {
         validateValueFormatVersion(kvFormatVersion, tagExtractor);
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
@@ -227,6 +231,7 @@ public final class KvTablet {
         this.tagExtractor = tagExtractor;
         this.kvFormatVersion = kvFormatVersion;
         this.valueEncoder = ValueEncoder.forVersion(kvFormatVersion, tagExtractor);
+        this.writeGuard = writeGuard;
     }
 
     private static void validateValueFormatVersion(
@@ -261,6 +266,51 @@ public final class KvTablet {
                     AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
                             compactionFilterFactory,
             @Nullable ToLongFunction<BinaryRow> tagExtractor)
+            throws IOException {
+        return create(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvTabletDir,
+                serverConf,
+                serverMetricGroup,
+                arrowBufferAllocator,
+                memorySegmentPool,
+                kvFormat,
+                rowMerger,
+                arrowCompressionInfo,
+                schemaGetter,
+                changelogImage,
+                kvFormatVersion,
+                sharedRateLimiter,
+                autoIncrementManager,
+                compactionFilterFactory,
+                tagExtractor,
+                KvWriteGuard.ACCEPT_ALL);
+    }
+
+    public static KvTablet create(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File kvTabletDir,
+            Configuration serverConf,
+            TabletServerMetricGroup serverMetricGroup,
+            BufferAllocator arrowBufferAllocator,
+            MemorySegmentPool memorySegmentPool,
+            KvFormat kvFormat,
+            RowMerger rowMerger,
+            ArrowCompressionInfo arrowCompressionInfo,
+            SchemaGetter schemaGetter,
+            ChangelogImage changelogImage,
+            int kvFormatVersion,
+            RateLimiter sharedRateLimiter,
+            AutoIncrementManager autoIncrementManager,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor,
+            KvWriteGuard writeGuard)
             throws IOException {
         validateValueFormatVersion(kvFormatVersion, tagExtractor);
         RocksDBKv kv =
@@ -297,7 +347,8 @@ public final class KvTablet {
                 kvFormatVersion,
                 rocksDBStatistics,
                 autoIncrementManager,
-                tagExtractor);
+                tagExtractor,
+                writeGuard);
     }
 
     private static RocksDBKv buildRocksDBKv(
@@ -468,9 +519,14 @@ public final class KvTablet {
                     validateSchemaId(kvRecords.schemaId(), latestSchemaId);
 
                     if (kvRecords.idempotenceProtocolVersion() == 1) {
+                        WriterKey writerKey = kvRecords.fencedWriterKey();
+                        if (writeGuard.beforeWriterState(writerKey)
+                                == KvWriteGuard.Decision.NO_OP) {
+                            return LogAppendInfo.noAppend();
+                        }
                         Optional<FencedWriterStateEntry> stale =
                                 logTablet.findStaleFencedBatch(
-                                        kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
+                                        writerKey, kvRecords.fencedSequence());
                         if (stale.isPresent()) {
                             FencedWriterStateEntry entry = stale.get();
                             return LogAppendInfo.duplicatedAt(
@@ -527,7 +583,8 @@ public final class KvTablet {
                                 currentAutoIncrementUpdater,
                                 walBuilder,
                                 latestSchemaRow,
-                                logEndOffsetOfPrevBatch);
+                                logEndOffsetOfPrevBatch,
+                                fenced ? kvRecords.fencedWriterKey() : null);
 
                         // There will be a situation that these batches of kvRecordBatch have not
                         // generated any CDC logs, for example, when client attempts to delete
@@ -640,7 +697,8 @@ public final class KvTablet {
             AutoIncrementUpdater autoIncrementUpdater,
             WalBuilder walBuilder,
             PaddingRow latestSchemaRow,
-            long startLogOffset)
+            long startLogOffset,
+            @Nullable WriterKey writerKey)
             throws Exception {
         long logOffset = startLogOffset;
 
@@ -653,6 +711,9 @@ public final class KvTablet {
             byte[] keyBytes = BytesUtils.toArray(kvRecord.getKey());
             KvPreWriteBuffer.Key key = KvPreWriteBuffer.Key.of(keyBytes);
             BinaryRow row = kvRecord.getRow();
+            if (writerKey != null) {
+                writeGuard.validateRecord(writerKey, keyBytes, row);
+            }
             BinaryValue currentValue;
             if (row == null) {
                 currentValue = null;

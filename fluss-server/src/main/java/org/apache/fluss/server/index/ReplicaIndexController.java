@@ -27,6 +27,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.KvWriteGuard;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -255,6 +256,13 @@ public final class ReplicaIndexController {
     public ToLongFunction<BinaryRow> createTagExtractor() {
         TombstonedPartitionDiscriminator d = this.tombstoneDiscriminator;
         return d == null ? null : d.createTagExtractor();
+    }
+
+    /** Creates the V1 write guard only for system-managed Index Tables. */
+    public KvWriteGuard createWriteGuard() {
+        return tableInfo.isIndexTable()
+                ? new IndexKvWriteGuard(tableInfo, metadataCache)
+                : KvWriteGuard.ACCEPT_ALL;
     }
 
     // ------------------------------------------------------------------------------------

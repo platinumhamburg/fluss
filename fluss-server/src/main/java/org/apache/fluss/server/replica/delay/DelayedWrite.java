@@ -75,7 +75,11 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
                         ((tableBucket, delayedBucketStatus) -> {
                             WriteResultForBucket writeResult =
                                     delayedBucketStatus.getWriteResultForBucket();
-                            if (writeResult.succeeded()) {
+                            if (writeResult.succeeded()
+                                    && delayedBucketStatus.getRequiredOffset() < 0L) {
+                                delayedBucketStatus.setAcksPending(false);
+                                delayedBucketStatus.setDelayedError(Errors.NONE);
+                            } else if (writeResult.succeeded()) {
                                 // Timeout error state will be cleared when required acks are
                                 // received.
                                 delayedBucketStatus.setAcksPending(true);

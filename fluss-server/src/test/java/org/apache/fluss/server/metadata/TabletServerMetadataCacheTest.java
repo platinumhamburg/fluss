@@ -22,6 +22,7 @@ import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.cluster.TabletServerInfo;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -135,6 +136,19 @@ public class TabletServerMetadataCacheTest {
                                 partitionName2,
                                 partitionId2,
                                 initialBucketMetadata));
+    }
+
+    @Test
+    void testAuthoritativeEmptyIsInitialized() {
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(8L)).isEmpty();
+
+        serverMetadataCache.updatePartitionTombstone(8L, PartitionTombstone.EMPTY);
+
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(8L))
+                .contains(PartitionTombstone.EMPTY);
+
+        serverMetadataCache.removePartitionTombstone(8L);
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(8L)).isEmpty();
     }
 
     @Test

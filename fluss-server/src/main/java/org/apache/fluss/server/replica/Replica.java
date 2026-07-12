@@ -60,6 +60,7 @@ import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexReplicator;
+import org.apache.fluss.server.index.IndexWriterKey;
 import org.apache.fluss.server.index.ReplicaIndexController;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
@@ -431,6 +432,34 @@ public final class Replica {
 
     public @Nullable KvTablet getKvTablet() {
         return kvTablet;
+    }
+
+    /** Retires writers for a newly tombstoned source partition under the KV write lock. */
+    public void retireTombstonedIndexWriters(long mainTableId) {
+        if (!tableInfo.isIndexTable()
+                || !tableInfo.getMainTableId().isPresent()
+                || tableInfo.getMainTableId().getAsLong() != mainTableId) {
+            return;
+        }
+        KvTablet kv = kvTablet;
+        if (kv == null) {
+            return;
+        }
+        kv.getGuardedExecutor()
+                .execute(
+                        () ->
+                                metadataCache
+                                        .getInitializedPartitionTombstone(mainTableId)
+                                        .ifPresent(
+                                                tombstone ->
+                                                        logTablet.removeFencedWriters(
+                                                                writerKey ->
+                                                                        tombstone.isTombstoned(
+                                                                                IndexWriterKey
+                                                                                        .decode(
+                                                                                                writerKey)
+                                                                                        .getPartitionId()
+                                                                                        .getAsLong()))));
     }
 
     public TablePath getTablePath() {
@@ -919,7 +948,8 @@ public final class Replica {
                                 tabletDir,
                                 schemaGetter,
                                 indexManager.createCompactionFilterFactory(),
-                                indexManager.createTagExtractor());
+                                indexManager.createTagExtractor(),
+                                indexManager.createWriteGuard());
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
@@ -948,7 +978,8 @@ public final class Replica {
                                 tableConfig,
                                 arrowCompressionInfo,
                                 indexManager.createCompactionFilterFactory(),
-                                indexManager.createTagExtractor());
+                                indexManager.createTagExtractor(),
+                                indexManager.createWriteGuard());
 
                 // we don't support rowCount
                 rowCount = tableConfig.getChangelogImage() == ChangelogImage.WAL ? null : 0L;
@@ -1274,8 +1305,10 @@ public final class Replica {
                         }
                         throw error;
                     }
-                    // we may need to increment high watermark.
-                    maybeIncrementLeaderHW(logTablet, clock.milliseconds());
+                    if (!logAppendInfo.hasNoAppend()) {
+                        // we may need to increment high watermark.
+                        maybeIncrementLeaderHW(logTablet, clock.milliseconds());
+                    }
                     return logAppendInfo;
                 });
     }

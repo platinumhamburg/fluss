@@ -252,6 +252,33 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                             compactionFilterFactory,
             @Nullable ToLongFunction<BinaryRow> tagExtractor)
             throws Exception {
+        return getOrCreateKv(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvFormat,
+                schemaGetter,
+                tableConfig,
+                arrowCompressionInfo,
+                compactionFilterFactory,
+                tagExtractor,
+                KvWriteGuard.ACCEPT_ALL);
+    }
+
+    public KvTablet getOrCreateKv(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            KvFormat kvFormat,
+            SchemaGetter schemaGetter,
+            TableConfig tableConfig,
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor,
+            KvWriteGuard writeGuard)
+            throws Exception {
         return inLock(
                 tabletCreationOrDeletionLock,
                 () -> {
@@ -290,7 +317,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     sharedRocksDBRateLimiter,
                                     autoIncrementManager,
                                     compactionFilterFactory,
-                                    tagExtractor);
+                                    tagExtractor,
+                                    writeGuard);
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -369,6 +397,23 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                             compactionFilterFactory,
             @Nullable ToLongFunction<BinaryRow> tagExtractor)
             throws Exception {
+        return loadKv(
+                tabletDir,
+                schemaGetter,
+                compactionFilterFactory,
+                tagExtractor,
+                KvWriteGuard.ACCEPT_ALL);
+    }
+
+    public KvTablet loadKv(
+            File tabletDir,
+            SchemaGetter schemaGetter,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor,
+            KvWriteGuard writeGuard)
+            throws Exception {
         Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TableBucket tableBucket = pathAndBucket.f1;
@@ -418,7 +463,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         sharedRocksDBRateLimiter,
                         autoIncrementManager,
                         compactionFilterFactory,
-                        tagExtractor);
+                        tagExtractor,
+                        writeGuard);
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(

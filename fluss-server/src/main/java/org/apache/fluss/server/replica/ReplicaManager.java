@@ -36,6 +36,7 @@ import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -582,9 +583,26 @@ public class ReplicaManager implements ServerReconfigurable {
                     // check or apply coordinator epoch.
                     validateAndApplyCoordinatorEpoch(coordinatorEpoch, "updateMetadataCache");
                     metadataCache.updateClusterMetadata(clusterMetadata);
+                    retireTombstonedIndexWriters(clusterMetadata.getPartitionTombstones());
                     updateReplicaTableConfig(clusterMetadata);
                     retryDeferredIndexReplicators();
                 });
+    }
+
+    private void retireTombstonedIndexWriters(Map<Long, PartitionTombstone> tombstones) {
+        if (tombstones == null || tombstones.isEmpty()) {
+            return;
+        }
+        for (Replica replica : getOnlineReplicaList()) {
+            if (!replica.getTableInfo().isIndexTable()
+                    || !replica.getTableInfo().getMainTableId().isPresent()) {
+                continue;
+            }
+            long mainTableId = replica.getTableInfo().getMainTableId().getAsLong();
+            if (tombstones.containsKey(mainTableId)) {
+                replica.retireTombstonedIndexWriters(mainTableId);
+            }
+        }
     }
 
     private void updateReplicaTableConfig(ClusterMetadata clusterMetadata) {
@@ -1357,7 +1375,9 @@ public class ReplicaManager implements ServerReconfigurable {
                         appendInfo.firstOffset(),
                         appendInfo.lastOffset());
                 putResultForBucketMap.put(
-                        tb, new PutKvResultForBucket(tb, appendInfo.lastOffset() + 1));
+                        tb,
+                        new PutKvResultForBucket(
+                                tb, appendInfo.hasNoAppend() ? -1L : appendInfo.lastOffset() + 1));
 
                 // metric for kv
                 tableMetrics.incKvMessageIn(entry.getValue().getRecordCount());

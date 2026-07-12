@@ -39,6 +39,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
@@ -190,6 +191,10 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
         return partitionTombstones.getOrDefault(mainTableId, PartitionTombstone.EMPTY);
     }
 
+    public Optional<PartitionTombstone> getInitializedPartitionTombstone(long mainTableId) {
+        return Optional.ofNullable(partitionTombstones.get(mainTableId));
+    }
+
     public OptionalInt getBucketLeader(long tableId, int bucketId) {
         Map<Integer, BucketMetadata> buckets =
                 serverMetadataSnapshot.getBucketMetadataForTable(tableId);
@@ -204,23 +209,20 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
     }
 
     public void updatePartitionTombstone(long mainTableId, PartitionTombstone tombstone) {
+        Objects.requireNonNull(tombstone, "tombstone");
         partitionTombstones.compute(
                 mainTableId,
                 (ignored, current) -> {
-                    if (current != null
-                            && tombstone != null
-                            && tombstone.getVersion() < current.getVersion()) {
+                    if (current != null && tombstone.getVersion() < current.getVersion()) {
                         return current;
-                    }
-                    // Remove only when the payload is structurally equivalent to the initial state
-                    // (PartitionTombstone.EMPTY, version == 0). A version-bearing-but-empty payload
-                    // (e.g. (-1, {}, v=N)) is a legitimate propagation entry and must be preserved
-                    // so that monotonic version bookkeeping is not lost.
-                    if (tombstone == null || PartitionTombstone.EMPTY.equals(tombstone)) {
-                        return null;
                     }
                     return tombstone;
                 });
+    }
+
+    /** Removes tombstone state only when the source table itself is deleted. */
+    public void removePartitionTombstone(long mainTableId) {
+        partitionTombstones.remove(mainTableId);
     }
 
     public void updateClusterMetadata(ClusterMetadata clusterMetadata) {
@@ -258,12 +260,14 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                             Long removedTableId = tableIdByPath.remove(tablePath);
                             if (removedTableId != null) {
                                 bucketMetadataMapForTables.remove(removedTableId);
+                                removePartitionTombstone(removedTableId);
                             }
                         } else if (tablePath == DELETED_TABLE_PATH) {
                             serverMetadataSnapshot
                                     .getTablePath(tableId)
                                     .ifPresent(tableIdByPath::remove);
                             bucketMetadataMapForTables.remove(tableId);
+                            removePartitionTombstone(tableId);
                         } else {
                             tableIdByPath.put(tablePath, tableId);
                             tableMetadata

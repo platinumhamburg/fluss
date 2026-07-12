@@ -689,7 +689,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     new HashSet<>(coordinatorContext.getLiveTabletServers().values()),
                     null,
                     null,
-                    tableBuckets);
+                    tableBuckets,
+                    collectPartitionTombstonesForIndexedTables());
 
             // register table metrics.
             coordinatorMetricGroup.addTableBucketMetricGroup(
@@ -703,7 +704,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     new HashSet<>(coordinatorContext.getLiveTabletServers().values()),
                     tableId,
                     null,
-                    Collections.emptySet());
+                    Collections.emptySet(),
+                    collectPartitionTombstonesForIndexedTables());
         }
     }
 
@@ -2256,11 +2258,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
     private Map<Long, PartitionTombstone> collectPartitionTombstonesForIndexedTables() {
         Map<Long, PartitionTombstone> tombstones = new HashMap<>();
-        Set<Long> visitedTableIds = new HashSet<>();
-        for (TableBucket tableBucket : coordinatorContext.getAllBuckets()) {
-            long tableId = tableBucket.getTableId();
-            if (!visitedTableIds.add(tableId)
-                    || coordinatorContext.isTableQueuedForDeletion(tableId)) {
+        for (long tableId : coordinatorContext.allTables().keySet()) {
+            if (coordinatorContext.isTableQueuedForDeletion(tableId)) {
                 continue;
             }
             TableInfo tableInfo = coordinatorContext.getTableInfoById(tableId);
@@ -2272,9 +2271,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
             try {
                 PartitionTombstone tombstone =
                         zooKeeperClient.getPartitionTombstone(tableInfo.getTablePath());
-                if (!PartitionTombstone.EMPTY.equals(tombstone)) {
-                    tombstones.put(tableId, tombstone);
-                }
+                tombstones.put(tableId, tombstone);
             } catch (Exception e) {
                 throw new FlussRuntimeException(
                         "Failed to load PartitionTombstone for table "
