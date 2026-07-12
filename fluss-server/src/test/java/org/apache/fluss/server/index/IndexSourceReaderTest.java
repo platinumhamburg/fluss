@@ -48,6 +48,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
@@ -94,6 +95,8 @@ final class IndexSourceReaderTest {
             assertThat(result.nextOffset()).isEqualTo(30L);
             assertThat(remote.closed.get()).isFalse();
         }
+        assertThat(remote.closed.get()).isFalse();
+        reader.close();
         assertThat(remote.closed.get()).isTrue();
         assertThat(sourceWal.readOffsets).containsExactly(20L);
     }
@@ -122,6 +125,76 @@ final class IndexSourceReaderTest {
         assertThat(sourceWal.readOffsets).containsExactly(10L);
         assertThat(sourceWal.readMaxBytes).containsExactly(5);
         assertThat(sourceWal.readMinOneMessage).containsExactly(true);
+    }
+
+    @Test
+    void testRemoteByteLimitReturnsHealthyPrefixWithoutPrematureEnd() {
+        TestingSourceWal sourceWal =
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        ControllableExecutor executor = new ControllableExecutor();
+        TestingRemoteFetcher remote =
+                new TestingRemoteFetcher(Arrays.asList(batch(0L, 10L), batch(10L, 20L))) {
+                    @Override
+                    public IndexSourceReader.RemoteRead fetchBounded(
+                            long startOffset, long localLogStartOffset, int maxBytes) {
+                        return remoteRead(
+                                Collections.singletonList(batch(0L, 10L)), true);
+                    }
+                };
+        IndexSourceReader reader = reader(sourceWal, () -> remote, executor);
+
+        CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 20L, 15);
+        executor.runNext();
+
+        try (IndexSourceReader.ReadResult result = future.join()) {
+            assertThat(offsets(result)).containsExactlyElementsOf(offsets(0L, 10L));
+            assertThat(result.nextOffset()).isEqualTo(10L);
+        }
+        assertThat(remote.closed).isFalse();
+    }
+
+    @Test
+    void testReusesRemoteSessionAcrossBoundedReadResults() {
+        TestingSourceWal sourceWal =
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        ControllableExecutor executor = new ControllableExecutor();
+        AtomicInteger opens = new AtomicInteger();
+        TestingRemoteFetcher remote =
+                new TestingRemoteFetcher(Arrays.asList(batch(0L, 10L), batch(10L, 20L))) {
+                    @Override
+                    public IndexSourceReader.RemoteRead fetchBounded(
+                            long startOffset, long localLogStartOffset, int maxBytes) {
+                        LogRecordBatch selected =
+                                startOffset == 0L ? batch(0L, 10L) : batch(10L, 20L);
+                        return remoteRead(
+                                Collections.singletonList(selected),
+                                selected.nextLogOffset() < localLogStartOffset);
+                    }
+                };
+        IndexSourceReader reader =
+                reader(
+                        sourceWal,
+                        () -> {
+                            opens.incrementAndGet();
+                            return remote;
+                        },
+                        executor);
+
+        CompletableFuture<IndexSourceReader.ReadResult> first = reader.read(0L, 20L, 5);
+        executor.runNext();
+        try (IndexSourceReader.ReadResult result = first.join()) {
+            assertThat(result.nextOffset()).isEqualTo(10L);
+        }
+        CompletableFuture<IndexSourceReader.ReadResult> second = reader.read(10L, 20L, 5);
+        executor.runNext();
+        try (IndexSourceReader.ReadResult result = second.join()) {
+            assertThat(result.nextOffset()).isEqualTo(20L);
+        }
+
+        assertThat(opens).hasValue(1);
+        assertThat(remote.closed).isFalse();
+        reader.close();
+        assertThat(remote.closed).isTrue();
     }
 
     @Test
@@ -536,6 +609,24 @@ final class IndexSourceReaderTest {
         public void close() {
             closed.set(true);
         }
+    }
+
+    private static IndexSourceReader.RemoteRead remoteRead(
+            Iterable<LogRecordBatch> batches, boolean stoppedByByteLimit) {
+        return new IndexSourceReader.RemoteRead() {
+            @Override
+            public boolean stoppedByByteLimit() {
+                return stoppedByByteLimit;
+            }
+
+            @Override
+            public java.util.Iterator<LogRecordBatch> iterator() {
+                return batches.iterator();
+            }
+
+            @Override
+            public void close() {}
+        };
     }
 
     private static final class ControllableExecutor implements Executor {

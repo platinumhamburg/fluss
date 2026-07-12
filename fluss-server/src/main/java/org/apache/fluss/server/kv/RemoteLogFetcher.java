@@ -75,31 +75,64 @@ public class RemoteLogFetcher implements Closeable {
     private static final String REMOTE_LOG_RECOVERY_DIR_PREFIX = "remote-log-recovery-";
     private static final int MAX_SEGMENT_METADATA_PER_PAGE = 16;
 
+    /** Defines whether batch views outlive a segment transition. */
+    public enum ConsumerMode {
+        KV_STREAMING,
+        INDEX_RETAINED
+    }
+
+    /** Explains why a bounded fetch stopped after it has been fully consumed. */
+    public enum StopReason {
+        NONE,
+        END,
+        BYTE_LIMIT
+    }
+
     private final RemoteLogManager remoteLogManager;
     private final TableBucket tableBucket;
     private final Path tempDir;
+    private final ConsumerMode consumerMode;
     private final Object lifecycleLock = new Object();
 
     /** Tracks the currently active iterator to ensure proper cleanup on close. */
     private RemoteLogBatchIterator activeIterator;
+    @Nullable private CachedSegment cachedSegment;
     private boolean closed;
 
     public RemoteLogFetcher(
             RemoteLogManager remoteLogManager, TableBucket tableBucket, File logTabletDir) {
+        this(remoteLogManager, tableBucket, logTabletDir, ConsumerMode.KV_STREAMING);
+    }
+
+    public RemoteLogFetcher(
+            RemoteLogManager remoteLogManager,
+            TableBucket tableBucket,
+            File logTabletDir,
+            ConsumerMode consumerMode) {
         this(
                 remoteLogManager,
                 tableBucket,
                 logTabletDir
                         .toPath()
                         .resolve("tmp")
-                        .resolve(REMOTE_LOG_RECOVERY_DIR_PREFIX + UUID.randomUUID()));
+                        .resolve(REMOTE_LOG_RECOVERY_DIR_PREFIX + UUID.randomUUID()),
+                consumerMode);
     }
 
     @VisibleForTesting
     RemoteLogFetcher(RemoteLogManager remoteLogManager, TableBucket tableBucket, Path tempDir) {
+        this(remoteLogManager, tableBucket, tempDir, ConsumerMode.KV_STREAMING);
+    }
+
+    private RemoteLogFetcher(
+            RemoteLogManager remoteLogManager,
+            TableBucket tableBucket,
+            Path tempDir,
+            ConsumerMode consumerMode) {
         this.remoteLogManager = remoteLogManager;
         this.tableBucket = tableBucket;
         this.tempDir = tempDir;
+        this.consumerMode = consumerMode;
     }
 
     /**
@@ -116,7 +149,7 @@ public class RemoteLogFetcher implements Closeable {
      *     iterator lazily downloads segments as needed.
      * @throws Exception if any error occurs during fetching or reading
      */
-    public Iterable<LogRecordBatch> fetch(long startOffset, long localLogStartOffset)
+    public FetchResult fetch(long startOffset, long localLogStartOffset)
             throws Exception {
         return fetchInternal(startOffset, localLogStartOffset, Long.MAX_VALUE);
     }
@@ -125,7 +158,7 @@ public class RemoteLogFetcher implements Closeable {
      * Fetches a byte-bounded range while retaining at most one small page of segment metadata.
      * The first batch may exceed {@code maxBytes}, matching local log min-one-message behavior.
      */
-    public Iterable<LogRecordBatch> fetch(
+    public FetchResult fetch(
             long startOffset, long localLogStartOffset, int maxBytes) throws Exception {
         if (maxBytes <= 0) {
             throw new IllegalArgumentException("maxBytes must be positive");
@@ -133,7 +166,7 @@ public class RemoteLogFetcher implements Closeable {
         return fetchInternal(startOffset, localLogStartOffset, maxBytes);
     }
 
-    private Iterable<LogRecordBatch> fetchInternal(
+    private FetchResult fetchInternal(
             long startOffset, long localLogStartOffset, long maxBytes) throws Exception {
         synchronized (lifecycleLock) {
             if (closed) {
@@ -178,13 +211,14 @@ public class RemoteLogFetcher implements Closeable {
                             localLogStartOffset,
                             maxBytes);
             this.activeIterator = iterator;
-            return () -> iterator;
+            return new FetchResult(iterator);
         }
     }
 
     @Override
     public void close() {
         RemoteLogBatchIterator iterator;
+        CachedSegment cached;
         synchronized (lifecycleLock) {
             if (closed) {
                 return;
@@ -192,9 +226,14 @@ public class RemoteLogFetcher implements Closeable {
             closed = true;
             iterator = activeIterator;
             activeIterator = null;
+            cached = cachedSegment;
+            cachedSegment = null;
         }
         if (iterator != null) {
             iterator.close();
+        }
+        if (cached != null) {
+            IOUtils.closeQuietly(cached.records, "FileLogRecords");
         }
         cleanupTempDirectory();
     }
@@ -219,7 +258,7 @@ public class RemoteLogFetcher implements Closeable {
      *
      * @return the local file containing the downloaded log data
      */
-    private File downloadSegment(RemoteLogSegment segment) throws IOException {
+    protected File downloadSegment(RemoteLogSegment segment) throws IOException {
         File localFile =
                 tempDir.resolve(
                                 FlussPaths.filenamePrefixFromOffset(segment.remoteLogStartOffset())
@@ -249,6 +288,29 @@ public class RemoteLogFetcher implements Closeable {
         return FileLogRecords.open(localFile, false);
     }
 
+    /** A closeable per-fetch lease over batch views and their backing files. */
+    public final class FetchResult implements Iterable<LogRecordBatch>, AutoCloseable {
+        private final RemoteLogBatchIterator iterator;
+
+        private FetchResult(RemoteLogBatchIterator iterator) {
+            this.iterator = iterator;
+        }
+
+        public StopReason stopReason() {
+            return iterator.stopReason;
+        }
+
+        @Override
+        public Iterator<LogRecordBatch> iterator() {
+            return iterator;
+        }
+
+        @Override
+        public void close() {
+            iterator.close();
+        }
+    }
+
     /**
      * An iterator that lazily downloads remote log segments and iterates over their batches in
      * order. It respects the startOffset and localLogStartOffset boundaries, yielding only batches
@@ -272,6 +334,8 @@ public class RemoteLogFetcher implements Closeable {
         private LogRecordBatch nextBatch;
         private boolean finished = false;
         private volatile boolean closed = false;
+        private volatile StopReason stopReason = StopReason.NONE;
+        @Nullable private RemoteLogSegment currentSegment;
 
         RemoteLogBatchIterator(
                 RemoteLogSegmentPage firstPage,
@@ -289,6 +353,8 @@ public class RemoteLogFetcher implements Closeable {
         /** Closes this iterator and releases all held resources. */
         public void close() {
             List<FileLogRecords> recordsToClose;
+            FileLogRecords currentRecords;
+            RemoteLogSegment segment;
             synchronized (this) {
                 if (closed) {
                     return;
@@ -296,10 +362,13 @@ public class RemoteLogFetcher implements Closeable {
                 closed = true;
                 recordsToClose = new ArrayList<>(openedFileLogRecords);
                 openedFileLogRecords.clear();
+                currentRecords = currentFileLogRecords;
+                segment = currentSegment;
                 currentFileLogRecords = null;
+                currentSegment = null;
                 currentBatchIterator = null;
             }
-            closeFileLogRecords(recordsToClose);
+            releaseIterator(this, recordsToClose, currentRecords, segment);
         }
 
         @Override
@@ -309,6 +378,7 @@ public class RemoteLogFetcher implements Closeable {
             }
             if (nextBatch == null && returnedBytes >= maxBytes) {
                 finished = true;
+                stopReason = StopReason.BYTE_LIMIT;
                 return false;
             }
             // Lazily advance while retaining opened files until close. Index replay may collect
@@ -346,11 +416,13 @@ public class RemoteLogFetcher implements Closeable {
                     // stop if we've reached localLogStartOffset
                     if (batch.baseLogOffset() >= localLogStartOffset) {
                         finished = true;
+                        stopReason = StopReason.END;
                         return;
                     }
                     if (returnedBytes > 0
                             && returnedBytes + batch.sizeInBytes() > maxBytes) {
                         finished = true;
+                        stopReason = StopReason.BYTE_LIMIT;
                         return;
                     }
                     nextBatch = batch;
@@ -360,12 +432,30 @@ public class RemoteLogFetcher implements Closeable {
                     return;
                 }
 
+                boolean completedSegment = currentFileLogRecords != null;
+                if (completedSegment && consumerMode == ConsumerMode.KV_STREAMING) {
+                    closeStreamingSegment(currentFileLogRecords);
+                }
                 currentFileLogRecords = null;
+                currentSegment = null;
                 currentBatchIterator = null;
+
+                // A bounded retaining result stops at the segment boundary rather than opening a
+                // segment merely to reject its first batch. The next read resumes at currentOffset.
+                if (completedSegment
+                        && consumerMode == ConsumerMode.INDEX_RETAINED
+                        && maxBytes != Long.MAX_VALUE
+                        && returnedBytes > 0
+                        && currentOffset < localLogStartOffset) {
+                    finished = true;
+                    stopReason = StopReason.BYTE_LIMIT;
+                    return;
+                }
 
                 // move to next segment
                 if (currentSegmentIndex >= segments.size() && !loadNextMetadataPage()) {
                     finished = true;
+                    stopReason = StopReason.END;
                     return;
                 }
 
@@ -377,6 +467,7 @@ public class RemoteLogFetcher implements Closeable {
                 // skip segments that start at or after localLogStartOffset
                 if (segment.remoteLogStartOffset() >= localLogStartOffset) {
                     finished = true;
+                    stopReason = StopReason.END;
                     return;
                 }
 
@@ -385,15 +476,19 @@ public class RemoteLogFetcher implements Closeable {
                     // current one. Otherwise, the recovery process may be significantly slowed down
                     // by the download time of remote segments, especially when there are many
                     // segments to fetch. trace by: https://github.com/apache/fluss/issues/3091
-                    File localFile = downloadSegment(segment);
-                    FileLogRecords openedRecords = openDownloadedSegment(localFile);
-                    if (!registerOpenedFileLogRecords(openedRecords)) {
-                        IOUtils.closeQuietly(openedRecords, "FileLogRecords");
-                        cleanupTempDirectory();
-                        finished = true;
-                        return;
+                    FileLogRecords openedRecords = acquireCachedSegment(this, segment);
+                    if (openedRecords == null) {
+                        File localFile = downloadSegment(segment);
+                        openedRecords = openDownloadedSegment(localFile);
+                        if (!registerOpenedFileLogRecords(openedRecords)) {
+                            IOUtils.closeQuietly(openedRecords, "FileLogRecords");
+                            cleanupTempDirectory();
+                            finished = true;
+                            return;
+                        }
                     }
                     currentFileLogRecords = openedRecords;
+                    currentSegment = segment;
                     int startPosition = 0;
                     // if this segment contains data before currentOffset, find the right position
                     if (segment.remoteLogStartOffset() < currentOffset) {
@@ -453,6 +548,16 @@ public class RemoteLogFetcher implements Closeable {
             return true;
         }
 
+        private void closeStreamingSegment(FileLogRecords records) {
+            boolean owned;
+            synchronized (this) {
+                owned = openedFileLogRecords.remove(records);
+            }
+            if (owned) {
+                IOUtils.closeQuietly(records, "FileLogRecords");
+            }
+        }
+
         private void closeOpenedFileLogRecords() {
             List<FileLogRecords> recordsToClose;
             synchronized (this) {
@@ -470,4 +575,69 @@ public class RemoteLogFetcher implements Closeable {
             }
         }
     }
+
+    @Nullable
+    private FileLogRecords acquireCachedSegment(
+            RemoteLogBatchIterator owner, RemoteLogSegment segment) {
+        synchronized (lifecycleLock) {
+            CachedSegment cached = cachedSegment;
+            if (cached == null) {
+                return null;
+            }
+            if (!cached.segment.remoteLogSegmentId().equals(segment.remoteLogSegmentId())
+                    || !cached.records.channel().isOpen()) {
+                cachedSegment = null;
+                IOUtils.closeQuietly(cached.records, "FileLogRecords");
+                return null;
+            }
+            if (!owner.registerOpenedFileLogRecords(cached.records)) {
+                return null;
+            }
+            cachedSegment = null;
+            return cached.records;
+        }
+    }
+
+    private void releaseIterator(
+            RemoteLogBatchIterator iterator,
+            List<FileLogRecords> ownedRecords,
+            @Nullable FileLogRecords currentRecords,
+            @Nullable RemoteLogSegment currentSegment) {
+        CachedSegment priorCached = null;
+        synchronized (lifecycleLock) {
+            if (activeIterator == iterator) {
+                activeIterator = null;
+            }
+            if (!closed
+                    && consumerMode == ConsumerMode.INDEX_RETAINED
+                    && currentRecords != null
+                    && currentSegment != null
+                    && currentRecords.channel().isOpen()) {
+                ownedRecords.remove(currentRecords);
+                priorCached = cachedSegment;
+                cachedSegment = new CachedSegment(currentSegment, currentRecords);
+            }
+        }
+        if (priorCached != null) {
+            IOUtils.closeQuietly(priorCached.records, "FileLogRecords");
+        }
+        closeFileLogRecords(ownedRecords);
+    }
+
+    private static void closeFileLogRecords(List<FileLogRecords> recordsToClose) {
+        for (FileLogRecords records : recordsToClose) {
+            IOUtils.closeQuietly(records, "FileLogRecords");
+        }
+    }
+
+    private static final class CachedSegment {
+        private final RemoteLogSegment segment;
+        private final FileLogRecords records;
+
+        private CachedSegment(RemoteLogSegment segment, FileLogRecords records) {
+            this.segment = segment;
+            this.records = records;
+        }
+    }
+
 }

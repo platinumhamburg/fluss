@@ -20,12 +20,15 @@ package org.apache.fluss.server.kv;
 import org.apache.fluss.exception.RemoteStorageException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.remote.RemoteLogTestBase;
 import org.apache.fluss.server.log.remote.RemoteLogTablet.RemoteLogSegmentPage;
 import org.apache.fluss.server.replica.Replica;
+import org.apache.fluss.utils.CloseableIterator;
 
 import org.junit.jupiter.api.Test;
 
@@ -45,6 +48,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
+import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
@@ -450,6 +455,165 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
             assertThat(examinedMetadata).hasValueLessThanOrEqualTo(reads * 16);
             assertThat(maxOpenHandles).hasValue(1);
             assertThat(openedRecords).hasSizeLessThanOrEqualTo(reads);
+        }
+        assertThat(openedRecords).allMatch(records -> !records.channel().isOpen());
+    }
+
+    @Test
+    void testIndexModeResumesWithinSegmentWithoutRedownload() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        RemoteLogSegment segment = remoteLogManager.relevantRemoteLogSegments(tb, 0L).get(0);
+        AtomicInteger downloads = new AtomicInteger();
+        AtomicInteger opens = new AtomicInteger();
+        List<FileLogRecords> openedRecords = new ArrayList<>();
+        try (RemoteLogFetcher fetcher =
+                new RemoteLogFetcher(
+                        remoteLogManager,
+                        tb,
+                        logTablet.getLogDir(),
+                        RemoteLogFetcher.ConsumerMode.INDEX_RETAINED) {
+                    @Override
+                    protected File downloadSegment(RemoteLogSegment remoteSegment)
+                            throws IOException {
+                        downloads.incrementAndGet();
+                        return super.downloadSegment(remoteSegment);
+                    }
+
+                    @Override
+                    protected FileLogRecords openDownloadedSegment(File localFile)
+                            throws IOException {
+                        opens.incrementAndGet();
+                        FileLogRecords records = super.openDownloadedSegment(localFile);
+                        openedRecords.add(records);
+                        return records;
+                    }
+                }) {
+            long offset = segment.remoteLogStartOffset();
+            int windows = 0;
+            while (offset < segment.remoteLogEndOffset()) {
+                try (RemoteLogFetcher.FetchResult result =
+                        fetcher.fetch(offset, segment.remoteLogEndOffset(), 1)) {
+                    Iterator<LogRecordBatch> batches = result.iterator();
+                    assertThat(batches.hasNext()).isTrue();
+                    LogRecordBatch batch = batches.next();
+                    assertThat(batch.nextLogOffset()).isGreaterThan(offset);
+                    offset = batch.nextLogOffset();
+                    assertThat(batches.hasNext()).isFalse();
+                    if (offset < segment.remoteLogEndOffset()) {
+                        assertThat(result.stopReason())
+                                .isEqualTo(RemoteLogFetcher.StopReason.BYTE_LIMIT);
+                    }
+                }
+                windows++;
+            }
+
+            assertThat(windows).isGreaterThan(1);
+            assertThat(downloads).hasValue(1);
+            assertThat(opens).hasValue(1);
+            assertThat(openedRecords).singleElement().matches(records -> records.channel().isOpen());
+        }
+        assertThat(openedRecords).allMatch(records -> !records.channel().isOpen());
+    }
+
+    @Test
+    void testKvStreamingKeepsOneOpenHandleAcrossManySegments() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 32);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        List<RemoteLogSegment> segments = remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        long remoteEndOffset = segments.get(segments.size() - 1).remoteLogEndOffset();
+        List<FileLogRecords> openedRecords = new ArrayList<>();
+        AtomicInteger maxOpenHandles = new AtomicInteger();
+        try (RemoteLogFetcher fetcher =
+                new RemoteLogFetcher(remoteLogManager, tb, logTablet.getLogDir()) {
+                    @Override
+                    protected FileLogRecords openDownloadedSegment(File localFile)
+                            throws IOException {
+                        FileLogRecords records = super.openDownloadedSegment(localFile);
+                        openedRecords.add(records);
+                        int openHandles =
+                                (int)
+                                        openedRecords.stream()
+                                                .filter(opened -> opened.channel().isOpen())
+                                                .count();
+                        maxOpenHandles.accumulateAndGet(openHandles, Math::max);
+                        return records;
+                    }
+                }) {
+            long expectedOffset = 0L;
+            int batches = 0;
+            for (LogRecordBatch batch : fetcher.fetch(0L, remoteEndOffset)) {
+                assertThat(batch.baseLogOffset()).isEqualTo(expectedOffset);
+                expectedOffset = batch.nextLogOffset();
+                batches++;
+            }
+
+            assertThat(batches).isPositive();
+            assertThat(expectedOffset).isEqualTo(remoteEndOffset);
+            assertThat(maxOpenHandles).hasValue(1);
+        }
+        assertThat(openedRecords).allMatch(records -> !records.channel().isOpen());
+    }
+
+    @Test
+    void testKvStreamingConsumesFinalRemoteRecordBeforeSegmentClose() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+        addMultiSegmentsToLogTablet(logTablet, 6);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        List<RemoteLogSegment> segments = remoteLogManager.relevantRemoteLogSegments(tb, 0L);
+        long startOffset = segments.get(0).remoteLogStartOffset();
+        long remoteEndOffset = segments.get(segments.size() - 1).remoteLogEndOffset();
+        List<FileLogRecords> openedRecords = new ArrayList<>();
+        AtomicInteger maxOpenHandles = new AtomicInteger();
+        try (LogRecordReadContext readContext =
+                        LogRecordReadContext.createCompactedRowReadContext(
+                                DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID);
+                RemoteLogFetcher fetcher =
+                        new RemoteLogFetcher(remoteLogManager, tb, logTablet.getLogDir()) {
+                            @Override
+                            protected FileLogRecords openDownloadedSegment(File localFile)
+                                    throws IOException {
+                                FileLogRecords records = super.openDownloadedSegment(localFile);
+                                openedRecords.add(records);
+                                int openHandles =
+                                        (int)
+                                                openedRecords.stream()
+                                                        .filter(
+                                                                opened ->
+                                                                        opened.channel().isOpen())
+                                                        .count();
+                                maxOpenHandles.accumulateAndGet(openHandles, Math::max);
+                                return records;
+                            }
+                        }) {
+            long expectedBatchOffset = startOffset;
+            long expectedRecordOffset = startOffset;
+            for (LogRecordBatch batch : fetcher.fetch(startOffset, remoteEndOffset)) {
+                assertThat(batch.baseLogOffset()).isEqualTo(expectedBatchOffset);
+                try (CloseableIterator<LogRecord> records = batch.records(readContext)) {
+                    while (records.hasNext()) {
+                        LogRecord record = records.next();
+                        assertThat(record.logOffset()).isEqualTo(expectedRecordOffset);
+                        expectedRecordOffset++;
+                    }
+                }
+                expectedBatchOffset = batch.nextLogOffset();
+            }
+
+            assertThat(expectedBatchOffset).isEqualTo(remoteEndOffset);
+            assertThat(expectedRecordOffset).isEqualTo(remoteEndOffset);
+            assertThat(maxOpenHandles).hasValue(1);
         }
         assertThat(openedRecords).allMatch(records -> !records.channel().isOpen());
     }
