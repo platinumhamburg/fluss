@@ -625,13 +625,16 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                     "Failed to truncate and restore writer snapshot for {} while log hash been moved to remote",
                     tb,
                     e);
-            if (replica.getTableInfo().isIndexTable()) {
+            boolean indexTable = replica.getTableInfo().isIndexTable();
+            if (indexTable) {
                 replicaManager.markReplicaOffline(tb, replica);
-                throw new StorageException(
-                        "Remote WriterState recovery failed for Index Table bucket " + tb, e);
             }
             if (e instanceof Error) {
                 throw (Error) e;
+            }
+            if (indexTable) {
+                throw new StorageException(
+                        "Remote WriterState recovery failed for Index Table bucket " + tb, e);
             }
             return -1L;
         }

@@ -564,6 +564,62 @@ public class ReplicaFetcherThreadTest {
     }
 
     @Test
+    void testIndexRemoteRecoveryRethrowsOriginalJvmError() throws Exception {
+        long initialOffset = 7L;
+        long remoteEndOffset = 50L;
+        TablePath indexPath = TablePath.of("test_db", "remote_error_index");
+        TableBucket indexBucket = registerIndexTableFollower(indexPath, 9902L);
+        Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
+        ScriptedRemoteLeaderEndpoint endpoint =
+                new ScriptedRemoteLeaderEndpoint(
+                        new Configuration(), leaderRM, followerServerId);
+        endpoint.addResponse(
+                indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
+        ReplicaFetcherThread fetcher =
+                new ReplicaFetcherThread("index-remote-error", followerRM, endpoint, 1000);
+        AssertionError injectedError = new AssertionError("injected remote recovery error");
+        fetcher.setRemoteWriterStateRecovery(
+                (ignoredReplica, ignoredFetchInfo, ignoredOffset) -> {
+                    throw injectedError;
+                });
+        fetcher.addBuckets(
+                Collections.singletonMap(
+                        indexBucket,
+                        new InitialFetchStatus(9902L, indexPath, leader.id(), initialOffset)));
+
+        assertThatThrownBy(fetcher::doWork)
+                .isSameAs(injectedError)
+                .isExactlyInstanceOf(AssertionError.class);
+
+        assertThat(fetcher.fetchStatus(indexBucket)).isPresent();
+        assertThat(fetcher.fetchStatus(indexBucket).get().fetchOffset()).isEqualTo(initialOffset);
+        assertThat(fetcher.fetchStatus(indexBucket).get().fetchOffset())
+                .isNotEqualTo(remoteEndOffset);
+        assertThatThrownBy(() -> followerRM.getReplicaOrException(indexBucket))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+        assertThatThrownBy(
+                        () ->
+                                failedReplica.makeLeader(
+                                        new NotifyLeaderAndIsrData(
+                                                PhysicalTablePath.of(indexPath),
+                                                indexBucket,
+                                                Arrays.asList(
+                                                        leaderServerId, followerServerId),
+                                                new LeaderAndIsr(
+                                                        followerServerId,
+                                                        INITIAL_LEADER_EPOCH + 1,
+                                                        Arrays.asList(
+                                                                leaderServerId,
+                                                                followerServerId),
+                                                        Collections.emptyList(),
+                                                        INITIAL_COORDINATOR_EPOCH,
+                                                        INITIAL_BUCKET_EPOCH + 1))))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+    }
+
+    @Test
     void testSuccessfulRemoteRecoveryAdvancesExactlyToRemoteEndOffset() throws Exception {
         long initialOffset = 7L;
         long remoteEndOffset = 50L;
