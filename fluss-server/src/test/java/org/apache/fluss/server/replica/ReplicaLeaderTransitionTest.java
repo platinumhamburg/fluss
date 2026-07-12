@@ -35,7 +35,11 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -57,11 +61,69 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ReplicaLeaderTransitionTest extends ReplicaTestBase {
 
+    private static final String DISABLED_SNAPSHOT_INTERVAL_TAG = "disabled-snapshot-interval";
+
     @Override
     protected Configuration getServerConf() {
         Configuration configuration = super.getServerConf();
         configuration.set(ConfigOptions.REMOTE_LOG_TASK_INTERVAL_DURATION, Duration.ofHours(1));
         return configuration;
+    }
+
+    @Override
+    protected Duration getKvSnapshotInterval(TestInfo testInfo) {
+        return testInfo.getTags().contains(DISABLED_SNAPSHOT_INTERVAL_TAG)
+                ? Duration.ZERO
+                : super.getKvSnapshotInterval(testInfo);
+    }
+
+    @Tag(DISABLED_SNAPSHOT_INTERVAL_TAG)
+    @ParameterizedTest
+    @EnumSource(KvIdempotenceProtocol.class)
+    void testDisabledSnapshotIntervalPublishesReadyKvLeaderWithoutRetry(
+            KvIdempotenceProtocol protocol) throws Exception {
+        long tableId = 150106L + protocol.version();
+        TablePath tablePath =
+                TablePath.of(
+                        "test_db_1", "disabled_snapshot_interval_" + protocol.version());
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        registerTableInZkClient(
+                tablePath,
+                DATA1_SCHEMA_PK,
+                tableId,
+                Collections.singletonList("a"),
+                Collections.singletonMap(
+                        ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(),
+                        String.valueOf(protocol.version())));
+
+        assertThat(notifyLeader(tablePath, tableBucket, 2, 0).get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+        Replica replica = replicaManager.getReplicaOrException(tableBucket);
+        assertThat(replica.isLeader()).isFalse();
+        assertThat(replica.getKvSnapshotManager()).isNull();
+
+        AtomicInteger initializationAttempts = new AtomicInteger();
+        List<PeriodicSnapshotManager> attemptedManagers = new ArrayList<>();
+        replica.setKvSnapshotInitializationFaultInjector(
+                manager -> {
+                    initializationAttempts.incrementAndGet();
+                    attemptedManagers.add(manager);
+                });
+
+        assertThat(notifyLeader(tablePath, tableBucket, TABLET_SERVER_ID, 1).get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+
+        assertThat(initializationAttempts).hasValue(1);
+        assertThat(attemptedManagers).containsExactly(replica.getKvSnapshotManager());
+        assertThat(replica.isLeader()).isTrue();
+        assertThat(replica.getLeaderId()).isEqualTo(TABLET_SERVER_ID);
+        assertThat(replica.getLeaderEpoch()).isEqualTo(1);
+        assertThat(replica.getKvTablet()).isNotNull();
+        assertThat(kvManager.getKv(tableBucket)).contains(replica.getKvTablet());
+        assertThat(replica.hasReadyKvSnapshotManager()).isTrue();
+        assertThat(replica.getKvSnapshotManager().isStarted()).isTrue();
+        assertThat(replica.getKvSnapshotManager().hasScheduledSnapshot()).isFalse();
+        assertThat(remoteLogTaskScheduler.getActivePeriodicScheduledTask()).hasSize(1);
     }
 
     @Test

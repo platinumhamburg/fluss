@@ -26,6 +26,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -70,12 +72,25 @@ class PeriodicSnapshotManagerTest {
         checkOnlyOneScheduledTasks();
     }
 
-    @Test
-    void testInitWithNonPositiveSnapshotInterval() {
-        periodicSnapshotManager = createSnapshotManager(0, NopSnapshotTarget.INSTANCE);
+    @ParameterizedTest
+    @ValueSource(longs = {0, -1})
+    void testInitWithNonPositiveSnapshotInterval(long snapshotInterval) {
+        periodicSnapshotManager =
+                createSnapshotManager(snapshotInterval, NopSnapshotTarget.INSTANCE);
         periodicSnapshotManager.start();
-        // periodic snapshot is disabled when periodicMaterializeDelay is not positive
+
+        assertThat(periodicSnapshotManager.isStarted()).isTrue();
+        assertThat(periodicSnapshotManager.hasScheduledSnapshot()).isFalse();
         Assertions.assertEquals(0, scheduledExecutorService.getAllScheduledTasks().size());
+
+        periodicSnapshotManager.triggerSnapshot();
+        assertThat(periodicSnapshotManager.isStarted()).isTrue();
+        assertThat(periodicSnapshotManager.hasScheduledSnapshot()).isFalse();
+        Assertions.assertEquals(0, scheduledExecutorService.getAllScheduledTasks().size());
+
+        periodicSnapshotManager.close();
+        assertThat(periodicSnapshotManager.isStarted()).isFalse();
+        assertThat(periodicSnapshotManager.hasScheduledSnapshot()).isFalse();
     }
 
     @Test

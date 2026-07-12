@@ -191,8 +191,7 @@ public class ReplicaTestBase {
         conf.setString(ConfigOptions.COORDINATOR_HOST, "localhost");
         conf.set(ConfigOptions.REMOTE_DATA_DIR, tempDir.getAbsolutePath() + "/remote_data_dir");
         conf.set(ConfigOptions.SERVER_IO_POOL_SIZE, 2);
-        // set snapshot interval to 1 seconds for test purpose
-        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1));
+        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, getKvSnapshotInterval(testInfo));
 
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE, MemorySize.parse("10kb"));
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_PAGE_SIZE, MemorySize.parse("512b"));
@@ -251,6 +250,10 @@ public class ReplicaTestBase {
     // Kept for subclasses that still define @BeforeEach setup() and call super.setup().
     // The actual initialization already happens in setup(TestInfo).
     protected void setup() throws Exception {}
+
+    protected Duration getKvSnapshotInterval(TestInfo testInfo) {
+        return Duration.ofSeconds(1);
+    }
 
     private void initMetadataCache(TabletServerMetadataCache metadataCache) {
         metadataCache.updateClusterMetadata(

@@ -165,13 +165,19 @@ public class PeriodicSnapshotManager implements Closeable {
     }
 
     public synchronized void start() {
-        if (!started && snapshotIntervalSupplier.getAsLong() > 0) {
-            if (periodicExecutor.isShutdown()) {
-                throw new IllegalStateException(
-                        "Cannot start periodic snapshot manager because its scheduler is shut down");
-            }
+        if (!started) {
+            long snapshotInterval = snapshotIntervalSupplier.getAsLong();
             started = true;
             try {
+                if (snapshotInterval <= 0) {
+                    LOG.info(
+                            "TableBucket {} starts with periodic snapshots disabled", tableBucket);
+                    return;
+                }
+                if (periodicExecutor.isShutdown()) {
+                    throw new IllegalStateException(
+                            "Cannot start periodic snapshot manager because its scheduler is shut down");
+                }
                 LOG.info("TableBucket {} starts periodic snapshot", tableBucket);
                 scheduleNextSnapshot(Math.max(initialDelay, 1));
                 if (scheduledTask == null) {
@@ -194,13 +200,18 @@ public class PeriodicSnapshotManager implements Closeable {
         return started;
     }
 
+    @VisibleForTesting
+    public synchronized boolean hasScheduledSnapshot() {
+        return scheduledTask != null && !scheduledTask.isDone();
+    }
+
     public long getSnapshotSize() {
         return target.getSnapshotSize();
     }
 
     // schedule thread and asyncOperationsThreadPool can access this method
     private synchronized void scheduleNextSnapshot(long delay) {
-        if (started && !periodicExecutor.isShutdown()) {
+        if (started && delay > 0 && !periodicExecutor.isShutdown()) {
 
             LOG.debug(
                     "TableBucket {} schedules the next snapshot in {} seconds",
