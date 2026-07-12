@@ -241,7 +241,6 @@ public final class IndexSourceReader implements AutoCloseable {
             remoteRead =
                     remoteFetcher.fetchBounded(
                             nextOffset, localLogStartOffset, maxBytes);
-            collector.attachResource(remoteRead);
             collector.collect(remoteRead, remoteEnd);
             if (remoteRead.stoppedByByteLimit()) {
                 collector.markByteLimit();
@@ -254,6 +253,13 @@ public final class IndexSourceReader implements AutoCloseable {
                                 + remoteEnd);
             }
 
+            AutoCloseable resultResource =
+                    remoteReadResource(
+                            remoteRead,
+                            remoteFetcher,
+                            collector.nextOffset() == remoteEnd);
+            collector.attachResource(resultResource);
+
             ReadResult result;
             if (!collector.limitReached()
                     && collector.nextOffset() == localLogStartOffset
@@ -265,7 +271,7 @@ public final class IndexSourceReader implements AutoCloseable {
                                 collector.remainingBytes(),
                                 collector);
             } else {
-                result = collector.finish(remoteRead);
+                result = collector.finish(resultResource);
             }
             remoteRead = null;
             if (closed.get() || future.isCancelled()) {
@@ -309,6 +315,22 @@ public final class IndexSourceReader implements AutoCloseable {
         if (remoteFetcherSession.compareAndSet(fetcher, null)) {
             fetcher.close();
         }
+    }
+
+    private AutoCloseable remoteReadResource(
+            RemoteRead remoteRead, RemoteFetcher remoteFetcher, boolean retireSession) {
+        if (!retireSession) {
+            return remoteRead;
+        }
+        return () -> {
+            try {
+                // Closing the fetcher first prevents iterator release from caching the final
+                // segment after the result's batch views have been consumed.
+                discardRemoteFetcher(remoteFetcher);
+            } finally {
+                remoteRead.close();
+            }
+        };
     }
 
     private ReadResult readLocal(

@@ -95,7 +95,7 @@ final class IndexSourceReaderTest {
             assertThat(result.nextOffset()).isEqualTo(30L);
             assertThat(remote.closed.get()).isFalse();
         }
-        assertThat(remote.closed.get()).isFalse();
+        assertThat(remote.closed.get()).isTrue();
         reader.close();
         assertThat(remote.closed.get()).isTrue();
         assertThat(sourceWal.readOffsets).containsExactly(20L);
@@ -185,6 +185,9 @@ final class IndexSourceReaderTest {
         try (IndexSourceReader.ReadResult result = first.join()) {
             assertThat(result.nextOffset()).isEqualTo(10L);
         }
+        assertThat(opens).hasValue(1);
+        assertThat(remote.closed).isFalse();
+
         CompletableFuture<IndexSourceReader.ReadResult> second = reader.read(10L, 20L, 5);
         executor.runNext();
         try (IndexSourceReader.ReadResult result = second.join()) {
@@ -192,7 +195,7 @@ final class IndexSourceReaderTest {
         }
 
         assertThat(opens).hasValue(1);
-        assertThat(remote.closed).isFalse();
+        assertThat(remote.closed).isTrue();
         reader.close();
         assertThat(remote.closed).isTrue();
     }
