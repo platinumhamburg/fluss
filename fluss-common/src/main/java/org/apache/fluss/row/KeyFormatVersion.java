@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.Internal;
 
 import java.util.Optional;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_1;
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 
@@ -31,7 +32,7 @@ public final class KeyFormatVersion {
     private KeyFormatVersion() {}
 
     public static int resolve(Optional<Integer> kvFormatVersion) {
-        return resolve(kvFormatVersion.orElse(KV_FORMAT_VERSION_2));
+        return resolve(kvFormatVersion.orElse(KV_FORMAT_VERSION_1));
     }
 
     public static int resolve(int kvFormatVersion) {

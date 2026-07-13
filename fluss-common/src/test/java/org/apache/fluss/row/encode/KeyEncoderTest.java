@@ -59,7 +59,7 @@ class KeyEncoderTest {
     }
 
     @Test
-    void testMissingKvFormatVersionDefaultsToVersionTwoKeyEncoding() {
+    void testMissingKvFormatVersionPreservesLegacyVersionOneKeyEncoding() {
         DataType[] dataTypes = new DataType[] {DataTypes.STRING(), DataTypes.BIGINT()};
         String[] fieldNames = new String[] {"name", "id"};
         RowType rowType = RowType.of(dataTypes, fieldNames);
@@ -84,8 +84,8 @@ class KeyEncoderTest {
                         false);
 
         byte[] lookupKey = missingVersionEncoder.encodeKey(row("Alice", 1L));
-        assertThat(lookupKey).isEqualTo(versionTwoEncoder.encodeKey(row("Alice", 1L)));
-        assertThat(lookupKey).isNotEqualTo(versionOneEncoder.encodeKey(row("Alice", 1L)));
+        assertThat(lookupKey).isEqualTo(versionOneEncoder.encodeKey(row("Alice", 1L)));
+        assertThat(lookupKey).isNotEqualTo(versionTwoEncoder.encodeKey(row("Alice", 1L)));
     }
 
     private static TableConfig tableConfigWithKvFormatVersion(int kvFormatVersion) {

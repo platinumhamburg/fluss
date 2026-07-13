@@ -56,6 +56,7 @@ import static org.apache.fluss.config.ConfigOptions.NoKeyAssigner.STICKY;
 public class ConfigOptions {
     public static final String DEFAULT_LISTENER_NAME = "FLUSS";
 
+    public static final int KV_FORMAT_VERSION_1 = 1;
     public static final int KV_FORMAT_VERSION_2 = 2;
     public static final int KV_FORMAT_VERSION_3 = 3;
     public static final int CURRENT_KV_FORMAT_VERSION = KV_FORMAT_VERSION_3;
@@ -1538,13 +1539,12 @@ public class ConfigOptions {
                                     + "Note: The datalake encoding and bucketing strategy mentioned below only takes effect "
                                     + "when 'datalake.format' is configured at cluster level. "
                                     + "Version Behaviors: "
-                                    + "(1) Version 1: Explicit legacy version that uses datalake's encoder "
+                                    + "(1) Version 1: Legacy tables with an explicit version 1 or missing version metadata use datalake's encoder "
                                     + "(e.g., Paimon/Iceberg) for both primary key and bucket key encoding. "
                                     + "This may not support prefix lookup properly because some datalake encoders (like Paimon) "
                                     + "don't guarantee that encoded bucket key bytes are a prefix of encoded primary key bytes. "
                                     + "(2) Version 2: Ordinary primary-key tables use Fluss's default encoder for primary key encoding "
                                     + "when bucket key differs from primary key, which ensures proper prefix lookup support. "
-                                    + "Missing version metadata resolves to version-2 key semantics. "
                                     + "When bucket key equals primary key (default bucket key), it still uses datalake's encoder "
                                     + "for optimization (encoded bytes can be reused for bucket calculation). "
                                     + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation. "

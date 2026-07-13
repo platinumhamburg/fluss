@@ -18,6 +18,8 @@
 package org.apache.fluss.record;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
@@ -26,6 +28,7 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
@@ -223,7 +226,7 @@ class KeyRecordBatchTest extends KvTestBase {
     }
 
     @Test
-    void testCreateDefaultsMissingKvFormatVersionToVersionTwo() {
+    void testCreatePreservesLegacyKeysWhenKvFormatVersionIsMissing() {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
@@ -247,9 +250,15 @@ class KeyRecordBatchTest extends KvTestBase {
                         null,
                         now,
                         now);
-        CompactedKeyEncoder keyEncoder =
-                CompactedKeyEncoder.createKeyEncoder(
-                        schema.getRowType(), schema.getPrimaryKeyColumnNames());
+        Configuration legacyConfig = new Configuration();
+        legacyConfig.set(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON);
+        legacyConfig.set(ConfigOptions.TABLE_KV_FORMAT_VERSION, 1);
+        KeyEncoder keyEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        schema.getRowType(),
+                        schema.getPrimaryKeyColumnNames(),
+                        new TableConfig(legacyConfig),
+                        false);
         byte[] key = keyEncoder.encodeKey(row(1, "Alice", "ignored"));
 
         KeyRecordBatch batch = KeyRecordBatch.create(Collections.singletonList(key), tableInfo);

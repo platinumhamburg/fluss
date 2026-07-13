@@ -20,6 +20,7 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
@@ -45,6 +46,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -618,6 +620,29 @@ final class LogLoaderTest extends LogTestBase {
                                 .indexWriterStateRecoveryCoverageFailures()
                                 .getCount())
                 .isEqualTo(failuresBefore + 1L);
+    }
+
+    @Test
+    void testV1CleanShutdownRejectsCorruptWalWhileRebuildingWriterState() throws Exception {
+        WriterKey writerKey = new WriterKey(7L, 8L);
+        LogTablet log = createFencedLogTablet(true);
+        appendFenced(log, writerKey, 100L);
+        File walFile = log.getSegments().get(0).getFileLogRecords().file();
+        log.close();
+        for (SnapshotFile snapshot : WriterStateManager.listSnapshotFiles(logDir)) {
+            snapshot.deleteIfExists();
+        }
+        try (RandomAccessFile file = new RandomAccessFile(walFile, "rw")) {
+            long lastByte = file.length() - 1L;
+            file.seek(lastByte);
+            int value = file.read();
+            file.seek(lastByte);
+            file.write(value ^ 1);
+        }
+
+        assertThatThrownBy(() -> createFencedLogTablet(true))
+                .isInstanceOf(CorruptMessageException.class)
+                .hasMessageContaining("crc");
     }
 
     @Test

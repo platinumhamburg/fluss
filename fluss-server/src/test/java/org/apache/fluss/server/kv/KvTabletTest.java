@@ -20,6 +20,8 @@ package org.apache.fluss.server.kv;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.CorruptMessageException;
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
@@ -91,6 +93,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import javax.annotation.Nullable;
 
 import java.io.File;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -1501,6 +1504,66 @@ class KvTabletTest {
 
         kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
         assertThat(kvTablet.multiGet(Collections.singletonList(key))).containsExactly(newerValue);
+    }
+
+    @Test
+    void testCorruptV1BatchIsRejectedBeforeWriterStateAdmission() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "corrupt_v1"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.V1_FENCED);
+        WriterKey writerKey = new WriterKey(10L, 20L);
+        BinaryRow row = compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "value"});
+        FencedKvRecordBatchBuilder builder =
+                FencedKvRecordBatchBuilder.builder(
+                        schemaId, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
+        builder.append("key".getBytes(), row);
+        builder.setWriterState(writerKey, 100L);
+        ByteBuffer buffer = builder.build().getByteBuf().nioBuffer();
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+        builder.close();
+        bytes[bytes.length - 1] ^= 1;
+        KvRecordBatch corrupt = KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
+
+        assertThatThrownBy(
+                        () ->
+                                kvTablet.putAsLeader(
+                                        corrupt,
+                                        null,
+                                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE))
+                .isInstanceOf(CorruptMessageException.class);
+        assertThat(logTablet.localLogEndOffset()).isZero();
+        assertThat(logTablet.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+        assertThat(kvTablet.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
+    }
+
+    @Test
+    void testV1TableRejectsBatchWhoseMagicClaimsV0() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "v1_magic_downgrade"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.V1_FENCED);
+        KvRecordBatch downgraded = mock(KvRecordBatch.class);
+        when(downgraded.idempotenceProtocolVersion()).thenReturn(0);
+        when(downgraded.schemaId()).thenReturn(schemaId);
+        doThrow(new AssertionError("a protocol-mismatched payload must not be decoded"))
+                .when(downgraded)
+                .records(any());
+
+        assertThatThrownBy(
+                        () ->
+                                kvTablet.putAsLeader(
+                                        downgraded,
+                                        null,
+                                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE))
+                .isInstanceOf(CorruptRecordException.class)
+                .hasMessageContaining("table protocol V1");
+        assertThat(logTablet.localLogEndOffset()).isZero();
+        assertThat(kvTablet.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
+        verify(downgraded, never()).records(any());
     }
 
     private static KvRecordBatch fencedBatch(

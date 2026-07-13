@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.DeletionDisabledException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvStorageException;
@@ -29,6 +30,7 @@ import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -513,12 +515,27 @@ public final class KvTablet {
                     throwIfUncertainWalAppend();
                     rocksDBKv.checkIfRocksDBClosed();
 
+                    KvIdempotenceProtocol tableProtocol = logTablet.getWriterStateProtocol();
+                    boolean fenced = tableProtocol == KvIdempotenceProtocol.V1_FENCED;
+                    if (fenced) {
+                        kvRecords.ensureValid();
+                    }
+                    int batchProtocolVersion = kvRecords.idempotenceProtocolVersion();
+                    if (batchProtocolVersion != tableProtocol.version()) {
+                        throw new CorruptRecordException(
+                                String.format(
+                                        "KV batch protocol V%d does not match table protocol V%d for %s",
+                                        batchProtocolVersion,
+                                        tableProtocol.version(),
+                                        tableBucket));
+                    }
+
                     SchemaInfo schemaInfo = schemaGetter.getLatestSchemaInfo();
                     Schema latestSchema = schemaInfo.getSchema();
                     short latestSchemaId = (short) schemaInfo.getSchemaId();
                     validateSchemaId(kvRecords.schemaId(), latestSchemaId);
 
-                    if (kvRecords.idempotenceProtocolVersion() == 1) {
+                    if (fenced) {
                         WriterKey writerKey = kvRecords.fencedWriterKey();
                         long fencedSequence = kvRecords.fencedSequence();
                         if (fencedSequence < 0L) {
@@ -562,7 +579,6 @@ public final class KvTablet {
                                             targetColumns, latestSchemaId, latestSchema);
 
                     RowType latestRowType = latestSchema.getRowType();
-                    boolean fenced = kvRecords.idempotenceProtocolVersion() == 1;
                     WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType, fenced);
                     if (fenced) {
                         walBuilder.setFencedWriterState(

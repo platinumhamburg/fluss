@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.kv;
 
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
@@ -239,11 +240,32 @@ public class KvRecoverHelper {
             throws Exception {
         try (LogRecordReadContext readContext = createLogRecordReadContext()) {
             long nextFetchOffset = startFetchOffset;
+            long localReadTargetOffset =
+                    fetchIsolation == FetchIsolation.HIGH_WATERMARK
+                            ? logTablet.getHighWatermark()
+                            : logTablet.localLogEndOffset();
             while (true) {
-                final Iterable<LogRecordBatch> batches;
                 if (nextFetchOffset < localLogStartOffset) {
-                    batches = remoteLogFetcher.fetch(nextFetchOffset, localLogStartOffset);
+                    long fetchStartOffset = nextFetchOffset;
+                    try (RemoteLogFetcher.FetchResult batches =
+                            remoteLogFetcher.fetch(nextFetchOffset, localLogStartOffset)) {
+                        for (LogRecordBatch logRecordBatch : batches) {
+                            validateRecoveryBatch(
+                                    logRecordBatch, nextFetchOffset, localLogStartOffset);
+                            nextFetchOffset =
+                                    applyLogRecordBatch(
+                                            logRecordBatch,
+                                            readContext,
+                                            rowCountUpdater,
+                                            autoIncIdRangeUpdater,
+                                            resumeRecordConsumer);
+                            recoveryFaultInjector.afterBatch(nextFetchOffset);
+                        }
+                    }
+                    requireRemoteFetchProgress(
+                            fetchStartOffset, nextFetchOffset, localLogStartOffset);
                 } else {
+                    long fetchStartOffset = nextFetchOffset;
                     LogRecords logRecords =
                             logTablet
                                     .read(
@@ -255,23 +277,89 @@ public class KvRecoverHelper {
                                             null)
                                     .getRecords();
                     if (logRecords == MemoryLogRecords.EMPTY) {
+                        requireLocalFetchProgress(
+                                fetchStartOffset, nextFetchOffset, localReadTargetOffset);
                         break;
                     }
-                    batches = logRecords.batches();
-                }
-
-                for (LogRecordBatch logRecordBatch : batches) {
-                    nextFetchOffset =
-                            applyLogRecordBatch(
-                                    logRecordBatch,
-                                    readContext,
-                                    rowCountUpdater,
-                                    autoIncIdRangeUpdater,
-                                    resumeRecordConsumer);
-                    recoveryFaultInjector.afterBatch(nextFetchOffset);
+                    for (LogRecordBatch logRecordBatch : logRecords.batches()) {
+                        validateRecoveryBatch(logRecordBatch, nextFetchOffset, Long.MAX_VALUE);
+                        nextFetchOffset =
+                                applyLogRecordBatch(
+                                        logRecordBatch,
+                                        readContext,
+                                        rowCountUpdater,
+                                        autoIncIdRangeUpdater,
+                                        resumeRecordConsumer);
+                        recoveryFaultInjector.afterBatch(nextFetchOffset);
+                    }
+                    requireLocalFetchProgress(
+                            fetchStartOffset, nextFetchOffset, localReadTargetOffset);
+                    if (nextFetchOffset <= fetchStartOffset) {
+                        break;
+                    }
                 }
             }
             return nextFetchOffset;
+        }
+    }
+
+    static void validateRecoveryBatch(
+            LogRecordBatch logRecordBatch, long expectedOffset, long localLogStartOffset) {
+        logRecordBatch.ensureValid();
+
+        long baseOffset = logRecordBatch.baseLogOffset();
+        long nextOffset = logRecordBatch.nextLogOffset();
+        if (baseOffset != expectedOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "KV recovery expected offset %d, but the next WAL batch starts at %d",
+                            expectedOffset, baseOffset));
+        }
+        if (nextOffset <= expectedOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "KV recovery WAL batch at offset %d does not advance the recovery offset",
+                            expectedOffset));
+        }
+        if (nextOffset > localLogStartOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "Remote WAL batch [%d, %d) crosses local WAL start offset %d",
+                            baseOffset, nextOffset, localLogStartOffset));
+        }
+    }
+
+    static void requireRemoteFetchProgress(
+            long fetchStartOffset, long nextFetchOffset, long localLogStartOffset) {
+        requireFetchProgress(
+                "Remote WAL fetch",
+                fetchStartOffset,
+                nextFetchOffset,
+                localLogStartOffset,
+                "local WAL start offset");
+    }
+
+    static void requireLocalFetchProgress(
+            long fetchStartOffset, long nextFetchOffset, long targetOffset) {
+        requireFetchProgress(
+                "Local WAL fetch",
+                fetchStartOffset,
+                nextFetchOffset,
+                targetOffset,
+                "target offset");
+    }
+
+    private static void requireFetchProgress(
+            String operation,
+            long fetchStartOffset,
+            long nextFetchOffset,
+            long targetOffset,
+            String targetDescription) {
+        if (fetchStartOffset < targetOffset && nextFetchOffset <= fetchStartOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "%s made no progress from offset %d toward %s %d",
+                            operation, fetchStartOffset, targetDescription, targetOffset));
         }
     }
 

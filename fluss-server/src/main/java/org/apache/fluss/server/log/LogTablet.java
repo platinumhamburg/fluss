@@ -1730,6 +1730,7 @@ public final class LogTablet {
             loadedWriters.values().forEach(writerStateManager::update);
         } else {
             for (LogRecordBatch batch : records.batches()) {
+                batch.ensureValid();
                 long expectedOffset = writerStateManager.mapEndOffset();
                 if (batch.lastLogOffset() < expectedOffset) {
                     continue;

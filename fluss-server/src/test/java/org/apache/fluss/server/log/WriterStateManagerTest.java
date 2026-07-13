@@ -37,6 +37,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -93,6 +94,40 @@ public class WriterStateManagerTest {
         assertThat(stateManager.protocol()).isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
         assertThat(stateManager.activeWriters()).containsOnlyKeys(5L);
         assertThat(stateManager.writerIdCount()).isEqualTo(1);
+    }
+
+    @Test
+    void testSnapshotWriteDrainsShortWritingChannel() throws Exception {
+        ByteBuffer source = ByteBuffer.wrap("complete-snapshot".getBytes(StandardCharsets.UTF_8));
+        ByteBuffer sink = ByteBuffer.allocate(source.remaining());
+        WritableByteChannel shortWriter =
+                new WritableByteChannel() {
+                    private boolean open = true;
+
+                    @Override
+                    public int write(ByteBuffer input) {
+                        int bytes = Math.min(3, input.remaining());
+                        for (int i = 0; i < bytes; i++) {
+                            sink.put(input.get());
+                        }
+                        return bytes;
+                    }
+
+                    @Override
+                    public boolean isOpen() {
+                        return open;
+                    }
+
+                    @Override
+                    public void close() {
+                        open = false;
+                    }
+                };
+
+        WriterStateManager.writeFully(shortWriter, source);
+
+        assertThat(source.hasRemaining()).isFalse();
+        assertThat(new String(sink.array(), StandardCharsets.UTF_8)).isEqualTo("complete-snapshot");
     }
 
     @Test
@@ -222,6 +257,26 @@ public class WriterStateManagerTest {
                 .contains(
                         new FencedWriterStateEntry(
                                 key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L));
+    }
+
+    @Test
+    void testSnapshotReplacesStaleTemporaryFileAndPublishesCompleteContents() throws Exception {
+        WriterStateManager manager = fencedManager();
+        WriterKey key = new WriterKey(4L, 5L);
+        appendFenced(manager, key, 100L, 10L, 1L);
+        manager.updateMapEndOffset(11L);
+        Path snapshot = writerSnapshotFile(logDir, 11L).toPath();
+        Path temporary = snapshot.resolveSibling(snapshot.getFileName() + ".tmp");
+        Files.write(temporary, "stale-partial-snapshot".getBytes(StandardCharsets.UTF_8));
+
+        manager.takeSnapshot();
+
+        assertThat(temporary).doesNotExist();
+        assertThat(Files.readAllBytes(snapshot)).isEqualTo(v2SnapshotBytes(100L, 10L));
+        WriterStateManager recovered = fencedManager();
+        recovered.truncateAndReload(0L, 11L, Long.MAX_VALUE);
+        assertThat(recovered.lastFencedEntry(key))
+                .contains(new FencedWriterStateEntry(key, 100L, 10L, 1L));
     }
 
     @Test

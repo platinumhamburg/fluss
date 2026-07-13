@@ -26,6 +26,7 @@ import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.json.JsonDeserializer;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.JsonSerializer;
@@ -40,8 +41,10 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -805,16 +808,7 @@ public class WriterStateManager {
                                         writerStateEntry.lastBatchTimestamp())));
         byte[] jsonBytes = new WriterSnapshotMap(snapshotEntries).toJsonBytes();
 
-        ByteBuffer buffer = ByteBuffer.allocate(jsonBytes.length);
-        buffer.put(jsonBytes);
-        buffer.flip();
-
-        try (FileChannel fileChannel =
-                FileChannel.open(
-                        file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
-            fileChannel.write(buffer);
-            fileChannel.force(true);
-        }
+        writeSnapshotAtomically(file, jsonBytes);
     }
 
     private static void writeFencedSnapshot(
@@ -830,15 +824,56 @@ public class WriterStateManager {
                                         entry.lastTimestamp())));
         byte[] jsonBytes = new FencedWriterSnapshotMap(snapshotEntries).toJsonBytes();
 
-        ByteBuffer buffer = ByteBuffer.allocate(jsonBytes.length);
-        buffer.put(jsonBytes);
-        buffer.flip();
+        writeSnapshotAtomically(file, jsonBytes);
+    }
 
-        try (FileChannel fileChannel =
-                FileChannel.open(
-                        file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
-            fileChannel.write(buffer);
-            fileChannel.force(true);
+    private static void writeSnapshotAtomically(File file, byte[] bytes) throws IOException {
+        Path target = file.toPath();
+        Path temp = target.resolveSibling(target.getFileName() + ".tmp");
+        try {
+            try (FileChannel fileChannel =
+                    FileChannel.open(
+                            temp,
+                            StandardOpenOption.CREATE,
+                            StandardOpenOption.TRUNCATE_EXISTING,
+                            StandardOpenOption.WRITE)) {
+                writeFully(fileChannel, ByteBuffer.wrap(bytes));
+                if (fileChannel.size() != bytes.length) {
+                    throw new IOException(
+                            String.format(
+                                    "Writer snapshot short write: expected %d bytes but wrote %d",
+                                    bytes.length, fileChannel.size()));
+                }
+                fileChannel.force(true);
+            }
+            try {
+                Files.move(
+                        temp,
+                        target,
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException moveFailure) {
+                throw new IOException(
+                        "WriterState snapshot requires atomic file replacement for " + target,
+                        moveFailure);
+            }
+            FileUtils.flushDir(target.toAbsolutePath().normalize().getParent());
+        } catch (IOException failure) {
+            try {
+                Files.deleteIfExists(temp);
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    static void writeFully(WritableByteChannel channel, ByteBuffer buffer) throws IOException {
+        while (buffer.hasRemaining()) {
+            int written = channel.write(buffer);
+            if (written <= 0) {
+                throw new IOException("Writer snapshot channel made no write progress");
+            }
         }
     }
 
