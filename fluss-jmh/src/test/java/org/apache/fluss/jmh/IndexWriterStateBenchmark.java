@@ -70,7 +70,7 @@ public class IndexWriterStateBenchmark {
                     5, new LogOffsetMetadata(5L), 5L, false, true, state.stateTimestampMs);
             return update.toEntry().lastBatchSequence();
         }
-        FencedWriterAppendInfo update = manager.prepareFencedUpdate(state.writerKeys[writer]);
+        FencedWriterAppendInfo update = manager.prepareFencedUpdate(new WriterKey(0L, writer));
         update.append(1L, 1L, state.stateTimestampMs);
         return update.updatedEntry().lastSequence();
     }
@@ -107,7 +107,7 @@ public class IndexWriterStateBenchmark {
     public long staleFenceLookup(StaleState state) {
         WriterStateManager manager = state.nextStaleManager();
         int writer = state.nextStaleWriter();
-        return manager.findStaleFencedBatch(state.writerKeys[writer], 0L)
+        return manager.findStaleFencedBatch(new WriterKey(0L, writer), 0L)
                 .orElseThrow(AssertionError::new)
                 .lastSequence();
     }
@@ -118,7 +118,6 @@ public class IndexWriterStateBenchmark {
         protected KvIdempotenceProtocol protocol;
         protected WriterStateManager[] managers;
         protected File[] managerDirs;
-        protected WriterKey[] writerKeys;
         protected long stateTimestampMs;
         private File rootDir;
         private int freshManagerCursor;
@@ -138,11 +137,7 @@ public class IndexWriterStateBenchmark {
             rootDir = Files.createTempDirectory("index-writer-state-jmh").toFile();
             managerDirs = new File[targetBuckets];
             managers = new WriterStateManager[targetBuckets];
-            writerKeys = new WriterKey[sourceWriters];
             stateTimestampMs = System.currentTimeMillis();
-            for (int writer = 0; writer < sourceWriters; writer++) {
-                writerKeys[writer] = new WriterKey(0L, writer);
-            }
 
             forceGc();
             long heapBefore = usedHeap();
@@ -163,10 +158,10 @@ public class IndexWriterStateBenchmark {
             }
             assertProductionRepresentation();
             assertAndResetFreshTraversalCoverage();
-            // Process-level retained-state estimate: arrays and immutable WriterKeys are allocated
-            // before the baseline; manager maps and their entry graphs are allocated between two
-            // forced-GC readings. This is reproducible per fork but is not a heap-dump dominator
-            // measurement, so setup noise is reported as a limitation with the benchmark results.
+            // Process-level retained-state estimate: manager maps, target-local WriterKeys, and
+            // their entry graphs are allocated between two forced-GC readings. This is
+            // reproducible per fork but is not a heap-dump dominator measurement, so setup noise
+            // is reported as a limitation with the benchmark results.
             forceGc();
             long retainedHeap = Math.max(0L, usedHeap() - heapBefore);
             long snapshotBytes = 0L;
@@ -193,7 +188,8 @@ public class IndexWriterStateBenchmark {
                     manager.loadWriterEntry(entry);
                 }
             } else {
-                for (WriterKey writerKey : writerKeys) {
+                for (int writer = 0; writer < sourceWriters; writer++) {
+                    WriterKey writerKey = new WriterKey(0L, writer);
                     FencedWriterAppendInfo update = manager.prepareFencedUpdate(writerKey);
                     update.append(0L, 0L, stateTimestampMs);
                     manager.updateFenced(update);
