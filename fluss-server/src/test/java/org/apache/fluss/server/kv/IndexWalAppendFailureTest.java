@@ -79,6 +79,8 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
     void testKnownBuildFailureTruncatesAndCanRetry() throws Exception {
         Fixture fixture = createFixture(8100L, "known_build_failure");
         KvRecordBatch mutation = mutation(WRITER_KEY, 100L, "value");
+        long errorTruncationsBefore =
+                fixture.kv.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount();
         fixture.kv.setBeforeWalBuild(
                 () -> {
                     throw new TestBuildException();
@@ -87,7 +89,7 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
         assertThatThrownBy(() -> fixture.putDirect(mutation)).isInstanceOf(TestBuildException.class);
         assertThat(fixture.kv.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
         assertThat(fixture.kv.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount())
-                .isEqualTo(1L);
+                .isEqualTo(errorTruncationsBefore + 1L);
         assertThat(fixture.log.localLogEndOffset()).isZero();
 
         fixture.kv.setBeforeWalBuild(null);

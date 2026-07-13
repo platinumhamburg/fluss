@@ -62,21 +62,27 @@ public class IndexWriterStateBenchmark {
 
     @Benchmark
     public long freshAppendValidation(TopologyState state) {
-        WriterStateManager manager = state.nextManager();
-        int writer = state.nextWriter();
+        WriterStateManager manager = state.nextFreshManager();
+        int writer = state.nextFreshWriter();
         if (state.protocol == KvIdempotenceProtocol.V0_COMPACT) {
             WriterAppendInfo update = manager.prepareUpdate(writer);
-            update.appendDataBatch(5, new LogOffsetMetadata(5L), 5L, false, true, 6L);
+            update.appendDataBatch(
+                    5,
+                    new LogOffsetMetadata(5L),
+                    5L,
+                    false,
+                    true,
+                    state.stateTimestampMs);
             return update.toEntry().lastBatchSequence();
         }
         FencedWriterAppendInfo update = manager.prepareFencedUpdate(state.writerKeys[writer]);
-        update.append(1L, 1L, 2L);
+        update.append(1L, 1L, state.stateTimestampMs);
         return update.updatedEntry().lastSequence();
     }
 
     @Benchmark
     public long snapshotSerialization(TopologyState state) throws Exception {
-        WriterStateManager manager = state.nextManager();
+        WriterStateManager manager = state.nextSnapshotManager();
         manager.updateMapEndOffset(state.nextSnapshotOffset());
         manager.takeSnapshot();
         return manager.latestSnapshotBytes();
@@ -84,21 +90,28 @@ public class IndexWriterStateBenchmark {
 
     @Benchmark
     public long snapshotReload(TopologyState state) throws Exception {
-        int bucket = state.nextBucket();
+        int bucket = state.nextReloadBucket();
         WriterStateManager reloaded =
                 new WriterStateManager(
                         new TableBucket(1L, bucket),
                         state.managerDirs[bucket],
                         Integer.MAX_VALUE,
                         state.protocol);
-        reloaded.truncateAndReload(0L, 1L, System.currentTimeMillis());
-        return reloaded.writerIdCount();
+        reloaded.truncateAndReload(0L, 1L, state.stateTimestampMs);
+        long reloadedWriters = reloaded.writerIdCount();
+        if (reloadedWriters != state.sourceWriters) {
+            throw new AssertionError(
+                    String.format(
+                            "%s reload for bucket %d retained %d writers, expected %d",
+                            state.protocol, bucket, reloadedWriters, state.sourceWriters));
+        }
+        return reloadedWriters;
     }
 
     @Benchmark
     public long staleFenceLookup(StaleState state) {
-        WriterStateManager manager = state.nextManager();
-        int writer = state.nextWriter();
+        WriterStateManager manager = state.nextStaleManager();
+        int writer = state.nextStaleWriter();
         return manager.findStaleFencedBatch(state.writerKeys[writer], 0L)
                 .orElseThrow(AssertionError::new)
                 .lastSequence();
@@ -111,8 +124,14 @@ public class IndexWriterStateBenchmark {
         protected WriterStateManager[] managers;
         protected File[] managerDirs;
         protected WriterKey[] writerKeys;
+        protected long stateTimestampMs;
         private File rootDir;
-        private int cursor;
+        private int freshManagerCursor;
+        private int freshWriterCursor;
+        private int snapshotManagerCursor;
+        private int reloadBucketCursor;
+        private int staleManagerCursor;
+        private int staleWriterCursor;
         private final AtomicLong snapshotOffset = new AtomicLong(1L);
 
         protected void initialize(
@@ -125,6 +144,7 @@ public class IndexWriterStateBenchmark {
             managerDirs = new File[targetBuckets];
             managers = new WriterStateManager[targetBuckets];
             writerKeys = new WriterKey[sourceWriters];
+            stateTimestampMs = System.currentTimeMillis();
             for (int writer = 0; writer < sourceWriters; writer++) {
                 writerKeys[writer] = new WriterKey(0L, writer);
             }
@@ -147,6 +167,7 @@ public class IndexWriterStateBenchmark {
                 managers[bucket] = manager;
             }
             assertProductionRepresentation();
+            assertAndResetFreshTraversalCoverage();
             // Process-level retained-state estimate: arrays and immutable WriterKeys are allocated
             // before the baseline; manager maps and their entry graphs are allocated between two
             // forced-GC readings. This is reproducible per fork but is not a heap-dump dominator
@@ -172,20 +193,28 @@ public class IndexWriterStateBenchmark {
                 for (int writer = 0; writer < sourceWriters; writer++) {
                     WriterStateEntry entry = WriterStateEntry.empty(writer);
                     for (int sequence = 0; sequence < 5; sequence++) {
-                        entry.addBath(sequence, sequence, 0, sequence + 1L);
+                        entry.addBath(sequence, sequence, 0, stateTimestampMs);
                     }
                     manager.loadWriterEntry(entry);
                 }
             } else {
                 for (WriterKey writerKey : writerKeys) {
                     FencedWriterAppendInfo update = manager.prepareFencedUpdate(writerKey);
-                    update.append(0L, 0L, 1L);
+                    update.append(0L, 0L, stateTimestampMs);
                     manager.updateFenced(update);
                 }
             }
         }
 
         private void assertProductionRepresentation() throws Exception {
+            for (WriterStateManager manager : managers) {
+                if (manager.writerIdCount() != sourceWriters) {
+                    throw new AssertionError(
+                            String.format(
+                                    "%s setup retained %d writers, expected %d",
+                                    protocol, manager.writerIdCount(), sourceWriters));
+                }
+            }
             if (protocol == KvIdempotenceProtocol.V0_COMPACT) {
                 Field writers = WriterStateManager.class.getDeclaredField("writers");
                 if (!writers.getGenericType().getTypeName().contains("java.lang.Long")) {
@@ -201,26 +230,57 @@ public class IndexWriterStateBenchmark {
                         || snapshot.contains("kv_idempotence_protocol_version")) {
                     throw new AssertionError("V0 snapshot representation changed");
                 }
-            } else {
-                for (WriterStateManager manager : managers) {
-                    if (manager.writerIdCount() != sourceWriters) {
-                        throw new AssertionError(
-                                "V1 setup must retain one latest entry per WriterKey");
-                    }
-                }
             }
         }
 
-        protected WriterStateManager nextManager() {
-            return managers[nextBucket()];
+        protected WriterStateManager nextFreshManager() {
+            return managers[nextFreshBucket()];
         }
 
-        protected int nextBucket() {
-            return Math.floorMod(cursor++, targetBuckets);
+        protected int nextFreshWriter() {
+            return Math.floorMod(freshWriterCursor++, sourceWriters);
         }
 
-        protected int nextWriter() {
-            return Math.floorMod(cursor++, sourceWriters);
+        protected WriterStateManager nextSnapshotManager() {
+            return managers[Math.floorMod(snapshotManagerCursor++, targetBuckets)];
+        }
+
+        protected int nextReloadBucket() {
+            return Math.floorMod(reloadBucketCursor++, targetBuckets);
+        }
+
+        protected WriterStateManager nextStaleManager() {
+            return managers[Math.floorMod(staleManagerCursor++, targetBuckets)];
+        }
+
+        protected int nextStaleWriter() {
+            return Math.floorMod(staleWriterCursor++, sourceWriters);
+        }
+
+        protected void assertAndResetFreshTraversalCoverage() {
+            boolean[] managersVisited = new boolean[targetBuckets];
+            boolean[] writersVisited = new boolean[sourceWriters];
+            int validationInvocations = Math.max(targetBuckets, sourceWriters);
+            for (int invocation = 0; invocation < validationInvocations; invocation++) {
+                managersVisited[nextFreshBucket()] = true;
+                writersVisited[nextFreshWriter()] = true;
+            }
+            for (int bucket = 0; bucket < targetBuckets; bucket++) {
+                if (!managersVisited[bucket]) {
+                    throw new AssertionError("fresh traversal misses target bucket " + bucket);
+                }
+            }
+            for (int writer = 0; writer < sourceWriters; writer++) {
+                if (!writersVisited[writer]) {
+                    throw new AssertionError("fresh traversal misses source writer " + writer);
+                }
+            }
+            freshManagerCursor = 0;
+            freshWriterCursor = 0;
+        }
+
+        private int nextFreshBucket() {
+            return Math.floorMod(freshManagerCursor++, targetBuckets);
         }
 
         protected long nextSnapshotOffset() {

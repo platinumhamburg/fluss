@@ -180,6 +180,8 @@ public class ReplicaManager implements ServerReconfigurable {
     private final IndexAccumulator indexAccumulator;
     private final IndexReplicatorPool indexReplicatorPool;
     private final IndexSender indexSender;
+    private final TabletServerMetricGroup.GaugeRegistration indexPushGaugeRegistration;
+    private final TabletServerMetricGroup.GaugeRegistration indexWriterStateGaugeRegistration;
     private final ExecutorService ioExecutor;
     private final ProjectionPushdownCache projectionsCache = new ProjectionPushdownCache();
     private final Lock replicaStateChangeLock = new ReentrantLock();
@@ -324,12 +326,14 @@ public class ReplicaManager implements ServerReconfigurable {
                         conf.get(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES).getBytes(),
                         conf.get(ConfigOptions.NETTY_SERVER_MAX_REQUEST_SIZE).getBytes(),
                         30_000L);
-        serverMetricGroup.registerIndexPushGauges(
-                indexAccumulator::pendingBytes,
-                indexSender::inFlightRequestCount,
-                indexSender::oldestInFlightAgeMs);
-        serverMetricGroup.registerIndexWriterStateGauges(
-                this::fencedWriterStateEntryCount, this::fencedWriterStateSnapshotBytes);
+        this.indexPushGaugeRegistration =
+                serverMetricGroup.registerIndexPushGauges(
+                        indexAccumulator::pendingBytes,
+                        indexSender::inFlightRequestCount,
+                        indexSender::oldestInFlightAgeMs);
+        this.indexWriterStateGaugeRegistration =
+                serverMetricGroup.registerIndexWriterStateGauges(
+                        this::fencedWriterStateEntryCount, this::fencedWriterStateSnapshotBytes);
 
         this.highWatermarkCheckpoints = new HashMap<>();
         for (File dataDir : localDiskManager.dataDirs()) {
@@ -2289,6 +2293,8 @@ public class ReplicaManager implements ServerReconfigurable {
     public static final class OfflineReplica implements HostedReplica {}
 
     public void shutdown() throws InterruptedException {
+        indexWriterStateGaugeRegistration.close();
+        indexPushGaugeRegistration.close();
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
         replicaFetcherManager.shutdown();

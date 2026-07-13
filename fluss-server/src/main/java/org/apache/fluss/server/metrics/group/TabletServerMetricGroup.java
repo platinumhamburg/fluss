@@ -34,6 +34,7 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
 
@@ -88,6 +89,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter indexPushRecordTooLargeFailures;
     private final Counter indexPushTombstoneNoOpBatches;
     private final Counter indexWriterStateRecoveryCoverageFailures;
+    private final AtomicReference<IndexPushGaugeSource> indexPushGaugeSource =
+            new AtomicReference<>(IndexPushGaugeSource.EMPTY);
+    private final AtomicReference<IndexWriterStateGaugeSource> indexWriterStateGaugeSource =
+            new AtomicReference<>(IndexWriterStateGaugeSource.EMPTY);
 
     public TabletServerMetricGroup(
             MetricRegistry registry, String clusterId, String rack, String hostname, int serverId) {
@@ -181,6 +186,21 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(
                 MetricNames.INDEX_WRITER_STATE_RECOVERY_COVERAGE_FAILURES_RATE,
                 new MeterView(indexWriterStateRecoveryCoverageFailures));
+        gauge(
+                MetricNames.INDEX_PUSH_PENDING_BYTES,
+                () -> indexPushGaugeSource.get().pendingBytesSupplier.getAsLong());
+        gauge(
+                MetricNames.INDEX_PUSH_IN_FLIGHT_REQUESTS,
+                () -> indexPushGaugeSource.get().inFlightRequestsSupplier.getAsInt());
+        gauge(
+                MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS,
+                () -> indexPushGaugeSource.get().oldestInFlightAgeMsSupplier.getAsLong());
+        gauge(
+                MetricNames.INDEX_WRITER_STATE_ENTRIES,
+                () -> indexWriterStateGaugeSource.get().entryCountSupplier.getAsLong());
+        gauge(
+                MetricNames.INDEX_WRITER_STATE_SNAPSHOT_BYTES,
+                () -> indexWriterStateGaugeSource.get().snapshotBytesSupplier.getAsLong());
 
         // Register server-level RocksDB aggregated metrics
         registerServerRocksDBMetrics();
@@ -327,21 +347,66 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         return indexWriterStateRecoveryCoverageFailures;
     }
 
-    public void registerIndexPushGauges(
+    public GaugeRegistration registerIndexPushGauges(
             LongSupplier pendingBytesSupplier,
             IntSupplier inFlightRequestsSupplier,
             LongSupplier oldestInFlightAgeMsSupplier) {
-        gauge(MetricNames.INDEX_PUSH_PENDING_BYTES, pendingBytesSupplier::getAsLong);
-        gauge(MetricNames.INDEX_PUSH_IN_FLIGHT_REQUESTS, inFlightRequestsSupplier::getAsInt);
-        gauge(
-                MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS,
-                oldestInFlightAgeMsSupplier::getAsLong);
+        IndexPushGaugeSource source =
+                new IndexPushGaugeSource(
+                        pendingBytesSupplier,
+                        inFlightRequestsSupplier,
+                        oldestInFlightAgeMsSupplier);
+        indexPushGaugeSource.set(source);
+        return () -> indexPushGaugeSource.compareAndSet(source, IndexPushGaugeSource.EMPTY);
     }
 
-    public void registerIndexWriterStateGauges(
+    public GaugeRegistration registerIndexWriterStateGauges(
             LongSupplier entryCountSupplier, LongSupplier snapshotBytesSupplier) {
-        gauge(MetricNames.INDEX_WRITER_STATE_ENTRIES, entryCountSupplier::getAsLong);
-        gauge(MetricNames.INDEX_WRITER_STATE_SNAPSHOT_BYTES, snapshotBytesSupplier::getAsLong);
+        IndexWriterStateGaugeSource source =
+                new IndexWriterStateGaugeSource(entryCountSupplier, snapshotBytesSupplier);
+        indexWriterStateGaugeSource.set(source);
+        return () ->
+                indexWriterStateGaugeSource.compareAndSet(
+                        source, IndexWriterStateGaugeSource.EMPTY);
+    }
+
+    /** Scoped ownership of replaceable server-level gauge suppliers. */
+    @FunctionalInterface
+    public interface GaugeRegistration extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    private static final class IndexPushGaugeSource {
+        private static final IndexPushGaugeSource EMPTY =
+                new IndexPushGaugeSource(() -> 0L, () -> 0, () -> 0L);
+
+        private final LongSupplier pendingBytesSupplier;
+        private final IntSupplier inFlightRequestsSupplier;
+        private final LongSupplier oldestInFlightAgeMsSupplier;
+
+        private IndexPushGaugeSource(
+                LongSupplier pendingBytesSupplier,
+                IntSupplier inFlightRequestsSupplier,
+                LongSupplier oldestInFlightAgeMsSupplier) {
+            this.pendingBytesSupplier = pendingBytesSupplier;
+            this.inFlightRequestsSupplier = inFlightRequestsSupplier;
+            this.oldestInFlightAgeMsSupplier = oldestInFlightAgeMsSupplier;
+        }
+    }
+
+    private static final class IndexWriterStateGaugeSource {
+        private static final IndexWriterStateGaugeSource EMPTY =
+                new IndexWriterStateGaugeSource(() -> 0L, () -> 0L);
+
+        private final LongSupplier entryCountSupplier;
+        private final LongSupplier snapshotBytesSupplier;
+
+        private IndexWriterStateGaugeSource(
+                LongSupplier entryCountSupplier, LongSupplier snapshotBytesSupplier) {
+            this.entryCountSupplier = entryCountSupplier;
+            this.snapshotBytesSupplier = snapshotBytesSupplier;
+        }
     }
 
     // ------------------------------------------------------------------------

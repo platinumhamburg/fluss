@@ -30,6 +30,8 @@ import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
+import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.concurrent.Executors;
 
@@ -43,6 +45,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Queue;
+import java.util.Iterator;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
@@ -303,6 +306,104 @@ final class IndexSourceReaderTest {
     }
 
     @Test
+    void testPartialRemoteFailureCountsConsumedBytesAndOneRemoteFailure() {
+        TestingSourceWal sourceWal =
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 20L, 20L, batches());
+        ControllableExecutor executor = new ControllableExecutor();
+        TabletServerMetricGroup metrics = isolatedMetrics("partial-remote");
+        LogRecordBatch consumed = batch(0L, 10L);
+        TestingRemoteFetcher remote =
+                new TestingRemoteFetcher(Collections.emptyList()) {
+                    @Override
+                    public IndexSourceReader.RemoteRead fetchBounded(
+                            long startOffset, long localLogStartOffset, int maxBytes) {
+                        return failingAfter(consumed, new IllegalStateException("remote decode"));
+                    }
+                };
+        IndexSourceReader reader = readerWithMetrics(sourceWal, () -> remote, executor, metrics);
+
+        CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 20L, 1024);
+        executor.runNext();
+
+        assertThatThrownBy(future::join).hasRootCauseMessage("remote decode");
+        assertThat(metrics.indexSourceRemoteReadBytes().getCount()).isEqualTo(10L);
+        assertThat(metrics.indexSourceRemoteReadFailures().getCount()).isEqualTo(1L);
+    }
+
+    @Test
+    void testLocalHandoffFailureDoesNotCountAsRemoteFailure() {
+        TestingSourceWal sourceWal =
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 10L, 20L, batches()) {
+                    @Override
+                    public FetchDataInfo read(
+                            long offset,
+                            int maxBytes,
+                            FetchIsolation isolation,
+                            boolean minOneMessage)
+                            throws IOException {
+                        throw new IOException("local handoff");
+                    }
+                };
+        ControllableExecutor executor = new ControllableExecutor();
+        TabletServerMetricGroup metrics = isolatedMetrics("local-handoff");
+        IndexSourceReader reader =
+                readerWithMetrics(
+                        sourceWal,
+                        () ->
+                                new TestingRemoteFetcher(
+                                        Collections.singletonList(batch(0L, 10L))),
+                        executor,
+                        metrics);
+
+        CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 20L, 1024);
+        executor.runNext();
+
+        assertThatThrownBy(future::join).hasRootCauseMessage("local handoff");
+        assertThat(metrics.indexSourceRemoteReadBytes().getCount()).isEqualTo(10L);
+        assertThat(metrics.indexSourceRemoteReadFailures().getCount()).isZero();
+    }
+
+    @Test
+    void testRemoteResourceCloseFailureCountsAsRemoteFailure() {
+        TestingSourceWal sourceWal =
+                new TestingSourceWal(REMOTE_BUCKET, 0L, 10L, 10L, batches());
+        ControllableExecutor executor = new ControllableExecutor();
+        TabletServerMetricGroup metrics = isolatedMetrics("remote-resource");
+        TestingRemoteFetcher remote =
+                new TestingRemoteFetcher(Collections.emptyList()) {
+                    @Override
+                    public IndexSourceReader.RemoteRead fetchBounded(
+                            long startOffset, long localLogStartOffset, int maxBytes) {
+                        return new IndexSourceReader.RemoteRead() {
+                            @Override
+                            public boolean stoppedByByteLimit() {
+                                return false;
+                            }
+
+                            @Override
+                            public Iterator<LogRecordBatch> iterator() {
+                                return Collections.singletonList(batch(0L, 10L)).iterator();
+                            }
+
+                            @Override
+                            public void close() {
+                                throw new IllegalStateException("remote resource close");
+                            }
+                        };
+                    }
+                };
+        IndexSourceReader reader = readerWithMetrics(sourceWal, () -> remote, executor, metrics);
+
+        CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 10L, 1024);
+        executor.runNext();
+        IndexSourceReader.ReadResult result = future.join();
+
+        assertThatThrownBy(result::close).hasRootCauseMessage("remote resource close");
+        assertThat(metrics.indexSourceRemoteReadBytes().getCount()).isEqualTo(10L);
+        assertThat(metrics.indexSourceRemoteReadFailures().getCount()).isEqualTo(1L);
+    }
+
+    @Test
     void testClipsRecordsAtHighWatermark() {
         TestingSourceWal sourceWal =
                 new TestingSourceWal(LOCAL_BUCKET, 20L, 20L, 35L, batches(batch(20L, 35L)));
@@ -475,15 +576,32 @@ final class IndexSourceReaderTest {
             TestingSourceWal sourceWal,
             IndexSourceReader.RemoteFetcherFactory remoteFetcherFactory,
             Executor executor) {
+        return readerWithMetrics(
+                sourceWal,
+                remoteFetcherFactory,
+                executor,
+                TestingMetricGroups.TABLET_SERVER_METRICS);
+    }
+
+    private IndexSourceReader readerWithMetrics(
+            TestingSourceWal sourceWal,
+            IndexSourceReader.RemoteFetcherFactory remoteFetcherFactory,
+            Executor executor,
+            TabletServerMetricGroup metrics) {
         IndexSourceReader reader =
                 new IndexSourceReader(
                         sourceWal,
                         remoteFetcherFactory,
                         executor,
                         readContext,
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
+                        metrics);
         closeables.add(reader);
         return reader;
+    }
+
+    private static TabletServerMetricGroup isolatedMetrics(String clusterId) {
+        return new TabletServerMetricGroup(
+                NOPMetricRegistry.INSTANCE, clusterId, "rack", "host", 1);
     }
 
     private static void assertCorruption(
@@ -554,7 +672,7 @@ final class IndexSourceReaderTest {
         return record;
     }
 
-    private static final class TestingSourceWal implements IndexReplicator.SourceWal {
+    private static class TestingSourceWal implements IndexReplicator.SourceWal {
         private final TableBucket tableBucket;
         private final long logStartOffset;
         private final long localLogStartOffset;
@@ -644,6 +762,30 @@ final class IndexSourceReaderTest {
             @Override
             public void close() {}
         };
+    }
+
+    private static IndexSourceReader.RemoteRead failingAfter(
+            LogRecordBatch batch, RuntimeException failure) {
+        return remoteRead(
+                () ->
+                        new Iterator<LogRecordBatch>() {
+                            private boolean delivered;
+
+                            @Override
+                            public boolean hasNext() {
+                                if (delivered) {
+                                    throw failure;
+                                }
+                                return true;
+                            }
+
+                            @Override
+                            public LogRecordBatch next() {
+                                delivered = true;
+                                return batch;
+                            }
+                        },
+                false);
     }
 
     private static final class ControllableExecutor implements Executor {
