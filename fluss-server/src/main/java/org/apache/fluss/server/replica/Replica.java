@@ -147,6 +147,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -202,7 +203,7 @@ public final class Replica {
     private final ArrowCompressionInfo arrowCompressionInfo;
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
     private final AtomicBoolean online = new AtomicBoolean(true);
-    @Nullable private volatile Runnable afterPutAdmission;
+    @Nullable private volatile PutAdmissionHook afterPutAdmission;
     private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
     private final RemoteLogManager remoteLogManager;
@@ -1437,9 +1438,9 @@ public final class Replica {
                         }
                     }
                     validateInSyncReplicaSize(requiredAcks);
-                    Runnable admissionHook = afterPutAdmission;
+                    PutAdmissionHook admissionHook = afterPutAdmission;
                     if (admissionHook != null) {
-                        admissionHook.run();
+                        admissionHook.consumer.accept(kvRecords);
                     }
                     LogAppendInfo logAppendInfo;
                     try {
@@ -2602,8 +2603,30 @@ public final class Replica {
     }
 
     @VisibleForTesting
-    void setAfterPutAdmission(@Nullable Runnable afterPutAdmission) {
-        this.afterPutAdmission = afterPutAdmission;
+    AutoCloseable installAfterPutAdmissionHook(Consumer<KvRecordBatch> consumer) {
+        Objects.requireNonNull(consumer, "consumer");
+        PutAdmissionHook installed = new PutAdmissionHook(consumer);
+        synchronized (this) {
+            if (afterPutAdmission != null) {
+                throw new IllegalStateException("A PutKv admission hook is already installed");
+            }
+            afterPutAdmission = installed;
+        }
+        return () -> {
+            synchronized (Replica.this) {
+                if (afterPutAdmission == installed) {
+                    afterPutAdmission = null;
+                }
+            }
+        };
+    }
+
+    private static final class PutAdmissionHook {
+        private final Consumer<KvRecordBatch> consumer;
+
+        private PutAdmissionHook(Consumer<KvRecordBatch> consumer) {
+            this.consumer = consumer;
+        }
     }
 
     @VisibleForTesting

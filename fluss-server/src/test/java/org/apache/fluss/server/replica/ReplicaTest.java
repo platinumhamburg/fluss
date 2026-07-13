@@ -233,6 +233,40 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     @Test
+    void testAfterPutAdmissionHookHasScopedOwnership() throws Exception {
+        TableBucket tableBucket = new TableBucket(998L, 0);
+        Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 998L, tableBucket);
+        WriterKey writerKey = new WriterKey(17L, 9L);
+        AtomicInteger hookCalls = new AtomicInteger();
+
+        AutoCloseable first =
+                replica.installAfterPutAdmissionHook(
+                        records -> {
+                            assertThat(records.fencedWriterKey()).isEqualTo(writerKey);
+                            assertThat(records.fencedSequence()).isEqualTo(100L);
+                            hookCalls.incrementAndGet();
+                        });
+        assertThatThrownBy(() -> replica.installAfterPutAdmissionHook(ignored -> {}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("already installed");
+        replica.putRecordsToLeader(
+                emptyFencedBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
+        first.close();
+
+        try (AutoCloseable replacement =
+                replica.installAfterPutAdmissionHook(ignored -> hookCalls.incrementAndGet())) {
+            // A stale owner must not clear the replacement registration.
+            first.close();
+            replica.putRecordsToLeader(
+                    emptyFencedBatch(writerKey, 101L), null, MergeMode.OVERWRITE, -1);
+        }
+        replica.putRecordsToLeader(
+                emptyFencedBatch(writerKey, 102L), null, MergeMode.OVERWRITE, -1);
+
+        assertThat(hookCalls).hasValue(2);
+    }
+
+    @Test
     void testUncertainV1AppendFailStopsExactlyOnce() throws Exception {
         TableBucket tableBucket = new TableBucket(994L, 0);
         Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 994L, tableBucket);
@@ -362,6 +396,7 @@ final class ReplicaTest extends ReplicaTestBase {
         CountDownLatch secondPutAdmitted = new CountDownLatch(1);
         CountDownLatch secondPutContendedOnKvLock = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(2);
+        AutoCloseable admissionHook = null;
 
         LogTabletTestHelper.runOnceAt(
                 replica.getLogTablet(),
@@ -380,7 +415,9 @@ final class ReplicaTest extends ReplicaTestBase {
                             emptyFencedBatch(new WriterKey(7L, 3L), 100L));
             assertThat(firstPutInAppend.await(10, TimeUnit.SECONDS)).isTrue();
 
-            replica.setAfterPutAdmission(secondPutAdmitted::countDown);
+            admissionHook =
+                    replica.installAfterPutAdmissionHook(
+                            ignoredRecords -> secondPutAdmitted.countDown());
             setPutLockContentionHook(
                     replica.getKvTablet(), secondPutContendedOnKvLock::countDown);
             CompletableFuture<Throwable> second =
@@ -402,7 +439,9 @@ final class ReplicaTest extends ReplicaTestBase {
             assertThat(replica.isOnline()).isFalse();
         } finally {
             failFirstPut.countDown();
-            replica.setAfterPutAdmission(null);
+            if (admissionHook != null) {
+                admissionHook.close();
+            }
             setPutLockContentionHook(replica.getKvTablet(), null);
             executor.shutdownNow();
             assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
