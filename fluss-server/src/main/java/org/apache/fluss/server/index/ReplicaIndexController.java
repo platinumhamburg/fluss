@@ -383,7 +383,7 @@ public final class ReplicaIndexController {
         } catch (IllegalStateException e) {
             state.set(State.DEFERRED);
             LOG.info(
-                    "Index table metadata became unavailable while building specs for {} -- "
+                    "Index table metadata is unavailable or inconsistent while building specs for {} -- "
                             + "deferring IndexReplicator; will retry on next metadata update.",
                     tableBucket,
                     e);

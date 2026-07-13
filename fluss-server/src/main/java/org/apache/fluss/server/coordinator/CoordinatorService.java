@@ -589,6 +589,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                     .containsKey(ConfigOptions.TABLE_REPLICATION_FACTOR.key())) {
                 indexDescriptor = indexDescriptor.withReplicationFactor(mainReplicationFactor);
             }
+            metadataManager.validateTableDescriptor(indexDescriptor);
             TablePath indexTablePath =
                     TablePath.of(
                             mainTablePath.getDatabaseName(),
@@ -831,14 +832,32 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     }
 
     private void cascadeDropIndexTables(TablePath mainTablePath) {
+        TableInfo mainInfo;
         List<TablePath> indexPaths;
         try {
-            TableInfo mainInfo = metadataManager.getTable(mainTablePath);
+            mainInfo = metadataManager.getTable(mainTablePath);
             indexPaths = indexTablePathsFor(mainTablePath, mainInfo.getSchema());
         } catch (TableNotExistException e) {
             // main table missing: nothing to cascade. The subsequent dropTable call will surface
             // the appropriate error or no-op according to the request's ignoreIfNotExists flag.
             return;
+        }
+        for (TablePath indexPath : indexPaths) {
+            TableInfo indexInfo;
+            try {
+                indexInfo = metadataManager.getTable(indexPath);
+            } catch (TableNotExistException e) {
+                continue;
+            }
+            OptionalLong owner = indexInfo.getMainTableId();
+            if (!indexInfo.isIndexTable()
+                    || !owner.isPresent()
+                    || owner.getAsLong() != mainInfo.getTableId()) {
+                throw new InvalidTableException(
+                        String.format(
+                                "Expected derived index table %s does not belong to main table %s (table id %d); refusing cascade drop.",
+                                indexPath, mainTablePath, mainInfo.getTableId()));
+            }
         }
         for (TablePath indexPath : indexPaths) {
             metadataManager.dropTable(indexPath, /* ignoreIfNotExists= */ true);

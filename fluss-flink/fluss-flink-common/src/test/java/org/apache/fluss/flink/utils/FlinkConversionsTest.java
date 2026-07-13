@@ -40,6 +40,7 @@ import org.apache.flink.table.catalog.ResolvedCatalogTable;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.catalog.UniqueConstraint;
 import org.apache.flink.table.catalog.WatermarkSpec;
+import org.apache.flink.table.catalog.exceptions.CatalogException;
 import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.expressions.utils.ResolvedExpressionMock;
 import org.apache.flink.table.refresh.RefreshHandler;
@@ -641,7 +642,6 @@ public class FlinkConversionsTest {
         options.put("secondary-index.idx_email.columns", "email");
         options.put("secondary-index.idx_email.bucket.num", "4");
         options.put("secondary-index.idx_email.visibility", "async");
-        options.put("index.visibility", "sync");
         options.put("connector", "fluss");
         options.put("bootstrap.servers", "localhost:9092");
 
@@ -669,16 +669,158 @@ public class FlinkConversionsTest {
         assertThat(index.getBucketCount()).hasValue(4);
         assertThat(descriptor.getProperties())
                 .doesNotContainKeys(
-                        "index.visibility",
                         "secondary-index.idx_email.columns",
                         "secondary-index.idx_email.visibility",
                         "secondary-index.idx_email.bucket.num");
         assertThat(descriptor.getCustomProperties())
                 .doesNotContainKeys(
-                        "index.visibility",
                         "secondary-index.idx_email.columns",
                         "secondary-index.idx_email.visibility",
                         "secondary-index.idx_email.bucket.num");
+    }
+
+    @Test
+    void testSecondaryIndexMetadataSurvivesCatalogRoundTrip() {
+        org.apache.fluss.metadata.Schema flussSchema =
+                org.apache.fluss.metadata.Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("email", DataTypes.STRING())
+                        .column("region", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index(
+                                "idx_email",
+                                org.apache.fluss.metadata.IndexType.SECONDARY,
+                                Collections.singletonList("email"),
+                                IndexVisibility.SYNC,
+                                2)
+                        .index(
+                                "idx_region_email",
+                                org.apache.fluss.metadata.IndexType.SECONDARY,
+                                Arrays.asList("region", "email"),
+                                IndexVisibility.ASYNC,
+                                5)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(3, "id").build();
+        long now = System.currentTimeMillis();
+        TableInfo tableInfo =
+                TableInfo.of(
+                        TablePath.of("db", "indexed_table"),
+                        1L,
+                        1,
+                        descriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+
+        CatalogTable flinkTable = (CatalogTable) FlinkConversions.toFlinkTable(tableInfo);
+        assertThat(flinkTable.getOptions())
+                .containsEntry("secondary-index.idx_email.columns", "[\"email\"]")
+                .containsEntry("secondary-index.idx_email.visibility", "sync")
+                .containsEntry("secondary-index.idx_email.bucket.num", "2")
+                .containsEntry("secondary-index.idx_region_email.columns", "[\"region\",\"email\"]")
+                .containsEntry("secondary-index.idx_region_email.visibility", "async")
+                .containsEntry("secondary-index.idx_region_email.bucket.num", "5");
+
+        ResolvedCatalogTable resolved =
+                new ResolvedCatalogTable(
+                        flinkTable,
+                        new TestSchemaResolver().resolve(flinkTable.getUnresolvedSchema()));
+        List<org.apache.fluss.metadata.Schema.Index> indexes =
+                FlinkConversions.toFlussTable(resolved).getSchema().getIndexes();
+        assertThat(indexes).hasSize(2);
+        assertThat(indexes.get(0).getIndexName()).isEqualTo("idx_email");
+        assertThat(indexes.get(0).getColumnNames()).containsExactly("email");
+        assertThat(indexes.get(0).getVisibility()).isEqualTo(IndexVisibility.SYNC);
+        assertThat(indexes.get(0).getBucketCount()).hasValue(2);
+        assertThat(indexes.get(1).getIndexName()).isEqualTo("idx_region_email");
+        assertThat(indexes.get(1).getColumnNames()).containsExactly("region", "email");
+        assertThat(indexes.get(1).getVisibility()).isEqualTo(IndexVisibility.ASYNC);
+        assertThat(indexes.get(1).getBucketCount()).hasValue(5);
+    }
+
+    @Test
+    void testSecondaryIndexColumnNamesSurviveCatalogRoundTrip() {
+        org.apache.fluss.metadata.Schema flussSchema =
+                org.apache.fluss.metadata.Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("last,name", DataTypes.STRING())
+                        .column(" code ", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index(
+                                "idx_special",
+                                org.apache.fluss.metadata.IndexType.SECONDARY,
+                                Arrays.asList("last,name", " code "),
+                                IndexVisibility.SYNC,
+                                2)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(1, "id").build();
+        long now = System.currentTimeMillis();
+        TableInfo tableInfo =
+                TableInfo.of(
+                        TablePath.of("db", "special_index_columns"),
+                        1L,
+                        1,
+                        descriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+
+        CatalogTable flinkTable = (CatalogTable) FlinkConversions.toFlinkTable(tableInfo);
+        assertThat(flinkTable.getOptions())
+                .containsEntry("secondary-index.idx_special.columns", "[\"last,name\",\" code \"]");
+
+        ResolvedCatalogTable resolved =
+                new ResolvedCatalogTable(
+                        flinkTable,
+                        new TestSchemaResolver().resolve(flinkTable.getUnresolvedSchema()));
+        assertThat(FlinkConversions.toFlussTable(resolved).getSchema().getIndexes())
+                .singleElement()
+                .extracting(org.apache.fluss.metadata.Schema.Index::getColumnNames)
+                .isEqualTo(Arrays.asList("last,name", " code "));
+    }
+
+    @Test
+    void testRejectsTableLevelIndexVisibility() {
+        Map<String, String> options = new HashMap<>();
+        options.put("secondary-index.idx_email.columns", "email");
+        options.put("index.visibility", "async");
+
+        assertThatThrownBy(() -> FlinkConversions.toFlussTable(resolvedIndexTable(options)))
+                .isInstanceOf(CatalogException.class)
+                .hasMessageContaining("index.visibility")
+                .hasMessageContaining("secondary-index.<index-name>.visibility");
+    }
+
+    @Test
+    void testRejectsMalformedOrIncompleteSecondaryIndexOptions() {
+        for (Map<String, String> invalidOptions :
+                Arrays.asList(
+                        Collections.singletonMap("secondary-index.idx_email.visiblity", "sync"),
+                        Collections.singletonMap("secondary-index.idx_email.visibility", "sync"),
+                        Collections.singletonMap("secondary-index.idx_email.columns", " , "),
+                        Collections.singletonMap(
+                                "secondary-index.idx_email.columns", "email,,name"),
+                        Collections.singletonMap("secondary-index.idx_email.columns", "email,"))) {
+            assertThatThrownBy(
+                            () -> FlinkConversions.toFlussTable(resolvedIndexTable(invalidOptions)))
+                    .as("options %s must not be silently ignored", invalidOptions)
+                    .isInstanceOf(CatalogException.class)
+                    .hasMessageContaining("secondary-index");
+        }
+    }
+
+    private static ResolvedCatalogTable resolvedIndexTable(Map<String, String> options) {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", org.apache.flink.table.api.DataTypes.INT())
+                        .column("email", org.apache.flink.table.api.DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        CatalogTable table = CatalogTable.of(schema, null, Collections.emptyList(), options);
+        return new ResolvedCatalogTable(
+                table, new TestSchemaResolver().resolve(table.getUnresolvedSchema()));
     }
 
     /** Test refresh handler for testing purpose. */

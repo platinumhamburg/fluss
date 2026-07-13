@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.source.lookup;
 
 import org.apache.fluss.client.lookup.LookupType;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.utils.ArrayUtils;
 import org.apache.fluss.utils.ValueEquality;
 
@@ -352,6 +353,7 @@ public class LookupNormalizer implements Serializable {
         for (int idx : lookupKeyIndexes) {
             lookupSet.add(idx);
         }
+        int[] bestMatch = null;
         for (int[] indexColumns : secondaryIndexes) {
             boolean allContained = true;
             for (int col : indexColumns) {
@@ -360,11 +362,33 @@ public class LookupNormalizer implements Serializable {
                     break;
                 }
             }
-            if (allContained) {
-                return indexColumns;
+            if (allContained && isBetterIndexMatch(indexColumns, bestMatch)) {
+                bestMatch = indexColumns;
             }
         }
-        return null;
+        return bestMatch;
+    }
+
+    private static boolean isBetterIndexMatch(int[] candidate, @Nullable int[] current) {
+        if (current == null || candidate.length != current.length) {
+            return current == null || candidate.length > current.length;
+        }
+        for (int i = 0; i < candidate.length; i++) {
+            if (candidate[i] != current[i]) {
+                return candidate[i] < current[i];
+            }
+        }
+        return false;
+    }
+
+    static String findMatchingSecondaryIndexName(Schema schema, List<String> lookupColumns) {
+        for (Schema.Index index : schema.getIndexes()) {
+            if (index.getColumnNames().equals(lookupColumns)) {
+                return index.getIndexName();
+            }
+        }
+        throw new IllegalStateException(
+                "No secondary index found matching lookup columns: " + lookupColumns);
     }
 
     private static LookupNormalizer tryCreatePrefixLookupNormalizer(

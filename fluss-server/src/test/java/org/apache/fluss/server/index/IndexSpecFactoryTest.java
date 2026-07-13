@@ -43,6 +43,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 /** Tests for {@link IndexSpecFactory}. */
@@ -237,6 +238,92 @@ class IndexSpecFactoryTest {
         assertThat(differentPartition.targetBucket())
                 .as("the partition discriminator does not affect the exact target bucket")
                 .isEqualTo(expectedBucket);
+    }
+
+    @Test
+    void testRejectsTableAtDerivedPathWithoutIndexOwnership() {
+        TablePath mainPath = TablePath.of("db", "users");
+        TableDescriptor mainDescriptor = singleIndexMainDescriptor(3);
+        TableInfo mainInfo = tableInfo(mainPath, 1L, 1, mainDescriptor);
+        FakeMetadataCache metadataCache = new FakeMetadataCache();
+        TablePath indexPath = TablePath.of("db", "users__idx_email");
+        metadataCache.add(indexPath, 11L, 2, mainDescriptor);
+
+        assertThatThrownBy(
+                        () ->
+                                IndexSpecFactory.buildIndexSpecs(
+                                        mainInfo,
+                                        new TableBucket(mainInfo.getTableId(), 0),
+                                        metadataCache))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(indexPath.toString())
+                .hasMessageContaining("Index Table");
+    }
+
+    @Test
+    void testRejectsIndexTableWithWrongMainBackLink() {
+        TablePath mainPath = TablePath.of("db", "users");
+        TableDescriptor mainDescriptor = singleIndexMainDescriptor(3);
+        TableInfo mainInfo = tableInfo(mainPath, 1L, 1, mainDescriptor);
+        FakeMetadataCache metadataCache = new FakeMetadataCache();
+        TablePath indexPath = TablePath.of("db", "users__idx_email");
+        metadataCache.add(
+                indexPath,
+                11L,
+                2,
+                IndexTableDescriptorFactory.derive(mainDescriptor, 99L, "db.users", "idx_email"));
+
+        assertThatThrownBy(
+                        () ->
+                                IndexSpecFactory.buildIndexSpecs(
+                                        mainInfo,
+                                        new TableBucket(mainInfo.getTableId(), 0),
+                                        metadataCache))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(indexPath.toString())
+                .hasMessageContaining("main table 1");
+    }
+
+    @Test
+    void testRejectsIndexTableWithUnexpectedBucketCount() {
+        TablePath mainPath = TablePath.of("db", "users");
+        TableDescriptor mainDescriptor = singleIndexMainDescriptor(3);
+        TableInfo mainInfo = tableInfo(mainPath, 1L, 1, mainDescriptor);
+        FakeMetadataCache metadataCache = new FakeMetadataCache();
+        TablePath indexPath = TablePath.of("db", "users__idx_email");
+        metadataCache.add(
+                indexPath,
+                11L,
+                2,
+                IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.users", "idx_email")
+                        .withBucketCount(4));
+
+        assertThatThrownBy(
+                        () ->
+                                IndexSpecFactory.buildIndexSpecs(
+                                        mainInfo,
+                                        new TableBucket(mainInfo.getTableId(), 0),
+                                        metadataCache))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(indexPath.toString())
+                .hasMessageContaining("bucket count 3")
+                .hasMessageContaining("but found 4");
+    }
+
+    private static TableDescriptor singleIndexMainDescriptor(int indexBucketCount) {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("email", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("email"),
+                                IndexVisibility.SYNC,
+                                indexBucketCount)
+                        .build();
+        return TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
     }
 
     private static int bucketFor(RowType rowType, int[] columnIndices, GenericRow row) {

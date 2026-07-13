@@ -19,15 +19,21 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.bucketing.FlussBucketingFunction;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
+import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
+import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
@@ -118,9 +124,10 @@ public final class IndexSpecFactory {
                 composeIndexValueColumnIndices(idxColumnIndices, basePkColumnIndices);
 
         String indexName = index.getIndexName();
-        long indexTableId = resolveIndexTableId(mainTableInfo, indexName, metadataCache);
-        int indexBucketCount = resolveIndexBucketCount(mainTableInfo, indexName, metadataCache);
-        int indexSchemaId = resolveIndexSchemaId(mainTableInfo, indexName, metadataCache);
+        ResolvedIndexTable indexTable = resolveIndexTable(mainTableInfo, index, metadataCache);
+        long indexTableId = indexTable.tableId;
+        int indexBucketCount = indexTable.bucketCount;
+        int indexSchemaId = indexTable.schemaId;
 
         CompactedKeyEncoder bucketKeyEncoder =
                 new CompactedKeyEncoder(mainRowType, idxColumnIndices);
@@ -205,36 +212,139 @@ public final class IndexSpecFactory {
                         mainTableInfo.getTablePath().getTableName(), indexName));
     }
 
-    private static long resolveIndexTableId(
-            TableInfo mainTableInfo, String indexName, TabletServerMetadataCache metadataCache) {
-        TablePath path = indexTablePathFor(mainTableInfo, indexName);
-        return metadataCache
-                .getTableId(path)
-                .orElseThrow(
-                        () -> new IllegalStateException("Index Table " + path + " not in cache"));
+    private static ResolvedIndexTable resolveIndexTable(
+            TableInfo mainTableInfo, Schema.Index index, TabletServerMetadataCache metadataCache) {
+        TablePath path = indexTablePathFor(mainTableInfo, index.getIndexName());
+        long cachedTableId =
+                metadataCache
+                        .getTableId(path)
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "Index Table " + path + " not in cache"));
+        TableMetadata metadata =
+                metadataCache
+                        .getTableMetadata(path)
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "Index Table " + path + " metadata not in cache"));
+        TableInfo indexTableInfo = metadata.getTableInfo();
+        if (cachedTableId != indexTableInfo.getTableId()) {
+            throw invalidMetadata(
+                    path,
+                    "table id "
+                            + cachedTableId
+                            + " from the path cache, but metadata contains "
+                            + indexTableInfo.getTableId());
+        }
+        validateIndexTable(mainTableInfo, index, path, indexTableInfo);
+        return new ResolvedIndexTable(
+                indexTableInfo.getTableId(),
+                indexTableInfo.getNumBuckets(),
+                indexTableInfo.getSchemaId());
     }
 
-    private static int resolveIndexBucketCount(
-            TableInfo mainTableInfo, String indexName, TabletServerMetadataCache metadataCache) {
-        TablePath path = indexTablePathFor(mainTableInfo, indexName);
-        return metadataCache
-                .getTableMetadata(path)
-                .map(tm -> tm.getTableInfo().getNumBuckets())
-                .orElseThrow(
-                        () ->
-                                new IllegalStateException(
-                                        "Index Table " + path + " bucket count not in cache"));
+    private static void validateIndexTable(
+            TableInfo mainTableInfo, Schema.Index index, TablePath path, TableInfo indexTableInfo) {
+        if (!indexTableInfo.isIndexTable()) {
+            throw invalidMetadata(path, "a table that is not an Index Table");
+        }
+        if (!indexTableInfo.getMainTableId().isPresent()
+                || indexTableInfo.getMainTableId().getAsLong() != mainTableInfo.getTableId()) {
+            throw invalidMetadata(
+                    path,
+                    "an Index Table owned by main table "
+                            + mainTableInfo.getTableId()
+                            + " but found owner "
+                            + (indexTableInfo.getMainTableId().isPresent()
+                                    ? indexTableInfo.getMainTableId().getAsLong()
+                                    : "none"));
+        }
+
+        TableDescriptor expected =
+                IndexTableDescriptorFactory.derive(
+                        mainTableInfo.toTableDescriptor(),
+                        mainTableInfo.getTableId(),
+                        mainTableInfo.getTablePath().toString(),
+                        index.getIndexName());
+        int expectedBucketCount =
+                expected.getTableDistribution()
+                        .flatMap(TableDescriptor.TableDistribution::getBucketCount)
+                        .orElseThrow(() -> invalidMetadata(path, "no derived bucket count"));
+        if (indexTableInfo.getNumBuckets() != expectedBucketCount) {
+            throw invalidMetadata(
+                    path,
+                    "bucket count "
+                            + expectedBucketCount
+                            + " but found "
+                            + indexTableInfo.getNumBuckets());
+        }
+        if (!indexTableInfo.getBucketKeys().equals(expected.getBucketKeys())) {
+            throw invalidMetadata(
+                    path,
+                    "bucket keys "
+                            + expected.getBucketKeys()
+                            + " but found "
+                            + indexTableInfo.getBucketKeys());
+        }
+        if (!indexTableInfo.getSchema().equals(expected.getSchema())) {
+            throw invalidMetadata(path, "a schema different from the derived Index Table schema");
+        }
+        if (indexTableInfo.getTableConfig().getKvFormat() != expected.getKvFormat()) {
+            throw invalidMetadata(
+                    path,
+                    "KV format "
+                            + expected.getKvFormat()
+                            + " but found "
+                            + indexTableInfo.getTableConfig().getKvFormat());
+        }
+        LogFormat actualLogFormat = indexTableInfo.getTableConfig().getLogFormat();
+        if (actualLogFormat != expected.getLogFormat()) {
+            throw invalidMetadata(
+                    path,
+                    "log format " + expected.getLogFormat() + " but found " + actualLogFormat);
+        }
+        ChangelogImage actualChangelogImage = indexTableInfo.getTableConfig().getChangelogImage();
+        if (actualChangelogImage != expected.getChangelogImage()) {
+            throw invalidMetadata(
+                    path,
+                    "changelog image "
+                            + expected.getChangelogImage()
+                            + " but found "
+                            + actualChangelogImage);
+        }
+        int expectedKvFormatVersion =
+                Integer.parseInt(
+                        expected.getProperties().get(ConfigOptions.TABLE_KV_FORMAT_VERSION.key()));
+        int actualKvFormatVersion = indexTableInfo.getTableConfig().getKvFormatVersion().orElse(0);
+        if (actualKvFormatVersion != expectedKvFormatVersion) {
+            throw invalidMetadata(
+                    path,
+                    "KV format version "
+                            + expectedKvFormatVersion
+                            + " but found "
+                            + actualKvFormatVersion);
+        }
+        if (indexTableInfo.getKvIdempotenceProtocol() != KvIdempotenceProtocol.V1_FENCED) {
+            throw invalidMetadata(path, "an unfenced KV idempotence protocol");
+        }
     }
 
-    private static int resolveIndexSchemaId(
-            TableInfo mainTableInfo, String indexName, TabletServerMetadataCache metadataCache) {
-        TablePath path = indexTablePathFor(mainTableInfo, indexName);
-        return metadataCache
-                .getTableMetadata(path)
-                .map(tm -> tm.getTableInfo().getSchemaId())
-                .orElseThrow(
-                        () ->
-                                new IllegalStateException(
-                                        "Index Table " + path + " schema id not in cache"));
+    private static IllegalStateException invalidMetadata(TablePath path, String detail) {
+        return new IllegalStateException(
+                "Invalid metadata for Index Table " + path + ": expected " + detail);
+    }
+
+    private static final class ResolvedIndexTable {
+        private final long tableId;
+        private final int bucketCount;
+        private final int schemaId;
+
+        private ResolvedIndexTable(long tableId, int bucketCount, int schemaId) {
+            this.tableId = tableId;
+            this.bucketCount = bucketCount;
+            this.schemaId = schemaId;
+        }
     }
 }

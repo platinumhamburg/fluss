@@ -24,6 +24,7 @@ import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TableAlreadyExistException;
+import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
@@ -180,6 +181,37 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
         TableInfo ageCityIndexInfo = admin.getTableInfo(ageCityIndexTablePath).get();
         assertThat(ageCityIndexInfo.toTableDescriptor().getSchema().getPrimaryKeyColumnNames())
                 .containsExactly("age", "city", "id");
+    }
+
+    @Test
+    void testRejectsDerivedIndexBucketCountAboveClusterLimit() throws Exception {
+        TablePath tablePath = TablePath.of(DB, "test_index_bucket_limit");
+        admin.createDatabase(DB, DatabaseDescriptor.EMPTY, true).get();
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("email", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Arrays.asList("email"),
+                                IndexVisibility.SYNC,
+                                31)
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
+
+        try {
+            assertThatThrownBy(() -> admin.createTable(tablePath, descriptor, false).get())
+                    .cause()
+                    .isInstanceOf(TooManyBucketsException.class)
+                    .hasMessageContaining("Bucket count 31")
+                    .hasMessageContaining("maximum limit 30");
+            assertThat(admin.tableExists(tablePath).get()).isFalse();
+        } finally {
+            admin.dropTable(tablePath, true).get();
+        }
     }
 
     @Test
@@ -457,6 +489,55 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
 
         admin.dropTable(indexPath, false).get();
         assertThat(admin.tableExists(indexPath).get()).isFalse();
+    }
+
+    @Test
+    void testCascadeDropRejectsSameNameTableWithoutIndexOwnership() throws Exception {
+        TablePath mainPath = TablePath.of(DB, "test_drop_index_identity");
+        TablePath indexPath =
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                1)
+                        .build();
+        TableDescriptor mainDescriptor =
+                TableDescriptor.builder().schema(mainSchema).distributedBy(1, "id").build();
+        TableDescriptor unrelatedDescriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .primaryKey("id")
+                                        .build())
+                        .distributedBy(1, "id")
+                        .build();
+
+        createTable(mainPath, mainDescriptor, true);
+        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().deleteTable(indexPath);
+        admin.createTable(indexPath, unrelatedDescriptor, false).get();
+        assertThat(admin.getTableInfo(indexPath).get().isIndexTable()).isFalse();
+
+        try {
+            assertThatThrownBy(() -> admin.dropTable(mainPath, false).get())
+                    .cause()
+                    .isInstanceOf(InvalidTableException.class)
+                    .hasMessageContaining(indexPath.toString())
+                    .hasMessageContaining("does not belong to main table");
+            assertThat(admin.tableExists(mainPath).get()).isTrue();
+            assertThat(admin.tableExists(indexPath).get()).isTrue();
+        } finally {
+            admin.dropTable(indexPath, true).get();
+            admin.dropTable(mainPath, true).get();
+        }
     }
 
     @Test

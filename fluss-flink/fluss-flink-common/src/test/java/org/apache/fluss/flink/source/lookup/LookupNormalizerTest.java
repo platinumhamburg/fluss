@@ -18,6 +18,8 @@
 package org.apache.fluss.flink.source.lookup;
 
 import org.apache.fluss.client.lookup.LookupType;
+import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.types.DataTypes;
 
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.GenericRowData;
@@ -265,6 +267,82 @@ class LookupNormalizerTest {
         assertThat(normalizer.getLookupType()).isEqualTo(LookupType.SECONDARY_INDEX_LOOKUP);
         // normalized key should only contain the index column (name)
         assertThat(normalizer.getLookupKeyIndexes()).containsExactly(1);
+    }
+
+    @Test
+    void testSupersetMatchSelectsMostSpecificIndexRegardlessOfInputOrder() {
+        int[][] lookupKeyIndexes = new int[][] {{1}, {2}, {3}};
+        int[][] lessSpecificFirst = new int[][] {{1}, {1, 3}};
+        int[][] moreSpecificFirst = new int[][] {{1, 3}, {1}};
+
+        LookupNormalizer first =
+                LookupNormalizer.validateAndCreateLookupNormalizer(
+                        lookupKeyIndexes,
+                        PRIMARY_KEYS,
+                        BUCKET_KEYS,
+                        PARTITION_KEYS,
+                        TABLE_SCHEMA,
+                        null,
+                        lessSpecificFirst);
+        LookupNormalizer second =
+                LookupNormalizer.validateAndCreateLookupNormalizer(
+                        lookupKeyIndexes,
+                        PRIMARY_KEYS,
+                        BUCKET_KEYS,
+                        PARTITION_KEYS,
+                        TABLE_SCHEMA,
+                        null,
+                        moreSpecificFirst);
+
+        assertThat(first.getLookupKeyIndexes()).containsExactly(1, 3);
+        assertThat(second.getLookupKeyIndexes()).containsExactly(1, 3);
+    }
+
+    @Test
+    void testEqualWidthSecondaryIndexMatchUsesStableColumnOrderTieBreak() {
+        int[][] lookupKeyIndexes = new int[][] {{1}, {2}, {3}};
+        int[][] emailFirst = new int[][] {{2}, {1}};
+        int[][] nameFirst = new int[][] {{1}, {2}};
+
+        LookupNormalizer first =
+                LookupNormalizer.validateAndCreateLookupNormalizer(
+                        lookupKeyIndexes,
+                        PRIMARY_KEYS,
+                        BUCKET_KEYS,
+                        PARTITION_KEYS,
+                        TABLE_SCHEMA,
+                        null,
+                        emailFirst);
+        LookupNormalizer second =
+                LookupNormalizer.validateAndCreateLookupNormalizer(
+                        lookupKeyIndexes,
+                        PRIMARY_KEYS,
+                        BUCKET_KEYS,
+                        PARTITION_KEYS,
+                        TABLE_SCHEMA,
+                        null,
+                        nameFirst);
+
+        assertThat(first.getLookupKeyIndexes()).containsExactly(1);
+        assertThat(second.getLookupKeyIndexes()).containsExactly(1);
+    }
+
+    @Test
+    void testIndexNameMatchPreservesColumnOrder() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("email", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index("idx_email_name", Arrays.asList("email", "name"))
+                        .index("idx_name_email", Arrays.asList("name", "email"))
+                        .build();
+
+        assertThat(
+                        LookupNormalizer.findMatchingSecondaryIndexName(
+                                schema, Arrays.asList("name", "email")))
+                .isEqualTo("idx_name_email");
     }
 
     @Test

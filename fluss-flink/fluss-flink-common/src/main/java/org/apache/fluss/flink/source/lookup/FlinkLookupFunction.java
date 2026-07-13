@@ -29,7 +29,6 @@ import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.flink.utils.FlussRowToFlinkRowConverter;
-import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
@@ -46,7 +45,6 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.stream.IntStream;
 
@@ -115,7 +113,8 @@ public class FlinkLookupFunction extends LookupFunction {
             RowType lookupKeyRowType = FlinkUtils.projectRowType(flinkRowType, lookupKeyIndexes);
             List<String> lookupColumns = lookupKeyRowType.getFieldNames();
             String indexName =
-                    findMatchingIndexName(table.getTableInfo().getSchema(), lookupColumns);
+                    LookupNormalizer.findMatchingSecondaryIndexName(
+                            table.getTableInfo().getSchema(), lookupColumns);
             lookuper = ((FlussTable) table).getSecondaryIndexLookuper(indexName);
         } else {
             Lookup lookup = table.newLookup();
@@ -176,17 +175,6 @@ public class FlinkLookupFunction extends LookupFunction {
             return row;
         }
         return projectedRow.replaceRow(row);
-    }
-
-    private static String findMatchingIndexName(Schema schema, List<String> lookupColumns) {
-        HashSet<String> lookupSet = new HashSet<>(lookupColumns);
-        for (Schema.Index index : schema.getIndexes()) {
-            if (lookupSet.equals(new HashSet<>(index.getColumnNames()))) {
-                return index.getIndexName();
-            }
-        }
-        throw new IllegalStateException(
-                "No secondary index found matching lookup columns: " + lookupColumns);
     }
 
     @Override

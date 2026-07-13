@@ -30,6 +30,7 @@ import org.apache.fluss.flink.source.ChangelogFlinkTableSource;
 import org.apache.fluss.flink.source.FlinkTableSource;
 import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
+import org.apache.fluss.flink.utils.SecondaryIndexColumnNames;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.TablePath;
 
@@ -63,7 +64,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DELETE_BEHAVIOR;
@@ -189,15 +189,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         for (Map.Entry<String, String> entry : tableOptions.entrySet()) {
             Matcher matcher = pattern.matcher(entry.getKey());
             if (matcher.matches()) {
-                String[] columns = entry.getValue().split(",");
-                List<String> columnList =
-                        Arrays.stream(columns)
-                                .map(String::trim)
-                                .filter(col -> !col.isEmpty())
-                                .collect(Collectors.toList());
-                if (columnList.isEmpty()) {
-                    continue;
-                }
+                List<String> columnList = SecondaryIndexColumnNames.decode(entry.getValue());
                 int[] columnIndexes = new int[columnList.size()];
                 for (int i = 0; i < columnList.size(); i++) {
                     int fieldIndex = tableOutputType.getFieldIndex(columnList.get(i));

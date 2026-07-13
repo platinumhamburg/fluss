@@ -147,6 +147,8 @@ public class FlinkConversions {
 
         Schema schema = tableInfo.getSchema();
 
+        serializeSecondaryIndexes(schema, newOptions);
+
         // convert aggregation functions to flink options
         for (Schema.Column column : schema.getColumns()) {
             if (column.getAggFunction().isPresent()) {
@@ -727,45 +729,91 @@ public class FlinkConversions {
      * declarations.
      */
     private static void parseSecondaryIndexes(Configuration options, Schema.Builder schemaBuilder) {
+        if (options.containsKey(TABLE_LEVEL_INDEX_VISIBILITY)) {
+            throw new CatalogException(
+                    "'index.visibility' is no longer supported. Use "
+                            + "'secondary-index.<index-name>.visibility' so each index stores its own visibility.");
+        }
         Map<String, SecondaryIndexOptions> byName = new TreeMap<>();
         for (Map.Entry<String, String> entry : options.toMap().entrySet()) {
-            Matcher matcher = SECONDARY_INDEX_OPTION_PATTERN.matcher(entry.getKey());
-            if (!matcher.matches()) {
+            if (!entry.getKey().startsWith(SECONDARY_INDEX_PREFIX)) {
                 continue;
             }
-            byName.computeIfAbsent(matcher.group(1), ignored -> new SecondaryIndexOptions())
-                    .set(matcher.group(2), entry.getValue());
+            Matcher matcher = SECONDARY_INDEX_OPTION_PATTERN.matcher(entry.getKey());
+            if (!matcher.matches()) {
+                throw new CatalogException(
+                        "Invalid secondary index option '"
+                                + entry.getKey()
+                                + "'. Expected secondary-index.<index-name>.columns, .visibility, or .bucket.num.");
+            }
+            try {
+                byName.computeIfAbsent(matcher.group(1), ignored -> new SecondaryIndexOptions())
+                        .set(matcher.group(2), entry.getValue());
+            } catch (RuntimeException e) {
+                throw new CatalogException(
+                        "Invalid value '"
+                                + entry.getValue()
+                                + "' for secondary index option '"
+                                + entry.getKey()
+                                + "'.",
+                        e);
+            }
         }
 
         byName.forEach(
                 (indexName, indexOptions) -> {
-                    if (!indexOptions.columns.isEmpty()) {
-                        schemaBuilder.index(
-                                indexName,
-                                IndexType.SECONDARY,
-                                indexOptions.columns,
-                                indexOptions.visibility,
-                                indexOptions.bucketCount);
+                    if (!indexOptions.columnsDefined || indexOptions.columns.isEmpty()) {
+                        throw new CatalogException(
+                                "Secondary index '"
+                                        + indexName
+                                        + "' must define at least one column with secondary-index."
+                                        + indexName
+                                        + ".columns.");
                     }
+                    schemaBuilder.index(
+                            indexName,
+                            IndexType.SECONDARY,
+                            indexOptions.columns,
+                            indexOptions.visibility,
+                            indexOptions.bucketCount);
                 });
+    }
+
+    private static void serializeSecondaryIndexes(Schema schema, Map<String, String> flinkOptions) {
+        for (Schema.Index index : schema.getIndexes()) {
+            String prefix = SECONDARY_INDEX_PREFIX + index.getIndexName();
+            flinkOptions.put(
+                    prefix + SECONDARY_INDEX_COLUMNS_SUFFIX,
+                    SecondaryIndexColumnNames.encode(index.getColumnNames()));
+            flinkOptions.put(
+                    prefix + SECONDARY_INDEX_VISIBILITY_SUFFIX,
+                    index.getVisibility().name().toLowerCase(Locale.ROOT));
+            index.getBucketCount()
+                    .ifPresent(
+                            bucketCount ->
+                                    flinkOptions.put(
+                                            prefix + SECONDARY_INDEX_BUCKET_NUM_SUFFIX,
+                                            String.valueOf(bucketCount)));
+        }
     }
 
     private static final class SecondaryIndexOptions {
         private List<String> columns = Collections.emptyList();
+        private boolean columnsDefined;
         private IndexVisibility visibility = IndexVisibility.SYNC;
         private @Nullable Integer bucketCount;
 
         private void set(String suffix, String value) {
             if (SECONDARY_INDEX_COLUMNS_SUFFIX.equals(suffix)) {
-                columns =
-                        Arrays.stream(value.split(","))
-                                .map(String::trim)
-                                .filter(col -> !col.isEmpty())
-                                .collect(Collectors.toList());
+                columnsDefined = true;
+                columns = SecondaryIndexColumnNames.decode(value);
             } else if (SECONDARY_INDEX_VISIBILITY_SUFFIX.equals(suffix)) {
                 visibility = IndexVisibility.valueOf(value.trim().toUpperCase(Locale.ROOT));
             } else if (SECONDARY_INDEX_BUCKET_NUM_SUFFIX.equals(suffix)) {
                 bucketCount = Integer.parseInt(value.trim());
+                if (bucketCount <= 0) {
+                    throw new IllegalArgumentException("bucket count must be positive");
+                }
             }
         }
     }
