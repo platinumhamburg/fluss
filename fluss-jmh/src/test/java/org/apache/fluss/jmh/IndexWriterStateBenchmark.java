@@ -60,6 +60,17 @@ import java.util.concurrent.atomic.AtomicLong;
         jvmArgsAppend = {"-Xms512m", "-Xmx4g"})
 public class IndexWriterStateBenchmark {
 
+    enum WriterKeyUse {
+        RETAINED_STATE,
+        INCOMING_REQUEST
+    }
+
+    interface WriterKeyObserver {
+        void onHeapBaselineCaptured();
+
+        void onWriterKeyCreated(WriterKeyUse use, WriterKey writerKey);
+    }
+
     @Benchmark
     public long freshAppendValidation(TopologyState state) {
         WriterStateManager manager = state.nextFreshManager();
@@ -70,7 +81,9 @@ public class IndexWriterStateBenchmark {
                     5, new LogOffsetMetadata(5L), 5L, false, true, state.stateTimestampMs);
             return update.toEntry().lastBatchSequence();
         }
-        FencedWriterAppendInfo update = manager.prepareFencedUpdate(new WriterKey(0L, writer));
+        FencedWriterAppendInfo update =
+                manager.prepareFencedUpdate(
+                        state.newWriterKey(writer, WriterKeyUse.INCOMING_REQUEST));
         update.append(1L, 1L, state.stateTimestampMs);
         return update.updatedEntry().lastSequence();
     }
@@ -107,12 +120,13 @@ public class IndexWriterStateBenchmark {
     public long staleFenceLookup(StaleState state) {
         WriterStateManager manager = state.nextStaleManager();
         int writer = state.nextStaleWriter();
-        return manager.findStaleFencedBatch(new WriterKey(0L, writer), 0L)
+        return manager.findStaleFencedBatch(
+                        state.newWriterKey(writer, WriterKeyUse.INCOMING_REQUEST), 0L)
                 .orElseThrow(AssertionError::new)
                 .lastSequence();
     }
 
-    private abstract static class BaseState {
+    abstract static class BaseState {
         protected int sourceWriters;
         protected int targetBuckets;
         protected KvIdempotenceProtocol protocol;
@@ -127,6 +141,7 @@ public class IndexWriterStateBenchmark {
         private int staleManagerCursor;
         private int staleWriterCursor;
         private final AtomicLong snapshotOffset = new AtomicLong(1L);
+        private WriterKeyObserver writerKeyObserver;
 
         protected void initialize(
                 String protocolName, int configuredSourceWriters, int configuredTargetBuckets)
@@ -139,8 +154,7 @@ public class IndexWriterStateBenchmark {
             managers = new WriterStateManager[targetBuckets];
             stateTimestampMs = System.currentTimeMillis();
 
-            forceGc();
-            long heapBefore = usedHeap();
+            long heapBefore = captureHeapBaseline();
             for (int bucket = 0; bucket < targetBuckets; bucket++) {
                 File managerDir = new File(rootDir, "bucket-" + bucket);
                 Files.createDirectories(managerDir.toPath());
@@ -189,7 +203,7 @@ public class IndexWriterStateBenchmark {
                 }
             } else {
                 for (int writer = 0; writer < sourceWriters; writer++) {
-                    WriterKey writerKey = new WriterKey(0L, writer);
+                    WriterKey writerKey = newWriterKey(writer, WriterKeyUse.RETAINED_STATE);
                     FencedWriterAppendInfo update = manager.prepareFencedUpdate(writerKey);
                     update.append(0L, 0L, stateTimestampMs);
                     manager.updateFenced(update);
@@ -278,6 +292,19 @@ public class IndexWriterStateBenchmark {
             return snapshotOffset.incrementAndGet();
         }
 
+        void setWriterKeyObserver(WriterKeyObserver writerKeyObserver) {
+            this.writerKeyObserver = writerKeyObserver;
+        }
+
+        WriterKey newWriterKey(int writer, WriterKeyUse use) {
+            WriterKey writerKey = new WriterKey(0L, writer);
+            WriterKeyObserver observer = writerKeyObserver;
+            if (observer != null) {
+                observer.onWriterKeyCreated(use, writerKey);
+            }
+            return writerKey;
+        }
+
         @TearDown(Level.Trial)
         public void tearDown() throws Exception {
             if (rootDir != null) {
@@ -294,6 +321,16 @@ public class IndexWriterStateBenchmark {
             System.gc();
             System.runFinalization();
             System.gc();
+        }
+
+        private long captureHeapBaseline() {
+            forceGc();
+            long heapBefore = usedHeap();
+            WriterKeyObserver observer = writerKeyObserver;
+            if (observer != null) {
+                observer.onHeapBaselineCaptured();
+            }
+            return heapBefore;
         }
     }
 

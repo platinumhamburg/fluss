@@ -15,26 +15,35 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Field;
-import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class IndexWriterStateBenchmarkTest {
 
     @Test
-    void testV1ManagersRetainTargetLocalWriterKeys() throws Exception {
+    void testV1ManagersRetainKeysCreatedAfterHeapBaseline() throws Exception {
         IndexWriterStateBenchmark.TopologyState state = topology("V1_FENCED", 64, 2);
+        RecordingWriterKeyObserver observer = new RecordingWriterKeyObserver();
+        state.setWriterKeyObserver(observer);
         try {
             state.setup();
             WriterStateManager[] managers = managers(state);
             Map<WriterKey, ?> first = fencedWriters(managers[0]);
             Map<WriterKey, ?> second = fencedWriters(managers[1]);
 
+            assertThat(observer.heapBaselineCount).isOne();
+            assertThat(observer.keysCreatedBeforeBaseline).isEmpty();
+            assertThat(observer.retainedKeys)
+                    .hasSize(state.configuredSourceWriters * state.configuredTargetBuckets);
             for (int writer = 0; writer < state.configuredSourceWriters; writer++) {
                 WriterKey expected = new WriterKey(0L, writer);
                 WriterKey firstKey = retainedKey(first, expected);
                 WriterKey secondKey = retainedKey(second, expected);
+                assertThat(observer.retainedKeys).contains(firstKey, secondKey);
                 assertThat(firstKey)
                         .as("writer %s must be materialized independently per target", writer)
                         .isNotSameAs(secondKey);
@@ -45,14 +54,31 @@ class IndexWriterStateBenchmarkTest {
     }
 
     @Test
-    void testBenchmarkDoesNotCacheWriterKeysOutsideMeasuredManagers() {
-        assertThat(
-                        Arrays.stream(
-                                        IndexWriterStateBenchmark.TopologyState.class
-                                                .getSuperclass()
-                                                .getDeclaredFields())
-                                .map(Field::getType))
-                .doesNotContain(WriterKey[].class);
+    void testFencedOperationsMaterializeAnIncomingWriterKeyPerInvocation() throws Exception {
+        IndexWriterStateBenchmark benchmark = new IndexWriterStateBenchmark();
+        RecordingWriterKeyObserver freshObserver = new RecordingWriterKeyObserver();
+        IndexWriterStateBenchmark.TopologyState freshState = topology("V1_FENCED", 64, 2);
+        freshState.setWriterKeyObserver(freshObserver);
+        try {
+            freshState.setup();
+            benchmark.freshAppendValidation(freshState);
+            benchmark.freshAppendValidation(freshState);
+            assertThat(freshObserver.incomingKeys).hasSize(2);
+        } finally {
+            freshState.tearDown();
+        }
+
+        RecordingWriterKeyObserver staleObserver = new RecordingWriterKeyObserver();
+        IndexWriterStateBenchmark.StaleState staleState = staleTopology(64, 2);
+        staleState.setWriterKeyObserver(staleObserver);
+        try {
+            staleState.setup();
+            benchmark.staleFenceLookup(staleState);
+            benchmark.staleFenceLookup(staleState);
+            assertThat(staleObserver.incomingKeys).hasSize(2);
+        } finally {
+            staleState.tearDown();
+        }
     }
 
     @Test
@@ -93,6 +119,14 @@ class IndexWriterStateBenchmarkTest {
         return state;
     }
 
+    private static IndexWriterStateBenchmark.StaleState staleTopology(
+            int sourceWriters, int targetBuckets) {
+        IndexWriterStateBenchmark.StaleState state = new IndexWriterStateBenchmark.StaleState();
+        state.configuredSourceWriters = sourceWriters;
+        state.configuredTargetBuckets = targetBuckets;
+        return state;
+    }
+
     private static WriterStateManager[] managers(IndexWriterStateBenchmark.TopologyState state)
             throws Exception {
         Field field = state.getClass().getSuperclass().getDeclaredField("managers");
@@ -112,5 +146,35 @@ class IndexWriterStateBenchmarkTest {
                 .filter(expected::equals)
                 .findFirst()
                 .orElseThrow(AssertionError::new);
+    }
+
+    private static final class RecordingWriterKeyObserver
+            implements IndexWriterStateBenchmark.WriterKeyObserver {
+        private final Set<WriterKey> keysCreatedBeforeBaseline = identitySet();
+        private final Set<WriterKey> retainedKeys = identitySet();
+        private final Set<WriterKey> incomingKeys = identitySet();
+        private int heapBaselineCount;
+
+        @Override
+        public void onHeapBaselineCaptured() {
+            heapBaselineCount++;
+        }
+
+        @Override
+        public void onWriterKeyCreated(
+                IndexWriterStateBenchmark.WriterKeyUse use, WriterKey writerKey) {
+            if (heapBaselineCount == 0) {
+                keysCreatedBeforeBaseline.add(writerKey);
+            }
+            if (use == IndexWriterStateBenchmark.WriterKeyUse.RETAINED_STATE) {
+                retainedKeys.add(writerKey);
+            } else {
+                incomingKeys.add(writerKey);
+            }
+        }
+
+        private static Set<WriterKey> identitySet() {
+            return Collections.newSetFromMap(new IdentityHashMap<>());
+        }
     }
 }
