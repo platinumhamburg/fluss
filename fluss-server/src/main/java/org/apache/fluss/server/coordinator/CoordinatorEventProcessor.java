@@ -723,8 +723,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
         }
         try {
             return Collections.singletonMap(
-                    mainTableId,
-                    zooKeeperClient.getPartitionTombstone(mainTable.getTablePath()));
+                    mainTableId, zooKeeperClient.getPartitionTombstone(mainTable.getTablePath()));
         } catch (Exception e) {
             throw new FlussRuntimeException(
                     "Failed to load PartitionTombstone for newly created Index Table "

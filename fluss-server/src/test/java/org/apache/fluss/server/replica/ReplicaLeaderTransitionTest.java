@@ -84,8 +84,7 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
             KvIdempotenceProtocol protocol) throws Exception {
         long tableId = 150106L + protocol.version();
         TablePath tablePath =
-                TablePath.of(
-                        "test_db_1", "disabled_snapshot_interval_" + protocol.version());
+                TablePath.of("test_db_1", "disabled_snapshot_interval_" + protocol.version());
         TableBucket tableBucket = new TableBucket(tableId, 0);
         registerTableInZkClient(
                 tablePath,
@@ -151,8 +150,7 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
                         .get();
 
         assertThat(failedReassignment).hasSize(1);
-        assertThat(failedReassignment.get(0).getErrorMessage())
-                .contains("Fail to init kv tablet");
+        assertThat(failedReassignment.get(0).getErrorMessage()).contains("Fail to init kv tablet");
         assertThat(replayAttempts).hasValue(5);
         assertThat(replica.isLeader()).isFalse();
         assertThat(replica.getLeaderId()).isNull();
@@ -201,8 +199,7 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
                                 TABLET_SERVER_ID,
                                 requestedLeaderEpoch)
                         .get();
-        assertThat(failedReassignment.get(0).getErrorMessage())
-                .contains("Fail to init kv tablet");
+        assertThat(failedReassignment.get(0).getErrorMessage()).contains("Fail to init kv tablet");
         assertThat(replayAttempts).hasValue(5);
         assertThat(replica.isLeader()).isFalse();
         assertThat(replica.getLeaderEpoch()).isEqualTo(priorLeaderEpoch);
@@ -232,8 +229,7 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
     }
 
     @Test
-    void testSnapshotInitializationFailureCleansAttemptAndRetryPublishesOnce()
-            throws Exception {
+    void testSnapshotInitializationFailureCleansAttemptAndRetryPublishesOnce() throws Exception {
         ReplayRecoveryFixture fixture =
                 prepareReplayRecoveryFixture(150104L, "snapshot_initialization_retry");
         Replica replica = fixture.replica;
@@ -297,8 +293,7 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
         assertThat(successfulRetry)
                 .containsOnly(new NotifyLeaderAndIsrResultForBucket(fixture.tableBucket));
         assertThat(attemptedManagers).hasSize(6);
-        assertThat(attemptedManagers.subList(0, 5))
-                .allMatch(manager -> !manager.isStarted());
+        assertThat(attemptedManagers.subList(0, 5)).allMatch(manager -> !manager.isStarted());
         assertThat(attemptedManagers.get(5)).isSameAs(replica.getKvSnapshotManager());
         assertThat(attemptedManagers.get(5).isStarted()).isTrue();
         assertThat(replayedBatches).hasValue(12);
@@ -379,8 +374,7 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
                     new byte[] {(byte) key},
                     compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {key, value}));
             builder.setWriterState(writerKey, sequence);
-            return KvRecordBatchReader.pointToByteBuffer(
-                    builder.build().getByteBuf().nioBuffer());
+            return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
         }
     }
 
@@ -401,17 +395,11 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
         Replica replica = replicaManager.getReplicaOrException(tableBucket);
         WriterKey writerKey = new WriterKey(41L, 17L);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 100L, 1, "before-snapshot"),
-                null,
-                MergeMode.OVERWRITE,
-                -1);
+                fencedBatch(writerKey, 100L, 1, "before-snapshot"), null, MergeMode.OVERWRITE, -1);
         replica.getKvSnapshotManager().triggerSnapshot();
         snapshotReporter.waitUntilSnapshotComplete(tableBucket, 0);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 500L, 2, "after-snapshot"),
-                null,
-                MergeMode.OVERWRITE,
-                -1);
+                fencedBatch(writerKey, 500L, 2, "after-snapshot"), null, MergeMode.OVERWRITE, -1);
         return new ReplayRecoveryFixture(tablePath, tableBucket, replica);
     }
 

@@ -96,6 +96,7 @@ public class RemoteLogFetcher implements Closeable {
 
     /** Tracks the currently active iterator to ensure proper cleanup on close. */
     private RemoteLogBatchIterator activeIterator;
+
     @Nullable private CachedSegment cachedSegment;
     private boolean closed;
 
@@ -149,25 +150,24 @@ public class RemoteLogFetcher implements Closeable {
      *     iterator lazily downloads segments as needed.
      * @throws Exception if any error occurs during fetching or reading
      */
-    public FetchResult fetch(long startOffset, long localLogStartOffset)
-            throws Exception {
+    public FetchResult fetch(long startOffset, long localLogStartOffset) throws Exception {
         return fetchInternal(startOffset, localLogStartOffset, Long.MAX_VALUE);
     }
 
     /**
-     * Fetches a byte-bounded range while retaining at most one small page of segment metadata.
-     * The first batch may exceed {@code maxBytes}, matching local log min-one-message behavior.
+     * Fetches a byte-bounded range while retaining at most one small page of segment metadata. The
+     * first batch may exceed {@code maxBytes}, matching local log min-one-message behavior.
      */
-    public FetchResult fetch(
-            long startOffset, long localLogStartOffset, int maxBytes) throws Exception {
+    public FetchResult fetch(long startOffset, long localLogStartOffset, int maxBytes)
+            throws Exception {
         if (maxBytes <= 0) {
             throw new IllegalArgumentException("maxBytes must be positive");
         }
         return fetchInternal(startOffset, localLogStartOffset, maxBytes);
     }
 
-    private FetchResult fetchInternal(
-            long startOffset, long localLogStartOffset, long maxBytes) throws Exception {
+    private FetchResult fetchInternal(long startOffset, long localLogStartOffset, long maxBytes)
+            throws Exception {
         synchronized (lifecycleLock) {
             if (closed) {
                 throw new IllegalStateException("RemoteLogFetcher is closed");
@@ -186,10 +186,7 @@ public class RemoteLogFetcher implements Closeable {
 
             RemoteLogSegmentPage firstPage =
                     remoteLogManager.relevantRemoteLogSegmentPage(
-                            tableBucket,
-                            startOffset,
-                            null,
-                            MAX_SEGMENT_METADATA_PER_PAGE);
+                            tableBucket, startOffset, null, MAX_SEGMENT_METADATA_PER_PAGE);
             if (firstPage.segments().isEmpty() && !firstPage.hasMore()) {
                 throw new RemoteStorageException(
                         String.format(
@@ -206,10 +203,7 @@ public class RemoteLogFetcher implements Closeable {
 
             RemoteLogBatchIterator iterator =
                     new RemoteLogBatchIterator(
-                            firstPage,
-                            startOffset,
-                            localLogStartOffset,
-                            maxBytes);
+                            firstPage, startOffset, localLogStartOffset, maxBytes);
             this.activeIterator = iterator;
             return new FetchResult(iterator);
         }
@@ -325,6 +319,7 @@ public class RemoteLogFetcher implements Closeable {
 
         /** Tracks the current read offset, advancing as batches are consumed. */
         private long currentOffset;
+
         private long returnedBytes;
 
         private int currentSegmentIndex = 0;
@@ -419,8 +414,7 @@ public class RemoteLogFetcher implements Closeable {
                         stopReason = StopReason.END;
                         return;
                     }
-                    if (returnedBytes > 0
-                            && returnedBytes + batch.sizeInBytes() > maxBytes) {
+                    if (returnedBytes > 0 && returnedBytes + batch.sizeInBytes() > maxBytes) {
                         finished = true;
                         stopReason = StopReason.BYTE_LIMIT;
                         return;
@@ -639,5 +633,4 @@ public class RemoteLogFetcher implements Closeable {
             this.records = records;
         }
     }
-
 }

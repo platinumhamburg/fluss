@@ -54,10 +54,7 @@ public class MemoryLogRecordsIndexedBuilder extends MemoryLogRecordsRowBuilder<I
     }
 
     public static MemoryLogRecordsIndexedBuilder fencedBuilder(
-            int schemaId,
-            int writeLimit,
-            AbstractPagedOutputView outputView,
-            boolean appendOnly) {
+            int schemaId, int writeLimit, AbstractPagedOutputView outputView, boolean appendOnly) {
         return new MemoryLogRecordsIndexedBuilder(
                 BUILDER_DEFAULT_OFFSET,
                 schemaId,

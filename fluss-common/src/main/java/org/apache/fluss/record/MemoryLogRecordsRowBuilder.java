@@ -149,8 +149,7 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
 
     public void setWriterState(long writerId, int batchBaseSequence) {
         checkState(
-                magic != LOG_MAGIC_VALUE_V3,
-                "Compact writer state does not support WAL magic v3");
+                magic != LOG_MAGIC_VALUE_V3, "Compact writer state does not support WAL magic v3");
         this.writerId = writerId;
         this.batchSequence = batchBaseSequence;
     }
@@ -165,8 +164,7 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
 
     public void resetWriterState(long writerId, int batchSequence) {
         checkState(
-                magic != LOG_MAGIC_VALUE_V3,
-                "Compact writer state does not support WAL magic v3");
+                magic != LOG_MAGIC_VALUE_V3, "Compact writer state does not support WAL magic v3");
         // trigger to rewrite batch header
         this.builtBuffer = null;
         this.writerId = writerId;

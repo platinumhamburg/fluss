@@ -42,10 +42,7 @@ public class ArrowWalBuilder implements WalBuilder {
     }
 
     private ArrowWalBuilder(
-            int schemaId,
-            ArrowWriter writer,
-            MemorySegmentPool memorySegmentPool,
-            boolean fenced)
+            int schemaId, ArrowWriter writer, MemorySegmentPool memorySegmentPool, boolean fenced)
             throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);

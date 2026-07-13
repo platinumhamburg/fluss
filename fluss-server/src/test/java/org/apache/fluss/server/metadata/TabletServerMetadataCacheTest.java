@@ -164,8 +164,7 @@ public class TabletServerMetadataCacheTest {
                                 new TableMetadata(DATA1_TABLE_INFO, initialBucketMetadata)),
                         Collections.emptyList()));
         serverMetadataCache.updatePartitionTombstone(
-                DATA1_TABLE_ID,
-                new PartitionTombstone(-1L, Collections.singleton(10L), 1L));
+                DATA1_TABLE_ID, new PartitionTombstone(-1L, Collections.singleton(10L), 1L));
 
         TableInfo deletionInfo =
                 TableInfo.of(
@@ -186,8 +185,7 @@ public class TabletServerMetadataCacheTest {
                         Collections.emptyList());
         UpdateMetadataRequest parsed = new UpdateMetadataRequest();
         parsed.parseFrom(request.toByteArray());
-        ClusterMetadata roundTripped =
-                ServerRpcMessageUtils.getUpdateMetadataRequestData(parsed);
+        ClusterMetadata roundTripped = ServerRpcMessageUtils.getUpdateMetadataRequestData(parsed);
 
         TablePath decodedPath =
                 roundTripped.getTableMetadataList().get(0).getTableInfo().getTablePath();
@@ -269,9 +267,9 @@ public class TabletServerMetadataCacheTest {
 
         // test delete one table.
         serverMetadataCache.updatePartitionTombstone(
-                DATA1_TABLE_ID,
-                new PartitionTombstone(-1L, Collections.singleton(10L), 1L));
-        assertThat(serverMetadataCache.getInitializedPartitionTombstone(DATA1_TABLE_ID)).isPresent();
+                DATA1_TABLE_ID, new PartitionTombstone(-1L, Collections.singleton(10L), 1L));
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(DATA1_TABLE_ID))
+                .isPresent();
         serverMetadataCache.updateClusterMetadata(
                 new ClusterMetadata(
                         coordinatorServer,

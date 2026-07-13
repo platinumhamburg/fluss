@@ -21,12 +21,13 @@ import org.junit.jupiter.api.Test;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
-import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.batchSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.fencedSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.lastOffsetDeltaOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.leaderEpochOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
@@ -37,7 +38,6 @@ import static org.apache.fluss.record.LogRecordBatchFormat.statisticsLengthOffse
 import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyHighOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyLowOffset;
-import static org.apache.fluss.record.LogRecordBatchFormat.fencedSequenceOffset;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 

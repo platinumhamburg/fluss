@@ -27,7 +27,6 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
-import sun.security.krb5.KrbException;
 
 import java.nio.file.Paths;
 import java.util.HashMap;
@@ -40,11 +39,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 class HadoopUtilsTest {
 
     @BeforeAll
-    static void setPropertiesToEnableKerberosConfigInit() throws KrbException {
+    static void setPropertiesToEnableKerberosConfigInit() throws Exception {
         System.setProperty("java.security.krb5.realm", "EXAMPLE.COM");
         System.setProperty("java.security.krb5.kdc", "kdc");
         System.setProperty("java.security.krb5.conf", "/dev/null");
-        sun.security.krb5.Config.refresh();
+        Class.forName("sun.security.krb5.Config").getMethod("refresh").invoke(null);
     }
 
     @AfterAll

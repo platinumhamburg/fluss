@@ -78,8 +78,7 @@ class MemorySegmentLogInputStream implements LogInputStream<LogRecordBatch> {
         }
         long batchSize = (long) LOG_OVERHEAD + recordSize;
         if (batchSize > Integer.MAX_VALUE) {
-            throw new CorruptMessageException(
-                    "Record batch declared size overflow: " + batchSize);
+            throw new CorruptMessageException("Record batch declared size overflow: " + batchSize);
         }
         if (batchSize < minimumHeaderSize) {
             throw new CorruptMessageException(

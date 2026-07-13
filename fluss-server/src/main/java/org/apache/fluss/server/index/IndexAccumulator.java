@@ -142,9 +142,7 @@ public final class IndexAccumulator {
                                 pendingBytesByReplicator.compute(
                                         batch.window().owner(),
                                         (ignoredOwner, ownerBytes) ->
-                                                ownerBytes == null
-                                                        ? bytes
-                                                        : ownerBytes + bytes);
+                                                ownerBytes == null ? bytes : ownerBytes + bytes);
                                 batch.markAccounted();
 
                                 if (!batch.ownerActive()) {

@@ -498,8 +498,7 @@ public class ReplicaFetcherThreadTest {
         long initialOffset = 7L;
         long remoteEndOffset = 50L;
         ScriptedRemoteLeaderEndpoint endpoint =
-                new ScriptedRemoteLeaderEndpoint(
-                        new Configuration(), leaderRM, followerServerId);
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
         endpoint.addResponse(tb, remoteFetchResult(tb, DATA1_TABLE_PATH, remoteEndOffset));
         ReplicaFetcherThread fetcher =
                 new ReplicaFetcherThread("non-index-remote-failure", followerRM, endpoint, 1000);
@@ -524,19 +523,16 @@ public class ReplicaFetcherThreadTest {
         TableBucket indexBucket = registerIndexTableFollower(indexPath, 9901L);
         Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
         ScriptedRemoteLeaderEndpoint endpoint =
-                new ScriptedRemoteLeaderEndpoint(
-                        new Configuration(), leaderRM, followerServerId);
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
         endpoint.addResponse(
                 indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
         ReplicaFetcherThread fetcher =
                 new ReplicaFetcherThread("index-remote-failure", followerRM, endpoint, 1000);
         Map<TableBucket, InitialFetchStatus> initialStatuses = new HashMap<>();
         initialStatuses.put(
-                indexBucket,
-                new InitialFetchStatus(9901L, indexPath, leader.id(), initialOffset));
+                indexBucket, new InitialFetchStatus(9901L, indexPath, leader.id(), initialOffset));
         initialStatuses.put(
-                tb,
-                new InitialFetchStatus(DATA1_TABLE_ID, DATA1_TABLE_PATH, leader.id(), 0L));
+                tb, new InitialFetchStatus(DATA1_TABLE_ID, DATA1_TABLE_PATH, leader.id(), 0L));
         fetcher.addBuckets(initialStatuses);
 
         fetcher.doWork();
@@ -552,14 +548,12 @@ public class ReplicaFetcherThreadTest {
                                         new NotifyLeaderAndIsrData(
                                                 PhysicalTablePath.of(indexPath),
                                                 indexBucket,
-                                                Arrays.asList(
-                                                        leaderServerId, followerServerId),
+                                                Arrays.asList(leaderServerId, followerServerId),
                                                 new LeaderAndIsr(
                                                         followerServerId,
                                                         INITIAL_LEADER_EPOCH + 1,
                                                         Arrays.asList(
-                                                                leaderServerId,
-                                                                followerServerId),
+                                                                leaderServerId, followerServerId),
                                                         Collections.emptyList(),
                                                         INITIAL_COORDINATOR_EPOCH,
                                                         INITIAL_BUCKET_EPOCH + 1))))
@@ -582,8 +576,7 @@ public class ReplicaFetcherThreadTest {
         TableBucket indexBucket = registerIndexTableFollower(indexPath, tableId);
         Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
         ScriptedRemoteLeaderEndpoint endpoint =
-                new ScriptedRemoteLeaderEndpoint(
-                        new Configuration(), leaderRM, followerServerId);
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
         endpoint.addResponse(
                 indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
         ReplicaFetcherThread fetcher =
@@ -599,8 +592,7 @@ public class ReplicaFetcherThreadTest {
         fetcher.addBuckets(
                 Collections.singletonMap(
                         indexBucket,
-                        new InitialFetchStatus(
-                                tableId, indexPath, leader.id(), initialOffset)));
+                        new InitialFetchStatus(tableId, indexPath, leader.id(), initialOffset)));
 
         fetcher.doWork();
 
@@ -615,14 +607,12 @@ public class ReplicaFetcherThreadTest {
                                         new NotifyLeaderAndIsrData(
                                                 PhysicalTablePath.of(indexPath),
                                                 indexBucket,
-                                                Arrays.asList(
-                                                        leaderServerId, followerServerId),
+                                                Arrays.asList(leaderServerId, followerServerId),
                                                 new LeaderAndIsr(
                                                         followerServerId,
                                                         INITIAL_LEADER_EPOCH + 1,
                                                         Arrays.asList(
-                                                                leaderServerId,
-                                                                followerServerId),
+                                                                leaderServerId, followerServerId),
                                                         Collections.emptyList(),
                                                         INITIAL_COORDINATOR_EPOCH,
                                                         INITIAL_BUCKET_EPOCH + 1))))
@@ -638,8 +628,7 @@ public class ReplicaFetcherThreadTest {
         TableBucket indexBucket = registerIndexTableFollower(indexPath, 9902L);
         Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
         ScriptedRemoteLeaderEndpoint endpoint =
-                new ScriptedRemoteLeaderEndpoint(
-                        new Configuration(), leaderRM, followerServerId);
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
         endpoint.addResponse(
                 indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
         ReplicaFetcherThread fetcher =
@@ -671,14 +660,12 @@ public class ReplicaFetcherThreadTest {
                                         new NotifyLeaderAndIsrData(
                                                 PhysicalTablePath.of(indexPath),
                                                 indexBucket,
-                                                Arrays.asList(
-                                                        leaderServerId, followerServerId),
+                                                Arrays.asList(leaderServerId, followerServerId),
                                                 new LeaderAndIsr(
                                                         followerServerId,
                                                         INITIAL_LEADER_EPOCH + 1,
                                                         Arrays.asList(
-                                                                leaderServerId,
-                                                                followerServerId),
+                                                                leaderServerId, followerServerId),
                                                         Collections.emptyList(),
                                                         INITIAL_COORDINATOR_EPOCH,
                                                         INITIAL_BUCKET_EPOCH + 1))))
@@ -691,8 +678,7 @@ public class ReplicaFetcherThreadTest {
         long initialOffset = 7L;
         long remoteEndOffset = 50L;
         ScriptedRemoteLeaderEndpoint endpoint =
-                new ScriptedRemoteLeaderEndpoint(
-                        new Configuration(), leaderRM, followerServerId);
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
         endpoint.addResponse(tb, remoteFetchResult(tb, DATA1_TABLE_PATH, remoteEndOffset));
         ReplicaFetcherThread fetcher =
                 new ReplicaFetcherThread("remote-recovery-success", followerRM, endpoint, 1000);
@@ -716,10 +702,11 @@ public class ReplicaFetcherThreadTest {
     @Test
     void testWriterSnapshotCopyFailureClosesStreamAndRemovesTempFile() throws Exception {
         File snapshotFile = new File(tempDir, "copy-failure.snapshot");
-        RemoteLogSegment segment = remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
-                .remoteLogFetchInfo()
-                .remoteLogSegmentList()
-                .get(0);
+        RemoteLogSegment segment =
+                remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
+                        .remoteLogFetchInfo()
+                        .remoteLogSegmentList()
+                        .get(0);
         TrackingInputStream input = new TrackingInputStream(true);
         RemoteLogManager remoteLogManager = remoteLogManagerReturning(segment, input);
 
@@ -738,10 +725,11 @@ public class ReplicaFetcherThreadTest {
     @Test
     void testWriterSnapshotMoveFailureClosesStreamAndRemovesTempFile() throws Exception {
         File snapshotFile = new File(tempDir, "move-failure.snapshot");
-        RemoteLogSegment segment = remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
-                .remoteLogFetchInfo()
-                .remoteLogSegmentList()
-                .get(0);
+        RemoteLogSegment segment =
+                remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
+                        .remoteLogFetchInfo()
+                        .remoteLogSegmentList()
+                        .get(0);
         TrackingInputStream input = new TrackingInputStream(false);
         RemoteLogManager remoteLogManager = remoteLogManagerReturning(segment, input);
         followerFetcher.setSnapshotFileMover(
@@ -761,8 +749,8 @@ public class ReplicaFetcherThreadTest {
         assertThat(new File(snapshotFile.getAbsolutePath() + ".tmp")).doesNotExist();
     }
 
-    private RemoteLogManager remoteLogManagerReturning(
-            RemoteLogSegment segment, InputStream input) throws Exception {
+    private RemoteLogManager remoteLogManagerReturning(RemoteLogSegment segment, InputStream input)
+            throws Exception {
         RemoteLogStorage storage = mock(RemoteLogStorage.class);
         when(storage.fetchIndex(segment, RemoteLogStorage.IndexType.WRITER_ID_SNAPSHOT))
                 .thenReturn(input);
@@ -801,8 +789,7 @@ public class ReplicaFetcherThreadTest {
                         mainDescriptor, DATA1_TABLE_ID, DATA1_TABLE_PATH.toString(), "idx");
         zkClient.registerTable(
                 indexPath,
-                TableRegistration.newTable(
-                        indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
+                TableRegistration.newTable(indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
         zkClient.registerFirstSchema(indexPath, indexDescriptor.getSchema());
         TableBucket indexBucket = new TableBucket(indexTableId, 0);
         followerRM.becomeLeaderOrFollower(
@@ -840,10 +827,7 @@ public class ReplicaFetcherThreadTest {
         return new FetchLogResultForBucket(
                 tableBucket,
                 new RemoteLogFetchInfo(
-                        "missing-remote-tablet",
-                        null,
-                        Collections.singletonList(segment),
-                        0),
+                        "missing-remote-tablet", null, Collections.singletonList(segment), 0),
                 remoteEndOffset);
     }
 

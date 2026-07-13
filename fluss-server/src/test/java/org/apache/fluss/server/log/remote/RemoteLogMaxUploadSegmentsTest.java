@@ -116,7 +116,8 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         addFencedSegments(log, 3);
         long localStartBefore = log.localLogStartOffset();
         long firstClosedEnd = log.getSegments().get(1).getBaseOffset();
-        assertThat(FlussPaths.writerSnapshotFile(log.getLogDir(), firstClosedEnd).delete()).isTrue();
+        assertThat(FlussPaths.writerSnapshotFile(log.getLogDir(), firstClosedEnd).delete())
+                .isTrue();
 
         remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
         if (retry) {
@@ -176,8 +177,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void testV1PostCommitResponseLossResolvesAuthoritativeManifest(boolean retry)
-            throws Exception {
+    void testV1PostCommitResponseLossResolvesAuthoritativeManifest(boolean retry) throws Exception {
         TableBucket tb = makeIndexTableAsLeader(retry ? 9913L : 9914L);
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
         addFencedSegments(log, 4);
@@ -205,8 +205,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
         addFencedSegments(log, 4);
         RemoteLogManifestHandle authoritativeReplacement =
-                new RemoteLogManifestHandle(
-                        new FsPath("file:///authoritative-replacement"), 4L);
+                new RemoteLogManifestHandle(new FsPath("file:///authoritative-replacement"), 4L);
         testCoordinatorGateway.authoritativeManifestOverride.set(authoritativeReplacement);
         testCoordinatorGateway.loseRemoteLogManifestResponseAfterCommit.set(true);
 
@@ -221,9 +220,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         assertThat(listIndexRemoteLogFiles(tb)).hasSize(3);
         assertThat(zkClient.getRemoteLogManifestHandle(tb)).contains(authoritativeReplacement);
 
-        zkClient.getCuratorClient()
-                .delete()
-                .forPath(ZkData.BucketRemoteLogsZNode.path(tb));
+        zkClient.getCuratorClient().delete().forPath(ZkData.BucketRemoteLogsZNode.path(tb));
         testCoordinatorGateway.authoritativeManifestOverride.set(null);
         testCoordinatorGateway.loseRemoteLogManifestResponseAfterCommit.set(false);
         remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
@@ -245,9 +242,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         FsPath dir =
                 FlussPaths.remoteLogTabletDir(
                         FlussPaths.remoteLogDir(conf),
-                        replicaManager
-                                .getReplicaOrException(tableBucket)
-                                .getPhysicalTablePath(),
+                        replicaManager.getReplicaOrException(tableBucket).getPhysicalTablePath(),
                         tableBucket);
         return Arrays.stream(dir.getFileSystem().listStatus(dir))
                 .map(fileStatus -> fileStatus.getPath().getName())
@@ -270,14 +265,10 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
                     return snapshot(0, entry(4L, 5L, endOffset - 1L))
                             .getBytes(StandardCharsets.UTF_8);
                 case DUPLICATE_WRITER:
-                    entries =
-                            entry(4L, 5L, endOffset - 1L)
-                                    + ","
-                                    + entry(4L, 5L, endOffset - 1L);
+                    entries = entry(4L, 5L, endOffset - 1L) + "," + entry(4L, 5L, endOffset - 1L);
                     return snapshot(1, entries).getBytes(StandardCharsets.UTF_8);
                 case TARGET_OFFSET_AT_END:
-                    return snapshot(1, entry(4L, 5L, endOffset))
-                            .getBytes(StandardCharsets.UTF_8);
+                    return snapshot(1, entry(4L, 5L, endOffset)).getBytes(StandardCharsets.UTF_8);
                 default:
                     throw new AssertionError(this);
             }
@@ -344,10 +335,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         for (int i = 0; i < segmentCount; i++) {
             MemoryLogRecordsCompactedBuilder builder =
                     MemoryLogRecordsCompactedBuilder.fencedBuilder(
-                            1,
-                            1024,
-                            new UnmanagedPagedOutputView(128),
-                            false);
+                            1, 1024, new UnmanagedPagedOutputView(128), false);
             builder.setFencedWriterState(writerKey, 100L + i * 100L);
             builder.close();
             log.appendAsLeader(

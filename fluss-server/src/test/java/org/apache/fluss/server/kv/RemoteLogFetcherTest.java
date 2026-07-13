@@ -25,8 +25,8 @@ import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.server.log.LogTablet;
-import org.apache.fluss.server.log.remote.RemoteLogTestBase;
 import org.apache.fluss.server.log.remote.RemoteLogTablet.RemoteLogSegmentPage;
+import org.apache.fluss.server.log.remote.RemoteLogTestBase;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.utils.CloseableIterator;
 
@@ -47,8 +47,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -402,8 +402,7 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
 
         List<RemoteLogSegment> segments = remoteLogManager.relevantRemoteLogSegments(tb, 0L);
         long remoteEndOffset = segments.get(segments.size() - 1).remoteLogEndOffset();
-        org.apache.fluss.server.log.remote.RemoteLogManager countingManager =
-                spy(remoteLogManager);
+        org.apache.fluss.server.log.remote.RemoteLogManager countingManager = spy(remoteLogManager);
         AtomicInteger pageCalls = new AtomicInteger();
         AtomicInteger examinedMetadata = new AtomicInteger();
         doAnswer(
@@ -515,7 +514,9 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
             assertThat(windows).isGreaterThan(1);
             assertThat(downloads).hasValue(1);
             assertThat(opens).hasValue(1);
-            assertThat(openedRecords).singleElement().matches(records -> records.channel().isOpen());
+            assertThat(openedRecords)
+                    .singleElement()
+                    .matches(records -> records.channel().isOpen());
         }
         assertThat(openedRecords).allMatch(records -> !records.channel().isOpen());
     }
@@ -589,9 +590,7 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
                                 int openHandles =
                                         (int)
                                                 openedRecords.stream()
-                                                        .filter(
-                                                                opened ->
-                                                                        opened.channel().isOpen())
+                                                        .filter(opened -> opened.channel().isOpen())
                                                         .count();
                                 maxOpenHandles.accumulateAndGet(openHandles, Math::max);
                                 return records;

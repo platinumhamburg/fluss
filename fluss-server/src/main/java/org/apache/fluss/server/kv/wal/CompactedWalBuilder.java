@@ -50,10 +50,7 @@ public class CompactedWalBuilder implements WalBuilder {
     }
 
     private CompactedWalBuilder(
-            int schemaId,
-            RowType rowType,
-            MemorySegmentPool memorySegmentPool,
-            boolean fenced)
+            int schemaId, RowType rowType, MemorySegmentPool memorySegmentPool, boolean fenced)
             throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
@@ -71,8 +68,7 @@ public class CompactedWalBuilder implements WalBuilder {
     }
 
     public static CompactedWalBuilder fencedBuilder(
-            int schemaId, RowType rowType, MemorySegmentPool memorySegmentPool)
-            throws IOException {
+            int schemaId, RowType rowType, MemorySegmentPool memorySegmentPool) throws IOException {
         return new CompactedWalBuilder(schemaId, rowType, memorySegmentPool, true);
     }
 

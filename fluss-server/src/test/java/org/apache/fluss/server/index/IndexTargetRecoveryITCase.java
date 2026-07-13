@@ -136,9 +136,7 @@ class IndexTargetRecoveryITCase {
         int followerToPromote =
                 replicas.stream().filter(id -> id != originalLeader).findFirst().orElseThrow();
         ReplicaManager followerManager =
-                FLUSS_CLUSTER_EXTENSION
-                        .getTabletServerById(followerToPromote)
-                        .getReplicaManager();
+                FLUSS_CLUSTER_EXTENSION.getTabletServerById(followerToPromote).getReplicaManager();
         followerManager
                 .getReplicaFetcherManager()
                 .removeFetcherForBuckets(Collections.singleton(indexBucket));
@@ -157,8 +155,7 @@ class IndexTargetRecoveryITCase {
         long kvSnapshotOffset = committedKvSnapshot.getLogOffset();
         assertThat(pausedFollowerOffset).isLessThan(kvSnapshotOffset);
 
-        Replica originalReplica =
-                FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(indexBucket);
+        Replica originalReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(indexBucket);
         putMainMutation(mainGateway, mainTableId, 1, "after-update");
         originalReplica.getLogTablet().roll(Optional.empty());
         deleteMainMutation(mainGateway, mainTableId, 2);
@@ -190,8 +187,7 @@ class IndexTargetRecoveryITCase {
                                         pausedFollowerOffset)));
         FLUSS_CLUSTER_EXTENSION.waitUntilReplicaExpandToIsr(indexBucket, followerToPromote);
         Replica recoveredReplica =
-                FLUSS_CLUSTER_EXTENSION.waitAndGetFollowerReplica(
-                        indexBucket, followerToPromote);
+                FLUSS_CLUSTER_EXTENSION.waitAndGetFollowerReplica(indexBucket, followerToPromote);
         assertThat(recoveredReplica.getLogTablet().localLogStartOffset())
                 .isGreaterThan(pausedFollowerOffset);
 
@@ -238,11 +234,7 @@ class IndexTargetRecoveryITCase {
         putIndexMutation(promotedGateway, indexTableId, writerKey, 0L, insertedKey, false);
 
         assertThat(recoveredReplica.getLogTablet().localLogEndOffset()).isEqualTo(walEndBefore);
-        assertThat(
-                        recoveredReplica
-                                .getLogTablet()
-                                .writerStateManager()
-                                .lastFencedEntry(writerKey))
+        assertThat(recoveredReplica.getLogTablet().writerStateManager().lastFencedEntry(writerKey))
                 .contains(writerStateBefore);
         assertThat(recoveredReplica.lookups(Collections.singletonList(insertedKey)).get(0))
                 .isEqualTo(insertedValueBefore);
@@ -279,11 +271,10 @@ class IndexTargetRecoveryITCase {
         }
     }
 
-    private static void deleteMainMutation(
-            TabletServerGateway gateway, long mainTableId, int key) throws Exception {
+    private static void deleteMainMutation(TabletServerGateway gateway, long mainTableId, int key)
+            throws Exception {
         KvRecordBatch batch =
-                genKvRecordBatch(
-                        Collections.singletonList(Tuple2.of(new Object[] {key}, null)));
+                genKvRecordBatch(Collections.singletonList(Tuple2.of(new Object[] {key}, null)));
         try {
             gateway.putKv(newPutKvRequest(mainTableId, 0, 1, batch)).get();
         } catch (Exception failure) {
@@ -310,10 +301,7 @@ class IndexTargetRecoveryITCase {
             builder.setWriterState(writerKey, sequence);
             BytesView batch = builder.build();
             PutKvRequest request =
-                    new PutKvRequest()
-                            .setTableId(indexTableId)
-                            .setAcks(-1)
-                            .setTimeoutMs(30_000);
+                    new PutKvRequest().setTableId(indexTableId).setAcks(-1).setTimeoutMs(30_000);
             request.setAggMode(MergeMode.OVERWRITE.getProtoValue());
             PbPutKvReqForBucket bucketRequest = request.addBucketsReq().setBucketId(0);
             bucketRequest.setRecordsBytesView(batch);

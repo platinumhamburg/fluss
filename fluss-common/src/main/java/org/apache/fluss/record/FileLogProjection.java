@@ -201,8 +201,7 @@ public class FileLogProjection {
             logHeaderBuffer.limit((int) Math.min(V2_RECORD_BATCH_HEADER_SIZE, availableBytes));
             readFullyOrFail(channel, logHeaderBuffer, position, "log header");
             BatchDeclaration declaration = validateBatchDeclaration();
-            if (availableBytes < declaration.headerSize
-                    || availableBytes < declaration.batchSize) {
+            if (availableBytes < declaration.headerSize || availableBytes < declaration.batchSize) {
                 return new BytesViewLogRecords(builder.build());
             }
             if (declaration.magic == LOG_MAGIC_VALUE_V3
@@ -210,10 +209,7 @@ public class FileLogProjection {
                 int headerBytesRead = logHeaderBuffer.position();
                 logHeaderBuffer.limit(declaration.headerSize);
                 readFullyOrFail(
-                        channel,
-                        logHeaderBuffer,
-                        position + headerBytesRead,
-                        "v3 log header");
+                        channel, logHeaderBuffer, position + headerBytesRead, "v3 log header");
             }
 
             logHeaderBuffer.rewind();
@@ -597,8 +593,7 @@ public class FileLogProjection {
 
         int batchSize = (int) batchSizeLong;
         if (batchSize == headerSize && (statisticsLength != 0 || recordCount != 0)) {
-            throw corrupt(
-                    "A header-only batch must have zero statisticsLength and recordCount");
+            throw corrupt("A header-only batch must have zero statisticsLength and recordCount");
         }
 
         int recordsStartOffset =
@@ -610,8 +605,7 @@ public class FileLogProjection {
                 (logHeaderBuffer.get(attributeOffset(magic)) & APPEND_ONLY_FLAG_MASK) > 0;
         int changeTypeBytes = appendOnly ? 0 : recordCount;
         int arrowHeaderOffset =
-                checkedRelativeOffset(
-                        recordsStartOffset, changeTypeBytes, "change-type offset");
+                checkedRelativeOffset(recordsStartOffset, changeTypeBytes, "change-type offset");
         if (arrowHeaderOffset > batchSize) {
             throw corrupt("Change types exceed the declared record batch");
         }

@@ -662,8 +662,7 @@ public class FlinkConversionsTest {
         TableDescriptor descriptor = FlinkConversions.toFlussTable(resolvedCatalogTable);
 
         assertThat(descriptor.getSchema().getIndexes()).hasSize(1);
-        org.apache.fluss.metadata.Schema.Index index =
-                descriptor.getSchema().getIndexes().get(0);
+        org.apache.fluss.metadata.Schema.Index index = descriptor.getSchema().getIndexes().get(0);
         assertThat(index.getIndexName()).isEqualTo("idx_email");
         assertThat(index.getColumnNames()).containsExactly("email");
         assertThat(index.getVisibility()).isEqualTo(IndexVisibility.ASYNC);

@@ -356,8 +356,7 @@ public final class IndexReplicator implements AutoCloseable {
                 transitionToTerminalLocked(cause);
                 throw (IndexSourceWalCorruptionException) cause;
             }
-            LOG.warn(
-                    "Failed to read WAL at offset {}: {}", pendingReadOffset, cause.getMessage());
+            LOG.warn("Failed to read WAL at offset {}: {}", pendingReadOffset, cause.getMessage());
             return false;
         }
         clearPendingRead(future);
@@ -384,9 +383,7 @@ public final class IndexReplicator implements AutoCloseable {
     }
 
     private boolean processReadResult(
-            IndexProgressState state,
-            long readOffset,
-            IndexSourceReader.ReadResult readResult) {
+            IndexProgressState state, long readOffset, IndexSourceReader.ReadResult readResult) {
 
         Map<TableBucket, BucketBatchBuilder> builders = new HashMap<>();
         long lastProcessedOffset = state.pushedOffset;
@@ -872,10 +869,7 @@ public final class IndexReplicator implements AutoCloseable {
 
         private static MutationGroup update(OldIndexEntry oldEntry, LogRecord after) {
             return new MutationGroup(
-                    ChangeType.UPDATE_BEFORE,
-                    oldEntry,
-                    after.getRow(),
-                    after.logOffset() + 1);
+                    ChangeType.UPDATE_BEFORE, oldEntry, after.getRow(), after.logOffset() + 1);
         }
     }
 
@@ -913,14 +907,12 @@ public final class IndexReplicator implements AutoCloseable {
 
         private void addDelete(TableBucket targetBucket, byte[] key) {
             operations.add(
-                    new Mutation(
-                            targetBucket, key, null, DefaultKvRecord.sizeOf(key, null)));
+                    new Mutation(targetBucket, key, null, DefaultKvRecord.sizeOf(key, null)));
         }
 
         private void addUpsert(TableBucket targetBucket, byte[] key, BinaryRow value) {
             operations.add(
-                    new Mutation(
-                            targetBucket, key, value, DefaultKvRecord.sizeOf(key, value)));
+                    new Mutation(targetBucket, key, value, DefaultKvRecord.sizeOf(key, value)));
         }
 
         private int operationCount() {
@@ -941,8 +933,7 @@ public final class IndexReplicator implements AutoCloseable {
             return delta;
         }
 
-        private void appendTo(
-                IndexSpec spec, Map<TableBucket, BucketBatchBuilder> builders) {
+        private void appendTo(IndexSpec spec, Map<TableBucket, BucketBatchBuilder> builders) {
             for (Mutation operation : operations) {
                 BucketBatchBuilder builder =
                         builders.computeIfAbsent(
@@ -967,10 +958,7 @@ public final class IndexReplicator implements AutoCloseable {
         private final int recordSize;
 
         private Mutation(
-                TableBucket targetBucket,
-                byte[] key,
-                @Nullable BinaryRow value,
-                int recordSize) {
+                TableBucket targetBucket, byte[] key, @Nullable BinaryRow value, int recordSize) {
             this.targetBucket = targetBucket;
             this.key = key;
             this.value = value;

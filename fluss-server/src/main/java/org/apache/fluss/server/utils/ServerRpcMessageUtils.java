@@ -1150,8 +1150,7 @@ public class ServerRpcMessageUtils {
         for (PbPutKvReqForBucket putKvReqForBucket : putKvRequest.getBucketsReqsList()) {
             ByteBuffer recordsBuffer = toByteBuffer(putKvReqForBucket.getRecordsSlice());
             if (recordsBuffer.remaining() >= KV_BATCH_MAGIC_OFFSET + 1
-                    && recordsBuffer.get(
-                                    recordsBuffer.position() + KV_BATCH_MAGIC_OFFSET)
+                    && recordsBuffer.get(recordsBuffer.position() + KV_BATCH_MAGIC_OFFSET)
                             == KvRecordBatch.KV_MAGIC_VALUE_V1
                     && apiVersion < 2) {
                 throw new UnsupportedVersionException(

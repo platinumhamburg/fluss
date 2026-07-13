@@ -166,8 +166,8 @@ public class RemoteLogTablet {
      * @param currentTimeMs the current time in milliseconds
      * @param lakeLogEndOffset the log end offset that has been synced to lake, null if data lake is
      *     disabled
-     * @param committedMinRetainOffset the minimum raw WAL offset retained by the latest committed KV
-     *     snapshot
+     * @param committedMinRetainOffset the minimum raw WAL offset retained by the latest committed
+     *     KV snapshot
      * @return list of expired segments that can be safely deleted
      */
     public List<RemoteLogSegment> expiredRemoteLogSegments(
@@ -301,8 +301,7 @@ public class RemoteLogTablet {
                         }
                     }
                     boolean hasMore =
-                            cursor != null
-                                    && offsetToRemoteLogSegmentId.higherKey(cursor) != null;
+                            cursor != null && offsetToRemoteLogSegmentId.higherKey(cursor) != null;
                     return new RemoteLogSegmentPage(segments, cursor, examined, hasMore);
                 });
     }

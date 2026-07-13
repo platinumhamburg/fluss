@@ -122,8 +122,7 @@ class PartitionTTLGoldenPathITCase {
     }
 
     @Test
-    void testDropRecreateCollisionRetiresWriterAndCompactsOnlyOldIncarnation()
-            throws Exception {
+    void testDropRecreateCollisionRetiresWriterAndCompactsOnlyOldIncarnation() throws Exception {
         String mainName = "main_ttl_" + System.nanoTime();
         TablePath mainPath = TablePath.of(DB, mainName);
         TablePath indexPath =
@@ -187,10 +186,7 @@ class PartitionTTLGoldenPathITCase {
                 CLUSTER.getTabletServerById(CLUSTER.waitAndGetLeader(targetBucket))
                         .getMetadataCache();
         waitUntil(
-                () ->
-                        metadataCache
-                                .getPartitionTombstone(mainTableId)
-                                .isTombstoned(oldPartitionId),
+                () -> metadataCache.getPartitionTombstone(mainTableId).isTombstoned(oldPartitionId),
                 TIMEOUT,
                 "old partition tombstone publication");
         waitUntil(
@@ -227,9 +223,7 @@ class PartitionTTLGoldenPathITCase {
         assertExactWriterState(targetReplica, newWriter, 1L);
         targetKv.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
         assertV3Tag(
-                targetKv.getRocksDBKv().get(newPhysicalKey),
-                newPartitionId,
-                "new v3 value tag");
+                targetKv.getRocksDBKv().get(newPhysicalKey), newPartitionId, "new v3 value tag");
 
         long walBeforeDelayed = targetReplica.getLogTablet().localLogEndOffset();
         putIndexMutation(indexTableId, indexBucket, delayedOldUpsert);
@@ -358,10 +352,10 @@ class PartitionTTLGoldenPathITCase {
         waitUntil(
                 () ->
                         replica.getLogTablet()
-                                .writerStateManager()
-                                .lastFencedEntry(writer)
-                                .map(FencedWriterStateEntry::lastSequence)
-                                .orElse(-1L)
+                                        .writerStateManager()
+                                        .lastFencedEntry(writer)
+                                        .map(FencedWriterStateEntry::lastSequence)
+                                        .orElse(-1L)
                                 == expectedSequence,
                 TIMEOUT,
                 "exact WriterState sequence " + expectedSequence);

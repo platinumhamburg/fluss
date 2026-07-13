@@ -67,12 +67,7 @@ public class IndexWriterStateBenchmark {
         if (state.protocol == KvIdempotenceProtocol.V0_COMPACT) {
             WriterAppendInfo update = manager.prepareUpdate(writer);
             update.appendDataBatch(
-                    5,
-                    new LogOffsetMetadata(5L),
-                    5L,
-                    false,
-                    true,
-                    state.stateTimestampMs);
+                    5, new LogOffsetMetadata(5L), 5L, false, true, state.stateTimestampMs);
             return update.toEntry().lastBatchSequence();
         }
         FencedWriterAppendInfo update = manager.prepareFencedUpdate(state.writerKeys[writer]);

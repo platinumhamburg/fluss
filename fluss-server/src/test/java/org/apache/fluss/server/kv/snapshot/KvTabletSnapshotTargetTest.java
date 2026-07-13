@@ -265,8 +265,7 @@ class KvTabletSnapshotTargetTest {
         periodicSnapshotManager.close();
         KvTabletSnapshotTarget committedTarget =
                 createSnapshotTargetWithCustomCommitter(
-                        remoteKvTabletDir,
-                        (snapshot, coordinatorEpoch, bucketLeaderEpoch) -> {});
+                        remoteKvTabletDir, (snapshot, coordinatorEpoch, bucketLeaderEpoch) -> {});
         periodicSnapshotManager = createSnapshotManager(committedTarget);
         periodicSnapshotManager.start();
         periodicSnapshotManager.triggerSnapshot();

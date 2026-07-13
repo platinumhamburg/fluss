@@ -42,8 +42,8 @@ public class IndexWalBuilder implements WalBuilder {
         this(schemaId, memorySegmentPool, false);
     }
 
-    private IndexWalBuilder(
-            int schemaId, MemorySegmentPool memorySegmentPool, boolean fenced) throws IOException {
+    private IndexWalBuilder(int schemaId, MemorySegmentPool memorySegmentPool, boolean fenced)
+            throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         // unlimited write size as we don't know the WAL size in advance
@@ -55,8 +55,8 @@ public class IndexWalBuilder implements WalBuilder {
                                 schemaId, Integer.MAX_VALUE, outputView, false);
     }
 
-    public static IndexWalBuilder fencedBuilder(
-            int schemaId, MemorySegmentPool memorySegmentPool) throws IOException {
+    public static IndexWalBuilder fencedBuilder(int schemaId, MemorySegmentPool memorySegmentPool)
+            throws IOException {
         return new IndexWalBuilder(schemaId, memorySegmentPool, true);
     }
 

@@ -87,8 +87,7 @@ public class FileLogInputStreamTest extends LogTestBase {
         ByteBuffer corruptHeader =
                 ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
         corruptHeader.putInt(
-                LENGTH_OFFSET,
-                V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1);
+                LENGTH_OFFSET, V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1);
         corruptHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
 
         try (FileLogRecords fileLogRecords =
@@ -96,7 +95,8 @@ public class FileLogInputStreamTest extends LogTestBase {
             fileLogRecords.channel().write(corruptHeader);
             fileLogRecords.flush();
             FileLogInputStream input =
-                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
+                    new FileLogInputStream(
+                            fileLogRecords, 0, (int) fileLogRecords.channel().size());
 
             assertThatThrownBy(input::nextBatch)
                     .isInstanceOf(CorruptMessageException.class)
@@ -150,15 +150,9 @@ public class FileLogInputStreamTest extends LogTestBase {
     void testInvalidDeclarationsAreCorruptEvenWithOnlyCommonPrefix(byte magic) throws Exception {
         int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(magic);
         assertFileHeaderRejected(
-                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
-                -1,
-                magic,
-                "negative");
+                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC, -1, magic, "negative");
         assertFileHeaderRejected(
-                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
-                Integer.MAX_VALUE,
-                magic,
-                "overflow");
+                LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC, Integer.MAX_VALUE, magic, "overflow");
         assertFileHeaderRejected(
                 LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
                 headerSize - LogRecordBatchFormat.LOG_OVERHEAD - 1,
@@ -175,7 +169,8 @@ public class FileLogInputStreamTest extends LogTestBase {
                 FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"))) {
             fileLogRecords.channel().write(header);
             FileLogInputStream input =
-                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
+                    new FileLogInputStream(
+                            fileLogRecords, 0, (int) fileLogRecords.channel().size());
             assertThat(input.nextBatch()).isNull();
         }
     }
@@ -189,7 +184,8 @@ public class FileLogInputStreamTest extends LogTestBase {
                 FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"))) {
             fileLogRecords.channel().write(header);
             FileLogInputStream input =
-                    new FileLogInputStream(fileLogRecords, 0, (int) fileLogRecords.channel().size());
+                    new FileLogInputStream(
+                            fileLogRecords, 0, (int) fileLogRecords.channel().size());
             assertThatThrownBy(input::nextBatch)
                     .isInstanceOf(CorruptMessageException.class)
                     .hasMessageContaining(message);

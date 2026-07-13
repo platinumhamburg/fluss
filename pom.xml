@@ -143,6 +143,7 @@
           plugin executes before, the property is undefined and makes the tests fail. Thus we define an empty property
           here to make sure it doesn't fail. See also https://issues.apache.org/jira/browse/SUREFIRE-1431 -->
         <argLine/>
+        <surefire.module.config/>
         <extraJavaTestArgs>
             -XX:+IgnoreUnrecognizedVMOptions
             --add-opens=java.base/java.lang=ALL-UNNAMED
@@ -725,7 +726,7 @@
                         <junit.jupiter.execution.parallel.config.strategy>dynamic
                         </junit.jupiter.execution.parallel.config.strategy>
                     </systemPropertyVariables>
-                    <argLine>@{argLine} -Xms256m -Xmx2048m -XX:+UseG1GC ${extraJavaTestArgs}</argLine>
+                    <argLine>@{argLine} -Xms256m -Xmx2048m -XX:+UseG1GC ${surefire.module.config} ${extraJavaTestArgs}</argLine>
                 </configuration>
                 <executions>
                     <!--execute all the unit tests-->

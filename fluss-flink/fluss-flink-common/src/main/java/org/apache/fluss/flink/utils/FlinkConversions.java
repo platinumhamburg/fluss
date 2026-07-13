@@ -763,8 +763,7 @@ public class FlinkConversions {
                                 .filter(col -> !col.isEmpty())
                                 .collect(Collectors.toList());
             } else if (SECONDARY_INDEX_VISIBILITY_SUFFIX.equals(suffix)) {
-                visibility =
-                        IndexVisibility.valueOf(value.trim().toUpperCase(Locale.ROOT));
+                visibility = IndexVisibility.valueOf(value.trim().toUpperCase(Locale.ROOT));
             } else if (SECONDARY_INDEX_BUCKET_NUM_SUFFIX.equals(suffix)) {
                 bucketCount = Integer.parseInt(value.trim());
             }

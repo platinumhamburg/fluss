@@ -112,8 +112,8 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeListOffsetsRequest;
-import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
 import static org.apache.fluss.metadata.DataLakeFormat.PAIMON;
@@ -292,8 +292,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
         Map<String, String> options = new HashMap<>(tableDescriptor.getProperties());
         options.put(
-                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(KV_FORMAT_VERSION_2));
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_2));
         assertThat(tableInfo.toTableDescriptor())
                 .isEqualTo(tableDescriptor.withProperties(options));
         assertThat(schemaInfo2).isEqualTo(schemaInfo);
@@ -321,8 +320,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
         options = new HashMap<>(expected.getProperties());
         options.put(
-                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
-                String.valueOf(KV_FORMAT_VERSION_2));
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_2));
         assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected.withProperties(options));
         assertThat(schemaInfo2).isEqualTo(schemaInfo);
         // assert created time

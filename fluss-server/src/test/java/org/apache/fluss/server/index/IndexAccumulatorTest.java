@@ -167,10 +167,8 @@ public class IndexAccumulatorTest {
     void dropForReplicatorContinuesAfterDropListenerFailure() {
         IndexAccumulator accumulator = new IndexAccumulator();
         IndexReplicator owner = replicator(accumulator);
-        IndexBatch first =
-                batch(new TableBucket(501L, 0), new IndexWindow("idx", 1L, 1, owner));
-        IndexBatch second =
-                batch(new TableBucket(501L, 1), new IndexWindow("idx", 2L, 1, owner));
+        IndexBatch first = batch(new TableBucket(501L, 0), new IndexWindow("idx", 1L, 1, owner));
+        IndexBatch second = batch(new TableBucket(501L, 1), new IndexWindow("idx", 2L, 1, owner));
         accumulator.append(first);
         accumulator.append(second);
 
@@ -239,12 +237,10 @@ public class IndexAccumulatorTest {
         IndexReplicator stoppingOwner = replicator(accumulator);
         IndexReplicator publishingOwner = replicator(accumulator);
         TableBucket bucket = new TableBucket(502L, 0);
-        IndexBatch seed =
-                batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
+        IndexBatch seed = batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
         accumulator.append(seed);
         Deque<IndexBatch> deque = queue(accumulator, bucket);
-        IndexBatch published =
-                batch(bucket, new IndexWindow("idx", 10L, 1, publishingOwner), 7);
+        IndexBatch published = batch(bucket, new IndexWindow("idx", 10L, 1, publishingOwner), 7);
         AtomicInteger dropped = new AtomicInteger(-1);
         AtomicReference<Throwable> cleanupFailure = new AtomicReference<>();
         Thread cleanupThread =
@@ -302,10 +298,8 @@ public class IndexAccumulatorTest {
         IndexReplicator stoppingOwner = replicator(accumulator);
         IndexReplicator retryingOwner = replicator(accumulator);
         TableBucket bucket = new TableBucket(503L, 0);
-        IndexBatch retry =
-                batch(bucket, new IndexWindow("idx", 10L, 1, retryingOwner), 11);
-        IndexBatch seed =
-                batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
+        IndexBatch retry = batch(bucket, new IndexWindow("idx", 10L, 1, retryingOwner), 11);
+        IndexBatch seed = batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
         accumulator.append(retry);
         accumulator.append(seed);
         assertThat(accumulator.pollFirst(bucket)).isSameAs(retry);
@@ -372,8 +366,7 @@ public class IndexAccumulatorTest {
 
         for (int i = 0; i < 100; i++) {
             TableBucket bucket = new TableBucket(600L + i, i);
-            IndexBatch batch =
-                    batch(bucket, new IndexWindow("idx", i + 1L, 1, owner), 3);
+            IndexBatch batch = batch(bucket, new IndexWindow("idx", i + 1L, 1, owner), 3);
             accumulator.append(batch);
             assertThat(accumulator.pollFirst(bucket)).isSameAs(batch);
             accumulator.release(batch);
@@ -392,10 +385,7 @@ public class IndexAccumulatorTest {
         IndexReplicator ownerB = replicator(accumulator);
 
         accumulator.append(
-                batch(
-                        new TableBucket(10L, 0),
-                        new IndexWindow("idx", 1L, 1, ownerA),
-                        3));
+                batch(new TableBucket(10L, 0), new IndexWindow("idx", 1L, 1, ownerA), 3));
 
         assertThat(accumulator.isFull()).isTrue();
         assertThat(accumulator.isFull(ownerA)).isTrue();

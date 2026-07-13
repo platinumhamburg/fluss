@@ -30,8 +30,8 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *
  * <p>A batch carries only a reference to the {@link IndexWindow} it belongs to; the WAL offset it
  * advances is a property of that window, not of the batch. On successful acknowledgement the batch
- * notifies its window via {@link IndexWindow#onBatchAcked(IndexBatch)}; on failure it is re-enqueued
- * for unlimited retry without advancing any offset.
+ * notifies its window via {@link IndexWindow#onBatchAcked(IndexBatch)}; on failure it is
+ * re-enqueued for unlimited retry without advancing any offset.
  *
  * <p>A batch acknowledges its window at most once: {@link #markAcked()} is a one-shot CAS guard
  * mirroring the client {@code WriteBatch} final-state machine, so a stray duplicate completion can
@@ -54,6 +54,7 @@ final class IndexBatch {
 
     /** One-shot guard ensuring pending-byte accounting is released at most once. */
     private final AtomicBoolean released = new AtomicBoolean(false);
+
     private boolean accounted;
 
     IndexBatch(TableBucket targetBucket, BytesView encoded, IndexWindow window) {

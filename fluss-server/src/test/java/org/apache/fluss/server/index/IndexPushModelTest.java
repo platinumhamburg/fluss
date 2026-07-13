@@ -28,18 +28,20 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.aligned.AlignedRowWriter;
+import org.apache.fluss.row.compacted.CompactedKeyWriter;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
-import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.KvEntry;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.TruncateReason;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Value;
 import org.apache.fluss.server.log.LogAppendInfo;
@@ -53,6 +55,7 @@ import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
+import org.apache.fluss.utils.UnsafeUtils;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -83,6 +86,7 @@ class IndexPushModelTest {
     private static final int SOURCE_OPERATIONS = 200;
     private static final int DROP_OFFSET = 100;
     private static final int KEYS_PER_INCARNATION = 4;
+    private static final int[] ALL_TARGET_COLUMNS = {0, 1, 2, 3};
     private static final short SCHEMA_ID = 1;
     private static final RowType INDEX_ROW_TYPE =
             DataTypes.ROW(
@@ -134,7 +138,9 @@ class IndexPushModelTest {
             Set<Long> tombstonedPartitions)
             throws Exception {
         SourceHistory history = SourceHistory.generate(fixture.mainTableId, seed);
-        assertThat(history.mutations).as("seed=%s source operations", seed).hasSize(SOURCE_OPERATIONS);
+        assertThat(history.mutations)
+                .as("seed=%s source operations", seed)
+                .hasSize(SOURCE_OPERATIONS);
         allPhysicalKeys.addAll(history.physicalKeys());
         EnumSet<EventFamily> coverage = EnumSet.noneOf(EventFamily.class);
 
@@ -145,11 +151,7 @@ class IndexPushModelTest {
         Delivery sameValue = history.window("same-value advance", 1, 2);
         fixture.applyFresh(sameValue, committedWriterStates, true, allPhysicalKeys, seed);
         fixture.applyNoOp(
-                first,
-                ExpectedOutcome.STALE,
-                committedWriterStates,
-                allPhysicalKeys,
-                seed);
+                first, ExpectedOutcome.STALE, committedWriterStates, allPhysicalKeys, seed);
         coverage.add(EventFamily.SAME_VALUE_STALE_UPSERT);
 
         Random random = new Random(seed);
@@ -159,11 +161,7 @@ class IndexPushModelTest {
         // The successful result is deliberately not used as source progress. The identical delta
         // is retried as it would be after a lost response.
         fixture.applyNoOp(
-                lostResponse,
-                ExpectedOutcome.STALE,
-                committedWriterStates,
-                allPhysicalKeys,
-                seed);
+                lostResponse, ExpectedOutcome.STALE, committedWriterStates, allPhysicalKeys, seed);
         coverage.add(EventFamily.EXACT_DUPLICATE_AFTER_LOST_RESPONSE);
 
         int laterEnd = 45 + random.nextInt(20);
@@ -172,11 +170,7 @@ class IndexPushModelTest {
         fixture.applyFresh(later, committedWriterStates, true, allPhysicalKeys, seed);
         Delivery reordered = history.window("reordered earlier window", lostEnd, earlierEnd);
         fixture.applyNoOp(
-                reordered,
-                ExpectedOutcome.STALE,
-                committedWriterStates,
-                allPhysicalKeys,
-                seed);
+                reordered, ExpectedOutcome.STALE, committedWriterStates, allPhysicalKeys, seed);
         coverage.add(EventFamily.OUT_OF_ORDER_DELIVERY);
 
         Delivery oldReplay = history.window("changed-boundary old replay", 0, DROP_OFFSET);
@@ -191,16 +185,20 @@ class IndexPushModelTest {
 
         tombstonedPartitions.add(history.oldIncarnation.partitionId);
         fixture.publishTombstone(
-                new PartitionTombstone(
-                        -1L, new HashSet<>(tombstonedPartitions), seed + 1L));
-        committedWriterStates.remove(history.oldIncarnation.writerKey);
+                new PartitionTombstone(-1L, new HashSet<>(tombstonedPartitions), seed + 1L));
+        committedWriterStates.remove(history.writerKey(history.oldIncarnation));
         fixture.assertWriterStates(committedWriterStates, seed);
         assertThat(history.newIncarnation.partitionId)
                 .as("seed=%s recreated partition incarnation", seed)
                 .isNotEqualTo(history.oldIncarnation.partitionId);
-        assertThat(history.oldIncarnation.rows.get(0).key)
+        assertThat(history.newIncarnation.generation)
+                .as("seed=%s recreated partition generation", seed)
+                .isGreaterThan(history.oldIncarnation.generation);
+        assertThat(OracleProjection.project(history.logicalRow(history.oldIncarnation, 0)).key)
                 .as("seed=%s physical keys include incarnation", seed)
-                .isNotEqualTo(history.newIncarnation.rows.get(0).key);
+                .isNotEqualTo(
+                        OracleProjection.project(history.logicalRow(history.newIncarnation, 0))
+                                .key);
         coverage.add(EventFamily.PARTITION_DROP_RECREATE);
 
         fixture.applyNoOp(
@@ -222,7 +220,8 @@ class IndexPushModelTest {
         fixture.applyFresh(newCommitted, committedWriterStates, true, allPhysicalKeys, seed);
 
         Delivery truncated = history.window("uncommitted target WAL", 120, 140);
-        PhysicalState beforeUncommitted = fixture.physicalState(truncated.writerKey, allPhysicalKeys);
+        PhysicalState beforeUncommitted =
+                fixture.physicalState(truncated.writerKey, allPhysicalKeys);
         long committedHighWatermark = fixture.log.getHighWatermark();
         assertThat(committedHighWatermark)
                 .as("seed=%s committed high watermark before truncation", seed)
@@ -237,8 +236,7 @@ class IndexPushModelTest {
                 .getKvPreWriteBuffer()
                 .truncateTo(beforeUncommitted.walEndOffset, TruncateReason.ERROR);
         fixture.recoverWriterState(committedWriterStates, seed);
-        PhysicalState afterTruncation =
-                fixture.physicalState(truncated.writerKey, allPhysicalKeys);
+        PhysicalState afterTruncation = fixture.physicalState(truncated.writerKey, allPhysicalKeys);
         assertThat(afterTruncation)
                 .as("seed=%s truncation removes uncommitted KV and WriterState", seed)
                 .usingRecursiveComparison()
@@ -251,14 +249,11 @@ class IndexPushModelTest {
         coverage.add(EventFamily.UNCOMMITTED_WAL_TRUNCATION);
 
         fixture.applyNoOp(
-                truncated,
-                ExpectedOutcome.STALE,
-                committedWriterStates,
-                allPhysicalKeys,
-                seed);
+                truncated, ExpectedOutcome.STALE, committedWriterStates, allPhysicalKeys, seed);
         coverage.add(EventFamily.STALE_REDELIVERY);
 
-        Delivery settle = history.window("final source-delta replay", DROP_OFFSET, SOURCE_OPERATIONS);
+        Delivery settle =
+                history.window("final source-delta replay", DROP_OFFSET, SOURCE_OPERATIONS);
         assertThat(settle.mutations)
                 .as("seed=%s settle replay contains source deltas only", seed)
                 .containsExactlyElementsOf(
@@ -347,16 +342,22 @@ class IndexPushModelTest {
     }
 
     private static final class SourceHistory {
+        private final long mainTableId;
+        private final int seed;
         private final List<SourceMutation> mutations;
-        private final Incarnation oldIncarnation;
-        private final Incarnation newIncarnation;
+        private final SourceIncarnation oldIncarnation;
+        private final SourceIncarnation newIncarnation;
         private final Map<String, String> terminalRows;
 
         private SourceHistory(
+                long mainTableId,
+                int seed,
                 List<SourceMutation> mutations,
-                Incarnation oldIncarnation,
-                Incarnation newIncarnation,
+                SourceIncarnation oldIncarnation,
+                SourceIncarnation newIncarnation,
                 Map<String, String> terminalRows) {
+            this.mainTableId = mainTableId;
+            this.seed = seed;
             this.mutations = mutations;
             this.oldIncarnation = oldIncarnation;
             this.newIncarnation = newIncarnation;
@@ -366,15 +367,16 @@ class IndexPushModelTest {
         private static SourceHistory generate(long mainTableId, int seed) {
             long oldPartitionId = 10_000L + seed * 2L;
             long newPartitionId = oldPartitionId + 1L;
-            Incarnation oldIncarnation = Incarnation.create(mainTableId, seed, oldPartitionId);
-            Incarnation newIncarnation = Incarnation.create(mainTableId, seed, newPartitionId);
+            SourceIncarnation oldIncarnation = new SourceIncarnation(oldPartitionId, 0);
+            SourceIncarnation newIncarnation = new SourceIncarnation(newPartitionId, 1);
             Random random = new Random(seed * 31L + 17L);
             List<SourceMutation> mutations = new ArrayList<>(SOURCE_OPERATIONS);
             for (int operation = 0; operation < SOURCE_OPERATIONS; operation++) {
-                Incarnation incarnation =
+                SourceIncarnation incarnation =
                         operation < DROP_OFFSET ? oldIncarnation : newIncarnation;
                 int key = random.nextInt(KEYS_PER_INCARNATION);
-                MutationKind kind = random.nextBoolean() ? MutationKind.UPSERT : MutationKind.DELETE;
+                MutationKind kind =
+                        random.nextBoolean() ? MutationKind.UPSERT : MutationKind.DELETE;
                 if (operation == 0 || operation == 1) {
                     key = 0;
                     kind = MutationKind.UPSERT;
@@ -390,26 +392,40 @@ class IndexPushModelTest {
                 }
                 mutations.add(
                         new SourceMutation(
-                                operation + 1L, incarnation, incarnation.rows.get(key), kind));
+                                operation + 1L,
+                                seed,
+                                key,
+                                "logical-partition-" + seed,
+                                incarnation,
+                                kind));
             }
 
             Map<String, String> terminalRows = new HashMap<>();
             applyReference(mutations.subList(0, DROP_OFFSET), terminalRows);
-            for (PhysicalRow row : oldIncarnation.rows) {
-                terminalRows.remove(row.encodedKey);
+            for (int key = 0; key < KEYS_PER_INCARNATION; key++) {
+                SourceMutation logicalRow =
+                        new SourceMutation(
+                                0L,
+                                seed,
+                                key,
+                                "logical-partition-" + seed,
+                                oldIncarnation,
+                                MutationKind.UPSERT);
+                terminalRows.remove(OracleProjection.project(logicalRow).encodedKey);
             }
             applyReference(mutations.subList(DROP_OFFSET, SOURCE_OPERATIONS), terminalRows);
             return new SourceHistory(
-                    mutations, oldIncarnation, newIncarnation, terminalRows);
+                    mainTableId, seed, mutations, oldIncarnation, newIncarnation, terminalRows);
         }
 
         private static void applyReference(
                 List<SourceMutation> mutations, Map<String, String> referenceRows) {
             for (SourceMutation mutation : mutations) {
+                OraclePhysicalRow row = OracleProjection.project(mutation);
                 if (mutation.kind == MutationKind.UPSERT) {
-                    referenceRows.put(mutation.row.encodedKey, mutation.row.encodedValue);
+                    referenceRows.put(row.encodedKey, row.encodedValue);
                 } else {
-                    referenceRows.remove(mutation.row.encodedKey);
+                    referenceRows.remove(row.encodedKey);
                 }
             }
         }
@@ -418,13 +434,11 @@ class IndexPushModelTest {
             assertThat(startInclusive).isLessThan(endExclusive);
             List<SourceMutation> delta =
                     new ArrayList<>(mutations.subList(startInclusive, endExclusive));
-            Incarnation incarnation = delta.get(0).incarnation;
+            SourceIncarnation incarnation = delta.get(0).incarnation;
             assertThat(delta)
                     .as("%s must not cross partition incarnations", label)
-                    .allSatisfy(
-                            mutation ->
-                                    assertThat(mutation.incarnation).isSameAs(incarnation));
-            return new Delivery(label, endExclusive, incarnation.writerKey, delta);
+                    .allSatisfy(mutation -> assertThat(mutation.incarnation).isSameAs(incarnation));
+            return new Delivery(label, endExclusive, writerKey(incarnation), delta);
         }
 
         private Delivery singleMutation(String label, int operationIndex) {
@@ -432,88 +446,131 @@ class IndexPushModelTest {
             return new Delivery(
                     label,
                     mutation.exclusiveOffset,
-                    mutation.incarnation.writerKey,
+                    writerKey(mutation.incarnation),
                     Collections.singletonList(mutation));
         }
 
         private List<byte[]> physicalKeys() {
-            List<byte[]> keys = new ArrayList<>(KEYS_PER_INCARNATION * 2);
-            for (PhysicalRow row : oldIncarnation.rows) {
-                keys.add(row.key);
+            Map<String, byte[]> keys = new LinkedHashMap<>();
+            for (SourceIncarnation incarnation :
+                    new SourceIncarnation[] {oldIncarnation, newIncarnation}) {
+                for (int key = 0; key < KEYS_PER_INCARNATION; key++) {
+                    SourceMutation logicalRow = logicalRow(incarnation, key);
+                    byte[] productionKey = ProductionProjection.project(logicalRow).key;
+                    byte[] oracleKey = OracleProjection.project(logicalRow).key;
+                    keys.put(encode(productionKey), productionKey);
+                    keys.put(encode(oracleKey), oracleKey);
+                }
             }
-            for (PhysicalRow row : newIncarnation.rows) {
-                keys.add(row.key);
-            }
-            return keys;
+            return new ArrayList<>(keys.values());
+        }
+
+        private SourceMutation logicalRow(SourceIncarnation incarnation, int key) {
+            return new SourceMutation(
+                    0L, seed, key, "logical-partition-" + seed, incarnation, MutationKind.UPSERT);
+        }
+
+        private WriterKey writerKey(SourceIncarnation incarnation) {
+            return IndexWriterKey.encode(new TableBucket(mainTableId, incarnation.partitionId, 0));
         }
     }
 
-    private static final class Incarnation {
+    private static final class SourceIncarnation {
         private final long partitionId;
-        private final WriterKey writerKey;
-        private final List<PhysicalRow> rows;
+        private final int generation;
 
-        private Incarnation(long partitionId, WriterKey writerKey, List<PhysicalRow> rows) {
+        private SourceIncarnation(long partitionId, int generation) {
             this.partitionId = partitionId;
-            this.writerKey = writerKey;
-            this.rows = rows;
-        }
-
-        private static Incarnation create(long mainTableId, int seed, long partitionId) {
-            List<PhysicalRow> rows = new ArrayList<>(KEYS_PER_INCARNATION);
-            for (int key = 0; key < KEYS_PER_INCARNATION; key++) {
-                rows.add(PhysicalRow.create(seed, key, partitionId));
-            }
-            return new Incarnation(
-                    partitionId,
-                    IndexWriterKey.encode(new TableBucket(mainTableId, partitionId, 0)),
-                    rows);
+            this.generation = generation;
         }
     }
 
-    private static final class PhysicalRow {
+    private static final class ProductionMutation {
         private final byte[] key;
         private final AlignedRow value;
-        private final String encodedKey;
-        private final String encodedValue;
 
-        private PhysicalRow(byte[] key, AlignedRow value, byte[] encodedValue) {
+        private ProductionMutation(byte[] key, AlignedRow value) {
             this.key = key;
             this.value = value;
-            this.encodedKey = encode(key);
-            this.encodedValue = encode(encodedValue);
         }
+    }
 
-        private static PhysicalRow create(int seed, int key, long partitionId) {
+    private static final class ProductionProjection {
+        private static final CompactedKeyEncoder KEY_ENCODER =
+                new CompactedKeyEncoder(INDEX_ROW_TYPE);
+
+        private static ProductionMutation project(SourceMutation mutation) {
             AlignedRow row = new AlignedRow(4);
             AlignedRowWriter writer = new AlignedRowWriter(row);
             writer.reset();
-            writer.writeLong(0, seed * 100L + key);
-            writer.writeLong(1, seed * 100L + key);
-            writer.writeString(2, fromString("logical-partition-" + seed));
-            writer.writeLong(3, partitionId);
+            writer.writeLong(0, mutation.seed * 100L + mutation.key);
+            writer.writeLong(1, mutation.seed * 100L + mutation.key);
+            writer.writeString(2, fromString(mutation.partition));
+            writer.writeLong(3, mutation.incarnation.partitionId);
             writer.complete();
-            return new PhysicalRow(
-                    new CompactedKeyEncoder(INDEX_ROW_TYPE).encodeKey(row),
-                    row,
-                    ValueEncoder.encodeValue(SCHEMA_ID, partitionId, row));
+            return new ProductionMutation(KEY_ENCODER.encodeKey(row), row);
+        }
+    }
+
+    private static final class OraclePhysicalRow {
+        private final byte[] key;
+        private final byte[] value;
+        private final String encodedKey;
+        private final String encodedValue;
+
+        private OraclePhysicalRow(byte[] key, byte[] value) {
+            this.key = key;
+            this.value = value;
+            this.encodedKey = encode(key);
+            this.encodedValue = encode(value);
+        }
+    }
+
+    private static final class OracleProjection {
+        private static OraclePhysicalRow project(SourceMutation mutation) {
+            CompactedKeyWriter keyWriter = new CompactedKeyWriter();
+            keyWriter.writeLong(mutation.seed * 100L + mutation.key);
+            keyWriter.writeLong(mutation.seed * 100L + mutation.key);
+            keyWriter.writeString(mutation.partition);
+            keyWriter.writeLong(mutation.incarnation.partitionId);
+
+            AlignedRow oracleRow = new AlignedRow(4);
+            AlignedRowWriter rowWriter = new AlignedRowWriter(oracleRow);
+            rowWriter.reset();
+            rowWriter.writeLong(0, mutation.seed * 100L + mutation.key);
+            rowWriter.writeLong(1, mutation.seed * 100L + mutation.key);
+            rowWriter.writeString(2, fromString(mutation.partition));
+            rowWriter.writeLong(3, mutation.incarnation.partitionId);
+            rowWriter.complete();
+
+            byte[] value = new byte[Short.BYTES + Long.BYTES + oracleRow.getSizeInBytes()];
+            UnsafeUtils.putShort(value, 0, SCHEMA_ID);
+            UnsafeUtils.putLong(value, Short.BYTES, mutation.incarnation.partitionId);
+            oracleRow.copyTo(value, Short.BYTES + Long.BYTES);
+            return new OraclePhysicalRow(keyWriter.toBytes(), value);
         }
     }
 
     private static final class SourceMutation {
         private final long exclusiveOffset;
-        private final Incarnation incarnation;
-        private final PhysicalRow row;
+        private final int seed;
+        private final int key;
+        private final String partition;
+        private final SourceIncarnation incarnation;
         private final MutationKind kind;
 
         private SourceMutation(
                 long exclusiveOffset,
-                Incarnation incarnation,
-                PhysicalRow row,
+                int seed,
+                int key,
+                String partition,
+                SourceIncarnation incarnation,
                 MutationKind kind) {
             this.exclusiveOffset = exclusiveOffset;
+            this.seed = seed;
+            this.key = key;
+            this.partition = partition;
             this.incarnation = incarnation;
-            this.row = row;
             this.kind = kind;
         }
     }
@@ -525,10 +582,7 @@ class IndexPushModelTest {
         private final List<SourceMutation> mutations;
 
         private Delivery(
-                String label,
-                long sequence,
-                WriterKey writerKey,
-                List<SourceMutation> mutations) {
+                String label, long sequence, WriterKey writerKey, List<SourceMutation> mutations) {
             this.label = label;
             this.sequence = sequence;
             this.writerKey = writerKey;
@@ -592,6 +646,103 @@ class IndexPushModelTest {
         }
     }
 
+    private static final class FreshExpectation {
+        private final int effectiveMutationCount;
+        private final long walEndOffset;
+        private final long lastWalOffset;
+        private final long prewriteMaxLsn;
+        private final List<KvEntry> uncommittedEntries;
+        private final Map<Key, KvEntry> uncommittedEntryMap;
+        private final Map<String, String> prewriteValues;
+        private final Map<String, String> rows;
+
+        private FreshExpectation(
+                int effectiveMutationCount,
+                long walEndOffset,
+                long lastWalOffset,
+                long prewriteMaxLsn,
+                List<KvEntry> uncommittedEntries,
+                Map<Key, KvEntry> uncommittedEntryMap,
+                Map<String, String> prewriteValues,
+                Map<String, String> rows) {
+            this.effectiveMutationCount = effectiveMutationCount;
+            this.walEndOffset = walEndOffset;
+            this.lastWalOffset = lastWalOffset;
+            this.prewriteMaxLsn = prewriteMaxLsn;
+            this.uncommittedEntries = uncommittedEntries;
+            this.uncommittedEntryMap = uncommittedEntryMap;
+            this.prewriteValues = prewriteValues;
+            this.rows = rows;
+        }
+
+        private static FreshExpectation from(
+                PhysicalState before, Delivery delivery, boolean presenceSensitiveMerge) {
+            Map<String, String> rows = new HashMap<>(before.rows);
+            List<KvEntry> entries = new ArrayList<>();
+            Map<Key, KvEntry> entryMap = new HashMap<>();
+            int effectiveMutations = 0;
+
+            for (SourceMutation mutation : delivery.mutations) {
+                OraclePhysicalRow projected = OracleProjection.project(mutation);
+                boolean wasPresent = rows.containsKey(projected.encodedKey);
+                boolean effective;
+                if (mutation.kind == MutationKind.UPSERT) {
+                    effective =
+                            !presenceSensitiveMerge
+                                    || !Objects.equals(
+                                            rows.get(projected.encodedKey), projected.encodedValue);
+                    rows.put(projected.encodedKey, projected.encodedValue);
+                } else {
+                    effective = rows.remove(projected.encodedKey) != null;
+                }
+                if (!effective) {
+                    continue;
+                }
+
+                Key key = Key.of(projected.key);
+                Value value =
+                        Value.of(mutation.kind == MutationKind.UPSERT ? projected.value : null);
+                ChangeType changeType =
+                        mutation.kind == MutationKind.UPSERT
+                                ? (wasPresent ? ChangeType.UPDATE_AFTER : ChangeType.INSERT)
+                                : ChangeType.DELETE;
+                long lsn = before.walEndOffset + effectiveMutations;
+                KvEntry previous = entryMap.get(key);
+                KvEntry entry =
+                        previous == null
+                                ? KvEntry.of(changeType, key, value, lsn)
+                                : KvEntry.of(changeType, key, value, lsn, previous);
+                entries.add(entry);
+                entryMap.put(key, entry);
+                effectiveMutations++;
+            }
+
+            int walAdvance = Math.max(1, effectiveMutations);
+            long lastWalOffset = before.walEndOffset + walAdvance - 1L;
+            long prewriteMaxLsn =
+                    effectiveMutations == 0
+                            ? before.prewriteMaxLsn
+                            : before.walEndOffset + effectiveMutations - 1L;
+            Map<String, String> prewriteValues = new LinkedHashMap<>();
+            entryMap.forEach(
+                    (key, entry) ->
+                            prewriteValues.put(
+                                    encode(key.get()),
+                                    entry.getValue().get() == null
+                                            ? "<DELETE>"
+                                            : encode(entry.getValue().get())));
+            return new FreshExpectation(
+                    effectiveMutations,
+                    lastWalOffset + 1L,
+                    lastWalOffset,
+                    prewriteMaxLsn,
+                    entries,
+                    entryMap,
+                    prewriteValues,
+                    rows);
+        }
+    }
+
     private static final class Fixture {
         private final long mainTableId;
         private final Replica replica;
@@ -622,24 +773,45 @@ class IndexPushModelTest {
                 List<byte[]> allPhysicalKeys,
                 int seed)
                 throws Exception {
-            long walBefore = log.localLogEndOffset();
-            long prewriteBefore = kv.getKvPreWriteBuffer().getMaxLSN();
+            PhysicalState before = physicalState(delivery.writerKey, allPhysicalKeys);
+            assertThat(before.prewriteEntryCount)
+                    .as("%s starts with a flushed prewrite list", context(seed, delivery))
+                    .isZero();
+            assertThat(before.prewriteValues)
+                    .as("%s starts with no pending prewrite values", context(seed, delivery))
+                    .isEmpty();
+            assertThat(kv.getKvPreWriteBuffer().getKvEntryMap())
+                    .as("%s starts with a flushed prewrite map", context(seed, delivery))
+                    .isEmpty();
+            FreshExpectation expected = FreshExpectation.from(before, delivery, !throughReplica);
             long staleBefore = metrics.indexPushStaleV1Batches().getCount();
             long tombstoneBefore = metrics.indexPushTombstoneNoOpBatches().getCount();
             LogAppendInfo result = apply(delivery, throughReplica);
+            PhysicalState after = physicalState(delivery.writerKey, allPhysicalKeys);
 
             assertThat(result.hasNoAppend()).as(context(seed, delivery)).isFalse();
             assertThat(result.duplicated()).as(context(seed, delivery)).isFalse();
-            assertThat(result.firstOffset()).as(context(seed, delivery)).isEqualTo(walBefore);
-            assertThat(result.lastOffset()).as(context(seed, delivery)).isGreaterThanOrEqualTo(walBefore);
-            long walAfter = result.lastOffset() + 1L;
-            assertThat(log.localLogEndOffset()).as(context(seed, delivery)).isEqualTo(walAfter);
-            assertThat(writerState(delivery.writerKey))
+            assertThat(result.firstOffset())
                     .as(context(seed, delivery))
-                    .contains(new WriterStateView(delivery.sequence, result.lastOffset()));
-            assertThat(kv.getKvPreWriteBuffer().getMaxLSN())
+                    .isEqualTo(before.walEndOffset);
+            assertThat(result.lastOffset())
                     .as(context(seed, delivery))
-                    .isBetween(prewriteBefore, result.lastOffset());
+                    .isEqualTo(expected.lastWalOffset);
+            assertThat(result.numMessages())
+                    .as("%s exact WAL advancement", context(seed, delivery))
+                    .isEqualTo(Math.max(1, expected.effectiveMutationCount));
+            assertThat(after.walEndOffset)
+                    .as(context(seed, delivery))
+                    .isEqualTo(expected.walEndOffset);
+            assertThat(after.writerState)
+                    .as(context(seed, delivery))
+                    .contains(new WriterStateView(delivery.sequence, expected.lastWalOffset));
+            assertThat(after.prewriteMaxLsn)
+                    .as(context(seed, delivery))
+                    .isEqualTo(expected.prewriteMaxLsn);
+            assertThat(after.rows)
+                    .as("%s exact physical rows", context(seed, delivery))
+                    .isEqualTo(throughReplica ? expected.rows : before.rows);
             assertThat(metrics.indexPushStaleV1Batches().getCount())
                     .as(context(seed, delivery))
                     .isEqualTo(staleBefore);
@@ -650,14 +822,31 @@ class IndexPushModelTest {
             if (throughReplica) {
                 assertThat(log.getHighWatermark())
                         .as("%s committed high watermark", context(seed, delivery))
-                        .isEqualTo(walAfter);
+                        .isEqualTo(expected.walEndOffset);
+                assertThat(kv.getKvPreWriteBuffer().getAllKvEntries())
+                        .as("%s committed prewrite entries are flushed", context(seed, delivery))
+                        .isEmpty();
+                assertThat(kv.getKvPreWriteBuffer().getKvEntryMap())
+                        .as("%s committed prewrite map is flushed", context(seed, delivery))
+                        .isEmpty();
+                assertThat(after.prewriteEntryCount).as(context(seed, delivery)).isZero();
+                assertThat(after.prewriteValues).as(context(seed, delivery)).isEmpty();
                 committedWriterStates.put(
                         delivery.writerKey,
-                        new WriterStateView(delivery.sequence, result.lastOffset()));
+                        new WriterStateView(delivery.sequence, expected.lastWalOffset));
             } else {
-                assertThat(actualRows(allPhysicalKeys))
-                        .as("%s uncommitted physical visibility", context(seed, delivery))
-                        .isNotNull();
+                assertThat(kv.getKvPreWriteBuffer().getAllKvEntries())
+                        .as("%s exact uncommitted prewrite entries", context(seed, delivery))
+                        .containsExactlyElementsOf(expected.uncommittedEntries);
+                assertThat(kv.getKvPreWriteBuffer().getKvEntryMap())
+                        .as("%s exact uncommitted prewrite map", context(seed, delivery))
+                        .isEqualTo(expected.uncommittedEntryMap);
+                assertThat(after.prewriteEntryCount)
+                        .as(context(seed, delivery))
+                        .isEqualTo(expected.effectiveMutationCount);
+                assertThat(after.prewriteValues)
+                        .as("%s exact uncommitted prewrite values", context(seed, delivery))
+                        .isEqualTo(expected.prewriteValues);
             }
         }
 
@@ -693,7 +882,9 @@ class IndexPushModelTest {
                         .isEqualTo(staleBefore);
             }
             assertThat(physicalState(delivery.writerKey, allPhysicalKeys))
-                    .as("%s has zero WAL, WriterState, and KV side effects", context(seed, delivery))
+                    .as(
+                            "%s has zero WAL, WriterState, and KV side effects",
+                            context(seed, delivery))
                     .usingRecursiveComparison()
                     .isEqualTo(before);
             assertWriterStates(committedWriterStates, seed);
@@ -710,9 +901,10 @@ class IndexPushModelTest {
             try {
                 int appended = 0;
                 for (SourceMutation mutation : delivery.mutations) {
+                    ProductionMutation projected = ProductionProjection.project(mutation);
                     builder.append(
-                            mutation.row.key,
-                            mutation.kind == MutationKind.UPSERT ? mutation.row.value : null);
+                            projected.key,
+                            mutation.kind == MutationKind.UPSERT ? projected.value : null);
                     appended++;
                 }
                 assertThat(appended)
@@ -723,7 +915,7 @@ class IndexPushModelTest {
                 KvRecordBatch records = KvRecordBatchReader.pointToByteBuffer(bytes);
                 return throughReplica
                         ? replica.putRecordsToLeader(records, null, MergeMode.OVERWRITE, -1)
-                        : kv.putAsLeader(records, null, MergeMode.OVERWRITE);
+                        : kv.putAsLeader(records, ALL_TARGET_COLUMNS, MergeMode.OVERWRITE);
             } finally {
                 builder.close();
             }
@@ -732,10 +924,12 @@ class IndexPushModelTest {
         private void recoverWriterState(
                 Map<WriterKey, WriterStateView> committedWriterStates, int seed) throws Exception {
             long recoveryEnd = log.localLogEndOffset();
-            assertThat(log.getHighWatermark()).as("seed=%s recovery high watermark", seed)
+            assertThat(log.getHighWatermark())
+                    .as("seed=%s recovery high watermark", seed)
                     .isEqualTo(recoveryEnd);
             log.writerStateManager().truncateFullyAndStartAt(0L);
-            assertThat(log.writerStateManager().writerIdCount()).as("seed=%s cleared state", seed)
+            assertThat(log.writerStateManager().writerIdCount())
+                    .as("seed=%s cleared state", seed)
                     .isZero();
             replica.loadWriterSnapshot(recoveryEnd);
             assertThat(log.writerStateManager().mapEndOffset())
@@ -808,7 +1002,12 @@ class IndexPushModelTest {
         }
 
         private static String context(int seed, Delivery delivery) {
-            return "seed=" + seed + ", delivery=" + delivery.label + ", sequence=" + delivery.sequence;
+            return "seed="
+                    + seed
+                    + ", delivery="
+                    + delivery.label
+                    + ", sequence="
+                    + delivery.sequence;
         }
     }
 

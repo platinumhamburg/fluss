@@ -282,7 +282,7 @@ public class IndexReplicatorAppendTest {
     @Test
     void missingUpdateAfterFailsClosedWithoutRetainedRowState() throws Exception {
         assertCorrupt(
-                        5L,
+                5L,
                 Collections.singletonList(
                         Collections.singletonList(
                                 record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)))));
@@ -472,10 +472,7 @@ public class IndexReplicatorAppendTest {
         assertThat(replicator.poll()).isTrue();
 
         KvRecord delete =
-                onlyRecords(
-                                accumulator
-                                        .pollFirst(new TableBucket(INDEX_TABLE_ID, 0))
-                                        .encoded())
+                onlyRecords(accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)).encoded())
                         .get(0);
         byte[] expectedOldKey =
                 new CompactedKeyEncoder(
@@ -654,8 +651,7 @@ public class IndexReplicatorAppendTest {
         when(batch.nextLogOffset()).thenReturn(1L);
         when(batch.records(readContext))
                 .thenAnswer(
-                        ignored ->
-                                CloseableIterator.wrap(new ArrayList<>(sourceBatch).iterator()));
+                        ignored -> CloseableIterator.wrap(new ArrayList<>(sourceBatch).iterator()));
         doThrow(new CorruptRecordException("injected crc failure")).when(batch).ensureValid();
         LogRecords records = mock(LogRecords.class);
         when(records.batches()).thenReturn(Collections.singletonList(batch));

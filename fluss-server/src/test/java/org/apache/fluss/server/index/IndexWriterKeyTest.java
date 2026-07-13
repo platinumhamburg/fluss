@@ -59,9 +59,7 @@ class IndexWriterKeyTest {
         assertThatThrownBy(() -> IndexWriterKey.decode(new WriterKey(1L, 3L)))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(
-                        () ->
-                                IndexWriterKey.decode(
-                                        new WriterKey(1L, Long.MIN_VALUE | (1L << 40))))
+                        () -> IndexWriterKey.decode(new WriterKey(1L, Long.MIN_VALUE | (1L << 40))))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> IndexWriterKey.encode(new TableBucket(99L, -1)))
                 .isInstanceOf(IllegalArgumentException.class);

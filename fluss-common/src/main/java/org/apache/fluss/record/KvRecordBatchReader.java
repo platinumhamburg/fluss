@@ -80,10 +80,7 @@ public final class KvRecordBatchReader {
         }
         if (sizeInBytes > remaining) {
             throw new CorruptMessageException(
-                    "KV batch size "
-                            + sizeInBytes
-                            + " exceeds remaining bytes "
-                            + remaining);
+                    "KV batch size " + sizeInBytes + " exceeds remaining bytes " + remaining);
         }
 
         if (magic == KvRecordBatch.KV_MAGIC_VALUE_V0) {

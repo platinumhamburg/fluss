@@ -79,8 +79,7 @@ public final class KeyEncodingRecycler<W> {
             int maxRetainedSizeInBytes) {
         checkArgument(retainedWriters > 0, "Retained writers must be positive.");
         checkArgument(
-                maxRetainedSizeInBytes >= 0,
-                "Max retained size in bytes must be non-negative.");
+                maxRetainedSizeInBytes >= 0, "Max retained size in bytes must be non-negative.");
         this.writerFactory = checkNotNull(writerFactory, "Writer factory must not be null.");
         this.writerResetter = checkNotNull(writerResetter, "Writer resetter must not be null.");
         this.retainedSizeGetter =

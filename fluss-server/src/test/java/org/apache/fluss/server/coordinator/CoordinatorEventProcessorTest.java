@@ -329,7 +329,8 @@ class CoordinatorEventProcessorTest {
                         .build()
                         .withReplicationFactor(1);
         long mainTableId = metadataManager.createTable(mainPath, mainDescriptor, null, false);
-        retryVerifyContext(ctx -> assertThat(ctx.getTablePathById(mainTableId)).isEqualTo(mainPath));
+        retryVerifyContext(
+                ctx -> assertThat(ctx.getTablePathById(mainTableId)).isEqualTo(mainPath));
 
         assertThat(lastTombstoneUpdate(0)).isEmpty();
 
@@ -342,8 +343,7 @@ class CoordinatorEventProcessorTest {
                         .withReplicationFactor(1);
         TablePath indexPath =
                 TablePath.of(
-                        defaultDatabase,
-                        IndexTableUtils.indexTableName("baseline_main", "idx_id"));
+                        defaultDatabase, IndexTableUtils.indexTableName("baseline_main", "idx_id"));
         TableAssignment indexAssignment =
                 generateAssignment(
                         1,
@@ -364,8 +364,7 @@ class CoordinatorEventProcessorTest {
 
         TablePath unrelatedPath = TablePath.of(defaultDatabase, "baseline_unrelated");
         long unrelatedId =
-                metadataManager.createTable(
-                        unrelatedPath, TEST_TABLE, indexAssignment, false);
+                metadataManager.createTable(unrelatedPath, TEST_TABLE, indexAssignment, false);
         retryVerifyContext(
                 ctx -> assertThat(ctx.getTablePathById(unrelatedId)).isEqualTo(unrelatedPath));
 

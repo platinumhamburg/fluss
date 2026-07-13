@@ -26,13 +26,7 @@ public final class LogAppendInfo {
     public static LogAppendInfo duplicatedAt(long targetWalOffset, long timestamp) {
         LogAppendInfo info =
                 new LogAppendInfo(
-                        targetWalOffset,
-                        targetWalOffset,
-                        timestamp,
-                        targetWalOffset,
-                        0,
-                        0,
-                        true);
+                        targetWalOffset, targetWalOffset, timestamp, targetWalOffset, 0, 0, true);
         info.setDuplicated(true);
         return info;
     }

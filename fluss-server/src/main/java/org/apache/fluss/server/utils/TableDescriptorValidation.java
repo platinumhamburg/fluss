@@ -670,5 +670,4 @@ public class TableDescriptorValidation {
             }
         }
     }
-
 }

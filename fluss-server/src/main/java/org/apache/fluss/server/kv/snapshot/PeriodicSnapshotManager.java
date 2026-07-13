@@ -170,8 +170,7 @@ public class PeriodicSnapshotManager implements Closeable {
             started = true;
             try {
                 if (snapshotInterval <= 0) {
-                    LOG.info(
-                            "TableBucket {} starts with periodic snapshots disabled", tableBucket);
+                    LOG.info("TableBucket {} starts with periodic snapshots disabled", tableBucket);
                     return;
                 }
                 if (periodicExecutor.isShutdown()) {

@@ -835,6 +835,7 @@ class AutoPartitionManagerTest {
         TableRegistration registration =
                 TableRegistration.newTable(tableId, remoteDataDir, descriptor);
         zookeeperClient.registerTable(tablePath, registration);
+        zookeeperClient.registerFirstSchema(tablePath, descriptor.getSchema());
         return tableInfo;
     }
 
@@ -885,6 +886,7 @@ class AutoPartitionManagerTest {
         TableRegistration registration =
                 TableRegistration.newTable(tableId, remoteDataDir, descriptor);
         zookeeperClient.registerTable(tablePath, registration);
+        zookeeperClient.registerFirstSchema(tablePath, descriptor.getSchema());
         return tableInfo;
     }
 

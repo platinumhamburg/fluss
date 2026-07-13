@@ -21,8 +21,8 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.exception.CorruptRecordException;
-import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.DuplicateSequenceException;
+import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
@@ -74,9 +74,9 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.record.TestData.TEST_SCHEMA_GETTER;
+import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
-import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.utils.FlussPaths.offsetFromFile;
 import static org.apache.fluss.utils.FlussPaths.writerSnapshotFile;
@@ -598,13 +598,9 @@ final class LogTabletTest extends LogTestBase {
     @ValueSource(booleans = {false, true})
     void testFollowerRejectsWalProtocolMismatch(boolean fencedTable) throws Exception {
         KvIdempotenceProtocol tableProtocol =
-                fencedTable
-                        ? KvIdempotenceProtocol.V1_FENCED
-                        : KvIdempotenceProtocol.V0_COMPACT;
+                fencedTable ? KvIdempotenceProtocol.V1_FENCED : KvIdempotenceProtocol.V0_COMPACT;
         KvIdempotenceProtocol incomingProtocol =
-                fencedTable
-                        ? KvIdempotenceProtocol.V0_COMPACT
-                        : KvIdempotenceProtocol.V1_FENCED;
+                fencedTable ? KvIdempotenceProtocol.V0_COMPACT : KvIdempotenceProtocol.V1_FENCED;
         LogTablet log = createProtocolLogTablet(tableProtocol);
         MemoryLogRecords mismatched = protocolRecords(incomingProtocol);
         prepareAppend(mismatched, true, 0L);
@@ -625,13 +621,9 @@ final class LogTabletTest extends LogTestBase {
                         DATA1_TABLE_ID,
                         DATA1_TABLE_PATH.getTableName());
         KvIdempotenceProtocol walProtocol =
-                fencedWal
-                        ? KvIdempotenceProtocol.V1_FENCED
-                        : KvIdempotenceProtocol.V0_COMPACT;
+                fencedWal ? KvIdempotenceProtocol.V1_FENCED : KvIdempotenceProtocol.V0_COMPACT;
         KvIdempotenceProtocol recoveryProtocol =
-                fencedWal
-                        ? KvIdempotenceProtocol.V0_COMPACT
-                        : KvIdempotenceProtocol.V1_FENCED;
+                fencedWal ? KvIdempotenceProtocol.V0_COMPACT : KvIdempotenceProtocol.V1_FENCED;
         LogTablet source = createProtocolLogTablet(recoveryDir, walProtocol);
         source.appendAsLeader(protocolRecords(walProtocol));
         source.close();
@@ -651,8 +643,7 @@ final class LogTabletTest extends LogTestBase {
                         DATA1_TABLE_ID,
                         DATA1_TABLE_PATH.getTableName());
         LogTablet source =
-                createProtocolLogTablet(
-                        recoveryDir, KvIdempotenceProtocol.V0_COMPACT, true);
+                createProtocolLogTablet(recoveryDir, KvIdempotenceProtocol.V0_COMPACT, true);
         source.appendAsLeader(protocolRecords(KvIdempotenceProtocol.V0_COMPACT));
         source.writerStateManager().takeSnapshot();
         source.close();
@@ -667,9 +658,7 @@ final class LogTabletTest extends LogTestBase {
         assertThatThrownBy(
                         () ->
                                 createProtocolLogTablet(
-                                        recoveryDir,
-                                        KvIdempotenceProtocol.V1_FENCED,
-                                        false))
+                                        recoveryDir, KvIdempotenceProtocol.V1_FENCED, false))
                 .isInstanceOf(CorruptRecordException.class)
                 .hasMessageContaining("Target WAL magic")
                 .hasMessageContaining("table protocol V1");
@@ -709,8 +698,8 @@ final class LogTabletTest extends LogTestBase {
         return createProtocolLogTablet(protocolDir, protocol);
     }
 
-    private LogTablet createProtocolLogTablet(
-            File protocolDir, KvIdempotenceProtocol protocol) throws Exception {
+    private LogTablet createProtocolLogTablet(File protocolDir, KvIdempotenceProtocol protocol)
+            throws Exception {
         return createProtocolLogTablet(protocolDir, protocol, true);
     }
 
@@ -734,9 +723,7 @@ final class LogTabletTest extends LogTestBase {
     }
 
     private static List<File> writerSnapshotFiles(File directory) {
-        File[] files =
-                directory.listFiles(
-                        file -> file.getName().endsWith(".writer_snapshot"));
+        File[] files = directory.listFiles(file -> file.getName().endsWith(".writer_snapshot"));
         return files == null ? Collections.emptyList() : Arrays.asList(files);
     }
 
@@ -755,34 +742,26 @@ final class LogTabletTest extends LogTestBase {
         MemoryLogRecordsCompactedBuilder builder =
                 protocol == KvIdempotenceProtocol.V1_FENCED
                         ? MemoryLogRecordsCompactedBuilder.fencedBuilder(
-                                DEFAULT_SCHEMA_ID,
-                                1024,
-                                new UnmanagedPagedOutputView(128),
-                                false)
+                                DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false)
                         : MemoryLogRecordsCompactedBuilder.builder(
-                                DEFAULT_SCHEMA_ID,
-                                1024,
-                                new UnmanagedPagedOutputView(128),
-                                false);
+                                DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
         if (protocol == KvIdempotenceProtocol.V1_FENCED) {
             builder.setFencedWriterState(new WriterKey(7L, 8L), 100L);
         } else {
             builder.setWriterState(7L, 0);
         }
         builder.append(
-                ChangeType.INSERT,
-                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "protocol"}));
+                ChangeType.INSERT, compactedRow(DATA1_ROW_TYPE, new Object[] {1, "protocol"}));
         builder.close();
         return MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
-    private static LogAppendInfo append(
-            LogTablet log, MemoryLogRecords records, boolean follower) throws Exception {
+    private static LogAppendInfo append(LogTablet log, MemoryLogRecords records, boolean follower)
+            throws Exception {
         return follower ? log.appendAsFollower(records) : log.appendAsLeader(records);
     }
 
-    private static void prepareAppend(
-            MemoryLogRecords records, boolean follower, long baseOffset) {
+    private static void prepareAppend(MemoryLogRecords records, boolean follower, long baseOffset) {
         if (!follower) {
             return;
         }
@@ -802,10 +781,7 @@ final class LogTabletTest extends LogTestBase {
             long sequence = (Long) writerAndSequences[i + 1];
             MemoryLogRecordsCompactedBuilder builder =
                     MemoryLogRecordsCompactedBuilder.fencedBuilder(
-                            DEFAULT_SCHEMA_ID,
-                            1024,
-                            new UnmanagedPagedOutputView(128),
-                            false);
+                            DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
             builder.setFencedWriterState(writerKey, sequence);
             builder.close();
             BytesView bytes = builder.build();

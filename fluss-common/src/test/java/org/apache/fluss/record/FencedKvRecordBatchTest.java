@@ -113,15 +113,13 @@ class FencedKvRecordBatchTest {
     void testReaderRejectsUnknownMagicBeforeHeaderAccess() {
         byte[] bytes = minimumBatchWithMagic((byte) 2);
 
-        assertReaderRejects(
-                ByteBuffer.wrap(bytes), "Unsupported KV batch magic 2");
+        assertReaderRejects(ByteBuffer.wrap(bytes), "Unsupported KV batch magic 2");
     }
 
     @ParameterizedTest
     @ValueSource(ints = {0, 1, 2, 3, 4})
     void testReaderRejectsTruncatedCommonPrefixWithoutAdvancing(int prefixSize) {
-        assertReaderRejects(
-                ByteBuffer.allocate(prefixSize), "minimum length and magic prefix");
+        assertReaderRejects(ByteBuffer.allocate(prefixSize), "minimum length and magic prefix");
     }
 
     @ParameterizedTest
@@ -211,7 +209,8 @@ class FencedKvRecordBatchTest {
         byte[] validRecordBatch = buildV1BatchWithKeys(new byte[] {42});
         int declaredSize = validRecordBatch.length - 1;
         byte[] bytesWithSentinel = Arrays.copyOf(validRecordBatch, validRecordBatch.length + 4);
-        Arrays.fill(bytesWithSentinel, validRecordBatch.length, bytesWithSentinel.length, (byte) 99);
+        Arrays.fill(
+                bytesWithSentinel, validRecordBatch.length, bytesWithSentinel.length, (byte) 99);
         putInt(bytesWithSentinel, FencedKvRecordBatch.LENGTH_OFFSET, declaredSize - Integer.BYTES);
         updateCrc(bytesWithSentinel, declaredSize);
         KvRecordBatch batch =
@@ -283,10 +282,7 @@ class FencedKvRecordBatchTest {
 
     private static FencedKvRecordBatchBuilder newBuilder() {
         return FencedKvRecordBatchBuilder.builder(
-                1,
-                Integer.MAX_VALUE,
-                new UnmanagedPagedOutputView(100),
-                KvFormat.COMPACTED);
+                1, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), KvFormat.COMPACTED);
     }
 
     private static KvRecordBatch.ReadContext readContext() {

@@ -27,8 +27,8 @@ import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
 
-import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
@@ -46,8 +46,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test for {@link DefaultLogRecordBatch}. */
 public class DefaultLogRecordBatchTest extends LogTestBase {
 
-    private static final WriterKey FENCED_WRITER_KEY =
-            new WriterKey(17L, Long.MIN_VALUE | 3L);
+    private static final WriterKey FENCED_WRITER_KEY = new WriterKey(17L, Long.MIN_VALUE | 3L);
     private static final long FENCED_SEQUENCE = (long) Integer.MAX_VALUE + 17L;
 
     @ParameterizedTest
@@ -59,8 +58,7 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
         assertThat(batch.idempotenceProtocolVersion()).isZero();
         assertThatThrownBy(batch::fencedWriterKey)
                 .isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(batch::fencedSequence)
-                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::fencedSequence).isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
@@ -79,10 +77,7 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
     void testV3WriterKeyAndLongSequenceSurviveMemoryRoundTrip() throws Exception {
         MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.fencedBuilder(
-                        schemaId,
-                        Integer.MAX_VALUE,
-                        new UnmanagedPagedOutputView(100),
-                        false);
+                        schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
         builder.setFencedWriterState(FENCED_WRITER_KEY, FENCED_SEQUENCE);
 
         LogRecordBatch batch =
@@ -92,18 +87,14 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
         assertThat(batch.fencedWriterKey()).isEqualTo(FENCED_WRITER_KEY);
         assertThat(batch.fencedSequence()).isEqualTo(FENCED_SEQUENCE);
         assertThatThrownBy(batch::writerId).isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(batch::batchSequence)
-                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::batchSequence).isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
     void testRowBuilderRewritesBuiltHeaderAfterFencedStateChanges() throws Exception {
         MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.fencedBuilder(
-                        schemaId,
-                        Integer.MAX_VALUE,
-                        new UnmanagedPagedOutputView(100),
-                        false);
+                        schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
         builder.setFencedWriterState(FENCED_WRITER_KEY, FENCED_SEQUENCE);
         LogRecordBatch first =
                 MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
@@ -125,20 +116,14 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
     void testV3RequiresWriterKeyAndAcceptsLongMaxSequence() throws Exception {
         MemoryLogRecordsCompactedBuilder missingKeyBuilder =
                 MemoryLogRecordsCompactedBuilder.fencedBuilder(
-                        schemaId,
-                        Integer.MAX_VALUE,
-                        new UnmanagedPagedOutputView(100),
-                        false);
+                        schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
         assertThatThrownBy(missingKeyBuilder::build)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("writer key");
 
         MemoryLogRecordsCompactedBuilder maxSequenceBuilder =
                 MemoryLogRecordsCompactedBuilder.fencedBuilder(
-                        schemaId,
-                        Integer.MAX_VALUE,
-                        new UnmanagedPagedOutputView(100),
-                        false);
+                        schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
         maxSequenceBuilder.setFencedWriterState(FENCED_WRITER_KEY, Long.MAX_VALUE);
         LogRecordBatch batch =
                 MemoryLogRecords.pointToBytesView(maxSequenceBuilder.build())
@@ -146,10 +131,7 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
                         .iterator()
                         .next();
         assertThat(batch.fencedSequence()).isEqualTo(Long.MAX_VALUE);
-        assertThatThrownBy(
-                        () ->
-                                maxSequenceBuilder.setFencedWriterState(
-                                        FENCED_WRITER_KEY, -1L))
+        assertThatThrownBy(() -> maxSequenceBuilder.setFencedWriterState(FENCED_WRITER_KEY, -1L))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -157,10 +139,7 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
     void testExistingBuilderFactoryCannotCreateV3() throws Exception {
         MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.builder(
-                        schemaId,
-                        Integer.MAX_VALUE,
-                        new UnmanagedPagedOutputView(100),
-                        false);
+                        schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
         LogRecordBatch batch =
                 MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
         assertThat(batch.magic()).isLessThan(LOG_MAGIC_VALUE_V3);
@@ -176,11 +155,7 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
             throws Exception {
         MemoryLogRecordsIndexedBuilder builder =
                 MemoryLogRecordsIndexedBuilder.builder(
-                        0L,
-                        schemaId,
-                        Integer.MAX_VALUE,
-                        magic,
-                        new UnmanagedPagedOutputView(100));
+                        0L, schemaId, Integer.MAX_VALUE, magic, new UnmanagedPagedOutputView(100));
         builder.setWriterState(writerId, sequence);
         return MemoryLogRecords.pointToBytesView(builder.build());
     }

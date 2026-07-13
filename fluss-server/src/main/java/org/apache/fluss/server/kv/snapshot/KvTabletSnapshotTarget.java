@@ -345,9 +345,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
      * guarantees the internal SST bookkeeping cleanup runs even if any outward update throws.
      */
     private void updateStateOnCommitSuccess(
-            long snapshotId,
-            SnapshotResult snapshotResult,
-            CompletedSnapshot completedSnapshot) {
+            long snapshotId, SnapshotResult snapshotResult, CompletedSnapshot completedSnapshot) {
         long flushedLogOffset = snapshotResult.getTabletState().getFlushedLogOffset();
         try {
             logOffsetOfLatestSnapshot = flushedLogOffset;

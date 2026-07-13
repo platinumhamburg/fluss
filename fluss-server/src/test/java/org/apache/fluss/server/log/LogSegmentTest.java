@@ -32,6 +32,7 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
+import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.utils.CloseableIterator;
 
 import org.junit.jupiter.api.Test;
@@ -52,8 +53,8 @@ import java.util.stream.Stream;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
-import static org.apache.fluss.record.TestData.TEST_SCHEMA_GETTER;
 import static org.apache.fluss.testutils.DataTestUtils.assertLogRecordsEquals;
 import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
 import static org.apache.fluss.testutils.DataTestUtils.genLogRecordsWithBaseOffsetAndTimestamp;
@@ -63,6 +64,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link LogSegment}. */
 final class LogSegmentTest extends LogTestBase {
+
+    private static final TestingSchemaGetter TEST_SCHEMA_GETTER =
+            new TestingSchemaGetter(DEFAULT_SCHEMA_ID, DATA1_SCHEMA);
 
     private @TempDir File tempDir;
 

@@ -25,6 +25,8 @@ import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
@@ -120,8 +122,18 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("age", DataTypes.INT())
                         .column("city", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("name_idx", "name")
-                        .index("age_city_idx", "age", "city")
+                        .index(
+                                "name_idx",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "age_city_idx",
+                                IndexType.SECONDARY,
+                                Arrays.asList("age", "city"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
@@ -129,8 +141,6 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .schema(schema)
                         .comment("test table with global secondary index")
                         .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("name_idx"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("age_city_idx"), "3")
                         .build();
 
         createTable(tablePath, descriptor, true);
@@ -183,7 +193,12 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("age", DataTypes.INT())
                         .column("region", DataTypes.STRING())
                         .primaryKey("id", "region")
-                        .index("name_idx", "name")
+                        .index(
+                                "name_idx",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
@@ -192,7 +207,6 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .comment("partitioned table with index")
                         .distributedBy(3, "id")
                         .partitionedBy("region")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("name_idx"), "3")
                         .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
                         .property(
                                 ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT,
@@ -274,10 +288,14 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                                         .column("id", DataTypes.INT())
                                         .column("name", DataTypes.STRING())
                                         .primaryKey("id")
-                                        .index("idx_name", "name")
+                                        .index(
+                                                "idx_name",
+                                                IndexType.SECONDARY,
+                                                Arrays.asList("name"),
+                                                IndexVisibility.SYNC,
+                                                1)
                                         .build())
                         .distributedBy(1, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
                         .build();
 
         assertThatThrownBy(() -> admin.createTable(mainTablePath, mainDescriptor, false).get())
@@ -293,22 +311,22 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
         TablePath tablePath = TablePath.of(DB, "test_non_pk_index_rejected");
         TablePath indexPath =
                 TablePath.of(
-                        DB,
-                        IndexTableUtils.indexTableName(tablePath.getTableName(), "idx_name"));
+                        DB, IndexTableUtils.indexTableName(tablePath.getTableName(), "idx_name"));
         admin.createDatabase(DB, org.apache.fluss.metadata.DatabaseDescriptor.EMPTY, true).get();
 
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
-                        .index("idx_name", "name")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(1, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         assertThatThrownBy(() -> admin.createTable(tablePath, descriptor, false).get())
                 .cause()
@@ -330,17 +348,22 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("age", DataTypes.INT())
                         .primaryKey("id")
-                        .index("name_idx", "name")
-                        .index("age_idx", "age")
+                        .index(
+                                "name_idx",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "age_idx",
+                                IndexType.SECONDARY,
+                                Arrays.asList("age"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("name_idx"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("age_idx"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -372,21 +395,23 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     void testUserCannotDropLiveInternalSecondaryIndexTableDirectly() throws Exception {
         TablePath mainPath = TablePath.of(DB, "test_direct_drop_live_index_rejected");
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
 
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(1, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         createTable(mainPath, descriptor, true);
         assertThat(admin.tableExists(indexPath).get()).isTrue();
@@ -405,21 +430,23 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     void testUserCanDropOrphanInternalSecondaryIndexTable() throws Exception {
         TablePath mainPath = TablePath.of(DB, "test_direct_drop_orphan_index_allowed");
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
 
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(1, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         createTable(mainPath, descriptor, true);
         assertThat(admin.tableExists(indexPath).get()).isTrue();
@@ -433,25 +460,26 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testUserCannotDropLiveInternalIndexWhenMainTableNameContainsSeparator()
-            throws Exception {
+    void testUserCannotDropLiveInternalIndexWhenMainTableNameContainsSeparator() throws Exception {
         TablePath mainPath = TablePath.of(DB, "tenant__orders_live");
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
 
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(1, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         createTable(mainPath, descriptor, true);
         assertThat(admin.tableExists(mainPath).get()).isTrue();
@@ -468,25 +496,26 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testUserCanDropOrphanInternalIndexWhenMainTableNameContainsSeparator()
-            throws Exception {
+    void testUserCanDropOrphanInternalIndexWhenMainTableNameContainsSeparator() throws Exception {
         TablePath mainPath = TablePath.of(DB, "tenant__orders_orphan");
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
 
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(1, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         createTable(mainPath, descriptor, true);
         assertThat(admin.tableExists(mainPath).get()).isTrue();
@@ -518,15 +547,16 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -576,7 +606,12 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("dt", DataTypes.STRING())
                         .primaryKey("id", "dt")
-                        .index("idx_name", Arrays.asList("name"))
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
 
         TableDescriptor descriptor =
@@ -589,7 +624,6 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                                 ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT,
                                 AutoPartitionTimeUnit.DAY)
                         .property(ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE, 0)
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "1")
                         .build();
 
         createTable(tablePath, descriptor, true);

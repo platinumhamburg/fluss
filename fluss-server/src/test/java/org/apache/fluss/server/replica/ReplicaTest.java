@@ -112,11 +112,11 @@ import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
-import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA2;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
@@ -147,9 +147,7 @@ final class ReplicaTest extends ReplicaTestBase {
     @Test
     void testPutKvTableProtocolContract() throws Exception {
         Replica v0 =
-                makeKvReplica(
-                        DATA1_PHYSICAL_TABLE_PATH_PK,
-                        new TableBucket(DATA1_TABLE_ID_PK, 1));
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
         makeKvReplicaAsLeader(v0);
         KvRecordTestUtils.KvRecordBatchFactory v0Factory =
                 KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
@@ -157,10 +155,7 @@ final class ReplicaTest extends ReplicaTestBase {
         KvRecordBatch fenced = emptyFencedBatch(new WriterKey(9L, 3L), 1L);
 
         v0.putRecordsToLeader(compact, null, MergeMode.DEFAULT, 0);
-        assertThatThrownBy(
-                        () ->
-                                v0.putRecordsToLeader(
-                                        fenced, null, MergeMode.OVERWRITE, -1))
+        assertThatThrownBy(() -> v0.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
 
         TablePath v1Path = TablePath.of("test_db", "protocol_v1");
@@ -173,8 +168,7 @@ final class ReplicaTest extends ReplicaTestBase {
                         .build();
         zkClient.registerTable(
                 v1Path,
-                TableRegistration.newTable(
-                        v1TableId, DEFAULT_REMOTE_DATA_DIR, v1Descriptor));
+                TableRegistration.newTable(v1TableId, DEFAULT_REMOTE_DATA_DIR, v1Descriptor));
         zkClient.registerFirstSchema(v1Path, DATA1_SCHEMA_PK);
         long now = System.currentTimeMillis();
         TableInfo v1Info =
@@ -187,24 +181,14 @@ final class ReplicaTest extends ReplicaTestBase {
                         now,
                         now);
         TableBucket v1Bucket = new TableBucket(v1TableId, 0);
-        Replica v1 =
-                makeKvReplica(PhysicalTablePath.of(v1Path), v1Bucket, v1Info);
+        Replica v1 = makeKvReplica(PhysicalTablePath.of(v1Path), v1Bucket, v1Info);
         makeLeaderReplica(v1, v1Path, v1Bucket, INITIAL_LEADER_EPOCH);
 
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        compact, null, MergeMode.OVERWRITE, -1))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(compact, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        fenced, null, MergeMode.DEFAULT, -1))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(fenced, null, MergeMode.DEFAULT, -1))
                 .isInstanceOf(InvalidTableException.class);
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        fenced, null, MergeMode.OVERWRITE, 0))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, 0))
                 .isInstanceOf(InvalidTableException.class);
         v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1);
 
@@ -217,10 +201,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                         MergeMode.OVERWRITE,
                                         -1))
                 .isInstanceOf(UnsupportedVersionException.class);
-        assertThatThrownBy(
-                        () ->
-                                v1.putRecordsToLeader(
-                                        compact, null, MergeMode.OVERWRITE, -1))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(compact, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
         assertThatThrownBy(
                         () ->
@@ -359,10 +340,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThatThrownBy(() -> replica.truncateTo(2L)).isInstanceOf(StorageException.class);
 
         assertThat(replica.isOnline()).isFalse();
-        assertThat(
-                        replica.getLogTablet()
-                                .writerStateManager()
-                                .lastFencedEntry(writerKey))
+        assertThat(replica.getLogTablet().writerStateManager().lastFencedEntry(writerKey))
                 .contains(stateBefore);
         assertThatThrownBy(
                         () ->
@@ -371,8 +349,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                                 PhysicalTablePath.of(tablePath),
                                                 tableBucket,
                                                 Arrays.asList(
-                                                        TABLET_SERVER_ID,
-                                                        TABLET_SERVER_ID + 1),
+                                                        TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
                                                 new LeaderAndIsr(
                                                         TABLET_SERVER_ID,
                                                         INITIAL_LEADER_EPOCH + 2,
@@ -410,21 +387,16 @@ final class ReplicaTest extends ReplicaTestBase {
         try {
             CompletableFuture<Throwable> first =
                     capturePutFailure(
-                            executor,
-                            replica,
-                            emptyFencedBatch(new WriterKey(7L, 3L), 100L));
+                            executor, replica, emptyFencedBatch(new WriterKey(7L, 3L), 100L));
             assertThat(firstPutInAppend.await(10, TimeUnit.SECONDS)).isTrue();
 
             admissionHook =
                     replica.installAfterPutAdmissionHook(
                             ignoredRecords -> secondPutAdmitted.countDown());
-            setPutLockContentionHook(
-                    replica.getKvTablet(), secondPutContendedOnKvLock::countDown);
+            setPutLockContentionHook(replica.getKvTablet(), secondPutContendedOnKvLock::countDown);
             CompletableFuture<Throwable> second =
                     capturePutFailure(
-                            executor,
-                            replica,
-                            emptyFencedBatch(new WriterKey(7L, 3L), 101L));
+                            executor, replica, emptyFencedBatch(new WriterKey(7L, 3L), 101L));
 
             assertThat(secondPutAdmitted.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(secondPutContendedOnKvLock.await(10, TimeUnit.SECONDS)).isTrue();
@@ -487,8 +459,7 @@ final class ReplicaTest extends ReplicaTestBase {
                         new UnmanagedPagedOutputView(128),
                         KvFormat.COMPACTED);
         builder.setWriterState(writerKey, sequence);
-        return KvRecordBatchReader.pointToByteBuffer(
-                builder.build().getByteBuf().nioBuffer());
+        return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
     @Test
@@ -601,8 +572,7 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     @Test
-    void testIndexReplicatorInitDefersWhenIndexTableIdVisibleButMetadataMissing()
-            throws Exception {
+    void testIndexReplicatorInitDefersWhenIndexTableIdVisibleButMetadataMissing() throws Exception {
         IndexedFixture f = setupIndexedMainTableReplica();
         publishIndexTableToCache(f);
         assertThat(serverMetadataCache.getTableId(f.indexTablePath)).isPresent();
@@ -1519,10 +1489,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                 1)
                         .build();
         TableDescriptor mainDescriptor =
-                TableDescriptor.builder()
-                        .schema(mainSchema)
-                        .distributedBy(1, "a")
-                        .build();
+                TableDescriptor.builder().schema(mainSchema).distributedBy(1, "a").build();
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(
                         mainDescriptor, mainTableId, mainPath.toString(), indexName);
@@ -1621,9 +1588,7 @@ final class ReplicaTest extends ReplicaTestBase {
         BytesView encoded = encodedKvBatch(batchMagic);
         PutKvRequest request =
                 new PutKvRequest().setTableId(tableId).setAcks(-1).setTimeoutMs(1000);
-        request.addBucketsReq()
-                .setBucketId(0)
-                .setRecordsBytesView(encoded);
+        request.addBucketsReq().setBucketId(0).setRecordsBytesView(encoded);
 
         org.assertj.core.api.ThrowableAssert.ThrowingCallable put =
                 () -> {
@@ -1665,9 +1630,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                 protocol.version())
                         .build();
         zkClient.registerTable(
-                path,
-                TableRegistration.newTable(
-                        tableId, DEFAULT_REMOTE_DATA_DIR, descriptor));
+                path, TableRegistration.newTable(tableId, DEFAULT_REMOTE_DATA_DIR, descriptor));
         zkClient.registerFirstSchema(path, DATA1_SCHEMA_PK);
         long now = System.currentTimeMillis();
         TableInfo info =

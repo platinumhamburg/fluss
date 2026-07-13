@@ -36,8 +36,8 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
-import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
+import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
@@ -65,9 +65,9 @@ import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
 import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
-import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.FencedWriterAppendInfo;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
+import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.LogTestUtils;
@@ -176,8 +176,7 @@ class KvTabletTest {
 
     private void initLogTabletAndKvTablet(
             TablePath tablePath, Schema schema, Map<String, String> tableConfig) throws Exception {
-        initLogTabletAndKvTablet(
-                tablePath, schema, tableConfig, KvIdempotenceProtocol.V0_COMPACT);
+        initLogTabletAndKvTablet(tablePath, schema, tableConfig, KvIdempotenceProtocol.V0_COMPACT);
     }
 
     private void initLogTabletAndKvTablet(
@@ -202,8 +201,7 @@ class KvTabletTest {
 
     private LogTablet createLogTablet(File tempLogDir, long tableId, PhysicalTablePath tablePath)
             throws Exception {
-        return createLogTablet(
-                tempLogDir, tableId, tablePath, KvIdempotenceProtocol.V0_COMPACT);
+        return createLogTablet(tempLogDir, tableId, tablePath, KvIdempotenceProtocol.V0_COMPACT);
     }
 
     private LogTablet createLogTablet(
@@ -1433,9 +1431,7 @@ class KvTabletTest {
 
         LogAppendInfo result =
                 kvTablet.putAsLeader(
-                        malformed,
-                        null,
-                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
+                        malformed, null, org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
 
         assertThat(result.duplicated()).isTrue();
         assertThat(result.lastOffset()).isEqualTo(17L);
@@ -1453,17 +1449,13 @@ class KvTabletTest {
                 KvIdempotenceProtocol.V1_FENCED);
         WriterKey writerKey = new WriterKey(9L, 3L);
         byte[] key = "race-key".getBytes();
-        BinaryRow olderRow =
-                compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "old"});
-        BinaryRow newerRow =
-                compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "new"});
+        BinaryRow olderRow = compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "old"});
+        BinaryRow newerRow = compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "new"});
         byte[] newerValue = ValueEncoder.encodeValue(schemaId, newerRow);
         KvRecordBatch older = fencedBatch(writerKey, 100L, key, olderRow);
         CompactedWalBuilder newerBuilder =
                 CompactedWalBuilder.fencedBuilder(
-                        schemaId,
-                        DATA1_SCHEMA_PK.getRowType(),
-                        new TestingMemorySegmentPool(1024));
+                        schemaId, DATA1_SCHEMA_PK.getRowType(), new TestingMemorySegmentPool(1024));
         newerBuilder.setFencedWriterState(writerKey, 200L);
         newerBuilder.append(ChangeType.INSERT, newerRow);
         kvTablet.setAfterFencedPrecheck(
@@ -1478,16 +1470,15 @@ class KvTabletTest {
 
         LogAppendInfo result =
                 kvTablet.putAsLeader(
-                        older,
-                        null,
-                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
+                        older, null, org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
         newerBuilder.deallocate();
 
         assertThat(result.duplicated()).isTrue();
         assertThat(result.lastOffset()).isZero();
         assertThat(logTablet.localLogEndOffset()).isEqualTo(1L);
         FencedWriterStateEntry state =
-                logTablet.writerStateManager()
+                logTablet
+                        .writerStateManager()
                         .lastFencedEntry(writerKey)
                         .orElseThrow(AssertionError::new);
         assertThat(state.lastSequence()).isEqualTo(200L);
@@ -1509,35 +1500,26 @@ class KvTabletTest {
         assertThat(batches.hasNext()).isFalse();
 
         kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
-        assertThat(kvTablet.multiGet(Collections.singletonList(key)))
-                .containsExactly(newerValue);
+        assertThat(kvTablet.multiGet(Collections.singletonList(key))).containsExactly(newerValue);
     }
 
     private static KvRecordBatch fencedBatch(
             WriterKey writerKey, long sequence, byte[] key, BinaryRow row) throws Exception {
         FencedKvRecordBatchBuilder builder =
                 FencedKvRecordBatchBuilder.builder(
-                        schemaId,
-                        1024,
-                        new UnmanagedPagedOutputView(128),
-                        KvFormat.COMPACTED);
+                        schemaId, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
         builder.append(key, row);
         builder.setWriterState(writerKey, sequence);
-        return KvRecordBatchReader.pointToByteBuffer(
-                builder.build().getByteBuf().nioBuffer());
+        return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
     private static KvRecordBatch emptyFencedBatch(WriterKey writerKey, long sequence)
             throws Exception {
         FencedKvRecordBatchBuilder builder =
                 FencedKvRecordBatchBuilder.builder(
-                        schemaId,
-                        1024,
-                        new UnmanagedPagedOutputView(128),
-                        KvFormat.COMPACTED);
+                        schemaId, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
         builder.setWriterState(writerKey, sequence);
-        return KvRecordBatchReader.pointToByteBuffer(
-                builder.build().getByteBuf().nioBuffer());
+        return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
     @Test

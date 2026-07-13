@@ -203,8 +203,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
                     new byte[] {(byte) key},
                     compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {key, value}));
             builder.setWriterState(writerKey, sequence);
-            return KvRecordBatchReader.pointToByteBuffer(
-                    builder.build().getByteBuf().nioBuffer());
+            return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
         }
     }
 
@@ -224,21 +223,16 @@ class ReplicaManagerTest extends ReplicaTestBase {
 
         CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> leaderResult =
                 notifyLeader(tablePath, tableBucket, TABLET_SERVER_ID, 0);
-        assertThat(leaderResult.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+        assertThat(leaderResult.get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
         Replica replica = replicaManager.getReplicaOrException(tableBucket);
         WriterKey writerKey = new WriterKey(41L, 17L);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 100L, 1, "before-snapshot"),
-                null,
-                MergeMode.OVERWRITE,
-                -1);
+                fencedBatch(writerKey, 100L, 1, "before-snapshot"), null, MergeMode.OVERWRITE, -1);
         replica.getKvSnapshotManager().triggerSnapshot();
         snapshotReporter.waitUntilSnapshotComplete(tableBucket, 0);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 500L, 2, "after-snapshot"),
-                null,
-                MergeMode.OVERWRITE,
-                -1);
+                fencedBatch(writerKey, 500L, 2, "after-snapshot"), null, MergeMode.OVERWRITE, -1);
 
         assertThat(notifyLeader(tablePath, tableBucket, 2, 1).get())
                 .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));

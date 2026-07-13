@@ -303,8 +303,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
 
     public void setWriterState(long writerId, int batchBaseSequence) {
         checkState(
-                magic != LOG_MAGIC_VALUE_V3,
-                "Compact writer state does not support WAL magic v3");
+                magic != LOG_MAGIC_VALUE_V3, "Compact writer state does not support WAL magic v3");
         // trigger to rewrite batch header when next build.
         this.resetBatchHeader = true;
         this.writerId = writerId;

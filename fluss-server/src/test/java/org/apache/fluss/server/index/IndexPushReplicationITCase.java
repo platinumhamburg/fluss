@@ -21,8 +21,8 @@ import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
-import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
@@ -173,7 +173,8 @@ class IndexPushReplicationITCase {
         // The sync push completed before the ack, so the sync pushed offset must have advanced to
         // the write log end offset. A single row at log offset 0 advances it to 1.
         assertThat(f.mainLeaderReplica.getSyncIndexPushedOffset())
-                .as("sync index pushed offset must equal the write log end offset after a sync write")
+                .as(
+                        "sync index pushed offset must equal the write log end offset after a sync write")
                 .isEqualTo(1L);
     }
 
@@ -244,8 +245,7 @@ class IndexPushReplicationITCase {
 
         KvRecordBatch deleteMissingKey =
                 genKvRecordBatch(
-                        Collections.singletonList(
-                                Tuple2.of(new Object[] {404}, /* value */ null)));
+                        Collections.singletonList(Tuple2.of(new Object[] {404}, /* value */ null)));
 
         f.mainGateway
                 .putKv(newPutKvRequest(f.mainTableId, 0, 1, deleteMissingKey))
@@ -258,8 +258,8 @@ class IndexPushReplicationITCase {
 
     /**
      * Scenario #4 (FIP V2 §2.6, async visibility): with async {@code Schema.Index} visibility the
-     * PutKv ack returns BEFORE the index push completes; the entry is only eventually visible.
-     * We don't assert immediate invisibility (would be flaky on fast machines / single-process
+     * PutKv ack returns BEFORE the index push completes; the entry is only eventually visible. We
+     * don't assert immediate invisibility (would be flaky on fast machines / single-process
      * self-RPC) — the contract under test is "eventual visibility under ASYNC".
      */
     @Test

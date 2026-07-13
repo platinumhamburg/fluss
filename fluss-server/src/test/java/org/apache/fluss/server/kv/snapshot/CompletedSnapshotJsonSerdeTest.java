@@ -40,8 +40,7 @@ class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot
     @Test
     void testTabletStateRetainsAllIndexReplayFloor() {
         TabletState state =
-                new TabletState(
-                        100L, 10L, 40L, Collections.<AutoIncIDRange>emptyList());
+                new TabletState(100L, 10L, 40L, Collections.<AutoIncIDRange>emptyList());
 
         assertThat(state.getMinRetainLogOffset()).isEqualTo(40L);
     }

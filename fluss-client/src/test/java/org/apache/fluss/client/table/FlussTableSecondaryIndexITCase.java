@@ -23,6 +23,8 @@ import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -39,7 +41,11 @@ import org.junit.jupiter.api.Test;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
@@ -67,17 +73,22 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("email", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
-                        .index("idx_email", "email")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Arrays.asList("email"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_email"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -143,8 +154,18 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("email", DataTypes.STRING())
                         .column("year", DataTypes.STRING())
                         .primaryKey("id", "year")
-                        .index("idx_name", "name")
-                        .index("idx_email", "email")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Arrays.asList("email"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
@@ -157,8 +178,6 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                                 ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT,
                                 AutoPartitionTimeUnit.YEAR)
                         .property(ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE, 0)
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_email"), "3")
                         .build();
 
         createTable(tablePath, descriptor, true);
@@ -239,17 +258,22 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("email", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
-                        .index("idx_email", "email")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Arrays.asList("email"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_email"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -316,17 +340,22 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("email", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
-                        .index("idx_email", "email")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Arrays.asList("email"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_email"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -353,38 +382,48 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             // secondary-index lookup must resolve to exactly one row. Verifying *all* rows (not a
             // sample) makes this a total-count check: a single missing or duplicated index entry
             // fails the run.
+            List<InternalRow> nameKeys = new ArrayList<>(testData.size());
+            List<InternalRow> emailKeys = new ArrayList<>(testData.size());
             for (Object[] rowData : testData) {
-                int id = (Integer) rowData[0];
-                final String nameVal = (String) rowData[1];
-                final String emailVal = (String) rowData[2];
+                nameKeys.add(row(rowData[1]));
+                emailKeys.add(row(rowData[2]));
+            }
+            List<LookupResult> nameResults =
+                    waitForAllIndexEntries(nameLookuper, nameKeys, "all name index entries");
+            List<LookupResult> emailResults =
+                    waitForAllIndexEntries(emailLookuper, emailKeys, "all email index entries");
 
-                waitUntil(
-                        () -> !nameLookuper.lookup(row(nameVal)).get().getRowList().isEmpty(),
-                        Duration.ofSeconds(60),
-                        "Name index for '" + nameVal + "'");
-                List<InternalRow> nameRows = nameLookuper.lookup(row(nameVal)).get().getRowList();
+            for (int i = 0; i < testData.size(); i++) {
+                Object[] rowData = testData.get(i);
+                int id = (Integer) rowData[0];
+                String nameVal = (String) rowData[1];
+                String emailVal = (String) rowData[2];
+
+                List<InternalRow> nameRows = nameResults.get(i).getRowList();
                 assertThat(nameRows).hasSize(1);
                 assertThat(nameRows.get(0).getInt(0)).isEqualTo(id);
                 assertThat(nameRows.get(0).getString(1).toString()).isEqualTo(nameVal);
                 assertThat(nameRows.get(0).getString(2).toString()).isEqualTo(emailVal);
 
-                waitUntil(
-                        () -> !emailLookuper.lookup(row(emailVal)).get().getRowList().isEmpty(),
-                        Duration.ofSeconds(60),
-                        "Email index for '" + emailVal + "'");
-                List<InternalRow> emailRows =
-                        emailLookuper.lookup(row(emailVal)).get().getRowList();
+                List<InternalRow> emailRows = emailResults.get(i).getRowList();
                 assertThat(emailRows).hasSize(1);
                 assertThat(emailRows.get(0).getInt(0)).isEqualTo(id);
+                assertThat(emailRows.get(0).getString(1).toString()).isEqualTo(nameVal);
+                assertThat(emailRows.get(0).getString(2).toString()).isEqualTo(emailVal);
             }
 
             // Negative anchor: values that were never written must resolve to no index entry, so a
             // bug returning rows for absent keys would be caught.
-            assertThat(nameLookuper.lookup(row("NoSuchName_42")).get().getRowList()).isEmpty();
+            assertThat(
+                            nameLookuper
+                                    .lookup(row("NoSuchName_42"))
+                                    .get(INDEX_VISIBILITY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                                    .getRowList())
+                    .isEmpty();
             List<InternalRow> missingEmail =
                     emailLookuper
                             .lookup(row("missing.person.0@nowhere.invalid"))
-                            .get()
+                            .get(INDEX_VISIBILITY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
                             .getRowList();
             assertThat(missingEmail).isEmpty();
         }
@@ -400,15 +439,16 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("product_id", DataTypes.INT())
                         .column("amount", DataTypes.INT())
                         .primaryKey("fact_id")
-                        .index("idx_product_id", "product_id")
+                        .index(
+                                "idx_product_id",
+                                IndexType.SECONDARY,
+                                Arrays.asList("product_id"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "fact_id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_product_id"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "fact_id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -450,14 +490,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("order_id", DataTypes.BIGINT())
                         .column("amount", DataTypes.INT())
                         .primaryKey("fact_id")
-                        .index("idx_order_id", "order_id")
+                        .index(
+                                "idx_order_id",
+                                IndexType.SECONDARY,
+                                Arrays.asList("order_id"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "fact_id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_order_id"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "fact_id").build();
         createTable(tablePath, descriptor, true);
 
         long orderId = 9_000_000_000L; // beyond int range, exercises true BIGINT handling
@@ -490,14 +531,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("price", DataTypes.DECIMAL(10, 2))
                         .column("amount", DataTypes.INT())
                         .primaryKey("fact_id")
-                        .index("idx_price", "price")
+                        .index(
+                                "idx_price",
+                                IndexType.SECONDARY,
+                                Arrays.asList("price"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "fact_id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_price"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "fact_id").build();
         createTable(tablePath, descriptor, true);
 
         BigDecimal priceValue = new BigDecimal("123.45");
@@ -538,14 +580,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("event_time", DataTypes.TIMESTAMP())
                         .column("amount", DataTypes.INT())
                         .primaryKey("fact_id")
-                        .index("idx_event_time", "event_time")
+                        .index(
+                                "idx_event_time",
+                                IndexType.SECONDARY,
+                                Arrays.asList("event_time"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "fact_id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_event_time"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "fact_id").build();
         createTable(tablePath, descriptor, true);
 
         TimestampNtz eventTime = TimestampNtz.fromMillis(1_700_000_000_000L);
@@ -579,14 +622,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("active", DataTypes.BOOLEAN())
                         .column("amount", DataTypes.INT())
                         .primaryKey("fact_id")
-                        .index("idx_active", "active")
+                        .index(
+                                "idx_active",
+                                IndexType.SECONDARY,
+                                Arrays.asList("active"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "fact_id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_active"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "fact_id").build();
         createTable(tablePath, descriptor, true);
 
         try (Table table = conn.getTable(tablePath)) {
@@ -625,14 +669,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("user_id", DataTypes.BIGINT().copy(false)) // NOT NULL index column
                         .column("note", DataTypes.STRING().copy(true))
                         .primaryKey("id")
-                        .index("idx_user", "user_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                Arrays.asList("user_id"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_user"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
         createTable(tablePath, descriptor, true);
 
         try (Table table = conn.getTable(tablePath)) {
@@ -655,14 +700,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("user_id", DataTypes.BIGINT().copy(true)) // nullable index column
                         .column("note", DataTypes.STRING().copy(true))
                         .primaryKey("id")
-                        .index("idx_user", "user_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                Arrays.asList("user_id"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_user"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
         createTable(tablePath, descriptor, true);
 
         try (Table table = conn.getTable(tablePath)) {
@@ -683,14 +729,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("product_id", DataTypes.INT())
                         .column("amount", DataTypes.INT())
                         .primaryKey("fact_id")
-                        .index("idx_product_id", "product_id")
+                        .index(
+                                "idx_product_id",
+                                IndexType.SECONDARY,
+                                Arrays.asList("product_id"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
-        TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_product_id"), "3")
-                        .build();
+        TableDescriptor descriptor = TableDescriptor.builder().schema(schema).build();
 
         createTable(tablePath, descriptor, true);
 
@@ -736,17 +783,22 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("email", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
-                        .index("idx_email", "email")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Arrays.asList("email"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_email"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -787,14 +839,15 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("id", DataTypes.INT())
                         .column("payload", DataTypes.BYTES())
                         .primaryKey("id")
-                        .index("idx_payload", "payload")
+                        .index(
+                                "idx_payload",
+                                IndexType.SECONDARY,
+                                Arrays.asList("payload"),
+                                IndexVisibility.SYNC,
+                                1)
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(1, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_payload"), "1")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
         createTable(tablePath, descriptor, true);
 
         byte[] writtenPayload = new byte[] {1, 2, 3};
@@ -828,15 +881,16 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("email", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -936,17 +990,22 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .column("name", DataTypes.STRING())
                         .column("email", DataTypes.STRING())
                         .primaryKey("id")
-                        .index("idx_name", "name")
-                        .index("idx_email", "email")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Arrays.asList("name"),
+                                IndexVisibility.SYNC,
+                                3)
+                        .index(
+                                "idx_email",
+                                IndexType.SECONDARY,
+                                Arrays.asList("email"),
+                                IndexVisibility.SYNC,
+                                3)
                         .build();
 
         TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "id")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_name"), "3")
-                        .property(ConfigOptions.secondaryIndexBucketNumKey("idx_email"), "3")
-                        .build();
+                TableDescriptor.builder().schema(schema).distributedBy(3, "id").build();
 
         createTable(tablePath, descriptor, true);
 
@@ -964,6 +1023,34 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
         assertThat(rowType.getField("id").getType().isNullable())
                 .as("Primary key 'id' should be NOT NULL")
                 .isFalse();
+    }
+
+    private static List<LookupResult> waitForAllIndexEntries(
+            Lookuper lookuper, List<InternalRow> keys, String description) {
+        AtomicReference<List<LookupResult>> successfulResults = new AtomicReference<>();
+        waitUntil(
+                () -> {
+                    List<CompletableFuture<LookupResult>> futures = new ArrayList<>(keys.size());
+                    for (InternalRow key : keys) {
+                        futures.add(lookuper.lookup(key));
+                    }
+                    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                            .get(INDEX_VISIBILITY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                    List<LookupResult> results = new ArrayList<>(futures.size());
+                    for (CompletableFuture<LookupResult> future : futures) {
+                        LookupResult result = future.join();
+                        if (result.getRowList().isEmpty()) {
+                            return false;
+                        }
+                        results.add(result);
+                    }
+                    successfulResults.set(results);
+                    return true;
+                },
+                INDEX_VISIBILITY_TIMEOUT,
+                description + " should become visible");
+        return successfulResults.get();
     }
 
     private List<Object[]> generateRandomTestData(int rowCount) {

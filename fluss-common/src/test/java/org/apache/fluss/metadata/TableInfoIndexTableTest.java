@@ -46,8 +46,7 @@ class TableInfoIndexTableTest {
                         Collections.singletonMap(
                                 ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "1"));
 
-        assertThat(tableInfo.getKvIdempotenceProtocol())
-                .isEqualTo(KvIdempotenceProtocol.V1_FENCED);
+        assertThat(tableInfo.getKvIdempotenceProtocol()).isEqualTo(KvIdempotenceProtocol.V1_FENCED);
     }
 
     @Test
@@ -105,7 +104,6 @@ class TableInfoIndexTableTest {
         properties.forEach(descriptor::property);
 
         long now = System.currentTimeMillis();
-        return TableInfo.of(
-                TablePath.of("db", "t"), 1L, 1, descriptor.build(), null, now, now);
+        return TableInfo.of(TablePath.of("db", "t"), 1L, 1, descriptor.build(), null, now, now);
     }
 }

@@ -17,8 +17,8 @@
 
 package org.apache.fluss.record;
 
-import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.CorruptMessageException;
+import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.memory.ManagedPagedOutputView;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.LogFormat;
@@ -58,11 +58,11 @@ import java.util.UUID;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
+import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
-import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.V0_RECORD_BATCH_HEADER_SIZE;
 import static org.apache.fluss.record.LogRecordBatchFormat.V1_RECORD_BATCH_HEADER_SIZE;
@@ -440,8 +440,7 @@ class FileLogProjectionTest {
         try (FileLogRecords fileLogRecords =
                 createFileWithLogHeader(
                         LOG_MAGIC_VALUE_V2, LogRecordBatchFormat.V2_RECORD_BATCH_HEADER_SIZE)) {
-            FileLogProjection.readLogHeaderFullyOrFail(
-                    fileLogRecords.channel(), v3HeaderBuffer, 0);
+            FileLogProjection.readLogHeaderFullyOrFail(fileLogRecords.channel(), v3HeaderBuffer, 0);
             assertThat(v3HeaderBuffer.position())
                     .isEqualTo(LogRecordBatchFormat.V2_RECORD_BATCH_HEADER_SIZE);
         }
@@ -449,15 +448,13 @@ class FileLogProjectionTest {
         v3HeaderBuffer.rewind();
         try (FileLogRecords fileLogRecords =
                 createFileWithLogHeader(LOG_MAGIC_VALUE_V3, V3_RECORD_BATCH_HEADER_SIZE)) {
-            FileLogProjection.readLogHeaderFullyOrFail(
-                    fileLogRecords.channel(), v3HeaderBuffer, 0);
+            FileLogProjection.readLogHeaderFullyOrFail(fileLogRecords.channel(), v3HeaderBuffer, 0);
             assertThat(v3HeaderBuffer.hasRemaining()).isFalse();
         }
 
         v3HeaderBuffer.rewind();
         try (FileLogRecords fileLogRecords =
-                createFileWithLogHeader(
-                        LOG_MAGIC_VALUE_V3, V3_RECORD_BATCH_HEADER_SIZE - 1)) {
+                createFileWithLogHeader(LOG_MAGIC_VALUE_V3, V3_RECORD_BATCH_HEADER_SIZE - 1)) {
             assertThatThrownBy(
                             () ->
                                     FileLogProjection.readLogHeaderFullyOrFail(
@@ -527,8 +524,7 @@ class FileLogProjectionTest {
         ByteBuffer corruptHeader =
                 ByteBuffer.allocate(V3_RECORD_BATCH_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
         corruptHeader.putInt(
-                LENGTH_OFFSET,
-                V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1);
+                LENGTH_OFFSET, V3_RECORD_BATCH_HEADER_SIZE - LogRecordBatchFormat.LOG_OVERHEAD - 1);
         corruptHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
         try (FileLogRecords fileLogRecords =
                 FileLogRecords.open(new File(tempDir, "undersized-v3-projection.log"))) {
@@ -553,12 +549,9 @@ class FileLogProjectionTest {
     void testProjectionRejectsMalformedLayoutBeforeReadingFollowingBatchBytes() throws Exception {
         assertMalformedV3LayoutRejected(
                 V3_RECORD_BATCH_HEADER_SIZE, -1, 0, true, "statisticsLength");
-        assertMalformedV3LayoutRejected(
-                V3_RECORD_BATCH_HEADER_SIZE, 0, -1, true, "recordCount");
-        assertMalformedV3LayoutRejected(
-                V3_RECORD_BATCH_HEADER_SIZE, 1, 0, true, "header-only");
-        assertMalformedV3LayoutRejected(
-                V3_RECORD_BATCH_HEADER_SIZE, 0, 1, true, "header-only");
+        assertMalformedV3LayoutRejected(V3_RECORD_BATCH_HEADER_SIZE, 0, -1, true, "recordCount");
+        assertMalformedV3LayoutRejected(V3_RECORD_BATCH_HEADER_SIZE, 1, 0, true, "header-only");
+        assertMalformedV3LayoutRejected(V3_RECORD_BATCH_HEADER_SIZE, 0, 1, true, "header-only");
         assertMalformedV3LayoutRejected(80, Integer.MAX_VALUE, 0, true, "overflow");
         assertMalformedV3LayoutRejected(80, 0, Integer.MAX_VALUE, false, "overflow");
         assertMalformedV3LayoutRejected(70, 0, 0, true, "Arrow header");
@@ -588,14 +581,18 @@ class FileLogProjectionTest {
                     physicalSize++) {
                 records.channel().truncate(completeEnd);
                 records.channel()
-                        .write(rawBatchTail(physicalSize, validDeclaredLength, tailMagic), completeEnd);
+                        .write(
+                                rawBatchTail(physicalSize, validDeclaredLength, tailMagic),
+                                completeEnd);
                 assertThat(projectToBytes(records, (int) records.channel().size()))
                         .isEqualTo(expected);
             }
 
             records.channel().truncate(completeEnd);
             records.channel()
-                    .write(rawBatchTail(headerSize, validDeclaredLength + 8, tailMagic), completeEnd);
+                    .write(
+                            rawBatchTail(headerSize, validDeclaredLength + 8, tailMagic),
+                            completeEnd);
             assertThat(projectToBytes(records, (int) records.channel().size())).isEqualTo(expected);
         }
     }
@@ -608,15 +605,12 @@ class FileLogProjectionTest {
                 LOG_MAGIC_VALUE_V2,
                 LOG_MAGIC_VALUE_V3
             })
-    void testRangeProjectionRejectsInvalidDeclarationFromCommonPrefix(byte magic)
-            throws Exception {
+    void testRangeProjectionRejectsInvalidDeclarationFromCommonPrefix(byte magic) throws Exception {
         int headerSize = LogRecordBatchFormat.recordBatchHeaderSize(magic);
         assertProjectionDeclarationRejected(magic, -1, "negative");
         assertProjectionDeclarationRejected(magic, Integer.MAX_VALUE, "overflow");
         assertProjectionDeclarationRejected(
-                magic,
-                headerSize - LogRecordBatchFormat.LOG_OVERHEAD - 1,
-                "smaller");
+                magic, headerSize - LogRecordBatchFormat.LOG_OVERHEAD - 1, "smaller");
     }
 
     @Test
@@ -661,11 +655,7 @@ class FileLogProjectionTest {
                                     LOG_MAGIC_VALUE_V3));
             FileLogInputStream.FileChannelLogRecordBatch payloadTruncatedBatch =
                     new FileLogInputStream.FileChannelLogRecordBatch(
-                            0L,
-                            LOG_MAGIC_VALUE_V3,
-                            records,
-                            0,
-                            declaredLength);
+                            0L, LOG_MAGIC_VALUE_V3, records, 0, declaredLength);
 
             assertThatThrownBy(
                             () ->
@@ -678,8 +668,7 @@ class FileLogProjectionTest {
 
     @Test
     void testProjectionRejectsOverlappingArrowBufferSpans() throws Exception {
-        List<ArrowFieldNode> nodes =
-                List.of(new ArrowFieldNode(1, 0), new ArrowFieldNode(1, 0));
+        List<ArrowFieldNode> nodes = List.of(new ArrowFieldNode(1, 0), new ArrowFieldNode(1, 0));
         List<ArrowBuffer> buffers =
                 List.of(
                         new ArrowBuffer(0, 16),
@@ -743,7 +732,8 @@ class FileLogProjectionTest {
     }
 
     private void assertMalformedArrowMetadataRejected(
-            List<ArrowFieldNode> nodes, List<ArrowBuffer> buffers, String message) throws Exception {
+            List<ArrowFieldNode> nodes, List<ArrowBuffer> buffers, String message)
+            throws Exception {
         try (FileLogRecords records = createFileWithArrowMetadata(nodes, buffers, 40)) {
             FileLogProjection projection = new FileLogProjection(new ProjectionPushdownCache());
             projection.setCurrentProjection(
@@ -777,17 +767,14 @@ class FileLogProjectionTest {
         batch.putInt(LENGTH_OFFSET, batchSize - LogRecordBatchFormat.LOG_OVERHEAD);
         batch.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V0);
         batch.putShort(schemaIdOffset(LOG_MAGIC_VALUE_V0), (short) DEFAULT_SCHEMA_ID);
-        batch.put(
-                attributeOffset(LOG_MAGIC_VALUE_V0),
-                DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK);
+        batch.put(attributeOffset(LOG_MAGIC_VALUE_V0), DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK);
         batch.putInt(recordsCountOffset(LOG_MAGIC_VALUE_V0), 1);
         batch.position(V0_RECORD_BATCH_HEADER_SIZE);
         batch.put(metadata);
         batch.position(batchSize);
         batch.flip();
 
-        FileLogRecords records =
-                FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"));
+        FileLogRecords records = FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"));
         records.channel().write(batch);
         return records;
     }
@@ -808,16 +795,14 @@ class FileLogProjectionTest {
             throws Exception {
         ByteBuffer bytesAfterHeader =
                 ByteBuffer.allocate(declaredSize + 64).order(ByteOrder.LITTLE_ENDIAN);
-        bytesAfterHeader.putInt(
-                LENGTH_OFFSET, declaredSize - LogRecordBatchFormat.LOG_OVERHEAD);
+        bytesAfterHeader.putInt(LENGTH_OFFSET, declaredSize - LogRecordBatchFormat.LOG_OVERHEAD);
         bytesAfterHeader.put(MAGIC_OFFSET, LOG_MAGIC_VALUE_V3);
         bytesAfterHeader.putShort(schemaIdOffset(LOG_MAGIC_VALUE_V3), (short) DEFAULT_SCHEMA_ID);
         bytesAfterHeader.put(
                 attributeOffset(LOG_MAGIC_VALUE_V3),
                 appendOnly ? DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK : 0);
         bytesAfterHeader.putInt(recordsCountOffset(LOG_MAGIC_VALUE_V3), recordCount);
-        bytesAfterHeader.putInt(
-                statisticsLengthOffset(LOG_MAGIC_VALUE_V3), statisticsLength);
+        bytesAfterHeader.putInt(statisticsLengthOffset(LOG_MAGIC_VALUE_V3), statisticsLength);
 
         try (FileLogRecords records =
                 FileLogRecords.open(new File(tempDir, UUID.randomUUID() + ".log"))) {

@@ -332,8 +332,7 @@ public class LogTieringTask implements Runnable {
                 remoteLogStorage.copyLogSegmentFiles(copyRemoteLogSegment, logSegmentFiles);
             } catch (RemoteStorageException e) {
                 metricGroup.remoteLogCopyErrors().inc();
-                if (log.writerStateManager().protocol()
-                        == KvIdempotenceProtocol.V1_FENCED) {
+                if (log.writerStateManager().protocol() == KvIdempotenceProtocol.V1_FENCED) {
                     if (!copiedSegments.isEmpty()) {
                         deleteRemoteLogSegmentFiles(copiedSegments, metricGroup);
                         copiedSegments.clear();
@@ -471,7 +470,8 @@ public class LogTieringTask implements Runnable {
                         newRemoteLogEndOffset,
                         newRemoteLogSize);
         try {
-            Optional<RemoteLogManifestHandle> authoritativeHandle = manifestHandleResolver.resolve();
+            Optional<RemoteLogManifestHandle> authoritativeHandle =
+                    manifestHandleResolver.resolve();
             if (authoritativeHandle.filter(attemptedHandle::equals).isPresent()) {
                 publishCommittedManifest(
                         remoteLogTablet,

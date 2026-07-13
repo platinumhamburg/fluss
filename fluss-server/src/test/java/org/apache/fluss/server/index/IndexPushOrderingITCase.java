@@ -29,16 +29,23 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.RowEncoder;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -46,18 +53,24 @@ import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
+import org.apache.fluss.server.log.FetchDataInfo;
+import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestHooks;
 import org.apache.fluss.server.tablet.TabletServer;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksIterator;
 
 import javax.annotation.Nullable;
 
@@ -66,6 +79,7 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -138,6 +152,7 @@ class IndexPushOrderingITCase {
         SequenceGate newKeyGate = null;
         boolean sourceRestarted = false;
         boolean targetRestarted = false;
+        Throwable primaryFailure = null;
 
         try {
             List<Integer> primaryKeys = primaryKeysForBucket(fixture.sourceBucket, 4);
@@ -154,13 +169,9 @@ class IndexPushOrderingITCase {
             String movementNewValue =
                     valueForBucketPrefix("movement-new", fixture.otherTarget.bucket);
 
-            List<SourceMutation> committedSourceWal = new ArrayList<>();
             putSourceAndWait(
                     fixture, SourceMutation.upsert(deleteUpsertPk, deleteUpsertValue), true);
-            committedSourceWal.add(SourceMutation.upsert(deleteUpsertPk, deleteUpsertValue));
-            putSourceAndWait(
-                    fixture, SourceMutation.upsert(movementPk, movementOldValue), true);
-            committedSourceWal.add(SourceMutation.upsert(movementPk, movementOldValue));
+            putSourceAndWait(fixture, SourceMutation.upsert(movementPk, movementOldValue), true);
 
             long snapshotOffset = fixture.sourceReplica.getSyncIndexPushedOffset();
             assertThat(snapshotOffset)
@@ -188,7 +199,6 @@ class IndexPushOrderingITCase {
 
             SourceMutation movement = SourceMutation.upsert(movementPk, movementNewValue);
             pendingSourceResponses.add(putSourceAndWait(fixture, movement, false));
-            committedSourceWal.add(movement);
             oldKeyGate.awaitOldAdmission();
             newKeyGate.awaitOldAdmission();
             long oldWindowEnd = oldKeyGate.oldSequence();
@@ -202,32 +212,25 @@ class IndexPushOrderingITCase {
                             fixture,
                             SourceMutation.upsert(upsertDeletePk, upsertDeleteValue),
                             false));
-            committedSourceWal.add(SourceMutation.upsert(upsertDeletePk, upsertDeleteValue));
             pendingSourceResponses.add(
                     putSourceAndWait(fixture, SourceMutation.delete(upsertDeletePk), false));
-            committedSourceWal.add(SourceMutation.delete(upsertDeletePk));
 
             pendingSourceResponses.add(
                     putSourceAndWait(fixture, SourceMutation.delete(deleteUpsertPk), false));
-            committedSourceWal.add(SourceMutation.delete(deleteUpsertPk));
             pendingSourceResponses.add(
                     putSourceAndWait(
                             fixture,
                             SourceMutation.upsert(deleteUpsertPk, deleteUpsertValue),
                             false));
-            committedSourceWal.add(SourceMutation.upsert(deleteUpsertPk, deleteUpsertValue));
 
             pendingSourceResponses.add(
                     putSourceAndWait(
                             fixture, SourceMutation.upsert(threeStepPk, threeStepValue), false));
-            committedSourceWal.add(SourceMutation.upsert(threeStepPk, threeStepValue));
             pendingSourceResponses.add(
                     putSourceAndWait(fixture, SourceMutation.delete(threeStepPk), false));
-            committedSourceWal.add(SourceMutation.delete(threeStepPk));
             pendingSourceResponses.add(
                     putSourceAndWait(
                             fixture, SourceMutation.upsert(threeStepPk, threeStepValue), false));
-            committedSourceWal.add(SourceMutation.upsert(threeStepPk, threeStepValue));
 
             waitUntil(
                     () ->
@@ -296,8 +299,7 @@ class IndexPushOrderingITCase {
                     CLUSTER.getTabletServerById(
                             CLUSTER.waitAndGetLeader(fixture.failoverTarget.tableBucket));
             long staleBeforeLostResponseRetry = staleCount(targetServerBeforeFailover);
-            sendCapturedBatch(
-                    fixture, fixture.failoverTarget.bucket, lostResponseRetry);
+            sendCapturedBatch(fixture, fixture.failoverTarget.bucket, lostResponseRetry);
             assertThat(staleCount(targetServerBeforeFailover))
                     .as("a lost-response retry must be observed as one duplicate fence")
                     .isEqualTo(staleBeforeLostResponseRetry + 1L);
@@ -325,16 +327,17 @@ class IndexPushOrderingITCase {
             assertThat(recoveredTarget.getLogTablet().getHighWatermark())
                     .isGreaterThan(recoveredEntry.dominatingTargetWalOffset());
             targetStop.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
+                    .isEqualTo(recoveredEntry);
 
             Map<TableBucket, Long> walBeforeStaleDelivery =
                     currentWalEnds(fixture.failoverTarget, fixture.otherTarget);
-
-            // The original RPCs were intentionally abandoned after their target-side admission.
-            // Remove the gates, then deliver their checksum-identical payloads in reverse order.
             byte[] delayedOldKeyDelete = oldKeyGate.capturedBatch();
             byte[] delayedNewKeyUpsert = newKeyGate.capturedBatch();
             newKeyGate.close();
+            newKeyGate = null;
             oldKeyGate.close();
+            oldKeyGate = null;
             TabletServer currentOtherTarget =
                     CLUSTER.getTabletServerById(
                             CLUSTER.waitAndGetLeader(fixture.otherTarget.tableBucket));
@@ -342,53 +345,76 @@ class IndexPushOrderingITCase {
                     CLUSTER.getTabletServerById(
                             CLUSTER.waitAndGetLeader(fixture.failoverTarget.tableBucket));
             Set<TabletServer> staleMetricServers =
-                    new LinkedHashSet<>(
-                            Arrays.asList(currentOtherTarget, currentFailoverTarget));
+                    new LinkedHashSet<>(Arrays.asList(currentOtherTarget, currentFailoverTarget));
             long staleBefore = totalStaleCount(staleMetricServers);
+
+            // Target state has no RPC-identity input. Re-delivering the checksum-equivalent batch
+            // models an already-sent old request whose transport cancellation loses the race.
             sendCapturedBatch(fixture, fixture.otherTarget.bucket, delayedNewKeyUpsert);
+            assertThat(totalStaleCount(staleMetricServers)).isEqualTo(staleBefore + 1L);
+            assertStaleDeliveryHasNoSideEffects(
+                    fixture,
+                    writerKey,
+                    walBeforeStaleDelivery,
+                    recoveredEntry,
+                    otherDominatingEntry);
             sendCapturedBatch(fixture, fixture.failoverTarget.bucket, delayedOldKeyDelete);
             assertThat(totalStaleCount(staleMetricServers)).isEqualTo(staleBefore + 2L);
-            assertThat(currentWalEnds(fixture.failoverTarget, fixture.otherTarget))
-                    .as("reverse-delivered old source batches must append no target WAL")
-                    .isEqualTo(walBeforeStaleDelivery);
-            assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
-                    .isEqualTo(recoveredEntry);
-            assertThat(currentFence(fixture.otherTarget.tableBucket, writerKey))
-                    .isEqualTo(otherDominatingEntry);
+            assertStaleDeliveryHasNoSideEffects(
+                    fixture,
+                    writerKey,
+                    walBeforeStaleDelivery,
+                    recoveredEntry,
+                    otherDominatingEntry);
 
-            assertIndexEqualsCommittedSourceWal(fixture, committedSourceWal);
+            assertIndexEqualsCommittedSourceWal(fixture, committedSourceEnd);
 
             CLUSTER.startTabletServer(oldSourceLeader);
             sourceRestarted = true;
             CLUSTER.startTabletServer(oldTargetLeader);
             targetRestarted = true;
             CLUSTER.assertHasTabletServerNumber(TABLET_SERVER_COUNT);
+        } catch (Exception | AssertionError failure) {
+            primaryFailure = failure;
+            throw failure;
         } finally {
+            List<Throwable> cleanupFailures = new ArrayList<>();
             if (newKeyGate != null) {
                 newKeyGate.releaseAll();
             }
             if (oldKeyGate != null) {
                 oldKeyGate.releaseAll();
             }
-            awaitQuietly(sourceStop);
-            awaitQuietly(targetStop);
-            if (!sourceRestarted && CLUSTER.getTabletServerById(fixture.sourceLeader) == null) {
-                CLUSTER.startTabletServer(fixture.sourceLeader);
-            }
-            if (!targetRestarted
-                    && CLUSTER.getTabletServerById(fixture.failoverTarget.leader) == null) {
-                CLUSTER.startTabletServer(fixture.failoverTarget.leader);
-            }
-            if (newKeyGate != null) {
-                newKeyGate.close();
-            }
-            if (oldKeyGate != null) {
-                oldKeyGate.close();
-            }
+            SequenceGate finalNewKeyGate = newKeyGate;
+            cleanup(cleanupFailures, () -> closeGate(finalNewKeyGate));
+            SequenceGate finalOldKeyGate = oldKeyGate;
+            cleanup(cleanupFailures, () -> closeGate(finalOldKeyGate));
             for (CompletableFuture<PutKvResponse> response : pendingSourceResponses) {
                 response.cancel(true);
             }
+            CompletableFuture<Void> finalSourceStop = sourceStop;
+            cleanup(cleanupFailures, () -> awaitStop(finalSourceStop));
+            CompletableFuture<Void> finalTargetStop = targetStop;
+            cleanup(cleanupFailures, () -> awaitStop(finalTargetStop));
+            if (!sourceRestarted && CLUSTER.getTabletServerById(fixture.sourceLeader) == null) {
+                cleanup(cleanupFailures, () -> CLUSTER.startTabletServer(fixture.sourceLeader));
+            }
+            if (!targetRestarted
+                    && CLUSTER.getTabletServerById(fixture.failoverTarget.leader) == null) {
+                cleanup(
+                        cleanupFailures,
+                        () -> CLUSTER.startTabletServer(fixture.failoverTarget.leader));
+            }
             failoverExecutor.shutdownNow();
+            cleanup(
+                    cleanupFailures,
+                    () -> {
+                        if (!failoverExecutor.awaitTermination(
+                                TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                            throw new AssertionError("failover executor did not terminate");
+                        }
+                    });
+            reportCleanupFailures(primaryFailure, cleanupFailures);
         }
     }
 
@@ -429,10 +455,7 @@ class IndexPushOrderingITCase {
                     "wait for index target ISR " + tableBucket);
             targets.add(
                     new Target(
-                            bucket,
-                            tableBucket,
-                            CLUSTER.waitAndGetLeader(tableBucket),
-                            replica));
+                            bucket, tableBucket, CLUSTER.waitAndGetLeader(tableBucket), replica));
         }
 
         for (int sourceBucket = 0; sourceBucket < MAIN_BUCKET_COUNT; sourceBucket++) {
@@ -485,14 +508,9 @@ class IndexPushOrderingITCase {
                         ? genKvRecordBatch(
                                 Collections.singletonList(
                                         Tuple2.of(new Object[] {mutation.primaryKey}, null)))
-                        : genKvRecordBatch(
-                                new Object[] {mutation.primaryKey, mutation.value});
+                        : genKvRecordBatch(new Object[] {mutation.primaryKey, mutation.value});
         PutKvRequest request =
-                newPutKvRequest(
-                                fixture.mainTableId,
-                                fixture.sourceBucket,
-                                1,
-                                batch)
+                newPutKvRequest(fixture.mainTableId, fixture.sourceBucket, 1, batch)
                         .setTimeoutMs((int) TIMEOUT.toMillis());
         CompletableFuture<PutKvResponse> response =
                 CLUSTER.newTabletServerClientForNode(fixture.sourceLeader).putKv(request);
@@ -524,8 +542,7 @@ class IndexPushOrderingITCase {
                 byte[] key = new byte[keyBuffer.remaining()];
                 keyBuffer.get(key);
                 builder.append(key, record.getRow());
-                if (Arrays.equals(key, expectedRow.key)
-                        && delete == (record.getRow() == null)) {
+                if (Arrays.equals(key, expectedRow.key) && delete == (record.getRow() == null)) {
                     containsExpectedMutation = true;
                 }
             }
@@ -575,8 +592,7 @@ class IndexPushOrderingITCase {
         return currentFence(target, writerKey);
     }
 
-    private static FencedWriterStateEntry currentFence(
-            TableBucket target, WriterKey writerKey) {
+    private static FencedWriterStateEntry currentFence(TableBucket target, WriterKey writerKey) {
         return CLUSTER.waitAndGetLeaderReplica(target)
                 .getLogTablet()
                 .writerStateManager()
@@ -594,37 +610,123 @@ class IndexPushOrderingITCase {
         return result;
     }
 
+    private static void assertStaleDeliveryHasNoSideEffects(
+            Fixture fixture,
+            WriterKey writerKey,
+            Map<TableBucket, Long> expectedWalEnds,
+            FencedWriterStateEntry expectedFailoverTargetEntry,
+            FencedWriterStateEntry expectedOtherTargetEntry) {
+        assertThat(currentWalEnds(fixture.failoverTarget, fixture.otherTarget))
+                .as("released original old-source requests must append no target WAL")
+                .isEqualTo(expectedWalEnds);
+        assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
+                .isEqualTo(expectedFailoverTargetEntry);
+        assertThat(currentFence(fixture.otherTarget.tableBucket, writerKey))
+                .isEqualTo(expectedOtherTargetEntry);
+    }
+
     private static void assertIndexEqualsCommittedSourceWal(
-            Fixture fixture, List<SourceMutation> sourceWal) {
-        Map<Integer, String> referenceRows = new LinkedHashMap<>();
-        Map<String, PhysicalRow> physicalRows = new LinkedHashMap<>();
-        for (SourceMutation mutation : sourceWal) {
-            if (mutation.value == null) {
-                referenceRows.remove(mutation.primaryKey);
-            } else {
-                referenceRows.put(mutation.primaryKey, mutation.value);
-                PhysicalRow row = physicalRow(mutation.value, mutation.primaryKey);
-                physicalRows.put(mutation.value + '\u0000' + mutation.primaryKey, row);
+            Fixture fixture, long committedSourceEnd) throws Exception {
+        Map<Integer, String> sourceRows = decodeCommittedSourceWal(fixture, committedSourceEnd);
+        Map<TableBucket, Map<String, String>> expected = emptyIndexProjection(fixture.indexTableId);
+        CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(INDEX_ROW_TYPE);
+        try (RowEncoder valueEncoder = RowEncoder.create(KvFormat.COMPACTED, INDEX_ROW_TYPE)) {
+            for (Map.Entry<Integer, String> sourceRow : sourceRows.entrySet()) {
+                valueEncoder.startNewRow();
+                valueEncoder.encodeField(0, fromString(sourceRow.getValue()));
+                valueEncoder.encodeField(1, sourceRow.getKey());
+                BinaryRow indexRow = valueEncoder.finishRow();
+                byte[] key = keyEncoder.encodeKey(indexRow);
+                byte[] value = ValueEncoder.encodeValue((short) 1, indexRow);
+                TableBucket bucket =
+                        new TableBucket(fixture.indexTableId, indexBucket(sourceRow.getValue()));
+                String previous = expected.get(bucket).put(encode(key), encode(value));
+                assertThat(previous).as("physical index keys are unique").isNull();
             }
         }
 
-        Map<String, Boolean> actual = new LinkedHashMap<>();
-        Map<String, Boolean> expected = new LinkedHashMap<>();
-        for (Map.Entry<String, PhysicalRow> entry : physicalRows.entrySet()) {
-            PhysicalRow row = entry.getValue();
-            byte[] value =
-                    CLUSTER.waitAndGetLeaderReplica(
-                                    new TableBucket(fixture.indexTableId, row.bucket))
-                            .lookups(Collections.singletonList(row.key))
-                            .get(0);
-            actual.put(entry.getKey(), value != null);
-            expected.put(
-                    entry.getKey(),
-                    row.indexedValue.equals(referenceRows.get(row.primaryKey)));
+        Map<TableBucket, Map<String, String>> actual = emptyIndexProjection(fixture.indexTableId);
+        for (int bucket = 0; bucket < INDEX_BUCKET_COUNT; bucket++) {
+            TableBucket tableBucket = new TableBucket(fixture.indexTableId, bucket);
+            Replica replica = CLUSTER.waitAndGetLeaderReplica(tableBucket);
+            replica.getKvTablet().flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+            try (ReadOptions readOptions = new ReadOptions();
+                    RocksIterator iterator =
+                            replica.getKvTablet()
+                                    .getRocksDBKv()
+                                    .getDb()
+                                    .newIterator(
+                                            replica.getKvTablet()
+                                                    .getRocksDBKv()
+                                                    .getDefaultColumnFamilyHandle(),
+                                            readOptions)) {
+                iterator.seekToFirst();
+                while (iterator.isValid()) {
+                    actual.get(tableBucket).put(encode(iterator.key()), encode(iterator.value()));
+                    iterator.next();
+                }
+                iterator.status();
+            }
         }
         assertThat(actual)
-                .as("physical Index Table rows must exactly project the committed source WAL")
+                .as(
+                        "all physical Index Table key/value rows must exactly project committed source WAL [0,%s)",
+                        committedSourceEnd)
                 .isEqualTo(expected);
+    }
+
+    private static Map<Integer, String> decodeCommittedSourceWal(
+            Fixture fixture, long committedSourceEnd) throws Exception {
+        Replica source = CLUSTER.waitAndGetLeaderReplica(fixture.sourceTableBucket);
+        FetchDataInfo fetch =
+                source.getLogTablet()
+                        .read(0L, Integer.MAX_VALUE, FetchIsolation.HIGH_WATERMARK, true);
+        Map<Integer, String> sourceRows = new LinkedHashMap<>();
+        long nextBatchOffset = 0L;
+        try (LogRecordReadContext readContext =
+                LogRecordReadContext.createReadContext(
+                        source.getTableInfo(),
+                        false,
+                        null,
+                        new TestingSchemaGetter(
+                                source.getTableInfo().getSchemaId(),
+                                source.getTableInfo().getSchema()))) {
+            for (LogRecordBatch batch : fetch.getRecords().batches()) {
+                assertThat(batch.baseLogOffset()).isEqualTo(nextBatchOffset);
+                assertThat(batch.nextLogOffset()).isLessThanOrEqualTo(committedSourceEnd);
+                try (CloseableIterator<LogRecord> records = batch.records(readContext)) {
+                    while (records.hasNext()) {
+                        LogRecord record = records.next();
+                        assertThat(record.logOffset()).isLessThan(committedSourceEnd);
+                        int primaryKey = record.getRow().getInt(0);
+                        ChangeType changeType = record.getChangeType();
+                        if (changeType == ChangeType.DELETE
+                                || changeType == ChangeType.UPDATE_BEFORE) {
+                            sourceRows.remove(primaryKey);
+                        } else {
+                            sourceRows.put(primaryKey, record.getRow().getString(1).toString());
+                        }
+                    }
+                }
+                nextBatchOffset = batch.nextLogOffset();
+            }
+        }
+        assertThat(nextBatchOffset)
+                .as("decoded committed source WAL coverage")
+                .isEqualTo(committedSourceEnd);
+        return sourceRows;
+    }
+
+    private static Map<TableBucket, Map<String, String>> emptyIndexProjection(long indexTableId) {
+        Map<TableBucket, Map<String, String>> projection = new LinkedHashMap<>();
+        for (int bucket = 0; bucket < INDEX_BUCKET_COUNT; bucket++) {
+            projection.put(new TableBucket(indexTableId, bucket), new LinkedHashMap<>());
+        }
+        return projection;
+    }
+
+    private static String encode(byte[] bytes) {
+        return Base64.getEncoder().encodeToString(bytes);
     }
 
     private static List<Integer> primaryKeysForBucket(int bucket, int count) {
@@ -665,7 +767,7 @@ class IndexPushOrderingITCase {
         value.setField(0, fromString(indexedValue));
         value.setField(1, primaryKey);
         byte[] key = new CompactedKeyEncoder(INDEX_ROW_TYPE).encodeKey(value);
-        return new PhysicalRow(indexedValue, primaryKey, key, indexBucket(indexedValue));
+        return new PhysicalRow(key);
     }
 
     private static int currentLeader(TableBucket tableBucket) {
@@ -696,14 +798,41 @@ class IndexPushOrderingITCase {
         }
     }
 
-    private static void awaitQuietly(@Nullable CompletableFuture<Void> future) {
+    private static void closeGate(@Nullable SequenceGate gate) throws Exception {
+        if (gate != null) {
+            gate.close();
+        }
+    }
+
+    private static void awaitStop(@Nullable CompletableFuture<Void> future) throws Exception {
         if (future == null) {
             return;
         }
+        future.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    private static void cleanup(List<Throwable> failures, CleanupAction action) {
         try {
-            future.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (Exception ignored) {
-            // The primary assertion reports the failure; finally only tries to make restart safe.
+            action.run();
+        } catch (Throwable failure) {
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            failures.add(failure);
+        }
+    }
+
+    private static void reportCleanupFailures(
+            @Nullable Throwable primaryFailure, List<Throwable> cleanupFailures) {
+        if (cleanupFailures.isEmpty()) {
+            return;
+        }
+        AssertionError cleanupFailure = new AssertionError("ordering IT cleanup failed");
+        cleanupFailures.forEach(cleanupFailure::addSuppressed);
+        if (primaryFailure != null) {
+            primaryFailure.addSuppressed(cleanupFailure);
+        } else {
+            throw cleanupFailure;
         }
     }
 
@@ -721,6 +850,11 @@ class IndexPushOrderingITCase {
     private static void assertSuccess(PutKvResponse response) {
         assertThat(response.getBucketsRespsList())
                 .allSatisfy(bucket -> assertThat(bucket.hasErrorCode()).isFalse());
+    }
+
+    @FunctionalInterface
+    private interface CleanupAction {
+        void run() throws Exception;
     }
 
     private static final class SequenceGate implements AutoCloseable {
@@ -818,7 +952,7 @@ class IndexPushOrderingITCase {
             try {
                 releaseOld.await();
             } catch (InterruptedException ignored) {
-                // Transport cancellation is the expected end of the admitted original RPC.
+                // Source shutdown may cancel the transport before the test releases the gate.
             } finally {
                 oldAbandoned.countDown();
             }
@@ -831,7 +965,7 @@ class IndexPushOrderingITCase {
         }
 
         private void awaitOldAbandoned() {
-            await(oldAbandoned, "wait for transport to abandon admitted old source request");
+            await(oldAbandoned, "wait for admitted old source request cancellation");
         }
 
         private void awaitNewAdmission() {
@@ -925,18 +1059,11 @@ class IndexPushOrderingITCase {
     }
 
     private static final class PhysicalRow {
-        private final String indexedValue;
-        private final int primaryKey;
         private final byte[] key;
-        private final int bucket;
 
-        private PhysicalRow(String indexedValue, int primaryKey, byte[] key, int bucket) {
-            this.indexedValue = indexedValue;
-            this.primaryKey = primaryKey;
+        private PhysicalRow(byte[] key) {
             this.key = key;
-            this.bucket = bucket;
         }
-
     }
 
     private static final class Target {

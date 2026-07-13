@@ -125,10 +125,7 @@ public class MemorySegmentLogInputStreamTest {
         assertCorruptBatch(
                 rawBatch(LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC, -1, magic), "negative");
         assertCorruptBatch(
-                rawBatch(
-                        LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC,
-                        Integer.MAX_VALUE,
-                        magic),
+                rawBatch(LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC, Integer.MAX_VALUE, magic),
                 "overflow");
         assertCorruptBatch(
                 rawBatch(

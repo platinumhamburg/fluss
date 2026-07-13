@@ -87,7 +87,8 @@ public class IndexReplicatorLifecycleTest {
         CountDownLatch consuming = new CountDownLatch(1);
         CountDownLatch releaseConsumption = new CountDownLatch(1);
         AtomicBoolean remoteClosed = new AtomicBoolean();
-        LogRecordBatch batch = batch(readContext, new BarrierIterator(consuming, releaseConsumption));
+        LogRecordBatch batch =
+                batch(readContext, new BarrierIterator(consuming, releaseConsumption));
         IndexSourceReader.SourceLog sourceLog = sourceLog(0L, 1L, emptyRecords());
         IndexSourceReader.RemoteFetcher remoteFetcher =
                 new IndexSourceReader.RemoteFetcher() {
@@ -212,7 +213,11 @@ public class IndexReplicatorLifecycleTest {
                         readContext);
         IndexAccumulator accumulator = new IndexAccumulator();
         IndexReplicator replicator =
-                replicator(reader, accumulator, readContext, Arrays.asList(spec("first"), spec("second")));
+                replicator(
+                        reader,
+                        accumulator,
+                        readContext,
+                        Arrays.asList(spec("first"), spec("second")));
 
         assertThat(replicator.poll()).isTrue();
         IndexWindow firstWindow = replicator.inFlightWindow("first");
@@ -252,8 +257,7 @@ public class IndexReplicatorLifecycleTest {
         when(batch.getRecordCount()).thenReturn(3);
         when(batch.records(readContext))
                 .thenAnswer(
-                        ignored ->
-                                CloseableIterator.wrap(Arrays.asList(first, gap).iterator()));
+                        ignored -> CloseableIterator.wrap(Arrays.asList(first, gap).iterator()));
         Queue<Runnable> queuedRemoteReads = new ArrayDeque<>();
         AtomicInteger fetchCount = new AtomicInteger();
         AtomicInteger closeCount = new AtomicInteger();
@@ -302,8 +306,7 @@ public class IndexReplicatorLifecycleTest {
             IndexSourceReader reader,
             IndexAccumulator accumulator,
             LogRecordReadContext readContext) {
-        return replicator(
-                reader, accumulator, readContext, Collections.singletonList(spec("idx")));
+        return replicator(reader, accumulator, readContext, Collections.singletonList(spec("idx")));
     }
 
     private static IndexReplicator replicator(
@@ -312,32 +315,27 @@ public class IndexReplicatorLifecycleTest {
             LogRecordReadContext readContext,
             java.util.List<IndexSpec> specs) {
         return IndexReplicator.forTesting(
-                reader,
-                specs,
-                accumulator,
-                readContext,
-                0L,
-                1024,
-                1024,
-                (sync, all) -> {});
+                reader, specs, accumulator, readContext, 0L, 1024, 1024, (sync, all) -> {});
     }
 
     private static IndexSpec spec(String name) {
         RowEncoder encoder =
-                RowEncoder.create(KvFormat.COMPACTED, new org.apache.fluss.types.DataType[] {DataTypes.BIGINT()});
-        return new IndexSpec(
-                        name,
-                        IndexVisibility.ASYNC,
-                        TARGET_BUCKET.getTableId(),
-                        1,
+                RowEncoder.create(
                         KvFormat.COMPACTED,
-                        new int[] {0},
-                        row -> {
-                            encoder.startNewRow();
-                            encoder.encodeField(0, row.getLong(0));
-                            BinaryRow value = encoder.finishRow();
-                            return new IndexSpec.IndexEntry(new byte[] {1}, value, 0);
-                        });
+                        new org.apache.fluss.types.DataType[] {DataTypes.BIGINT()});
+        return new IndexSpec(
+                name,
+                IndexVisibility.ASYNC,
+                TARGET_BUCKET.getTableId(),
+                1,
+                KvFormat.COMPACTED,
+                new int[] {0},
+                row -> {
+                    encoder.startNewRow();
+                    encoder.encodeField(0, row.getLong(0));
+                    BinaryRow value = encoder.finishRow();
+                    return new IndexSpec.IndexEntry(new byte[] {1}, value, 0);
+                });
     }
 
     private static IndexSourceReader.RemoteFetcher remoteFetcher(
@@ -361,10 +359,7 @@ public class IndexReplicatorLifecycleTest {
     }
 
     private static IndexSourceReader.SourceLog sourceLog(
-            long logStartOffset,
-            long localLogStartOffset,
-            long highWatermark,
-            LogRecords records) {
+            long logStartOffset, long localLogStartOffset, long highWatermark, LogRecords records) {
         return new IndexSourceReader.SourceLog() {
             @Override
             public TableBucket tableBucket() {
@@ -499,8 +494,7 @@ public class IndexReplicatorLifecycleTest {
         private final CountDownLatch releaseConsumption;
         private boolean consumed;
 
-        private BarrierIterator(
-                CountDownLatch consuming, CountDownLatch releaseConsumption) {
+        private BarrierIterator(CountDownLatch consuming, CountDownLatch releaseConsumption) {
             this.consuming = consuming;
             this.releaseConsumption = releaseConsumption;
         }

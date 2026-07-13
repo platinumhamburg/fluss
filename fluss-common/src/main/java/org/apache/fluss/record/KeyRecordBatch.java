@@ -64,8 +64,7 @@ public class KeyRecordBatch implements KvRecordBatch {
     public static KeyRecordBatch create(List<byte[]> keyBytes, TableInfo tableInfo) {
         TableConfig tableConfig = tableInfo.getTableConfig();
         KvFormat kvFormat = tableConfig.getKvFormat();
-        short kvFormatVersion =
-                (short) KeyFormatVersion.resolve(tableConfig.getKvFormatVersion());
+        short kvFormatVersion = (short) KeyFormatVersion.resolve(tableConfig.getKvFormatVersion());
         short schemaId = (short) tableInfo.getSchemaId();
         boolean defaultBucketKey = tableInfo.isDefaultBucketKey();
         return new KeyRecordBatch(

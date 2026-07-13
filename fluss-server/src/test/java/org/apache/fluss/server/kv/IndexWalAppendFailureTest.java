@@ -86,7 +86,8 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                     throw new TestBuildException();
                 });
 
-        assertThatThrownBy(() -> fixture.putDirect(mutation)).isInstanceOf(TestBuildException.class);
+        assertThatThrownBy(() -> fixture.putDirect(mutation))
+                .isInstanceOf(TestBuildException.class);
         assertThat(fixture.kv.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
         assertThat(fixture.kv.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount())
                 .isEqualTo(errorTruncationsBefore + 1L);

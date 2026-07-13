@@ -289,8 +289,7 @@ public class RemoteLogManager implements Closeable {
             @Nullable Long afterStartOffset,
             int maxSegmentsToExamine) {
         return remoteLogTablet(tableBucket)
-                .relevantRemoteLogSegmentPage(
-                        offset, afterStartOffset, maxSegmentsToExamine);
+                .relevantRemoteLogSegmentPage(offset, afterStartOffset, maxSegmentsToExamine);
     }
 
     private boolean remoteDisabled() {

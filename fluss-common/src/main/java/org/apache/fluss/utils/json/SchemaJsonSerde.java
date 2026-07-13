@@ -148,7 +148,8 @@ public class SchemaJsonSerde implements JsonSerializer<Schema>, JsonDeserializer
                 }
                 IndexVisibility visibility = IndexVisibility.SYNC;
                 if (indexNode.has(INDEX_VISIBILITY_NAME)) {
-                    visibility = IndexVisibility.valueOf(indexNode.get(INDEX_VISIBILITY_NAME).asText());
+                    visibility =
+                            IndexVisibility.valueOf(indexNode.get(INDEX_VISIBILITY_NAME).asText());
                 }
                 Integer bucketCount = null;
                 if (indexNode.has(INDEX_BUCKET_NUM_NAME)) {

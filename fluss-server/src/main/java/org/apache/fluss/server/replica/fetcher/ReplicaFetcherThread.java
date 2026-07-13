@@ -689,9 +689,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                 rlm.getRemoteLogStorage()
                         .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT)) {
             Files.copy(
-                    snapshotInput,
-                    tmpSnapshotFile.toPath(),
-                    StandardCopyOption.REPLACE_EXISTING);
+                    snapshotInput, tmpSnapshotFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
             snapshotFileMover.move(tmpSnapshotFile.toPath(), snapshotFile.toPath());
         } catch (RemoteStorageException | IOException | RuntimeException | Error failure) {
             try {
@@ -709,8 +707,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
 
     @FunctionalInterface
     interface RemoteWriterStateRecovery {
-        void recover(
-                Replica replica, RemoteLogFetchInfo remoteLogFetchInfo, long nextFetchOffset)
+        void recover(Replica replica, RemoteLogFetchInfo remoteLogFetchInfo, long nextFetchOffset)
                 throws Exception;
     }
 

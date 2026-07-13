@@ -22,7 +22,7 @@ import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.lookup.SecondaryIndexLookuper;
 import org.apache.fluss.client.table.writer.UpsertWriter;
-import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -36,6 +36,7 @@ import org.junit.jupiter.api.Test;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.Collections;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
@@ -142,19 +143,16 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
                         .column("a", DataTypes.INT())
                         .column("b", DataTypes.STRING())
                         .primaryKey("a")
-                        .index(INDEX_NAME, "b")
+                        .index(
+                                INDEX_NAME,
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                visibility == null ? IndexVisibility.SYNC : visibility,
+                                3)
                         .build();
-        TableDescriptor.Builder builder =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(3, "a")
-                        // Pin the Index Table bucket count to 1 to keep
-                        // resolveIndexBucketCount aligned with the single main bucket.
-                        .property(ConfigOptions.secondaryIndexBucketNumKey(INDEX_NAME), "3");
-        if (visibility != null) {
-            builder.property(ConfigOptions.INDEX_VISIBILITY, visibility);
-        }
-        createTable(mainPath, builder.build(), /* ignoreIfExists */ true);
+        TableDescriptor descriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
+        createTable(mainPath, descriptor, /* ignoreIfExists */ true);
     }
 
     private static TablePath indexTablePathFor(TablePath mainPath) {

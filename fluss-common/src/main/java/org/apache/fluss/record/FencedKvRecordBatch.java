@@ -199,8 +199,7 @@ public class FencedKvRecordBatch implements KvRecordBatch {
                     "Fenced KV batch has negative record count " + recordCount);
         }
         int payloadSize = sizeInBytes() - RECORD_BATCH_HEADER_SIZE;
-        long minimumPayloadSize =
-                (long) recordCount * (DefaultKvRecord.LENGTH_LENGTH + 1L);
+        long minimumPayloadSize = (long) recordCount * (DefaultKvRecord.LENGTH_LENGTH + 1L);
         if (minimumPayloadSize > payloadSize) {
             throw new CorruptMessageException(
                     "Fenced KV batch record count "
@@ -216,16 +215,13 @@ public class FencedKvRecordBatch implements KvRecordBatch {
 
     private int validateRecordBounds(int recordPosition, int batchEnd) {
         if (recordPosition > batchEnd - DefaultKvRecord.LENGTH_LENGTH) {
-            throw new CorruptMessageException(
-                    "KV record length crosses declared batch end");
+            throw new CorruptMessageException("KV record length crosses declared batch end");
         }
         int recordBodySize = segment.getInt(recordPosition);
         if (recordBodySize < 1) {
-            throw new CorruptMessageException(
-                    "KV record has invalid body size " + recordBodySize);
+            throw new CorruptMessageException("KV record has invalid body size " + recordBodySize);
         }
-        long recordEnd =
-                (long) recordPosition + DefaultKvRecord.LENGTH_LENGTH + recordBodySize;
+        long recordEnd = (long) recordPosition + DefaultKvRecord.LENGTH_LENGTH + recordBodySize;
         if (recordEnd > batchEnd) {
             throw new CorruptMessageException("KV record crosses declared batch end");
         }

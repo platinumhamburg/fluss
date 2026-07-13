@@ -49,9 +49,9 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * <p>Recheck: after Hop 2 returns, every surviving main row is re-validated against the user's
  * original {@code lookupKey}. Index columns are extracted from both sides using positional {@link
  * InternalRow.FieldGetter}s and compared via {@link ValueEquality#contentEquals(Object, Object)}.
- * Any row whose current {@code idxCols} disagree with the lookup key is discarded as a stale
- * index pointer (covers both the async-visibility window and the natural lag during
- * partition-tombstone cleanup).
+ * Any row whose current {@code idxCols} disagree with the lookup key is discarded as a stale index
+ * pointer (covers both the async-visibility window and the natural lag during partition-tombstone
+ * cleanup).
  */
 @Internal
 @ThreadSafe

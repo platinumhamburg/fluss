@@ -108,10 +108,13 @@ class IndexSourceReaderRemoteLogFetcherTest extends RemoteLogTestBase {
                         mock(LogRecordReadContext.class));
 
         try (IndexSourceReader.ReadResult result = reader.read(0L, 20L, 15).join()) {
-            assertThat(result.batches()).singleElement().satisfies(batch -> {
-                assertThat(batch.baseLogOffset()).isZero();
-                assertThat(batch.nextLogOffset()).isEqualTo(10L);
-            });
+            assertThat(result.batches())
+                    .singleElement()
+                    .satisfies(
+                            batch -> {
+                                assertThat(batch.baseLogOffset()).isZero();
+                                assertThat(batch.nextLogOffset()).isEqualTo(10L);
+                            });
             assertThat(result.nextOffset()).isEqualTo(10L);
         }
         assertThat(downloads).hasValue(1);
@@ -181,10 +184,13 @@ class IndexSourceReaderRemoteLogFetcherTest extends RemoteLogTestBase {
                         mock(LogRecordReadContext.class));
 
         IndexSourceReader.ReadResult handoff = reader.read(0L, 20L, 15).join();
-        assertThat(handoff.batches()).singleElement().satisfies(batch -> {
-            assertThat(batch.baseLogOffset()).isZero();
-            assertThat(batch.nextLogOffset()).isEqualTo(10L);
-        });
+        assertThat(handoff.batches())
+                .singleElement()
+                .satisfies(
+                        batch -> {
+                            assertThat(batch.baseLogOffset()).isZero();
+                            assertThat(batch.nextLogOffset()).isEqualTo(10L);
+                        });
         assertThat(handoff.nextOffset()).isEqualTo(10L);
         assertThat(channel.isOpen()).isTrue();
         assertThat(Files.exists(logTablet.getLogDir().toPath().resolve("tmp"))).isTrue();
@@ -234,10 +240,7 @@ class IndexSourceReaderRemoteLogFetcherTest extends RemoteLogTestBase {
 
             @Override
             public FetchDataInfo read(
-                    long offset,
-                    int maxBytes,
-                    FetchIsolation isolation,
-                    boolean minOneMessage) {
+                    long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage) {
                 throw new AssertionError("byte-limited remote prefix must not read local WAL");
             }
         };
@@ -281,10 +284,7 @@ class IndexSourceReaderRemoteLogFetcherTest extends RemoteLogTestBase {
 
             @Override
             public FetchDataInfo read(
-                    long offset,
-                    int maxBytes,
-                    FetchIsolation isolation,
-                    boolean minOneMessage) {
+                    long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage) {
                 localReads.incrementAndGet();
                 return new FetchDataInfo(localRecords);
             }
@@ -299,8 +299,8 @@ class IndexSourceReaderRemoteLogFetcherTest extends RemoteLogTestBase {
             RemoteLogFetcher fetcher, Runnable onClose) {
         return new IndexSourceReader.RemoteFetcher() {
             @Override
-            public Iterable<LogRecordBatch> fetch(
-                    long startOffset, long localLogStartOffset) throws Exception {
+            public Iterable<LogRecordBatch> fetch(long startOffset, long localLogStartOffset)
+                    throws Exception {
                 return fetcher.fetch(startOffset, localLogStartOffset);
             }
 

@@ -141,7 +141,8 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     public CompletableFuture<Collection<RowData>> asyncLookup(RowData keyRow) {
         RowData normalizedKeyRow = lookupNormalizer.normalizeLookupKey(keyRow);
         RemainingFilter remainingFilter = lookupNormalizer.createRemainingFilter(keyRow);
-        // Bind a wrapper to this call. Multiple async lookups can be in flight at the same time, so a
+        // Bind a wrapper to this call. Multiple async lookups can be in flight at the same time, so
+        // a
         // shared mutable wrapper would let a later call overwrite an earlier call's key data.
         InternalRow flussKeyRow = new FlinkAsFlussRow(normalizedKeyRow);
 

@@ -52,8 +52,8 @@ import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrReqForBucket;
 import org.apache.fluss.rpc.messages.PbPrefixLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
-import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
+import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.messages.ScanKvRequest;
 import org.apache.fluss.rpc.messages.ScanKvResponse;
@@ -136,16 +136,13 @@ public class TabletServiceITCase {
     @Test
     void testApiV1RejectsTruncatedV1BatchBeforeHeaderDecode() {
         byte[] prefix = {0, 0, 0, 0, 1};
-        PutKvRequest request =
-                new PutKvRequest().setTableId(1L).setAcks(-1).setTimeoutMs(1000);
+        PutKvRequest request = new PutKvRequest().setTableId(1L).setAcks(-1).setTimeoutMs(1000);
         request.addBucketsReq()
                 .setBucketId(0)
                 .setRecordsBytesView(
-                        new MemorySegmentBytesView(
-                                MemorySegment.wrap(prefix), 0, prefix.length));
+                        new MemorySegmentBytesView(MemorySegment.wrap(prefix), 0, prefix.length));
 
-        assertThatThrownBy(
-                        () -> ServerRpcMessageUtils.getPutKvData(request, (short) 1))
+        assertThatThrownBy(() -> ServerRpcMessageUtils.getPutKvData(request, (short) 1))
                 .isInstanceOf(UnsupportedVersionException.class);
     }
 

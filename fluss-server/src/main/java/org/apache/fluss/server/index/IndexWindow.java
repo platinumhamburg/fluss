@@ -75,8 +75,8 @@ final class IndexWindow {
     }
 
     /**
-     * Atomically fail this window and transfer ownership of its registered batches to the caller.
-     * A null result means another terminal transition won.
+     * Atomically fail this window and transfer ownership of its registered batches to the caller. A
+     * null result means another terminal transition won.
      */
     @Nullable
     List<IndexBatch> tryFailAndDrain(Throwable failure) {
@@ -130,5 +130,4 @@ final class IndexWindow {
             owner.onWindowComplete(indexName, windowEndOffset);
         }
     }
-
 }

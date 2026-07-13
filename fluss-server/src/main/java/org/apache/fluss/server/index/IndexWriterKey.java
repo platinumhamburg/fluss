@@ -69,9 +69,7 @@ public final class IndexWriterKey {
         }
 
         public OptionalLong getPartitionId() {
-            return partitionId == null
-                    ? OptionalLong.empty()
-                    : OptionalLong.of(partitionId);
+            return partitionId == null ? OptionalLong.empty() : OptionalLong.of(partitionId);
         }
 
         public int getBucketId() {

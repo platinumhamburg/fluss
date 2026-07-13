@@ -181,9 +181,7 @@ class ArrowWalBuilderTest {
 
         WalBuilder compactedBuilder =
                 CompactedWalBuilder.fencedBuilder(
-                        DEFAULT_SCHEMA_ID,
-                        DATA1_ROW_TYPE,
-                        new TestingMemorySegmentPool(1024));
+                        DEFAULT_SCHEMA_ID, DATA1_ROW_TYPE, new TestingMemorySegmentPool(1024));
         assertFencedBatch(compactedBuilder, writerKey, sequence);
 
         WalBuilder indexBuilder =
@@ -244,9 +242,7 @@ class ArrowWalBuilderTest {
 
         WalBuilder compactedBuilder =
                 CompactedWalBuilder.fencedBuilder(
-                        DEFAULT_SCHEMA_ID,
-                        DATA1_ROW_TYPE,
-                        new TestingMemorySegmentPool(1024));
+                        DEFAULT_SCHEMA_ID, DATA1_ROW_TYPE, new TestingMemorySegmentPool(1024));
         compactedBuilder.append(ChangeType.UPDATE_AFTER, row(2, "compacted"));
         MemoryLogRecords compactedRecords = buildFenced(compactedBuilder, writerKey, sequence);
         try (LogRecordReadContext context =
@@ -302,8 +298,8 @@ class ArrowWalBuilderTest {
         assertThat(records.hasNext()).isFalse();
     }
 
-    private static void assertFencedBatch(
-            WalBuilder builder, WriterKey writerKey, long sequence) throws Exception {
+    private static void assertFencedBatch(WalBuilder builder, WriterKey writerKey, long sequence)
+            throws Exception {
         builder.setFencedWriterState(writerKey, sequence);
         LogRecordBatch batch = builder.build().batches().iterator().next();
         assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);

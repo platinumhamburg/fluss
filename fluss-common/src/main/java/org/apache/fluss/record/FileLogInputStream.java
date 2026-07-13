@@ -93,8 +93,7 @@ public class FileLogInputStream
         }
         long batchSize = (long) LOG_OVERHEAD + length;
         if (batchSize > Integer.MAX_VALUE) {
-            throw new CorruptMessageException(
-                    "Record batch declared size overflow: " + batchSize);
+            throw new CorruptMessageException("Record batch declared size overflow: " + batchSize);
         }
         if (batchSize < minimumHeaderSize) {
             throw new CorruptMessageException(
