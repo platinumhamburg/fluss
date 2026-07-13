@@ -96,6 +96,7 @@ public final class IndexReplicator implements AutoCloseable {
     private volatile long emptyIndexPushedOffset;
 
     private final AtomicBoolean closed;
+    private final AtomicBoolean readContextClosed;
     private final AtomicReference<Throwable> terminalFailure;
     private final ReentrantLock lifecycleLock;
 
@@ -195,6 +196,7 @@ public final class IndexReplicator implements AutoCloseable {
         this.maxWindowBytes = maxWindowBytes;
         this.preferredMaxRequestBytes = preferredMaxRequestBytes;
         this.closed = new AtomicBoolean(false);
+        this.readContextClosed = new AtomicBoolean(false);
         this.terminalFailure = new AtomicReference<>();
         this.lifecycleLock = new ReentrantLock();
         this.onProgress = onProgress;
@@ -501,16 +503,24 @@ public final class IndexReplicator implements AutoCloseable {
      * owning replica, and wakes the read-pool worker so it can poll the next ready window.
      */
     void onWindowComplete(String indexName, long windowEndOffset) {
-        IndexProgressState state = indexStatesByName.get(indexName);
-        if (state == null) {
-            if (indexStates.isEmpty() && windowEndOffset > emptyIndexPushedOffset) {
-                emptyIndexPushedOffset = windowEndOffset;
+        lifecycleLock.lock();
+        try {
+            if (closed.get() || terminalFailure.get() != null) {
+                return;
             }
-        } else {
-            advanceIndexState(state, windowEndOffset);
-            state.inFlightWindow = null;
+            IndexProgressState state = indexStatesByName.get(indexName);
+            if (state == null) {
+                if (indexStates.isEmpty() && windowEndOffset > emptyIndexPushedOffset) {
+                    emptyIndexPushedOffset = windowEndOffset;
+                }
+            } else {
+                advanceIndexState(state, windowEndOffset);
+                state.inFlightWindow = null;
+            }
+            notifyProgress();
+        } finally {
+            lifecycleLock.unlock();
         }
-        notifyProgress();
         Runnable signal = this.wakeupSignal;
         if (signal != null) {
             signal.run();
@@ -541,13 +551,30 @@ public final class IndexReplicator implements AutoCloseable {
         if (!terminalFailure.compareAndSet(null, failure)) {
             return;
         }
-        retirePendingReadLocked();
-        sourceReader.close();
+        Throwable cleanupFailure = cleanupOwnedResourcesLocked();
+        if (cleanupFailure != null && cleanupFailure != failure) {
+            failure.addSuppressed(cleanupFailure);
+        }
         LOG.error(
                 "Index replication for source bucket {} failed terminally at pushed offset {}",
                 sourceReader.tableBucket(),
                 getAllIndexPushedOffset(),
                 failure);
+    }
+
+    private void retireOwnedBatchesLocked() {
+        for (IndexProgressState state : indexStates) {
+            IndexWindow window = state.inFlightWindow;
+            state.inFlightWindow = null;
+            if (window == null) {
+                continue;
+            }
+            List<IndexBatch> drained = window.tryRetireAndDrain();
+            if (drained != null) {
+                accumulator.dropBatches(drained);
+            }
+        }
+        accumulator.dropForReplicator(this);
     }
 
     @VisibleForTesting
@@ -728,14 +755,40 @@ public final class IndexReplicator implements AutoCloseable {
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
-            retirePendingReadLocked();
-            sourceReader.close();
-            if (readContext != null) {
-                readContext.close();
+            Throwable cleanupFailure = cleanupOwnedResourcesLocked();
+            if (cleanupFailure != null) {
+                LOG.warn(
+                        "Failed to completely close index replication resources for source bucket {}",
+                        sourceReader.tableBucket(),
+                        cleanupFailure);
             }
         } finally {
             lifecycleLock.unlock();
         }
+    }
+
+    @Nullable
+    private Throwable cleanupOwnedResourcesLocked() {
+        Throwable failure = null;
+        failure = runCleanupStep(failure, this::retirePendingReadLocked);
+        failure = runCleanupStep(failure, this::retireOwnedBatchesLocked);
+        failure = runCleanupStep(failure, sourceReader::close);
+        return runCleanupStep(failure, this::closeReadContext);
+    }
+
+    @Nullable
+    private static Throwable runCleanupStep(@Nullable Throwable previousFailure, Runnable step) {
+        try {
+            step.run();
+        } catch (Throwable failure) {
+            if (previousFailure == null) {
+                return failure;
+            }
+            if (previousFailure != failure) {
+                previousFailure.addSuppressed(failure);
+            }
+        }
+        return previousFailure;
     }
 
     private void retirePendingReadLocked() {
@@ -757,8 +810,14 @@ public final class IndexReplicator implements AutoCloseable {
         }
     }
 
-    boolean isClosed() {
+    public boolean isClosed() {
         return closed.get();
+    }
+
+    private void closeReadContext() {
+        if (readContext != null && readContextClosed.compareAndSet(false, true)) {
+            readContext.close();
+        }
     }
 
     @VisibleForTesting

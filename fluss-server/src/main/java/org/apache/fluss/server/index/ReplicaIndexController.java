@@ -125,6 +125,7 @@ public final class ReplicaIndexController {
      * discriminator cannot be initialized after {@code Replica#createKv()}.
      */
     public void prepareForLeader() {
+        stopIndexReplicator();
         this.tombstoneDiscriminator =
                 TombstonedPartitionDiscriminator.forIndexTable(tableInfo, metadataCache);
     }

@@ -183,32 +183,47 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
     }
 
     @Test
-    void testStaleDirectoriesFromUncleanShutdownAreCleanedUp() throws Exception {
+    void testClosingFetcherDoesNotDeleteAnotherRecoveryDirectory() throws Exception {
         TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
         makeLogTableAsLeader(tb, false);
         Replica replica = replicaManager.getReplicaOrException(tb);
         File logTabletDir = replica.getLogTablet().getLogDir();
 
         Path tmpDir = logTabletDir.toPath().resolve("tmp");
-        Files.createDirectories(tmpDir);
-
-        // Simulate stale directories left behind by a previous unclean shutdown.
-        Path staleDir1 = Files.createDirectories(tmpDir.resolve("remote-log-recovery-stale-1"));
-        Path staleDir2 = Files.createDirectories(tmpDir.resolve("remote-log-recovery-stale-2"));
-        // Create a file inside one stale dir to simulate a partially downloaded segment.
-        Files.createFile(staleDir1.resolve("00000000000000000000.log"));
-
-        assertThat(Files.exists(staleDir1)).isTrue();
-        assertThat(Files.exists(staleDir2)).isTrue();
-
-        // Simulate next startup: creating and closing a new RemoteLogFetcher should
-        // clean up the entire tmp directory including all stale recovery directories.
         RemoteLogFetcher fetcher = new RemoteLogFetcher(remoteLogManager, tb, logTabletDir);
+        Path ownDir = Files.createDirectories(fetcher.getTempDir());
+        Path concurrentDir =
+                Files.createDirectories(tmpDir.resolve("remote-log-recovery-concurrent"));
+        Path concurrentFile = Files.createFile(concurrentDir.resolve("segment.log"));
+
         fetcher.close();
 
-        assertThat(Files.exists(staleDir1)).isFalse();
-        assertThat(Files.exists(staleDir2)).isFalse();
-        assertThat(Files.exists(tmpDir)).isFalse();
+        assertThat(ownDir).doesNotExist();
+        assertThat(concurrentDir).exists();
+        assertThat(concurrentFile).exists();
+    }
+
+    @Test
+    void testNewFetcherScavengesAbandonedDirectoryButPreservesActiveRecovery() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, false);
+        File logTabletDir = replicaManager.getReplicaOrException(tb).getLogTablet().getLogDir();
+        Path tmpDir = logTabletDir.toPath().resolve("tmp");
+
+        try (RemoteLogFetcher active = new RemoteLogFetcher(remoteLogManager, tb, logTabletDir)) {
+            Path activeDir = Files.createDirectories(active.getTempDir());
+            Path activeFile = Files.createFile(activeDir.resolve("active.log"));
+            Path abandonedDir =
+                    Files.createDirectories(tmpDir.resolve("remote-log-recovery-abandoned"));
+            Files.createFile(abandonedDir.resolve("stale.log"));
+
+            try (RemoteLogFetcher ignored =
+                    new RemoteLogFetcher(remoteLogManager, tb, logTabletDir)) {
+                assertThat(abandonedDir).doesNotExist();
+                assertThat(activeDir).exists();
+                assertThat(activeFile).exists();
+            }
+        }
     }
 
     @Test

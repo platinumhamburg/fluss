@@ -132,6 +132,18 @@ public class IndexWindowTest {
     }
 
     @Test
+    void completionAfterOwnerCloseCannotAdvanceProgress() {
+        AtomicLong advanced = new AtomicLong(-1L);
+        IndexReplicator replicator = newReplicator(10L, (sync, all) -> advanced.set(sync));
+        replicator.close();
+
+        replicator.onWindowComplete("idx", 42L);
+
+        assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(10L);
+        assertThat(advanced).hasValue(-1L);
+    }
+
+    @Test
     void terminalBatchFailurePreventsWindowFromAdvancing() {
         IndexReplicator replicator = newReplicator(10L, (sync, all) -> {});
         IndexWindow window = new IndexWindow("idx", 42L, 1, replicator);

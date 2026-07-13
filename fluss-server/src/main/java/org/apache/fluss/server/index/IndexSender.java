@@ -154,7 +154,6 @@ public final class IndexSender implements AutoCloseable {
 
     private final ConcurrentMap<TableBucket, IndexBatch> inFlightBatches =
             MapUtils.newConcurrentMap();
-    private final ConcurrentMap<TableBucket, Integer> resolvedLeaders = MapUtils.newConcurrentMap();
     private final ReentrantLock lifecycleLock = new ReentrantLock();
     private final Condition lifecycleDrained = lifecycleLock.newCondition();
     private final Map<Integer, TargetContext> targetsByServer = new HashMap<>();
@@ -551,6 +550,10 @@ public final class IndexSender implements AutoCloseable {
                     });
         }
 
+        int queuedBucketCountForTesting() {
+            return inLock(lock, readyBuckets::size);
+        }
+
         @Override
         public void run() {
             super.run();
@@ -658,16 +661,6 @@ public final class IndexSender implements AutoCloseable {
                         leaderResolver.resolveLeader(tb.getTableId(), tb.getBucket());
                 if (leaderOpt.isPresent()) {
                     int leader = leaderOpt.getAsInt();
-                    lifecycleLock.lock();
-                    try {
-                        Integer previous = resolvedLeaders.put(tb, leader);
-                        if (previous != null && previous != leader) {
-                            targetsByServer.remove(previous);
-                            nextTargetGeneration++;
-                        }
-                    } finally {
-                        lifecycleLock.unlock();
-                    }
                     byServer.computeIfAbsent(leader, k -> new ArrayList<>()).add(batch);
                 } else {
                     reEnqueueOwnedBatch(batch);
@@ -1387,15 +1380,20 @@ public final class IndexSender implements AutoCloseable {
     }
 
     private void relinquishDroppedBatch(IndexBatch batch) {
+        TableBucket bucket = batch.targetBucket();
+        boolean unmuted = false;
         lifecycleLock.lock();
         try {
             ownedBatches.remove(batch);
-            TableBucket bucket = batch.targetBucket();
             if (inFlightBatches.remove(bucket, batch)) {
                 inFlightSinceMs.remove(bucket);
+                unmuted = true;
             }
         } finally {
             lifecycleLock.unlock();
+        }
+        if (unmuted && accumulator.hasPending(bucket)) {
+            enqueueReadyBucket(bucket);
         }
     }
 
@@ -1540,6 +1538,15 @@ public final class IndexSender implements AutoCloseable {
 
     public int inFlightRequestCount() {
         return inFlightSinceMs.size();
+    }
+
+    @VisibleForTesting
+    int queuedBucketCountForTesting() {
+        int count = 0;
+        for (SenderWorker worker : workers) {
+            count += worker.queuedBucketCountForTesting();
+        }
+        return count;
     }
 
     @VisibleForTesting

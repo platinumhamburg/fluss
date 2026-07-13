@@ -180,8 +180,9 @@ public class IndexReplicatorLifecycleTest {
         }
         assertThat(poll.get(10, TimeUnit.SECONDS)).isTrue();
         close.get(10, TimeUnit.SECONDS);
-        assertThat(accumulator.dropForReplicator(replicator)).isOne();
+        assertThat(accumulator.dropForReplicator(replicator)).isZero();
         assertThat(accumulator.hasPending(TARGET_BUCKET)).isFalse();
+        assertThat(accumulator.pendingBytes(replicator)).isZero();
         assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
 
@@ -243,6 +244,156 @@ public class IndexReplicatorLifecycleTest {
         assertThat(replicator.hasPendingRead()).isFalse();
         assertThat(replicator.poll()).isFalse();
         replicator.close();
+    }
+
+    @Test
+    void terminalCleanupContinuesWhenCompletedRemoteReadCloseFails() throws Exception {
+        LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        LogRecordBatch batch =
+                batch(
+                        readContext,
+                        CloseableIterator.wrap(Collections.singletonList(record()).iterator()));
+        Queue<Runnable> queuedRemoteReads = new ArrayDeque<>();
+        AtomicInteger openedFetchers = new AtomicInteger();
+        AtomicInteger closedFetchers = new AtomicInteger();
+        IndexSourceReader reader =
+                new IndexSourceReader(
+                        sourceLog(0L, 1L, emptyRecords()),
+                        () -> {
+                            if (openedFetchers.getAndIncrement() == 0) {
+                                return remoteFetcher(batch, closedFetchers);
+                            }
+                            return new IndexSourceReader.RemoteFetcher() {
+                                @Override
+                                public Iterable<LogRecordBatch> fetch(
+                                        long startOffset, long localLogStartOffset) {
+                                    return Collections.singletonList(batch);
+                                }
+
+                                @Override
+                                public IndexSourceReader.RemoteRead fetchBounded(
+                                        long startOffset, long localLogStartOffset, int maxBytes) {
+                                    return new IndexSourceReader.RemoteRead() {
+                                        @Override
+                                        public boolean stoppedByByteLimit() {
+                                            return false;
+                                        }
+
+                                        @Override
+                                        public java.util.Iterator<LogRecordBatch> iterator() {
+                                            return Collections.singletonList(batch).iterator();
+                                        }
+
+                                        @Override
+                                        public void close() {
+                                            throw new RuntimeException("remote read close failed");
+                                        }
+                                    };
+                                }
+
+                                @Override
+                                public void close() {
+                                    closedFetchers.incrementAndGet();
+                                }
+                            };
+                        },
+                        command -> {
+                            if (openedFetchers.get() == 0) {
+                                command.run();
+                            } else {
+                                queuedRemoteReads.add(command);
+                            }
+                        },
+                        readContext);
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator replicator =
+                replicator(
+                        reader,
+                        accumulator,
+                        readContext,
+                        Arrays.asList(spec("first"), spec("second")));
+
+        assertThat(replicator.poll()).isTrue();
+        IndexWindow firstWindow = replicator.inFlightWindow("first");
+        assertThat(firstWindow).isNotNull();
+        assertThat(queuedRemoteReads).hasSize(1);
+        queuedRemoteReads.remove().run();
+        assertThat(replicator.hasPendingRead()).isTrue();
+
+        RuntimeException failure = new RuntimeException("terminal sender failure");
+        firstWindow.tryFailAndDrain(failure);
+
+        assertThat(replicator.terminalFailure()).isSameAs(failure);
+        assertThat(failure.getSuppressed())
+                .singleElement()
+                .satisfies(
+                        cleanupFailure -> {
+                            assertThat(cleanupFailure)
+                                    .hasMessageContaining("Failed to close index source read");
+                            assertThat(cleanupFailure.getCause())
+                                    .hasMessageContaining("remote read close failed");
+                        });
+        assertThat(replicator.hasPendingRead()).isFalse();
+        assertThat(replicator.inFlightWindow("first")).isNull();
+        assertThat(accumulator.pendingBytes(replicator)).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(openedFetchers).hasValue(2);
+        assertThat(closedFetchers).hasValue(2);
+        verify(readContext, times(1)).close();
+        assertThatThrownBy(() -> reader.read(0L, 1L, 1024))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("closed");
+        replicator.close();
+        verify(readContext, times(1)).close();
+    }
+
+    @Test
+    void terminalWindowFailureRetiresAllPublishedWindowsForOwner() throws Exception {
+        LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        LogRecordBatch batch = mock(LogRecordBatch.class);
+        when(batch.baseLogOffset()).thenReturn(0L);
+        when(batch.nextLogOffset()).thenReturn(1L);
+        when(batch.sizeInBytes()).thenReturn(1);
+        when(batch.getRecordCount()).thenReturn(1);
+        when(batch.records(readContext))
+                .thenAnswer(
+                        ignored ->
+                                CloseableIterator.wrap(
+                                        Collections.singletonList(record()).iterator()));
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator replicator =
+                replicator(
+                        new IndexSourceReader(
+                                sourceLog(0L, 0L, records(batch)),
+                                null,
+                                Runnable::run,
+                                readContext),
+                        accumulator,
+                        readContext,
+                        Arrays.asList(spec("first"), spec("second")));
+
+        assertThat(replicator.poll()).isTrue();
+        IndexWindow first = replicator.inFlightWindow("first");
+        IndexWindow second = replicator.inFlightWindow("second");
+        assertThat(first).isNotNull();
+        assertThat(second).isNotNull();
+        assertThat(accumulator.pendingBytes(replicator)).isPositive();
+
+        RuntimeException failure = new RuntimeException("terminal sender failure");
+        for (IndexBatch drained : first.tryFailAndDrain(failure)) {
+            accumulator.remove(drained);
+            accumulator.release(drained);
+        }
+
+        assertThat(replicator.terminalFailure()).isSameAs(failure);
+        assertThat(replicator.inFlightWindow("first")).isNull();
+        assertThat(replicator.inFlightWindow("second")).isNull();
+        assertThat(second.isActive()).isFalse();
+        assertThat(accumulator.pendingBytes(replicator)).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
+        verify(readContext, times(1)).close();
+        replicator.close();
+        verify(readContext, times(1)).close();
     }
 
     @Test

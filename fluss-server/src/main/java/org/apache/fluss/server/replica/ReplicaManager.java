@@ -310,7 +310,9 @@ public class ReplicaManager implements ServerReconfigurable {
         this.indexReplicatorPool =
                 new IndexReplicatorPool(
                         conf.getInt(ConfigOptions.INDEX_REPLICATION_READER_NUMBER),
-                        (int) conf.get(ConfigOptions.INDEX_REPLICATION_MAX_WINDOW_BYTES).getBytes(),
+                        checkedIndexWindowBytes(
+                                conf.get(ConfigOptions.INDEX_REPLICATION_MAX_WINDOW_BYTES)
+                                        .getBytes()),
                         conf.get(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES).getBytes(),
                         conf.get(ConfigOptions.INDEX_REPLICATION_BACKOFF_INTERVAL).toMillis());
         this.indexSender =
@@ -1804,17 +1806,32 @@ public class ReplicaManager implements ServerReconfigurable {
     }
 
     /**
-     * Returns {@code true} when the bucket's leader replica is local and requires SYNC index
-     * visibility (its PutKv ack must wait for secondary-index mutations to be applied). Returns
-     * {@code false} if the replica is not available locally, in which case index gating is skipped
-     * and only the usual ISR replication rules apply.
+     * Returns {@code true} when the bucket's leader replica requires SYNC index visibility (its
+     * PutKv ack must wait for secondary-index mutations to be applied). If the local replica
+     * disappears during acknowledgement, conservatively retains the gate so delayed completion
+     * re-resolves the replica and reports the leadership error instead of acknowledging early.
      */
-    private boolean requiresSyncIndexVisibility(TableBucket tableBucket) {
+    boolean requiresSyncIndexVisibility(TableBucket tableBucket) {
         try {
             return getReplicaOrException(tableBucket).requiresSyncIndexVisibility();
         } catch (Exception e) {
-            return false;
+            LOG.warn(
+                    "Replica {} disappeared before write acknowledgement; applying conservative index visibility gating",
+                    tableBucket,
+                    e);
+            return true;
         }
+    }
+
+    static int checkedIndexWindowBytes(long bytes) {
+        if (bytes <= 0L || bytes > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    ConfigOptions.INDEX_REPLICATION_MAX_WINDOW_BYTES.key()
+                            + " must fit in a positive 32-bit integer, but was "
+                            + bytes
+                            + " bytes");
+        }
+        return (int) bytes;
     }
 
     private void maybeAddDelayedFetchLog(

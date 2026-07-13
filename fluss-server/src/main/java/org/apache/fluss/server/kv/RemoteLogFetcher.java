@@ -39,12 +39,17 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.apache.fluss.utils.FileUtils.deleteDirectoryQuietly;
@@ -73,6 +78,8 @@ public class RemoteLogFetcher implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(RemoteLogFetcher.class);
 
     private static final String REMOTE_LOG_RECOVERY_DIR_PREFIX = "remote-log-recovery-";
+    private static final Object TEMP_DIR_OWNERSHIP_LOCK = new Object();
+    private static final Set<Path> ACTIVE_TEMP_DIRS = new HashSet<>();
     private static final int MAX_SEGMENT_METADATA_PER_PAGE = 16;
 
     /** Defines whether batch views outlive a segment transition. */
@@ -117,23 +124,31 @@ public class RemoteLogFetcher implements Closeable {
                         .toPath()
                         .resolve("tmp")
                         .resolve(REMOTE_LOG_RECOVERY_DIR_PREFIX + UUID.randomUUID()),
-                consumerMode);
+                consumerMode,
+                true);
     }
 
     @VisibleForTesting
     RemoteLogFetcher(RemoteLogManager remoteLogManager, TableBucket tableBucket, Path tempDir) {
-        this(remoteLogManager, tableBucket, tempDir, ConsumerMode.KV_STREAMING);
+        this(remoteLogManager, tableBucket, tempDir, ConsumerMode.KV_STREAMING, false);
     }
 
     private RemoteLogFetcher(
             RemoteLogManager remoteLogManager,
             TableBucket tableBucket,
             Path tempDir,
-            ConsumerMode consumerMode) {
+            ConsumerMode consumerMode,
+            boolean scavengeAbandonedDirectories) {
         this.remoteLogManager = remoteLogManager;
         this.tableBucket = tableBucket;
-        this.tempDir = tempDir;
+        this.tempDir = tempDir.toAbsolutePath().normalize();
         this.consumerMode = consumerMode;
+        synchronized (TEMP_DIR_OWNERSHIP_LOCK) {
+            if (scavengeAbandonedDirectories) {
+                scavengeAbandonedDirectories(this.tempDir.getParent());
+            }
+            ACTIVE_TEMP_DIRS.add(this.tempDir);
+        }
     }
 
     /**
@@ -223,22 +238,57 @@ public class RemoteLogFetcher implements Closeable {
             cached = cachedSegment;
             cachedSegment = null;
         }
-        if (iterator != null) {
-            iterator.close();
+        try {
+            if (iterator != null) {
+                iterator.close();
+            }
+        } finally {
+            try {
+                if (cached != null) {
+                    IOUtils.closeQuietly(cached.records, "FileLogRecords");
+                }
+                cleanupTempDirectory();
+            } finally {
+                synchronized (TEMP_DIR_OWNERSHIP_LOCK) {
+                    ACTIVE_TEMP_DIRS.remove(tempDir);
+                }
+            }
         }
-        if (cached != null) {
-            IOUtils.closeQuietly(cached.records, "FileLogRecords");
+    }
+
+    private static void scavengeAbandonedDirectories(@Nullable Path parent) {
+        if (parent == null || !Files.isDirectory(parent)) {
+            return;
         }
-        cleanupTempDirectory();
+        try (DirectoryStream<Path> directories =
+                Files.newDirectoryStream(parent, REMOTE_LOG_RECOVERY_DIR_PREFIX + "*")) {
+            for (Path directory : directories) {
+                Path normalized = directory.toAbsolutePath().normalize();
+                if (!ACTIVE_TEMP_DIRS.contains(normalized)
+                        && Files.isDirectory(normalized, LinkOption.NOFOLLOW_LINKS)) {
+                    LOG.info("Cleaning up abandoned remote log recovery dir: {}", normalized);
+                    deleteDirectoryQuietly(normalized.toFile());
+                }
+            }
+        } catch (IOException e) {
+            LOG.debug("Unable to scan remote log recovery parent {}", parent, e);
+        }
     }
 
     private void cleanupTempDirectory() {
-        // Remove the entire "tmp" parent directory to clean up our subdirectory as well
-        // as any stale recovery directories left by a previous failed recovery.
+        if (Files.exists(tempDir)) {
+            LOG.info("Cleaning up remote log recovery dir: {}", tempDir);
+            deleteDirectoryQuietly(tempDir.toFile());
+        }
         Path tmpDir = tempDir.getParent();
         if (tmpDir != null && Files.exists(tmpDir)) {
-            LOG.info("Cleaning up remote log recovery tmp dir: {}", tmpDir);
-            deleteDirectoryQuietly(tmpDir.toFile());
+            try {
+                Files.deleteIfExists(tmpDir);
+            } catch (DirectoryNotEmptyException ignored) {
+                // Another recovery owns a sibling directory.
+            } catch (IOException e) {
+                LOG.debug("Unable to remove empty remote log recovery parent {}", tmpDir, e);
+            }
         }
     }
 

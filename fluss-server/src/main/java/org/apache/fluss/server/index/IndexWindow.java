@@ -80,17 +80,25 @@ final class IndexWindow {
      */
     @Nullable
     List<IndexBatch> tryFailAndDrain(Throwable failure) {
-        List<IndexBatch> drained;
+        List<IndexBatch> drained = tryRetireAndDrain();
+        if (drained != null) {
+            owner.onWindowFailed(indexName, this, failure);
+        }
+        return drained;
+    }
+
+    /** Retires this window without notifying its owner, for owner-wide terminal cleanup. */
+    @Nullable
+    List<IndexBatch> tryRetireAndDrain() {
         synchronized (this) {
             if (terminal) {
                 return null;
             }
             terminal = true;
-            drained = new ArrayList<>(batches);
+            List<IndexBatch> drained = new ArrayList<>(batches);
             batches.clear();
+            return drained;
         }
-        owner.onWindowFailed(indexName, this, failure);
-        return drained;
     }
 
     synchronized boolean isActive() {

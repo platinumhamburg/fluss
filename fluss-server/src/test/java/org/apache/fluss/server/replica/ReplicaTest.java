@@ -52,6 +52,7 @@ import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.index.IndexReplicator;
 import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.UncertainWalAppendException;
@@ -617,6 +618,20 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(f.replica.isIndexReplicatorInitDeferred())
                 .as("deferred flag must be cleared after a successful retry")
                 .isFalse();
+    }
+
+    @Test
+    void testLeaderEpochBumpReplacesAndClosesIndexReplicator() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        publishIndexTableToCache(f);
+        makeIndexedMainReplicaAsLeader(f, INITIAL_LEADER_EPOCH);
+        IndexReplicator previous = f.replica.getIndexReplicator();
+        assertThat(previous).isNotNull();
+
+        makeIndexedMainReplicaAsLeader(f, INITIAL_LEADER_EPOCH + 1);
+
+        assertThat(f.replica.getIndexReplicator()).isNotNull().isNotSameAs(previous);
+        assertThat(previous.isClosed()).isTrue();
     }
 
     @Test
@@ -1536,6 +1551,11 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     private void makeIndexedMainReplicaAsLeader(IndexedFixture f) throws Exception {
+        makeIndexedMainReplicaAsLeader(f, INITIAL_LEADER_EPOCH);
+    }
+
+    private void makeIndexedMainReplicaAsLeader(IndexedFixture f, int leaderEpoch)
+            throws Exception {
         f.replica.makeLeader(
                 new NotifyLeaderAndIsrData(
                         PhysicalTablePath.of(f.mainPath),
@@ -1543,11 +1563,11 @@ final class ReplicaTest extends ReplicaTestBase {
                         Collections.singletonList(TABLET_SERVER_ID),
                         new LeaderAndIsr(
                                 TABLET_SERVER_ID,
-                                INITIAL_LEADER_EPOCH,
+                                leaderEpoch,
                                 Collections.singletonList(TABLET_SERVER_ID),
                                 Collections.emptyList(),
                                 INITIAL_COORDINATOR_EPOCH,
-                                INITIAL_LEADER_EPOCH)));
+                                leaderEpoch)));
     }
 
     /**

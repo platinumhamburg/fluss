@@ -247,6 +247,7 @@ public class IndexAccumulatorTest {
                 new Thread(
                         () -> {
                             try {
+                                stoppingOwner.close();
                                 dropped.set(accumulator.dropForReplicator(stoppingOwner));
                             } catch (Throwable t) {
                                 cleanupFailure.set(t);
@@ -265,7 +266,6 @@ public class IndexAccumulatorTest {
                         },
                         "index-initial-publisher");
 
-        stoppingOwner.close();
         synchronized (deque) {
             cleanupThread.start();
             awaitBlocked(cleanupThread);
@@ -279,7 +279,7 @@ public class IndexAccumulatorTest {
         assertThat(appendThread.isAlive()).isFalse();
         assertThat(cleanupFailure.get()).isNull();
         assertThat(appendFailure.get()).isNull();
-        assertThat(dropped).hasValue(1);
+        assertThat(dropped).hasValue(0);
         assertThat(accumulator.pollFirst(bucket)).isSameAs(published);
         accumulator.release(published);
         published.window().onBatchAcked(published);
@@ -323,6 +323,7 @@ public class IndexAccumulatorTest {
                 new Thread(
                         () -> {
                             try {
+                                stoppingOwner.close();
                                 dropped.set(accumulator.dropForReplicator(stoppingOwner));
                             } catch (Throwable t) {
                                 cleanupFailure.set(t);
@@ -330,7 +331,6 @@ public class IndexAccumulatorTest {
                         },
                         "index-owner-cleanup");
 
-        stoppingOwner.close();
         synchronized (deque) {
             retryThread.start();
             awaitBlocked(retryThread);
@@ -345,7 +345,7 @@ public class IndexAccumulatorTest {
         assertThat(retryFailure.get()).isNull();
         assertThat(cleanupFailure.get()).isNull();
         assertThat(reEnqueued.get()).isTrue();
-        assertThat(dropped).hasValue(1);
+        assertThat(dropped).hasValue(0);
         assertThat(retry.attempts()).isEqualTo(1);
         assertThat(accumulator.pollFirst(bucket)).isSameAs(retry);
         accumulator.release(retry);

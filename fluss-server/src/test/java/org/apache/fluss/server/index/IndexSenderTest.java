@@ -1135,7 +1135,7 @@ public class IndexSenderTest {
     }
 
     @Test
-    void repeatedListenerFailuresEventuallySendOnOwnerWorker() {
+    void repeatedListenerFailuresEventuallySendOnOwnerWorker() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         TableBucket bucket = new TableBucket(494L, 0);
         IndexReplicator owner = owner(accumulator);
@@ -1145,11 +1145,15 @@ public class IndexSenderTest {
         RecordingGateway gateway = new RecordingGateway();
         gateway.autoCompleteSuccess = true;
         AtomicReference<String> invocationThread = new AtomicReference<>();
+        CountDownLatch invocationStarted = new CountDownLatch(1);
+        CountDownLatch allowInvocation = new CountDownLatch(1);
         IndexSender.LifecycleHooks hooks =
                 new IndexSender.LifecycleHooks() {
                     @Override
                     public void beforePutKvInvocation() {
                         invocationThread.compareAndSet(null, Thread.currentThread().getName());
+                        invocationStarted.countDown();
+                        awaitLatch(allowInvocation);
                     }
                 };
         IndexSender sender =
@@ -1175,12 +1179,14 @@ public class IndexSenderTest {
             accumulator.append(second);
             accumulator.append(third);
 
+            assertThat(invocationStarted.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(accumulator.hasPending(bucket)).isTrue();
             assertThat(accumulator.pendingBytes(owner))
                     .isEqualTo(
                             first.encoded().getBytesLength()
                                     + second.encoded().getBytesLength()
                                     + third.encoded().getBytesLength());
+            allowInvocation.countDown();
             await(() -> owner.getSyncIndexPushedOffset() == 30L);
             await(() -> accumulator.missedAppendNotificationCountForTesting() == 0);
 
@@ -1197,6 +1203,7 @@ public class IndexSenderTest {
             assertThat(sender.ownedBatchCountForTesting()).isZero();
             assertThat(sender.ownedBatchPayloadBytesForTesting()).isZero();
         } finally {
+            allowInvocation.countDown();
             sender.close();
         }
     }
@@ -1257,7 +1264,7 @@ public class IndexSenderTest {
             assertThat(sender.ownedBatchPayloadBytesForTesting()).isEqualTo(64L * 1024L);
 
             owner.close();
-            assertThat(accumulator.dropForReplicator(owner)).isEqualTo(1);
+            assertThat(accumulator.dropForReplicator(owner)).isZero();
 
             assertThat(accumulator.hasUnsent()).isFalse();
             assertThat(accumulator.pendingBytes()).isZero();
@@ -1266,6 +1273,47 @@ public class IndexSenderTest {
                     .isZero();
             assertThat(sender.ownedBatchPayloadBytesForTesting()).isZero();
         } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void droppingInFlightOwnerReschedulesAnotherOwnersPendingBatch() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        TableBucket bucket = new TableBucket(493L, 0);
+        IndexReplicator firstOwner = ownerWithIndex(accumulator);
+        IndexWindow firstWindow = new IndexWindow("idx", 10L, 1, firstOwner);
+        firstOwner.registerInFlightWindow("idx", firstWindow);
+        accumulator.append(batch(bucket, firstWindow));
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (ignoredTable, ignoredBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L);
+        IndexReplicator secondOwner = owner(accumulator);
+        try {
+            await(() -> gateway.pending.size() == 1);
+
+            accumulator.append(batch(bucket, new IndexWindow("idx", 20L, 1, secondOwner)));
+            await(() -> sender.queuedBucketCountForTesting() == 0);
+            assertThat(accumulator.hasPending(bucket)).isTrue();
+            assertThat(sender.inFlightRequestCount()).isOne();
+
+            firstOwner.close();
+
+            await(() -> gateway.pending.size() == 2);
+            completePutKv(gateway, 1, true);
+            await(() -> secondOwner.getSyncIndexPushedOffset() == 20L);
+            completePutKv(gateway, 0, true);
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            firstOwner.close();
+            secondOwner.close();
             sender.close();
         }
     }

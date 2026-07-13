@@ -395,6 +395,19 @@ public final class IndexAccumulator {
                         }
                     });
         }
+        releaseAndNotifyDroppedBatches(droppedBatches);
+        return droppedBatches.size();
+    }
+
+    /** Retires batches that may be queued or sender-owned after their owner fails terminally. */
+    void dropBatches(List<IndexBatch> droppedBatches) {
+        for (IndexBatch batch : droppedBatches) {
+            remove(batch);
+        }
+        releaseAndNotifyDroppedBatches(droppedBatches);
+    }
+
+    private void releaseAndNotifyDroppedBatches(Iterable<IndexBatch> droppedBatches) {
         for (IndexBatch batch : droppedBatches) {
             release(batch);
         }
@@ -409,9 +422,8 @@ public final class IndexAccumulator {
                 }
             }
             for (Throwable failure : listenerFailures) {
-                LOG.warn("Error notifying dropped index batch for replicator {}", owner, failure);
+                LOG.warn("Error notifying dropped index batch", failure);
             }
         }
-        return droppedBatches.size();
     }
 }
