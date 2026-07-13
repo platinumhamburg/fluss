@@ -54,6 +54,12 @@ class StatsAggregateOperatorTest {
                                             .scanned(CleanupObjectType.LOG_SEGMENT, 1L)
                                             .planned(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
                                             .deleted(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
+                                            .ruleDecision(
+                                                    CleanupObjectType.LOG_SEGMENT,
+                                                    RuleDecisionCounters.scanned(10L))
+                                            .ruleDecision(
+                                                    CleanupObjectType.LOG_SEGMENT,
+                                                    RuleDecisionCounters.candidate(10L))
                                             .plannedDirectory(1L)
                                             .removedDirectory(1L)
                                             .build())));
@@ -64,8 +70,33 @@ class StatsAggregateOperatorTest {
                                             .scanned(CleanupObjectType.KV_SHARED_SST, 2L)
                                             .planned(CleanupObjectType.KV_SHARED_SST, 2L, 20L)
                                             .deleteFailed(CleanupObjectType.KV_SHARED_SST, 1L)
+                                            .ruleDecision(
+                                                    CleanupObjectType.KV_SHARED_SST,
+                                                    RuleDecisionCounters.scanned(10L))
+                                            .ruleDecision(
+                                                    CleanupObjectType.KV_SHARED_SST,
+                                                    RuleDecisionCounters.scanned(10L))
+                                            .ruleDecision(
+                                                    CleanupObjectType.KV_SHARED_SST,
+                                                    RuleDecisionCounters.candidate(10L))
+                                            .ruleDecision(
+                                                    CleanupObjectType.KV_SHARED_SST,
+                                                    RuleDecisionCounters.candidate(10L))
                                             .plannedDirectory(1L)
                                             .skipped(SkipReasonCode.KEEP_ACTIVE, 2L)
+                                            .build())));
+            harness.processElement(
+                    new StreamRecord<>(
+                            CleanupReportInput.stats(
+                                    CleanStats.builder(orders)
+                                            .scanned(CleanupObjectType.LOG_MANIFEST, 1L)
+                                            .ruleDecision(
+                                                    CleanupObjectType.LOG_MANIFEST,
+                                                    RuleDecisionCounters.scanned(5L))
+                                            .ruleDecision(
+                                                    CleanupObjectType.LOG_MANIFEST,
+                                                    RuleDecisionCounters.keepActive(5L))
+                                            .skipped(SkipReasonCode.KEEP_ACTIVE, 1L)
                                             .build())));
             harness.processElement(
                     new StreamRecord<>(
@@ -79,7 +110,7 @@ class StatsAggregateOperatorTest {
             harness.endInput();
 
             CleanupReport result = harness.getRecordOutput().iterator().next().getValue();
-            assertThat(result.global().scannedFiles()).isEqualTo(3L);
+            assertThat(result.global().scannedFiles()).isEqualTo(4L);
             assertThat(result.global().plannedFiles()).isEqualTo(3L);
             assertThat(result.global().plannedDirs()).isEqualTo(2L);
             assertThat(result.global().plannedBytes()).isEqualTo(30L);
@@ -87,6 +118,15 @@ class StatsAggregateOperatorTest {
             assertThat(result.global().bytesReclaimed()).isEqualTo(10L);
             assertThat(result.tasksPlanned()).isEqualTo(2L);
             assertThat(result.metadataFailures()).isEqualTo(1L);
+            assertThat(result.byRuleDecision().get(CleanupObjectType.LOG_SEGMENT).candidateFiles())
+                    .isEqualTo(1L);
+            assertThat(
+                            result.byRuleDecision()
+                                    .get(CleanupObjectType.LOG_MANIFEST)
+                                    .keepActiveFiles())
+                    .isEqualTo(1L);
+            assertThat(result.ruleCountersConsistent()).isTrue();
+            assertThat(result.coverageComplete()).isFalse();
 
             assertThat(indexOf(events, "action=summary")).isGreaterThanOrEqualTo(0);
             assertThat(events).noneMatch(event -> event.contains("action=retention_wait_"));
@@ -107,6 +147,36 @@ class StatsAggregateOperatorTest {
             assertThat(events).anyMatch(event -> event.contains("action=summary_by_type"));
             assertThat(events).anyMatch(event -> event.contains("action=summary_by_reason"));
             assertThat(events).anyMatch(event -> event.contains("action=audit_integrity"));
+            assertThat(events)
+                    .anyMatch(
+                            event ->
+                                    event.contains("action=table_rule_summary")
+                                            && event.contains("database=db")
+                                            && event.contains("table=orders")
+                                            && event.contains("object_type=log_segment")
+                                            && event.contains("candidate_files=1")
+                                            && event.contains("candidate_bytes=10"));
+            assertThat(events)
+                    .anyMatch(
+                            event ->
+                                    event.contains("action=coverage_summary")
+                                            && event.contains("complete=false")
+                                            && event.contains("metadata_read_failed_targets=1")
+                                            && event.contains("rpc_failed_targets=1")
+                                            && event.contains("affected_tables=1")
+                                            && event.contains("action_required=true"));
+            assertThat(events)
+                    .anyMatch(
+                            event ->
+                                    event.contains("action=audit_integrity")
+                                            && event.contains("rule_counters_consistent=true")
+                                            && event.contains("coverage_complete=false"));
+            assertThat(events)
+                    .noneMatch(
+                            event ->
+                                    event.contains("--bootstrap-server")
+                                            || event.contains("access-key")
+                                            || event.contains("token="));
         }
     }
 

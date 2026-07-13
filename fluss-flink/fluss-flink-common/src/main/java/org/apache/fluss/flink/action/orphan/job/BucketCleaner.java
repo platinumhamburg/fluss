@@ -172,8 +172,11 @@ public final class BucketCleaner {
                 Decision decision = rule.evaluate(meta, activeRefs, cutoffMillis);
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.recordScanned(objectType);
+                stats.recordRuleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
                 switch (decision) {
                     case DELETE:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.candidate(meta.size()));
                         stats.recordPlanned(objectType, meta.size());
                         if (safeDeleter.deleteFile(meta, decision, rule.id())) {
                             if (!dryRun) {
@@ -185,15 +188,21 @@ public final class BucketCleaner {
                         }
                         break;
                     case SKIP_UNKNOWN:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.unknownFileType(meta.size()));
                         audit.logSkipUnknown(meta.path(), rule.id());
                         stats.recordSkip(SkipReasonCode.UNKNOWN_FILE_TYPE);
                         visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.keepActive(meta.size()));
                         stats.recordSkip(SkipReasonCode.KEEP_ACTIVE);
                         visit.hasRemainingChild = true;
                         break;
                     case DEFER:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.newerThanCutoff(meta.size()));
                         stats.recordSkip(SkipReasonCode.NEWER_THAN_CUTOFF);
                         visit.hasRemainingChild = true;
                         break;
@@ -218,6 +227,8 @@ public final class BucketCleaner {
         public final Map<CleanupObjectType, CleanupCounters> byObjectType =
                 new EnumMap<>(CleanupObjectType.class);
         public final Map<SkipReasonCode, Long> bySkipReason = new EnumMap<>(SkipReasonCode.class);
+        public final Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision =
+                new EnumMap<>(CleanupObjectType.class);
 
         public static BucketCleanStats empty() {
             return new BucketCleanStats();
@@ -266,6 +277,12 @@ public final class BucketCleaner {
         private void addByObjectType(CleanupObjectType type, CleanupCounters delta) {
             byObjectType.put(
                     type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
+        }
+
+        private void recordRuleDecision(CleanupObjectType type, RuleDecisionCounters delta) {
+            byRuleDecision.put(
+                    type,
+                    byRuleDecision.getOrDefault(type, RuleDecisionCounters.empty()).add(delta));
         }
     }
 

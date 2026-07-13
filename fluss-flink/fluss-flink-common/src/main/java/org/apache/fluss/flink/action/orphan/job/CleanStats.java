@@ -48,6 +48,7 @@ public final class CleanStats implements Serializable {
     private final ScopeIdentity scope;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<SkipReasonCode, Long> bySkipReason;
+    private final Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision;
 
     public CleanStats(
             long scannedFiles,
@@ -70,6 +71,7 @@ public final class CleanStats implements Serializable {
                         deleteFailures,
                         bytesReclaimed),
                 Collections.emptyMap(),
+                Collections.emptyMap(),
                 Collections.emptyMap());
     }
 
@@ -78,6 +80,15 @@ public final class CleanStats implements Serializable {
             CleanupCounters counters,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
             Map<SkipReasonCode, Long> bySkipReason) {
+        this(scope, counters, byObjectType, bySkipReason, Collections.emptyMap());
+    }
+
+    public CleanStats(
+            ScopeIdentity scope,
+            CleanupCounters counters,
+            Map<CleanupObjectType, CleanupCounters> byObjectType,
+            Map<SkipReasonCode, Long> bySkipReason,
+            Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision) {
         this.scope = scope;
         Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
         objectCopy.putAll(byObjectType);
@@ -85,6 +96,9 @@ public final class CleanStats implements Serializable {
         Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
         reasonCopy.putAll(bySkipReason);
         this.bySkipReason = reasonCopy;
+        Map<CleanupObjectType, RuleDecisionCounters> decisionCopy = new HashMap<>();
+        decisionCopy.putAll(byRuleDecision);
+        this.byRuleDecision = decisionCopy;
         this.scannedFiles = counters.scannedFiles();
         this.plannedFiles = counters.plannedFiles();
         this.plannedDirs = counters.plannedDirs();
@@ -132,6 +146,10 @@ public final class CleanStats implements Serializable {
         return Collections.unmodifiableMap(bySkipReason);
     }
 
+    public Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision() {
+        return Collections.unmodifiableMap(byRuleDecision);
+    }
+
     public long scannedFiles() {
         return scannedFiles;
     }
@@ -173,6 +191,8 @@ public final class CleanStats implements Serializable {
                 new EnumMap<>(CleanupObjectType.class);
         private final EnumMap<SkipReasonCode, Long> bySkipReason =
                 new EnumMap<>(SkipReasonCode.class);
+        private final EnumMap<CleanupObjectType, RuleDecisionCounters> byRuleDecision =
+                new EnumMap<>(CleanupObjectType.class);
 
         private Builder(ScopeIdentity scope) {
             this.scope = scope;
@@ -211,8 +231,15 @@ public final class CleanStats implements Serializable {
             return this;
         }
 
+        public Builder ruleDecision(CleanupObjectType type, RuleDecisionCounters counters) {
+            byRuleDecision.put(
+                    type,
+                    byRuleDecision.getOrDefault(type, RuleDecisionCounters.empty()).add(counters));
+            return this;
+        }
+
         public CleanStats build() {
-            return new CleanStats(scope, counters, byObjectType, bySkipReason);
+            return new CleanStats(scope, counters, byObjectType, bySkipReason, byRuleDecision);
         }
 
         private Builder add(CleanupObjectType type, CleanupCounters delta) {

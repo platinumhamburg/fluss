@@ -39,6 +39,7 @@ public final class TableCleanupSummary implements Serializable {
     private final CleanupCounters counters;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<SkipReasonCode, Long> bySkipReason;
+    private final Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision;
 
     TableCleanupSummary(
             ScopeIdentity scope,
@@ -46,7 +47,8 @@ public final class TableCleanupSummary implements Serializable {
             long metadataFailures,
             CleanupCounters counters,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
-            Map<SkipReasonCode, Long> bySkipReason) {
+            Map<SkipReasonCode, Long> bySkipReason,
+            Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision) {
         this.scope = scope.tableKey();
         this.tasksPlanned = tasksPlanned;
         this.metadataFailures = metadataFailures;
@@ -57,6 +59,9 @@ public final class TableCleanupSummary implements Serializable {
         Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
         reasonCopy.putAll(bySkipReason);
         this.bySkipReason = reasonCopy;
+        Map<CleanupObjectType, RuleDecisionCounters> decisionCopy = new HashMap<>();
+        decisionCopy.putAll(byRuleDecision);
+        this.byRuleDecision = decisionCopy;
     }
 
     public ScopeIdentity scope() {
@@ -89,5 +94,9 @@ public final class TableCleanupSummary implements Serializable {
 
     public Map<SkipReasonCode, Long> bySkipReason() {
         return Collections.unmodifiableMap(bySkipReason);
+    }
+
+    public Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision() {
+        return Collections.unmodifiableMap(byRuleDecision);
     }
 }

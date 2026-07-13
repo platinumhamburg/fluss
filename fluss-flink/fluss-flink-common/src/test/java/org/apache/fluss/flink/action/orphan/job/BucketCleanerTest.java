@@ -126,6 +126,12 @@ class BucketCleanerTest {
         assertThat(stats.byObjectType.get(CleanupObjectType.LOG_SEGMENT).scannedFiles())
                 .isEqualTo(1L);
         assertThat(stats.bySkipReason).containsEntry(SkipReasonCode.UNKNOWN_FILE_TYPE, 1L);
+        RuleDecisionCounters decisions = stats.byRuleDecision.get(CleanupObjectType.LOG_SEGMENT);
+        assertThat(decisions.scannedFiles()).isEqualTo(1L);
+        assertThat(decisions.scannedBytes()).isEqualTo(1L);
+        assertThat(decisions.unknownFileTypeFiles()).isEqualTo(1L);
+        assertThat(decisions.unknownFileTypeBytes()).isEqualTo(1L);
+        assertThat(decisions.isConsistent()).isTrue();
         assertThat(Files.exists(dotFile)).isTrue();
         assertThat(Files.exists(segmentDir)).isTrue();
     }
@@ -157,6 +163,11 @@ class BucketCleanerTest {
         assertThat(stats.scannedFiles).isEqualTo(2L);
         // orphan.sst deleted; active.sst kept
         assertThat(stats.deletedFiles).isGreaterThanOrEqualTo(1L);
+        RuleDecisionCounters decisions = stats.byRuleDecision.get(CleanupObjectType.KV_SHARED_SST);
+        assertThat(decisions.scannedFiles()).isEqualTo(2L);
+        assertThat(decisions.keepActiveFiles()).isEqualTo(1L);
+        assertThat(decisions.candidateFiles()).isEqualTo(1L);
+        assertThat(decisions.isConsistent()).isTrue();
         assertThat(Files.exists(activeSst)).isTrue();
         assertThat(Files.exists(orphanSst)).isFalse();
     }
@@ -215,6 +226,41 @@ class BucketCleanerTest {
                 .isEqualTo(10L);
         assertThat(stats.byObjectType.get(CleanupObjectType.LOG_SEGMENT).deletedFiles())
                 .isEqualTo(0L);
+        RuleDecisionCounters decisions = stats.byRuleDecision.get(CleanupObjectType.LOG_SEGMENT);
+        assertThat(decisions.scannedFiles()).isEqualTo(1L);
+        assertThat(decisions.scannedBytes()).isEqualTo(10L);
+        assertThat(decisions.candidateFiles()).isEqualTo(1L);
+        assertThat(decisions.candidateBytes()).isEqualTo(10L);
+        assertThat(decisions.keepActiveFiles()).isZero();
+        assertThat(decisions.newerThanCutoffFiles()).isZero();
+        assertThat(decisions.unknownFileTypeFiles()).isZero();
+        assertThat(decisions.isConsistent()).isTrue();
+        assertThat(Files.exists(logFile)).isTrue();
+    }
+
+    @Test
+    void recordsNewerThanCutoffDecision(@TempDir Path tmp) throws IOException {
+        Path bucketRoot = Files.createDirectories(tmp.resolve("bucket"));
+        Path segmentDir =
+                Files.createDirectories(bucketRoot.resolve("11111111-1111-1111-1111-111111111111"));
+        Path logFile =
+                Files.write(
+                        segmentDir.resolve(
+                                FlussPaths.filenamePrefixFromOffset(0L)
+                                        + FlussPaths.LOG_FILE_SUFFIX),
+                        new byte[5]);
+        long cutoff = System.currentTimeMillis() - 10_000L;
+
+        BucketCleaner.BucketCleanStats stats =
+                createCleaner(bucketRoot, cutoff, true)
+                        .clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
+
+        RuleDecisionCounters decisions = stats.byRuleDecision.get(CleanupObjectType.LOG_SEGMENT);
+        assertThat(decisions.scannedFiles()).isEqualTo(1L);
+        assertThat(decisions.scannedBytes()).isEqualTo(5L);
+        assertThat(decisions.newerThanCutoffFiles()).isEqualTo(1L);
+        assertThat(decisions.newerThanCutoffBytes()).isEqualTo(5L);
+        assertThat(decisions.isConsistent()).isTrue();
         assertThat(Files.exists(logFile)).isTrue();
     }
 

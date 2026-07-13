@@ -207,7 +207,8 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         bucketStats.deleteFailures,
                         bucketStats.bytesReclaimed),
                 bucketStats.byObjectType,
-                bucketStats.bySkipReason);
+                bucketStats.bySkipReason,
+                bucketStats.byRuleDecision);
     }
 
     // -------------------------------------------------------------------------

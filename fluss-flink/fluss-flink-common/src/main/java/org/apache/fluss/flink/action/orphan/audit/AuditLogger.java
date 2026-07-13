@@ -22,6 +22,7 @@ import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.job.CleanStats;
 import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.CleanupReport;
+import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
 import org.apache.fluss.flink.action.orphan.job.TableCleanupSummary;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
@@ -787,6 +788,16 @@ public final class AuditLogger {
                         entry.getValue(),
                         dryRun);
             }
+            for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry :
+                    table.byRuleDecision().entrySet()) {
+                logRuleDecisions(
+                        runId,
+                        stage,
+                        "table_rule_summary",
+                        scopeFields(scope) + " object_type=" + lower(entry.getKey().name()),
+                        entry.getValue(),
+                        dryRun);
+            }
         }
         for (Map.Entry<String, CleanupCounters> entry :
                 new TreeMap<>(report.databases()).entrySet()) {
@@ -818,9 +829,48 @@ public final class AuditLogger {
                     entry.getValue(),
                     dryRun);
         }
+        for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry :
+                report.byRuleDecision().entrySet()) {
+            logRuleDecisions(
+                    runId,
+                    stage,
+                    "summary_by_rule",
+                    "scope=global object_type=" + lower(entry.getKey().name()),
+                    entry.getValue(),
+                    dryRun);
+        }
+        long noRemoteManifestTargets = reasonCount(report, SkipReasonCode.NO_REMOTE_MANIFEST);
+        long emptyActiveSetTargets = reasonCount(report, SkipReasonCode.EMPTY_KV_ACTIVE_SET);
+        long directoryListFailedTargets = reasonCount(report, SkipReasonCode.DIRECTORY_LIST_FAILED);
+        long rpcFailedTargets = reasonCount(report, SkipReasonCode.RPC_ERROR);
+        int affectedTables = 0;
+        for (TableCleanupSummary table : tables) {
+            if (table.metadataFailures() > 0L || hasActionRequiredReason(table.bySkipReason())) {
+                affectedTables++;
+            }
+        }
+        AUDIT.info(
+                "audit_version=1 run_id={} stage={} action=coverage_summary scope=global"
+                        + " no_remote_manifest_targets={} empty_active_set_targets={}"
+                        + " metadata_read_failed_targets={} directory_list_failed_targets={}"
+                        + " rpc_failed_targets={} affected_tables={} complete={}"
+                        + " action_required={} dry_run={} ts={}",
+                runId,
+                stage,
+                noRemoteManifestTargets,
+                emptyActiveSetTargets,
+                report.metadataFailures(),
+                directoryListFailedTargets,
+                rpcFailedTargets,
+                affectedTables,
+                report.coverageComplete(),
+                !report.coverageComplete(),
+                dryRun,
+                Instant.now());
         AUDIT.info(
                 "audit_version=1 run_id={} stage={} action=audit_integrity"
                         + " global_equals_table_sum={} plan_equals_table_sum={} table_count={}"
+                        + " rule_counters_consistent={} coverage_complete={}"
                         + " dry_run={} ts={}",
                 runId,
                 stage,
@@ -828,6 +878,8 @@ public final class AuditLogger {
                 report.tasksPlanned() == tableTasksPlanned
                         && report.metadataFailures() == tableMetadataFailures,
                 tables.size(),
+                report.ruleCountersConsistent(),
+                report.coverageComplete(),
                 dryRun,
                 Instant.now());
         logCounters(
@@ -840,6 +892,51 @@ public final class AuditLogger {
                         + report.metadataFailures(),
                 report.global(),
                 dryRun);
+    }
+
+    private static void logRuleDecisions(
+            String runId,
+            String stage,
+            String action,
+            String dimensions,
+            RuleDecisionCounters counters,
+            boolean dryRun) {
+        AUDIT.info(
+                "audit_version=1 run_id={} stage={} action={} {}"
+                        + " scanned_files={} scanned_bytes={}"
+                        + " keep_active_files={} keep_active_bytes={}"
+                        + " newer_than_cutoff_files={} newer_than_cutoff_bytes={}"
+                        + " unknown_file_type_files={} unknown_file_type_bytes={}"
+                        + " candidate_files={} candidate_bytes={} dry_run={} ts={}",
+                runId,
+                stage,
+                action,
+                dimensions,
+                counters.scannedFiles(),
+                counters.scannedBytes(),
+                counters.keepActiveFiles(),
+                counters.keepActiveBytes(),
+                counters.newerThanCutoffFiles(),
+                counters.newerThanCutoffBytes(),
+                counters.unknownFileTypeFiles(),
+                counters.unknownFileTypeBytes(),
+                counters.candidateFiles(),
+                counters.candidateBytes(),
+                dryRun,
+                Instant.now());
+    }
+
+    private static long reasonCount(CleanupReport report, SkipReasonCode reason) {
+        return report.bySkipReason().getOrDefault(reason, 0L);
+    }
+
+    private static boolean hasActionRequiredReason(Map<SkipReasonCode, Long> reasons) {
+        for (Map.Entry<SkipReasonCode, Long> entry : reasons.entrySet()) {
+            if (entry.getValue() > 0L && entry.getKey().actionRequired()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void logCounters(
