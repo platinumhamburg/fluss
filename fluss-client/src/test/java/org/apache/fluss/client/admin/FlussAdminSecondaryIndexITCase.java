@@ -295,8 +295,12 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testCreateTableRollsBackWhenDerivedIndexTableNameExists() throws Exception {
+    void testCreateTableIsAtomicWhenLaterDerivedIndexTableNameExists() throws Exception {
         TablePath mainTablePath = TablePath.of(DB, "test_index_table_name_collision");
+        TablePath firstIndexTablePath =
+                TablePath.of(
+                        DB,
+                        IndexTableUtils.indexTableName(mainTablePath.getTableName(), "idx_age"));
         TablePath existingIndexTablePath =
                 TablePath.of(
                         DB,
@@ -319,7 +323,14 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                                 Schema.newBuilder()
                                         .column("id", DataTypes.INT())
                                         .column("name", DataTypes.STRING())
+                                        .column("age", DataTypes.INT())
                                         .primaryKey("id")
+                                        .index(
+                                                "idx_age",
+                                                IndexType.SECONDARY,
+                                                Arrays.asList("age"),
+                                                IndexVisibility.SYNC,
+                                                1)
                                         .index(
                                                 "idx_name",
                                                 IndexType.SECONDARY,
@@ -335,6 +346,7 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                 .isInstanceOf(TableAlreadyExistException.class);
 
         assertThat(admin.tableExists(mainTablePath).get()).isFalse();
+        assertThat(admin.tableExists(firstIndexTablePath).get()).isFalse();
         assertThat(admin.tableExists(existingIndexTablePath).get()).isTrue();
     }
 

@@ -34,6 +34,7 @@ import org.apache.fluss.utils.types.Tuple2;
 
 import javax.annotation.Nullable;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
@@ -127,6 +128,26 @@ public final class ZkData {
 
         public static TableRegistration decode(byte[] json) {
             return JsonSerdeUtils.readValue(json, TableRegistrationJsonSerde.INSTANCE);
+        }
+    }
+
+    /** A durable marker that keeps a table path occupied until its deletion is complete. */
+    public static final class TableDeletionZNode {
+
+        public static String path(TablePath tablePath) {
+            return TableZNode.path(tablePath) + "/deletion";
+        }
+
+        public static byte[] encode(long tableId) {
+            return ByteBuffer.allocate(Long.BYTES).putLong(tableId).array();
+        }
+
+        public static long decode(byte[] bytes) {
+            if (bytes.length != Long.BYTES) {
+                throw new IllegalArgumentException(
+                        "Invalid table deletion marker length: " + bytes.length);
+            }
+            return ByteBuffer.wrap(bytes).getLong();
         }
     }
 

@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.coordinator;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.DatabaseAlreadyExistException;
@@ -56,8 +57,12 @@ import org.apache.fluss.server.zk.data.DatabaseRegistration;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableDeletion;
+import org.apache.fluss.server.zk.data.TableMetadataRegistration;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
+import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 import org.apache.fluss.utils.function.RunnableWithException;
 import org.apache.fluss.utils.function.ThrowingRunnable;
 import org.apache.fluss.utils.types.Tuple2;
@@ -67,6 +72,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -76,19 +82,32 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAlterTableProperties;
+import static org.apache.fluss.utils.concurrent.Executors.directExecutor;
 
 /** A manager for metadata. */
 public class MetadataManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(MetadataManager.class);
     private static final int PARTITION_TOMBSTONE_CAS_RETRY_LIMIT = 3;
+    private static final long TABLE_DELETION_RETRY_DELAY_MILLIS = 1000L;
 
     private final ZooKeeperClient zookeeperClient;
     private final int maxPartitionNum;
     private final int maxBucketNum;
     private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
+    private final Executor tableDeletionExecutor;
+    private final Consumer<Runnable> tableDeletionRetryScheduler;
+    // Coordinator epochs fence different leaders. This lock serializes read-modify-write metadata
+    // mutations issued by the current leader, including automatic partition management and
+    // watcher repairs, so a deleted path cannot be recreated between validation and commit.
+    private final Object metadataMutationLock = new Object();
 
     public static final Set<String> SENSITIVE_TABLE_OPTIONS = new HashSet<>();
 
@@ -108,10 +127,39 @@ public class MetadataManager {
             ZooKeeperClient zookeeperClient,
             Configuration conf,
             LakeCatalogDynamicLoader lakeCatalogDynamicLoader) {
+        this(zookeeperClient, conf, lakeCatalogDynamicLoader, directExecutor());
+    }
+
+    MetadataManager(
+            ZooKeeperClient zookeeperClient,
+            Configuration conf,
+            LakeCatalogDynamicLoader lakeCatalogDynamicLoader,
+            Executor tableDeletionExecutor) {
+        this(
+                zookeeperClient,
+                conf,
+                lakeCatalogDynamicLoader,
+                tableDeletionExecutor,
+                runnable ->
+                        FutureUtils.runAfterDelay(
+                                runnable,
+                                TABLE_DELETION_RETRY_DELAY_MILLIS,
+                                TimeUnit.MILLISECONDS));
+    }
+
+    @VisibleForTesting
+    MetadataManager(
+            ZooKeeperClient zookeeperClient,
+            Configuration conf,
+            LakeCatalogDynamicLoader lakeCatalogDynamicLoader,
+            Executor tableDeletionExecutor,
+            Consumer<Runnable> tableDeletionRetryScheduler) {
         this.zookeeperClient = zookeeperClient;
         this.maxPartitionNum = conf.get(ConfigOptions.MAX_PARTITION_NUM);
         this.maxBucketNum = conf.get(ConfigOptions.MAX_BUCKET_NUM);
         this.lakeCatalogDynamicLoader = lakeCatalogDynamicLoader;
+        this.tableDeletionExecutor = tableDeletionExecutor;
+        this.tableDeletionRetryScheduler = tableDeletionRetryScheduler;
     }
 
     /** Validates the table descriptor. */
@@ -123,6 +171,14 @@ public class MetadataManager {
     }
 
     public void createDatabase(
+            String databaseName, DatabaseDescriptor databaseDescriptor, boolean ignoreIfExists)
+            throws DatabaseAlreadyExistException {
+        synchronized (metadataMutationLock) {
+            createDatabaseInternal(databaseName, databaseDescriptor, ignoreIfExists);
+        }
+    }
+
+    private void createDatabaseInternal(
             String databaseName, DatabaseDescriptor databaseDescriptor, boolean ignoreIfExists)
             throws DatabaseAlreadyExistException {
         if (databaseExists(databaseName)) {
@@ -150,6 +206,16 @@ public class MetadataManager {
     }
 
     public void alterDatabaseProperties(
+            String databaseName,
+            DatabasePropertyChanges databasePropertyChanges,
+            boolean ignoreIfNotExists) {
+        synchronized (metadataMutationLock) {
+            alterDatabasePropertiesInternal(
+                    databaseName, databasePropertyChanges, ignoreIfNotExists);
+        }
+    }
+
+    private void alterDatabasePropertiesInternal(
             String databaseName,
             DatabasePropertyChanges databasePropertyChanges,
             boolean ignoreIfNotExists) {
@@ -317,6 +383,13 @@ public class MetadataManager {
 
     public void dropDatabase(String name, boolean ignoreIfNotExists, boolean cascade)
             throws DatabaseNotExistException, DatabaseNotEmptyException {
+        synchronized (metadataMutationLock) {
+            dropDatabaseInternal(name, ignoreIfNotExists, cascade);
+        }
+    }
+
+    private void dropDatabaseInternal(String name, boolean ignoreIfNotExists, boolean cascade)
+            throws DatabaseNotExistException, DatabaseNotEmptyException {
         if (!databaseExists(name)) {
             if (ignoreIfNotExists) {
                 return;
@@ -332,6 +405,13 @@ public class MetadataManager {
 
     public void dropTable(TablePath tablePath, boolean ignoreIfNotExists)
             throws TableNotExistException {
+        synchronized (metadataMutationLock) {
+            dropTableInternal(tablePath, ignoreIfNotExists);
+        }
+    }
+
+    private void dropTableInternal(TablePath tablePath, boolean ignoreIfNotExists)
+            throws TableNotExistException {
         if (!tableExists(tablePath)) {
             if (ignoreIfNotExists) {
                 return;
@@ -342,6 +422,91 @@ public class MetadataManager {
         // in here, we just delete the table node in zookeeper, which will then trigger
         // the physical deletion in tablet servers and assignments in zk
         uncheck(() -> zookeeperClient.deleteTable(tablePath), "Fail to drop table: " + tablePath);
+    }
+
+    public void deleteTables(List<TableDeletion> tableDeletions, int coordinatorZkVersion) {
+        List<TableDeletion> deletions = new ArrayList<>(tableDeletions);
+        synchronized (metadataMutationLock) {
+            uncheck(
+                    () -> zookeeperClient.markTablesForDeletion(deletions, coordinatorZkVersion),
+                    "Fail to mark tables for deletion: " + deletions);
+        }
+        for (int i = 0; i < deletions.size(); i++) {
+            TableDeletion tableDeletion = deletions.get(i);
+            try {
+                zookeeperClient.completeTableDeletion(
+                        tableDeletion.getTablePath(), coordinatorZkVersion);
+            } catch (Exception e) {
+                List<TableDeletion> remaining =
+                        new ArrayList<>(deletions.subList(i, deletions.size()));
+                if (isRetryableTableDeletionFailure(e)) {
+                    scheduleTableDeletionRetry(remaining, coordinatorZkVersion);
+                }
+                throw new FlussRuntimeException(
+                        "Fail to complete table deletion: " + tableDeletion, e);
+            }
+        }
+    }
+
+    private void scheduleTableDeletionRetry(
+            List<TableDeletion> tableDeletions, int coordinatorZkVersion) {
+        tableDeletionRetryScheduler.accept(
+                () -> {
+                    try {
+                        tableDeletionExecutor.execute(
+                                () -> retryTableDeletions(tableDeletions, coordinatorZkVersion));
+                    } catch (RejectedExecutionException e) {
+                        LOG.debug(
+                                "Table deletion retry was discarded because the Coordinator is stopping: {}.",
+                                tableDeletions,
+                                e);
+                    }
+                });
+    }
+
+    private void retryTableDeletions(List<TableDeletion> tableDeletions, int coordinatorZkVersion) {
+        for (int i = 0; i < tableDeletions.size(); i++) {
+            TableDeletion tableDeletion = tableDeletions.get(i);
+            try {
+                zookeeperClient.completeTableDeletion(
+                        tableDeletion.getTablePath(), coordinatorZkVersion);
+            } catch (Exception e) {
+                if (!isRetryableTableDeletionFailure(e)) {
+                    LOG.warn(
+                            "Stopping table deletion retry for {} after a non-retryable failure.",
+                            tableDeletions,
+                            e);
+                    return;
+                }
+                List<TableDeletion> remaining =
+                        new ArrayList<>(tableDeletions.subList(i, tableDeletions.size()));
+                LOG.warn(
+                        "Failed to complete marked table deletion {}; retrying remaining deletions {}.",
+                        tableDeletion,
+                        remaining,
+                        e);
+                scheduleTableDeletionRetry(remaining, coordinatorZkVersion);
+                return;
+            }
+        }
+    }
+
+    private static boolean isCoordinatorEpochConflict(Throwable throwable) {
+        return ExceptionUtils.findThrowable(throwable, KeeperException.BadVersionException.class)
+                .isPresent();
+    }
+
+    private static boolean isRetryableTableDeletionFailure(Throwable throwable) {
+        return !isCoordinatorEpochConflict(throwable)
+                && !ExceptionUtils.findThrowable(throwable, IllegalStateException.class).isPresent()
+                && !ExceptionUtils.findThrowable(throwable, IllegalArgumentException.class)
+                        .isPresent();
+    }
+
+    public void resumeTableDeletions(int coordinatorZkVersion) {
+        uncheck(
+                () -> zookeeperClient.resumeTableDeletions(coordinatorZkVersion),
+                "Fail to resume incomplete table deletions");
     }
 
     public void completeDeleteTable(long tableId) {
@@ -373,6 +538,17 @@ public class MetadataManager {
      * @return the table id
      */
     public long createTable(
+            TablePath tablePath,
+            TableDescriptor tableToCreate,
+            @Nullable TableAssignment tableAssignment,
+            boolean ignoreIfExists)
+            throws TableAlreadyExistException, DatabaseNotExistException {
+        synchronized (metadataMutationLock) {
+            return createTableInternal(tablePath, tableToCreate, tableAssignment, ignoreIfExists);
+        }
+    }
+
+    private long createTableInternal(
             TablePath tablePath,
             TableDescriptor tableToCreate,
             @Nullable TableAssignment tableAssignment,
@@ -423,11 +599,97 @@ public class MetadataManager {
                 "Fail to create table " + tablePath);
     }
 
+    public long allocateTableId() {
+        return uncheck(zookeeperClient::getTableIdAndIncrement, "Fail to allocate table id");
+    }
+
+    /** Persists a group of fully prepared tables in one epoch-fenced ZooKeeper transaction. */
+    void createTablesAtomically(
+            List<TableCreation> tableCreations,
+            boolean ignoreIfFirstTableExists,
+            int coordinatorZkVersion) {
+        synchronized (metadataMutationLock) {
+            createTablesAtomicallyInternal(
+                    tableCreations, ignoreIfFirstTableExists, coordinatorZkVersion);
+        }
+    }
+
+    private void createTablesAtomicallyInternal(
+            List<TableCreation> tableCreations,
+            boolean ignoreIfFirstTableExists,
+            int coordinatorZkVersion) {
+        if (tableCreations.isEmpty()) {
+            throw new IllegalArgumentException("At least one table is required.");
+        }
+
+        TablePath firstTablePath = tableCreations.get(0).getTablePath();
+        if (!databaseExists(firstTablePath.getDatabaseName())) {
+            throw new DatabaseNotExistException(
+                    "Database " + firstTablePath.getDatabaseName() + " does not exist.");
+        }
+        if (tableExists(firstTablePath)) {
+            if (ignoreIfFirstTableExists) {
+                return;
+            }
+            throw new TableAlreadyExistException("Table " + firstTablePath + " already exists.");
+        }
+        for (int i = 1; i < tableCreations.size(); i++) {
+            TablePath tablePath = tableCreations.get(i).getTablePath();
+            if (!databaseExists(tablePath.getDatabaseName())) {
+                throw new DatabaseNotExistException(
+                        "Database " + tablePath.getDatabaseName() + " does not exist.");
+            }
+            if (tableExists(tablePath)) {
+                throw new TableAlreadyExistException("Table " + tablePath + " already exists.");
+            }
+        }
+
+        List<TableMetadataRegistration> registrations =
+                tableCreations.stream()
+                        .map(
+                                tableCreation ->
+                                        new TableMetadataRegistration(
+                                                tableCreation.getTablePath(),
+                                                TableRegistration.newTable(
+                                                        tableCreation.getTableId(),
+                                                        zookeeperClient.getDefaultRemoteDataDir(),
+                                                        tableCreation.getTableDescriptor()),
+                                                tableCreation.getTableDescriptor().getSchema(),
+                                                tableCreation.getTableAssignment()))
+                        .collect(Collectors.toList());
+        try {
+            zookeeperClient.registerTablesAtomically(registrations, coordinatorZkVersion);
+        } catch (KeeperException.NodeExistsException e) {
+            throw new TableAlreadyExistException(
+                    "One of the tables in the atomic creation already exists.", e);
+        } catch (Exception e) {
+            throw new FlussRuntimeException("Fail to atomically create tables.", e);
+        }
+    }
+
     public void alterTableSchema(
             TablePath tablePath,
             List<TableChange> schemaChanges,
             boolean ignoreIfNotExists,
-            FlussPrincipal flussPrincipal)
+            FlussPrincipal flussPrincipal,
+            int coordinatorZkVersion)
+            throws TableNotExistException, TableNotPartitionedException {
+        synchronized (metadataMutationLock) {
+            alterTableSchemaInternal(
+                    tablePath,
+                    schemaChanges,
+                    ignoreIfNotExists,
+                    flussPrincipal,
+                    coordinatorZkVersion);
+        }
+    }
+
+    private void alterTableSchemaInternal(
+            TablePath tablePath,
+            List<TableChange> schemaChanges,
+            boolean ignoreIfNotExists,
+            FlussPrincipal flussPrincipal,
+            int coordinatorZkVersion)
             throws TableNotExistException, TableNotPartitionedException {
         try {
 
@@ -450,7 +712,12 @@ public class MetadataManager {
 
                 // Update Fluss schema (ZK) after Lake sync succeeds
                 if (!newSchema.equals(table.getSchema())) {
-                    zookeeperClient.registerSchema(tablePath, newSchema, table.getSchemaId() + 1);
+                    zookeeperClient.registerSchema(
+                            tablePath,
+                            table.getTableId(),
+                            newSchema,
+                            table.getSchemaId() + 1,
+                            coordinatorZkVersion);
                 } else {
                     LOG.info(
                             "Skipping schema evolution for table {} because the column(s) to add {} already exist.",
@@ -517,7 +784,26 @@ public class MetadataManager {
             List<TableChange> tableChanges,
             TablePropertyChanges tablePropertyChanges,
             boolean ignoreIfNotExists,
-            FlussPrincipal flussPrincipal) {
+            FlussPrincipal flussPrincipal,
+            int coordinatorZkVersion) {
+        synchronized (metadataMutationLock) {
+            alterTablePropertiesInternal(
+                    tablePath,
+                    tableChanges,
+                    tablePropertyChanges,
+                    ignoreIfNotExists,
+                    flussPrincipal,
+                    coordinatorZkVersion);
+        }
+    }
+
+    private void alterTablePropertiesInternal(
+            TablePath tablePath,
+            List<TableChange> tableChanges,
+            TablePropertyChanges tablePropertyChanges,
+            boolean ignoreIfNotExists,
+            FlussPrincipal flussPrincipal,
+            int coordinatorZkVersion) {
         try {
             // it throws TableNotExistException if the table or database not exists
             TableRegistration tableReg = getTableRegistration(tablePath);
@@ -564,7 +850,11 @@ public class MetadataManager {
                 TableRegistration updatedTableRegistration =
                         tableReg.newProperties(
                                 newDescriptor.getProperties(), newDescriptor.getCustomProperties());
-                zookeeperClient.updateTable(tablePath, updatedTableRegistration);
+                zookeeperClient.updateTable(
+                        tablePath,
+                        tableReg.tableId,
+                        updatedTableRegistration,
+                        coordinatorZkVersion);
             } else {
                 LOG.info(
                         "No properties changed when alter table {}, skip update table.", tablePath);
@@ -821,7 +1111,26 @@ public class MetadataManager {
             long tableId,
             PartitionAssignment partitionAssignment,
             ResolvedPartitionSpec partition,
-            boolean ignoreIfExists) {
+            boolean ignoreIfExists,
+            int coordinatorZkVersion) {
+        synchronized (metadataMutationLock) {
+            createPartitionInternal(
+                    tablePath,
+                    tableId,
+                    partitionAssignment,
+                    partition,
+                    ignoreIfExists,
+                    coordinatorZkVersion);
+        }
+    }
+
+    private void createPartitionInternal(
+            TablePath tablePath,
+            long tableId,
+            PartitionAssignment partitionAssignment,
+            ResolvedPartitionSpec partition,
+            boolean ignoreIfExists,
+            int coordinatorZkVersion) {
         String partitionName = partition.getPartitionName();
         Optional<PartitionRegistration> optionalPartitionRegistration =
                 getOptionalPartitionRegistration(tablePath, partitionName);
@@ -884,7 +1193,8 @@ public class MetadataManager {
                     partitionAssignment,
                     zookeeperClient.getDefaultRemoteDataDir(),
                     tablePath,
-                    tableId);
+                    tableId,
+                    coordinatorZkVersion);
             LOG.info(
                     "Register partition {} to zookeeper for table [{}].", partitionName, tablePath);
         } catch (KeeperException.NodeExistsException nodeExistsException) {
@@ -918,7 +1228,23 @@ public class MetadataManager {
     }
 
     public void dropPartition(
-            TablePath tablePath, ResolvedPartitionSpec partition, boolean ignoreIfNotExists) {
+            TablePath tablePath,
+            long expectedTableId,
+            ResolvedPartitionSpec partition,
+            boolean ignoreIfNotExists,
+            int coordinatorZkVersion) {
+        synchronized (metadataMutationLock) {
+            dropPartitionInternal(
+                    tablePath, expectedTableId, partition, ignoreIfNotExists, coordinatorZkVersion);
+        }
+    }
+
+    private void dropPartitionInternal(
+            TablePath tablePath,
+            long expectedTableId,
+            ResolvedPartitionSpec partition,
+            boolean ignoreIfNotExists,
+            int coordinatorZkVersion) {
         String partitionName = partition.getPartitionName();
         Optional<PartitionRegistration> optionalPartitionRegistration =
                 getOptionalPartitionRegistration(tablePath, partitionName);
@@ -936,9 +1262,18 @@ public class MetadataManager {
         try {
             if (hasSecondaryIndexes(tablePath)) {
                 dropPartitionAndPersistTombstone(
-                        tablePath, partitionName, optionalPartitionRegistration.get());
+                        tablePath,
+                        expectedTableId,
+                        partitionName,
+                        optionalPartitionRegistration.get(),
+                        coordinatorZkVersion);
             } else {
-                zookeeperClient.deletePartition(tablePath, partitionName);
+                zookeeperClient.deletePartition(
+                        tablePath,
+                        partitionName,
+                        expectedTableId,
+                        optionalPartitionRegistration.get().getPartitionId(),
+                        coordinatorZkVersion);
             }
         } catch (Exception e) {
             throw new FlussRuntimeException(
@@ -953,8 +1288,30 @@ public class MetadataManager {
         return !getLatestSchema(tablePath).getSchema().getIndexes().isEmpty();
     }
 
+    public PartitionTombstone advancePartitionTombstone(
+            TablePath tablePath,
+            long expectedTableId,
+            long partitionId,
+            Collection<Long> alivePartitionIdsAfterDrop,
+            int coordinatorZkVersion)
+            throws Exception {
+        synchronized (metadataMutationLock) {
+            return PartitionTombstoneAdvancer.advanceAndPersist(
+                    zookeeperClient,
+                    tablePath,
+                    expectedTableId,
+                    partitionId,
+                    alivePartitionIdsAfterDrop,
+                    coordinatorZkVersion);
+        }
+    }
+
     private void dropPartitionAndPersistTombstone(
-            TablePath tablePath, String partitionName, PartitionRegistration partitionRegistration)
+            TablePath tablePath,
+            long expectedTableId,
+            String partitionName,
+            PartitionRegistration partitionRegistration,
+            int coordinatorZkVersion)
             throws Exception {
         long partitionId = partitionRegistration.getPartitionId();
         Exception lastConflict = null;
@@ -968,7 +1325,13 @@ public class MetadataManager {
                             current.f0, partitionId, alivePartitionIdsAfterDrop);
             try {
                 zookeeperClient.deletePartitionAndSetTombstone(
-                        tablePath, partitionName, updated, current.f1);
+                        tablePath,
+                        partitionName,
+                        expectedTableId,
+                        partitionId,
+                        updated,
+                        current.f1,
+                        coordinatorZkVersion);
                 return;
             } catch (KeeperException.BadVersionException | KeeperException.NodeExistsException e) {
                 lastConflict = e;

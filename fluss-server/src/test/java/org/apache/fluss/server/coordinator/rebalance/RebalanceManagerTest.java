@@ -95,7 +95,11 @@ public class RebalanceManagerTest {
         kvSnapshotLeaseManager.start();
 
         autoPartitionManager =
-                new AutoPartitionManager(serverMetadataCache, metadataManager, new Configuration());
+                new AutoPartitionManager(
+                        serverMetadataCache,
+                        metadataManager,
+                        new Configuration(),
+                        zkEpoch.getCoordinatorEpochZkVersion());
         lakeTableTieringManager =
                 new LakeTableTieringManager(TestingMetricGroups.LAKE_TIERING_METRICS);
         CoordinatorEventProcessor eventProcessor = buildCoordinatorEventProcessor();

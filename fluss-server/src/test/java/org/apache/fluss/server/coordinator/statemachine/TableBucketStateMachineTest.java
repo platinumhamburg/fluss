@@ -126,7 +126,8 @@ class TableBucketStateMachineTest {
                                 zookeeperClient,
                                 new Configuration(),
                                 new LakeCatalogDynamicLoader(new Configuration(), null, true)),
-                        new Configuration());
+                        new Configuration(),
+                        zkEpoch.getCoordinatorEpochZkVersion());
         lakeTableTieringManager =
                 new LakeTableTieringManager(TestingMetricGroups.LAKE_TIERING_METRICS);
 

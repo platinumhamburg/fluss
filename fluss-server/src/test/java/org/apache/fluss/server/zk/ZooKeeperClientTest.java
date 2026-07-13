@@ -24,6 +24,7 @@ import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
@@ -34,17 +35,21 @@ import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
+import org.apache.fluss.server.zk.data.DatabaseRegistration;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableDeletion;
+import org.apache.fluss.server.zk.data.TableMetadataRegistration;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
 import org.apache.fluss.shaded.curator5.org.apache.curator.CuratorZookeeperClient;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFramework;
+import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.transaction.CuratorOp;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.ZooKeeper;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.client.ZKClientConfig;
@@ -74,6 +79,7 @@ import java.util.stream.Collectors;
 import static org.apache.fluss.cluster.rebalance.RebalanceStatus.COMPLETED;
 import static org.apache.fluss.cluster.rebalance.RebalanceStatus.NOT_STARTED;
 import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
+import static org.apache.fluss.server.zk.data.ZkData.TableDeletionZNode;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -395,10 +401,11 @@ class ZooKeeperClientTest {
                 .containsValues(tableReg1, tableReg2);
 
         // update table.
+        long tableIdToUpdate = tableReg1.tableId;
         currentMillis = System.currentTimeMillis();
         tableReg1 =
                 new TableRegistration(
-                        13,
+                        tableIdToUpdate,
                         "third table",
                         Arrays.asList("a", "b"),
                         new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
@@ -407,7 +414,8 @@ class ZooKeeperClientTest {
                         remoteDataDir,
                         currentMillis,
                         currentMillis);
-        zookeeperClient.updateTable(tablePath1, tableReg1);
+        zookeeperClient.updateTable(
+                tablePath1, tableIdToUpdate, tableReg1, zkEpoch.getCoordinatorEpochZkVersion());
         optionalTable1 = zookeeperClient.getTable(tablePath1);
         assertThat(optionalTable1.isPresent()).isTrue();
         assertThat(optionalTable1.get()).isEqualTo(tableReg1);
@@ -415,6 +423,463 @@ class ZooKeeperClientTest {
         // delete table.
         zookeeperClient.deleteTable(tablePath1);
         assertThat(zookeeperClient.getTable(tablePath1)).isEmpty();
+    }
+
+    @Test
+    void testRegisterTablesAtomically() throws Exception {
+        TablePath tablePath1 = TablePath.of("atomic_db", "table_1");
+        TablePath tablePath2 = TablePath.of("atomic_db", "table_2");
+        registerDatabase("atomic_db");
+        Schema schema1 =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        Schema schema2 =
+                Schema.newBuilder().column("key", DataTypes.BIGINT()).primaryKey("key").build();
+        TableRegistration table1 = tableRegistration(101, schema1, 2);
+        TableRegistration table2 = tableRegistration(102, schema2, 1);
+        TableAssignment assignment1 =
+                TableAssignment.builder()
+                        .add(0, BucketAssignment.of(1, 2))
+                        .add(1, BucketAssignment.of(2, 1))
+                        .build();
+
+        zookeeperClient.registerTablesAtomically(
+                Arrays.asList(
+                        new TableMetadataRegistration(tablePath1, table1, schema1, assignment1),
+                        new TableMetadataRegistration(tablePath2, table2, schema2, null)),
+                zkEpoch.getCoordinatorEpochZkVersion());
+
+        assertThat(zookeeperClient.getTable(tablePath1)).contains(table1);
+        assertThat(zookeeperClient.getSchemaById(tablePath1, 1))
+                .contains(new SchemaInfo(schema1, 1));
+        assertThat(zookeeperClient.getTableAssignment(101)).contains(assignment1);
+        assertThat(zookeeperClient.getTable(tablePath2)).contains(table2);
+        assertThat(zookeeperClient.getSchemaById(tablePath2, 1))
+                .contains(new SchemaInfo(schema2, 1));
+        assertThat(zookeeperClient.getTableAssignment(102)).isEmpty();
+    }
+
+    @Test
+    void testRegisterTablesAtomicallyLeavesNoPartialMetadataOnConflict() throws Exception {
+        TablePath newTablePath = TablePath.of("atomic_conflict_db", "new_table");
+        TablePath existingTablePath = TablePath.of("atomic_conflict_db", "existing_table");
+        registerDatabase("atomic_conflict_db");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        TableRegistration newTable = tableRegistration(201, schema, 1);
+        TableRegistration existingTable = tableRegistration(202, schema, 1);
+        TableAssignment newAssignment =
+                TableAssignment.builder().add(0, BucketAssignment.of(1)).build();
+        zookeeperClient.registerTable(existingTablePath, existingTable);
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerTablesAtomically(
+                                        Arrays.asList(
+                                                new TableMetadataRegistration(
+                                                        newTablePath,
+                                                        newTable,
+                                                        schema,
+                                                        newAssignment),
+                                                new TableMetadataRegistration(
+                                                        existingTablePath,
+                                                        tableRegistration(203, schema, 1),
+                                                        schema,
+                                                        null)),
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(KeeperException.NodeExistsException.class);
+
+        assertThat(zookeeperClient.getTable(newTablePath)).isEmpty();
+        assertThat(zookeeperClient.getSchemaById(newTablePath, 1)).isEmpty();
+        assertThat(zookeeperClient.getTableAssignment(201)).isEmpty();
+        assertThat(zookeeperClient.getTable(existingTablePath)).contains(existingTable);
+    }
+
+    @Test
+    void testRegisterTablesAtomicallyRejectsStaleCoordinatorEpoch() throws Exception {
+        TablePath tablePath = TablePath.of("stale_epoch_db", "table");
+        registerDatabase("stale_epoch_db");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        TableRegistration table = tableRegistration(301, schema, 1);
+        TableAssignment assignment =
+                TableAssignment.builder().add(0, BucketAssignment.of(1)).build();
+        int staleZkVersion = zkEpoch.getCoordinatorEpochZkVersion();
+        zookeeperClient.fenceBecomeCoordinatorLeader("new-coordinator");
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerTablesAtomically(
+                                        Collections.singletonList(
+                                                new TableMetadataRegistration(
+                                                        tablePath, table, schema, assignment)),
+                                        staleZkVersion))
+                .isInstanceOf(KeeperException.BadVersionException.class);
+
+        assertThat(zookeeperClient.getTable(tablePath)).isEmpty();
+        assertThat(zookeeperClient.getSchemaById(tablePath, 1)).isEmpty();
+        assertThat(zookeeperClient.getTableAssignment(301)).isEmpty();
+    }
+
+    @Test
+    void testRegisterTablesAtomicallyDoesNotRecreateDeletedDatabase() throws Exception {
+        String database = "deleted_atomic_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        registerDatabase(database);
+        zookeeperClient.deleteDatabase(database);
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerTablesAtomically(
+                                        Collections.singletonList(
+                                                new TableMetadataRegistration(
+                                                        tablePath,
+                                                        tableRegistration(350, schema, 1),
+                                                        schema,
+                                                        null)),
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(KeeperException.NoNodeException.class);
+
+        assertThat(zookeeperClient.getDatabase(database)).isEmpty();
+        assertThat(zookeeperClient.getTable(tablePath)).isEmpty();
+    }
+
+    @Test
+    void testTableDeletionIsIdentityAndCoordinatorEpochFenced() throws Exception {
+        TablePath tablePath = TablePath.of("conditional_delete_db", "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        TableRegistration table = tableRegistration(401, schema, 1);
+        registerDatabase("conditional_delete_db");
+        zookeeperClient.registerTable(tablePath, table);
+        zookeeperClient.registerFirstSchema(tablePath, schema);
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.markTablesForDeletion(
+                                        Collections.singletonList(
+                                                new TableDeletion(tablePath, 402)),
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(zookeeperClient.getTable(tablePath)).contains(table);
+        assertThat(zookeeperClient.getSchemaById(tablePath, 1)).contains(new SchemaInfo(schema, 1));
+
+        int staleCoordinatorVersion = zkEpoch.getCoordinatorEpochZkVersion();
+        zookeeperClient.markTablesForDeletion(
+                Collections.singletonList(new TableDeletion(tablePath, 401)),
+                staleCoordinatorVersion);
+        assertThat(
+                        zookeeperClient
+                                .getCuratorClient()
+                                .checkExists()
+                                .forPath(TableDeletionZNode.path(tablePath)))
+                .isNotNull();
+
+        ZkEpoch newEpoch = zookeeperClient.fenceBecomeCoordinatorLeader("new-coordinator");
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.completeTableDeletion(
+                                        tablePath, staleCoordinatorVersion))
+                .isInstanceOf(KeeperException.BadVersionException.class);
+        assertThat(zookeeperClient.getTable(tablePath)).contains(table);
+        assertThat(zookeeperClient.getSchemaById(tablePath, 1)).contains(new SchemaInfo(schema, 1));
+
+        zookeeperClient.resumeTableDeletions(newEpoch.getCoordinatorEpochZkVersion());
+        assertThat(zookeeperClient.getTable(tablePath)).isEmpty();
+        assertThat(zookeeperClient.getSchemaById(tablePath, 1)).isEmpty();
+    }
+
+    @Test
+    void testCascadeDeletionMarkersAreCreatedAtomically() throws Exception {
+        String database = "atomic_delete_db";
+        TablePath tablePath1 = TablePath.of(database, "table_1");
+        TablePath tablePath2 = TablePath.of(database, "table_2");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        registerDatabase(database);
+        zookeeperClient.registerTable(tablePath1, tableRegistration(411, schema, 1));
+        zookeeperClient.registerTable(tablePath2, tableRegistration(412, schema, 1));
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.markTablesForDeletion(
+                                        Arrays.asList(
+                                                new TableDeletion(tablePath1, 411),
+                                                new TableDeletion(tablePath2, 999)),
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(
+                        zookeeperClient
+                                .getCuratorClient()
+                                .checkExists()
+                                .forPath(TableDeletionZNode.path(tablePath1)))
+                .isNull();
+        assertThat(
+                        zookeeperClient
+                                .getCuratorClient()
+                                .checkExists()
+                                .forPath(TableDeletionZNode.path(tablePath2)))
+                .isNull();
+        assertThat(zookeeperClient.getTable(tablePath1)).isPresent();
+        assertThat(zookeeperClient.getTable(tablePath2)).isPresent();
+    }
+
+    @Test
+    void testMarkedTableRejectsPartitionCreationWithoutLeakingAssignment() throws Exception {
+        String database = "deleting_partition_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        long tableId = 421L;
+        long partitionId = 422L;
+        registerDatabase(database);
+        zookeeperClient.registerTable(tablePath, tableRegistration(tableId, schema, 1));
+        zookeeperClient.markTablesForDeletion(
+                Collections.singletonList(new TableDeletion(tablePath, tableId)),
+                zkEpoch.getCoordinatorEpochZkVersion());
+
+        PartitionAssignment assignment =
+                new PartitionAssignment(
+                        tableId, Collections.singletonMap(0, BucketAssignment.of(1)));
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerPartitionAssignmentAndMetadata(
+                                        partitionId,
+                                        "p=1",
+                                        assignment,
+                                        remoteDataDir,
+                                        tablePath,
+                                        tableId,
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(zookeeperClient.getPartitionAssignment(partitionId)).isEmpty();
+        assertThat(zookeeperClient.getPartition(tablePath, "p=1")).isEmpty();
+        assertThat(zookeeperClient.getTable(tablePath)).isPresent();
+    }
+
+    @Test
+    void testMarkedTableDeletionBatchesLargeMetadataTree() throws Exception {
+        String database = "large_delete_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        long tableId = 431L;
+        registerDatabase(database);
+        zookeeperClient.registerTable(tablePath, tableRegistration(tableId, schema, 1));
+
+        List<CuratorOp> childCreates = new ArrayList<>();
+        for (int i = 0; i < 1023; i++) {
+            childCreates.add(
+                    zookeeperClient
+                            .getCuratorClient()
+                            .transactionOp()
+                            .create()
+                            .forPath(
+                                    org.apache.fluss.server.zk.data.ZkData.TableZNode.path(
+                                                    tablePath)
+                                            + "/child-"
+                                            + i));
+        }
+        zookeeperClient.getCuratorClient().transaction().forOperations(childCreates);
+
+        zookeeperClient.markTablesForDeletion(
+                Collections.singletonList(new TableDeletion(tablePath, tableId)),
+                zkEpoch.getCoordinatorEpochZkVersion());
+        zookeeperClient.completeTableDeletion(tablePath, zkEpoch.getCoordinatorEpochZkVersion());
+
+        assertThat(zookeeperClient.getTable(tablePath)).isEmpty();
+    }
+
+    @Test
+    void testStalePartitionDeleteDoesNotMutateRecreatedTable() throws Exception {
+        String database = "recreated_partition_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        long oldTableId = 441L;
+        long oldPartitionId = 442L;
+        registerDatabase(database);
+        zookeeperClient.registerTable(tablePath, tableRegistration(oldTableId, schema, 1));
+        zookeeperClient.registerPartitionAssignmentAndMetadata(
+                oldPartitionId,
+                "p=1",
+                new PartitionAssignment(
+                        oldTableId, Collections.singletonMap(0, BucketAssignment.of(1))),
+                remoteDataDir,
+                tablePath,
+                oldTableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
+
+        zookeeperClient.deleteTable(tablePath);
+
+        long newTableId = 451L;
+        long newPartitionId = 452L;
+        zookeeperClient.registerTable(tablePath, tableRegistration(newTableId, schema, 1));
+        zookeeperClient.registerPartitionAssignmentAndMetadata(
+                newPartitionId,
+                "p=1",
+                new PartitionAssignment(
+                        newTableId, Collections.singletonMap(0, BucketAssignment.of(1))),
+                remoteDataDir,
+                tablePath,
+                newTableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.deletePartition(
+                                        tablePath,
+                                        "p=1",
+                                        oldTableId,
+                                        oldPartitionId,
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(zookeeperClient.getPartition(tablePath, "p=1"))
+                .hasValueSatisfying(
+                        partition ->
+                                assertThat(partition.getPartitionId()).isEqualTo(newPartitionId));
+    }
+
+    @Test
+    void testStaleCoordinatorCannotCreatePartition() throws Exception {
+        String database = "stale_partition_create_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        long tableId = 471L;
+        long partitionId = 472L;
+        registerDatabase(database);
+        zookeeperClient.registerTable(tablePath, tableRegistration(tableId, schema, 1));
+        int staleZkVersion = zkEpoch.getCoordinatorEpochZkVersion();
+        zookeeperClient.fenceBecomeCoordinatorLeader("new-coordinator");
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerPartitionAssignmentAndMetadata(
+                                        partitionId,
+                                        "p=1",
+                                        new PartitionAssignment(
+                                                tableId,
+                                                Collections.singletonMap(
+                                                        0, BucketAssignment.of(1))),
+                                        remoteDataDir,
+                                        tablePath,
+                                        tableId,
+                                        staleZkVersion))
+                .isInstanceOf(KeeperException.BadVersionException.class);
+
+        assertThat(zookeeperClient.getPartition(tablePath, "p=1")).isEmpty();
+        assertThat(zookeeperClient.getPartitionAssignment(partitionId)).isEmpty();
+    }
+
+    @Test
+    void testStaleSchemaRegistrationDoesNotRecreateDeletedTablePath() throws Exception {
+        String database = "deleted_schema_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        Schema staleSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        registerDatabase(database);
+        zookeeperClient.registerTable(tablePath, tableRegistration(461L, schema, 1));
+        zookeeperClient.registerFirstSchema(tablePath, schema);
+        zookeeperClient.deleteTable(tablePath);
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerSchema(
+                                        tablePath,
+                                        461L,
+                                        staleSchema,
+                                        2,
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(KeeperException.NoNodeException.class);
+
+        assertThat(
+                        zookeeperClient
+                                .getCuratorClient()
+                                .checkExists()
+                                .forPath(
+                                        org.apache.fluss.server.zk.data.ZkData.TableZNode.path(
+                                                tablePath)))
+                .isNull();
+        assertThat(zookeeperClient.getSchemaById(tablePath, 2)).isEmpty();
+    }
+
+    @Test
+    void testStaleTableUpdateDoesNotOverwriteRecreatedTable() throws Exception {
+        String database = "recreated_update_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        TableRegistration oldTable = tableRegistration(471L, schema, 1);
+        TableRegistration newTable = tableRegistration(472L, schema, 1);
+        registerDatabase(database);
+        zookeeperClient.registerTable(tablePath, oldTable);
+        zookeeperClient.deleteTable(tablePath);
+        zookeeperClient.registerTable(tablePath, newTable);
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.updateTable(
+                                        tablePath,
+                                        oldTable.tableId,
+                                        oldTable,
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(zookeeperClient.getTable(tablePath)).contains(newTable);
+    }
+
+    @Test
+    void testStaleCoordinatorCannotAlterExistingTable() throws Exception {
+        String database = "stale_alter_db";
+        TablePath tablePath = TablePath.of(database, "table");
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        Schema nextSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("payload", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        long tableId = 481L;
+        TableRegistration table = tableRegistration(tableId, schema, 1);
+        registerDatabase(database);
+        zookeeperClient.registerFirstSchema(tablePath, schema);
+        zookeeperClient.registerTable(tablePath, table, false);
+        int staleZkVersion = zkEpoch.getCoordinatorEpochZkVersion();
+        zookeeperClient.fenceBecomeCoordinatorLeader("new-coordinator");
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerSchema(
+                                        tablePath, tableId, nextSchema, 2, staleZkVersion))
+                .isInstanceOf(KeeperException.BadVersionException.class);
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.updateTable(
+                                        tablePath, tableId, table, staleZkVersion))
+                .isInstanceOf(KeeperException.BadVersionException.class);
+
+        assertThat(zookeeperClient.getSchemaById(tablePath, 2)).isEmpty();
+        assertThat(zookeeperClient.getTable(tablePath)).contains(table);
+    }
+
+    private static void registerDatabase(String database) throws Exception {
+        zookeeperClient.registerDatabase(
+                database, DatabaseRegistration.of(DatabaseDescriptor.builder().build()));
+    }
+
+    private static TableRegistration tableRegistration(
+            long tableId, Schema schema, int bucketCount) {
+        return TableRegistration.newTable(
+                tableId,
+                remoteDataDir,
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(bucketCount, schema.getPrimaryKeyColumnNames().get(0))
+                        .build());
     }
 
     @Test
@@ -436,6 +901,8 @@ class ZooKeeperClientTest {
                         .primaryKey("a")
                         .build();
         int registeredSchemaId = zookeeperClient.registerFirstSchema(tablePath, schema);
+        long tableId = 1L;
+        zookeeperClient.registerTable(tablePath, tableRegistration(tableId, schema, 1), false);
         assertThat(registeredSchemaId).isEqualTo(schemaId);
         assertThat(zookeeperClient.getCurrentSchemaId(tablePath)).isEqualTo(schemaId);
 
@@ -454,7 +921,9 @@ class ZooKeeperClientTest {
                         .withComment("b is second column")
                         .primaryKey("a")
                         .build();
-        registeredSchemaId = zookeeperClient.registerSchema(tablePath, schema2, 2);
+        registeredSchemaId =
+                zookeeperClient.registerSchema(
+                        tablePath, tableId, schema2, 2, zkEpoch.getCoordinatorEpochZkVersion());
         assertThat(registeredSchemaId).isEqualTo(2);
         assertThat(zookeeperClient.getCurrentSchemaId(tablePath)).isEqualTo(2);
 
@@ -464,7 +933,14 @@ class ZooKeeperClientTest {
         assertThat(schemaInfo.get().getSchemaId()).isEqualTo(2);
 
         // test register schema with existed schemaId
-        assertThatThrownBy(() -> zookeeperClient.registerSchema(tablePath, schema2, 2))
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerSchema(
+                                        tablePath,
+                                        tableId,
+                                        schema2,
+                                        2,
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
                 .isExactlyInstanceOf(KeeperException.NodeExistsException.class);
     }
 
@@ -611,9 +1087,21 @@ class ZooKeeperClientTest {
                                         })
                                 .getBucketAssignments());
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                1L, "p1", partitionAssignment, remoteDataDir, tablePath, tableId);
+                1L,
+                "p1",
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                2L, "p2", partitionAssignment, remoteDataDir, tablePath, tableId);
+                2L,
+                "p2",
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // check created partitions
         partitions = zookeeperClient.getPartitions(tablePath);
@@ -626,7 +1114,8 @@ class ZooKeeperClientTest {
                 .containsValues(new ArrayList<>(partitions));
 
         // test delete partition
-        zookeeperClient.deletePartition(tablePath, "p1");
+        zookeeperClient.deletePartition(
+                tablePath, "p1", tableId, 1L, zkEpoch.getCoordinatorEpochZkVersion());
         partitions = zookeeperClient.getPartitions(tablePath);
         assertThat(partitions).containsExactly("p2");
     }

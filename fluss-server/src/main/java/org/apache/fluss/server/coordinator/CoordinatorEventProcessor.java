@@ -86,6 +86,7 @@ import org.apache.fluss.server.coordinator.event.NotifyKvSnapshotOffsetEvent;
 import org.apache.fluss.server.coordinator.event.NotifyLakeTableOffsetEvent;
 import org.apache.fluss.server.coordinator.event.NotifyLeaderAndIsrResponseReceivedEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceEvent;
+import org.apache.fluss.server.coordinator.event.RefreshPartitionTombstonesEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
 import org.apache.fluss.server.coordinator.event.SchemaChangeEvent;
 import org.apache.fluss.server.coordinator.event.TableRegistrationChangeEvent;
@@ -118,6 +119,7 @@ import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
@@ -271,6 +273,9 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
     public void startup() {
         coordinatorContext.setCoordinatorServerInfo(getCoordinatorServerInfo());
+        // A deletion marker keeps its table root occupied while descendants are removed. Finish
+        // these deletions before the table watcher and metadata loader can observe partial trees.
+        metadataManager.resumeTableDeletions(coordinatorContext.getCoordinatorZkVersion());
         // start watchers first so that we won't miss node in zk;
         coordinatorChangeWatcher.start();
         tabletServerChangeWatcher.start();
@@ -612,6 +617,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
             processNotifyKvSnapshotOffsetEvent((NotifyKvSnapshotOffsetEvent) event);
         } else if (event instanceof NotifyLakeTableOffsetEvent) {
             processNotifyLakeTableOffsetEvent((NotifyLakeTableOffsetEvent) event);
+        } else if (event instanceof RefreshPartitionTombstonesEvent) {
+            processRefreshPartitionTombstones();
         } else if (event instanceof CommitRemoteLogManifestEvent) {
             CommitRemoteLogManifestEvent commitRemoteLogManifestEvent =
                     (CommitRemoteLogManifestEvent) event;
@@ -921,6 +928,26 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 new TablePartition(tableId, dropPartitionEvent.getPartitionId());
 
         TableInfo dropTableInfo = coordinatorContext.getTableInfoById(tableId);
+        if (dropTableInfo == null) {
+            return;
+        }
+        try {
+            Optional<TableRegistration> persistedTable =
+                    zooKeeperClient.getTable(dropTableInfo.getTablePath());
+            if (zooKeeperClient.isTableMarkedForDeletion(dropTableInfo.getTablePath())
+                    || !persistedTable.isPresent()
+                    || persistedTable.get().tableId != tableId) {
+                // Recursive table deletion also emits child partition events. The table deletion
+                // event owns replica cleanup and no partition tombstone is needed in that case.
+                return;
+            }
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to determine whether table "
+                            + dropTableInfo.getTablePath()
+                            + " is being deleted.",
+                    e);
+        }
         // For main tables that declare secondary indexes, read the already-persisted
         // PartitionTombstone and ship it to live TabletServers in the same UpdateMetadataRequest.
         // If this event came from a legacy/direct ZK partition delete that did not atomically
@@ -937,11 +964,12 @@ public class CoordinatorEventProcessor implements EventProcessor {
                             loadAlivePartitionIdsForSafeFloor(
                                     dropTableInfo, dropPartitionEvent.getPartitionId());
                     updated =
-                            PartitionTombstoneAdvancer.advanceAndPersist(
-                                    zooKeeperClient,
+                            metadataManager.advancePartitionTombstone(
                                     dropTableInfo.getTablePath(),
+                                    tableId,
                                     dropPartitionEvent.getPartitionId(),
-                                    alivePartitionIdsAfterDrop);
+                                    alivePartitionIdsAfterDrop,
+                                    coordinatorContext.getCoordinatorZkVersion());
                 }
                 partitionTombstones = Collections.singletonMap(tableId, updated);
             } catch (Exception e) {
@@ -2299,11 +2327,30 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 throw new FlussRuntimeException(
                         "Failed to load PartitionTombstone for table "
                                 + tableInfo.getTablePath()
-                                + " while building startup metadata update",
+                                + " while building metadata update",
                         e);
             }
         }
         return tombstones;
+    }
+
+    private void processRefreshPartitionTombstones() {
+        Set<ServerInfo> liveTabletServers =
+                new HashSet<>(coordinatorContext.getLiveTabletServers().values());
+        if (liveTabletServers.isEmpty()) {
+            return;
+        }
+
+        try {
+            Map<Long, PartitionTombstone> tombstones = collectPartitionTombstonesForIndexedTables();
+            if (!tombstones.isEmpty()) {
+                updateTabletServerMetadataCache(
+                        liveTabletServers, null, null, Collections.emptySet(), tombstones);
+            }
+        } catch (RuntimeException e) {
+            LOG.warn("Failed to refresh partition tombstones. Scheduling another refresh.", e);
+            coordinatorRequestBatch.schedulePartitionTombstoneRepair();
+        }
     }
 
     /** Update metadata cache for all remote tablet servers. */

@@ -18,19 +18,49 @@
 package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.metadata.PartitionTombstone;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Tests for {@link PartitionTombstoneAdvancer}. */
 class PartitionTombstoneAdvancerTest {
+
+    @Test
+    void testCasConflictRecomputesFromLatestTombstone() throws Exception {
+        ZooKeeperClient zkClient = mock(ZooKeeperClient.class);
+        TablePath tablePath = TablePath.of("db", "table");
+        PartitionTombstone concurrent = new PartitionTombstone(-1L, Collections.singleton(7L), 1L);
+        when(zkClient.getPartitionTombstoneWithVersion(tablePath))
+                .thenReturn(Tuple2.of(PartitionTombstone.EMPTY, Optional.empty()))
+                .thenReturn(Tuple2.of(concurrent, Optional.of(0)));
+        doThrow(new KeeperException.NodeExistsException())
+                .doNothing()
+                .when(zkClient)
+                .compareAndSetPartitionTombstone(eq(tablePath), any(), any());
+
+        PartitionTombstone updated =
+                PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tablePath, 9L);
+
+        assertThat(updated.getExplicitSet()).containsExactlyInAnyOrder(7L, 9L);
+        assertThat(updated.getVersion()).isEqualTo(2L);
+    }
 
     @Test
     void testSparseAlivePartitionsAdvanceFloorToBeforeMinimumAlive() {

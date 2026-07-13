@@ -242,11 +242,12 @@ public class CoordinatorServer extends ServerBase {
                     new LakeTableTieringManager(
                             new LakeTieringMetricGroup(metricRegistry, serverMetricGroup));
 
-            this.metadataManager = new MetadataManager(zkClient, conf, lakeCatalogDynamicLoader);
             this.ioExecutor =
                     Executors.newFixedThreadPool(
                             conf.get(ConfigOptions.SERVER_IO_POOL_SIZE),
                             new ExecutorThreadFactory("coordinator-io"));
+            this.metadataManager =
+                    new MetadataManager(zkClient, conf, lakeCatalogDynamicLoader, ioExecutor);
 
             // Initialize and start the kv snapshot lease manager
             this.kvSnapshotLeaseManager =
@@ -303,7 +304,11 @@ public class CoordinatorServer extends ServerBase {
             this.coordinatorChannelManager = new CoordinatorChannelManager(rpcClient);
 
             this.autoPartitionManager =
-                    new AutoPartitionManager(metadataCache, metadataManager, conf);
+                    new AutoPartitionManager(
+                            metadataCache,
+                            metadataManager,
+                            conf,
+                            zkEpoch.getCoordinatorEpochZkVersion());
             autoPartitionManager.start();
 
             // start coordinator event processor after we register coordinator leader to zk

@@ -25,11 +25,14 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.zk.NOPErrorHandler;
+import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.BucketAssignment;
+import org.apache.fluss.server.zk.data.DatabaseRegistration;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.types.DataTypes;
 
@@ -48,10 +51,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Unit-level coverage for the read-advance-persist helper used by the Coordinator's {@code
- * processDropPartition}. The Coordinator wiring (calling this helper for indexed main tables and
- * shipping the new tombstone via {@code UpdateMetadataRequest}) is verified by inspection; this
- * test exercises the helper against a real ZooKeeper to guarantee persistence, version-bumping,
- * conservative fallback, and safe-floor compaction when an alive-partition snapshot is available.
+ * processDropPartition}. {@link CoordinatorEventProcessorTest} covers the event wiring and metadata
+ * fanout; this test exercises the helper against a real ZooKeeper to guarantee persistence,
+ * version-bumping, conservative fallback, and safe-floor compaction when an alive-partition
+ * snapshot is available.
  */
 class CoordinatorTombstoneOnDropPartitionTest {
 
@@ -84,6 +87,7 @@ class CoordinatorTombstoneOnDropPartitionTest {
         TablePath tp = TablePath.of("db", "main");
         // Sanity check: znode does not exist yet, so a read returns EMPTY.
         assertThat(zkClient.getPartitionTombstone(tp)).isEqualTo(PartitionTombstone.EMPTY);
+        registerTable(tp, 1L);
 
         PartitionTombstone updated = PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 5L);
 
@@ -97,6 +101,7 @@ class CoordinatorTombstoneOnDropPartitionTest {
     @Test
     void testSuccessiveDropsAccumulateInExplicitSet() throws Exception {
         TablePath tp = TablePath.of("db", "main");
+        registerTable(tp, 1L);
         PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 5L);
         PartitionTombstone afterTwo =
                 PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 7L);
@@ -110,6 +115,7 @@ class CoordinatorTombstoneOnDropPartitionTest {
     @Test
     void testLegacyDropsDoNotAdvanceFloorWithoutAliveSnapshot() throws Exception {
         TablePath tp = TablePath.of("db", "main");
+        registerTable(tp, 1L);
         PartitionTombstone afterZero =
                 PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 0L);
         assertThat(afterZero.getFloor()).isEqualTo(-1L);
@@ -133,6 +139,7 @@ class CoordinatorTombstoneOnDropPartitionTest {
     @Test
     void testAdvanceAndPersistUsesAliveSnapshotToCompressSparseDroppedIds() throws Exception {
         TablePath tablePath = TablePath.of("default", "tombstone_safe_floor_sparse");
+        registerTable(tablePath, 1L);
         zkClient.setOrCreatePartitionTombstone(
                 tablePath, new PartitionTombstone(0L, asSet(2L, 10L), 3L));
 
@@ -149,6 +156,7 @@ class CoordinatorTombstoneOnDropPartitionTest {
     @Test
     void testAdvanceAndPersistKeepsHighSparseDropExplicit() throws Exception {
         TablePath tablePath = TablePath.of("default", "tombstone_safe_floor_high_sparse");
+        registerTable(tablePath, 1L);
         zkClient.setOrCreatePartitionTombstone(tablePath, PartitionTombstone.EMPTY);
 
         PartitionTombstone updated =
@@ -164,6 +172,7 @@ class CoordinatorTombstoneOnDropPartitionTest {
     @Test
     void testAdvanceAndPersistFoldsEverythingWhenNoAlivePartitionRemains() throws Exception {
         TablePath tablePath = TablePath.of("default", "tombstone_safe_floor_empty_alive");
+        registerTable(tablePath, 1L);
         zkClient.setOrCreatePartitionTombstone(
                 tablePath, new PartitionTombstone(0L, asSet(2L, 50L), 3L));
 
@@ -183,6 +192,7 @@ class CoordinatorTombstoneOnDropPartitionTest {
         // still advances so observers can detect a change. The shape of (floor, explicit) stays
         // identical to the previous snapshot.
         TablePath tp = TablePath.of("db", "main");
+        registerTable(tp, 1L);
         PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 0L);
         PartitionTombstone afterRedrop =
                 PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tp, 0L);
@@ -196,6 +206,8 @@ class CoordinatorTombstoneOnDropPartitionTest {
     void testTombstonesAreScopedPerTablePath() throws Exception {
         TablePath tpA = TablePath.of("db", "a");
         TablePath tpB = TablePath.of("db", "b");
+        registerTable(tpA, 1L);
+        registerTable(tpB, 2L);
 
         PartitionTombstone afterA = PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tpA, 5L);
         PartitionTombstone afterB = PartitionTombstoneAdvancer.advanceAndPersist(zkClient, tpB, 9L);
@@ -231,11 +243,19 @@ class CoordinatorTombstoneOnDropPartitionTest {
                 new PartitionAssignment(
                         tableId, Collections.singletonMap(0, BucketAssignment.of(0)));
         ResolvedPartitionSpec partition = ResolvedPartitionSpec.fromPartitionValue("dt", "2026");
-        metadataManager.createPartition(tablePath, tableId, assignment, partition, false);
+        ZkEpoch epoch = zkClient.fenceBecomeCoordinatorLeader("coordinator");
+        metadataManager.createPartition(
+                tablePath,
+                tableId,
+                assignment,
+                partition,
+                false,
+                epoch.getCoordinatorEpochZkVersion());
         PartitionRegistration registration =
                 zkClient.getPartition(tablePath, partition.getPartitionName()).get();
 
-        metadataManager.dropPartition(tablePath, partition, false);
+        metadataManager.dropPartition(
+                tablePath, tableId, partition, false, epoch.getCoordinatorEpochZkVersion());
 
         assertThat(zkClient.getPartition(tablePath, partition.getPartitionName())).isEmpty();
         assertThat(zkClient.getPartitionAssignment(registration.getPartitionId()))
@@ -247,6 +267,21 @@ class CoordinatorTombstoneOnDropPartitionTest {
 
     private static Set<Long> asSet(long... values) {
         return LongStream.of(values).boxed().collect(Collectors.toSet());
+    }
+
+    private static void registerTable(TablePath tablePath, long tableId) throws Exception {
+        if (!zkClient.getDatabase(tablePath.getDatabaseName()).isPresent()) {
+            zkClient.registerDatabase(
+                    tablePath.getDatabaseName(),
+                    DatabaseRegistration.of(DatabaseDescriptor.builder().build()));
+        }
+        Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build();
+        zkClient.registerTable(
+                tablePath,
+                TableRegistration.newTable(
+                        tableId,
+                        zkClient.getDefaultRemoteDataDir(),
+                        TableDescriptor.builder().schema(schema).distributedBy(1, "id").build()));
     }
 
     private static MetadataManager newMetadataManager() {

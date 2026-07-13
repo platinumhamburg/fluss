@@ -1436,6 +1436,7 @@ public class IndexSenderTest {
             await(() -> owner.terminalFailure() != null);
             hooks.release();
             await(() -> sender.inFlightRequestCount() == 0);
+            await(() -> accumulator.pendingBytes() == 0L);
 
             assertThat(gateway.requests).isEmpty();
             assertThat(accumulator.pendingBytes()).isZero();

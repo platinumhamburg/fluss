@@ -54,6 +54,7 @@ import org.apache.fluss.server.coordinator.event.AdjustIsrReceivedEvent;
 import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
 import org.apache.fluss.server.coordinator.event.CoordinatorEventManager;
+import org.apache.fluss.server.coordinator.event.RefreshPartitionTombstonesEvent;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.statemachine.BucketState;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaState;
@@ -206,7 +207,11 @@ class CoordinatorEventProcessorTest {
         // set a test channel manager for the context
         testCoordinatorChannelManager = new TestCoordinatorChannelManager();
         autoPartitionManager =
-                new AutoPartitionManager(serverMetadataCache, metadataManager, new Configuration());
+                new AutoPartitionManager(
+                        serverMetadataCache,
+                        metadataManager,
+                        new Configuration(),
+                        zkEpoch.getCoordinatorEpochZkVersion());
         lakeTableTieringManager =
                 new LakeTableTieringManager(TestingMetricGroups.LAKE_TIERING_METRICS);
         Configuration conf = new Configuration();
@@ -369,6 +374,18 @@ class CoordinatorEventProcessorTest {
                 ctx -> assertThat(ctx.getTablePathById(unrelatedId)).isEqualTo(unrelatedPath));
 
         assertThat(lastTombstoneUpdate(0)).isEmpty();
+
+        PartitionTombstone refreshedTombstone =
+                new PartitionTombstone(17L, Collections.singleton(23L), 2L);
+        zookeeperClient.setOrCreatePartitionTombstone(mainPath, refreshedTombstone);
+        eventProcessor.getCoordinatorEventManager().put(new RefreshPartitionTombstonesEvent());
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(lastTombstoneUpdate(0))
+                                .containsExactlyEntriesOf(
+                                        Collections.singletonMap(mainTableId, refreshedTombstone)));
     }
 
     @Test
@@ -734,7 +751,12 @@ class CoordinatorEventProcessorTest {
         assertThat(completedSnapshotStoreManager.getBucketCompletedSnapshotStores()).isNotEmpty();
 
         // drop the partition
-        zookeeperClient.deletePartition(tablePath, partition1Name);
+        zookeeperClient.deletePartition(
+                tablePath,
+                partition1Name,
+                tableId,
+                partition1Id,
+                zkEpoch.getCoordinatorEpochZkVersion());
         verifyPartitionDropped(tableId, partition1Id);
 
         // verify CompleteSnapshotStore has been removed when the table partition1 is dropped
@@ -796,7 +818,12 @@ class CoordinatorEventProcessorTest {
         // now, drop partition2 and restart the coordinator event processor,
         // the partition2 should be dropped
         eventProcessor.shutdown();
-        zookeeperClient.deletePartition(tablePath, partition2Name);
+        zookeeperClient.deletePartition(
+                tablePath,
+                partition2Name,
+                tableId,
+                partition2Id,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // start the coordinator
         eventProcessor = buildCoordinatorEventProcessor();
@@ -1039,7 +1066,12 @@ class CoordinatorEventProcessorTest {
         builder.setCustomProperty("custom.key", "custom.value");
         TablePropertyChanges tablePropertyChanges = builder.build();
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), tablePropertyChanges, false, null);
+                t1,
+                Collections.emptyList(),
+                tablePropertyChanges,
+                false,
+                null,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // get updated table info and verify metadata update request is sent
         TableInfo updatedTableInfo = metadataManager.getTable(t1);
@@ -1300,14 +1332,16 @@ class CoordinatorEventProcessorTest {
                 partitionAssignment,
                 remoteDataDir,
                 tablePath,
-                tableId);
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
         zookeeperClient.registerPartitionAssignmentAndMetadata(
                 partition2Id,
                 partition2Name,
                 partitionAssignment,
                 remoteDataDir,
                 tablePath,
-                tableId);
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         return Tuple2.of(
                 new PartitionIdName(partition1Id, partition1Name),
@@ -1592,7 +1626,8 @@ class CoordinatorEventProcessorTest {
     }
 
     private void alterTable(TablePath tablePath, List<TableChange> schemaChanges) {
-        metadataManager.alterTableSchema(tablePath, schemaChanges, true, null);
+        metadataManager.alterTableSchema(
+                tablePath, schemaChanges, true, null, zkEpoch.getCoordinatorEpochZkVersion());
     }
 
     private TableDescriptor getPartitionedTable() {

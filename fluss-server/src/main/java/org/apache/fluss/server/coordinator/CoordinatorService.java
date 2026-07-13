@@ -171,6 +171,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableDeletion;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
@@ -191,6 +192,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -239,6 +241,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     private final boolean kvTableAllowCreation;
     private final Supplier<EventManager> eventManagerSupplier;
     private final Supplier<Integer> coordinatorEpochSupplier;
+    private final Supplier<Integer> coordinatorZkVersionSupplier;
     private final CoordinatorMetadataCache metadataCache;
 
     private final LakeTableTieringManager lakeTableTieringManager;
@@ -279,6 +282,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 () -> coordinatorEventProcessorSupplier.get().getCoordinatorEventManager();
         this.coordinatorEpochSupplier =
                 () -> coordinatorEventProcessorSupplier.get().getCoordinatorEpoch();
+        this.coordinatorZkVersionSupplier =
+                () ->
+                        coordinatorEventProcessorSupplier
+                                .get()
+                                .getCoordinatorContext()
+                                .getCoordinatorZkVersion();
         this.lakeTableTieringManager = lakeTableTieringManager;
         this.metadataCache = metadataCache;
         this.lakeCatalogDynamicLoader = lakeCatalogDynamicLoader;
@@ -439,6 +448,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
     @Override
     public CompletableFuture<CreateTableResponse> createTable(CreateTableRequest request) {
+        int coordinatorZkVersion = coordinatorZkVersionSupplier.get();
+        return createTableInternal(request, coordinatorZkVersion);
+    }
+
+    private CompletableFuture<CreateTableResponse> createTableInternal(
+            CreateTableRequest request, int coordinatorZkVersion) {
         TablePath tablePath = toTablePath(request.getTablePath());
         tablePath.validate();
         authorizeDatabase(OperationType.CREATE, tablePath.getDatabaseName());
@@ -506,82 +521,42 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             }
         }
 
-        // then create table;
-        long mainTableId =
-                metadataManager.createTable(
-                        tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
-
-        // auto-derive Index Tables for any indexes declared on the main table's schema; this is
-        // synchronous so that the Coordinator returns success only when both the main table and
-        // every Index Table are persisted in ZK. If any Index Table fails to persist, roll back the
-        // partial state (the already-created Index Tables and the main table this request created)
-        // so CREATE TABLE is atomic: the caller never observes a main table that declares indexes
-        // but lacks complete backing Index Tables, and a default retry (ignoreIfExists=false) is
-        // not blocked by a half-created main table.
-        List<TablePath> createdIndexTablePaths = new ArrayList<>();
-        try {
-            autoDeriveIndexTables(tablePath, tableDescriptor, mainTableId, createdIndexTablePaths);
-        } catch (RuntimeException e) {
-            rollbackPartialTableCreation(tablePath, createdIndexTablePaths, mainTableId);
-            throw e;
+        if (tableDescriptor.getSchema().getIndexes().isEmpty()) {
+            metadataManager.createTable(
+                    tablePath, tableDescriptor, tableAssignment, request.isIgnoreIfExists());
+        } else {
+            createTableWithIndexes(
+                    tablePath,
+                    tableDescriptor,
+                    tableAssignment,
+                    request.isIgnoreIfExists(),
+                    coordinatorZkVersion);
         }
 
         return CompletableFuture.completedFuture(new CreateTableResponse());
     }
 
-    /**
-     * Undoes a partially completed CREATE TABLE after {@link #autoDeriveIndexTables} fails. Drops
-     * every Index Table created by this request and, only when this request actually created the
-     * main table ({@code createdMainTableId != -1}), drops the main table too. Cleanup failures are
-     * logged rather than thrown so the original creation error is the one surfaced to the caller.
-     */
-    private void rollbackPartialTableCreation(
-            TablePath mainTablePath,
-            List<TablePath> createdIndexTablePaths,
-            long createdMainTableId) {
-        for (TablePath indexPath : createdIndexTablePaths) {
-            try {
-                metadataManager.dropTable(indexPath, /* ignoreIfNotExists= */ true);
-            } catch (RuntimeException cleanupError) {
-                LOG.warn(
-                        "Failed to clean up derived Index Table {} while rolling back CREATE TABLE for {}",
-                        indexPath,
-                        mainTablePath,
-                        cleanupError);
-            }
-        }
-        // Only drop the main table if this request created it. When ignoreIfExists=true matched a
-        // pre-existing main table (createdMainTableId == -1), leave that table intact.
-        if (createdMainTableId != -1L) {
-            try {
-                metadataManager.dropTable(mainTablePath, /* ignoreIfNotExists= */ true);
-            } catch (RuntimeException cleanupError) {
-                LOG.warn(
-                        "Failed to drop main table while rolling back CREATE TABLE for {}",
-                        mainTablePath,
-                        cleanupError);
-            }
-        }
-    }
-
-    private void autoDeriveIndexTables(
+    private void createTableWithIndexes(
             TablePath mainTablePath,
             TableDescriptor mainDescriptor,
-            long createdMainTableId,
-            List<TablePath> createdIndexTablePaths) {
-        if (mainDescriptor.getSchema().getIndexes().isEmpty() || createdMainTableId == -1L) {
+            @Nullable TableAssignment mainAssignment,
+            boolean ignoreIfExists,
+            int coordinatorZkVersion) {
+        if (ignoreIfExists && metadataManager.tableExists(mainTablePath)) {
             return;
         }
+
+        long mainTableId = metadataManager.allocateTableId();
+        List<TableCreation> tableCreations = new ArrayList<>();
+        tableCreations.add(
+                new TableCreation(mainTablePath, mainTableId, mainDescriptor, mainAssignment));
         int mainReplicationFactor = mainDescriptor.getReplicationFactor();
         String mainTableName = mainTablePath.getDatabaseName() + "." + mainTablePath.getTableName();
         List<Schema.Index> indexes = mainDescriptor.getSchema().getIndexes();
         for (Schema.Index index : indexes) {
             TableDescriptor indexDescriptor =
                     IndexTableDescriptorFactory.derive(
-                            mainDescriptor,
-                            createdMainTableId,
-                            mainTableName,
-                            index.getIndexName());
+                            mainDescriptor, mainTableId, mainTableName, index.getIndexName());
             // Ensure the replication factor is set: the index table descriptor factory does not
             // propagate it, but generateAssignment requires it.
             if (!indexDescriptor
@@ -604,14 +579,25 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 TabletServerInfo[] servers = metadataCache.getLiveServers();
                 indexAssignment = generateAssignment(indexBucketCount, indexReplicaFactor, servers);
             }
-            metadataManager.createTable(
-                    indexTablePath, indexDescriptor, indexAssignment, /* ignoreIfExists= */ false);
-            createdIndexTablePaths.add(indexTablePath);
+            tableCreations.add(
+                    new TableCreation(
+                            indexTablePath,
+                            metadataManager.allocateTableId(),
+                            indexDescriptor,
+                            indexAssignment));
         }
+        metadataManager.createTablesAtomically(
+                tableCreations, ignoreIfExists, coordinatorZkVersion);
     }
 
     @Override
     public CompletableFuture<AlterTableResponse> alterTable(AlterTableRequest request) {
+        int coordinatorZkVersion = coordinatorZkVersionSupplier.get();
+        return alterTableInternal(request, coordinatorZkVersion);
+    }
+
+    private CompletableFuture<AlterTableResponse> alterTableInternal(
+            AlterTableRequest request, int coordinatorZkVersion) {
         TablePath tablePath = toTablePath(request.getTablePath());
         tablePath.validate();
         authorizeTable(OperationType.ALTER, tablePath);
@@ -633,7 +619,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                     tablePath,
                     alterSchemaChanges,
                     request.isIgnoreIfNotExists(),
-                    currentSession().getPrincipal());
+                    currentSession().getPrincipal(),
+                    coordinatorZkVersion);
         }
 
         if (!alterTableConfigChanges.isEmpty()) {
@@ -642,7 +629,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                     alterTableConfigChanges,
                     tablePropertyChanges,
                     request.isIgnoreIfNotExists(),
-                    currentSession().getPrincipal());
+                    currentSession().getPrincipal(),
+                    coordinatorZkVersion);
         }
 
         return CompletableFuture.completedFuture(new AlterTableResponse());
@@ -771,6 +759,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
     @Override
     public CompletableFuture<DropTableResponse> dropTable(DropTableRequest request) {
+        int coordinatorZkVersion = coordinatorZkVersionSupplier.get();
+        return dropTableInternal(request, coordinatorZkVersion);
+    }
+
+    private CompletableFuture<DropTableResponse> dropTableInternal(
+            DropTableRequest request, int coordinatorZkVersion) {
         TablePath tablePath = toTablePath(request.getTablePath());
         authorizeTable(OperationType.DROP, tablePath);
 
@@ -780,13 +774,14 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             return CompletableFuture.completedFuture(response);
         }
         validateDropTablePermission(tablePath, tableInfo);
-        // cascade-drop derived Index Tables BEFORE the main table so any in-flight push from a
-        // leader of the main table cannot land on an Index Table whose main has already been
-        // unregistered. Each Index Table is dropped with ignoreIfNotExists=true so a retried
-        // DROP TABLE after a partial failure is recoverable. The main-table drop honors the
-        // user-facing ignoreIfNotExists flag from the request.
-        cascadeDropIndexTables(tablePath);
-        metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
+        Map<TablePath, Long> indexTableIds = validateIndexTablesForCascade(tablePath, tableInfo);
+
+        List<TableDeletion> tableDeletions = new ArrayList<>(indexTableIds.size() + 1);
+        tableDeletions.add(new TableDeletion(tablePath, tableInfo.getTableId()));
+        for (Map.Entry<TablePath, Long> indexTable : indexTableIds.entrySet()) {
+            tableDeletions.add(new TableDeletion(indexTable.getKey(), indexTable.getValue()));
+        }
+        metadataManager.deleteTables(tableDeletions, coordinatorZkVersion);
         return CompletableFuture.completedFuture(response);
     }
 
@@ -831,17 +826,10 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
     }
 
-    private void cascadeDropIndexTables(TablePath mainTablePath) {
-        TableInfo mainInfo;
-        List<TablePath> indexPaths;
-        try {
-            mainInfo = metadataManager.getTable(mainTablePath);
-            indexPaths = indexTablePathsFor(mainTablePath, mainInfo.getSchema());
-        } catch (TableNotExistException e) {
-            // main table missing: nothing to cascade. The subsequent dropTable call will surface
-            // the appropriate error or no-op according to the request's ignoreIfNotExists flag.
-            return;
-        }
+    private Map<TablePath, Long> validateIndexTablesForCascade(
+            TablePath mainTablePath, TableInfo mainInfo) {
+        List<TablePath> indexPaths = indexTablePathsFor(mainTablePath, mainInfo.getSchema());
+        Map<TablePath, Long> indexTableIds = new LinkedHashMap<>();
         for (TablePath indexPath : indexPaths) {
             TableInfo indexInfo;
             try {
@@ -858,10 +846,9 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                 "Expected derived index table %s does not belong to main table %s (table id %d); refusing cascade drop.",
                                 indexPath, mainTablePath, mainInfo.getTableId()));
             }
+            indexTableIds.put(indexPath, indexInfo.getTableId());
         }
-        for (TablePath indexPath : indexPaths) {
-            metadataManager.dropTable(indexPath, /* ignoreIfNotExists= */ true);
-        }
+        return indexTableIds;
     }
 
     /**
@@ -888,6 +875,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<CreatePartitionResponse> createPartition(
             CreatePartitionRequest request) {
+        int coordinatorZkVersion = coordinatorZkVersionSupplier.get();
+        return createPartitionInternal(request, coordinatorZkVersion);
+    }
+
+    private CompletableFuture<CreatePartitionResponse> createPartitionInternal(
+            CreatePartitionRequest request, int coordinatorZkVersion) {
         TablePath tablePath = toTablePath(request.getTablePath());
         authorizeTable(OperationType.WRITE, tablePath);
 
@@ -925,12 +918,19 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 table.tableId,
                 partitionAssignment,
                 partitionToCreate,
-                request.isIgnoreIfNotExists());
+                request.isIgnoreIfNotExists(),
+                coordinatorZkVersion);
         return CompletableFuture.completedFuture(response);
     }
 
     @Override
     public CompletableFuture<DropPartitionResponse> dropPartition(DropPartitionRequest request) {
+        int coordinatorZkVersion = coordinatorZkVersionSupplier.get();
+        return dropPartitionInternal(request, coordinatorZkVersion);
+    }
+
+    private CompletableFuture<DropPartitionResponse> dropPartitionInternal(
+            DropPartitionRequest request, int coordinatorZkVersion) {
         TablePath tablePath = toTablePath(request.getTablePath());
         authorizeTable(OperationType.WRITE, tablePath);
 
@@ -947,7 +947,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         ResolvedPartitionSpec partitionToDrop =
                 ResolvedPartitionSpec.fromPartitionSpec(table.partitionKeys, partitionSpec);
 
-        metadataManager.dropPartition(tablePath, partitionToDrop, request.isIgnoreIfNotExists());
+        metadataManager.dropPartition(
+                tablePath,
+                table.tableId,
+                partitionToDrop,
+                request.isIgnoreIfNotExists(),
+                coordinatorZkVersion);
         return CompletableFuture.completedFuture(response);
     }
 

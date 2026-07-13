@@ -56,6 +56,8 @@ import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ResourceAcl;
 import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableDeletion;
+import org.apache.fluss.server.zk.data.TableMetadataRegistration;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.ZkData;
@@ -85,7 +87,9 @@ import org.apache.fluss.server.zk.data.ZkData.SchemasZNode;
 import org.apache.fluss.server.zk.data.ZkData.ServerIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.ServerIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.ServerTagsZNode;
+import org.apache.fluss.server.zk.data.ZkData.TableDeletionZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableSequenceIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableZNode;
 import org.apache.fluss.server.zk.data.ZkData.TablesZNode;
@@ -120,6 +124,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -149,8 +154,8 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * ┌─────────────────────────────────────────────────────────┐
  * │ 1. Invoked by the Coordinator (not the TabletServer)    │
  * │ 2. Operates on persistent nodes (not ephemeral)         │
- * │ 3. Constitutes a "control plane" operation:             │
- * │    partition assignment or LeaderAndIsr election        │
+ * │ 3. Constitutes a "control plane" operation whose result │
+ * │    cannot be safely overwritten or replayed             │
  * │ 4. Concurrent access to the same path by old and new    │
  * │    leaders during leader failover                       │
  * │ 5. No other mechanisms (optimistic locking,             │
@@ -158,11 +163,13 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * └─────────────────────────────────────────────────────────┘
  * </pre>
  *
- * <p>In practice, only two types of operations truly require this:
+ * <p>In practice, these operations require it:
  *
  * <ul>
  *   <li>CRUD for Table/Partition Assignment (assignment decisions).
  *   <li>CRUD for LeaderAndIsr (leader election results).
+ *   <li>Atomic table creation and durable table-deletion cleanup.
+ *   <li>Table schema/property mutations and partition deletion/tombstone updates.
  * </ul>
  *
  * <p>These operations are inevitably executed concurrently by the old and new coordinators during
@@ -172,7 +179,6 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * <p>All other operations do not require epoch checks because:
  *
  * <ul>
- *   <li>DDL operations are protected against concurrency by client reconnection mechanisms.
  *   <li>TabletServer operations are unaffected by coordinator failovers.
  *   <li>ACLs and Configs have their own version control or idempotency guarantees.
  *   <li>Ephemeral nodes are managed via session lifecycle.
@@ -786,6 +792,77 @@ public class ZooKeeperClient implements AutoCloseable {
                 tablePath.getDatabaseName());
     }
 
+    /** Atomically registers complete metadata for a group of tables. */
+    public void registerTablesAtomically(
+            List<TableMetadataRegistration> registrations, int expectedZkVersion) throws Exception {
+        if (registrations.isEmpty()) {
+            return;
+        }
+
+        Set<String> databaseNames =
+                registrations.stream()
+                        .map(registration -> registration.getTablePath().getDatabaseName())
+                        .collect(Collectors.toSet());
+        Map<String, Stat> databaseStats = new LinkedHashMap<>();
+        Set<String> missingTablesNodes = new HashSet<>();
+        for (String databaseName : databaseNames) {
+            Stat databaseStat = new Stat();
+            byte[] databaseBytes =
+                    zkClient.getData()
+                            .storingStatIn(databaseStat)
+                            .forPath(DatabaseZNode.path(databaseName));
+            // Reject malformed parent nodes instead of treating them as valid databases.
+            DatabaseZNode.decode(databaseBytes);
+            databaseStats.put(databaseName, databaseStat);
+            if (zkClient.checkExists().forPath(TablesZNode.path(databaseName)) == null) {
+                missingTablesNodes.add(databaseName);
+            }
+        }
+        if (registrations.stream()
+                .anyMatch(registration -> registration.getTableAssignment() != null)) {
+            createRecursiveWithEpochCheck(TableIdsZNode.path(), null, expectedZkVersion, false);
+        }
+
+        List<CuratorOp> operations = new ArrayList<>();
+        for (Map.Entry<String, Stat> database : databaseStats.entrySet()) {
+            String databaseName = database.getKey();
+            operations.add(
+                    zkOp.checkOp(
+                            DatabaseZNode.path(databaseName), database.getValue().getVersion()));
+            if (missingTablesNodes.contains(databaseName)) {
+                operations.add(
+                        zkOp.createOp(TablesZNode.path(databaseName), null, CreateMode.PERSISTENT));
+            }
+        }
+        for (TableMetadataRegistration registration : registrations) {
+            TablePath tablePath = registration.getTablePath();
+            operations.add(
+                    zkOp.createOp(
+                            TableZNode.path(tablePath),
+                            TableZNode.encode(registration.getTableRegistration()),
+                            CreateMode.PERSISTENT));
+            operations.add(
+                    zkOp.createOp(SchemasZNode.path(tablePath), null, CreateMode.PERSISTENT));
+            operations.add(
+                    zkOp.createOp(
+                            SchemaZNode.path(tablePath, DEFAULT_SCHEMA_ID),
+                            SchemaZNode.encode(registration.getSchema()),
+                            CreateMode.PERSISTENT));
+            TableAssignment assignment = registration.getTableAssignment();
+            if (assignment != null) {
+                operations.add(
+                        zkOp.createOp(
+                                TableIdZNode.path(registration.getTableRegistration().tableId),
+                                TableIdZNode.encode(assignment),
+                                CreateMode.PERSISTENT));
+            }
+        }
+
+        zkClient.transaction()
+                .forOperations(wrapRequestsWithEpochCheck(operations, expectedZkVersion));
+        LOG.info("Atomically registered metadata for {} tables.", registrations.size());
+    }
+
     /** Get the table in ZK. */
     public Optional<TableRegistration> getTable(TablePath tablePath) throws Exception {
         Optional<byte[]> bytes = getOrEmpty(TableZNode.path(tablePath));
@@ -862,11 +939,27 @@ public class ZooKeeperClient implements AutoCloseable {
         return result;
     }
 
-    /** Update the table in ZK. */
-    public void updateTable(TablePath tablePath, TableRegistration tableRegistration)
+    /** Updates an existing table identity in an epoch-fenced transaction. */
+    public void updateTable(
+            TablePath tablePath,
+            long expectedTableId,
+            TableRegistration tableRegistration,
+            int expectedZkVersion)
             throws Exception {
         String path = TableZNode.path(tablePath);
-        zkClient.setData().forPath(path, TableZNode.encode(tableRegistration));
+        if (tableRegistration.tableId != expectedTableId) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Updated table registration has id %d instead of expected id %d.",
+                            tableRegistration.tableId, expectedTableId));
+        }
+        Stat tableStat = getActiveTableStat(tablePath, expectedTableId);
+        CuratorOp update =
+                zkClient.transactionOp()
+                        .setData()
+                        .withVersion(tableStat.getVersion())
+                        .forPath(path, TableZNode.encode(tableRegistration));
+        zkClient.transaction().forOperations(wrapRequestWithEpochCheck(update, expectedZkVersion));
         LOG.info(
                 "Updated table {} for database {}",
                 tablePath.getTableName(),
@@ -878,6 +971,175 @@ public class ZooKeeperClient implements AutoCloseable {
         String path = TableZNode.path(tablePath);
         zkClient.delete().deletingChildrenIfNeeded().forPath(path);
         LOG.info("Deleted table {}.", tablePath);
+    }
+
+    /** Atomically marks a group of table identities for deletion. */
+    public void markTablesForDeletion(List<TableDeletion> tableDeletions, int expectedZkVersion)
+            throws Exception {
+        if (tableDeletions.isEmpty()) {
+            return;
+        }
+
+        Set<TablePath> tablePaths = new HashSet<>();
+        List<CuratorOp> operations = new ArrayList<>();
+        for (TableDeletion tableDeletion : tableDeletions) {
+            TablePath tablePath = tableDeletion.getTablePath();
+            if (!tablePaths.add(tablePath)) {
+                throw new IllegalArgumentException("Duplicate table deletion for " + tablePath);
+            }
+
+            String tablePathInZk = TableZNode.path(tablePath);
+            Stat tableStat = new Stat();
+            byte[] tableBytes = zkClient.getData().storingStatIn(tableStat).forPath(tablePathInZk);
+            long actualTableId = TableZNode.decode(tableBytes).tableId;
+            if (actualTableId != tableDeletion.getTableId()) {
+                throw new IllegalStateException(
+                        String.format(
+                                "Table %s has id %d instead of expected id %d.",
+                                tablePath, actualTableId, tableDeletion.getTableId()));
+            }
+
+            operations.add(zkOp.checkOp(tablePathInZk, tableStat.getVersion()));
+            String markerPath = TableDeletionZNode.path(tablePath);
+            Stat markerStat = new Stat();
+            try {
+                byte[] markerBytes =
+                        zkClient.getData().storingStatIn(markerStat).forPath(markerPath);
+                long markedTableId = TableDeletionZNode.decode(markerBytes);
+                if (markedTableId != tableDeletion.getTableId()) {
+                    throw new IllegalStateException(
+                            String.format(
+                                    "Table %s is marked for deletion with id %d instead of expected id %d.",
+                                    tablePath, markedTableId, tableDeletion.getTableId()));
+                }
+                operations.add(zkOp.checkOp(markerPath, markerStat.getVersion()));
+            } catch (KeeperException.NoNodeException e) {
+                // Updating the table data to the same value advances its version. Concurrent
+                // metadata mutations that checked the previous version are then rejected.
+                operations.add(zkOp.updateOp(tablePathInZk, tableBytes));
+                operations.add(
+                        zkOp.createOp(
+                                markerPath,
+                                TableDeletionZNode.encode(tableDeletion.getTableId()),
+                                CreateMode.PERSISTENT));
+            }
+        }
+
+        zkClient.transaction()
+                .forOperations(wrapRequestsWithEpochCheck(operations, expectedZkVersion));
+        LOG.info("Marked table deletions {}.", tableDeletions);
+    }
+
+    /** Completes a previously marked table deletion. */
+    public void completeTableDeletion(TablePath tablePath, int expectedZkVersion) throws Exception {
+        String tablePathInZk = TableZNode.path(tablePath);
+        String markerPath = TableDeletionZNode.path(tablePath);
+
+        while (true) {
+            Stat markerStat = new Stat();
+            byte[] markerBytes;
+            try {
+                markerBytes = zkClient.getData().storingStatIn(markerStat).forPath(markerPath);
+            } catch (KeeperException.NoNodeException e) {
+                if (zkClient.checkExists().forPath(tablePathInZk) == null) {
+                    return;
+                }
+                throw new IllegalStateException(
+                        "Table " + tablePath + " has no durable deletion marker.", e);
+            }
+
+            Stat tableStat = new Stat();
+            byte[] tableBytes = zkClient.getData().storingStatIn(tableStat).forPath(tablePathInZk);
+            long markedTableId = TableDeletionZNode.decode(markerBytes);
+            long actualTableId = TableZNode.decode(tableBytes).tableId;
+            if (actualTableId != markedTableId) {
+                throw new IllegalStateException(
+                        String.format(
+                                "Refusing to delete table %s with id %d using marker for id %d.",
+                                tablePath, actualTableId, markedTableId));
+            }
+
+            deleteTableChildren(
+                    tablePathInZk, markerPath, markerStat.getVersion(), expectedZkVersion);
+            List<CuratorOp> finalOperations = new ArrayList<>(4);
+            finalOperations.add(zkOp.checkOp(tablePathInZk, tableStat.getVersion()));
+            finalOperations.add(zkOp.checkOp(markerPath, markerStat.getVersion()));
+            finalOperations.add(zkOp.deleteOp(markerPath));
+            finalOperations.add(zkOp.deleteOp(tablePathInZk));
+            try {
+                zkClient.transaction()
+                        .forOperations(
+                                wrapRequestsWithEpochCheck(finalOperations, expectedZkVersion));
+                LOG.info("Deleted marked table {} with id {}.", tablePath, markedTableId);
+                return;
+            } catch (KeeperException.NotEmptyException e) {
+                // A metadata mutation that started before the marker may have added a child. Keep
+                // the marker and remove the newly visible child before retrying the final step.
+            } catch (KeeperException.NoNodeException e) {
+                if (zkClient.checkExists().forPath(tablePathInZk) == null) {
+                    return;
+                }
+                throw e;
+            }
+        }
+    }
+
+    /** Resumes all durable table deletions before table metadata is loaded. */
+    public void resumeTableDeletions(int expectedZkVersion) throws Exception {
+        for (String database : listDatabases()) {
+            for (String table : listTables(database)) {
+                TablePath tablePath = TablePath.of(database, table);
+                if (zkClient.checkExists().forPath(TableDeletionZNode.path(tablePath)) != null) {
+                    completeTableDeletion(tablePath, expectedZkVersion);
+                }
+            }
+        }
+    }
+
+    private void deleteTableChildren(
+            String tablePath, String markerPath, int markerVersion, int expectedZkVersion)
+            throws Exception {
+        while (true) {
+            List<String> pathsToDelete = new ArrayList<>();
+            for (String child : getChildren(tablePath)) {
+                String childPath = tablePath + "/" + child;
+                if (!childPath.equals(markerPath)) {
+                    collectTableSubtreePostOrder(childPath, pathsToDelete);
+                }
+            }
+            if (pathsToDelete.isEmpty()) {
+                return;
+            }
+
+            boolean relist = false;
+            int maxDeletesPerBatch = MAX_BATCH_SIZE - 2;
+            for (int from = 0; from < pathsToDelete.size(); from += maxDeletesPerBatch) {
+                int to = Math.min(from + maxDeletesPerBatch, pathsToDelete.size());
+                List<CuratorOp> operations = new ArrayList<>(to - from + 1);
+                operations.add(zkOp.checkOp(markerPath, markerVersion));
+                for (String path : pathsToDelete.subList(from, to)) {
+                    operations.add(zkOp.deleteOp(path));
+                }
+                try {
+                    zkClient.transaction()
+                            .forOperations(
+                                    wrapRequestsWithEpochCheck(operations, expectedZkVersion));
+                } catch (KeeperException.NoNodeException | KeeperException.NotEmptyException e) {
+                    relist = true;
+                    break;
+                }
+            }
+            if (!relist) {
+                return;
+            }
+        }
+    }
+
+    private void collectTableSubtreePostOrder(String path, List<String> result) throws Exception {
+        for (String child : getChildren(path)) {
+            collectTableSubtreePostOrder(path + "/" + child, result);
+        }
+        result.add(path);
     }
 
     public boolean tableExist(TablePath tablePath) throws Exception {
@@ -1059,10 +1321,25 @@ public class ZooKeeperClient implements AutoCloseable {
         return stat.getNumChildren();
     }
 
-    /** Delete a partition for a table in ZK. */
-    public void deletePartition(TablePath tablePath, String partitionName) throws Exception {
-        String path = PartitionZNode.path(tablePath, partitionName);
-        zkClient.delete().forPath(path);
+    /** Deletes an existing partition identity in an epoch-fenced transaction. */
+    public void deletePartition(
+            TablePath tablePath,
+            String partitionName,
+            long expectedTableId,
+            long expectedPartitionId,
+            int expectedZkVersion)
+            throws Exception {
+        String tablePathInZk = TableZNode.path(tablePath);
+        Stat tableStat = getActiveTableStat(tablePath, expectedTableId);
+        String partitionPath = PartitionZNode.path(tablePath, partitionName);
+        Stat partitionStat =
+                getPartitionStat(tablePath, partitionName, expectedTableId, expectedPartitionId);
+        List<CuratorOp> operations = new ArrayList<>(3);
+        operations.add(zkOp.checkOp(tablePathInZk, tableStat.getVersion()));
+        operations.add(zkOp.checkOp(partitionPath, partitionStat.getVersion()));
+        operations.add(zkOp.deleteOp(partitionPath));
+        zkClient.transaction()
+                .forOperations(wrapRequestsWithEpochCheck(operations, expectedZkVersion));
     }
 
     /**
@@ -1074,28 +1351,25 @@ public class ZooKeeperClient implements AutoCloseable {
      * durable for secondary-index filtering.
      */
     public void deletePartitionAndSetTombstone(
-            TablePath tablePath, String partitionName, PartitionTombstone tombstone)
-            throws Exception {
-        Tuple2<PartitionTombstone, Optional<Integer>> current =
-                getPartitionTombstoneWithVersion(tablePath);
-        deletePartitionAndSetTombstone(tablePath, partitionName, tombstone, current.f1);
-    }
-
-    /**
-     * Deletes a partition metadata node and persists the table's partition tombstone in one ZK
-     * transaction, using the provided tombstone znode version as an optimistic concurrency check.
-     */
-    public void deletePartitionAndSetTombstone(
             TablePath tablePath,
             String partitionName,
+            long expectedTableId,
+            long expectedPartitionId,
             PartitionTombstone tombstone,
-            Optional<Integer> expectedTombstoneVersion)
+            Optional<Integer> expectedTombstoneVersion,
+            int expectedZkVersion)
             throws Exception {
+        String tablePathInZk = TableZNode.path(tablePath);
+        Stat tableStat = getActiveTableStat(tablePath, expectedTableId);
         String partitionPath = PartitionZNode.path(tablePath, partitionName);
+        Stat partitionStat =
+                getPartitionStat(tablePath, partitionName, expectedTableId, expectedPartitionId);
         String tombstonePath = PartitionTombstoneZNode.path(tablePath);
         byte[] tombstoneBytes = PartitionTombstoneBinarySerde.serialize(tombstone);
 
-        List<CuratorOp> ops = new ArrayList<>(2);
+        List<CuratorOp> ops = new ArrayList<>(4);
+        ops.add(zkOp.checkOp(tablePathInZk, tableStat.getVersion()));
+        ops.add(zkOp.checkOp(partitionPath, partitionStat.getVersion()));
         ops.add(zkOp.deleteOp(partitionPath));
         if (expectedTombstoneVersion.isPresent()) {
             ops.add(
@@ -1106,7 +1380,7 @@ public class ZooKeeperClient implements AutoCloseable {
         } else {
             ops.add(zkOp.createOp(tombstonePath, tombstoneBytes, CreateMode.PERSISTENT));
         }
-        zkClient.transaction().forOperations(ops);
+        zkClient.transaction().forOperations(wrapRequestsWithEpochCheck(ops, expectedZkVersion));
     }
 
     // --------------------------------------------------------------------------------------------
@@ -1144,25 +1418,127 @@ public class ZooKeeperClient implements AutoCloseable {
     }
 
     /**
-     * Persists the {@link PartitionTombstone} for the given main table to ZK, creating the znode
-     * (and any missing parents) if it does not yet exist, otherwise overwriting it. Each successive
-     * write should advance {@link PartitionTombstone#getVersion()}.
+     * Persists the {@link PartitionTombstone} for the given active main table to ZK, creating the
+     * znode if it does not yet exist or otherwise overwriting it. Each successive write should
+     * advance {@link PartitionTombstone#getVersion()}.
      */
     public void setOrCreatePartitionTombstone(TablePath tablePath, PartitionTombstone tombstone)
             throws Exception {
+        Tuple2<PartitionTombstone, Optional<Integer>> current =
+                getPartitionTombstoneWithVersion(tablePath);
+        compareAndSetPartitionTombstone(tablePath, tombstone, current.f1);
+    }
+
+    public void compareAndSetPartitionTombstone(
+            TablePath tablePath,
+            PartitionTombstone tombstone,
+            Optional<Integer> expectedTombstoneVersion)
+            throws Exception {
+        compareAndSetPartitionTombstoneInternal(
+                tablePath, null, tombstone, expectedTombstoneVersion, null);
+    }
+
+    public void compareAndSetPartitionTombstone(
+            TablePath tablePath,
+            long expectedTableId,
+            PartitionTombstone tombstone,
+            Optional<Integer> expectedTombstoneVersion,
+            int expectedZkVersion)
+            throws Exception {
+        compareAndSetPartitionTombstoneInternal(
+                tablePath, expectedTableId, tombstone, expectedTombstoneVersion, expectedZkVersion);
+    }
+
+    private void compareAndSetPartitionTombstoneInternal(
+            TablePath tablePath,
+            @Nullable Long expectedTableId,
+            PartitionTombstone tombstone,
+            Optional<Integer> expectedTombstoneVersion,
+            @Nullable Integer expectedZkVersion)
+            throws Exception {
+        String tablePathInZk = TableZNode.path(tablePath);
+        Stat tableStat =
+                expectedTableId == null
+                        ? getActiveTableStat(tablePath)
+                        : getActiveTableStat(tablePath, expectedTableId);
         String path = PartitionTombstoneZNode.path(tablePath);
         byte[] bytes = PartitionTombstoneBinarySerde.serialize(tombstone);
-        Optional<Stat> stat = getStat(path);
-        if (stat.isPresent()) {
-            zkClient.setData().withVersion(stat.get().getVersion()).forPath(path, bytes);
+        List<CuratorOp> operations = new ArrayList<>(2);
+        operations.add(zkOp.checkOp(tablePathInZk, tableStat.getVersion()));
+        if (expectedTombstoneVersion.isPresent()) {
+            operations.add(
+                    zkClient.transactionOp()
+                            .setData()
+                            .withVersion(expectedTombstoneVersion.get())
+                            .forPath(path, bytes));
         } else {
-            try {
-                zkClient.create().creatingParentsIfNeeded().forPath(path, bytes);
-            } catch (KeeperException.NodeExistsException e) {
-                Stat freshStat = zkClient.checkExists().forPath(path);
-                zkClient.setData().withVersion(freshStat.getVersion()).forPath(path, bytes);
-            }
+            operations.add(zkOp.createOp(path, bytes, CreateMode.PERSISTENT));
         }
+        if (expectedZkVersion == null) {
+            zkClient.transaction().forOperations(operations);
+        } else {
+            zkClient.transaction()
+                    .forOperations(wrapRequestsWithEpochCheck(operations, expectedZkVersion));
+        }
+    }
+
+    public boolean isTableMarkedForDeletion(TablePath tablePath) throws Exception {
+        return zkClient.checkExists().forPath(TableDeletionZNode.path(tablePath)) != null;
+    }
+
+    private Stat getActiveTableStat(TablePath tablePath) throws Exception {
+        Stat tableStat = new Stat();
+        byte[] tableBytes =
+                zkClient.getData().storingStatIn(tableStat).forPath(TableZNode.path(tablePath));
+        TableZNode.decode(tableBytes);
+        if (isTableMarkedForDeletion(tablePath)) {
+            throw new IllegalStateException("Table " + tablePath + " is being deleted.");
+        }
+        return tableStat;
+    }
+
+    private Stat getActiveTableStat(TablePath tablePath, long expectedTableId) throws Exception {
+        Stat tableStat = new Stat();
+        byte[] tableBytes =
+                zkClient.getData().storingStatIn(tableStat).forPath(TableZNode.path(tablePath));
+        long actualTableId = TableZNode.decode(tableBytes).tableId;
+        if (actualTableId != expectedTableId) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Table %s has id %d instead of expected id %d.",
+                            tablePath, actualTableId, expectedTableId));
+        }
+        if (isTableMarkedForDeletion(tablePath)) {
+            throw new IllegalStateException("Table " + tablePath + " is being deleted.");
+        }
+        return tableStat;
+    }
+
+    private Stat getPartitionStat(
+            TablePath tablePath,
+            String partitionName,
+            long expectedTableId,
+            long expectedPartitionId)
+            throws Exception {
+        Stat partitionStat = new Stat();
+        byte[] partitionBytes =
+                zkClient.getData()
+                        .storingStatIn(partitionStat)
+                        .forPath(PartitionZNode.path(tablePath, partitionName));
+        PartitionRegistration partition = PartitionZNode.decode(partitionBytes);
+        if (partition.getTableId() != expectedTableId
+                || partition.getPartitionId() != expectedPartitionId) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Partition %s of table %s has identity (%d, %d) instead of expected (%d, %d).",
+                            partitionName,
+                            tablePath,
+                            partition.getTableId(),
+                            partition.getPartitionId(),
+                            expectedTableId,
+                            expectedPartitionId));
+        }
+        return partitionStat;
     }
 
     private static PartitionTombstone decodePartitionTombstone(byte[] bytes) {
@@ -1185,34 +1561,37 @@ public class ZooKeeperClient implements AutoCloseable {
             PartitionAssignment partitionAssignment,
             String remoteDataDir,
             TablePath tablePath,
-            long tableId)
+            long tableId,
+            int expectedZkVersion)
             throws Exception {
         // Merge "registerPartitionAssignment()" and "registerPartition()"
         // into one transaction. This is to avoid the case that the partition assignment is
         // registered
         // but the partition metadata is not registered.
 
-        // Create parent dictionary in advance.
-        try {
-            String tabletServerPartitionParentPath = ZkData.PartitionIdsZNode.path();
-            zkClient.create()
-                    .creatingParentsIfNeeded()
-                    .withMode(CreateMode.PERSISTENT)
-                    .forPath(tabletServerPartitionParentPath);
-        } catch (KeeperException.NodeExistsException e) {
-            // ignore
+        // Create the global assignment parent without allowing a stale Coordinator to mutate ZK.
+        createRecursiveWithEpochCheck(
+                ZkData.PartitionIdsZNode.path(), null, expectedZkVersion, false);
+        String tablePathInZk = TableZNode.path(tablePath);
+        Stat tableStat = new Stat();
+        byte[] tableBytes = zkClient.getData().storingStatIn(tableStat).forPath(tablePathInZk);
+        long actualTableId = TableZNode.decode(tableBytes).tableId;
+        if (actualTableId != tableId) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Table %s has id %d instead of expected id %d.",
+                            tablePath, actualTableId, tableId));
         }
-        try {
-            String metadataPartitionParentPath = PartitionsZNode.path(tablePath);
-            zkClient.create()
-                    .creatingParentsIfNeeded()
-                    .withMode(CreateMode.PERSISTENT)
-                    .forPath(metadataPartitionParentPath);
-        } catch (KeeperException.NodeExistsException e) {
-            // ignore
+        if (zkClient.checkExists().forPath(TableDeletionZNode.path(tablePath)) != null) {
+            throw new IllegalStateException("Table " + tablePath + " is being deleted.");
         }
 
-        List<CuratorOp> ops = new ArrayList<>(2);
+        List<CuratorOp> ops = new ArrayList<>(4);
+        ops.add(zkOp.checkOp(tablePathInZk, tableStat.getVersion()));
+        String metadataPartitionParentPath = PartitionsZNode.path(tablePath);
+        if (zkClient.checkExists().forPath(metadataPartitionParentPath) == null) {
+            ops.add(zkOp.createOp(metadataPartitionParentPath, null, CreateMode.PERSISTENT));
+        }
         String tabletServerPartitionPath = PartitionIdZNode.path(partitionId);
         CuratorOp tabletServerPartitionNode =
                 zkClient.transactionOp()
@@ -1235,7 +1614,7 @@ public class ZooKeeperClient implements AutoCloseable {
 
         ops.add(tabletServerPartitionNode);
         ops.add(metadataPartitionNode);
-        zkClient.transaction().forOperations(ops);
+        zkClient.transaction().forOperations(wrapRequestsWithEpochCheck(ops, expectedZkVersion));
     }
 
     // --------------------------------------------------------------------------------------------
@@ -1244,16 +1623,30 @@ public class ZooKeeperClient implements AutoCloseable {
 
     /** Register schema to ZK metadata and return the schema id. */
     public int registerFirstSchema(TablePath tablePath, Schema schema) throws Exception {
-        return registerSchema(tablePath, schema, DEFAULT_SCHEMA_ID);
-    }
-
-    public int registerSchema(TablePath tablePath, Schema schema, int schemaId) throws Exception {
-        // increase schema id.
-        String path = SchemaZNode.path(tablePath, schemaId);
+        String path = SchemaZNode.path(tablePath, DEFAULT_SCHEMA_ID);
         zkClient.create()
                 .creatingParentsIfNeeded()
                 .withMode(CreateMode.PERSISTENT)
                 .forPath(path, SchemaZNode.encode(schema));
+        LOG.info("Registered first schema for table {}.", tablePath);
+        return DEFAULT_SCHEMA_ID;
+    }
+
+    public int registerSchema(
+            TablePath tablePath,
+            long expectedTableId,
+            Schema schema,
+            int schemaId,
+            int expectedZkVersion)
+            throws Exception {
+        String tablePathInZk = TableZNode.path(tablePath);
+        Stat tableStat = getActiveTableStat(tablePath, expectedTableId);
+        String path = SchemaZNode.path(tablePath, schemaId);
+        List<CuratorOp> operations = new ArrayList<>(2);
+        operations.add(zkOp.checkOp(tablePathInZk, tableStat.getVersion()));
+        operations.add(zkOp.createOp(path, SchemaZNode.encode(schema), CreateMode.PERSISTENT));
+        zkClient.transaction()
+                .forOperations(wrapRequestsWithEpochCheck(operations, expectedZkVersion));
         LOG.info("Registered new schema version {} for table {}.", schemaId, tablePath);
         return schemaId;
     }

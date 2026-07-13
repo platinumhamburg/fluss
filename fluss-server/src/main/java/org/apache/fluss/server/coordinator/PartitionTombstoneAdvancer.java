@@ -22,7 +22,9 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 import org.apache.fluss.utils.serde.PartitionTombstoneBinarySerde;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,6 +33,7 @@ import javax.annotation.Nullable;
 
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
@@ -53,6 +56,8 @@ public final class PartitionTombstoneAdvancer {
     @VisibleForTesting static final int EXPLICIT_SET_WARNING_THRESHOLD = 4096;
 
     @VisibleForTesting static final int SERIALIZED_BYTES_WARNING_THRESHOLD = 256 * 1024;
+
+    private static final int MAX_CAS_ATTEMPTS = 3;
 
     private PartitionTombstoneAdvancer() {}
 
@@ -157,13 +162,50 @@ public final class PartitionTombstoneAdvancer {
             long partitionId,
             @Nullable Collection<Long> alivePartitionIdsAfterDrop)
             throws Exception {
-        PartitionTombstone current = zkClient.getPartitionTombstone(tablePath);
-        PartitionTombstone updated =
-                dropPartition(current, partitionId, alivePartitionIdsAfterDrop);
-        zkClient.setOrCreatePartitionTombstone(tablePath, updated);
-        logAdvancement(tablePath, partitionId, current, updated);
-        logIfTombstoneLarge(tablePath, updated);
-        return updated;
+        for (int attempt = 1; ; attempt++) {
+            Tuple2<PartitionTombstone, Optional<Integer>> current =
+                    zkClient.getPartitionTombstoneWithVersion(tablePath);
+            PartitionTombstone updated =
+                    dropPartition(current.f0, partitionId, alivePartitionIdsAfterDrop);
+            try {
+                zkClient.compareAndSetPartitionTombstone(tablePath, updated, current.f1);
+                logAdvancement(tablePath, partitionId, current.f0, updated);
+                logIfTombstoneLarge(tablePath, updated);
+                return updated;
+            } catch (KeeperException.BadVersionException | KeeperException.NodeExistsException e) {
+                if (attempt >= MAX_CAS_ATTEMPTS) {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    /** Advances a tombstone only for the expected table identity and coordinator epoch. */
+    public static PartitionTombstone advanceAndPersist(
+            ZooKeeperClient zkClient,
+            TablePath tablePath,
+            long expectedTableId,
+            long partitionId,
+            @Nullable Collection<Long> alivePartitionIdsAfterDrop,
+            int expectedZkVersion)
+            throws Exception {
+        for (int attempt = 1; ; attempt++) {
+            Tuple2<PartitionTombstone, Optional<Integer>> current =
+                    zkClient.getPartitionTombstoneWithVersion(tablePath);
+            PartitionTombstone updated =
+                    dropPartition(current.f0, partitionId, alivePartitionIdsAfterDrop);
+            try {
+                zkClient.compareAndSetPartitionTombstone(
+                        tablePath, expectedTableId, updated, current.f1, expectedZkVersion);
+                logAdvancement(tablePath, partitionId, current.f0, updated);
+                logIfTombstoneLarge(tablePath, updated);
+                return updated;
+            } catch (KeeperException.BadVersionException | KeeperException.NodeExistsException e) {
+                if (attempt >= MAX_CAS_ATTEMPTS) {
+                    throw e;
+                }
+            }
+        }
     }
 
     private static void logAdvancement(

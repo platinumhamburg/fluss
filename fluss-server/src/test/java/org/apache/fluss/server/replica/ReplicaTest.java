@@ -71,6 +71,7 @@ import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
+import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.testutils.DataTestUtils;
@@ -1248,7 +1249,13 @@ final class ReplicaTest extends ReplicaTestBase {
                 kvReplica,
                 DataTestUtils.genKvRecordBatch(new Object[] {4, "555"}, new Object[] {3, "d"}));
         // update schema.
-        zkClient.registerSchema(DATA1_TABLE_PATH_PK, DATA2_SCHEMA, newSchemaId);
+        ZkEpoch schemaEpoch = zkClient.fenceBecomeCoordinatorLeader("schema-test");
+        zkClient.registerSchema(
+                DATA1_TABLE_PATH_PK,
+                DATA1_TABLE_ID_PK,
+                DATA2_SCHEMA,
+                newSchemaId,
+                schemaEpoch.getCoordinatorEpochZkVersion());
         serverMetadataCache.updateLatestSchema(
                 DATA1_TABLE_ID, new SchemaInfo(DATA2_SCHEMA, newSchemaId));
         // write data with new schema
