@@ -282,11 +282,30 @@ class IndexPushOrderingITCase {
 
             FencedWriterStateEntry dominatingEntry =
                     waitForFence(fixture.failoverTarget.tableBucket, writerKey, committedSourceEnd);
+            FencedWriterStateEntry otherDominatingEntry =
+                    waitForFence(fixture.otherTarget.tableBucket, writerKey, committedSourceEnd);
             Replica targetBeforeFailover =
                     CLUSTER.waitAndGetLeaderReplica(fixture.failoverTarget.tableBucket);
             assertThat(targetBeforeFailover.getLogTablet().getHighWatermark())
                     .as("the dominating target WAL record must be committed before failover")
                     .isGreaterThan(dominatingEntry.dominatingTargetWalOffset());
+
+            byte[] lostResponseRetry = oldKeyGate.dominatingBatch();
+            long walBeforeLostResponseRetry = targetBeforeFailover.getLocalLogEndOffset();
+            TabletServer targetServerBeforeFailover =
+                    CLUSTER.getTabletServerById(
+                            CLUSTER.waitAndGetLeader(fixture.failoverTarget.tableBucket));
+            long staleBeforeLostResponseRetry = staleCount(targetServerBeforeFailover);
+            sendCapturedBatch(
+                    fixture, fixture.failoverTarget.bucket, lostResponseRetry);
+            assertThat(staleCount(targetServerBeforeFailover))
+                    .as("a lost-response retry must be observed as one duplicate fence")
+                    .isEqualTo(staleBeforeLostResponseRetry + 1L);
+            assertThat(targetBeforeFailover.getLocalLogEndOffset())
+                    .as("an identical successful retry must append no target WAL")
+                    .isEqualTo(walBeforeLostResponseRetry);
+            assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
+                    .isEqualTo(dominatingEntry);
 
             int oldTargetLeader = fixture.failoverTarget.leader;
             targetStop =
@@ -332,6 +351,10 @@ class IndexPushOrderingITCase {
             assertThat(currentWalEnds(fixture.failoverTarget, fixture.otherTarget))
                     .as("reverse-delivered old source batches must append no target WAL")
                     .isEqualTo(walBeforeStaleDelivery);
+            assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
+                    .isEqualTo(recoveredEntry);
+            assertThat(currentFence(fixture.otherTarget.tableBucket, writerKey))
+                    .isEqualTo(otherDominatingEntry);
 
             assertIndexEqualsCommittedSourceWal(fixture, committedSourceWal);
 
@@ -549,6 +572,11 @@ class IndexPushOrderingITCase {
                 },
                 TIMEOUT,
                 "wait for target fence " + expectedSequence + ", observed=" + observedSequence);
+        return currentFence(target, writerKey);
+    }
+
+    private static FencedWriterStateEntry currentFence(
+            TableBucket target, WriterKey writerKey) {
         return CLUSTER.waitAndGetLeaderReplica(target)
                 .getLogTablet()
                 .writerStateManager()
@@ -707,6 +735,7 @@ class IndexPushOrderingITCase {
         private final CountDownLatch releaseOld = new CountDownLatch(1);
         private final CountDownLatch releaseNew = new CountDownLatch(1);
         private final AtomicReference<byte[]> capturedBatch = new AtomicReference<>();
+        private final AtomicReference<byte[]> dominatingBatch = new AtomicReference<>();
         private final AtomicReference<String> captureFailure = new AtomicReference<>();
         private final AutoCloseable registration;
 
@@ -726,48 +755,63 @@ class IndexPushOrderingITCase {
             long sequence = batch.fencedSequence();
             oldSequence.compareAndSet(-1L, sequence);
             if (sequence == oldSequence.get()) {
-                CapturedBatch captured;
-                try {
-                    captured = copyBatch(batch, expectedRow, delete);
-                } catch (Exception e) {
-                    captureFailure.compareAndSet(
-                            null, "failed to copy admitted source batch: " + e.getMessage());
+                byte[] captured = captureEquivalentBatch(batch);
+                if (captured == null) {
                     oldAdmitted.countDown();
                     throw AbandonedOldRequest.INSTANCE;
                 }
-                KvRecordBatch reconstructed =
-                        KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(captured.bytes));
-                if (!captured.containsExpectedMutation) {
-                    captureFailure.compareAndSet(
-                            null, "admitted source batch does not contain expected mutation");
-                } else if (reconstructed.magic() != batch.magic()
-                        || reconstructed.schemaId() != batch.schemaId()
-                        || !reconstructed.fencedWriterKey().equals(batch.fencedWriterKey())
-                        || reconstructed.fencedSequence() != batch.fencedSequence()
-                        || reconstructed.sizeInBytes() != batch.sizeInBytes()
-                        || reconstructed.checksum() != batch.checksum()
-                        || reconstructed.getRecordCount() != batch.getRecordCount()) {
-                    captureFailure.compareAndSet(
-                            null,
-                            "rebuilt batch does not match admitted source batch: size="
-                                    + reconstructed.sizeInBytes()
-                                    + '/'
-                                    + batch.sizeInBytes()
-                                    + ", checksum="
-                                    + reconstructed.checksum()
-                                    + '/'
-                                    + batch.checksum());
-                }
-                if (capturedBatch.compareAndSet(null, captured.bytes)) {
+                if (capturedBatch.compareAndSet(null, captured)) {
                     oldAdmitted.countDown();
                     abandonAfterCancellation();
                 }
                 throw AbandonedOldRequest.INSTANCE;
             } else if (sequence > oldSequence.get()) {
+                byte[] captured = captureEquivalentBatch(batch);
+                if (captured == null) {
+                    newAdmitted.countDown();
+                    throw AbandonedOldRequest.INSTANCE;
+                }
+                dominatingBatch.compareAndSet(null, captured);
                 newSequence.accumulateAndGet(sequence, Math::max);
                 newAdmitted.countDown();
                 await(releaseNew, "wait to release new source-leader replay");
             }
+        }
+
+        @Nullable
+        private byte[] captureEquivalentBatch(KvRecordBatch batch) {
+            CapturedBatch captured;
+            try {
+                captured = copyBatch(batch, expectedRow, delete);
+            } catch (Exception e) {
+                captureFailure.compareAndSet(
+                        null, "failed to copy admitted source batch: " + e.getMessage());
+                return null;
+            }
+            KvRecordBatch reconstructed =
+                    KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(captured.bytes));
+            if (!captured.containsExpectedMutation) {
+                captureFailure.compareAndSet(
+                        null, "admitted source batch does not contain expected mutation");
+            } else if (reconstructed.magic() != batch.magic()
+                    || reconstructed.schemaId() != batch.schemaId()
+                    || !reconstructed.fencedWriterKey().equals(batch.fencedWriterKey())
+                    || reconstructed.fencedSequence() != batch.fencedSequence()
+                    || reconstructed.sizeInBytes() != batch.sizeInBytes()
+                    || reconstructed.checksum() != batch.checksum()
+                    || reconstructed.getRecordCount() != batch.getRecordCount()) {
+                captureFailure.compareAndSet(
+                        null,
+                        "rebuilt batch does not match admitted source batch: size="
+                                + reconstructed.sizeInBytes()
+                                + '/'
+                                + batch.sizeInBytes()
+                                + ", checksum="
+                                + reconstructed.checksum()
+                                + '/'
+                                + batch.checksum());
+            }
+            return captured.bytes;
         }
 
         private void abandonAfterCancellation() {
@@ -792,6 +836,7 @@ class IndexPushOrderingITCase {
 
         private void awaitNewAdmission() {
             await(newAdmitted, "wait for new source-leader target admission");
+            assertThat(captureFailure.get()).isNull();
         }
 
         private long oldSequence() {
@@ -818,6 +863,13 @@ class IndexPushOrderingITCase {
         private byte[] capturedBatch() {
             byte[] bytes = capturedBatch.get();
             assertThat(bytes).as("captured admitted old source batch").isNotNull();
+            assertThat(captureFailure.get()).isNull();
+            return bytes.clone();
+        }
+
+        private byte[] dominatingBatch() {
+            byte[] bytes = dominatingBatch.get();
+            assertThat(bytes).as("captured dominating source batch").isNotNull();
             assertThat(captureFailure.get()).isNull();
             return bytes.clone();
         }
