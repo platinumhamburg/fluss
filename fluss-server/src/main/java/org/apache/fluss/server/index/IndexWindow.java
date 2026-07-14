@@ -42,17 +42,21 @@ final class IndexWindow {
 
     private final String indexName;
     private final long windowEndOffset;
+    private final int expectedBatchCount;
     private int remaining;
     private final IndexReplicator owner;
     private final List<IndexBatch> batches;
+    private volatile boolean admitted;
     private boolean terminal;
 
     IndexWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
         this.indexName = indexName;
         this.windowEndOffset = windowEndOffset;
+        this.expectedBatchCount = batchCount;
         this.remaining = batchCount;
         this.owner = owner;
         this.batches = new ArrayList<>(batchCount);
+        this.admitted = false;
     }
 
     String indexName() {
@@ -103,6 +107,22 @@ final class IndexWindow {
 
     synchronized boolean isActive() {
         return !terminal;
+    }
+
+    boolean isAdmitted() {
+        return admitted;
+    }
+
+    void markAdmitted() {
+        admitted = true;
+    }
+
+    int expectedBatchCount() {
+        return expectedBatchCount;
+    }
+
+    synchronized boolean hasExactRegisteredBatches(List<IndexBatch> expected) {
+        return batches.size() == expected.size() && batches.containsAll(expected);
     }
 
     synchronized int registeredBatchCount() {

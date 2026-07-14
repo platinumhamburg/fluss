@@ -901,11 +901,22 @@ public class ConfigOptions {
                     .memoryType()
                     .defaultValue(MemorySize.parse("64mb"))
                     .withDescription(
-                            "Maximum bytes of pending (un-acknowledged) index batches buffered per "
-                                    + "leader-side index replicator. When one replicator reaches "
-                                    + "this limit the read layer stops polling new WAL windows for "
-                                    + "that replicator, applying back-pressure without blocking "
-                                    + "unrelated main-table buckets.");
+                            "Maximum retained payload bytes of pending (un-acknowledged) index "
+                                    + "batches buffered per leader-side index replicator. One "
+                                    + "indivisible admitted window may cross this soft threshold; "
+                                    + "the read layer then stops polling new WAL windows for that "
+                                    + "replicator without blocking unrelated main-table buckets.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_TOTAL_PENDING_BYTES =
+            key("index.replication.max-total-pending-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("256mb"))
+                    .withDescription(
+                            "Maximum retained payload bytes of admitted, unacknowledged index "
+                                    + "batches across one TabletServer. The value includes queued, "
+                                    + "in-flight, and retry-retained page buffers. It is a hard "
+                                    + "post-admission bound for accumulator payload pages, not an "
+                                    + "exact bound on total JVM heap usage.");
 
     public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_REQUEST_BYTES =
             key("index.replication.max-request-bytes")

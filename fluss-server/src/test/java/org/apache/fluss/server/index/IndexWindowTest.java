@@ -95,6 +95,26 @@ public class IndexWindowTest {
     }
 
     @Test
+    void admissionStateIsSeparateFromWindowActivity() {
+        IndexReplicator replicator = newReplicator(0L, (sync, all) -> {});
+        IndexWindow window = new IndexWindow("idx", 10L, 1, replicator);
+        IndexBatch batch = batch(window, 0);
+
+        assertThat(window.isActive()).isTrue();
+        assertThat(window.isAdmitted()).isFalse();
+        assertThat(window.expectedBatchCount()).isEqualTo(1);
+
+        window.markAdmitted();
+        assertThat(window.isActive()).isTrue();
+        assertThat(window.isAdmitted()).isTrue();
+
+        assertThat(window.tryRetireAndDrain()).containsExactly(batch);
+        assertThat(window.isActive()).isFalse();
+        assertThat(window.isAdmitted()).isTrue();
+        assertThat(window.expectedBatchCount()).isEqualTo(1);
+    }
+
+    @Test
     void offsetAdvancesOnlyAfterAllBatchesAcked() {
         AtomicLong advanced = new AtomicLong(-1L);
         IndexReplicator replicator = newReplicator(0L, (sync, all) -> advanced.set(sync));

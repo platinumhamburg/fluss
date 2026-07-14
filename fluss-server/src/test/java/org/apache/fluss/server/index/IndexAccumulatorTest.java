@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.bytesview.BytesView;
@@ -26,12 +27,21 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
@@ -65,6 +75,363 @@ public class IndexAccumulatorTest {
     private static IndexReplicator replicator(IndexAccumulator accumulator) {
         return new IndexReplicator(
                 null, Collections.emptyList(), accumulator, null, 0L, 1024, (sync, all) -> {});
+    }
+
+    @Test
+    void capacityLimitsMustBePositiveAndAllConstructorsRemainAvailable() {
+        assertThatCode(() -> new IndexAccumulator()).doesNotThrowAnyException();
+        assertThatCode(() -> new IndexAccumulator(1L)).doesNotThrowAnyException();
+        assertThatCode(() -> new IndexAccumulator(1L, 2L)).doesNotThrowAnyException();
+
+        assertThatThrownBy(() -> new IndexAccumulator(0L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IndexAccumulator(1L, 0L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new IndexAccumulator(-1L, 1L))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void wholeWindowAdmissionIsAllOrNoneAtTotalCapacity() {
+        long totalLimit = 10L;
+        IndexAccumulator accumulator = new IndexAccumulator(100L, totalLimit);
+        AtomicInteger wakeups = new AtomicInteger();
+        accumulator.setAppendListener(ignored -> wakeups.incrementAndGet());
+        IndexReplicator ownerA = replicator(accumulator);
+        IndexWindow ownerAWindow = new IndexWindow("idx", 10L, 1, ownerA);
+        IndexBatch ownerABatch =
+                batch(new TableBucket(710L, 0), ownerAWindow, 1, totalLimit);
+        List<IndexBatch> ownerAWindowBatches = Collections.singletonList(ownerABatch);
+        IndexReplicator ownerB = replicator(accumulator);
+        IndexWindow ownerBWindow = new IndexWindow("idx", 20L, 2, ownerB);
+        IndexBatch ownerBFirst = batch(new TableBucket(711L, 0), ownerBWindow, 1, 3L);
+        IndexBatch ownerBSecond = batch(new TableBucket(711L, 1), ownerBWindow, 1, 7L);
+        List<IndexBatch> ownerBWindowBatches = Arrays.asList(ownerBFirst, ownerBSecond);
+
+        assertThat(accumulator.tryAppendWindow(ownerAWindowBatches)).isTrue();
+        assertThat(accumulator.pendingBytes()).isEqualTo(totalLimit);
+
+        assertThat(accumulator.tryAppendWindow(ownerBWindowBatches)).isFalse();
+        assertThat(accumulator.pendingBytes(ownerB)).isZero();
+        assertThat(accumulator.hasPending(ownerBFirst.targetBucket())).isFalse();
+        assertThat(accumulator.hasPending(ownerBSecond.targetBucket())).isFalse();
+        assertThat(ownerBWindow.isAdmitted()).isFalse();
+        assertThat(wakeups).hasValue(ownerAWindowBatches.size());
+
+        accumulator.remove(ownerABatch);
+        accumulator.release(ownerABatch);
+    }
+
+    @Test
+    void indivisibleWindowMayCrossPerOwnerSoftThreshold() {
+        IndexAccumulator accumulator = new IndexAccumulator(5L, 10L);
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexBatch admitted = batch(new TableBucket(712L, 0), window, 1, 7L);
+
+        assertThat(accumulator.tryAppendWindow(Collections.singletonList(admitted))).isTrue();
+        assertThat(accumulator.pendingBytes(owner)).isEqualTo(7L);
+        assertThat(accumulator.isFull(owner)).isTrue();
+        assertThat(accumulator.isFull()).isFalse();
+
+        accumulator.remove(admitted);
+        accumulator.release(admitted);
+    }
+
+    @Test
+    void concurrentWholeWindowAdmissionNeverExceedsTotalCapacity() throws Exception {
+        long totalLimit = 6L;
+        IndexAccumulator accumulator = new IndexAccumulator(100L, totalLimit);
+        IndexReplicator ownerA = replicator(accumulator);
+        IndexWindow windowA = new IndexWindow("idx", 10L, 2, ownerA);
+        List<IndexBatch> batchesA =
+                Arrays.asList(
+                        batch(new TableBucket(713L, 0), windowA, 1, 3L),
+                        batch(new TableBucket(713L, 1), windowA, 1, 3L));
+        IndexReplicator ownerB = replicator(accumulator);
+        IndexWindow windowB = new IndexWindow("idx", 20L, 2, ownerB);
+        List<IndexBatch> batchesB =
+                Arrays.asList(
+                        batch(new TableBucket(714L, 0), windowB, 1, 3L),
+                        batch(new TableBucket(714L, 1), windowB, 1, 3L));
+        CyclicBarrier start = new CyclicBarrier(3);
+        AtomicLong maximumObserved = new AtomicLong();
+        AtomicInteger wakeups = new AtomicInteger();
+        accumulator.setAfterAppendAdmissionHook(
+                () ->
+                        maximumObserved.accumulateAndGet(
+                                accumulator.pendingBytes(), Math::max));
+        accumulator.setAppendListener(ignored -> wakeups.incrementAndGet());
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Boolean> admittedA =
+                    executor.submit(
+                            () -> {
+                                start.await();
+                                return accumulator.tryAppendWindow(batchesA);
+                            });
+            Future<Boolean> admittedB =
+                    executor.submit(
+                            () -> {
+                                start.await();
+                                return accumulator.tryAppendWindow(batchesB);
+                            });
+            start.await();
+
+            boolean resultA = admittedA.get(5, TimeUnit.SECONDS);
+            boolean resultB = admittedB.get(5, TimeUnit.SECONDS);
+
+            assertThat(resultA).isNotEqualTo(resultB);
+            assertThat(accumulator.pendingBytes()).isEqualTo(totalLimit);
+            assertThat(maximumObserved).hasValue(totalLimit);
+            assertThat(wakeups).hasValue(2);
+            assertThat(windowA.isAdmitted()).isEqualTo(resultA);
+            assertThat(windowB.isAdmitted()).isEqualTo(resultB);
+            List<IndexBatch> rejected = resultA ? batchesB : batchesA;
+            for (IndexBatch batch : rejected) {
+                assertThat(accumulator.hasPending(batch.targetBucket())).isFalse();
+            }
+            for (IndexBatch batch : resultA ? batchesA : batchesB) {
+                accumulator.remove(batch);
+                accumulator.release(batch);
+            }
+            assertThat(accumulator.pendingBytes()).isZero();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void totalCapacityUsesRetainedPagesRatherThanLogicalPayload() {
+        IndexAccumulator accumulator = new IndexAccumulator(100L, 4096L);
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch first = batch(new TableBucket(715L, 0), window, 1, 4096L);
+        IndexBatch second = batch(new TableBucket(715L, 1), window, 1, 4096L);
+
+        assertThat(first.encoded().getBytesLength() + second.encoded().getBytesLength())
+                .isLessThan(4096);
+        assertThatThrownBy(() -> accumulator.tryAppendWindow(Arrays.asList(first, second)))
+                .isInstanceOf(RecordTooLargeException.class);
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(owner)).isZero();
+        assertThat(accumulator.hasPending(first.targetBucket())).isFalse();
+        assertThat(accumulator.hasPending(second.targetBucket())).isFalse();
+        assertThat(window.isAdmitted()).isFalse();
+    }
+
+    @Test
+    void retainedByteOverflowIsRejectedWithoutAccounting() {
+        IndexAccumulator accumulator = new IndexAccumulator(Long.MAX_VALUE, Long.MAX_VALUE);
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch first =
+                batch(new TableBucket(716L, 0), window, 0, Long.MAX_VALUE);
+        IndexBatch second = batch(new TableBucket(716L, 1), window, 0, 1L);
+
+        assertThatThrownBy(() -> accumulator.tryAppendWindow(Arrays.asList(first, second)))
+                .isInstanceOf(RecordTooLargeException.class);
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(owner)).isZero();
+    }
+
+    @Test
+    void retryDoesNotReserveAgainAndAckReleasesExactlyOnce() {
+        IndexAccumulator accumulator = new IndexAccumulator(5L, 5L);
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexBatch batch = batch(new TableBucket(717L, 0), window, 1, 5L);
+
+        assertThat(accumulator.tryAppendWindow(Collections.singletonList(batch))).isTrue();
+        assertThat(accumulator.pollFirst(batch.targetBucket())).isSameAs(batch);
+        assertThat(accumulator.reEnqueueIfActive(batch, 0L)).isTrue();
+        assertThat(accumulator.pendingBytes()).isEqualTo(5L);
+        assertThat(accumulator.pendingBytes(owner)).isEqualTo(5L);
+        assertThat(accumulator.pollFirst(batch.targetBucket())).isSameAs(batch);
+
+        accumulator.release(batch);
+        accumulator.release(batch);
+        window.onBatchAcked(batch);
+        window.onBatchAcked(batch);
+
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(owner)).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+        assertThat(owner.getSyncIndexPushedOffset()).isEqualTo(10L);
+    }
+
+    @Test
+    void terminalFailureAndOwnerCloseEachReleaseWholeWindowExactlyOnce() {
+        IndexAccumulator accumulator = new IndexAccumulator(100L, 10L);
+        IndexReplicator failedOwner = replicator(accumulator);
+        IndexWindow failedWindow = new IndexWindow("idx", 10L, 2, failedOwner);
+        List<IndexBatch> failedBatches =
+                Arrays.asList(
+                        batch(new TableBucket(718L, 0), failedWindow, 1, 2L),
+                        batch(new TableBucket(718L, 1), failedWindow, 1, 3L));
+        assertThat(accumulator.tryAppendWindow(failedBatches)).isTrue();
+
+        RuntimeException failure = new RuntimeException("terminal");
+        List<IndexBatch> drained = failedWindow.tryFailAndDrain(failure);
+        assertThat(drained).containsExactlyInAnyOrderElementsOf(failedBatches);
+        accumulator.dropBatches(drained);
+        accumulator.dropBatches(drained);
+        assertThat(failedOwner.terminalFailure()).isSameAs(failure);
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(failedOwner)).isZero();
+
+        IndexReplicator closedOwner = replicator(accumulator);
+        IndexWindow closedWindow = new IndexWindow("idx", 20L, 2, closedOwner);
+        List<IndexBatch> closedBatches =
+                Arrays.asList(
+                        batch(new TableBucket(719L, 0), closedWindow, 1, 4L),
+                        batch(new TableBucket(719L, 1), closedWindow, 1, 6L));
+        assertThat(accumulator.tryAppendWindow(closedBatches)).isTrue();
+
+        closedOwner.close();
+        closedOwner.close();
+        assertThat(accumulator.dropForReplicator(closedOwner)).isZero();
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(closedOwner)).isZero();
+        assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
+    }
+
+    @Test
+    void ownerCloseAfterReservationRollsBackEveryTarget() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator(100L, 10L);
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch first = batch(new TableBucket(720L, 0), window, 1, 4L);
+        IndexBatch second = batch(new TableBucket(720L, 1), window, 1, 6L);
+        List<IndexBatch> batches = Arrays.asList(first, second);
+        CountDownLatch reserved = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        AtomicInteger wakeups = new AtomicInteger();
+        accumulator.setAppendListener(ignored -> wakeups.incrementAndGet());
+        accumulator.setAfterAppendAdmissionHook(
+                () -> {
+                    reserved.countDown();
+                    await(resume);
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Boolean> admission = executor.submit(() -> accumulator.tryAppendWindow(batches));
+            assertThat(reserved.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(accumulator.pendingBytes()).isEqualTo(10L);
+
+            owner.close();
+            resume.countDown();
+
+            assertThat(admission.get(5, TimeUnit.SECONDS)).isFalse();
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.pendingBytes(owner)).isZero();
+            assertThat(accumulator.pendingOwnerCountForTesting()).isZero();
+            assertThat(accumulator.hasPending(first.targetBucket())).isFalse();
+            assertThat(accumulator.hasPending(second.targetBucket())).isFalse();
+            assertThat(window.isAdmitted()).isFalse();
+            assertThat(wakeups).hasValue(0);
+        } finally {
+            resume.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void wholeWindowInputMustBeCompleteExactAndUnique() {
+        IndexAccumulator accumulator = new IndexAccumulator(100L, 100L);
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch first = batch(new TableBucket(721L, 0), window);
+        IndexBatch second = batch(new TableBucket(721L, 1), window);
+
+        assertThatThrownBy(() -> accumulator.tryAppendWindow(Collections.emptyList()))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> accumulator.tryAppendWindow(Collections.singletonList(first)))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        IndexWindow otherWindow = new IndexWindow("idx", 20L, 1, owner);
+        IndexBatch other = batch(new TableBucket(722L, 0), otherWindow);
+        assertThatThrownBy(() -> accumulator.tryAppendWindow(Arrays.asList(first, other)))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        IndexWindow duplicateWindow = new IndexWindow("idx", 30L, 2, owner);
+        IndexBatch duplicateFirst = batch(new TableBucket(723L, 0), duplicateWindow);
+        IndexBatch duplicateSecond = batch(new TableBucket(723L, 0), duplicateWindow);
+        assertThatThrownBy(
+                        () ->
+                                accumulator.tryAppendWindow(
+                                        Arrays.asList(duplicateFirst, duplicateSecond)))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        IndexWindow overRegisteredWindow = new IndexWindow("idx", 40L, 2, owner);
+        IndexBatch registeredFirst = batch(new TableBucket(725L, 0), overRegisteredWindow);
+        IndexBatch registeredSecond = batch(new TableBucket(725L, 1), overRegisteredWindow);
+        batch(new TableBucket(725L, 2), overRegisteredWindow);
+        assertThatThrownBy(
+                        () ->
+                                accumulator.tryAppendWindow(
+                                        Arrays.asList(registeredFirst, registeredSecond)))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        IndexWindow releasedWindow = new IndexWindow("idx", 50L, 1, owner);
+        IndexBatch released = batch(new TableBucket(726L, 0), releasedWindow);
+        assertThat(released.markReleased()).isTrue();
+        assertThatThrownBy(
+                        () ->
+                                accumulator.tryAppendWindow(
+                                        Collections.singletonList(released)))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        IndexWindow accountedWindow = new IndexWindow("idx", 60L, 1, owner);
+        IndexBatch accounted = batch(new TableBucket(727L, 0), accountedWindow);
+        assertThat(accounted.markAccounted()).isTrue();
+        assertThatThrownBy(
+                        () ->
+                                accumulator.tryAppendWindow(
+                                        Collections.singletonList(accounted)))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        assertThatThrownBy(() -> accumulator.append(first))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(window.isAdmitted()).isFalse();
+
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(first, second))).isTrue();
+        assertThatThrownBy(() -> accumulator.tryAppendWindow(Arrays.asList(first, second)))
+                .isInstanceOf(IllegalArgumentException.class);
+        for (IndexBatch admitted : Arrays.asList(first, second)) {
+            accumulator.remove(admitted);
+            accumulator.release(admitted);
+        }
+    }
+
+    @Test
+    void senderPollingLeavesStagedUnadmittedHeadInPlace() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexBatch batch = batch(new TableBucket(724L, 0), window);
+        Deque<IndexBatch> staged = new ArrayDeque<>();
+        staged.add(batch);
+        queues(accumulator).put(batch.targetBucket(), staged);
+
+        assertThat(accumulator.pollFirst(batch.targetBucket())).isNull();
+        assertThat(accumulator.pollFirstReady(batch.targetBucket(), Long.MAX_VALUE)).isNull();
+        assertThat(accumulator.hasPending(batch.targetBucket())).isTrue();
+
+        window.markAdmitted();
+        assertThat(accumulator.pollFirstReady(batch.targetBucket(), Long.MAX_VALUE)).isSameAs(batch);
+        assertThat(accumulator.hasPending(batch.targetBucket())).isFalse();
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
     }
 
     @Test

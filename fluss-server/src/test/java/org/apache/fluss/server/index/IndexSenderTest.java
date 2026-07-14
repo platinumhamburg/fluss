@@ -71,6 +71,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
@@ -887,8 +888,7 @@ public class IndexSenderTest {
         IndexBatch second = batchOfSize(secondBucket, window, 3, 4096L);
         long preferredRequestBytes =
                 first.encoded().getBytesLength() + second.encoded().getBytesLength();
-        accumulator.append(first);
-        accumulator.append(second);
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(first, second))).isTrue();
         IndexSender sender =
                 new IndexSender(
                         accumulator,
@@ -979,8 +979,7 @@ public class IndexSenderTest {
         long hardLimit = exactRequestBytes(siblingBucket, sibling);
         AtomicInteger leaderResolutions = new AtomicInteger();
         AtomicInteger gatewayCreations = new AtomicInteger();
-        accumulator.append(large);
-        accumulator.append(sibling);
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(large, sibling))).isTrue();
         IndexSender sender =
                 new IndexSender(
                         accumulator,
@@ -1036,7 +1035,6 @@ public class IndexSenderTest {
         IndexBatch retry = batchOfSize(retryBucket, window, 1);
         IndexBatch oversized = batchOfSize(oversizedBucket, window, 1024 * 1024);
         BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.RETRY_PUBLICATION);
-        accumulator.append(retry);
         IndexSender sender =
                 new IndexSender(
                         accumulator,
@@ -1051,6 +1049,9 @@ public class IndexSenderTest {
                         exactRequestBytes(retryBucket, retry),
                         5_000L,
                         hooks);
+        Consumer<TableBucket> senderWakeup =
+                suppressAppendNotification(accumulator, oversizedBucket);
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(retry, oversized))).isTrue();
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
             assertThat(owner.inFlightWindow("idx")).isSameAs(window);
@@ -1058,7 +1059,7 @@ public class IndexSenderTest {
             Future<?> failedRequest = executor.submit(() -> completePutKv(gateway, 0, false));
             hooks.awaitReached();
 
-            accumulator.append(oversized);
+            senderWakeup.accept(oversizedBucket);
             await(() -> owner.terminalFailure() != null);
             await(() -> accumulator.pendingBytes() == 0L);
 
@@ -1400,12 +1401,12 @@ public class IndexSenderTest {
         RecordingGateway gateway = new RecordingGateway();
         TableBucket smallBucket = new TableBucket(47L, 0);
         TableBucket largeBucket = new TableBucket(47L, 1);
-        IndexReplicator owner = owner(accumulator);
+        IndexReplicator owner = ownerWithIndex(accumulator);
         IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        owner.registerInFlightWindow("idx", window);
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
         long hardLimit = exactRequestBytes(smallBucket, small);
-        accumulator.append(small);
         IndexSender sender =
                 new IndexSender(
                         accumulator,
@@ -1420,9 +1421,11 @@ public class IndexSenderTest {
                         hardLimit,
                         5_000L,
                         IndexSender.LifecycleHooks.NO_OP);
+        Consumer<TableBucket> senderWakeup = suppressAppendNotification(accumulator, largeBucket);
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(small, large))).isTrue();
         try {
             await(() -> gateway.requests.size() == 1);
-            accumulator.append(large);
+            senderWakeup.accept(largeBucket);
             await(() -> owner.terminalFailure() != null);
             await(() -> sender.inFlightRequestCount() == 0);
 
@@ -1452,12 +1455,12 @@ public class IndexSenderTest {
         }
         TableBucket smallBucket = new TableBucket(tableId, smallBucketId);
         TableBucket largeBucket = new TableBucket(tableId, largeBucketId);
-        IndexReplicator owner = owner(accumulator);
+        IndexReplicator owner = ownerWithIndex(accumulator);
         IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        owner.registerInFlightWindow("idx", window);
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
         BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.PUT_KV_INVOCATION);
-        accumulator.append(small);
         IndexSender sender =
                 new IndexSender(
                         accumulator,
@@ -1472,9 +1475,11 @@ public class IndexSenderTest {
                         exactRequestBytes(smallBucket, small),
                         5_000L,
                         hooks);
+        Consumer<TableBucket> senderWakeup = suppressAppendNotification(accumulator, largeBucket);
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(small, large))).isTrue();
         try {
             hooks.awaitReached();
-            accumulator.append(large);
+            senderWakeup.accept(largeBucket);
             await(() -> owner.terminalFailure() != null);
             hooks.release();
             await(() -> sender.inFlightRequestCount() == 0);
@@ -1508,7 +1513,6 @@ public class IndexSenderTest {
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
         FinalPutKvRegistrationHooks hooks = new FinalPutKvRegistrationHooks();
-        accumulator.append(small);
         IndexSender sender =
                 new IndexSender(
                         accumulator,
@@ -1523,9 +1527,11 @@ public class IndexSenderTest {
                         exactRequestBytes(smallBucket, small),
                         5_000L,
                         hooks);
+        Consumer<TableBucket> senderWakeup = suppressAppendNotification(accumulator, largeBucket);
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(small, large))).isTrue();
         try {
             hooks.awaitBeforeDecision();
-            accumulator.append(large);
+            senderWakeup.accept(largeBucket);
             await(() -> owner.terminalFailure() != null);
             assertThat(owner.inFlightWindow("idx")).isNull();
 
@@ -1807,6 +1813,21 @@ public class IndexSenderTest {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    private static Consumer<TableBucket> suppressAppendNotification(
+            IndexAccumulator accumulator, TableBucket suppressedBucket) throws Exception {
+        Field field = IndexAccumulator.class.getDeclaredField("appendListener");
+        field.setAccessible(true);
+        Consumer<TableBucket> senderWakeup = (Consumer<TableBucket>) field.get(accumulator);
+        accumulator.setAppendListener(
+                bucket -> {
+                    if (!bucket.equals(suppressedBucket)) {
+                        senderWakeup.accept(bucket);
+                    }
+                });
+        return senderWakeup;
+    }
+
     private static void replaceQueueRegistry(IndexAccumulator accumulator, CountingBucketMap queues)
             throws Exception {
         Field field = IndexAccumulator.class.getDeclaredField("batches");
@@ -1938,6 +1959,76 @@ public class IndexSenderTest {
     }
 
     @Test
+    void totalRetainedCapacitySurvivesRetryAndRecoversRejectedWindow() throws Exception {
+        long totalLimit = 6L;
+        IndexAccumulator accumulator = new IndexAccumulator(Long.MAX_VALUE, totalLimit);
+        RecordingGateway gateway = new RecordingGateway();
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, bucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        1024L * 1024L,
+                        5_000L);
+        IndexReplicator firstOwner = owner(accumulator);
+        IndexWindow firstWindow = new IndexWindow("idx", 10L, 1, firstOwner);
+        IndexBatch first =
+                batchOfSize(new TableBucket(240L, 0), firstWindow, 1, 3L);
+        IndexReplicator secondOwner = owner(accumulator);
+        IndexWindow secondWindow = new IndexWindow("idx", 20L, 1, secondOwner);
+        IndexBatch second =
+                batchOfSize(new TableBucket(240L, 1), secondWindow, 1, 3L);
+        IndexReplicator rejectedOwner = owner(accumulator);
+        IndexWindow rejectedWindow = new IndexWindow("idx", 30L, 1, rejectedOwner);
+        IndexBatch rejected =
+                batchOfSize(new TableBucket(241L, 0), rejectedWindow, 1, 3L);
+        try {
+            assertThat(accumulator.tryAppendWindow(Collections.singletonList(first))).isTrue();
+            assertThat(accumulator.tryAppendWindow(Collections.singletonList(second))).isTrue();
+            assertThat(accumulator.pendingBytes()).isEqualTo(totalLimit);
+            await(() -> !gateway.pending.isEmpty());
+
+            assertThat(accumulator.tryAppendWindow(Collections.singletonList(rejected))).isFalse();
+            assertThat(accumulator.pendingBytes()).isEqualTo(totalLimit);
+            assertThat(accumulator.pendingBytes(rejectedOwner)).isZero();
+            assertThat(accumulator.hasPending(rejected.targetBucket())).isFalse();
+            assertThat(rejectedWindow.isAdmitted()).isFalse();
+
+            completePutKv(gateway, 0, false);
+            await(() -> first.attempts() + second.attempts() > 0);
+            assertThat(accumulator.pendingBytes()).isEqualTo(totalLimit);
+
+            gateway.autoCompleteSuccess = true;
+            for (int i = 1; i < gateway.pending.size(); i++) {
+                if (!gateway.pending.get(i).isDone()) {
+                    completePutKv(gateway, i, true);
+                }
+            }
+            await(() -> accumulator.pendingBytes() == 0L);
+            assertThat(firstOwner.getSyncIndexPushedOffset()).isEqualTo(10L);
+            assertThat(secondOwner.getSyncIndexPushedOffset()).isEqualTo(20L);
+
+            assertThat(rejectedWindow.tryRetireAndDrain()).containsExactly(rejected);
+            IndexWindow rebuiltWindow = new IndexWindow("idx", 30L, 1, rejectedOwner);
+            IndexBatch rebuilt =
+                    batchOfSize(new TableBucket(241L, 0), rebuiltWindow, 1, 3L);
+            assertThat(accumulator.tryAppendWindow(Collections.singletonList(rebuilt))).isTrue();
+            await(() -> rejectedOwner.getSyncIndexPushedOffset() == 30L);
+
+            assertThat(accumulator.pendingBytes()).isZero();
+            assertThat(accumulator.pendingBytes(rejectedOwner)).isZero();
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
     void failedHeadBatchRetriesBeforeLaterBatchInSameBucket() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
@@ -2001,8 +2092,9 @@ public class IndexSenderTest {
             // One window spanning two index buckets of the same table; it completes only once both
             // buckets are acked.
             IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
-            accumulator.append(batch(new TableBucket(300L, 0), window));
-            accumulator.append(batch(new TableBucket(300L, 1), window));
+            IndexBatch first = batch(new TableBucket(300L, 0), window);
+            IndexBatch second = batch(new TableBucket(300L, 1), window);
+            assertThat(accumulator.tryAppendWindow(Arrays.asList(first, second))).isTrue();
 
             // Bucket 1 keeps failing, so the window never completes and the offset never advances
             // even though bucket 0 was acked. A buggy "RPC-ok == whole-batch-acked" sender would
@@ -2032,8 +2124,7 @@ public class IndexSenderTest {
         IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
         IndexBatch acked = batchOfSize(ackBucket, window, 11);
         IndexBatch retry = batchOfSize(retryBucket, window, 23);
-        accumulator.append(acked);
-        accumulator.append(retry);
+        assertThat(accumulator.tryAppendWindow(Arrays.asList(acked, retry))).isTrue();
         IndexSender sender =
                 new IndexSender(
                         accumulator,

@@ -18,6 +18,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.exception.CorruptRecordException;
+import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
@@ -55,7 +56,10 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -598,6 +602,106 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
+    void totalCapacityRejectionLeavesNoInFlightAndRereadsSameOffset() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator(Long.MAX_VALUE, 4096L);
+        PollFixture fixture =
+                pollFixture(
+                        0L,
+                        1024,
+                        spec(),
+                        accumulator,
+                        Collections.singletonList(
+                                Collections.singletonList(
+                                        record(0L, ChangeType.INSERT, row(1L, 10L, 100L)))),
+                        (ignored, failure) -> {});
+        IndexReplicator fillingOwner =
+                new IndexReplicator(
+                        null,
+                        Collections.emptyList(),
+                        accumulator,
+                        null,
+                        0L,
+                        1024,
+                        (sync, all) -> {});
+        IndexWindow fillingWindow = new IndexWindow("filler", 1L, 1, fillingOwner);
+        IndexBatch fillingBatch =
+                new IndexBatch(
+                        new TableBucket(78L, 0),
+                        new org.apache.fluss.record.bytesview.MemorySegmentBytesView(
+                                org.apache.fluss.memory.MemorySegment.wrap(new byte[] {1}), 0, 1),
+                        4096L,
+                        fillingWindow);
+        AtomicBoolean fillOnce = new AtomicBoolean();
+        fixture.sourceWal.beforeReadReturn =
+                () -> {
+                    if (fillOnce.compareAndSet(false, true)) {
+                        assertThat(
+                                        accumulator.tryAppendWindow(
+                                                Collections.singletonList(fillingBatch)))
+                                .isTrue();
+                    }
+                };
+
+        assertThat(fixture.replicator.poll()).isFalse();
+
+        assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isZero();
+        assertThat(accumulator.pendingBytes(fixture.replicator)).isZero();
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
+
+        assertThat(accumulator.pollFirst(fillingBatch.targetBucket())).isSameAs(fillingBatch);
+        accumulator.release(fillingBatch);
+        fillingWindow.onBatchAcked(fillingBatch);
+        assertThat(accumulator.pendingBytes()).isZero();
+
+        assertThat(fixture.replicator.poll()).isTrue();
+        IndexBatch admitted = accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        assertThat(admitted).isNotNull();
+        assertThat(admitted.window().windowEndOffset()).isEqualTo(1L);
+        acknowledge(accumulator, admitted);
+
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(1L);
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(0L, 0L);
+    }
+
+    @Test
+    void retainedWindowAboveHardTotalFailsTerminallyOnceWithoutReread() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator(Long.MAX_VALUE, 4095L);
+        AtomicInteger terminalCallbacks = new AtomicInteger();
+        AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
+        PollFixture fixture =
+                pollFixture(
+                        0L,
+                        1024,
+                        spec(),
+                        accumulator,
+                        Collections.singletonList(
+                                Collections.singletonList(
+                                        record(0L, ChangeType.INSERT, row(1L, 10L, 100L)))),
+                        (replicator, failure) -> {
+                            terminalCallbacks.incrementAndGet();
+                            callbackFailure.set(failure);
+                        });
+
+        assertThat(fixture.replicator.poll()).isFalse();
+
+        assertThat(fixture.replicator.terminalFailure())
+                .isInstanceOf(RecordTooLargeException.class);
+        assertThat(callbackFailure.get()).isSameAs(fixture.replicator.terminalFailure());
+        assertThat(terminalCallbacks).hasValue(1);
+        assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isZero();
+        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(accumulator.pendingBytes(fixture.replicator)).isZero();
+        assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
+
+        assertThat(fixture.replicator.poll()).isFalse();
+        assertThat(terminalCallbacks).hasValue(1);
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
+    }
+
+    @Test
     void terminalWindowFailureClearsMatchingInFlightWithoutAdvancing() throws Exception {
         PollFixture fixture =
                 pollFixture(
@@ -727,6 +831,23 @@ public class IndexReplicatorAppendTest {
             IndexSpec spec,
             List<List<LogRecord>> sourceBatches)
             throws Exception {
+        return pollFixture(
+                initialOffset,
+                preferredMaxRequestBytes,
+                spec,
+                new IndexAccumulator(),
+                sourceBatches,
+                (ignored, failure) -> {});
+    }
+
+    private static PollFixture pollFixture(
+            long initialOffset,
+            int preferredMaxRequestBytes,
+            IndexSpec spec,
+            IndexAccumulator accumulator,
+            List<List<LogRecord>> sourceBatches,
+            BiConsumer<IndexReplicator, Throwable> onTerminalFailure)
+            throws Exception {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
         LogRecords logRecords = mock(LogRecords.class);
         List<LogRecordBatch> batches = new ArrayList<>();
@@ -747,17 +868,19 @@ public class IndexReplicatorAppendTest {
         }
         when(logRecords.batches()).thenReturn(batches);
         TestingSourceWal sourceWal = new TestingSourceWal(highWatermark, logRecords);
-        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexSourceReader sourceReader =
+                new IndexSourceReader(sourceWal, null, Runnable::run, readContext);
         IndexReplicator replicator =
                 IndexReplicator.forTesting(
-                        sourceWal,
+                        sourceReader,
                         Collections.singletonList(spec),
                         accumulator,
                         readContext,
                         initialOffset,
                         1024,
                         preferredMaxRequestBytes,
-                        (sync, all) -> {});
+                        (sync, all) -> {},
+                        onTerminalFailure);
         return new PollFixture(sourceWal, accumulator, replicator);
     }
 
@@ -801,6 +924,7 @@ public class IndexReplicatorAppendTest {
         private final long highWatermark;
         private final LogRecords records;
         private final List<Long> readOffsets = new ArrayList<>();
+        private volatile Runnable beforeReadReturn = () -> {};
 
         private TestingSourceWal(long highWatermark, LogRecords records) {
             this.highWatermark = highWatermark;
@@ -826,6 +950,7 @@ public class IndexReplicatorAppendTest {
         public FetchDataInfo read(
                 long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage) {
             readOffsets.add(offset);
+            beforeReadReturn.run();
             return new FetchDataInfo(records);
         }
     }

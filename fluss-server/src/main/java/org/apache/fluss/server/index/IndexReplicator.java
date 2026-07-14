@@ -19,6 +19,7 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
@@ -328,9 +329,9 @@ public final class IndexReplicator implements AutoCloseable {
             return false;
         }
 
-        // Back-pressure is scoped to this producer. A stalled target index bucket should stop this
-        // replicator from deriving more windows, but must not stop unrelated table buckets.
-        if (accumulator.isFull(this)) {
+        // Total retained capacity is a hard bound; the per-producer threshold remains soft and
+        // prevents one stalled source from continuing to derive windows.
+        if (accumulator.isFull() || accumulator.isFull(this)) {
             return false;
         }
 
@@ -341,7 +342,10 @@ public final class IndexReplicator implements AutoCloseable {
         long hw = sourceReader.highWatermark();
         boolean polled = false;
         for (IndexProgressState state : indexStates) {
-            if (closed.get() || terminalFailure.get() != null || accumulator.isFull(this)) {
+            if (closed.get()
+                    || terminalFailure.get() != null
+                    || accumulator.isFull()
+                    || accumulator.isFull(this)) {
                 break;
             }
             if (state.inFlightWindow != null) {
@@ -519,20 +523,43 @@ public final class IndexReplicator implements AutoCloseable {
         IndexWindow window =
                 new IndexWindow(
                         state.spec.getIndexName(), lastProcessedOffset, encoded.size(), this);
-        registerInFlightWindow(state.spec.getIndexName(), window);
         List<IndexBatch> batches = new ArrayList<>(encoded.size());
-        for (Map.Entry<TableBucket, BytesView> entry : encoded.entrySet()) {
-            batches.add(
-                    new IndexBatch(
-                            entry.getKey(),
-                            entry.getValue(),
-                            builders.get(entry.getKey()).retainedBytes(),
-                            window));
-        }
-        for (IndexBatch batch : batches) {
-            accumulator.append(batch);
+        registerInFlightWindow(state.spec.getIndexName(), window);
+        try {
+            for (Map.Entry<TableBucket, BytesView> entry : encoded.entrySet()) {
+                batches.add(
+                        new IndexBatch(
+                                entry.getKey(),
+                                entry.getValue(),
+                                builders.get(entry.getKey()).retainedBytes(),
+                                window));
+            }
+            if (!accumulator.tryAppendWindow(batches)) {
+                retireUnadmittedWindow(state, window);
+                return false;
+            }
+        } catch (RecordTooLargeException failure) {
+            retireUnadmittedWindow(state, window);
+            transitionToTerminalLocked(failure);
+            return false;
+        } catch (RuntimeException | Error failure) {
+            retireUnadmittedWindow(state, window);
+            throw failure;
         }
         return true;
+    }
+
+    private void retireUnadmittedWindow(IndexProgressState state, IndexWindow window) {
+        if (window.isAdmitted()) {
+            return;
+        }
+        if (state.inFlightWindow == window) {
+            state.inFlightWindow = null;
+        }
+        List<IndexBatch> drained = window.tryRetireAndDrain();
+        if (drained != null) {
+            accumulator.dropBatches(drained);
+        }
     }
 
     private void advanceOnEmptyWindow(IndexProgressState state, long windowEndOffset) {

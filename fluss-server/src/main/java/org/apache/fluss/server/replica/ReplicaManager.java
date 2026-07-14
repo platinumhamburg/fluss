@@ -306,7 +306,9 @@ public class ReplicaManager implements ServerReconfigurable {
         this.rpcClient = rpcClient;
         this.indexAccumulator =
                 new IndexAccumulator(
-                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_PENDING_BYTES).getBytes());
+                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_PENDING_BYTES).getBytes(),
+                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_TOTAL_PENDING_BYTES)
+                                .getBytes());
         this.indexReplicatorPool =
                 new IndexReplicatorPool(
                         conf.getInt(ConfigOptions.INDEX_REPLICATION_READER_NUMBER),

@@ -57,7 +57,7 @@ final class IndexBatch {
     /** One-shot guard ensuring pending-byte accounting is released at most once. */
     private final AtomicBoolean released = new AtomicBoolean(false);
 
-    private boolean accounted;
+    private volatile boolean accounted;
 
     IndexBatch(TableBucket targetBucket, BytesView encoded, IndexWindow window) {
         this(targetBucket, encoded, encoded.getBytesLength(), window);
@@ -129,8 +129,12 @@ final class IndexBatch {
         return released.get();
     }
 
-    void markAccounted() {
+    synchronized boolean markAccounted() {
+        if (released.get() || accounted) {
+            return false;
+        }
         accounted = true;
+        return true;
     }
 
     boolean wasAccounted() {

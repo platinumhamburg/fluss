@@ -19,6 +19,7 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.utils.MapUtils;
 
@@ -30,6 +31,7 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -40,6 +42,9 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+
 /**
  * TabletServer-global staging area that accumulates pre-encoded {@link IndexBatch}es per target
  * index-table bucket. Producers ({@link IndexReplicator}s, running on the read worker pool) append
@@ -48,9 +53,9 @@ import java.util.function.Consumer;
  *
  * <p>This class is a pure per-bucket queue store: it has no knowledge of leaders, RPC, or retry
  * policy. Leader resolution and in-flight muting are the sender's concern. It does, however, track
- * both total pending (un-acknowledged) retained bytes for observability and per-replicator pending
- * bytes so the read layer can apply back-pressure without letting one stalled replicator stop
- * unrelated replicators from deriving new windows.
+ * total pending (un-acknowledged) retained bytes as a hard admission bound and tracks
+ * per-replicator pending bytes so the read layer can apply soft back-pressure without letting one
+ * stalled replicator stop unrelated replicators from deriving new windows.
  */
 @Internal
 @ThreadSafe
@@ -63,6 +68,12 @@ public final class IndexAccumulator {
 
     /** Upper bound on pending retained bytes for one producing replicator. */
     private final long maxPendingBytes;
+
+    /** Hard upper bound on pending retained bytes across this TabletServer accumulator. */
+    private final long maxTotalPendingBytes;
+
+    /** Serializes competing capacity checks and reservations, but never releases. */
+    private final Object admissionLock = new Object();
 
     /** Total retained bytes of all batches currently pending, including queued and in-flight. */
     private final AtomicLong pendingBytes = new AtomicLong(0L);
@@ -91,15 +102,23 @@ public final class IndexAccumulator {
 
     /** Creates an accumulator with no back-pressure bound (primarily for tests). */
     public IndexAccumulator() {
-        this(Long.MAX_VALUE);
+        this(Long.MAX_VALUE, Long.MAX_VALUE);
     }
 
-    /** Creates an accumulator that reports back-pressure once a producer reaches the bound. */
+    /** Creates an accumulator using the same legacy bound per producer and in total. */
     public IndexAccumulator(long maxPendingBytes) {
-        this.maxPendingBytes = maxPendingBytes;
+        this(maxPendingBytes, maxPendingBytes);
     }
 
-    /** Registers a listener invoked after every {@link #append(IndexBatch)} to wake consumers. */
+    /** Creates an accumulator with separate per-producer and TabletServer-wide bounds. */
+    public IndexAccumulator(long maxPendingBytes, long maxTotalPendingBytes) {
+        checkArgument(maxPendingBytes > 0, "maxPendingBytes must be positive");
+        checkArgument(maxTotalPendingBytes > 0, "maxTotalPendingBytes must be positive");
+        this.maxPendingBytes = maxPendingBytes;
+        this.maxTotalPendingBytes = maxTotalPendingBytes;
+    }
+
+    /** Registers a listener invoked for every admitted batch to wake consumers. */
     public void setAppendListener(Consumer<TableBucket> appendListener) {
         this.appendListener = appendListener;
     }
@@ -116,48 +135,184 @@ public final class IndexAccumulator {
         this.afterAppendAdmissionHook = afterAppendAdmissionHook;
     }
 
-    /** Append a batch to the tail of its target bucket's queue. */
+    /**
+     * Compatibility helper for single-batch windows. Multi-batch windows must use {@link
+     * #tryAppendWindow(List)} so no partial fanout can escape.
+     */
     public void append(IndexBatch batch) {
-        boolean published;
-        // Publication order is window -> batch -> deque. Sender lifecycle code never acquires its
-        // lifecycle lock while holding any of these monitors.
-        synchronized (batch.window()) {
-            synchronized (batch) {
-                if (!batch.ownerActive() || batch.isReleased()) {
-                    return;
-                }
+        checkNotNull(batch, "batch");
+        checkArgument(
+                batch.window().expectedBatchCount() == 1,
+                "append only supports single-batch windows");
+        tryAppendWindow(Collections.singletonList(batch));
+    }
+
+    /**
+     * Atomically admits and publishes every target batch of one source window.
+     *
+     * <p>Capacity reservation is serialized across producers, while sender-visible queue
+     * publication is staged behind the window's admission flag. A rejected or failed publication
+     * leaves no queue or accounting residue.
+     */
+    public boolean tryAppendWindow(List<IndexBatch> windowBatches) {
+        checkNotNull(windowBatches, "windowBatches");
+        checkArgument(!windowBatches.isEmpty(), "windowBatches must not be empty");
+        IndexBatch first = checkNotNull(windowBatches.get(0), "window batch");
+        IndexWindow window = first.window();
+
+        synchronized (window) {
+            validateWindowBatches(windowBatches, window);
+            if (!window.isActive() || window.owner().isClosed()) {
+                return false;
+            }
+
+            long windowBytes = retainedBytes(windowBatches);
+            if (windowBytes > maxTotalPendingBytes) {
+                throw new RecordTooLargeException(
+                        "Index replication window retains "
+                                + windowBytes
+                                + " bytes, exceeding max total pending bytes="
+                                + maxTotalPendingBytes);
+            }
+            if (!reserve(windowBatches, window, windowBytes)) {
+                return false;
+            }
+
+            try {
                 Runnable hook = afterAppendAdmissionHook;
                 if (hook != null) {
                     hook.run();
                 }
-                batches.compute(
-                        batch.targetBucket(),
-                        (ignored, current) -> {
-                            Deque<IndexBatch> deque =
-                                    current == null ? new ArrayDeque<>() : current;
-                            synchronized (deque) {
-                                deque.addLast(batch);
-                                long bytes = batch.retainedBytes();
-                                pendingBytes.addAndGet(bytes);
-                                pendingBytesByReplicator.compute(
-                                        batch.window().owner(),
-                                        (ignoredOwner, ownerBytes) ->
-                                                ownerBytes == null ? bytes : ownerBytes + bytes);
-                                batch.markAccounted();
+                if (!window.isActive() || window.owner().isClosed()) {
+                    rollbackWindow(windowBatches);
+                    return false;
+                }
 
-                                if (!batch.ownerActive()) {
-                                    removeExact(deque, batch);
-                                    release(batch);
-                                }
-                                return deque.isEmpty() ? null : deque;
-                            }
-                        });
-                published = !batch.isReleased();
+                for (IndexBatch batch : windowBatches) {
+                    publishStaged(batch);
+                    if (!window.isActive() || window.owner().isClosed()) {
+                        rollbackWindow(windowBatches);
+                        return false;
+                    }
+                }
+                window.markAdmitted();
+            } catch (RuntimeException | Error failure) {
+                rollbackWindow(windowBatches);
+                throw failure;
             }
         }
-        if (!published) {
-            return;
+
+        for (IndexBatch batch : windowBatches) {
+            notifyAppend(batch);
         }
+        return true;
+    }
+
+    private void validateWindowBatches(List<IndexBatch> windowBatches, IndexWindow window) {
+        checkArgument(!window.isAdmitted(), "window is already admitted");
+        checkArgument(
+                windowBatches.size() == window.expectedBatchCount(),
+                "window batch list does not match its expected batch count");
+        Set<TableBucket> targetBuckets = new HashSet<>();
+        for (IndexBatch batch : windowBatches) {
+            checkNotNull(batch, "window batch");
+            checkArgument(batch.window() == window, "all batches must reference the same window");
+            checkArgument(
+                    targetBuckets.add(batch.targetBucket()),
+                    "window contains a duplicate target bucket");
+            checkArgument(!batch.isReleased(), "window contains a released batch");
+            checkArgument(!batch.wasAccounted(), "window contains an accounted batch");
+        }
+        checkArgument(
+                window.hasExactRegisteredBatches(windowBatches),
+                "window batch list does not match its registered batches");
+    }
+
+    private long retainedBytes(List<IndexBatch> windowBatches) {
+        long bytes = 0L;
+        for (IndexBatch batch : windowBatches) {
+            try {
+                bytes = Math.addExact(bytes, batch.retainedBytes());
+            } catch (ArithmeticException overflow) {
+                throw new RecordTooLargeException(
+                        "Index replication window retained-byte total overflowed", overflow);
+            }
+        }
+        return bytes;
+    }
+
+    private boolean reserve(
+            List<IndexBatch> windowBatches, IndexWindow window, long windowBytes) {
+        synchronized (admissionLock) {
+            if (!window.isActive() || window.owner().isClosed()) {
+                return false;
+            }
+
+            while (true) {
+                long current = pendingBytes.get();
+                if (current > maxTotalPendingBytes - windowBytes) {
+                    return false;
+                }
+                if (pendingBytes.compareAndSet(current, current + windowBytes)) {
+                    break;
+                }
+            }
+
+            try {
+                pendingBytesByReplicator.compute(
+                        window.owner(),
+                        (ignoredOwner, ownerBytes) ->
+                                ownerBytes == null
+                                        ? windowBytes
+                                        : Math.addExact(ownerBytes, windowBytes));
+            } catch (RuntimeException | Error failure) {
+                pendingBytes.addAndGet(-windowBytes);
+                throw failure;
+            }
+
+            for (IndexBatch batch : windowBatches) {
+                if (!batch.markAccounted()) {
+                    rollbackReservation(windowBatches, window.owner());
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    private void rollbackReservation(
+            List<IndexBatch> windowBatches, IndexReplicator owner) {
+        for (IndexBatch batch : windowBatches) {
+            if (batch.wasAccounted()) {
+                release(batch);
+            } else {
+                releaseReservedBytes(owner, batch.retainedBytes());
+            }
+        }
+    }
+
+    private void publishStaged(IndexBatch batch) {
+        batches.compute(
+                batch.targetBucket(),
+                (ignored, current) -> {
+                    Deque<IndexBatch> deque = current == null ? new ArrayDeque<>() : current;
+                    synchronized (deque) {
+                        deque.addLast(batch);
+                    }
+                    return deque;
+                });
+    }
+
+    private void rollbackWindow(List<IndexBatch> windowBatches) {
+        for (IndexBatch batch : windowBatches) {
+            remove(batch);
+        }
+        for (IndexBatch batch : windowBatches) {
+            release(batch);
+        }
+    }
+
+    private void notifyAppend(IndexBatch batch) {
         Consumer<TableBucket> listener = this.appendListener;
         if (listener != null) {
             try {
@@ -201,7 +356,7 @@ public final class IndexAccumulator {
      * layer.
      */
     public boolean isFull() {
-        return pendingBytes.get() >= maxPendingBytes;
+        return pendingBytes.get() >= maxTotalPendingBytes;
     }
 
     /**
@@ -256,6 +411,10 @@ public final class IndexAccumulator {
                 bucket,
                 (ignored, deque) -> {
                     synchronized (deque) {
+                        IndexBatch head = deque.peekFirst();
+                        if (head == null || !head.window().isAdmitted()) {
+                            return deque;
+                        }
                         result[0] = deque.pollFirst();
                         return deque.isEmpty() ? null : deque;
                     }
@@ -278,6 +437,9 @@ public final class IndexAccumulator {
                         IndexBatch head = deque.peekFirst();
                         if (head == null) {
                             return null;
+                        }
+                        if (!head.window().isAdmitted()) {
+                            return deque;
                         }
                         if (head.readyAtMs() > nowMs) {
                             return deque;
@@ -335,13 +497,15 @@ public final class IndexAccumulator {
     public void release(IndexBatch batch) {
         synchronized (batch) {
             if (batch.markReleased() && batch.wasAccounted()) {
-                long bytes = batch.retainedBytes();
-                pendingBytes.addAndGet(-bytes);
-                pendingBytesByReplicator.computeIfPresent(
-                        batch.window().owner(),
-                        (ignored, current) -> current == bytes ? null : current - bytes);
+                releaseReservedBytes(batch.window().owner(), batch.retainedBytes());
             }
         }
+    }
+
+    private void releaseReservedBytes(IndexReplicator owner, long bytes) {
+        pendingBytesByReplicator.computeIfPresent(
+                owner, (ignored, current) -> current == bytes ? null : current - bytes);
+        pendingBytes.addAndGet(-bytes);
     }
 
     private static boolean removeExact(Deque<IndexBatch> deque, IndexBatch batch) {
