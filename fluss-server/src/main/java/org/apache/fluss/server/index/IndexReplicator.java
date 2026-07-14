@@ -55,6 +55,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
 
 /**
  * WAL-driven index replicator that reads committed WAL entries, derives index mutations, and stages
@@ -76,6 +77,9 @@ public final class IndexReplicator implements AutoCloseable {
 
     private static final int PAGE_SIZE = 4096;
 
+    private static final BiConsumer<IndexReplicator, Throwable> NO_TERMINAL_CALLBACK =
+            (ignoredReplicator, ignoredFailure) -> {};
+
     /** Receives sync and all-index progress after an index window advances. */
     @FunctionalInterface
     public interface IndexProgressListener {
@@ -89,6 +93,7 @@ public final class IndexReplicator implements AutoCloseable {
     private final IndexAccumulator accumulator;
     private final LogRecordReadContext readContext;
     private final IndexProgressListener onProgress;
+    private final BiConsumer<IndexReplicator, Throwable> onTerminalFailure;
     private final int maxWindowBytes;
     private final long preferredMaxRequestBytes;
 
@@ -179,6 +184,28 @@ public final class IndexReplicator implements AutoCloseable {
             int maxWindowBytes,
             long preferredMaxRequestBytes,
             IndexProgressListener onProgress) {
+        this(
+                sourceReader,
+                indexSpecs,
+                accumulator,
+                readContext,
+                initialOffset,
+                maxWindowBytes,
+                preferredMaxRequestBytes,
+                onProgress,
+                NO_TERMINAL_CALLBACK);
+    }
+
+    IndexReplicator(
+            IndexSourceReader sourceReader,
+            List<IndexSpec> indexSpecs,
+            IndexAccumulator accumulator,
+            LogRecordReadContext readContext,
+            long initialOffset,
+            int maxWindowBytes,
+            long preferredMaxRequestBytes,
+            IndexProgressListener onProgress,
+            BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
         this.sourceReader = sourceReader;
         this.indexStates = new ArrayList<>(indexSpecs.size());
         this.indexStatesByName = new LinkedHashMap<>();
@@ -200,6 +227,7 @@ public final class IndexReplicator implements AutoCloseable {
         this.terminalFailure = new AtomicReference<>();
         this.lifecycleLock = new ReentrantLock();
         this.onProgress = onProgress;
+        this.onTerminalFailure = onTerminalFailure;
     }
 
     @VisibleForTesting
@@ -242,6 +270,29 @@ public final class IndexReplicator implements AutoCloseable {
                 maxWindowBytes,
                 preferredMaxRequestBytes,
                 onProgress);
+    }
+
+    @VisibleForTesting
+    static IndexReplicator forTesting(
+            IndexSourceReader sourceReader,
+            List<IndexSpec> indexSpecs,
+            IndexAccumulator accumulator,
+            LogRecordReadContext readContext,
+            long initialOffset,
+            int maxWindowBytes,
+            long preferredMaxRequestBytes,
+            IndexProgressListener onProgress,
+            BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
+        return new IndexReplicator(
+                sourceReader,
+                indexSpecs,
+                accumulator,
+                readContext,
+                initialOffset,
+                maxWindowBytes,
+                preferredMaxRequestBytes,
+                onProgress,
+                onTerminalFailure);
     }
 
     /** Sets the wake-up signal used to nudge the read-pool worker after a window completes. */
@@ -560,6 +611,17 @@ public final class IndexReplicator implements AutoCloseable {
                 sourceReader.tableBucket(),
                 getAllIndexPushedOffset(),
                 failure);
+        try {
+            onTerminalFailure.accept(this, failure);
+        } catch (Throwable callbackFailure) {
+            if (callbackFailure != failure) {
+                failure.addSuppressed(callbackFailure);
+            }
+            LOG.warn(
+                    "Failed to report terminal index replication state for {}",
+                    sourceReader.tableBucket(),
+                    callbackFailure);
+        }
     }
 
     private void retireOwnedBatchesLocked() {

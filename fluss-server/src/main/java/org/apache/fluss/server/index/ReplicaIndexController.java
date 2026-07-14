@@ -66,7 +66,9 @@ import java.util.function.ToLongFunction;
  *   NOT_STARTED --&gt; DEFERRED   (metadata not yet available)
  *   NOT_STARTED --&gt; RUNNING    (metadata available, replicator started)
  *   DEFERRED   --&gt; RUNNING    (metadata arrived, retry succeeded)
+ *   RUNNING    --&gt; FAILED      (current replicator reports a terminal failure)
  *   RUNNING    --&gt; NOT_STARTED (become follower / close)
+ *   FAILED     --&gt; NOT_STARTED (become follower / close)
  * </pre>
  */
 @Internal
@@ -76,7 +78,8 @@ public final class ReplicaIndexController {
     enum State {
         NOT_STARTED,
         DEFERRED,
-        RUNNING
+        RUNNING,
+        FAILED
     }
 
     private static final Logger LOG = LoggerFactory.getLogger(ReplicaIndexController.class);
@@ -89,8 +92,9 @@ public final class ReplicaIndexController {
     private final RemoteLogManager remoteLogManager;
     private final TabletServerMetricGroup metrics;
     private final AtomicReference<State> state = new AtomicReference<>(State.NOT_STARTED);
+    private final Object lifecycleLock = new Object();
 
-    @Nullable private IndexReplicator indexReplicator;
+    @Nullable private volatile IndexReplicator indexReplicator;
 
     /**
      * The partition-tombstone judge for Index Tables; {@code null} for main tables and for Index
@@ -332,6 +336,11 @@ public final class ReplicaIndexController {
         return state.get() == State.DEFERRED;
     }
 
+    /** Returns {@code true} when the current replicator stopped after a terminal failure. */
+    public boolean isFailed() {
+        return state.get() == State.FAILED;
+    }
+
     @VisibleForTesting
     public IndexReplicator getIndexReplicator() {
         return indexReplicator;
@@ -408,42 +417,87 @@ public final class ReplicaIndexController {
                         initialOffset,
                         replicatorPool.maxWindowBytes(),
                         replicatorPool.preferredMaxRequestBytes(),
-                        onProgress);
-        this.indexReplicator = replicator;
-        state.set(State.RUNNING);
+                        onProgress,
+                        this::onIndexReplicatorFailed);
         // Register with the read pool; the pool worker will catch up on any WAL entries already
         // committed before this replicator was created.
-        replicatorPool.register(tableBucket, replicator);
+        installIndexReplicator(replicator);
         LOG.info("IndexReplicator (WAL-driven) registered for {}", tableBucket);
     }
 
-    private void stopIndexReplicator() {
-        IndexReplicator r = this.indexReplicator;
-        if (r != null) {
-            if (replicatorPool != null) {
-                replicatorPool.unregister(tableBucket);
-            }
+    void installIndexReplicator(IndexReplicator replicator) {
+        RuntimeException registrationFailure = null;
+        Error registrationError = null;
+        synchronized (lifecycleLock) {
+            State previousState = state.get();
+            IndexReplicator previousReplicator = indexReplicator;
+            indexReplicator = replicator;
+            state.set(State.RUNNING);
             try {
-                r.close();
-            } catch (Exception e) {
-                LOG.warn("Error closing IndexReplicator for {}", tableBucket, e);
+                replicatorPool.register(tableBucket, replicator);
+            } catch (RuntimeException e) {
+                indexReplicator = previousReplicator;
+                state.set(previousState);
+                registrationFailure = e;
+            } catch (Error e) {
+                indexReplicator = previousReplicator;
+                state.set(previousState);
+                registrationError = e;
             }
-            // Drop any batches still queued for this replicator. Once it is gone (table dropped or
-            // leadership moved) those batches can never resolve a leader and would otherwise loop
-            // forever in the sender's at-least-once retry, pinning memory and holding
-            // back-pressure.
-            if (accumulator != null) {
-                int dropped = accumulator.dropForReplicator(r);
-                if (dropped > 0) {
-                    LOG.info(
-                            "Discarded {} queued index batch(es) for {} after stopping its "
-                                    + "replicator",
-                            dropped,
-                            tableBucket);
-                }
-            }
-            this.indexReplicator = null;
         }
-        state.set(State.NOT_STARTED);
+        if (registrationFailure != null || registrationError != null) {
+            try {
+                replicator.close();
+            } catch (Exception e) {
+                LOG.warn("Error closing unregistered IndexReplicator for {}", tableBucket, e);
+            }
+            if (registrationFailure != null) {
+                throw registrationFailure;
+            }
+            throw registrationError;
+        }
+    }
+
+    void onIndexReplicatorFailed(IndexReplicator failed, Throwable failure) {
+        synchronized (lifecycleLock) {
+            if (indexReplicator != failed || state.get() != State.RUNNING) {
+                return;
+            }
+            state.set(State.FAILED);
+        }
+        LOG.error("Index replication stopped for source bucket {}", tableBucket, failure);
+    }
+
+    private void stopIndexReplicator() {
+        IndexReplicator r;
+        synchronized (lifecycleLock) {
+            r = indexReplicator;
+            indexReplicator = null;
+            state.set(State.NOT_STARTED);
+        }
+        if (r == null) {
+            return;
+        }
+        if (replicatorPool != null) {
+            replicatorPool.unregister(tableBucket);
+        }
+        try {
+            r.close();
+        } catch (Exception e) {
+            LOG.warn("Error closing IndexReplicator for {}", tableBucket, e);
+        }
+        // Drop any batches still queued for this replicator. Once it is gone (table dropped or
+        // leadership moved) those batches can never resolve a leader and would otherwise loop
+        // forever in the sender's at-least-once retry, pinning memory and holding back-pressure.
+        if (accumulator != null) {
+            int dropped = accumulator.dropForReplicator(r);
+            if (dropped > 0) {
+                LOG.info(
+                        "Discarded {} queued index batch(es) for {} after stopping its "
+                                + "replicator",
+                        dropped,
+                        tableBucket);
+            }
+        }
     }
 }

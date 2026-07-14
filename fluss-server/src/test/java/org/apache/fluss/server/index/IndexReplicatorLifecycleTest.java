@@ -48,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -433,7 +434,21 @@ public class IndexReplicatorLifecycleTest {
                         queuedRemoteReads::add,
                         readContext);
         IndexAccumulator accumulator = new IndexAccumulator();
-        IndexReplicator replicator = replicator(reader, accumulator, readContext);
+        AtomicInteger callbackCount = new AtomicInteger();
+        AtomicReference<IndexReplicator> reportedReplicator = new AtomicReference<>();
+        AtomicReference<Throwable> reportedFailure = new AtomicReference<>();
+        IndexReplicator replicator =
+                replicator(
+                        reader,
+                        accumulator,
+                        readContext,
+                        (reported, failure) -> {
+                            verify(readContext, times(1)).close();
+                            assertThat(accumulator.pendingBytes(reported)).isZero();
+                            callbackCount.incrementAndGet();
+                            reportedReplicator.set(reported);
+                            reportedFailure.set(failure);
+                        });
 
         assertThat(replicator.poll()).isFalse();
         assertThat(queuedRemoteReads).hasSize(1);
@@ -444,6 +459,11 @@ public class IndexReplicatorLifecycleTest {
                 .hasMessageContaining("expected record offset 1 but found 2");
         Throwable terminal = replicator.terminalFailure();
         assertThat(terminal).isInstanceOf(IndexSourceWalCorruptionException.class);
+        assertThat(callbackCount).hasValue(1);
+        assertThat(reportedReplicator.get()).isSameAs(replicator);
+        assertThat(reportedFailure.get()).isSameAs(replicator.terminalFailure());
+        verify(readContext, times(1)).close();
+        assertThat(accumulator.pendingBytes(replicator)).isZero();
         assertThat(fetchCount).hasValue(1);
         assertThat(closeCount).hasValue(1);
 
@@ -451,6 +471,54 @@ public class IndexReplicatorLifecycleTest {
         assertThat(replicator.terminalFailure()).isSameAs(terminal);
         assertThat(fetchCount).hasValue(1);
         replicator.close();
+        replicator.close();
+        assertThat(callbackCount).hasValue(1);
+    }
+
+    @Test
+    void terminalCallbackFailureIsSuppressedAfterCleanup() throws Exception {
+        LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        LogRecord first = record(0L);
+        LogRecord gap = record(2L);
+        LogRecordBatch batch = mock(LogRecordBatch.class);
+        when(batch.baseLogOffset()).thenReturn(0L);
+        when(batch.nextLogOffset()).thenReturn(3L);
+        when(batch.sizeInBytes()).thenReturn(3);
+        when(batch.getRecordCount()).thenReturn(3);
+        when(batch.records(readContext))
+                .thenAnswer(
+                        ignored -> CloseableIterator.wrap(Arrays.asList(first, gap).iterator()));
+        IndexSourceReader reader =
+                new IndexSourceReader(
+                        sourceLog(0L, 0L, 3L, records(batch)), null, Runnable::run, readContext);
+        IndexAccumulator accumulator = new IndexAccumulator();
+        AtomicInteger callbackCount = new AtomicInteger();
+        RuntimeException callbackFailure = new RuntimeException("terminal callback failed");
+        IndexReplicator replicator =
+                replicator(
+                        reader,
+                        accumulator,
+                        readContext,
+                        (reported, failure) -> {
+                            callbackCount.incrementAndGet();
+                            throw callbackFailure;
+                        });
+
+        assertThatThrownBy(replicator::poll)
+                .isInstanceOf(IndexSourceWalCorruptionException.class)
+                .hasMessageContaining("expected record offset 1 but found 2");
+
+        Throwable terminal = replicator.terminalFailure();
+        assertThat(terminal).isInstanceOf(IndexSourceWalCorruptionException.class);
+        assertThat(terminal.getSuppressed()).contains(callbackFailure);
+        assertThat(callbackCount).hasValue(1);
+        verify(readContext, times(1)).close();
+        assertThat(accumulator.pendingBytes(replicator)).isZero();
+
+        assertThat(replicator.poll()).isFalse();
+        replicator.close();
+        replicator.close();
+        assertThat(callbackCount).hasValue(1);
     }
 
     private static IndexReplicator replicator(
@@ -458,6 +526,23 @@ public class IndexReplicatorLifecycleTest {
             IndexAccumulator accumulator,
             LogRecordReadContext readContext) {
         return replicator(reader, accumulator, readContext, Collections.singletonList(spec("idx")));
+    }
+
+    private static IndexReplicator replicator(
+            IndexSourceReader reader,
+            IndexAccumulator accumulator,
+            LogRecordReadContext readContext,
+            BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
+        return IndexReplicator.forTesting(
+                reader,
+                Collections.singletonList(spec("idx")),
+                accumulator,
+                readContext,
+                0L,
+                1024,
+                1024,
+                (sync, all) -> {},
+                onTerminalFailure);
     }
 
     private static IndexReplicator replicator(
