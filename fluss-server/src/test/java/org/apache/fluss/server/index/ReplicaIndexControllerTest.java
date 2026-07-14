@@ -20,11 +20,13 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.encode.RowEncoder;
@@ -40,10 +42,14 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -132,21 +138,100 @@ class ReplicaIndexControllerTest {
         verify(readContext, times(1)).close();
     }
 
+    @Test
+    void followerStopUnregistersBeforeClosingAndDroppingCurrentReplicator() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        ReplicaIndexController controller = controller(accumulator);
+        AtomicBoolean observeProbePoll = new AtomicBoolean();
+        CountDownLatch probePolled = new CountDownLatch(1);
+        IndexReplicator probe =
+                idleReplicator(
+                        new IndexAccumulator(),
+                        mock(LogRecordReadContext.class),
+                        (ignored, failure) -> {},
+                        () -> {
+                            if (observeProbePoll.get()) {
+                                probePolled.countDown();
+                            }
+                        });
+        LogRecordReadContext oldReadContext = mock(LogRecordReadContext.class);
+        AtomicReference<IndexReplicator> oldReference = new AtomicReference<>();
+        doAnswer(
+                        ignored -> {
+                            // IndexReplicator.close() retires its own queued batches before it
+                            // closes the read context. The positive pre-stop assertion below
+                            // proves this was a real owned backlog rather than an empty fixture.
+                            assertThat(accumulator.pendingBytes(oldReference.get())).isZero();
+                            pool.register(TABLE_BUCKET, probe);
+                            return null;
+                        })
+                .when(oldReadContext)
+                .close();
+        IndexReplicator old =
+                idleReplicator(accumulator, oldReadContext, (ignored, failure) -> {}, () -> {});
+        oldReference.set(old);
+        IndexWindow window = new IndexWindow("idx", 1L, 1, old);
+        IndexBatch queued =
+                new IndexBatch(
+                        TARGET_BUCKET,
+                        new MemorySegmentBytesView(
+                                MemorySegment.wrap(new byte[] {1}), 0, 1),
+                        window);
+        accumulator.append(queued);
+        assertThat(accumulator.pendingBytes(old)).isPositive();
+
+        try {
+            controller.installIndexReplicator(old);
+            controller.onBecomeFollower();
+
+            assertThat(old.isClosed()).isTrue();
+            assertThat(accumulator.pendingBytes(old)).isZero();
+            assertThat(controller.getIndexReplicator()).isNull();
+            assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.NOT_STARTED);
+            verify(oldReadContext, times(1)).close();
+
+            // The second stop must not unregister the probe that was installed while old was
+            // closing.
+            controller.onBecomeFollower();
+            observeProbePoll.set(true);
+            pool.signal(TABLE_BUCKET);
+            assertThat(probePolled.await(10, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.unregister(TABLE_BUCKET);
+            probe.close();
+        }
+    }
+
     private ReplicaIndexController controller() {
-        return new ReplicaIndexController(
-                null, TABLE_BUCKET, null, pool, new IndexAccumulator(), null, null);
+        return controller(new IndexAccumulator());
+    }
+
+    private ReplicaIndexController controller(IndexAccumulator accumulator) {
+        return new ReplicaIndexController(null, TABLE_BUCKET, null, pool, accumulator, null, null);
     }
 
     private static IndexReplicator idleReplicator(
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
+        return idleReplicator(
+                new IndexAccumulator(), readContext, onTerminalFailure, () -> {});
+    }
+
+    private static IndexReplicator idleReplicator(
+            IndexAccumulator accumulator,
+            LogRecordReadContext readContext,
+            BiConsumer<IndexReplicator, Throwable> onTerminalFailure,
+            Runnable onHighWatermark) {
         IndexSourceReader reader =
                 new IndexSourceReader(
-                        sourceLog(0L, 0L, 0L, emptyRecords()), null, Runnable::run, readContext);
+                        sourceLog(0L, 0L, 0L, emptyRecords(), null, onHighWatermark),
+                        null,
+                        Runnable::run,
+                        readContext);
         return IndexReplicator.forTesting(
                 reader,
                 Collections.singletonList(spec()),
-                new IndexAccumulator(),
+                accumulator,
                 readContext,
                 0L,
                 1024,
@@ -255,7 +340,7 @@ class ReplicaIndexControllerTest {
             long localLogStartOffset,
             long highWatermark,
             LogRecords records) {
-        return sourceLog(logStartOffset, localLogStartOffset, highWatermark, records, null);
+        return sourceLog(logStartOffset, localLogStartOffset, highWatermark, records, null, () -> {});
     }
 
     private static IndexSourceReader.SourceLog sourceLog(
@@ -264,6 +349,22 @@ class ReplicaIndexControllerTest {
             long highWatermark,
             LogRecords records,
             AtomicBoolean exposeCorruption) {
+        return sourceLog(
+                logStartOffset,
+                localLogStartOffset,
+                highWatermark,
+                records,
+                exposeCorruption,
+                () -> {});
+    }
+
+    private static IndexSourceReader.SourceLog sourceLog(
+            long logStartOffset,
+            long localLogStartOffset,
+            long highWatermark,
+            LogRecords records,
+            AtomicBoolean exposeCorruption,
+            Runnable onHighWatermark) {
         return new IndexSourceReader.SourceLog() {
             @Override
             public TableBucket tableBucket() {
@@ -272,6 +373,7 @@ class ReplicaIndexControllerTest {
 
             @Override
             public long highWatermark() {
+                onHighWatermark.run();
                 return exposeCorruption == null
                         ? highWatermark
                         : (exposeCorruption.get() ? highWatermark : 0L);
