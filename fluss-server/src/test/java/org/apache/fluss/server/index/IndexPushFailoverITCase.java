@@ -27,6 +27,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
@@ -39,9 +40,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
@@ -299,78 +303,107 @@ class IndexPushFailoverITCase {
                 .as("pushed offset must be the -1 sentinel before any main-table write")
                 .isEqualTo(-1L);
 
-        // Determine which server hosts the target index bucket leader
-        byte[] indexKey = encodeIndexKey("test", 1);
-        int targetIdxBucket = computeIndexBucket("test");
-        TableBucket idxTb = new TableBucket(indexTableId, targetIdxBucket);
-        int idxLeaderServer = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(idxTb);
-
-        // Kill the index table's leader (only if it's different from the main leader)
-        if (idxLeaderServer == mainLeader) {
-            // If they're on the same server, pick a different index bucket
-            for (int i = 0; i < 3; i++) {
-                int leader =
-                        FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(indexTableId, i));
-                if (leader != mainLeader) {
-                    idxLeaderServer = leader;
-                    break;
-                }
+        // Select a physical target bucket whose leader is not the source main-table leader. The
+        // written value below is derived from this exact bucket, so the stopped server owns the
+        // target that receives the index push.
+        int[] indexBucketLeaders = new int[3];
+        int targetIdxBucket = -1;
+        for (int i = 0; i < 3; i++) {
+            int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(indexTableId, i));
+            indexBucketLeaders[i] = leader;
+            if (targetIdxBucket == -1 && leader != mainLeader) {
+                targetIdxBucket = i;
             }
         }
+        if (targetIdxBucket == -1) {
+            throw new AssertionError(
+                    "No index bucket leader differs from source main-table leader "
+                            + mainLeader
+                            + "; index bucket leaders are "
+                            + Arrays.toString(indexBucketLeaders));
+        }
 
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(idxLeaderServer);
+        String selectedValue = valueForIndexBucket("target-failover", targetIdxBucket);
+        byte[] indexKey = encodeIndexKey(selectedValue, 1);
+        TableBucket idxTb = new TableBucket(indexTableId, targetIdxBucket);
+        int stoppedTargetLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(idxTb);
+        assertThat(stoppedTargetLeader)
+                .as("selected index bucket leader must differ from the source main-table leader")
+                .isNotEqualTo(mainLeader);
+        assertThat(stoppedTargetLeader)
+                .as("selected index bucket leader must remain the observed target leader")
+                .isEqualTo(indexBucketLeaders[targetIdxBucket]);
 
-        // Wait for new index leaders
-        final int stoppedServer = idxLeaderServer;
-        for (int i = 0; i < 3; i++) {
-            TableBucket tb = new TableBucket(indexTableId, i);
+        boolean targetLeaderStopped = false;
+        Throwable primaryFailure = null;
+        try {
+            FLUSS_CLUSTER_EXTENSION.stopTabletServer(stoppedTargetLeader);
+            targetLeaderStopped = true;
+
+            // Submit the source write while the exact physical target is unavailable. Do not wait
+            // for replacement leadership before the push enters the retry path.
+            CompletableFuture<PutKvResponse> sourceWrite =
+                    FLUSS_CLUSTER_EXTENSION
+                            .newTabletServerClientForNode(mainLeader)
+                            .putKv(
+                                    newPutKvRequest(
+                                            mainTableId,
+                                            0,
+                                            1,
+                                            genKvRecordBatch(
+                                                    new Object[] {1, selectedValue})));
+            waitUntil(
+                    () -> FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(idxTb) != stoppedTargetLeader,
+                    TIMEOUT,
+                    "wait for the selected target index bucket to fail over");
+            sourceWrite.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            // Verify the exact physical key on the replacement leader for the exact bucket that
+            // was unavailable during the source write.
             waitUntil(
                     () -> {
                         try {
-                            int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
-                            return leader != stoppedServer;
+                            Replica idxReplica =
+                                    FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(idxTb);
+                            List<byte[]> result =
+                                    idxReplica.lookups(Collections.singletonList(indexKey));
+                            return result.get(0) != null;
                         } catch (Exception e) {
                             return false;
                         }
                     },
                     TIMEOUT,
-                    "wait for new index leader for bucket " + i);
-        }
+                    "wait for index entry after selected target leader failover");
+            Replica replacementTargetLeader =
+                    FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(idxTb);
+            assertThat(replacementTargetLeader.lookups(Collections.singletonList(indexKey)).get(0))
+                    .as("exact physical index key must be present on the replacement target leader")
+                    .isNotNull();
 
-        // Write to the main table — the push should retry and reach the new index leader
-        FLUSS_CLUSTER_EXTENSION
-                .newTabletServerClientForNode(mainLeader)
-                .putKv(
-                        newPutKvRequest(
-                                mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "test"})))
-                .get();
-
-        // Verify the index entry eventually appears
-        waitUntil(
-                () -> {
-                    try {
-                        Replica idxReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(idxTb);
-                        List<byte[]> result =
-                                idxReplica.lookups(Collections.singletonList(indexKey));
-                        return result.get(0) != null;
-                    } catch (Exception e) {
-                        return false;
+            // One source row at offset 0 advances the exact completed prefix to 1. An exact check
+            // catches both a retry that never completed and an accidental skip past source WAL.
+            waitUntil(
+                    () -> mainReplica.getSyncIndexPushedOffset() == 1L,
+                    TIMEOUT,
+                    "pushed offset must equal the one-row source WAL end after retry");
+            assertThat(mainReplica.getSyncIndexPushedOffset()).isEqualTo(1L);
+        } catch (Exception | AssertionError failure) {
+            primaryFailure = failure;
+            throw failure;
+        } finally {
+            if (targetLeaderStopped) {
+                try {
+                    FLUSS_CLUSTER_EXTENSION.startTabletServer(stoppedTargetLeader);
+                    FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+                } catch (Exception | AssertionError restartFailure) {
+                    if (primaryFailure != null) {
+                        primaryFailure.addSuppressed(restartFailure);
+                    } else {
+                        throw restartFailure;
                     }
-                },
-                TIMEOUT,
-                "wait for index entry after index table leader failover");
-
-        // One source row at offset 0 advances the exact completed prefix to 1. An exact check
-        // catches both a retry that never completed and an accidental skip past source WAL.
-        waitUntil(
-                () -> mainReplica.getSyncIndexPushedOffset() == 1L,
-                TIMEOUT,
-                "pushed offset must equal the one-row source WAL end after retry");
-        assertThat(mainReplica.getSyncIndexPushedOffset()).isEqualTo(1L);
-
-        // Restart the stopped server
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(stoppedServer);
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+                }
+            }
+        }
     }
 
     private static byte[] encodeIndexKey(String b, int a) {
@@ -391,6 +424,16 @@ class IndexPushFailoverITCase {
         row.setField(0, fromString(bValue));
         byte[] bucketKey = bucketKeyEncoder.encodeKey(row);
         return new org.apache.fluss.bucketing.FlussBucketingFunction().bucketing(bucketKey, 3);
+    }
+
+    private static String valueForIndexBucket(String prefix, int expectedBucket) {
+        for (int suffix = 0; suffix < 100_000; suffix++) {
+            String candidate = prefix + '-' + suffix;
+            if (computeIndexBucket(candidate) == expectedBucket) {
+                return candidate;
+            }
+        }
+        throw new AssertionError("No value found for index bucket " + expectedBucket);
     }
 
     private static CompletedSnapshot triggerSnapshotPersistingIndexPushedOffset(
