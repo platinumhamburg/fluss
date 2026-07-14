@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Unit tests for {@link IndexAccumulator} per-bucket queue, re-enqueue ordering and listener. */
 public class IndexAccumulatorTest {
@@ -51,14 +52,56 @@ public class IndexAccumulatorTest {
     }
 
     private static IndexBatch batch(TableBucket targetBucket, IndexWindow window, int size) {
+        return batch(targetBucket, window, size, size);
+    }
+
+    private static IndexBatch batch(
+            TableBucket targetBucket, IndexWindow window, int size, long retainedBytes) {
         byte[] bytes = new byte[size];
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length);
-        return new IndexBatch(targetBucket, encoded, window);
+        return new IndexBatch(targetBucket, encoded, retainedBytes, window);
     }
 
     private static IndexReplicator replicator(IndexAccumulator accumulator) {
         return new IndexReplicator(
                 null, Collections.emptyList(), accumulator, null, 0L, 1024, (sync, all) -> {});
+    }
+
+    @Test
+    void pendingAccountingUsesRetainedBytes() {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexReplicator owner = replicator(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexBatch batch = batch(new TableBucket(700L, 0), window, 3, 4096L);
+
+        accumulator.append(batch);
+
+        assertThat(batch.encoded().getBytesLength()).isEqualTo(3);
+        assertThat(batch.retainedBytes()).isEqualTo(4096L);
+        assertThat(window.registeredPayloadBytes()).isEqualTo(3L);
+        assertThat(accumulator.pendingBytes()).isEqualTo(4096L);
+        assertThat(accumulator.pendingBytes(owner)).isEqualTo(4096L);
+
+        accumulator.release(accumulator.pollFirst(batch.targetBucket()));
+        assertThat(accumulator.pendingBytes()).isZero();
+    }
+
+    @Test
+    void retainedBytesMustCoverEncodedPayload() {
+        IndexWindow window = new IndexWindow("idx", 1L, 1, replicator(new IndexAccumulator()));
+
+        assertThatThrownBy(() -> batch(new TableBucket(701L, 0), window, 3, 2L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("retainedBytes must cover the encoded payload");
+    }
+
+    @Test
+    void retainedBytesMustNotBeNegative() {
+        IndexWindow window = new IndexWindow("idx", 1L, 1, replicator(new IndexAccumulator()));
+
+        assertThatThrownBy(() -> batch(new TableBucket(702L, 0), window, 0, -1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("retainedBytes must cover the encoded payload");
     }
 
     @Test

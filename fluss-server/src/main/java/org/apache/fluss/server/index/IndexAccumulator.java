@@ -48,7 +48,7 @@ import java.util.function.Consumer;
  *
  * <p>This class is a pure per-bucket queue store: it has no knowledge of leaders, RPC, or retry
  * policy. Leader resolution and in-flight muting are the sender's concern. It does, however, track
- * both total pending (un-acknowledged) encoded bytes for observability and per-replicator pending
+ * both total pending (un-acknowledged) retained bytes for observability and per-replicator pending
  * bytes so the read layer can apply back-pressure without letting one stalled replicator stop
  * unrelated replicators from deriving new windows.
  */
@@ -61,13 +61,13 @@ public final class IndexAccumulator {
     private final ConcurrentMap<TableBucket, Deque<IndexBatch>> batches =
             MapUtils.newConcurrentMap();
 
-    /** Upper bound on pending encoded bytes for one producing replicator. */
+    /** Upper bound on pending retained bytes for one producing replicator. */
     private final long maxPendingBytes;
 
-    /** Total encoded bytes of all batches currently pending, including queued and in-flight. */
+    /** Total retained bytes of all batches currently pending, including queued and in-flight. */
     private final AtomicLong pendingBytes = new AtomicLong(0L);
 
-    /** Pending encoded bytes grouped by the leader-side replicator that produced the batches. */
+    /** Pending retained bytes grouped by the leader-side replicator that produced the batches. */
     private final ConcurrentMap<IndexReplicator, Long> pendingBytesByReplicator =
             MapUtils.newConcurrentMap();
 
@@ -137,7 +137,7 @@ public final class IndexAccumulator {
                                     current == null ? new ArrayDeque<>() : current;
                             synchronized (deque) {
                                 deque.addLast(batch);
-                                long bytes = batch.encoded().getBytesLength();
+                                long bytes = batch.retainedBytes();
                                 pendingBytes.addAndGet(bytes);
                                 pendingBytesByReplicator.compute(
                                         batch.window().owner(),
@@ -196,7 +196,7 @@ public final class IndexAccumulator {
     }
 
     /**
-     * Returns {@code true} once the total pending encoded bytes reach the configured bound. The
+     * Returns {@code true} once the total pending retained bytes reach the configured bound. The
      * read layer consults this before deriving a new window so derivation cannot outrun the send
      * layer.
      */
@@ -213,12 +213,12 @@ public final class IndexAccumulator {
         return pendingBytes(owner) >= maxPendingBytes;
     }
 
-    /** Total encoded bytes currently pending, including queued and in-flight. */
+    /** Total retained bytes currently pending, including queued and in-flight. */
     public long pendingBytes() {
         return pendingBytes.get();
     }
 
-    /** Encoded bytes currently pending for the given producing replicator. */
+    /** Retained bytes currently pending for the given producing replicator. */
     public long pendingBytes(IndexReplicator owner) {
         Long ownerPendingBytes = pendingBytesByReplicator.get(owner);
         return ownerPendingBytes == null ? 0L : ownerPendingBytes;
@@ -335,7 +335,7 @@ public final class IndexAccumulator {
     public void release(IndexBatch batch) {
         synchronized (batch) {
             if (batch.markReleased() && batch.wasAccounted()) {
-                long bytes = batch.encoded().getBytesLength();
+                long bytes = batch.retainedBytes();
                 pendingBytes.addAndGet(-bytes);
                 pendingBytesByReplicator.computeIfPresent(
                         batch.window().owner(),

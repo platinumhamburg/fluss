@@ -522,7 +522,12 @@ public final class IndexReplicator implements AutoCloseable {
         registerInFlightWindow(state.spec.getIndexName(), window);
         List<IndexBatch> batches = new ArrayList<>(encoded.size());
         for (Map.Entry<TableBucket, BytesView> entry : encoded.entrySet()) {
-            batches.add(new IndexBatch(entry.getKey(), entry.getValue(), window));
+            batches.add(
+                    new IndexBatch(
+                            entry.getKey(),
+                            entry.getValue(),
+                            builders.get(entry.getKey()).retainedBytes(),
+                            window));
         }
         for (IndexBatch batch : batches) {
             accumulator.append(batch);
@@ -1089,10 +1094,11 @@ public final class IndexReplicator implements AutoCloseable {
 
     /** Per-target-bucket builder that directly encodes KV records. */
     static final class BucketBatchBuilder {
+        private final UnmanagedPagedOutputView output;
         final FencedKvRecordBatchBuilder builder;
 
         BucketBatchBuilder(short schemaId, KvFormat kvFormat) {
-            UnmanagedPagedOutputView output = new UnmanagedPagedOutputView(PAGE_SIZE);
+            this.output = new UnmanagedPagedOutputView(PAGE_SIZE);
             this.builder =
                     FencedKvRecordBatchBuilder.builder(
                             schemaId, Integer.MAX_VALUE, output, kvFormat);
@@ -1117,6 +1123,10 @@ public final class IndexReplicator implements AutoCloseable {
         BytesView finish(WriterKey writerKey, long windowEndOffset) throws IOException {
             builder.setWriterState(writerKey, windowEndOffset);
             return builder.build();
+        }
+
+        long retainedBytes() {
+            return Math.multiplyExact((long) output.getWrittenSegments().size(), PAGE_SIZE);
         }
     }
 }

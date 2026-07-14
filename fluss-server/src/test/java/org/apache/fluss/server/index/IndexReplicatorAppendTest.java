@@ -156,6 +156,19 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
+    void tinyProductionBatchRetainsOneFullPage() throws Exception {
+        IndexReplicator.BucketBatchBuilder builder =
+                new IndexReplicator.BucketBatchBuilder(INDEX_SCHEMA_ID, KvFormat.COMPACTED);
+        IndexSpec.IndexEntry entry = spec().encodeEntry(row(1L, 10L, 100L));
+        builder.appendUpsert(entry.key(), entry.value());
+
+        BytesView encoded = builder.finish(new WriterKey(0L, 0L), 1L);
+
+        assertThat(encoded.getBytesLength()).isLessThan(4096);
+        assertThat(builder.retainedBytes()).isEqualTo(4096L);
+    }
+
+    @Test
     void nonIndexColumnUpdateSkipsRedundantUpsert() {
         IndexReplicator replicator = newReplicator();
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();

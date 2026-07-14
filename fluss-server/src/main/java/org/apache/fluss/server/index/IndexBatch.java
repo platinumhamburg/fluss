@@ -23,6 +23,7 @@ import org.apache.fluss.record.bytesview.BytesView;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /**
@@ -42,6 +43,7 @@ final class IndexBatch {
 
     private final TableBucket targetBucket;
     private final BytesView encoded;
+    private final long retainedBytes;
     private final IndexWindow window;
 
     private int attempts;
@@ -58,8 +60,16 @@ final class IndexBatch {
     private boolean accounted;
 
     IndexBatch(TableBucket targetBucket, BytesView encoded, IndexWindow window) {
+        this(targetBucket, encoded, encoded.getBytesLength(), window);
+    }
+
+    IndexBatch(TableBucket targetBucket, BytesView encoded, long retainedBytes, IndexWindow window) {
         this.targetBucket = checkNotNull(targetBucket, "targetBucket");
         this.encoded = checkNotNull(encoded, "encoded");
+        checkArgument(
+                retainedBytes >= encoded.getBytesLength(),
+                "retainedBytes must cover the encoded payload");
+        this.retainedBytes = retainedBytes;
         this.window = checkNotNull(window, "window");
         this.attempts = 0;
         this.readyAtMs = 0L;
@@ -73,6 +83,10 @@ final class IndexBatch {
 
     BytesView encoded() {
         return encoded;
+    }
+
+    long retainedBytes() {
+        return retainedBytes;
     }
 
     IndexWindow window() {
