@@ -196,6 +196,9 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
                 MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS,
                 () -> indexPushGaugeSource.get().oldestInFlightAgeMsSupplier.getAsLong());
         gauge(
+                MetricNames.INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT,
+                () -> indexPushGaugeSource.get().failedSourceBucketCountSupplier.getAsLong());
+        gauge(
                 MetricNames.INDEX_WRITER_STATE_ENTRIES,
                 () -> indexWriterStateGaugeSource.get().entryCountSupplier.getAsLong());
         gauge(
@@ -350,12 +353,14 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     public GaugeRegistration registerIndexPushGauges(
             LongSupplier pendingBytesSupplier,
             IntSupplier inFlightRequestsSupplier,
-            LongSupplier oldestInFlightAgeMsSupplier) {
+            LongSupplier oldestInFlightAgeMsSupplier,
+            LongSupplier failedSourceBucketCountSupplier) {
         IndexPushGaugeSource source =
                 new IndexPushGaugeSource(
                         pendingBytesSupplier,
                         inFlightRequestsSupplier,
-                        oldestInFlightAgeMsSupplier);
+                        oldestInFlightAgeMsSupplier,
+                        failedSourceBucketCountSupplier);
         indexPushGaugeSource.set(source);
         return () -> indexPushGaugeSource.compareAndSet(source, IndexPushGaugeSource.EMPTY);
     }
@@ -379,19 +384,22 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     private static final class IndexPushGaugeSource {
         private static final IndexPushGaugeSource EMPTY =
-                new IndexPushGaugeSource(() -> 0L, () -> 0, () -> 0L);
+                new IndexPushGaugeSource(() -> 0L, () -> 0, () -> 0L, () -> 0L);
 
         private final LongSupplier pendingBytesSupplier;
         private final IntSupplier inFlightRequestsSupplier;
         private final LongSupplier oldestInFlightAgeMsSupplier;
+        private final LongSupplier failedSourceBucketCountSupplier;
 
         private IndexPushGaugeSource(
                 LongSupplier pendingBytesSupplier,
                 IntSupplier inFlightRequestsSupplier,
-                LongSupplier oldestInFlightAgeMsSupplier) {
+                LongSupplier oldestInFlightAgeMsSupplier,
+                LongSupplier failedSourceBucketCountSupplier) {
             this.pendingBytesSupplier = pendingBytesSupplier;
             this.inFlightRequestsSupplier = inFlightRequestsSupplier;
             this.oldestInFlightAgeMsSupplier = oldestInFlightAgeMsSupplier;
+            this.failedSourceBucketCountSupplier = failedSourceBucketCountSupplier;
         }
     }
 

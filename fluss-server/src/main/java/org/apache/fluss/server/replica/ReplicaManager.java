@@ -332,7 +332,8 @@ public class ReplicaManager implements ServerReconfigurable {
                 serverMetricGroup.registerIndexPushGauges(
                         indexAccumulator::pendingBytes,
                         indexSender::inFlightRequestCount,
-                        indexSender::oldestInFlightAgeMs);
+                        indexSender::oldestInFlightAgeMs,
+                        this::failedIndexReplicationSourceBucketCount);
         this.indexWriterStateGaugeRegistration =
                 serverMetricGroup.registerIndexWriterStateGauges(
                         this::fencedWriterStateEntryCount, this::fencedWriterStateSnapshotBytes);
@@ -496,6 +497,13 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private long atMinIsrCount() {
         return onlineReplicas().filter(Replica::isAtMinIsr).count();
+    }
+
+    private long failedIndexReplicationSourceBucketCount() {
+        return onlineReplicas()
+                .filter(Replica::isLeader)
+                .filter(replica -> replica.getIndexManager().isFailed())
+                .count();
     }
 
     @VisibleForTesting

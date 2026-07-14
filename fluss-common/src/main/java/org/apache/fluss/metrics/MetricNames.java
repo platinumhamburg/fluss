@@ -137,10 +137,11 @@ public class MetricNames {
     public static final String INDEX_PUSH_LATENCY_MS = "indexPushLatencyMs";
     public static final String PARTITION_TOMBSTONE_APPLY_DROPS_RATE =
             "partitionTombstoneApplyDropsPerSecond";
-    public static final String INDEX_PUSHED_OFFSET_LAG = "indexPushedOffsetLag";
     public static final String INDEX_PUSH_PENDING_BYTES = "indexPushPendingBytes";
     public static final String INDEX_PUSH_IN_FLIGHT_REQUESTS = "indexPushInFlightRequests";
     public static final String INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS = "indexPushOldestInFlightAgeMs";
+    public static final String INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT =
+            "indexReplicationFailedSourceBucketCount";
     public static final String INDEX_PUSH_STALE_V1_BATCHES_RATE =
             "indexPushStaleV1BatchesPerSecond";
     public static final String INDEX_WRITER_STATE_ENTRIES = "indexWriterStateEntries";
