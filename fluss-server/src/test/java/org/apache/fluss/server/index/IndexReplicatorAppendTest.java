@@ -169,6 +169,30 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
+    void pollPublishesTinyBatchWithRetainedPageAccounting() throws Exception {
+        PollFixture fixture =
+                pollFixture(
+                        0L,
+                        1024,
+                        Collections.singletonList(
+                                Collections.singletonList(
+                                        record(0L, ChangeType.INSERT, row(1L, 10L, 100L)))));
+
+        assertThat(fixture.replicator.poll()).isTrue();
+
+        IndexBatch batch = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        assertThat(batch).isNotNull();
+        assertThat(batch.encoded().getBytesLength()).isLessThan(4096);
+        assertThat(batch.retainedBytes()).isEqualTo(4096L);
+        assertThat(fixture.accumulator.pendingBytes()).isEqualTo(4096L);
+        assertThat(fixture.accumulator.pendingBytes(fixture.replicator)).isEqualTo(4096L);
+
+        fixture.accumulator.release(batch);
+        assertThat(fixture.accumulator.pendingBytes()).isZero();
+        assertThat(fixture.accumulator.pendingBytes(fixture.replicator)).isZero();
+    }
+
+    @Test
     void nonIndexColumnUpdateSkipsRedundantUpsert() {
         IndexReplicator replicator = newReplicator();
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();

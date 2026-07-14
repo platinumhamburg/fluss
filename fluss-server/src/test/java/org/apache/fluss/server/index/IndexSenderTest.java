@@ -875,6 +875,48 @@ public class IndexSenderTest {
     }
 
     @Test
+    void requestChunkingUsesLogicalBytesRatherThanRetainedBytes() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.autoCompleteSuccess = true;
+        TableBucket firstBucket = new TableBucket(431L, 0);
+        TableBucket secondBucket = new TableBucket(431L, 1);
+        IndexReplicator owner = owner(accumulator);
+        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexBatch first = batchOfSize(firstBucket, window, 3, 4096L);
+        IndexBatch second = batchOfSize(secondBucket, window, 3, 4096L);
+        long preferredRequestBytes =
+                first.encoded().getBytesLength() + second.encoded().getBytesLength();
+        accumulator.append(first);
+        accumulator.append(second);
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, targetBucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L,
+                        1L,
+                        1L,
+                        preferredRequestBytes,
+                        1024L * 1024L,
+                        5_000L,
+                        IndexSender.LifecycleHooks.NO_OP);
+        try {
+            assertThat(preferredRequestBytes).isGreaterThan(first.encoded().getBytesLength());
+            assertThat(preferredRequestBytes).isLessThan(first.retainedBytes());
+
+            await(() -> gateway.requests.size() == 1);
+            assertThat(gateway.requests.get(0).getBucketsReqsList()).hasSize(2);
+            await(() -> accumulator.pendingBytes() == 0L);
+            assertThat(accumulator.hasUnsent()).isFalse();
+        } finally {
+            sender.close();
+        }
+    }
+
+    @Test
     void singletonAboveHardLimitFailsOnceWithoutRetryOrOffsetAdvance() throws Exception {
         IndexAccumulator accumulator = new IndexAccumulator();
         RecordingGateway gateway = new RecordingGateway();
@@ -1611,9 +1653,14 @@ public class IndexSenderTest {
     }
 
     private static IndexBatch batchOfSize(TableBucket targetBucket, IndexWindow window, int size) {
+        return batchOfSize(targetBucket, window, size, size);
+    }
+
+    private static IndexBatch batchOfSize(
+            TableBucket targetBucket, IndexWindow window, int size, long retainedBytes) {
         byte[] bytes = new byte[size];
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, size);
-        return new IndexBatch(targetBucket, encoded, window);
+        return new IndexBatch(targetBucket, encoded, retainedBytes, window);
     }
 
     private static IndexBatch v1Batch(TableBucket targetBucket, IndexWindow window)
