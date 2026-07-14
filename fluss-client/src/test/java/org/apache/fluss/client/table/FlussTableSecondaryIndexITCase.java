@@ -90,7 +90,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                 TablePath.of(
                         DB,
                         IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
-        waitAllReplicasReady(admin.getTableInfo(indexPath).get().getTableId(), 1);
+        waitAllReplicasReady(admin.getTableInfo(indexPath).get().getTableId(), 2);
         try (Table mainTable = conn.getTable(mainPath);
                 Table indexTable = conn.getTable(indexPath)) {
             assertThat(indexTable.getTableInfo().isIndexTable()).isTrue();
@@ -108,7 +108,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
 
     private static int countRows(Table table) throws Exception {
         int rowCount = 0;
-        try (BatchScanner scanner = table.newScan().createBatchScanner()) {
+        try (BatchScanner scanner = table.newScan().limit(1).createBatchScanner()) {
             CloseableIterator<InternalRow> nextBatch;
             while ((nextBatch = scanner.pollBatch(Duration.ofSeconds(30))) != null) {
                 CloseableIterator<InternalRow> batch = nextBatch;
