@@ -97,6 +97,10 @@ public class FlussTable implements Table {
     @Override
     public Upsert newUpsert() {
         checkState(
+                !tableInfo.isIndexTable(),
+                "Table %s is an internal secondary index table and doesn't support public UpsertWriter.",
+                tablePath);
+        checkState(
                 hasPrimaryKey,
                 "Table %s is not a Primary Key Table and doesn't support UpsertWriter.",
                 tablePath);

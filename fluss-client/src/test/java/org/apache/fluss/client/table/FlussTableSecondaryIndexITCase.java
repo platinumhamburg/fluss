@@ -21,6 +21,7 @@ import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.table.writer.UpsertWriter;
+import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.IndexType;
@@ -35,6 +36,7 @@ import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
+import org.apache.fluss.utils.CloseableIterator;
 
 import org.junit.jupiter.api.Test;
 
@@ -42,6 +44,7 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -62,6 +65,63 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
 
     /** Bounded poll deadline for index visibility checks. */
     private static final Duration INDEX_VISIBILITY_TIMEOUT = Duration.ofSeconds(30);
+
+    @Test
+    void indexTableRejectsPublicUpsertWriterCreation() throws Exception {
+        TablePath mainPath = TablePath.of(DB, "test_public_index_write_guard");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("name"),
+                                IndexVisibility.SYNC,
+                                2)
+                        .build();
+        createTable(
+                mainPath,
+                TableDescriptor.builder().schema(schema).distributedBy(2, "id").build(),
+                true);
+
+        TablePath indexPath =
+                TablePath.of(
+                        DB,
+                        IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+        waitAllReplicasReady(admin.getTableInfo(indexPath).get().getTableId(), 1);
+        try (Table mainTable = conn.getTable(mainPath);
+                Table indexTable = conn.getTable(indexPath)) {
+            assertThat(indexTable.getTableInfo().isIndexTable()).isTrue();
+            assertThat(countRows(indexTable)).isZero();
+
+            assertThatThrownBy(indexTable::newUpsert)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining(indexPath.toString())
+                    .hasMessageContaining("internal secondary index table");
+
+            assertThat(countRows(indexTable)).isZero();
+            assertThat(mainTable.newUpsert()).isNotNull();
+        }
+    }
+
+    private static int countRows(Table table) throws Exception {
+        int rowCount = 0;
+        try (BatchScanner scanner = table.newScan().createBatchScanner()) {
+            CloseableIterator<InternalRow> nextBatch;
+            while ((nextBatch = scanner.pollBatch(Duration.ofSeconds(30))) != null) {
+                CloseableIterator<InternalRow> batch = nextBatch;
+                try (batch) {
+                    while (batch.hasNext()) {
+                        batch.next();
+                        rowCount++;
+                    }
+                }
+            }
+        }
+        return rowCount;
+    }
 
     @Test
     void testSecondaryIndexLookup() throws Exception {
