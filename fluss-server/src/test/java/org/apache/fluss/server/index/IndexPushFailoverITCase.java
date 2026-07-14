@@ -31,6 +31,7 @@ import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
@@ -69,18 +70,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       becomes visible.
  * </ul>
  *
- * <p>Requires a 3-node cluster with replication factor 3 for leader failover.
+ * <p>Requires a 4-node cluster with replication factor 3 for leader failover.
  */
 class IndexPushFailoverITCase {
 
     private static final String DB = "test_failover_db";
     private static final String INDEX_NAME = "idx_b";
     private static final Duration TIMEOUT = Duration.ofSeconds(60);
+    private static final int TABLET_SERVER_COUNT = 4;
+    private static final int INDEX_BUCKET_COUNT = 3;
+    private static final int TARGET_FAILOVER_INDEX_BUCKET_COUNT = 8;
 
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
             FlussClusterExtension.builder()
-                    .setNumOfTabletServers(3)
+                    .setNumOfTabletServers(TABLET_SERVER_COUNT)
                     .setClusterConf(initConfig())
                     .build();
 
@@ -117,7 +121,7 @@ class IndexPushFailoverITCase {
                                 IndexType.SECONDARY,
                                 Collections.singletonList("b"),
                                 IndexVisibility.SYNC,
-                                3)
+                                INDEX_BUCKET_COUNT)
                         .build();
         TableDescriptor descriptor =
                 TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
@@ -134,7 +138,7 @@ class IndexPushFailoverITCase {
         TableBucket mainBucket = new TableBucket(mainTableId, 0);
         FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
         int originalLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(mainBucket);
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < INDEX_BUCKET_COUNT; i++) {
             FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(new TableBucket(indexTableId, i));
         }
 
@@ -253,7 +257,7 @@ class IndexPushFailoverITCase {
 
         // Restart the stopped server for cluster health
         FLUSS_CLUSTER_EXTENSION.startTabletServer(originalLeader);
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(TABLET_SERVER_COUNT);
     }
 
     /**
@@ -276,7 +280,7 @@ class IndexPushFailoverITCase {
                                 IndexType.SECONDARY,
                                 Collections.singletonList("b"),
                                 IndexVisibility.SYNC,
-                                3)
+                                TARGET_FAILOVER_INDEX_BUCKET_COUNT)
                         .build();
         TableDescriptor descriptor =
                 TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
@@ -293,8 +297,8 @@ class IndexPushFailoverITCase {
         FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
         int mainLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(mainBucket);
 
-        // Wait for all index bucket leaders and IndexReplicator
-        for (int i = 0; i < 3; i++) {
+        // Wait for all index bucket leaders and IndexReplicator.
+        for (int i = 0; i < TARGET_FAILOVER_INDEX_BUCKET_COUNT; i++) {
             FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(new TableBucket(indexTableId, i));
         }
         Replica mainReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
@@ -309,36 +313,76 @@ class IndexPushFailoverITCase {
                 .as("pushed offset must be the -1 sentinel before any main-table write")
                 .isEqualTo(-1L);
 
-        // Select a physical target bucket whose leader is not the source main-table leader. The
-        // written value below is derived from this exact bucket, so the stopped server owns the
-        // target that receives the index push.
-        int[] indexBucketLeaders = new int[3];
+        TableAssignment sourceAssignment =
+                FLUSS_CLUSTER_EXTENSION
+                        .getZooKeeperClient()
+                        .getTableAssignment(mainTableId)
+                        .orElseThrow(
+                                () ->
+                                        new AssertionError(
+                                                "Source main-table assignment is missing from ZK"));
+        List<Integer> sourceBucketReplicas =
+                sourceAssignment.getBucketAssignment(mainBucket.getBucket()).getReplicas();
+        assertThat(sourceBucketReplicas)
+                .as("source main-table leader must belong to source bucket's RF=3 assignment")
+                .contains(mainLeader);
+
+        List<Integer> targetOnlyServers = new ArrayList<>();
+        for (int serverId = 0; serverId < TABLET_SERVER_COUNT; serverId++) {
+            assertThat(FLUSS_CLUSTER_EXTENSION.getTabletServerById(serverId))
+                    .as("tablet server %s must be live before target selection", serverId)
+                    .isNotNull();
+            if (!sourceBucketReplicas.contains(serverId)) {
+                targetOnlyServers.add(serverId);
+            }
+        }
+        if (targetOnlyServers.size() != 1) {
+            throw new AssertionError(
+                    "Source bucket assignment must leave exactly one target-only live server; "
+                            + "source bucket replicas="
+                            + sourceBucketReplicas
+                            + ", live servers=0.."
+                            + (TABLET_SERVER_COUNT - 1));
+        }
+        int targetOnlyServer = targetOnlyServers.get(0);
+
+        // Select an actual index bucket led by the one server that cannot host a source-bucket
+        // replica. The written value below hashes to this exact bucket, so stopping its leader
+        // leaves source WAL quorum intact while making the target unavailable.
+        int[] indexBucketLeaders = new int[TARGET_FAILOVER_INDEX_BUCKET_COUNT];
         int targetIdxBucket = -1;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < TARGET_FAILOVER_INDEX_BUCKET_COUNT; i++) {
             int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(indexTableId, i));
             indexBucketLeaders[i] = leader;
-            if (targetIdxBucket == -1 && leader != mainLeader) {
+            if (targetIdxBucket == -1 && leader == targetOnlyServer) {
                 targetIdxBucket = i;
             }
         }
         if (targetIdxBucket == -1) {
             throw new AssertionError(
-                    "No index bucket leader differs from source main-table leader "
-                            + mainLeader
-                            + "; index bucket leaders are "
+                    "No index bucket is led by target-only server "
+                            + targetOnlyServer
+                            + "; source bucket replicas="
+                            + sourceBucketReplicas
+                            + "; index bucket leaders="
                             + Arrays.toString(indexBucketLeaders));
         }
 
-        String selectedValue = valueForIndexBucket("target-failover", targetIdxBucket);
+        String selectedValue =
+                valueForIndexBucket(
+                        "target-failover", targetIdxBucket, TARGET_FAILOVER_INDEX_BUCKET_COUNT);
         byte[] indexKey = encodeIndexKey(selectedValue, 1);
         TableBucket idxTb = new TableBucket(indexTableId, targetIdxBucket);
         int stoppedTargetLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(idxTb);
         assertThat(stoppedTargetLeader)
-                .as("selected index bucket leader must differ from the source main-table leader")
-                .isNotEqualTo(mainLeader);
+                .as("selected index bucket leader must be the target-only server")
+                .isEqualTo(targetOnlyServer);
         assertThat(stoppedTargetLeader)
                 .as("selected index bucket leader must remain the observed target leader")
                 .isEqualTo(indexBucketLeaders[targetIdxBucket]);
+        assertThat(sourceBucketReplicas)
+                .as("target-only index leader must not host a source-bucket replica")
+                .doesNotContain(stoppedTargetLeader);
 
         IndexAccumulator sourceAccumulator =
                 FLUSS_CLUSTER_EXTENSION
@@ -433,7 +477,9 @@ class IndexPushFailoverITCase {
                         cleanupFailures,
                         () -> FLUSS_CLUSTER_EXTENSION.startTabletServer(stoppedTargetLeader));
             }
-            cleanup(cleanupFailures, () -> FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3));
+            cleanup(
+                    cleanupFailures,
+                    () -> FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(TABLET_SERVER_COUNT));
             reportCleanupFailures(primaryFailure, cleanupFailures);
         }
     }
@@ -451,17 +497,27 @@ class IndexPushFailoverITCase {
     }
 
     private static int computeIndexBucket(String bValue) {
+        return computeIndexBucket(bValue, INDEX_BUCKET_COUNT);
+    }
+
+    private static int computeIndexBucket(String bValue, int indexBucketCount) {
         CompactedKeyEncoder bucketKeyEncoder = new CompactedKeyEncoder(INDEX_BUCKET_KEY_TYPE);
         GenericRow row = new GenericRow(1);
         row.setField(0, fromString(bValue));
         byte[] bucketKey = bucketKeyEncoder.encodeKey(row);
-        return new org.apache.fluss.bucketing.FlussBucketingFunction().bucketing(bucketKey, 3);
+        return new org.apache.fluss.bucketing.FlussBucketingFunction()
+                .bucketing(bucketKey, indexBucketCount);
     }
 
     private static String valueForIndexBucket(String prefix, int expectedBucket) {
+        return valueForIndexBucket(prefix, expectedBucket, INDEX_BUCKET_COUNT);
+    }
+
+    private static String valueForIndexBucket(
+            String prefix, int expectedBucket, int indexBucketCount) {
         for (int suffix = 0; suffix < 100_000; suffix++) {
             String candidate = prefix + '-' + suffix;
-            if (computeIndexBucket(candidate) == expectedBucket) {
+            if (computeIndexBucket(candidate, indexBucketCount) == expectedBucket) {
                 return candidate;
             }
         }
