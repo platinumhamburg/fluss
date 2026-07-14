@@ -39,10 +39,14 @@ import org.apache.fluss.utils.IndexTableUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.lang.reflect.Field;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -84,6 +88,8 @@ class IndexPushFailoverITCase {
         Configuration conf = new Configuration();
         conf.setInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR, 3);
         conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofHours(1));
+        // Keep a failed target batch visible in its deque long enough for the causal retry check.
+        conf.set(ConfigOptions.INDEX_REPLICATION_RETRY_BACKOFF, Duration.ofSeconds(1));
         return conf;
     }
 
@@ -255,7 +261,7 @@ class IndexPushFailoverITCase {
      * retry via the LeaderResolver and the entry should eventually appear on the new index leader.
      */
     @Test
-    void testIndexTableLeaderFailoverRetries() throws Exception {
+    void testIndexTableLeaderFailoverRetries() throws Throwable {
         TablePath mainPath = TablePath.of(DB, "main_idx_failover");
         TablePath indexPath =
                 TablePath.of(DB, IndexTableUtils.indexTableName("main_idx_failover", INDEX_NAME));
@@ -334,9 +340,19 @@ class IndexPushFailoverITCase {
                 .as("selected index bucket leader must remain the observed target leader")
                 .isEqualTo(indexBucketLeaders[targetIdxBucket]);
 
+        IndexAccumulator sourceAccumulator =
+                FLUSS_CLUSTER_EXTENSION
+                        .getTabletServerById(mainLeader)
+                        .getReplicaManager()
+                        .getIndexAccumulator();
+        boolean coordinatorStopped = false;
         boolean targetLeaderStopped = false;
         Throwable primaryFailure = null;
         try {
+            // Keep the old target assignment frozen so the source sender must observe the stopped
+            // target before a replacement can become available.
+            FLUSS_CLUSTER_EXTENSION.stopCoordinatorServer();
+            coordinatorStopped = true;
             FLUSS_CLUSTER_EXTENSION.stopTabletServer(stoppedTargetLeader);
             targetLeaderStopped = true;
 
@@ -352,6 +368,23 @@ class IndexPushFailoverITCase {
                                             1,
                                             genKvRecordBatch(
                                                     new Object[] {1, selectedValue})));
+
+            // IndexBatch.attempts() increments only when a failed batch is put back into this
+            // exact target bucket's deque. With the coordinator stopped, a replacement cannot
+            // race this observation; the source SYNC future and pushed offset must remain pending.
+            waitUntil(
+                    () -> hasRetriedTargetBatch(sourceAccumulator, idxTb),
+                    TIMEOUT,
+                    "wait for the selected target index batch to fail and requeue");
+            assertThat(sourceWrite.isDone())
+                    .as("source SYNC write must remain unresolved while the target is unavailable")
+                    .isFalse();
+            assertThat(mainReplica.getSyncIndexPushedOffset())
+                    .as("sync pushed offset must remain at the pre-write baseline during retry")
+                    .isEqualTo(-1L);
+
+            FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
+            coordinatorStopped = false;
             waitUntil(
                     () -> FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(idxTb) != stoppedTargetLeader,
                     TIMEOUT,
@@ -387,22 +420,21 @@ class IndexPushFailoverITCase {
                     TIMEOUT,
                     "pushed offset must equal the one-row source WAL end after retry");
             assertThat(mainReplica.getSyncIndexPushedOffset()).isEqualTo(1L);
-        } catch (Exception | AssertionError failure) {
+        } catch (Throwable failure) {
             primaryFailure = failure;
             throw failure;
         } finally {
-            if (targetLeaderStopped) {
-                try {
-                    FLUSS_CLUSTER_EXTENSION.startTabletServer(stoppedTargetLeader);
-                    FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
-                } catch (Exception | AssertionError restartFailure) {
-                    if (primaryFailure != null) {
-                        primaryFailure.addSuppressed(restartFailure);
-                    } else {
-                        throw restartFailure;
-                    }
-                }
+            List<Throwable> cleanupFailures = new ArrayList<>();
+            if (coordinatorStopped) {
+                cleanup(cleanupFailures, FLUSS_CLUSTER_EXTENSION::startCoordinatorServer);
             }
+            if (targetLeaderStopped) {
+                cleanup(
+                        cleanupFailures,
+                        () -> FLUSS_CLUSTER_EXTENSION.startTabletServer(stoppedTargetLeader));
+            }
+            cleanup(cleanupFailures, () -> FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3));
+            reportCleanupFailures(primaryFailure, cleanupFailures);
         }
     }
 
@@ -434,6 +466,58 @@ class IndexPushFailoverITCase {
             }
         }
         throw new AssertionError("No value found for index bucket " + expectedBucket);
+    }
+
+    /** Read-only test observation of the package-private retry state for one physical target. */
+    @SuppressWarnings("unchecked")
+    private static boolean hasRetriedTargetBatch(IndexAccumulator accumulator, TableBucket target)
+            throws ReflectiveOperationException {
+        Field batchesField = IndexAccumulator.class.getDeclaredField("batches");
+        batchesField.setAccessible(true);
+        Map<TableBucket, Deque<IndexBatch>> batches =
+                (Map<TableBucket, Deque<IndexBatch>>) batchesField.get(accumulator);
+        Deque<IndexBatch> deque = batches.get(target);
+        if (deque == null) {
+            return false;
+        }
+        synchronized (deque) {
+            for (IndexBatch batch : deque) {
+                if (batch.targetBucket().equals(target) && batch.attempts() > 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    private static void cleanup(List<Throwable> failures, CleanupAction action) {
+        try {
+            action.run();
+        } catch (Throwable failure) {
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            failures.add(failure);
+        }
+    }
+
+    private static void reportCleanupFailures(Throwable primaryFailure, List<Throwable> cleanupFailures)
+            throws Throwable {
+        if (cleanupFailures.isEmpty()) {
+            return;
+        }
+        AssertionError cleanupFailure = new AssertionError("index target failover IT cleanup failed");
+        cleanupFailures.forEach(cleanupFailure::addSuppressed);
+        if (primaryFailure != null) {
+            primaryFailure.addSuppressed(cleanupFailure);
+        } else {
+            throw cleanupFailure;
+        }
+    }
+
+    @FunctionalInterface
+    private interface CleanupAction {
+        void run() throws Throwable;
     }
 
     private static CompletedSnapshot triggerSnapshotPersistingIndexPushedOffset(
