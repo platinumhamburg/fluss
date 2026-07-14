@@ -718,24 +718,34 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
     private Map<Long, PartitionTombstone> partitionTombstoneRequiredByCreatedTable(
             TableInfo createdTable) {
-        if (!createdTable.isIndexTable() || !createdTable.getMainTableId().isPresent()) {
+        TableInfo mainTable;
+        if (createdTable.isPartitioned() && !createdTable.getSchema().getIndexes().isEmpty()) {
+            // Atomic table creation can surface main/index watcher events in either order.
+            // Publishing from the main-table event makes initialization order-independent.
+            mainTable = createdTable;
+        } else if (createdTable.isIndexTable() && createdTable.getMainTableId().isPresent()) {
+            mainTable =
+                    coordinatorContext.getTableInfoById(createdTable.getMainTableId().getAsLong());
+        } else {
             return Collections.emptyMap();
         }
-        long mainTableId = createdTable.getMainTableId().getAsLong();
-        TableInfo mainTable = coordinatorContext.getTableInfoById(mainTableId);
         if (mainTable == null
                 || !mainTable.isPartitioned()
-                || coordinatorContext.isTableQueuedForDeletion(mainTableId)) {
+                || coordinatorContext.isTableQueuedForDeletion(mainTable.getTableId())) {
             return Collections.emptyMap();
         }
         try {
             return Collections.singletonMap(
-                    mainTableId, zooKeeperClient.getPartitionTombstone(mainTable.getTablePath()));
+                    mainTable.getTableId(),
+                    zooKeeperClient.getPartitionTombstone(mainTable.getTablePath()));
         } catch (Exception e) {
-            throw new FlussRuntimeException(
-                    "Failed to load PartitionTombstone for newly created Index Table "
-                            + createdTable.getTablePath(),
+            LOG.warn(
+                    "Failed to load partition tombstone baseline for newly created table {}. "
+                            + "Scheduling a fresh metadata repair.",
+                    createdTable.getTablePath(),
                     e);
+            coordinatorRequestBatch.schedulePartitionTombstoneRepair();
+            return Collections.emptyMap();
         }
     }
 

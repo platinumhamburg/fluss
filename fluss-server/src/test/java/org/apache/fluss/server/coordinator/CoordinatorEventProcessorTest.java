@@ -312,7 +312,7 @@ class CoordinatorEventProcessorTest {
     }
 
     @Test
-    void testCreatePublishesOnlyNewlyRequiredIndexBaseline() throws Exception {
+    void testIndexedMainCreatePublishesTombstoneBaselineBeforeIndexEvent() throws Exception {
         initCoordinatorChannel();
         TablePath mainPath = TablePath.of(defaultDatabase, "baseline_main");
         TableDescriptor mainDescriptor =
@@ -337,7 +337,9 @@ class CoordinatorEventProcessorTest {
         retryVerifyContext(
                 ctx -> assertThat(ctx.getTablePathById(mainTableId)).isEqualTo(mainPath));
 
-        assertThat(lastTombstoneUpdate(0)).isEmpty();
+        assertThat(lastTombstoneUpdate(0))
+                .containsExactlyEntriesOf(
+                        Collections.singletonMap(mainTableId, PartitionTombstone.EMPTY));
 
         TableDescriptor indexDescriptor =
                 IndexTableDescriptorFactory.derive(

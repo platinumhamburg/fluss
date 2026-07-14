@@ -73,9 +73,16 @@ public final class PartitionTombstoneBinarySerde {
      *
      * @param bytes the binary representation produced by {@link #serialize}
      * @return the deserialized tombstone
-     * @throws IllegalArgumentException if the format version is unsupported
+     * @throws IllegalArgumentException if the payload is malformed or the format version is
+     *     unsupported
      */
     public static PartitionTombstone deserialize(byte[] bytes) {
+        if (bytes.length < HEADER_SIZE) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "PartitionTombstone payload length %d is smaller than header length %d.",
+                            bytes.length, HEADER_SIZE));
+        }
         ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
         byte version = buf.get();
         if (version != FORMAT_VERSION) {
@@ -88,9 +95,29 @@ public final class PartitionTombstoneBinarySerde {
         long inBandVersion = buf.getLong();
         long floor = buf.getLong();
         int count = buf.getInt();
+        long expectedLength = HEADER_SIZE + (long) count * Long.BYTES;
+        if (count < 0 || expectedLength != bytes.length) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "PartitionTombstone explicit count %d does not match payload length %d.",
+                            count, bytes.length));
+        }
         Set<Long> explicitSet = new HashSet<>(count);
+        long previous = floor;
         for (int i = 0; i < count; i++) {
-            explicitSet.add(buf.getLong());
+            long partitionId = buf.getLong();
+            if (partitionId <= floor) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "PartitionTombstone explicit partition id %d must be greater than floor %d.",
+                                partitionId, floor));
+            }
+            if (i > 0 && partitionId <= previous) {
+                throw new IllegalArgumentException(
+                        "PartitionTombstone explicit partition ids must be strictly increasing.");
+            }
+            explicitSet.add(partitionId);
+            previous = partitionId;
         }
         return new PartitionTombstone(floor, explicitSet, inBandVersion);
     }

@@ -52,6 +52,14 @@ public final class PartitionTombstone {
     public PartitionTombstone(long floor, Set<Long> explicitSet, long version) {
         checkNotNull(explicitSet, "explicitSet");
         checkArgument(version >= 0L, "version must be non-negative, got %s", version);
+        for (Long partitionId : explicitSet) {
+            checkNotNull(partitionId, "explicitSet must not contain null");
+            checkArgument(
+                    partitionId > floor,
+                    "explicit partition id %s must be greater than floor %s",
+                    partitionId,
+                    floor);
+        }
         this.floor = floor;
         this.explicitSet = Collections.unmodifiableSet(new HashSet<>(explicitSet));
         this.version = version;

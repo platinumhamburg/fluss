@@ -21,6 +21,8 @@ import org.apache.fluss.utils.serde.PartitionTombstoneBinarySerde;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
@@ -108,6 +110,14 @@ class PartitionTombstoneTest {
     }
 
     @Test
+    void testRejectsExplicitIdsCoveredByFloor() {
+        assertThatThrownBy(
+                        () -> new PartitionTombstone(5L, new HashSet<>(Arrays.asList(5L, 7L)), 1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("greater than floor");
+    }
+
+    @Test
     void testBinarySerdeRoundTrip() {
         Set<Long> explicit = new HashSet<>(Arrays.asList(5L, 8L, 12L));
         PartitionTombstone tombstone = new PartitionTombstone(3L, explicit, 7L);
@@ -130,5 +140,46 @@ class PartitionTombstoneTest {
         assertThat(deserialized.getFloor()).isEqualTo(-1L);
         assertThat(deserialized.getExplicitSet()).isEmpty();
         assertThat(deserialized.getVersion()).isEqualTo(0L);
+    }
+
+    @Test
+    void testBinarySerdeRejectsTruncatedPayloadBeforeReadingFields() {
+        byte[] valid = PartitionTombstoneBinarySerde.serialize(PartitionTombstone.EMPTY);
+        byte[] truncated = Arrays.copyOf(valid, valid.length - 1);
+
+        assertThatThrownBy(() -> PartitionTombstoneBinarySerde.deserialize(truncated))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload length");
+    }
+
+    @Test
+    void testBinarySerdeRejectsCountThatDoesNotMatchPayloadLength() {
+        byte[] bytes = PartitionTombstoneBinarySerde.serialize(PartitionTombstone.EMPTY);
+        ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(20, Integer.MAX_VALUE);
+
+        assertThatThrownBy(() -> PartitionTombstoneBinarySerde.deserialize(bytes))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("explicit count")
+                .hasMessageContaining("payload length");
+    }
+
+    @Test
+    void testBinarySerdeRejectsNonCanonicalExplicitIds() {
+        PartitionTombstone tombstone =
+                new PartitionTombstone(3L, new HashSet<>(Arrays.asList(5L, 8L)), 1L);
+        byte[] bytes = PartitionTombstoneBinarySerde.serialize(tombstone);
+        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        buffer.putLong(24, 8L);
+        buffer.putLong(32, 5L);
+
+        assertThatThrownBy(() -> PartitionTombstoneBinarySerde.deserialize(bytes))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("strictly increasing");
+
+        buffer.putLong(24, 3L);
+        buffer.putLong(32, 8L);
+        assertThatThrownBy(() -> PartitionTombstoneBinarySerde.deserialize(bytes))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("greater than floor");
     }
 }
