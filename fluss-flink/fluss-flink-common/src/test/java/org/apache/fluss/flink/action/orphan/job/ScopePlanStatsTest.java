@@ -17,19 +17,23 @@
 
 package org.apache.fluss.flink.action.orphan.job;
 
-import org.apache.fluss.annotation.Internal;
-import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.junit.jupiter.api.Test;
 
-import java.io.Serializable;
+import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Marker interface for work items emitted by {@link ScopeEnumeratorFunction} and consumed by {@link
- * ScanAndCleanFunction}. Implementations carry enough context for a single subtask to execute
- * cleanup independently (no further coordinator interaction needed).
- */
-@Internal
-public interface CleanTask extends Serializable {
+class ScopePlanStatsTest {
 
-    /** Returns the stable ownership used for audit aggregation. */
-    ScopeIdentity scope();
+    @Test
+    void aggregatesExpectedNoManifestSkipsWithoutPerBucketWarnings() {
+        ScopePlanStats stats = new ScopePlanStats();
+
+        for (int i = 0; i < 12; i++) {
+            stats.discoveredBucket();
+            stats.skippedNoRemoteManifest();
+        }
+
+        assertThat(stats.discoveredBuckets()).isEqualTo(12L);
+        assertThat(stats.skippedNoRemoteManifestCount()).isEqualTo(12L);
+        assertThat(stats.bucketTasks()).isZero();
+    }
 }

@@ -15,21 +15,16 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.action.orphan.job;
+package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
-import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 
-import java.io.Serializable;
-
-/**
- * Marker interface for work items emitted by {@link ScopeEnumeratorFunction} and consumed by {@link
- * ScanAndCleanFunction}. Implementations carry enough context for a single subtask to execute
- * cleanup independently (no further coordinator interaction needed).
- */
+/** Operator-facing categories for skipped cleanup work. */
 @Internal
-public interface CleanTask extends Serializable {
-
-    /** Returns the stable ownership used for audit aggregation. */
-    ScopeIdentity scope();
+public enum SkipCategory {
+    EXPECTED_SKIP,
+    SAFETY_SKIP,
+    DEGRADED_SKIP,
+    OUT_OF_SCOPE,
+    UNSUPPORTED
 }

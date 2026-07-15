@@ -18,6 +18,8 @@
 package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
+import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
 
@@ -57,6 +59,47 @@ public final class AuditLogger {
                 "action=cutoff older_than_iso={} older_than_ms={} ts={}",
                 CUTOFF_FORMATTER.format(Instant.ofEpochMilli(olderThanMillis)),
                 olderThanMillis,
+                Instant.now());
+    }
+
+    /** One-shot, non-secret execution configuration at normal INFO level. */
+    public void logRunStart(OrphanCleanConfig config) {
+        String scope = config.allDatabases() ? "all-databases" : config.database().get();
+        if (config.table().isPresent()) {
+            scope = scope + "." + config.table().get();
+        }
+        AUDIT.info(
+                "action=run_start scope={} older_than_ms={} dry_run={} parallelism={}"
+                        + " remote_fs_rate_limit={} allow_delete_manifest={}"
+                        + " allow_clean_orphan_tables={} allow_clean_orphan_partitions={} ts={}",
+                scope,
+                config.olderThanMillis(),
+                config.dryRun(),
+                config.parallelism().isPresent() ? config.parallelism().get() : "default",
+                config.remoteFsOpRateLimitPerSecond(),
+                config.allowDeleteManifest(),
+                config.allowCleanOrphanTables(),
+                config.allowCleanOrphanPartitions(),
+                Instant.now());
+    }
+
+    /** One-shot aggregate of discovered scope, expected skips, and emitted cleanup work. */
+    public void logScopePlan(ScopePlanStats stats) {
+        AUDIT.info(
+                "action=scope_plan databases={} tables={} partitions={} discovered_buckets={}"
+                        + " bucket_tasks={} orphan_dir_tasks={} skipped_no_remote_manifest={}"
+                        + " skipped_empty_kv_active_set={} skipped_out_of_scope_root={}"
+                        + " metadata_failures={} ts={}",
+                stats.databases(),
+                stats.tables(),
+                stats.partitions(),
+                stats.discoveredBuckets(),
+                stats.bucketTasks(),
+                stats.orphanDirTasks(),
+                stats.skippedNoRemoteManifestCount(),
+                stats.skippedEmptyKvActiveSetCount(),
+                stats.skippedOutOfScopeRootCount(),
+                stats.metadataFailures(),
                 Instant.now());
     }
 
