@@ -1063,6 +1063,7 @@ public final class Replica {
                         tableBucket,
                         physicalPath);
                 CompletedSnapshot completedSnapshot = optCompletedSnapshot.get();
+                validateSnapshotIndexPushedOffset(completedSnapshot);
                 // always create a new dir for the kv tablet
                 File tabletDir =
                         kvManager.createTabletDir(
@@ -1144,6 +1145,23 @@ public final class Replica {
         }
 
         return optCompletedSnapshot;
+    }
+
+    private void validateSnapshotIndexPushedOffset(CompletedSnapshot snapshot) {
+        if (!hasSecondaryIndexes) {
+            return;
+        }
+        Long indexPushedOffset = snapshot.getIndexPushedOffset();
+        if (indexPushedOffset == null || indexPushedOffset < 0) {
+            throw new KvStorageException(
+                    "KV Snapshot "
+                            + snapshot.getSnapshotID()
+                            + " for main table bucket "
+                            + tableBucket
+                            + " with secondary indexes must contain a non-negative "
+                            + "indexPushedOffset, but was "
+                            + indexPushedOffset);
+        }
     }
 
     private void downloadKvSnapshots(CompletedSnapshot completedSnapshot, Path kvTabletDir)

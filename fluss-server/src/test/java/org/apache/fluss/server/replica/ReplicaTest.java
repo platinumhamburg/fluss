@@ -19,6 +19,7 @@ package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.StorageException;
@@ -51,12 +52,14 @@ import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexReplicator;
 import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.UncertainWalAppendException;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.FetchParams;
@@ -141,6 +144,8 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 /** Test for {@link Replica}. */
 final class ReplicaTest extends ReplicaTestBase {
@@ -622,6 +627,46 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(f.replica.getIndexReplicator()).isNull();
     }
 
+    @ParameterizedTest(name = "indexPushedOffset={0}")
+    @MethodSource("invalidSnapshotIndexPushedOffsets")
+    void testIndexedMainRejectsSnapshotWithoutValidIndexPushedOffset(
+            Long indexPushedOffset, @TempDir Path snapshotDir) throws Exception {
+        TestSnapshotContext snapshotContext = new TestSnapshotContext(snapshotDir.toString());
+        IndexedFixture f = setupIndexedMainTableReplica(snapshotContext);
+        TableBucket sourceBucket = new TableBucket(f.mainTableId, 0);
+        KvSnapshotHandle snapshotHandle = mock(KvSnapshotHandle.class);
+        CompletedSnapshot invalidSnapshot =
+                new CompletedSnapshot(
+                        sourceBucket,
+                        0L,
+                        new FsPath(snapshotDir.toUri()),
+                        snapshotHandle,
+                        5L,
+                        1L,
+                        indexPushedOffset,
+                        null);
+        snapshotContext.testKvSnapshotStore.commitKvSnapshot(
+                invalidSnapshot, INITIAL_COORDINATOR_EPOCH, INITIAL_LEADER_EPOCH);
+
+        assertThatThrownBy(() -> makeIndexedMainReplicaAsLeader(f))
+                .isInstanceOf(KvStorageException.class)
+                .hasRootCauseMessage(
+                        "KV Snapshot 0 for main table bucket "
+                                + sourceBucket
+                                + " with secondary indexes must contain a non-negative "
+                                + "indexPushedOffset, but was "
+                                + indexPushedOffset);
+
+        verifyNoInteractions(snapshotHandle);
+        assertThat(f.replica.isLeader()).isFalse();
+        assertThat(f.replica.getKvTablet()).isNull();
+        assertThat(kvManager.getKv(sourceBucket)).isEmpty();
+        assertThat(f.replica.getKvSnapshotManager()).isNull();
+        assertThat(f.replica.hasReadyKvSnapshotManager()).isFalse();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        assertThat(f.replica.getLogTablet().getMinRetainOffset()).isZero();
+    }
+
     @Test
     void testIndexReplicatorInitDefersWhenIndexTableIdVisibleButMetadataMissing() throws Exception {
         IndexedFixture f = setupIndexedMainTableReplica();
@@ -1034,6 +1079,10 @@ final class ReplicaTest extends ReplicaTestBase {
         // wait until the snapshot 0 success
         CompletedSnapshot completedSnapshot0 =
                 kvSnapshotStore.waitUntilSnapshotComplete(tableBucket, 0);
+
+        assertThat(completedSnapshot0.getIndexPushedOffset()).isNull();
+        assertThat(completedSnapshot0.getMinRetainLogOffset())
+                .isEqualTo(completedSnapshot0.getLogOffset());
 
         // check snapshot
         long expectedLogOffset = 4;
@@ -1710,6 +1759,10 @@ final class ReplicaTest extends ReplicaTestBase {
             assertThat(replica.getKvTablet().getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
             assertThat(replica.getLogTablet().localLogEndOffset()).isZero();
         }
+    }
+
+    private static Stream<Arguments> invalidSnapshotIndexPushedOffsets() {
+        return Stream.of(Arguments.of((Long) null), Arguments.of(-1L));
     }
 
     private static Stream<Arguments> putKvProtocolMatrix() {
