@@ -32,8 +32,8 @@ import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.LoggerConfig;
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -64,7 +64,10 @@ class AuditLoggerTest {
             harness.open();
             harness.processElement(
                     new StreamRecord<>(
-                            CleanupStats.scope(1L, 1L, Map.of(SkipReasonCode.RPC_ERROR, 1L))));
+                            CleanupStats.scope(
+                                    1L,
+                                    1L,
+                                    Collections.singletonMap(SkipReasonCode.RPC_ERROR, 1L))));
             harness.processElement(new StreamRecord<>(stats));
             harness.endInput();
         }
@@ -135,7 +138,7 @@ class AuditLoggerTest {
     void mtimeUnavailableSampleNameIsSanitizedAndCapped() {
         List<String> events = new CopyOnWriteArrayList<>();
         AuditLogger logger = new AuditLogger();
-        String longSuffix = "a".repeat(140);
+        String longSuffix = String.join("", Collections.nCopies(140, "a"));
 
         try (AuditCapture ignored = new AuditCapture(events)) {
             logger.logMtimeUnavailableOnce(
