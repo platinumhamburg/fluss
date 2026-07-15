@@ -307,11 +307,11 @@ class IndexPushFailoverITCase {
                 Duration.ofSeconds(30),
                 "wait for IndexReplicator");
 
-        // Nothing has been written to the main table yet, so the pushed offset is still its
-        // initial sentinel (-1 = nothing pushed).
+        // Offset zero is the exclusive next-read position before the first source record.
         assertThat(mainReplica.getSyncIndexPushedOffset())
-                .as("pushed offset must be the -1 sentinel before any main-table write")
-                .isEqualTo(-1L);
+                .as("the first SYNC write must start from the offset-zero baseline")
+                .isZero();
+        assertThat(mainReplica.getAllIndexPushedOffset()).isZero();
 
         TableAssignment sourceAssignment =
                 FLUSS_CLUSTER_EXTENSION
@@ -423,8 +423,9 @@ class IndexPushFailoverITCase {
                     .as("source SYNC write must remain unresolved while the target is unavailable")
                     .isFalse();
             assertThat(mainReplica.getSyncIndexPushedOffset())
-                    .as("sync pushed offset must remain at the pre-write baseline during retry")
-                    .isEqualTo(-1L);
+                    .as("sync progress must remain at the pre-write baseline during retry")
+                    .isZero();
+            assertThat(mainReplica.getAllIndexPushedOffset()).isZero();
 
             FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
             coordinatorStopped = false;

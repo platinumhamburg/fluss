@@ -2,8 +2,8 @@
 
 ## Status
 
-The design was accepted in discussion on 2026-07-15 and is awaiting review of this
-written form before implementation planning.
+The design was accepted in discussion on 2026-07-15 and implemented after the focused and
+production-shaped verification listed below passed.
 
 ## Problem
 
