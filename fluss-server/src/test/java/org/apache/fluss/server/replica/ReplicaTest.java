@@ -24,6 +24,7 @@ import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnsupportedVersionException;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
@@ -52,7 +53,6 @@ import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
-import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexReplicator;
 import org.apache.fluss.server.index.IndexTableDescriptorFactory;
@@ -625,6 +625,57 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(f.replica.getLogTablet().getMinRetainOffset()).isZero();
         assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
         assertThat(f.replica.getIndexReplicator()).isNull();
+    }
+
+    @Test
+    void testSameIndexedReplicaRepromotionWithoutSnapshotResetsIndexProgress() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+
+        makeIndexedMainReplicaAsLeader(f, 0);
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        f.replica.advanceIndexProgress(11L, 7L);
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(11L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(7L);
+
+        makeIndexedMainReplicaAsFollower(f, 1);
+        makeIndexedMainReplicaAsLeader(f, 2);
+
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isZero();
+        assertThat(f.replica.getAllIndexPushedOffset()).isZero();
+    }
+
+    @Test
+    void testSameIndexedReplicaRepromotionRestoresExactSnapshotIndexProgress(
+            @TempDir Path snapshotDir) throws Exception {
+        TestSnapshotContext snapshotContext = new TestSnapshotContext(snapshotDir.toString());
+        IndexedFixture f = setupIndexedMainTableReplica(snapshotContext);
+        TableBucket sourceBucket = new TableBucket(f.mainTableId, 0);
+
+        makeIndexedMainReplicaAsLeader(f, 0);
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        putRecordsToLeader(
+                f.replica,
+                org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch(
+                        new Object[] {1, "snapshot-baseline"}));
+        f.replica.getKvSnapshotManager().triggerSnapshot();
+        CompletedSnapshot snapshot =
+                snapshotContext.testKvSnapshotStore.waitUntilSnapshotComplete(sourceBucket, 0);
+        assertThat(snapshot.getIndexPushedOffset()).isEqualTo(0L);
+
+        f.replica.advanceIndexProgress(11L, 7L);
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(11L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(7L);
+        makeIndexedMainReplicaAsFollower(f, 1);
+        makeIndexedMainReplicaAsLeader(f, 2);
+
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(0L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(0L);
     }
 
     @ParameterizedTest(name = "indexPushedOffset={0}")

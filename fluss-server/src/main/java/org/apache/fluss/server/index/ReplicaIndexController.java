@@ -147,7 +147,7 @@ public final class ReplicaIndexController {
      * @param onProgress callback fired after each window completes with sync/all index progress;
      *     typically wired to {@code Replica::advanceIndexProgress}
      * @param initialOffset the non-negative exclusive next source WAL offset restored by the owning
-     *     replica
+     *     replica when the table has secondary indexes; ignored when it has none
      */
     public void onBecomeLeader(
             LogTablet logTablet,

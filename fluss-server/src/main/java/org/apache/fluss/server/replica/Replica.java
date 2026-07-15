@@ -701,6 +701,7 @@ public final class Replica {
             // Prepare index-table tombstone state before opening RocksDB. Compaction filters are
             // attached during KvTablet creation and cannot be installed afterward.
             indexManager.prepareForLeader();
+            resetIndexProgressForLeader();
             // if it's become new leader, we must
             // first destroy the old kv tablet
             // if exist. Otherwise, it'll use still the old kv tablet which will cause data loss
@@ -1002,11 +1003,25 @@ public final class Replica {
     }
 
     public void seedIndexPushedOffsetOnLoad(long offset) {
+        if (hasSecondaryIndexes) {
+            if (hasSyncIndexes) {
+                syncIndexPushedOffset = offset;
+            }
+            allIndexPushedOffset = offset;
+            return;
+        }
         if (offset > syncIndexPushedOffset) {
             syncIndexPushedOffset = offset;
         }
         if (offset > allIndexPushedOffset) {
             allIndexPushedOffset = offset;
+        }
+    }
+
+    private void resetIndexProgressForLeader() {
+        if (hasSecondaryIndexes) {
+            syncIndexPushedOffset = hasSyncIndexes ? 0L : -1L;
+            allIndexPushedOffset = 0L;
         }
     }
 
