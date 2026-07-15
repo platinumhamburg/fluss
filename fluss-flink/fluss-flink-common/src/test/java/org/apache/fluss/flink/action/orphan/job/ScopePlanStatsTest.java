@@ -17,6 +17,9 @@
 
 package org.apache.fluss.flink.action.orphan.job;
 
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
+
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,5 +38,22 @@ class ScopePlanStatsTest {
         assertThat(stats.discoveredBuckets()).isEqualTo(12L);
         assertThat(stats.skippedNoRemoteManifestCount()).isEqualTo(12L);
         assertThat(stats.bucketTasks()).isZero();
+    }
+
+    @Test
+    void createsOneImmutableScopeSummaryTask() {
+        ScopePlanStats stats = new ScopePlanStats();
+        stats.bucketTask();
+        stats.orphanDirTask();
+        stats.metadataFailure();
+        stats.skippedNoRemoteManifest();
+
+        ScopeSummaryTask task = ScopeSummaryTask.from(stats);
+
+        assertThat(task.scope()).isEqualTo(ScopeIdentity.global());
+        assertThat(task.stats().sourceStage()).isEqualTo(CleanupStats.SourceStage.SCOPE);
+        assertThat(task.stats().tasksPlanned()).isEqualTo(2L);
+        assertThat(task.stats().metadataFailures()).isEqualTo(1L);
+        assertThat(task.stats().skipped()).containsEntry(SkipReasonCode.NO_REMOTE_MANIFEST, 1L);
     }
 }

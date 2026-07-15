@@ -139,6 +139,46 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
         return auditAppender.messages();
     }
 
+    @Test
+    void emptyScopeStillEmitsOneCompleteTerminalSummary() throws Exception {
+        String dbName = newDatabaseName("empty_scope");
+        admin.createDatabase(dbName, DatabaseDescriptor.EMPTY, true).get();
+
+        runCleanerForDatabase(true, dbName, "--parallelism", "3");
+
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=scope_plan")
+                                        && message.contains("tables=0")
+                                        && message.contains("bucket_tasks=0")
+                                        && message.contains("orphan_dir_tasks=0"));
+        assertThat(
+                        auditMessages().stream()
+                                .filter(message -> message.contains("action=audit_integrity"))
+                                .count())
+                .isEqualTo(1L);
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=audit_integrity")
+                                        && message.contains("rule_counters_consistent=true")
+                                        && message.contains("coverage_complete=true")
+                                        && message.contains("dry_run_counters_consistent=true"));
+        assertThat(
+                        auditMessages().stream()
+                                .filter(message -> message.contains("action=summary "))
+                                .count())
+                .isEqualTo(1L);
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=summary ")
+                                        && message.contains("scanned=0")
+                                        && message.contains("deleted_files=0")
+                                        && message.contains("bytes_reclaimed=0"));
+    }
+
     private void attachAuditAppender() {
         LoggerContext context = (LoggerContext) LogManager.getContext(false);
         org.apache.logging.log4j.core.config.Configuration config = context.getConfiguration();

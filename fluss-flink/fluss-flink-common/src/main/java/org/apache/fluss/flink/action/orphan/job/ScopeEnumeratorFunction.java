@@ -168,6 +168,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                         out);
             }
             audit.logScopePlan(planStats);
+            out.collect(ScopeSummaryTask.from(planStats));
         }
     }
 

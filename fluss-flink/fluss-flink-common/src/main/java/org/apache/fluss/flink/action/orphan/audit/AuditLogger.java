@@ -19,11 +19,9 @@ package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
-import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
-import org.apache.fluss.flink.action.orphan.job.CleanupReport;
+import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
-import org.apache.fluss.flink.action.orphan.job.TableCleanupSummary;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
@@ -496,33 +494,42 @@ public final class AuditLogger {
                 Instant.now());
     }
 
-    /** Emits bounded terminal rule and coverage diagnostics from the aggregated report. */
-    public void logReport(CleanupReport report, boolean dryRun) {
-        for (TableCleanupSummary table : report.tables().values()) {
-            for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry :
-                    table.byRuleDecision().entrySet()) {
-                logRuleDecisions(
-                        "table_rule_summary",
-                        "database="
-                                + table.scope().database()
-                                + " table="
-                                + table.scope().table()
-                                + " table_id="
-                                + nullable(table.scope().tableId())
-                                + " object_type="
-                                + lower(entry.getKey().name()),
-                        entry.getValue(),
-                        dryRun);
-            }
-        }
-        for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry :
-                report.byRuleDecision().entrySet()) {
-            logRuleDecisions(
-                    "summary_by_rule",
-                    "scope=global object_type=" + lower(entry.getKey().name()),
-                    entry.getValue(),
-                    dryRun);
-        }
+    public void logTableRuleSummary(
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            RuleDecisionCounters counters,
+            boolean dryRun) {
+        logRuleDecisions(
+                "table_rule_summary",
+                "database="
+                        + scope.database()
+                        + " table="
+                        + scope.table()
+                        + " table_id="
+                        + nullable(scope.tableId())
+                        + " object_type="
+                        + lower(objectType.name()),
+                counters,
+                dryRun);
+    }
+
+    public void logGlobalRuleSummary(
+            CleanupObjectType objectType, RuleDecisionCounters counters, boolean dryRun) {
+        logRuleDecisions(
+                "summary_by_rule",
+                "scope=global object_type=" + lower(objectType.name()),
+                counters,
+                dryRun);
+    }
+
+    public void logCoverageSummary(
+            Map<SkipReasonCode, Long> skipped,
+            long metadataFailures,
+            long mtimeUnavailableFiles,
+            long mtimeUnavailableBytes,
+            long mtimeUnavailableDirs,
+            boolean coverageComplete,
+            boolean dryRun) {
         AUDIT.info(
                 "action=coverage_summary no_remote_manifest_targets={}"
                         + " empty_active_set_targets={} metadata_read_failed_targets={}"
@@ -530,33 +537,32 @@ public final class AuditLogger {
                         + " mtime_unavailable_files={} mtime_unavailable_bytes={}"
                         + " mtime_unavailable_dirs={} complete={}"
                         + " action_required={} dry_run={} ts={}",
-                reasonCount(report, SkipReasonCode.NO_REMOTE_MANIFEST),
-                reasonCount(report, SkipReasonCode.EMPTY_KV_ACTIVE_SET),
-                report.metadataFailures(),
-                reasonCount(report, SkipReasonCode.DIRECTORY_LIST_FAILED),
-                reasonCount(report, SkipReasonCode.RPC_ERROR),
-                report.mtimeUnavailableFiles(),
-                report.mtimeUnavailableBytes(),
-                report.mtimeUnavailableDirs(),
-                report.coverageComplete(),
-                !report.coverageComplete(),
+                skipped.getOrDefault(SkipReasonCode.NO_REMOTE_MANIFEST, 0L),
+                skipped.getOrDefault(SkipReasonCode.EMPTY_KV_ACTIVE_SET, 0L),
+                metadataFailures,
+                skipped.getOrDefault(SkipReasonCode.DIRECTORY_LIST_FAILED, 0L),
+                skipped.getOrDefault(SkipReasonCode.RPC_ERROR, 0L),
+                mtimeUnavailableFiles,
+                mtimeUnavailableBytes,
+                mtimeUnavailableDirs,
+                coverageComplete,
+                !coverageComplete,
                 dryRun,
                 Instant.now());
+    }
+
+    public void logAuditIntegrity(CleanupSummary summary) {
         AUDIT.info(
                 "action=audit_integrity rule_counters_consistent={} coverage_complete={}"
-                        + " dry_run={} ts={}",
-                report.ruleCountersConsistent(),
-                report.coverageComplete(),
-                dryRun,
+                        + " dry_run_counters_consistent={} inconsistent_object_types={}"
+                        + " inconsistent_scopes={} dry_run={} ts={}",
+                summary.ruleCountersConsistent(),
+                summary.coverageComplete(),
+                summary.dryRunCountersConsistent(),
+                summary.inconsistentObjectTypes(),
+                summary.inconsistentScopes(),
+                summary.dryRun(),
                 Instant.now());
-        CleanupCounters counters = report.global();
-        logSummary(
-                counters.scannedFiles(),
-                counters.deletedFiles(),
-                counters.emptyDirsRemoved(),
-                counters.deleteFailures(),
-                counters.bytesReclaimed(),
-                dryRun);
     }
 
     private static void logRuleDecisions(
@@ -584,10 +590,6 @@ public final class AuditLogger {
                 counters.candidateBytes(),
                 dryRun,
                 Instant.now());
-    }
-
-    private static long reasonCount(CleanupReport report, SkipReasonCode reason) {
-        return report.bySkipReason().getOrDefault(reason, 0L);
     }
 
     private static String nullable(Object value) {
