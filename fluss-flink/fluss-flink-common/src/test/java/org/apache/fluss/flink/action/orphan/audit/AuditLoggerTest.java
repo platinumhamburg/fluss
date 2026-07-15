@@ -17,11 +17,13 @@
 
 package org.apache.fluss.flink.action.orphan.audit;
 
-import org.apache.fluss.flink.action.orphan.job.CleanStats;
-import org.apache.fluss.flink.action.orphan.job.CleanupReport;
+import org.apache.fluss.flink.action.orphan.job.CleanupStats;
+import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
-import org.apache.fluss.flink.action.orphan.job.TablePlanStats;
+import org.apache.fluss.flink.action.orphan.job.StatsAggregateOperator;
 
+import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
@@ -30,7 +32,6 @@ import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.LoggerConfig;
 import org.junit.jupiter.api.Test;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -40,10 +41,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 class AuditLoggerTest {
 
     @Test
-    void emitsBoundedRuleAndCoverageSummaries() {
+    void emitsBoundedRuleAndCoverageSummaries() throws Exception {
         ScopeIdentity orders = ScopeIdentity.table("db", "orders", 7L);
-        CleanStats stats =
-                CleanStats.builder(orders)
+        CleanupStats stats =
+                CleanupStats.scanBuilder(orders)
                         .scanned(CleanupObjectType.LOG_SEGMENT, 2L)
                         .planned(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
                         .ruleDecision(
@@ -54,15 +55,18 @@ class AuditLoggerTest {
                                         .add(RuleDecisionCounters.keepActive(5L)))
                         .skipped(SkipReasonCode.KEEP_ACTIVE, 1L)
                         .build();
-        TablePlanStats plan =
-                new TablePlanStats(orders, 1L, 1L, Map.of(SkipReasonCode.RPC_ERROR, 1L));
-        CleanupReport report =
-                CleanupReport.aggregate(
-                        Collections.singletonList(plan), Collections.singletonList(stats), true);
         List<String> events = new CopyOnWriteArrayList<>();
 
-        try (AuditCapture ignored = new AuditCapture(events)) {
-            new AuditLogger().logReport(report, true);
+        try (AuditCapture ignored = new AuditCapture(events);
+                OneInputStreamOperatorTestHarness<CleanupStats, CleanupSummary> harness =
+                        new OneInputStreamOperatorTestHarness<>(
+                                new StatsAggregateOperator(true), 1, 1, 0)) {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(
+                            CleanupStats.scope(1L, 1L, Map.of(SkipReasonCode.RPC_ERROR, 1L))));
+            harness.processElement(new StreamRecord<>(stats));
+            harness.endInput();
         }
 
         assertThat(events)
@@ -86,7 +90,10 @@ class AuditLoggerTest {
                         event ->
                                 event.contains("action=audit_integrity")
                                         && event.contains("rule_counters_consistent=true")
-                                        && event.contains("coverage_complete=false"));
+                                        && event.contains("coverage_complete=false")
+                                        && event.contains("dry_run_counters_consistent=true")
+                                        && event.contains("inconsistent_object_types=0")
+                                        && event.contains("inconsistent_scopes=0"));
         assertThat(events)
                 .noneMatch(
                         event ->

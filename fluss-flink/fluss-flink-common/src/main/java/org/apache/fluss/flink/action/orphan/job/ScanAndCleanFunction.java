@@ -61,12 +61,12 @@ import java.util.Map;
  *       older than the cutoff, then removes old empty directories bottom-up.
  * </ul>
  *
- * <p>Each task emits a single {@link CleanStats} containing scalar counters. Remote filesystem
+ * <p>Each task emits a single {@link CleanupStats} containing scalar counters. Remote filesystem
  * operation rate is limited per-subtask: {@code configuredRate / runtimeParallelism}. The serial
  * processing within each subtask guarantees no concurrent throttler access.
  */
 @Internal
-public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask, CleanStats> {
+public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask, CleanupStats> {
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(ScanAndCleanFunction.class);
@@ -102,9 +102,11 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     }
 
     @Override
-    public void processElement(CleanTask task, Context ctx, Collector<CleanStats> out)
+    public void processElement(CleanTask task, Context ctx, Collector<CleanupStats> out)
             throws Exception {
-        if (task instanceof BucketCleanTask) {
+        if (task instanceof ScopeSummaryTask) {
+            out.collect(((ScopeSummaryTask) task).stats());
+        } else if (task instanceof BucketCleanTask) {
             out.collect(processBucketTask((BucketCleanTask) task));
         } else if (task instanceof OrphanDirCleanTask) {
             out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
@@ -115,13 +117,13 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     // BucketCleanTask processing
     // -------------------------------------------------------------------------
 
-    private CleanStats processBucketTask(BucketCleanTask task) throws IOException {
+    private CleanupStats processBucketTask(BucketCleanTask task) throws IOException {
         FsPath logDir = task.logTabletDir() != null ? new FsPath(task.logTabletDir()) : null;
         FsPath kvDir = task.kvTabletDir() != null ? new FsPath(task.kvTabletDir()) : null;
 
         FsPath anyDir = logDir != null ? logDir : kvDir;
         if (anyDir == null) {
-            return CleanStats.empty(task.scope());
+            return CleanupStats.emptyScan(task.scope());
         }
 
         BucketActiveRefs activeRefs =
@@ -145,7 +147,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
-        return new CleanStats(
+        return CleanupStats.scan(
                 task.scope(),
                 new CleanupCounters(
                         bucketStats.scannedFiles,
@@ -165,18 +167,18 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     // OrphanDirCleanTask processing
     // -------------------------------------------------------------------------
 
-    private CleanStats processOrphanDirTask(OrphanDirCleanTask task) throws IOException {
+    private CleanupStats processOrphanDirTask(OrphanDirCleanTask task) throws IOException {
         FsPath dirPath = new FsPath(task.dirPath());
         FileSystem fs = dirPath.getFileSystem();
         remoteFsOpRateLimiter.acquire();
         if (!fs.exists(dirPath)) {
-            return CleanStats.empty(task.scope());
+            return CleanupStats.emptyScan(task.scope());
         }
 
         SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun(), task.scope());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
 
-        CleanStats.Builder stats = CleanStats.builder(task.scope());
+        CleanupStats.Builder stats = CleanupStats.scanBuilder(task.scope());
 
         remoteFsOpRateLimiter.acquire();
         FileStatus rootStatus = fs.getFileStatus(dirPath);
