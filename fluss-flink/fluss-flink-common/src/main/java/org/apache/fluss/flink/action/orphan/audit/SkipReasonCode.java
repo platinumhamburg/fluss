@@ -24,6 +24,7 @@ import org.apache.fluss.annotation.Internal;
 public enum SkipReasonCode {
     KEEP_ACTIVE(SkipCategory.EXPECTED_SKIP, false, false),
     NEWER_THAN_CUTOFF(SkipCategory.EXPECTED_SKIP, false, false),
+    MTIME_UNAVAILABLE(SkipCategory.DEGRADED_SKIP, false, true),
     NO_REMOTE_MANIFEST(SkipCategory.EXPECTED_SKIP, false, false),
     EMPTY_KV_ACTIVE_SET(SkipCategory.SAFETY_SKIP, true, false),
     UNKNOWN_FILE_TYPE(SkipCategory.SAFETY_SKIP, false, true),

@@ -37,6 +37,9 @@ public enum Decision {
      */
     DEFER,
 
+    /** Filesystem cannot provide an age verdict; conservatively retain the object. */
+    MTIME_UNAVAILABLE,
+
     /** File path or extension is not recognized; skip without deletion. */
     SKIP_UNKNOWN
 }

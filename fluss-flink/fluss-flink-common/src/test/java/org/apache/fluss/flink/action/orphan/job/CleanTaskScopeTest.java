@@ -40,6 +40,7 @@ class CleanTaskScopeTest {
                         Collections.emptySet(),
                         Collections.emptySet(),
                         Collections.emptySet(),
+                        Collections.emptySet(),
                         100L,
                         true,
                         false);

@@ -33,6 +33,8 @@ public final class RuleDecisionCounters implements Serializable {
     private final long keepActiveBytes;
     private final long newerThanCutoffFiles;
     private final long newerThanCutoffBytes;
+    private final long mtimeUnavailableFiles;
+    private final long mtimeUnavailableBytes;
     private final long unknownFileTypeFiles;
     private final long unknownFileTypeBytes;
     private final long candidateFiles;
@@ -45,6 +47,8 @@ public final class RuleDecisionCounters implements Serializable {
             long keepActiveBytes,
             long newerThanCutoffFiles,
             long newerThanCutoffBytes,
+            long mtimeUnavailableFiles,
+            long mtimeUnavailableBytes,
             long unknownFileTypeFiles,
             long unknownFileTypeBytes,
             long candidateFiles,
@@ -55,6 +59,8 @@ public final class RuleDecisionCounters implements Serializable {
         this.keepActiveBytes = keepActiveBytes;
         this.newerThanCutoffFiles = newerThanCutoffFiles;
         this.newerThanCutoffBytes = newerThanCutoffBytes;
+        this.mtimeUnavailableFiles = mtimeUnavailableFiles;
+        this.mtimeUnavailableBytes = mtimeUnavailableBytes;
         this.unknownFileTypeFiles = unknownFileTypeFiles;
         this.unknownFileTypeBytes = unknownFileTypeBytes;
         this.candidateFiles = candidateFiles;
@@ -62,27 +68,31 @@ public final class RuleDecisionCounters implements Serializable {
     }
 
     public static RuleDecisionCounters empty() {
-        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     public static RuleDecisionCounters scanned(long bytes) {
-        return new RuleDecisionCounters(1L, bytes, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+        return new RuleDecisionCounters(1L, bytes, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     public static RuleDecisionCounters candidate(long bytes) {
-        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 1L, bytes);
+        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 1L, bytes);
     }
 
     public static RuleDecisionCounters keepActive(long bytes) {
-        return new RuleDecisionCounters(0L, 0L, 1L, bytes, 0L, 0L, 0L, 0L, 0L, 0L);
+        return new RuleDecisionCounters(0L, 0L, 1L, bytes, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     public static RuleDecisionCounters newerThanCutoff(long bytes) {
-        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 1L, bytes, 0L, 0L, 0L, 0L);
+        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 1L, bytes, 0L, 0L, 0L, 0L, 0L, 0L);
+    }
+
+    public static RuleDecisionCounters mtimeUnavailable(long bytes) {
+        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 0L, 0L, 1L, bytes, 0L, 0L, 0L, 0L);
     }
 
     public static RuleDecisionCounters unknownFileType(long bytes) {
-        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 0L, 0L, 1L, bytes, 0L, 0L);
+        return new RuleDecisionCounters(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 1L, bytes, 0L, 0L);
     }
 
     public RuleDecisionCounters add(RuleDecisionCounters other) {
@@ -93,6 +103,8 @@ public final class RuleDecisionCounters implements Serializable {
                 keepActiveBytes + other.keepActiveBytes,
                 newerThanCutoffFiles + other.newerThanCutoffFiles,
                 newerThanCutoffBytes + other.newerThanCutoffBytes,
+                mtimeUnavailableFiles + other.mtimeUnavailableFiles,
+                mtimeUnavailableBytes + other.mtimeUnavailableBytes,
                 unknownFileTypeFiles + other.unknownFileTypeFiles,
                 unknownFileTypeBytes + other.unknownFileTypeBytes,
                 candidateFiles + other.candidateFiles,
@@ -103,11 +115,13 @@ public final class RuleDecisionCounters implements Serializable {
         return scannedFiles
                         == keepActiveFiles
                                 + newerThanCutoffFiles
+                                + mtimeUnavailableFiles
                                 + unknownFileTypeFiles
                                 + candidateFiles
                 && scannedBytes
                         == keepActiveBytes
                                 + newerThanCutoffBytes
+                                + mtimeUnavailableBytes
                                 + unknownFileTypeBytes
                                 + candidateBytes;
     }
@@ -134,6 +148,14 @@ public final class RuleDecisionCounters implements Serializable {
 
     public long newerThanCutoffBytes() {
         return newerThanCutoffBytes;
+    }
+
+    public long mtimeUnavailableFiles() {
+        return mtimeUnavailableFiles;
+    }
+
+    public long mtimeUnavailableBytes() {
+        return mtimeUnavailableBytes;
     }
 
     public long unknownFileTypeFiles() {

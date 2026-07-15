@@ -154,7 +154,33 @@ public final class CleanupReport implements Serializable {
         return Collections.unmodifiableMap(byRuleDecision);
     }
 
+    public long mtimeUnavailableFiles() {
+        return sumMtimeUnavailableFiles(byRuleDecision.values());
+    }
+
+    public long mtimeUnavailableBytes() {
+        long total = 0L;
+        for (RuleDecisionCounters counters : byRuleDecision.values()) {
+            total += counters.mtimeUnavailableBytes();
+        }
+        return total;
+    }
+
+    public long mtimeUnavailableDirs() {
+        return bySkipReason.getOrDefault(SkipReasonCode.MTIME_UNAVAILABLE, 0L)
+                - mtimeUnavailableFiles();
+    }
+
     public boolean ruleCountersConsistent() {
+        if (bySkipReason.getOrDefault(SkipReasonCode.MTIME_UNAVAILABLE, 0L)
+                < mtimeUnavailableFiles()) {
+            return false;
+        }
+        for (TableCleanupSummary table : tables.values()) {
+            if (!table.mtimeCountersConsistent()) {
+                return false;
+            }
+        }
         for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry : byRuleDecision.entrySet()) {
             RuleDecisionCounters decisions = entry.getValue();
             CleanupCounters counters =
@@ -172,6 +198,15 @@ public final class CleanupReport implements Serializable {
             }
         }
         return true;
+    }
+
+    private static long sumMtimeUnavailableFiles(
+            Collection<RuleDecisionCounters> decisionCounters) {
+        long total = 0L;
+        for (RuleDecisionCounters counters : decisionCounters) {
+            total += counters.mtimeUnavailableFiles();
+        }
+        return total;
     }
 
     public boolean coverageComplete() {
