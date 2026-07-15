@@ -19,6 +19,8 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
@@ -37,6 +39,8 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.EnumMap;
+import java.util.Map;
 
 /**
  * Per-bucket orphan cleanup for live buckets: walks the provided bucket directories and dispatches
@@ -92,17 +96,36 @@ public final class BucketCleaner {
             return;
         }
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
-        stack.push(new DirVisit(root, false, false, null, true));
+        stack.push(new DirVisit(root, false, false, -1L, null, true));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
-                    stats.plannedDirs++;
-                    if (dryRun) {
-                        audit.logWouldDeleteDir(visit.dir);
-                    } else if (safeDeleter.deleteEmptyDir(visit.dir)) {
-                        stats.emptyDirsRemoved++;
+                    stats.recordPlannedDirectory();
+                    SafeDeleter.DirectoryDeleteResult result =
+                            safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
+                    switch (result) {
+                        case SUCCESS:
+                            if (!dryRun) {
+                                stats.recordRemovedDirectory();
+                            }
+                            break;
+                        case NOT_EMPTY:
+                            stats.recordSkip(SkipReasonCode.DIRECTORY_NOT_EMPTY);
+                            visit.markParentRemaining();
+                            break;
+                        case LIST_FAILED:
+                            stats.recordSkip(SkipReasonCode.DIRECTORY_LIST_FAILED);
+                            visit.markParentRemaining();
+                            break;
+                        case DELETE_FAILED:
+                            stats.recordDeleteFailure(CleanupObjectType.DIRECTORY);
+                            visit.markParentRemaining();
+                            break;
+                        default:
+                            visit.markParentRemaining();
+                            break;
                     }
                 } else if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
@@ -115,6 +138,7 @@ public final class BucketCleaner {
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
+                stats.recordSkip(SkipReasonCode.DIRECTORY_LIST_FAILED);
                 if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
                 }
@@ -141,6 +165,7 @@ public final class BucketCleaner {
                                     childPath,
                                     false,
                                     child.getModificationTime() < cutoffMillis,
+                                    child.getModificationTime(),
                                     visit,
                                     false));
                     continue;
@@ -149,27 +174,40 @@ public final class BucketCleaner {
                         new FileMeta(childPath, child.getLen(), child.getModificationTime());
                 FileRule rule = dispatcher.dispatch(meta);
                 Decision decision = rule.evaluate(meta, activeRefs, cutoffMillis);
-                stats.scannedFiles++;
+                CleanupObjectType objectType = rule.id().objectType();
+                stats.recordScanned(objectType);
+                stats.recordRuleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
                 switch (decision) {
                     case DELETE:
-                        stats.plannedFiles++;
-                        stats.plannedBytes += meta.size();
-                        if (safeDeleter.deleteFile(meta.path(), decision, rule.id())) {
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.candidate(meta.size()));
+                        stats.recordPlanned(objectType, meta.size());
+                        if (safeDeleter.deleteFile(meta, decision, rule.id())) {
                             if (!dryRun) {
-                                stats.deletedFiles++;
-                                stats.bytesReclaimed += meta.size();
+                                stats.recordDeleted(objectType, meta.size());
                             }
                         } else {
-                            stats.deleteFailures++;
+                            stats.recordDeleteFailure(objectType);
                             visit.hasRemainingChild = true;
                         }
                         break;
                     case SKIP_UNKNOWN:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.unknownFileType(meta.size()));
                         audit.logSkipUnknown(meta.path(), rule.id());
+                        stats.recordSkip(SkipReasonCode.UNKNOWN_FILE_TYPE);
                         visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.keepActive(meta.size()));
+                        stats.recordSkip(SkipReasonCode.KEEP_ACTIVE);
+                        visit.hasRemainingChild = true;
+                        break;
                     case DEFER:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.newerThanCutoff(meta.size()));
+                        stats.recordSkip(SkipReasonCode.NEWER_THAN_CUTOFF);
                         visit.hasRemainingChild = true;
                         break;
                     default:
@@ -190,9 +228,65 @@ public final class BucketCleaner {
         public long emptyDirsRemoved;
         public long deleteFailures;
         public long bytesReclaimed;
+        public final Map<CleanupObjectType, CleanupCounters> byObjectType =
+                new EnumMap<>(CleanupObjectType.class);
+        public final Map<SkipReasonCode, Long> bySkipReason = new EnumMap<>(SkipReasonCode.class);
+        public final Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision =
+                new EnumMap<>(CleanupObjectType.class);
 
         public static BucketCleanStats empty() {
             return new BucketCleanStats();
+        }
+
+        private void recordScanned(CleanupObjectType type) {
+            scannedFiles++;
+            addByObjectType(type, new CleanupCounters(1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L));
+        }
+
+        private void recordPlanned(CleanupObjectType type, long bytes) {
+            plannedFiles++;
+            plannedBytes += bytes;
+            addByObjectType(type, new CleanupCounters(0L, 1L, 0L, bytes, 0L, 0L, 0L, 0L));
+        }
+
+        private void recordDeleted(CleanupObjectType type, long bytes) {
+            deletedFiles++;
+            bytesReclaimed += bytes;
+            addByObjectType(type, new CleanupCounters(0L, 0L, 0L, 0L, 1L, 0L, 0L, bytes));
+        }
+
+        private void recordDeleteFailure(CleanupObjectType type) {
+            deleteFailures++;
+            addByObjectType(type, new CleanupCounters(0L, 0L, 0L, 0L, 0L, 0L, 1L, 0L));
+        }
+
+        private void recordPlannedDirectory() {
+            plannedDirs++;
+            addByObjectType(
+                    CleanupObjectType.DIRECTORY,
+                    new CleanupCounters(0L, 0L, 1L, 0L, 0L, 0L, 0L, 0L));
+        }
+
+        private void recordRemovedDirectory() {
+            emptyDirsRemoved++;
+            addByObjectType(
+                    CleanupObjectType.DIRECTORY,
+                    new CleanupCounters(0L, 0L, 0L, 0L, 0L, 1L, 0L, 0L));
+        }
+
+        private void recordSkip(SkipReasonCode reason) {
+            bySkipReason.put(reason, bySkipReason.getOrDefault(reason, 0L) + 1L);
+        }
+
+        private void addByObjectType(CleanupObjectType type, CleanupCounters delta) {
+            byObjectType.put(
+                    type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
+        }
+
+        private void recordRuleDecision(CleanupObjectType type, RuleDecisionCounters delta) {
+            byRuleDecision.put(
+                    type,
+                    byRuleDecision.getOrDefault(type, RuleDecisionCounters.empty()).add(delta));
         }
     }
 
@@ -200,17 +294,30 @@ public final class BucketCleaner {
         private final FsPath dir;
         private boolean postOrder;
         private final boolean oldEnough;
+        private final long modificationTime;
         private final DirVisit parent;
         private final boolean root;
         private boolean hasRemainingChild;
 
         private DirVisit(
-                FsPath dir, boolean postOrder, boolean oldEnough, DirVisit parent, boolean root) {
+                FsPath dir,
+                boolean postOrder,
+                boolean oldEnough,
+                long modificationTime,
+                DirVisit parent,
+                boolean root) {
             this.dir = dir;
             this.postOrder = postOrder;
             this.oldEnough = oldEnough;
+            this.modificationTime = modificationTime;
             this.parent = parent;
             this.root = root;
+        }
+
+        private void markParentRemaining() {
+            if (parent != null) {
+                parent.hasRemainingChild = true;
+            }
         }
     }
 }

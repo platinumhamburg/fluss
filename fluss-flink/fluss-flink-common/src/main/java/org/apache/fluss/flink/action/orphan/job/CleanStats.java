@@ -25,6 +25,7 @@ import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import java.io.Serializable;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -47,6 +48,7 @@ public final class CleanStats implements Serializable {
     private final ScopeIdentity scope;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<SkipReasonCode, Long> bySkipReason;
+    private final Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision;
 
     public CleanStats(
             long scannedFiles,
@@ -69,6 +71,7 @@ public final class CleanStats implements Serializable {
                         deleteFailures,
                         bytesReclaimed),
                 Collections.emptyMap(),
+                Collections.emptyMap(),
                 Collections.emptyMap());
     }
 
@@ -77,14 +80,25 @@ public final class CleanStats implements Serializable {
             CleanupCounters counters,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
             Map<SkipReasonCode, Long> bySkipReason) {
+        this(scope, counters, byObjectType, bySkipReason, Collections.emptyMap());
+    }
+
+    public CleanStats(
+            ScopeIdentity scope,
+            CleanupCounters counters,
+            Map<CleanupObjectType, CleanupCounters> byObjectType,
+            Map<SkipReasonCode, Long> bySkipReason,
+            Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision) {
         this.scope = scope;
-        EnumMap<CleanupObjectType, CleanupCounters> objectCopy =
-                new EnumMap<>(CleanupObjectType.class);
+        Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
         objectCopy.putAll(byObjectType);
-        this.byObjectType = Collections.unmodifiableMap(objectCopy);
-        EnumMap<SkipReasonCode, Long> reasonCopy = new EnumMap<>(SkipReasonCode.class);
+        this.byObjectType = objectCopy;
+        Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
         reasonCopy.putAll(bySkipReason);
-        this.bySkipReason = Collections.unmodifiableMap(reasonCopy);
+        this.bySkipReason = reasonCopy;
+        Map<CleanupObjectType, RuleDecisionCounters> decisionCopy = new HashMap<>();
+        decisionCopy.putAll(byRuleDecision);
+        this.byRuleDecision = decisionCopy;
         this.scannedFiles = counters.scannedFiles();
         this.plannedFiles = counters.plannedFiles();
         this.plannedDirs = counters.plannedDirs();
@@ -125,11 +139,15 @@ public final class CleanStats implements Serializable {
     }
 
     public Map<CleanupObjectType, CleanupCounters> byObjectType() {
-        return byObjectType;
+        return Collections.unmodifiableMap(byObjectType);
     }
 
     public Map<SkipReasonCode, Long> bySkipReason() {
-        return bySkipReason;
+        return Collections.unmodifiableMap(bySkipReason);
+    }
+
+    public Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision() {
+        return Collections.unmodifiableMap(byRuleDecision);
     }
 
     public long scannedFiles() {
@@ -173,25 +191,39 @@ public final class CleanStats implements Serializable {
                 new EnumMap<>(CleanupObjectType.class);
         private final EnumMap<SkipReasonCode, Long> bySkipReason =
                 new EnumMap<>(SkipReasonCode.class);
+        private final EnumMap<CleanupObjectType, RuleDecisionCounters> byRuleDecision =
+                new EnumMap<>(CleanupObjectType.class);
 
         private Builder(ScopeIdentity scope) {
             this.scope = scope;
         }
 
+        public Builder scanned(CleanupObjectType type, long files) {
+            return add(type, new CleanupCounters(files, 0L, 0L, 0L, 0L, 0L, 0L, 0L));
+        }
+
         public Builder planned(CleanupObjectType type, long files, long bytes) {
-            CleanupCounters delta = new CleanupCounters(0L, files, 0L, bytes, 0L, 0L, 0L, 0L);
-            counters = counters.add(delta);
-            byObjectType.put(
-                    type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
-            return this;
+            return add(type, new CleanupCounters(0L, files, 0L, bytes, 0L, 0L, 0L, 0L));
         }
 
         public Builder deleted(CleanupObjectType type, long files, long bytes) {
-            CleanupCounters delta = new CleanupCounters(0L, 0L, 0L, 0L, files, 0L, 0L, bytes);
-            counters = counters.add(delta);
-            byObjectType.put(
-                    type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
-            return this;
+            return add(type, new CleanupCounters(0L, 0L, 0L, 0L, files, 0L, 0L, bytes));
+        }
+
+        public Builder deleteFailed(CleanupObjectType type, long files) {
+            return add(type, new CleanupCounters(0L, 0L, 0L, 0L, 0L, 0L, files, 0L));
+        }
+
+        public Builder plannedDirectory(long dirs) {
+            return add(
+                    CleanupObjectType.DIRECTORY,
+                    new CleanupCounters(0L, 0L, dirs, 0L, 0L, 0L, 0L, 0L));
+        }
+
+        public Builder removedDirectory(long dirs) {
+            return add(
+                    CleanupObjectType.DIRECTORY,
+                    new CleanupCounters(0L, 0L, 0L, 0L, 0L, dirs, 0L, 0L));
         }
 
         public Builder skipped(SkipReasonCode reason, long count) {
@@ -199,8 +231,22 @@ public final class CleanStats implements Serializable {
             return this;
         }
 
+        public Builder ruleDecision(CleanupObjectType type, RuleDecisionCounters counters) {
+            byRuleDecision.put(
+                    type,
+                    byRuleDecision.getOrDefault(type, RuleDecisionCounters.empty()).add(counters));
+            return this;
+        }
+
         public CleanStats build() {
-            return new CleanStats(scope, counters, byObjectType, bySkipReason);
+            return new CleanStats(scope, counters, byObjectType, bySkipReason, byRuleDecision);
+        }
+
+        private Builder add(CleanupObjectType type, CleanupCounters delta) {
+            counters = counters.add(delta);
+            byObjectType.put(
+                    type, byObjectType.getOrDefault(type, CleanupCounters.empty()).add(delta));
+            return this;
         }
     }
 }

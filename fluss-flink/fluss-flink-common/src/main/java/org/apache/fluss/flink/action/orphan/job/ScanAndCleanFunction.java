@@ -20,6 +20,9 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
@@ -38,7 +41,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.Map;
 
@@ -126,7 +128,8 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         task.kvActiveSnapDirs(),
                         task.logActiveManifestPaths());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
-        SafeDeleter safeDeleter = createSafeDeleter(anyDir.getFileSystem(), task.dryRun());
+        SafeDeleter safeDeleter =
+                createSafeDeleter(anyDir.getFileSystem(), task.dryRun(), task.scope());
         BucketCleaner cleaner =
                 new BucketCleaner(
                         dispatcher,
@@ -149,8 +152,9 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         bucketStats.emptyDirsRemoved,
                         bucketStats.deleteFailures,
                         bucketStats.bytesReclaimed),
-                Collections.emptyMap(),
-                Collections.emptyMap());
+                bucketStats.byObjectType,
+                bucketStats.bySkipReason,
+                bucketStats.byRuleDecision);
     }
 
     // -------------------------------------------------------------------------
@@ -165,17 +169,10 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             return CleanStats.empty(task.scope());
         }
 
-        SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun());
+        SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun(), task.scope());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
 
-        long scannedFiles = 0L;
-        long plannedFiles = 0L;
-        long plannedDirs = 0L;
-        long plannedBytes = 0L;
-        long deletedFiles = 0L;
-        long emptyDirsRemoved = 0L;
-        long deleteFailures = 0L;
-        long bytesReclaimed = 0L;
+        CleanStats.Builder stats = CleanStats.builder(task.scope());
 
         remoteFsOpRateLimiter.acquire();
         FileStatus rootStatus = fs.getFileStatus(dirPath);
@@ -186,17 +183,37 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         false,
                         rootStatus.isDir()
                                 && rootStatus.getModificationTime() < task.cutoffMillis(),
+                        rootStatus.getModificationTime(),
                         null));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
-                    plannedDirs++;
-                    if (task.dryRun()) {
-                        audit.logWouldDeleteDir(visit.dir);
-                    } else if (safeDeleter.deleteEmptyDir(visit.dir)) {
-                        emptyDirsRemoved++;
+                    stats.plannedDirectory(1L);
+                    SafeDeleter.DirectoryDeleteResult result =
+                            safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
+                    switch (result) {
+                        case SUCCESS:
+                            if (!task.dryRun()) {
+                                stats.removedDirectory(1L);
+                            }
+                            break;
+                        case NOT_EMPTY:
+                            stats.skipped(SkipReasonCode.DIRECTORY_NOT_EMPTY, 1L);
+                            visit.markParentRemaining();
+                            break;
+                        case LIST_FAILED:
+                            stats.skipped(SkipReasonCode.DIRECTORY_LIST_FAILED, 1L);
+                            visit.markParentRemaining();
+                            break;
+                        case DELETE_FAILED:
+                            stats.deleteFailed(CleanupObjectType.DIRECTORY, 1L);
+                            visit.markParentRemaining();
+                            break;
+                        default:
+                            visit.markParentRemaining();
+                            break;
                     }
                 } else if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
@@ -209,6 +226,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
+                stats.skipped(SkipReasonCode.DIRECTORY_LIST_FAILED, 1L);
                 if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
                 }
@@ -230,39 +248,57 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                                     childPath,
                                     false,
                                     child.getModificationTime() < task.cutoffMillis(),
+                                    child.getModificationTime(),
                                     visit));
-                    continue;
-                }
-                scannedFiles++;
-                if (child.getModificationTime() >= task.cutoffMillis()) {
-                    visit.hasRemainingChild = true;
                     continue;
                 }
                 FileMeta meta =
                         new FileMeta(childPath, child.getLen(), child.getModificationTime());
                 FileRule rule = dispatcher.dispatch(meta);
+                CleanupObjectType objectType = rule.id().objectType();
+                stats.scanned(objectType, 1L);
+                stats.ruleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
+                if (child.getModificationTime() >= task.cutoffMillis()) {
+                    stats.ruleDecision(
+                            objectType, RuleDecisionCounters.newerThanCutoff(meta.size()));
+                    stats.skipped(SkipReasonCode.NEWER_THAN_CUTOFF, 1L);
+                    visit.hasRemainingChild = true;
+                    continue;
+                }
                 Decision decision =
                         rule.evaluate(meta, BucketActiveRefs.empty(), task.cutoffMillis());
                 switch (decision) {
                     case DELETE:
-                        plannedFiles++;
-                        plannedBytes += meta.size();
-                        if (safeDeleter.deleteFile(meta.path(), decision, rule.id())) {
+                        stats.ruleDecision(objectType, RuleDecisionCounters.candidate(meta.size()));
+                        stats.planned(objectType, 1L, meta.size());
+                        if (safeDeleter.deleteFile(meta, decision, rule.id())) {
                             if (!task.dryRun()) {
-                                deletedFiles++;
-                                bytesReclaimed += meta.size();
+                                stats.deleted(objectType, 1L, meta.size());
                             }
                         } else {
-                            deleteFailures++;
+                            stats.deleteFailed(objectType, 1L);
                             visit.hasRemainingChild = true;
                         }
                         break;
                     case SKIP_UNKNOWN:
+                        stats.ruleDecision(
+                                objectType, RuleDecisionCounters.unknownFileType(meta.size()));
                         audit.logSkipUnknown(meta.path(), rule.id());
+                        stats.skipped(SkipReasonCode.UNKNOWN_FILE_TYPE, 1L);
                         visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
+                        stats.ruleDecision(
+                                objectType, RuleDecisionCounters.keepActive(meta.size()));
+                        stats.skipped(SkipReasonCode.KEEP_ACTIVE, 1L);
+                        visit.hasRemainingChild = true;
+                        break;
                     case DEFER:
+                        stats.ruleDecision(
+                                objectType, RuleDecisionCounters.newerThanCutoff(meta.size()));
+                        stats.skipped(SkipReasonCode.NEWER_THAN_CUTOFF, 1L);
+                        visit.hasRemainingChild = true;
+                        break;
                     default:
                         visit.hasRemainingChild = true;
                         break;
@@ -270,27 +306,15 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             }
         }
 
-        return new CleanStats(
-                task.scope(),
-                new CleanupCounters(
-                        scannedFiles,
-                        plannedFiles,
-                        plannedDirs,
-                        plannedBytes,
-                        deletedFiles,
-                        emptyDirsRemoved,
-                        deleteFailures,
-                        bytesReclaimed),
-                Collections.emptyMap(),
-                Collections.emptyMap());
+        return stats.build();
     }
 
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
-    private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun) {
-        return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter);
+    private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun, ScopeIdentity scope) {
+        return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter, scope);
     }
 
     private static double perSubtaskRate(long totalRate, int parallelism, int subtaskIndex) {
@@ -304,14 +328,27 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         private final FsPath dir;
         private boolean postOrder;
         private final boolean oldEnough;
+        private final long modificationTime;
         private final DirVisit parent;
         private boolean hasRemainingChild;
 
-        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough, DirVisit parent) {
+        private DirVisit(
+                FsPath dir,
+                boolean postOrder,
+                boolean oldEnough,
+                long modificationTime,
+                DirVisit parent) {
             this.dir = dir;
             this.postOrder = postOrder;
             this.oldEnough = oldEnough;
+            this.modificationTime = modificationTime;
             this.parent = parent;
+        }
+
+        private void markParentRemaining() {
+            if (parent != null) {
+                parent.hasRemainingChild = true;
+            }
         }
     }
 }

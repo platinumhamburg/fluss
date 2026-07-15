@@ -19,7 +19,12 @@ package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
+import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
+import org.apache.fluss.flink.action.orphan.job.CleanupReport;
+import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
+import org.apache.fluss.flink.action.orphan.job.TableCleanupSummary;
+import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
 
@@ -29,6 +34,8 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
+import java.util.Map;
 
 /**
  * Structured audit log writer for the orphan files cleanup action.
@@ -111,12 +118,180 @@ public final class AuditLogger {
         AUDIT.info("action=would_delete rule={} path={} ts={}", ruleId, path, Instant.now());
     }
 
+    public void logWouldDelete(FileMeta file, RuleId ruleId, ScopeIdentity scope) {
+        logObjectAction(
+                "would_delete",
+                file,
+                ruleId,
+                scope,
+                "older_than_cutoff",
+                "planned",
+                true,
+                false,
+                false);
+    }
+
+    public void logDeleted(FileMeta file, RuleId ruleId, ScopeIdentity scope) {
+        logObjectAction(
+                "deleted",
+                file,
+                ruleId,
+                scope,
+                "older_than_cutoff",
+                "success",
+                false,
+                false,
+                false);
+    }
+
+    public void logDeleteFailed(
+            FileMeta file,
+            RuleId ruleId,
+            ScopeIdentity scope,
+            String reasonCode,
+            boolean retryable) {
+        logObjectAction(
+                "delete_failed", file, ruleId, scope, reasonCode, "failed", false, retryable, true);
+    }
+
+    private void logObjectAction(
+            String action,
+            FileMeta file,
+            RuleId ruleId,
+            ScopeIdentity scope,
+            String reasonCode,
+            String result,
+            boolean dryRun,
+            boolean retryable,
+            boolean actionRequired) {
+        AUDIT.info(
+                "audit_version=1 stage=scan action={} object_type={} path={}"
+                        + " size_bytes={} mtime_ms={} rule={} reason_code={} result={}"
+                        + " database={} table={} table_id={} partition_id={} bucket_id={}"
+                        + " dry_run={} retryable={} action_required={} ts={}",
+                action,
+                ruleId.objectType().name().toLowerCase(Locale.ROOT),
+                file.path(),
+                file.size(),
+                file.modificationTime(),
+                ruleId,
+                reasonCode,
+                result,
+                scope.database(),
+                scope.table(),
+                scope.tableId(),
+                scope.partitionId(),
+                scope.bucketId(),
+                dryRun,
+                retryable,
+                actionRequired,
+                Instant.now());
+    }
+
     public void logDirDeleted(FsPath dir) {
         AUDIT.info("action=dir_deleted path={} ts={}", dir, Instant.now());
     }
 
     public void logWouldDeleteDir(FsPath dir) {
         AUDIT.info("action=would_delete_dir path={} ts={}", dir, Instant.now());
+    }
+
+    public void logWouldDeleteDirectory(
+            FsPath dir, long modificationTime, ScopeIdentity scope, boolean dryRun) {
+        logDirectoryAction(
+                "would_delete",
+                dir,
+                modificationTime,
+                scope,
+                "empty_and_older_than_cutoff",
+                "planned",
+                dryRun,
+                false,
+                false);
+    }
+
+    public void logDeletedDirectory(
+            FsPath dir, long modificationTime, ScopeIdentity scope, boolean dryRun) {
+        logDirectoryAction(
+                "deleted",
+                dir,
+                modificationTime,
+                scope,
+                "empty_and_older_than_cutoff",
+                "deleted",
+                dryRun,
+                false,
+                false);
+    }
+
+    public void logSkippedDirectory(
+            FsPath dir,
+            long modificationTime,
+            ScopeIdentity scope,
+            String reasonCode,
+            boolean dryRun,
+            boolean retryable,
+            boolean actionRequired) {
+        logDirectoryAction(
+                "skip_directory",
+                dir,
+                modificationTime,
+                scope,
+                reasonCode,
+                "skipped",
+                dryRun,
+                retryable,
+                actionRequired);
+    }
+
+    public void logDirectoryDeleteFailed(
+            FsPath dir,
+            long modificationTime,
+            ScopeIdentity scope,
+            String reasonCode,
+            boolean dryRun,
+            boolean retryable) {
+        logDirectoryAction(
+                "delete_failed",
+                dir,
+                modificationTime,
+                scope,
+                reasonCode,
+                "failed",
+                dryRun,
+                retryable,
+                true);
+    }
+
+    private static void logDirectoryAction(
+            String action,
+            FsPath dir,
+            long modificationTime,
+            ScopeIdentity scope,
+            String reasonCode,
+            String result,
+            boolean dryRun,
+            boolean retryable,
+            boolean actionRequired) {
+        AUDIT.info(
+                "audit_version=1 stage=scan action={} object_type=directory path={}"
+                        + " size_bytes=0 mtime_ms={} rule=empty-directory reason_code={} result={}"
+                        + " database={} table={} table_id={} partition_id={} bucket_id={}"
+                        + " dry_run={} retryable={} action_required={} ts={}",
+                action,
+                dir,
+                modificationTime,
+                reasonCode,
+                result,
+                scope.database(),
+                scope.table(),
+                nullable(scope.tableId()),
+                nullable(scope.partitionId()),
+                nullable(scope.bucketId()),
+                dryRun,
+                retryable,
+                actionRequired,
+                Instant.now());
     }
 
     public void logSkipUnknown(FsPath path, RuleId ruleId) {
@@ -275,5 +450,99 @@ public final class AuditLogger {
                 bytesReclaimed,
                 dryRun,
                 Instant.now());
+    }
+
+    /** Emits bounded terminal rule and coverage diagnostics from the aggregated report. */
+    public void logReport(CleanupReport report, boolean dryRun) {
+        for (TableCleanupSummary table : report.tables().values()) {
+            for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry :
+                    table.byRuleDecision().entrySet()) {
+                logRuleDecisions(
+                        "table_rule_summary",
+                        "database="
+                                + table.scope().database()
+                                + " table="
+                                + table.scope().table()
+                                + " table_id="
+                                + nullable(table.scope().tableId())
+                                + " object_type="
+                                + lower(entry.getKey().name()),
+                        entry.getValue(),
+                        dryRun);
+            }
+        }
+        for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry :
+                report.byRuleDecision().entrySet()) {
+            logRuleDecisions(
+                    "summary_by_rule",
+                    "scope=global object_type=" + lower(entry.getKey().name()),
+                    entry.getValue(),
+                    dryRun);
+        }
+        AUDIT.info(
+                "action=coverage_summary no_remote_manifest_targets={}"
+                        + " empty_active_set_targets={} metadata_read_failed_targets={}"
+                        + " directory_list_failed_targets={} rpc_failed_targets={} complete={}"
+                        + " action_required={} dry_run={} ts={}",
+                reasonCount(report, SkipReasonCode.NO_REMOTE_MANIFEST),
+                reasonCount(report, SkipReasonCode.EMPTY_KV_ACTIVE_SET),
+                report.metadataFailures(),
+                reasonCount(report, SkipReasonCode.DIRECTORY_LIST_FAILED),
+                reasonCount(report, SkipReasonCode.RPC_ERROR),
+                report.coverageComplete(),
+                !report.coverageComplete(),
+                dryRun,
+                Instant.now());
+        AUDIT.info(
+                "action=audit_integrity rule_counters_consistent={} coverage_complete={}"
+                        + " dry_run={} ts={}",
+                report.ruleCountersConsistent(),
+                report.coverageComplete(),
+                dryRun,
+                Instant.now());
+        CleanupCounters counters = report.global();
+        logSummary(
+                counters.scannedFiles(),
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed(),
+                dryRun);
+    }
+
+    private static void logRuleDecisions(
+            String action, String dimensions, RuleDecisionCounters counters, boolean dryRun) {
+        AUDIT.info(
+                "action={} {} scanned_files={} scanned_bytes={} keep_active_files={}"
+                        + " keep_active_bytes={} newer_than_cutoff_files={}"
+                        + " newer_than_cutoff_bytes={} unknown_file_type_files={}"
+                        + " unknown_file_type_bytes={} candidate_files={} candidate_bytes={}"
+                        + " dry_run={} ts={}",
+                action,
+                dimensions,
+                counters.scannedFiles(),
+                counters.scannedBytes(),
+                counters.keepActiveFiles(),
+                counters.keepActiveBytes(),
+                counters.newerThanCutoffFiles(),
+                counters.newerThanCutoffBytes(),
+                counters.unknownFileTypeFiles(),
+                counters.unknownFileTypeBytes(),
+                counters.candidateFiles(),
+                counters.candidateBytes(),
+                dryRun,
+                Instant.now());
+    }
+
+    private static long reasonCount(CleanupReport report, SkipReasonCode reason) {
+        return report.bySkipReason().getOrDefault(reason, 0L);
+    }
+
+    private static String nullable(Object value) {
+        return value == null ? "none" : value.toString();
+    }
+
+    private static String lower(String value) {
+        return value.toLowerCase(Locale.ROOT);
     }
 }

@@ -33,6 +33,7 @@ public enum SkipReasonCode {
     RPC_ERROR(SkipCategory.DEGRADED_SKIP, true, true),
     METADATA_READ_FAILED(SkipCategory.DEGRADED_SKIP, true, true),
     DIRECTORY_LIST_FAILED(SkipCategory.DEGRADED_SKIP, true, true),
+    DIRECTORY_NOT_EMPTY(SkipCategory.EXPECTED_SKIP, false, false),
     UNSUPPORTED_API(SkipCategory.UNSUPPORTED, false, true);
 
     private final SkipCategory category;
