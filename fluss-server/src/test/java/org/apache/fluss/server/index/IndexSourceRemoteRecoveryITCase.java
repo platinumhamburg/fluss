@@ -39,6 +39,10 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.log.LogSegment;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.log.remote.RemoteLogTablet;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestHooks;
@@ -183,27 +187,13 @@ class IndexSourceRemoteRecoveryITCase {
                     .as("the closed old run must not advance over the second source prefix")
                     .isEqualTo(baselinePushedOffset);
 
-            fixture.sourceReplica.getLogTablet().roll(Optional.empty());
-            waitUntil(
-                    () ->
-                            fixture.sourceReplica
-                                            .getLogTablet()
-                                            .canFetchFromRemoteLog(baselinePushedOffset)
-                                    && fixture.sourceReplica
-                                            .getLogTablet()
-                                            .canFetchFromRemoteLog(committedSourceEnd - 1L),
-                    REMOTE_TIMEOUT,
-                    "wait for raw remote source WAL to cover the complete replay range");
-            assertThat(
-                            fixture.sourceReplica
-                                    .getLogTablet()
-                                    .canFetchFromRemoteLog(baselinePushedOffset))
-                    .isTrue();
-            assertThat(
-                            fixture.sourceReplica
-                                    .getLogTablet()
-                                    .canFetchFromRemoteLog(committedSourceEnd - 1L))
-                    .isTrue();
+            LogTablet sourceLog = fixture.sourceReplica.getLogTablet();
+            sourceLog.roll(Optional.empty());
+            assertThat(sourceLog.activeLogSegment().getBaseOffset())
+                    .as("the explicit roll must close the complete committed replay range")
+                    .isEqualTo(committedSourceEnd);
+            waitForRawRemoteReplayCoverage(
+                    fixture.sourceReplica, baselinePushedOffset, committedSourceEnd);
 
             startAndUntrack(fixture.recoveryFollower, stoppedServers);
             CLUSTER.waitUntilReplicaExpandToIsr(
@@ -494,6 +484,143 @@ class IndexSourceRemoteRecoveryITCase {
                 "wait for source high watermark to reach local end");
         assertThat(sourceReplica.getLogTablet().getHighWatermark())
                 .isEqualTo(sourceReplica.getLocalLogEndOffset());
+    }
+
+    private void waitForRawRemoteReplayCoverage(
+            Replica sourceReplica, long baselinePushedOffset, long committedSourceEnd) {
+        LogTablet sourceLog = sourceReplica.getLogTablet();
+        RemoteLogManager remoteLogManager =
+                sourceTabletServer(fixture.sourceLeader)
+                        .getReplicaManager()
+                        .getRemoteLogManager();
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(fixture.sourceTableBucket);
+        LOG.info(
+                "Task 7 initial remote coverage state: {}",
+                safeRemoteCoverageState(
+                        sourceReplica, remoteLog, baselinePushedOffset, committedSourceEnd));
+
+        try {
+            waitUntil(
+                    () ->
+                            sourceLog.canFetchFromRemoteLog(baselinePushedOffset)
+                                    && sourceLog.canFetchFromRemoteLog(committedSourceEnd - 1L),
+                    REMOTE_TIMEOUT,
+                    "wait for raw remote source WAL to cover the complete replay range");
+        } catch (AssertionError | RuntimeException failure) {
+            String state =
+                    safeRemoteCoverageState(
+                            sourceReplica,
+                            remoteLog,
+                            baselinePushedOffset,
+                            committedSourceEnd);
+            throw new AssertionError(
+                    "raw remote source WAL coverage timed out; final tiering state: " + state,
+                    failure);
+        }
+
+        String finalState =
+                safeRemoteCoverageState(
+                        sourceReplica, remoteLog, baselinePushedOffset, committedSourceEnd);
+        LOG.info("Task 7 raw remote replay range covered: {}", finalState);
+        assertThat(sourceLog.canFetchFromRemoteLog(baselinePushedOffset))
+                .as("raw remote source WAL must cover the replay start")
+                .isTrue();
+        assertThat(sourceLog.canFetchFromRemoteLog(committedSourceEnd - 1L))
+                .as("raw remote source WAL must cover the replay end minus one")
+                .isTrue();
+    }
+
+    private static String safeRemoteCoverageState(
+            Replica sourceReplica,
+            RemoteLogTablet remoteLog,
+            long baselinePushedOffset,
+            long committedSourceEnd) {
+        try {
+            return remoteCoverageState(
+                    sourceReplica, remoteLog, baselinePushedOffset, committedSourceEnd);
+        } catch (RuntimeException failure) {
+            return "diagnostic-error="
+                    + failure.getClass().getSimpleName()
+                    + ':'
+                    + failure.getMessage();
+        }
+    }
+
+    private static String remoteCoverageState(
+            Replica sourceReplica,
+            RemoteLogTablet remoteLog,
+            long baselinePushedOffset,
+            long committedSourceEnd) {
+        LogTablet sourceLog = sourceReplica.getLogTablet();
+        long remoteStart = remoteLog.getRemoteLogStartOffset();
+        long remoteEnd = remoteLog.getRemoteLogEndOffset().orElse(-1L);
+        return String.format(
+                "required=[%d,%d), covered={start=%s,endMinusOne=%s}, "
+                        + "remote=[%d,%d), local=[%d,%d), logStart=%d, hw=%d, "
+                        + "recoveryPoint=%d, activeBase=%d, retainedLocalSegments=%d, isr=%s, "
+                        + "manifest=%s, localSegments=%s, remoteSegments=%s, "
+                        + "copy={requests=%d,bytes=%d,errors=%d}",
+                baselinePushedOffset,
+                committedSourceEnd,
+                sourceLog.canFetchFromRemoteLog(baselinePushedOffset),
+                sourceLog.canFetchFromRemoteLog(committedSourceEnd - 1L),
+                remoteStart,
+                remoteEnd,
+                sourceLog.localLogStartOffset(),
+                sourceLog.localLogEndOffset(),
+                sourceLog.logStartOffset(),
+                sourceLog.getHighWatermark(),
+                sourceLog.getRecoveryPoint(),
+                sourceLog.activeLogSegment().getBaseOffset(),
+                sourceLog.getTieredLogLocalSegments(),
+                sourceReplica.getIsr(),
+                remoteManifestState(sourceReplica.getTableBucket()),
+                localSegmentState(sourceLog),
+                remoteSegmentState(remoteLog),
+                sourceReplica.tableMetrics().remoteLogCopyRequests().getCount(),
+                sourceReplica.tableMetrics().remoteLogCopyBytes().getCount(),
+                sourceReplica.tableMetrics().remoteLogCopyErrors().getCount());
+    }
+
+    private static String remoteManifestState(TableBucket tableBucket) {
+        try {
+            return CLUSTER.getZooKeeperClient().getRemoteLogManifestHandle(tableBucket).toString();
+        } catch (Exception failure) {
+            return "error=" + failure.getClass().getSimpleName() + ':' + failure.getMessage();
+        }
+    }
+
+    private static List<String> localSegmentState(LogTablet logTablet) {
+        List<LogSegment> segments = logTablet.logSegments();
+        List<String> state = new ArrayList<>(segments.size());
+        long activeBase = logTablet.activeLogSegment().getBaseOffset();
+        for (int index = 0; index < segments.size(); index++) {
+            LogSegment segment = segments.get(index);
+            long endOffset =
+                    index + 1 < segments.size()
+                            ? segments.get(index + 1).getBaseOffset()
+                            : logTablet.localLogEndOffset();
+            state.add(
+                    String.format(
+                            "[%d,%d):%db%s",
+                            segment.getBaseOffset(),
+                            endOffset,
+                            segment.getSizeInBytes(),
+                            segment.getBaseOffset() == activeBase ? ":active" : ""));
+        }
+        return state;
+    }
+
+    private static List<String> remoteSegmentState(RemoteLogTablet remoteLog) {
+        return remoteLog.allRemoteLogSegments().stream()
+                .map(
+                        segment ->
+                                String.format(
+                                        "[%d,%d):%db",
+                                        segment.remoteLogStartOffset(),
+                                        segment.remoteLogEndOffset(),
+                                        segment.segmentSizeInBytes()))
+                .collect(Collectors.toList());
     }
 
     private void waitForExactPhysicalRows(Map<Integer, String> expectedRows) throws Exception {
