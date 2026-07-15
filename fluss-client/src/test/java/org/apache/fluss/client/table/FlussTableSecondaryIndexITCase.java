@@ -20,8 +20,8 @@ package org.apache.fluss.client.table;
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
-import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.client.table.scanner.batch.BatchScanner;
+import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.IndexType;
@@ -35,8 +35,8 @@ import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
-import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.CloseableIterator;
+import org.apache.fluss.utils.IndexTableUtils;
 
 import org.junit.jupiter.api.Test;
 
@@ -88,8 +88,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
 
         TablePath indexPath =
                 TablePath.of(
-                        DB,
-                        IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_name"));
         waitAllReplicasReady(admin.getTableInfo(indexPath).get().getTableId(), 2);
         try (Table mainTable = conn.getTable(mainPath);
                 Table indexTable = conn.getTable(indexPath)) {
