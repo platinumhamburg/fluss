@@ -20,7 +20,8 @@ package org.apache.fluss.flink.action.orphan;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.Action;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
-import org.apache.fluss.flink.action.orphan.job.CleanStats;
+import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
+import org.apache.fluss.flink.action.orphan.job.CleanupReport;
 import org.apache.fluss.flink.action.orphan.job.OrphanFilesCleanJob;
 
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -51,14 +52,19 @@ public class OrphanFilesCleanAction implements Action {
     @Override
     public void run() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        CleanStats stats =
+        CleanupReport report =
                 OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null));
+        CleanupCounters stats = report.global();
         LOG.info(
-                "remove_orphan_files done: scope={} scanned={} deletedTotal={}"
-                        + " emptyDirsRemoved={} failures={} bytesReclaimed={} dryRun={}",
+                "remove_orphan_files done: scope={} scannedFiles={} plannedFiles={} plannedDirs={}"
+                        + " plannedBytes={} deletedFiles={} emptyDirsRemoved={} failures={}"
+                        + " bytesReclaimed={} dryRun={}",
                 scopeDescription(),
-                stats.scanned(),
-                stats.deleted(),
+                stats.scannedFiles(),
+                stats.plannedFiles(),
+                stats.plannedDirs(),
+                stats.plannedBytes(),
+                stats.deletedFiles(),
                 stats.emptyDirsRemoved(),
                 stats.deleteFailures(),
                 stats.bytesReclaimed(),

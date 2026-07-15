@@ -21,6 +21,7 @@ import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
+import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 import org.apache.fluss.utils.FlussPaths;
@@ -35,6 +36,10 @@ import java.nio.file.attribute.FileTime;
 import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class BucketCleanerTest {
 
@@ -54,14 +59,18 @@ class BucketCleanerTest {
         makeOld(segmentDir, cutoff - 1000L);
         makeOld(bucketRoot, cutoff - 1000L);
 
-        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff);
+        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff, false);
 
         BucketCleaner.BucketCleanStats stats =
                 cleaner.clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
 
-        assertThat(stats.scanned).isEqualTo(1L);
-        assertThat(stats.deleted).isEqualTo(2L);
+        assertThat(stats.scannedFiles).isEqualTo(1L);
+        assertThat(stats.plannedFiles).isEqualTo(1L);
+        assertThat(stats.plannedDirs).isEqualTo(1L);
+        assertThat(stats.plannedBytes).isEqualTo(1L);
+        assertThat(stats.deletedFiles).isEqualTo(1L);
         assertThat(stats.emptyDirsRemoved).isEqualTo(1L);
+        assertThat(stats.bytesReclaimed).isEqualTo(1L);
         assertThat(Files.exists(logFile)).isFalse();
         assertThat(Files.exists(segmentDir)).isFalse();
         assertThat(Files.exists(bucketRoot)).isTrue();
@@ -74,7 +83,7 @@ class BucketCleanerTest {
                 Files.createDirectories(bucketRoot.resolve("11111111-1111-1111-1111-111111111111"));
         long cutoff = System.currentTimeMillis() - 1000L;
 
-        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff);
+        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff, false);
 
         BucketCleaner.BucketCleanStats stats =
                 cleaner.clean(
@@ -84,7 +93,7 @@ class BucketCleanerTest {
                                 Collections.<String>emptySet()),
                         new FsPath(bucketRoot.toString()));
 
-        assertThat(stats.deleted).isEqualTo(0L);
+        assertThat(stats.deletedFiles).isEqualTo(0L);
         assertThat(stats.emptyDirsRemoved).isEqualTo(0L);
         assertThat(Files.exists(segmentDir)).isTrue();
     }
@@ -100,33 +109,100 @@ class BucketCleanerTest {
         makeOld(segmentDir, cutoff - 1000L);
         makeOld(bucketRoot, cutoff - 1000L);
 
-        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff);
+        BucketCleaner cleaner = createCleaner(bucketRoot, cutoff, false);
 
         BucketCleaner.BucketCleanStats stats =
                 cleaner.clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
 
-        assertThat(stats.scanned).isEqualTo(1L);
-        assertThat(stats.deleted).isEqualTo(0L);
+        assertThat(stats.scannedFiles).isEqualTo(1L);
+        assertThat(stats.plannedFiles).isEqualTo(0L);
+        assertThat(stats.deletedFiles).isEqualTo(0L);
         assertThat(stats.emptyDirsRemoved).isEqualTo(0L);
         assertThat(Files.exists(dotFile)).isTrue();
         assertThat(Files.exists(segmentDir)).isTrue();
+    }
+
+    @Test
+    void dryRunReportsPlanWithoutActualReclamation(@TempDir Path tmp) throws IOException {
+        Path bucketRoot = Files.createDirectories(tmp.resolve("bucket"));
+        Path segmentDir =
+                Files.createDirectories(bucketRoot.resolve("11111111-1111-1111-1111-111111111111"));
+        Path logFile =
+                Files.write(
+                        segmentDir.resolve(
+                                FlussPaths.filenamePrefixFromOffset(0L)
+                                        + FlussPaths.LOG_FILE_SUFFIX),
+                        new byte[10]);
+        long cutoff = System.currentTimeMillis() - 1000L;
+        makeOld(logFile, cutoff - 1000L);
+        makeOld(segmentDir, cutoff - 1000L);
+
+        BucketCleaner.BucketCleanStats stats =
+                createCleaner(bucketRoot, cutoff, true)
+                        .clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
+
+        assertThat(stats.plannedFiles).isEqualTo(1L);
+        assertThat(stats.plannedDirs).isEqualTo(1L);
+        assertThat(stats.plannedBytes).isEqualTo(10L);
+        assertThat(stats.deletedFiles).isEqualTo(0L);
+        assertThat(stats.emptyDirsRemoved).isEqualTo(0L);
+        assertThat(stats.deleteFailures).isEqualTo(0L);
+        assertThat(stats.bytesReclaimed).isEqualTo(0L);
+        assertThat(Files.exists(logFile)).isTrue();
+    }
+
+    @Test
+    void failedDeleteKeepsPlanButDoesNotReportReclamation(@TempDir Path tmp) throws IOException {
+        Path bucketRoot = Files.createDirectories(tmp.resolve("bucket"));
+        Path segmentDir =
+                Files.createDirectories(bucketRoot.resolve("11111111-1111-1111-1111-111111111111"));
+        Path logFile =
+                Files.write(
+                        segmentDir.resolve(
+                                FlussPaths.filenamePrefixFromOffset(0L)
+                                        + FlussPaths.LOG_FILE_SUFFIX),
+                        new byte[10]);
+        long cutoff = System.currentTimeMillis() - 1000L;
+        makeOld(logFile, cutoff - 1000L);
+        FileSystem failingFs = mock(FileSystem.class);
+        when(failingFs.delete(any(FsPath.class), eq(false))).thenReturn(false);
+        RateLimiter limiter = RateLimiter.create(1000.0);
+        BucketCleaner cleaner =
+                new BucketCleaner(
+                        new RuleDispatcher(),
+                        new SafeDeleter(failingFs, false, new AuditLogger(), limiter),
+                        new AuditLogger(),
+                        cutoff,
+                        limiter,
+                        false);
+
+        BucketCleaner.BucketCleanStats stats =
+                cleaner.clean(BucketActiveRefs.empty(), new FsPath(bucketRoot.toString()));
+
+        assertThat(stats.plannedFiles).isEqualTo(1L);
+        assertThat(stats.plannedBytes).isEqualTo(10L);
+        assertThat(stats.deletedFiles).isEqualTo(0L);
+        assertThat(stats.deleteFailures).isEqualTo(1L);
+        assertThat(stats.bytesReclaimed).isEqualTo(0L);
     }
 
     private static void makeOld(Path path, long timestampMillis) throws IOException {
         Files.setLastModifiedTime(path, FileTime.fromMillis(timestampMillis));
     }
 
-    private static BucketCleaner createCleaner(Path bucketRoot, long cutoff) throws IOException {
+    private static BucketCleaner createCleaner(Path bucketRoot, long cutoff, boolean dryRun)
+            throws IOException {
         RateLimiter remoteFsOpRateLimiter = RateLimiter.create(1000.0);
         return new BucketCleaner(
                 new RuleDispatcher(),
                 new SafeDeleter(
                         new FsPath(bucketRoot.toString()).getFileSystem(),
-                        false,
+                        dryRun,
                         new AuditLogger(),
                         remoteFsOpRateLimiter),
                 new AuditLogger(),
                 cutoff,
-                remoteFsOpRateLimiter);
+                remoteFsOpRateLimiter,
+                dryRun);
     }
 }

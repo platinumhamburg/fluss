@@ -36,18 +36,14 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
  * #endInput()}.
  */
 @Internal
-public final class StatsAggregateOperator extends AbstractStreamOperator<CleanStats>
-        implements OneInputStreamOperator<CleanStats, CleanStats>, BoundedOneInput {
+public final class StatsAggregateOperator extends AbstractStreamOperator<CleanupReport>
+        implements OneInputStreamOperator<CleanStats, CleanupReport>, BoundedOneInput {
 
-    private static final long serialVersionUID = 2L;
+    private static final long serialVersionUID = 3L;
 
     private final boolean dryRun;
 
-    private transient long scanned;
-    private transient long deleted;
-    private transient long emptyDirsRemoved;
-    private transient long deleteFailures;
-    private transient long bytesReclaimed;
+    private transient CleanupReport.Accumulator accumulator;
 
     public StatsAggregateOperator(boolean dryRun) {
         this.dryRun = dryRun;
@@ -56,37 +52,28 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     @Override
     public void open() throws Exception {
         super.open();
-        scanned = 0L;
-        deleted = 0L;
-        emptyDirsRemoved = 0L;
-        deleteFailures = 0L;
-        bytesReclaimed = 0L;
+        accumulator = CleanupReport.accumulator(dryRun);
     }
 
     @Override
     public void processElement(StreamRecord<CleanStats> element) {
-        CleanStats stats = element.getValue();
-        scanned += stats.scanned();
-        deleted += stats.deleted();
-        emptyDirsRemoved += stats.emptyDirsRemoved();
-        deleteFailures += stats.deleteFailures();
-        bytesReclaimed += stats.bytesReclaimed();
+        accumulator.addStats(element.getValue());
     }
 
     @Override
     public void endInput() {
         AuditLogger audit = new AuditLogger();
-        CleanStats finalStats =
-                new CleanStats(scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed);
+        CleanupReport report = accumulator.build();
+        CleanupCounters counters = report.global();
 
         audit.logSummary(
-                scanned,
-                deleted - emptyDirsRemoved,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed,
+                counters.scannedFiles(),
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed(),
                 dryRun);
 
-        output.collect(new StreamRecord<>(finalStats));
+        output.collect(new StreamRecord<>(report));
     }
 }

@@ -19,53 +19,50 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 
-/**
- * Work item for cleaning an orphan table or partition directory. The directory has already been
- * identified as an orphan candidate by {@link ScopeEnumeratorFunction} (ID guard satisfied).
- */
+import java.io.Serializable;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+/** Per-table work plan produced by scope enumeration for final audit reporting. */
 @Internal
-public final class OrphanDirCleanTask implements CleanTask {
+public final class TablePlanStats implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
     private final ScopeIdentity scope;
-    private final String dirPath;
-    private final long cutoffMillis;
-    private final boolean dryRun;
-    private final boolean allowDeleteManifest;
+    private final long tasksPlanned;
+    private final long metadataFailures;
+    private final Map<SkipReasonCode, Long> skipped;
 
-    public OrphanDirCleanTask(
+    public TablePlanStats(
             ScopeIdentity scope,
-            String dirPath,
-            long cutoffMillis,
-            boolean dryRun,
-            boolean allowDeleteManifest) {
-        this.scope = scope;
-        this.dirPath = dirPath;
-        this.cutoffMillis = cutoffMillis;
-        this.dryRun = dryRun;
-        this.allowDeleteManifest = allowDeleteManifest;
+            long tasksPlanned,
+            long metadataFailures,
+            Map<SkipReasonCode, Long> skipped) {
+        this.scope = scope.tableKey();
+        this.tasksPlanned = tasksPlanned;
+        this.metadataFailures = metadataFailures;
+        Map<SkipReasonCode, Long> copy = new HashMap<>();
+        copy.putAll(skipped);
+        this.skipped = copy;
     }
 
-    @Override
     public ScopeIdentity scope() {
         return scope;
     }
 
-    public String dirPath() {
-        return dirPath;
+    public long tasksPlanned() {
+        return tasksPlanned;
     }
 
-    public long cutoffMillis() {
-        return cutoffMillis;
+    public long metadataFailures() {
+        return metadataFailures;
     }
 
-    public boolean dryRun() {
-        return dryRun;
-    }
-
-    public boolean allowDeleteManifest() {
-        return allowDeleteManifest;
+    public Map<SkipReasonCode, Long> skipped() {
+        return Collections.unmodifiableMap(skipped);
     }
 }
