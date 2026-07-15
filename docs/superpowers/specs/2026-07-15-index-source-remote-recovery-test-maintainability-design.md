@@ -2,7 +2,7 @@
 
 ## Status
 
-The written design was approved on 2026-07-15 and is ready for implementation planning.
+The design was implemented and verified on 2026-07-15.
 
 ## Goal
 

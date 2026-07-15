@@ -121,155 +121,21 @@ class IndexSourceRemoteRecoveryITCase {
     @Test
     void recoverAsyncIndexFromRawRemoteSourceWalAndContinueLocally() throws Throwable {
         try (RemoteRecoveryFixture recovery = setUpRemoteRecovery()) {
-            recovery.stopServer(recovery.recoveryFollower);
-            CLUSTER.waitUntilReplicaShrinkFromIsr(
-                    recovery.sourceTableBucket, recovery.recoveryFollower);
-            recovery.stopServer(recovery.offlineFollower);
-            CLUSTER.waitUntilReplicaShrinkFromIsr(
-                    recovery.sourceTableBucket, recovery.offlineFollower);
-
             Map<Integer, String> expectedRows = new LinkedHashMap<>();
-            for (int key = 0; key < BASELINE_ROW_COUNT; key++) {
-                putSourceRow(recovery, recovery.sourceLeader, key, recovery.firstIndexValue);
-                expectedRows.put(key, recovery.firstIndexValue);
-            }
-            waitForExactPhysicalRows(recovery, expectedRows);
-            waitUntil(
-                    () ->
-                            recovery.sourceReplica.getAllIndexPushedOffset()
-                                    == recovery.sourceReplica.getLocalLogEndOffset(),
-                    TIMEOUT,
-                    "wait for the exact baseline index prefix");
-            long baselinePushedOffset = recovery.sourceReplica.getLocalLogEndOffset();
-            assertThat(baselinePushedOffset).isPositive();
-            assertThat(recovery.sourceReplica.getAllIndexPushedOffset())
-                    .as("the conservative baseline must cover the complete first source prefix")
-                    .isEqualTo(baselinePushedOffset);
-
-            CompletedSnapshot snapshot =
-                    CLUSTER.triggerAndWaitSnapshot(recovery.sourceTableBucket);
-            assertThat(snapshot.getLogOffset()).isEqualTo(baselinePushedOffset);
-            assertThat(snapshot.getIndexPushedOffset())
-                    .as("the source snapshot must persist the exact conservative index prefix")
-                    .isEqualTo(baselinePushedOffset);
-
-            IndexReplicator oldReplicator = recovery.sourceReplica.getIndexReplicator();
-            assertThat(oldReplicator).isNotNull();
-            oldReplicator.close();
-            assertThat(oldReplicator.isClosed()).isTrue();
-            sourceTabletServer(recovery.sourceLeader)
-                    .getReplicaManager()
-                    .getIndexReplicatorPool()
-                    .unregister(recovery.sourceTableBucket);
-            assertThat(recovery.sourceReplica.getIndexReplicator())
-                    .as("the retired source controller must still identify the exact old run")
-                    .isSameAs(oldReplicator);
-
-            for (int key = 0; key < UPDATED_ROW_COUNT; key++) {
-                putSourceRow(recovery, recovery.sourceLeader, key, recovery.secondIndexValue);
-                expectedRows.put(key, recovery.secondIndexValue);
-            }
-            int replayInsertEnd = BASELINE_ROW_COUNT + REPLAY_INSERT_COUNT;
-            for (int key = BASELINE_ROW_COUNT; key < replayInsertEnd; key++) {
-                putSourceRow(recovery, recovery.sourceLeader, key, recovery.secondIndexValue);
-                expectedRows.put(key, recovery.secondIndexValue);
-            }
-            waitForSourceCommit(recovery.sourceReplica);
-            long committedSourceEnd = recovery.sourceReplica.getLocalLogEndOffset();
-            assertThat(committedSourceEnd).isGreaterThan(baselinePushedOffset);
-            assertThat(recovery.sourceReplica.getAllIndexPushedOffset())
-                    .as("the closed old run must not advance over the second source prefix")
-                    .isEqualTo(baselinePushedOffset);
-
-            LogTablet sourceLog = recovery.sourceReplica.getLogTablet();
-            sourceLog.roll(Optional.empty());
-            assertThat(sourceLog.activeLogSegment().getBaseOffset())
-                    .as("the explicit roll must close the complete committed replay range")
-                    .isEqualTo(committedSourceEnd);
-            waitForRawRemoteReplayCoverage(
-                    recovery, recovery.sourceReplica, baselinePushedOffset, committedSourceEnd);
-
-            recovery.startServer(recovery.recoveryFollower);
-            CLUSTER.waitUntilReplicaExpandToIsr(
-                    recovery.sourceTableBucket, recovery.recoveryFollower);
-            Replica recoveryFollowerReplica =
-                    CLUSTER.waitAndGetFollowerReplica(
-                            recovery.sourceTableBucket, recovery.recoveryFollower);
-            long followerLocalStart = recoveryFollowerReplica.getLogTablet().localLogStartOffset();
-            assertThat(followerLocalStart)
-                    .as("the selected recovery follower must have discarded the baseline range")
-                    .isGreaterThan(baselinePushedOffset);
-
-            assertThat(CLUSTER.waitAndGetLeader(recovery.gatedTargetBucket))
-                    .as("the gated target must remain led by the target-only server")
-                    .isEqualTo(recovery.targetOnlyServer);
-            Replica gatedTargetReplica = CLUSTER.waitAndGetLeaderReplica(recovery.gatedTargetBucket);
-            WriterKey writerKey = IndexWriterKey.encode(recovery.sourceTableBucket);
-            recovery.installReplayGate(gatedTargetReplica, writerKey, baselinePushedOffset);
-
-            TabletServer recoveryTabletServer = sourceTabletServer(recovery.recoveryFollower);
-            TabletServerMetricGroup recoveryMetrics =
-                    recoveryTabletServer.getReplicaManager().getServerMetricGroup();
-            long remoteBytesBefore = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
-
-            recovery.stopServer(recovery.sourceLeader);
-            waitUntil(
-                    () ->
-                            CLUSTER.waitAndGetLeader(recovery.sourceTableBucket)
-                                    == recovery.recoveryFollower,
-                    TIMEOUT,
-                    "wait for the exact remote-recovery follower to lead the source bucket");
-            Replica newSourceReplica = CLUSTER.waitAndGetLeaderReplica(recovery.sourceTableBucket);
-            assertThat(CLUSTER.waitAndGetLeader(recovery.sourceTableBucket))
-                    .isEqualTo(recovery.recoveryFollower);
-            waitUntil(
-                    () -> newSourceReplica.getIndexReplicator() != null,
-                    TIMEOUT,
-                    "wait for the recovered source IndexReplicator");
-
-            recovery.replayGate().awaitAdmission();
-            long remoteBytesWhileAckHeld = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
-            assertThat(newSourceReplica.getLogTablet().localLogStartOffset())
-                    .as("the replay start must be unavailable from local source WAL")
-                    .isGreaterThan(baselinePushedOffset);
-            assertThat(newSourceReplica.getAllIndexPushedOffset())
-                    .as("the held target ACK must preserve the snapshot-restored baseline")
-                    .isEqualTo(baselinePushedOffset);
-            assertThat(remoteBytesWhileAckHeld)
-                    .as("raw remote source bytes must be consumed before target progress advances")
-                    .isGreaterThan(remoteBytesBefore);
-
-            recovery.replayGate().release();
-            waitUntil(
-                    () -> newSourceReplica.getAllIndexPushedOffset() == committedSourceEnd,
-                    TIMEOUT,
-                    "wait for exact recovered source replay progress");
-            assertThat(newSourceReplica.getAllIndexPushedOffset()).isEqualTo(committedSourceEnd);
-            assertExactIndexProjection(recovery, expectedRows);
-            assertIndexKeyAbsent(
-                    recovery, recovery.firstIndexValue, 0, "known stale pre-update key");
-            assertIndexKeyAbsent(
-                    recovery, recovery.secondIndexValue, NEVER_WRITTEN_KEY, "never-written index key");
-
-            int continuationKey = replayInsertEnd;
-            putSourceRow(
-                    recovery, recovery.recoveryFollower, continuationKey, recovery.firstIndexValue);
-            expectedRows.put(continuationKey, recovery.firstIndexValue);
-            waitForSourceCommit(newSourceReplica);
-            long continuationEnd = newSourceReplica.getLocalLogEndOffset();
-            assertThat(continuationEnd).isGreaterThan(committedSourceEnd);
-            waitUntil(
-                    () -> newSourceReplica.getAllIndexPushedOffset() == continuationEnd,
-                    TIMEOUT,
-                    "wait for exact local continuation progress");
-            assertThat(newSourceReplica.getAllIndexPushedOffset()).isEqualTo(continuationEnd);
-            assertExactIndexProjection(recovery, expectedRows);
+            long baselinePushedOffset = persistBaselineSnapshot(recovery, expectedRows);
+            long committedSourceEnd =
+                    createRemoteReplayRange(recovery, baselinePushedOffset, expectedRows);
+            RecoveredSource recovered =
+                    recoverFromRemoteWal(recovery, baselinePushedOffset, committedSourceEnd);
+            verifyRecoveredProjection(recovery, recovered, committedSourceEnd, expectedRows);
+            long continuationEnd =
+                    verifyLocalContinuation(recovery, recovered, committedSourceEnd, expectedRows);
 
             LOG.info(
-                    "Task 7 evidence: roles sourceLeader={}, recoveryFollower={}, "
-                            + "offlineFollower={}, targetOnly={}, targetBucket={}; "
-                            + "baseline={}, committedEnd={}, followerLocalStart={}, "
-                            + "replaySequence={}, remoteBytes={}->{}, continuationEnd={}",
+                    "Remote index recovery evidence: sourceLeader={}, recoveryFollower={}, "
+                            + "offlineFollower={}, targetOnly={}, targetBucket={}; baseline={}, "
+                            + "committedEnd={}, followerLocalStart={}, replaySequence={}, "
+                            + "remoteBytes={}->{}, continuationEnd={}",
                     recovery.sourceLeader,
                     recovery.recoveryFollower,
                     recovery.offlineFollower,
@@ -277,10 +143,10 @@ class IndexSourceRemoteRecoveryITCase {
                     recovery.gatedTargetBucket,
                     baselinePushedOffset,
                     committedSourceEnd,
-                    followerLocalStart,
+                    recovered.followerLocalStart,
                     recovery.replayGate().admittedSequence(),
-                    remoteBytesBefore,
-                    remoteBytesWhileAckHeld,
+                    recovered.remoteBytesBefore,
+                    recovered.remoteBytesWhileAckHeld,
                     continuationEnd);
         }
     }
@@ -300,6 +166,62 @@ class IndexSourceRemoteRecoveryITCase {
     }
 
     private static RemoteRecoveryFixture setUpRemoteRecovery() throws Exception {
+        IndexedSourceTable indexedSourceTable = createIndexedSourceTable();
+        CLUSTER.waitUntilAllReplicaReady(indexedSourceTable.sourceTableBucket);
+        Replica sourceReplica =
+                CLUSTER.waitAndGetLeaderReplica(indexedSourceTable.sourceTableBucket);
+        waitUntil(
+                () -> sourceReplica.getIsr().size() == REPLICATION_FACTOR,
+                TIMEOUT,
+                "wait for source RF3 ISR");
+        waitUntil(
+                () -> sourceReplica.getIndexReplicator() != null,
+                TIMEOUT,
+                "wait for initial source IndexReplicator");
+        int sourceLeader = CLUSTER.waitAndGetLeader(indexedSourceTable.sourceTableBucket);
+        RecoveryRoles roles =
+                resolveRecoveryRoles(indexedSourceTable.sourceTableBucket, sourceLeader);
+        TableBucket gatedTargetBucket =
+                findTargetBucketLedBy(
+                        indexedSourceTable.indexTableId,
+                        roles.targetOnlyServer,
+                        roles.sourceReplicas);
+
+        int targetBucket = gatedTargetBucket.getBucket();
+        String firstIndexValue = valueForIndexBucket("remote-old", targetBucket);
+        String secondIndexValue = valueForIndexBucket("remote-new", targetBucket);
+        assertThat(firstIndexValue).isNotEqualTo(secondIndexValue);
+        assertThat(indexBucket(firstIndexValue)).isEqualTo(targetBucket);
+        assertThat(indexBucket(secondIndexValue)).isEqualTo(targetBucket);
+        assertThat(CLUSTER.waitAndGetLeader(gatedTargetBucket)).isEqualTo(roles.targetOnlyServer);
+
+        LOG.info(
+                "Task 7 topology: source={} assignment={}, sourceLeader={}, recoveryFollower={}, "
+                        + "offlineFollower={}, targetOnly={}, targetBucket={}, values=[{}, {}]",
+                indexedSourceTable.sourceTableBucket,
+                roles.sourceReplicas,
+                roles.sourceLeader,
+                roles.recoveryFollower,
+                roles.offlineFollower,
+                roles.targetOnlyServer,
+                gatedTargetBucket,
+                firstIndexValue,
+                secondIndexValue);
+        return new RemoteRecoveryFixture(
+                indexedSourceTable.mainTableId,
+                indexedSourceTable.indexTableId,
+                indexedSourceTable.sourceTableBucket,
+                roles.sourceLeader,
+                roles.recoveryFollower,
+                roles.offlineFollower,
+                roles.targetOnlyServer,
+                gatedTargetBucket,
+                firstIndexValue,
+                secondIndexValue,
+                sourceReplica);
+    }
+
+    private static IndexedSourceTable createIndexedSourceTable() throws Exception {
         String tableName = "source_remote_recovery_" + System.nanoTime();
         TablePath mainPath = TablePath.of("task7", tableName);
         TablePath indexPath =
@@ -326,22 +248,14 @@ class IndexSourceRemoteRecoveryITCase {
                         .getTable(indexPath)
                         .orElseThrow(() -> new AssertionError("Index Table missing from ZK"))
                         .tableId;
-        TableBucket sourceTableBucket = new TableBucket(mainTableId, 0);
-        CLUSTER.waitUntilAllReplicaReady(sourceTableBucket);
-        Replica sourceReplica = CLUSTER.waitAndGetLeaderReplica(sourceTableBucket);
-        waitUntil(
-                () -> sourceReplica.getIsr().size() == REPLICATION_FACTOR,
-                TIMEOUT,
-                "wait for source RF3 ISR");
-        waitUntil(
-                () -> sourceReplica.getIndexReplicator() != null,
-                TIMEOUT,
-                "wait for initial source IndexReplicator");
-        int sourceLeader = CLUSTER.waitAndGetLeader(sourceTableBucket);
+        return new IndexedSourceTable(mainTableId, indexTableId);
+    }
 
+    private static RecoveryRoles resolveRecoveryRoles(
+            TableBucket sourceTableBucket, int sourceLeader) throws Exception {
         TableAssignment sourceAssignment =
                 CLUSTER.getZooKeeperClient()
-                        .getTableAssignment(mainTableId)
+                        .getTableAssignment(sourceTableBucket.getTableId())
                         .orElseThrow(() -> new AssertionError("Source assignment missing from ZK"));
         List<Integer> sourceReplicas =
                 new ArrayList<>(sourceAssignment.getBucketAssignment(0).getReplicas());
@@ -377,7 +291,16 @@ class IndexSourceRemoteRecoveryITCase {
         assertThat(roles)
                 .containsExactlyInAnyOrderElementsOf(
                         Arrays.stream(liveServerIds).boxed().collect(Collectors.toList()));
+        return new RecoveryRoles(
+                sourceReplicas,
+                sourceLeader,
+                recoveryFollower,
+                offlineFollower,
+                targetOnlyServer);
+    }
 
+    private static TableBucket findTargetBucketLedBy(
+            long indexTableId, int targetOnlyServer, List<Integer> sourceReplicas) throws Exception {
         int targetBucket = -1;
         int[] indexLeaders = new int[INDEX_BUCKET_COUNT];
         for (int bucket = 0; bucket < INDEX_BUCKET_COUNT; bucket++) {
@@ -402,41 +325,184 @@ class IndexSourceRemoteRecoveryITCase {
                             + "; index leaders="
                             + Arrays.toString(indexLeaders));
         }
+        return new TableBucket(indexTableId, targetBucket);
+    }
 
-        String firstIndexValue = valueForIndexBucket("remote-old", targetBucket);
-        String secondIndexValue = valueForIndexBucket("remote-new", targetBucket);
-        assertThat(firstIndexValue).isNotEqualTo(secondIndexValue);
-        assertThat(indexBucket(firstIndexValue)).isEqualTo(targetBucket);
-        assertThat(indexBucket(secondIndexValue)).isEqualTo(targetBucket);
-        TableBucket gatedTargetBucket = new TableBucket(indexTableId, targetBucket);
-        assertThat(CLUSTER.waitAndGetLeader(gatedTargetBucket)).isEqualTo(targetOnlyServer);
+    private static long persistBaselineSnapshot(
+            RemoteRecoveryFixture recovery, Map<Integer, String> expectedRows) throws Exception {
+        recovery.stopServer(recovery.recoveryFollower);
+        CLUSTER.waitUntilReplicaShrinkFromIsr(
+                recovery.sourceTableBucket, recovery.recoveryFollower);
+        recovery.stopServer(recovery.offlineFollower);
+        CLUSTER.waitUntilReplicaShrinkFromIsr(recovery.sourceTableBucket, recovery.offlineFollower);
 
-        LOG.info(
-                "Task 7 topology: source={} assignment={}, sourceLeader={}, recoveryFollower={}, "
-                        + "offlineFollower={}, targetOnly={}, indexLeaders={}, targetBucket={}, "
-                        + "values=[{}, {}]",
-                sourceTableBucket,
-                sourceReplicas,
-                sourceLeader,
-                recoveryFollower,
-                offlineFollower,
-                targetOnlyServer,
-                indexLeaders,
-                gatedTargetBucket,
-                firstIndexValue,
-                secondIndexValue);
-        return new RemoteRecoveryFixture(
-                mainTableId,
-                indexTableId,
-                sourceTableBucket,
-                sourceLeader,
-                recoveryFollower,
-                offlineFollower,
-                targetOnlyServer,
-                gatedTargetBucket,
-                firstIndexValue,
-                secondIndexValue,
-                sourceReplica);
+        for (int key = 0; key < BASELINE_ROW_COUNT; key++) {
+            putSourceRow(recovery, recovery.sourceLeader, key, recovery.firstIndexValue);
+            expectedRows.put(key, recovery.firstIndexValue);
+        }
+        waitForExactPhysicalRows(recovery, expectedRows);
+        waitUntil(
+                () ->
+                        recovery.sourceReplica.getAllIndexPushedOffset()
+                                == recovery.sourceReplica.getLocalLogEndOffset(),
+                TIMEOUT,
+                "wait for the exact baseline index prefix");
+        long baselinePushedOffset = recovery.sourceReplica.getLocalLogEndOffset();
+        assertThat(baselinePushedOffset).isPositive();
+        assertThat(recovery.sourceReplica.getAllIndexPushedOffset())
+                .as("the conservative baseline must cover the complete first source prefix")
+                .isEqualTo(baselinePushedOffset);
+
+        CompletedSnapshot snapshot = CLUSTER.triggerAndWaitSnapshot(recovery.sourceTableBucket);
+        assertThat(snapshot.getLogOffset()).isEqualTo(baselinePushedOffset);
+        assertThat(snapshot.getIndexPushedOffset())
+                .as("the source snapshot must persist the exact conservative index prefix")
+                .isEqualTo(baselinePushedOffset);
+        return baselinePushedOffset;
+    }
+
+    private static long createRemoteReplayRange(
+            RemoteRecoveryFixture recovery,
+            long baselinePushedOffset,
+            Map<Integer, String> expectedRows)
+            throws Exception {
+        IndexReplicator oldReplicator = recovery.sourceReplica.getIndexReplicator();
+        assertThat(oldReplicator).isNotNull();
+        oldReplicator.close();
+        assertThat(oldReplicator.isClosed()).isTrue();
+        sourceTabletServer(recovery.sourceLeader)
+                .getReplicaManager()
+                .getIndexReplicatorPool()
+                .unregister(recovery.sourceTableBucket);
+        assertThat(recovery.sourceReplica.getIndexReplicator())
+                .as("the retired source controller must still identify the exact old run")
+                .isSameAs(oldReplicator);
+
+        for (int key = 0; key < UPDATED_ROW_COUNT; key++) {
+            putSourceRow(recovery, recovery.sourceLeader, key, recovery.secondIndexValue);
+            expectedRows.put(key, recovery.secondIndexValue);
+        }
+        int replayInsertEnd = BASELINE_ROW_COUNT + REPLAY_INSERT_COUNT;
+        for (int key = BASELINE_ROW_COUNT; key < replayInsertEnd; key++) {
+            putSourceRow(recovery, recovery.sourceLeader, key, recovery.secondIndexValue);
+            expectedRows.put(key, recovery.secondIndexValue);
+        }
+        waitForSourceCommit(recovery.sourceReplica);
+        long committedSourceEnd = recovery.sourceReplica.getLocalLogEndOffset();
+        assertThat(committedSourceEnd).isGreaterThan(baselinePushedOffset);
+        assertThat(recovery.sourceReplica.getAllIndexPushedOffset())
+                .as("the closed old run must not advance over the second source prefix")
+                .isEqualTo(baselinePushedOffset);
+
+        LogTablet sourceLog = recovery.sourceReplica.getLogTablet();
+        sourceLog.roll(Optional.empty());
+        assertThat(sourceLog.activeLogSegment().getBaseOffset())
+                .as("the explicit roll must close the complete committed replay range")
+                .isEqualTo(committedSourceEnd);
+        waitForRawRemoteReplayCoverage(
+                recovery, recovery.sourceReplica, baselinePushedOffset, committedSourceEnd);
+        return committedSourceEnd;
+    }
+
+    private static RecoveredSource recoverFromRemoteWal(
+            RemoteRecoveryFixture recovery, long baselinePushedOffset, long committedSourceEnd)
+            throws Exception {
+        recovery.startServer(recovery.recoveryFollower);
+        CLUSTER.waitUntilReplicaExpandToIsr(recovery.sourceTableBucket, recovery.recoveryFollower);
+        Replica recoveryFollowerReplica =
+                CLUSTER.waitAndGetFollowerReplica(
+                        recovery.sourceTableBucket, recovery.recoveryFollower);
+        long followerLocalStart = recoveryFollowerReplica.getLogTablet().localLogStartOffset();
+        assertThat(followerLocalStart)
+                .as("the selected recovery follower must have discarded the baseline range")
+                .isGreaterThan(baselinePushedOffset);
+
+        assertThat(CLUSTER.waitAndGetLeader(recovery.gatedTargetBucket))
+                .as("the gated target must remain led by the target-only server")
+                .isEqualTo(recovery.targetOnlyServer);
+        Replica gatedTargetReplica = CLUSTER.waitAndGetLeaderReplica(recovery.gatedTargetBucket);
+        WriterKey writerKey = IndexWriterKey.encode(recovery.sourceTableBucket);
+        recovery.installReplayGate(gatedTargetReplica, writerKey, baselinePushedOffset);
+
+        TabletServer recoveryTabletServer = sourceTabletServer(recovery.recoveryFollower);
+        TabletServerMetricGroup recoveryMetrics =
+                recoveryTabletServer.getReplicaManager().getServerMetricGroup();
+        long remoteBytesBefore = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
+
+        recovery.stopServer(recovery.sourceLeader);
+        waitUntil(
+                () ->
+                        CLUSTER.waitAndGetLeader(recovery.sourceTableBucket)
+                                == recovery.recoveryFollower,
+                TIMEOUT,
+                "wait for the exact remote-recovery follower to lead the source bucket");
+        Replica newSourceReplica = CLUSTER.waitAndGetLeaderReplica(recovery.sourceTableBucket);
+        assertThat(CLUSTER.waitAndGetLeader(recovery.sourceTableBucket))
+                .isEqualTo(recovery.recoveryFollower);
+        waitUntil(
+                () -> newSourceReplica.getIndexReplicator() != null,
+                TIMEOUT,
+                "wait for the recovered source IndexReplicator");
+
+        recovery.replayGate().awaitAdmission();
+        long remoteBytesWhileAckHeld = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
+        assertThat(newSourceReplica.getLogTablet().localLogStartOffset())
+                .as("the replay start must be unavailable from local source WAL")
+                .isGreaterThan(baselinePushedOffset);
+        assertThat(newSourceReplica.getAllIndexPushedOffset())
+                .as("the held target ACK must preserve the snapshot-restored baseline")
+                .isEqualTo(baselinePushedOffset);
+        assertThat(remoteBytesWhileAckHeld)
+                .as("raw remote source bytes must be consumed before target progress advances")
+                .isGreaterThan(remoteBytesBefore);
+        return new RecoveredSource(
+                newSourceReplica,
+                followerLocalStart,
+                remoteBytesBefore,
+                remoteBytesWhileAckHeld);
+    }
+
+    private static void verifyRecoveredProjection(
+            RemoteRecoveryFixture recovery,
+            RecoveredSource recovered,
+            long committedSourceEnd,
+            Map<Integer, String> expectedRows)
+            throws Exception {
+        recovery.replayGate().release();
+        waitUntil(
+                () -> recovered.replica.getAllIndexPushedOffset() == committedSourceEnd,
+                TIMEOUT,
+                "wait for exact recovered source replay progress");
+        assertThat(recovered.replica.getAllIndexPushedOffset()).isEqualTo(committedSourceEnd);
+        assertExactIndexProjection(recovery, expectedRows);
+        assertIndexKeyAbsent(recovery, recovery.firstIndexValue, 0, "known stale pre-update key");
+        assertIndexKeyAbsent(
+                recovery,
+                recovery.secondIndexValue,
+                NEVER_WRITTEN_KEY,
+                "never-written index key");
+    }
+
+    private static long verifyLocalContinuation(
+            RemoteRecoveryFixture recovery,
+            RecoveredSource recovered,
+            long committedSourceEnd,
+            Map<Integer, String> expectedRows)
+            throws Exception {
+        int continuationKey = BASELINE_ROW_COUNT + REPLAY_INSERT_COUNT;
+        putSourceRow(
+                recovery, recovery.recoveryFollower, continuationKey, recovery.firstIndexValue);
+        expectedRows.put(continuationKey, recovery.firstIndexValue);
+        waitForSourceCommit(recovered.replica);
+        long continuationEnd = recovered.replica.getLocalLogEndOffset();
+        assertThat(continuationEnd).isGreaterThan(committedSourceEnd);
+        waitUntil(
+                () -> recovered.replica.getAllIndexPushedOffset() == continuationEnd,
+                TIMEOUT,
+                "wait for exact local continuation progress");
+        assertThat(recovered.replica.getAllIndexPushedOffset()).isEqualTo(continuationEnd);
+        assertExactIndexProjection(recovery, expectedRows);
+        return continuationEnd;
     }
 
     private static void putSourceRow(
@@ -849,6 +915,57 @@ class IndexSourceRemoteRecoveryITCase {
         private PhysicalIndexRow(byte[] key, byte[] value) {
             this.key = key;
             this.value = value;
+        }
+    }
+
+    private static final class IndexedSourceTable {
+        private final long mainTableId;
+        private final long indexTableId;
+        private final TableBucket sourceTableBucket;
+
+        private IndexedSourceTable(long mainTableId, long indexTableId) {
+            this.mainTableId = mainTableId;
+            this.indexTableId = indexTableId;
+            this.sourceTableBucket = new TableBucket(mainTableId, 0);
+        }
+    }
+
+    private static final class RecoveryRoles {
+        private final List<Integer> sourceReplicas;
+        private final int sourceLeader;
+        private final int recoveryFollower;
+        private final int offlineFollower;
+        private final int targetOnlyServer;
+
+        private RecoveryRoles(
+                List<Integer> sourceReplicas,
+                int sourceLeader,
+                int recoveryFollower,
+                int offlineFollower,
+                int targetOnlyServer) {
+            this.sourceReplicas = new ArrayList<>(sourceReplicas);
+            this.sourceLeader = sourceLeader;
+            this.recoveryFollower = recoveryFollower;
+            this.offlineFollower = offlineFollower;
+            this.targetOnlyServer = targetOnlyServer;
+        }
+    }
+
+    private static final class RecoveredSource {
+        private final Replica replica;
+        private final long followerLocalStart;
+        private final long remoteBytesBefore;
+        private final long remoteBytesWhileAckHeld;
+
+        private RecoveredSource(
+                Replica replica,
+                long followerLocalStart,
+                long remoteBytesBefore,
+                long remoteBytesWhileAckHeld) {
+            this.replica = replica;
+            this.followerLocalStart = followerLocalStart;
+            this.remoteBytesBefore = remoteBytesBefore;
+            this.remoteBytesWhileAckHeld = remoteBytesWhileAckHeld;
         }
     }
 
