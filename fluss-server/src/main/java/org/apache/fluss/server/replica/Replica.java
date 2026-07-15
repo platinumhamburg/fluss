@@ -971,7 +971,7 @@ public final class Replica {
 
     public void advanceIndexProgress(long syncIndexOffset, long allIndexOffset) {
         boolean syncAdvanced = false;
-        if (syncIndexOffset > syncIndexPushedOffset) {
+        if (hasSyncIndexes && syncIndexOffset > syncIndexPushedOffset) {
             syncIndexPushedOffset = syncIndexOffset;
             syncAdvanced = true;
         }

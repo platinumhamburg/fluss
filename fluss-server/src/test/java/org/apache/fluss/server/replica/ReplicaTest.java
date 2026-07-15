@@ -795,6 +795,17 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     @Test
+    void testAsyncOnlyIndexProgressKeepsSyncOffsetNotApplicable() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica(IndexVisibility.ASYNC);
+
+        f.replica.advanceIndexProgress(Long.MAX_VALUE, 40L);
+
+        assertThat(f.replica.requiresSyncIndexVisibility()).isFalse();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(-1L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(40L);
+    }
+
+    @Test
     void testAppendRecordsToLeader() throws Exception {
         Replica logReplica =
                 makeLogReplica(DATA1_PHYSICAL_TABLE_PATH, new TableBucket(DATA1_TABLE_ID, 1));
@@ -1636,11 +1647,21 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     private IndexedFixture setupIndexedMainTableReplica() throws Exception {
-        return setupIndexedMainTableReplica(null);
+        return setupIndexedMainTableReplica(null, IndexVisibility.SYNC);
     }
 
     private IndexedFixture setupIndexedMainTableReplica(TestSnapshotContext snapshotContext)
             throws Exception {
+        return setupIndexedMainTableReplica(snapshotContext, IndexVisibility.SYNC);
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica(IndexVisibility indexVisibility)
+            throws Exception {
+        return setupIndexedMainTableReplica(null, indexVisibility);
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica(
+            TestSnapshotContext snapshotContext, IndexVisibility indexVisibility) throws Exception {
         String indexName = "idx_b";
         String mainName = "test_indexed_main";
         long mainTableId = 9001L;
@@ -1661,7 +1682,7 @@ final class ReplicaTest extends ReplicaTestBase {
                                 indexName,
                                 IndexType.SECONDARY,
                                 Collections.singletonList("b"),
-                                IndexVisibility.SYNC,
+                                indexVisibility,
                                 1)
                         .build();
         TableDescriptor mainDescriptor =
