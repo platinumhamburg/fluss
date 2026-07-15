@@ -207,6 +207,10 @@ public final class IndexReplicator implements AutoCloseable {
             long preferredMaxRequestBytes,
             IndexProgressListener onProgress,
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
+        if (initialOffset < 0) {
+            throw new IllegalArgumentException(
+                    "initialOffset must be non-negative, but was " + initialOffset);
+        }
         this.sourceReader = sourceReader;
         this.indexStates = new ArrayList<>(indexSpecs.size());
         this.indexStatesByName = new LinkedHashMap<>();
@@ -355,9 +359,6 @@ public final class IndexReplicator implements AutoCloseable {
             // after observing an empty slot so this poll cannot start a successor window.
             if (terminalFailure.get() != null) {
                 break;
-            }
-            if (state.pushedOffset < 0) {
-                state.pushedOffset = sourceReader.logStartOffset();
             }
             long readOffset = nextReadOffset(state);
             if (readOffset >= hw) {

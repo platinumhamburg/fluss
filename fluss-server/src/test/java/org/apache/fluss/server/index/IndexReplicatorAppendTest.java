@@ -104,6 +104,22 @@ public class IndexReplicatorAppendTest {
                 (sync, all) -> {});
     }
 
+    @Test
+    void rejectsNegativeInitialOffset() {
+        assertThatThrownBy(
+                        () ->
+                                new IndexReplicator(
+                                        null,
+                                        Collections.emptyList(),
+                                        new IndexAccumulator(),
+                                        null,
+                                        -1L,
+                                        1024,
+                                        (sync, all) -> {}))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("initialOffset must be non-negative, but was -1");
+    }
+
     /**
      * Builds a spec whose index value columns are {idx, pk}. Both the key and the stored value are
      * encoded from exactly those columns, mirroring production's {@code IndexSpecFactory}, so an
@@ -410,7 +426,7 @@ public class IndexReplicatorAppendTest {
                         Collections.singletonList(spec()),
                         new IndexAccumulator(),
                         readContext,
-                        -1L,
+                        0L,
                         1024,
                         1024,
                         (sync, all) -> {});

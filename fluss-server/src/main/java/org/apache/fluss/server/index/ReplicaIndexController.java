@@ -146,7 +146,8 @@ public final class ReplicaIndexController {
      * @param schemaGetter the schema getter for the table
      * @param onProgress callback fired after each window completes with sync/all index progress;
      *     typically wired to {@code Replica::advanceIndexProgress}
-     * @param initialOffset the seeded index offset (from snapshot restore), or {@code -1L}
+     * @param initialOffset the non-negative exclusive next source WAL offset restored by the owning
+     *     replica
      */
     public void onBecomeLeader(
             LogTablet logTablet,
@@ -407,7 +408,7 @@ public final class ReplicaIndexController {
                         remoteLogManager.remoteLogExecutor(),
                         readContext,
                         metrics);
-        // Use the already-seeded offset (from snapshot restore or -1) as the starting point.
+        // Use the owning replica's explicit non-negative next-read offset.
         IndexReplicator replicator =
                 new IndexReplicator(
                         sourceReader,
