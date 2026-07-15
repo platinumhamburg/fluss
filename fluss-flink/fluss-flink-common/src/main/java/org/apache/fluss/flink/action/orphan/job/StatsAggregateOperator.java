@@ -64,15 +64,8 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
     public void endInput() {
         AuditLogger audit = new AuditLogger();
         CleanupReport report = accumulator.build();
-        CleanupCounters counters = report.global();
 
-        audit.logSummary(
-                counters.scannedFiles(),
-                counters.deletedFiles(),
-                counters.emptyDirsRemoved(),
-                counters.deleteFailures(),
-                counters.bytesReclaimed(),
-                dryRun);
+        audit.logReport(report, dryRun);
 
         output.collect(new StreamRecord<>(report));
     }

@@ -36,18 +36,26 @@ public final class CleanupReport implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final CleanupCounters global;
+    private final long tasksPlanned;
+    private final long metadataFailures;
     private final Map<ScopeIdentity, TableCleanupSummary> tables;
     private final Map<String, CleanupCounters> databases;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<SkipReasonCode, Long> bySkipReason;
+    private final Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision;
 
     private CleanupReport(
             CleanupCounters global,
+            long tasksPlanned,
+            long metadataFailures,
             Map<ScopeIdentity, TableCleanupSummary> tables,
             Map<String, CleanupCounters> databases,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
-            Map<SkipReasonCode, Long> bySkipReason) {
+            Map<SkipReasonCode, Long> bySkipReason,
+            Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision) {
         this.global = global;
+        this.tasksPlanned = tasksPlanned;
+        this.metadataFailures = metadataFailures;
         this.tables = new HashMap<>(tables);
         this.databases = new HashMap<>(databases);
         Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
@@ -56,6 +64,9 @@ public final class CleanupReport implements Serializable {
         Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
         reasonCopy.putAll(bySkipReason);
         this.bySkipReason = reasonCopy;
+        Map<CleanupObjectType, RuleDecisionCounters> decisionCopy = new HashMap<>();
+        decisionCopy.putAll(byRuleDecision);
+        this.byRuleDecision = decisionCopy;
     }
 
     public static CleanupReport aggregate(
@@ -92,8 +103,27 @@ public final class CleanupReport implements Serializable {
         }
     }
 
+    private static void mergeRuleDecisions(
+            Map<CleanupObjectType, RuleDecisionCounters> target,
+            Map<CleanupObjectType, RuleDecisionCounters> source) {
+        for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry : source.entrySet()) {
+            target.put(
+                    entry.getKey(),
+                    target.getOrDefault(entry.getKey(), RuleDecisionCounters.empty())
+                            .add(entry.getValue()));
+        }
+    }
+
     public CleanupCounters global() {
         return global;
+    }
+
+    public long tasksPlanned() {
+        return tasksPlanned;
+    }
+
+    public long metadataFailures() {
+        return metadataFailures;
     }
 
     public TableCleanupSummary tableSummary(ScopeIdentity scope) {
@@ -120,24 +150,68 @@ public final class CleanupReport implements Serializable {
         return Collections.unmodifiableMap(bySkipReason);
     }
 
+    public Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision() {
+        return Collections.unmodifiableMap(byRuleDecision);
+    }
+
+    public boolean ruleCountersConsistent() {
+        for (Map.Entry<CleanupObjectType, RuleDecisionCounters> entry : byRuleDecision.entrySet()) {
+            RuleDecisionCounters decisions = entry.getValue();
+            CleanupCounters counters =
+                    byObjectType.getOrDefault(entry.getKey(), CleanupCounters.empty());
+            if (!decisions.isConsistent()
+                    || decisions.candidateFiles() != counters.plannedFiles()
+                    || decisions.candidateBytes() != counters.plannedBytes()) {
+                return false;
+            }
+        }
+        for (Map.Entry<CleanupObjectType, CleanupCounters> entry : byObjectType.entrySet()) {
+            if (entry.getValue().plannedFiles() > 0L
+                    && !byRuleDecision.containsKey(entry.getKey())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public boolean coverageComplete() {
+        if (metadataFailures > 0L) {
+            return false;
+        }
+        for (Map.Entry<SkipReasonCode, Long> entry : bySkipReason.entrySet()) {
+            if (entry.getValue() > 0L && entry.getKey().actionRequired()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** Incremental bounded-memory report aggregation for the final Flink operator. */
     public static final class Accumulator {
         private final boolean dryRun;
         private CleanupCounters global = CleanupCounters.empty();
+        private long tasksPlanned;
+        private long metadataFailures;
         private final Map<ScopeIdentity, TableAccumulator> tables = new HashMap<>();
         private final Map<String, CleanupCounters> databases = new HashMap<>();
         private final EnumMap<CleanupObjectType, CleanupCounters> byObjectType =
                 new EnumMap<>(CleanupObjectType.class);
         private final EnumMap<SkipReasonCode, Long> bySkipReason =
                 new EnumMap<>(SkipReasonCode.class);
+        private final EnumMap<CleanupObjectType, RuleDecisionCounters> byRuleDecision =
+                new EnumMap<>(CleanupObjectType.class);
 
         private Accumulator(boolean dryRun) {
             this.dryRun = dryRun;
         }
 
         public void addPlan(TablePlanStats plan) {
+            tasksPlanned += plan.tasksPlanned();
+            metadataFailures += plan.metadataFailures();
             TableAccumulator table =
                     tables.computeIfAbsent(plan.scope(), ignored -> new TableAccumulator());
+            table.tasksPlanned += plan.tasksPlanned();
+            table.metadataFailures += plan.metadataFailures();
             mergeReasons(table.bySkipReason, plan.skipped());
             mergeReasons(bySkipReason, plan.skipped());
             if (!plan.scope().database().isEmpty()) {
@@ -154,6 +228,7 @@ public final class CleanupReport implements Serializable {
             table.counters = table.counters.add(counters);
             mergeCounters(table.byObjectType, taskStats.byObjectType());
             mergeReasons(table.bySkipReason, taskStats.bySkipReason());
+            mergeRuleDecisions(table.byRuleDecision, taskStats.byRuleDecision());
             if (!tableKey.database().isEmpty()) {
                 databases.put(
                         tableKey.database(),
@@ -163,6 +238,7 @@ public final class CleanupReport implements Serializable {
             }
             mergeCounters(byObjectType, taskStats.byObjectType());
             mergeReasons(bySkipReason, taskStats.bySkipReason());
+            mergeRuleDecisions(byRuleDecision, taskStats.byRuleDecision());
         }
 
         public CleanupReport build() {
@@ -179,19 +255,34 @@ public final class CleanupReport implements Serializable {
                         entry.getKey(),
                         new TableCleanupSummary(
                                 entry.getKey(),
+                                table.tasksPlanned,
+                                table.metadataFailures,
                                 table.counters,
                                 table.byObjectType,
-                                table.bySkipReason));
+                                table.bySkipReason,
+                                table.byRuleDecision));
             }
-            return new CleanupReport(global, summaries, databases, byObjectType, bySkipReason);
+            return new CleanupReport(
+                    global,
+                    tasksPlanned,
+                    metadataFailures,
+                    summaries,
+                    databases,
+                    byObjectType,
+                    bySkipReason,
+                    byRuleDecision);
         }
     }
 
     private static final class TableAccumulator {
+        private long tasksPlanned;
+        private long metadataFailures;
         private CleanupCounters counters = CleanupCounters.empty();
         private final EnumMap<CleanupObjectType, CleanupCounters> byObjectType =
                 new EnumMap<>(CleanupObjectType.class);
         private final EnumMap<SkipReasonCode, Long> bySkipReason =
                 new EnumMap<>(SkipReasonCode.class);
+        private final EnumMap<CleanupObjectType, RuleDecisionCounters> byRuleDecision =
+                new EnumMap<>(CleanupObjectType.class);
     }
 }

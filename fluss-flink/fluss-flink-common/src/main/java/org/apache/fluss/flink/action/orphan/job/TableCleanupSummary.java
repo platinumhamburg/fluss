@@ -34,16 +34,24 @@ public final class TableCleanupSummary implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final ScopeIdentity scope;
+    private final long tasksPlanned;
+    private final long metadataFailures;
     private final CleanupCounters counters;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<SkipReasonCode, Long> bySkipReason;
+    private final Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision;
 
     TableCleanupSummary(
             ScopeIdentity scope,
+            long tasksPlanned,
+            long metadataFailures,
             CleanupCounters counters,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
-            Map<SkipReasonCode, Long> bySkipReason) {
+            Map<SkipReasonCode, Long> bySkipReason,
+            Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision) {
         this.scope = scope.tableKey();
+        this.tasksPlanned = tasksPlanned;
+        this.metadataFailures = metadataFailures;
         this.counters = counters;
         Map<CleanupObjectType, CleanupCounters> objectCopy = new HashMap<>();
         objectCopy.putAll(byObjectType);
@@ -51,6 +59,9 @@ public final class TableCleanupSummary implements Serializable {
         Map<SkipReasonCode, Long> reasonCopy = new HashMap<>();
         reasonCopy.putAll(bySkipReason);
         this.bySkipReason = reasonCopy;
+        Map<CleanupObjectType, RuleDecisionCounters> decisionCopy = new HashMap<>();
+        decisionCopy.putAll(byRuleDecision);
+        this.byRuleDecision = decisionCopy;
     }
 
     public ScopeIdentity scope() {
@@ -59,6 +70,14 @@ public final class TableCleanupSummary implements Serializable {
 
     public long plannedFiles() {
         return counters.plannedFiles();
+    }
+
+    public long tasksPlanned() {
+        return tasksPlanned;
+    }
+
+    public long metadataFailures() {
+        return metadataFailures;
     }
 
     public long plannedBytes() {
@@ -75,5 +94,9 @@ public final class TableCleanupSummary implements Serializable {
 
     public Map<SkipReasonCode, Long> bySkipReason() {
         return Collections.unmodifiableMap(bySkipReason);
+    }
+
+    public Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision() {
+        return Collections.unmodifiableMap(byRuleDecision);
     }
 }
