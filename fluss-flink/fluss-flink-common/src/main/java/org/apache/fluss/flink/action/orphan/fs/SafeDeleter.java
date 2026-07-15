@@ -19,7 +19,9 @@ package org.apache.fluss.flink.action.orphan.fs;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
+import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
@@ -56,13 +58,24 @@ public final class SafeDeleter {
     private final boolean dryRun;
     private final AuditLogger audit;
     private final RateLimiter remoteFsOpRateLimiter;
+    private final ScopeIdentity scope;
 
     public SafeDeleter(
             FileSystem fs, boolean dryRun, AuditLogger audit, RateLimiter remoteFsOpRateLimiter) {
+        this(fs, dryRun, audit, remoteFsOpRateLimiter, ScopeIdentity.global());
+    }
+
+    public SafeDeleter(
+            FileSystem fs,
+            boolean dryRun,
+            AuditLogger audit,
+            RateLimiter remoteFsOpRateLimiter,
+            ScopeIdentity scope) {
         this.fs = fs;
         this.dryRun = dryRun;
         this.audit = audit;
         this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
+        this.scope = scope;
     }
 
     /**
@@ -74,22 +87,30 @@ public final class SafeDeleter {
      *     should track {@code false} returns as delete failures in their run summary.
      */
     public boolean deleteFile(FsPath file, Decision decision, RuleId ruleId) {
+        return deleteFile(new FileMeta(file, -1L, -1L), decision, ruleId);
+    }
+
+    public boolean deleteFile(FileMeta file, Decision decision, RuleId ruleId) {
         checkArgument(
                 decision == Decision.DELETE,
                 "deleteFile must only be called for Decision.DELETE, got %s",
                 decision);
         if (dryRun) {
-            audit.logWouldDelete(file, ruleId);
+            audit.logWouldDelete(file, ruleId, scope);
             return true;
         }
         remoteFsOpRateLimiter.acquire();
         try {
-            boolean ok = fs.delete(file, false);
-            audit.logDeleted(file, ruleId, ok);
+            boolean ok = fs.delete(file.path(), false);
+            if (ok) {
+                audit.logDeleted(file, ruleId, scope);
+            } else {
+                audit.logDeleteFailed(file, ruleId, scope, "filesystem_returned_false", true);
+            }
             return ok;
         } catch (IOException e) {
-            LOG.warn("Failed to delete file: {}", file, e);
-            audit.logDeleted(file, ruleId, false);
+            LOG.warn("Failed to delete file: {}", file.path(), e);
+            audit.logDeleteFailed(file, ruleId, scope, "io_error", true);
             return false;
         }
     }
@@ -103,24 +124,55 @@ public final class SafeDeleter {
      *     directory" counter when this returns {@code false}.
      */
     public boolean deleteEmptyDir(FsPath dir) {
+        return deleteEmptyDir(dir, -1L);
+    }
+
+    public boolean deleteEmptyDir(FsPath dir, long modificationTime) {
+        return deleteEmptyDirDetailed(dir, modificationTime).successful();
+    }
+
+    public DirectoryDeleteResult deleteEmptyDirDetailed(FsPath dir, long modificationTime) {
         FileStatus[] children = listChildrenSilently(dir);
-        if (children == null || children.length > 0) {
-            return false;
+        if (children == null) {
+            audit.logSkippedDirectory(
+                    dir, modificationTime, scope, "directory_list_failed", dryRun, true, true);
+            return DirectoryDeleteResult.LIST_FAILED;
+        }
+        if (children.length > 0) {
+            audit.logSkippedDirectory(
+                    dir, modificationTime, scope, "directory_not_empty", dryRun, false, false);
+            return DirectoryDeleteResult.NOT_EMPTY;
         }
         if (dryRun) {
-            audit.logWouldDeleteDir(dir);
-            return true;
+            audit.logWouldDeleteDirectory(dir, modificationTime, scope, true);
+            return DirectoryDeleteResult.SUCCESS;
         }
         remoteFsOpRateLimiter.acquire();
         try {
             boolean ok = fs.delete(dir, false);
             if (ok) {
-                audit.logDirDeleted(dir);
+                audit.logDeletedDirectory(dir, modificationTime, scope, false);
+                return DirectoryDeleteResult.SUCCESS;
             }
-            return ok;
+            audit.logDirectoryDeleteFailed(
+                    dir, modificationTime, scope, "filesystem_returned_false", false, true);
+            return DirectoryDeleteResult.DELETE_FAILED;
         } catch (IOException e) {
             LOG.warn("Failed to delete empty directory: {}", dir, e);
-            return false;
+            audit.logDirectoryDeleteFailed(dir, modificationTime, scope, "io_error", false, true);
+            return DirectoryDeleteResult.DELETE_FAILED;
+        }
+    }
+
+    /** Result of the final empty-directory recheck and non-recursive delete attempt. */
+    public enum DirectoryDeleteResult {
+        SUCCESS,
+        NOT_EMPTY,
+        LIST_FAILED,
+        DELETE_FAILED;
+
+        public boolean successful() {
+            return this == SUCCESS;
         }
     }
 
