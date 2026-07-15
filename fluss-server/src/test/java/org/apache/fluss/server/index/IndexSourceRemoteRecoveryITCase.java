@@ -325,6 +325,10 @@ class IndexSourceRemoteRecoveryITCase {
                             + "; index leaders="
                             + Arrays.toString(indexLeaders));
         }
+        LOG.info(
+                "Index Table leaders for target-only server {}: {}",
+                targetOnlyServer,
+                Arrays.toString(indexLeaders));
         return new TableBucket(indexTableId, targetBucket);
     }
 
