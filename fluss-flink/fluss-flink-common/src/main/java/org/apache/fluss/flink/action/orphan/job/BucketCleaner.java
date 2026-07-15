@@ -20,12 +20,14 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
+import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
@@ -59,6 +61,7 @@ public final class BucketCleaner {
     private final long cutoffMillis;
     private final RateLimiter remoteFsOpRateLimiter;
     private final boolean dryRun;
+    private final ScopeIdentity scope;
 
     public BucketCleaner(
             RuleDispatcher dispatcher,
@@ -67,12 +70,31 @@ public final class BucketCleaner {
             long cutoffMillis,
             RateLimiter remoteFsOpRateLimiter,
             boolean dryRun) {
+        this(
+                dispatcher,
+                safeDeleter,
+                audit,
+                cutoffMillis,
+                remoteFsOpRateLimiter,
+                dryRun,
+                ScopeIdentity.global());
+    }
+
+    public BucketCleaner(
+            RuleDispatcher dispatcher,
+            SafeDeleter safeDeleter,
+            AuditLogger audit,
+            long cutoffMillis,
+            RateLimiter remoteFsOpRateLimiter,
+            boolean dryRun,
+            ScopeIdentity scope) {
         this.dispatcher = dispatcher;
         this.safeDeleter = safeDeleter;
         this.audit = audit;
         this.cutoffMillis = cutoffMillis;
         this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
         this.dryRun = dryRun;
+        this.scope = scope;
     }
 
     /** Cleans one bucket's log/kv subtrees using the caller-supplied active reference set. */
@@ -156,12 +178,21 @@ public final class BucketCleaner {
             for (FileStatus child : children) {
                 FsPath childPath = child.getPath();
                 if (child.isDir()) {
+                    long modificationTime = child.getModificationTime();
+                    if (MtimePolicy.isUnavailable(modificationTime)) {
+                        stats.recordSkip(SkipReasonCode.MTIME_UNAVAILABLE);
+                        audit.logMtimeUnavailableOnce(
+                                scope,
+                                CleanupObjectType.DIRECTORY,
+                                "directory",
+                                childPath.getName());
+                    }
                     stack.push(
                             new DirVisit(
                                     childPath,
                                     false,
-                                    child.getModificationTime() < cutoffMillis,
-                                    child.getModificationTime(),
+                                    MtimePolicy.isOlderThanCutoff(modificationTime, cutoffMillis),
+                                    modificationTime,
                                     visit,
                                     false));
                     continue;
@@ -169,7 +200,10 @@ public final class BucketCleaner {
                 FileMeta meta =
                         new FileMeta(childPath, child.getLen(), child.getModificationTime());
                 FileRule rule = dispatcher.dispatch(meta);
-                Decision decision = rule.evaluate(meta, activeRefs, cutoffMillis);
+                Decision decision =
+                        MtimePolicy.failClosed(
+                                rule.evaluate(meta, activeRefs, cutoffMillis),
+                                meta.modificationTime());
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.recordScanned(objectType);
                 stats.recordRuleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
@@ -198,6 +232,14 @@ public final class BucketCleaner {
                         stats.recordRuleDecision(
                                 objectType, RuleDecisionCounters.keepActive(meta.size()));
                         stats.recordSkip(SkipReasonCode.KEEP_ACTIVE);
+                        visit.hasRemainingChild = true;
+                        break;
+                    case MTIME_UNAVAILABLE:
+                        stats.recordRuleDecision(
+                                objectType, RuleDecisionCounters.mtimeUnavailable(meta.size()));
+                        stats.recordSkip(SkipReasonCode.MTIME_UNAVAILABLE);
+                        audit.logMtimeUnavailableOnce(
+                                scope, objectType, "file", meta.path().getName());
                         visit.hasRemainingChild = true;
                         break;
                     case DEFER:

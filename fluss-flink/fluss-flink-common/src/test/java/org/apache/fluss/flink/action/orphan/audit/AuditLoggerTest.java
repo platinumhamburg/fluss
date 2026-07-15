@@ -96,6 +96,56 @@ class AuditLoggerTest {
                                         || event.contains("action=newer_than_cutoff"));
     }
 
+    @Test
+    void mtimeUnavailableErrorIsBoundedPerLoggerInstance() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        AuditLogger logger = new AuditLogger();
+        ScopeIdentity scope =
+                ScopeIdentity.table("db", "orders", 7L).withPartitionAndBucket(11L, 4);
+
+        try (AuditCapture ignored = new AuditCapture(events)) {
+            logger.logMtimeUnavailableOnce(
+                    scope, CleanupObjectType.LOG_SEGMENT, "file", "first.log");
+            logger.logMtimeUnavailableOnce(
+                    scope, CleanupObjectType.DIRECTORY, "directory", "second-dir");
+        }
+
+        assertThat(events.stream().filter(e -> e.contains("action=mtime_unavailable")).count())
+                .isEqualTo(1L);
+        assertThat(events)
+                .anyMatch(
+                        event ->
+                                event.startsWith("ERROR ")
+                                        && event.contains("table_id=7")
+                                        && event.contains("partition_id=11")
+                                        && event.contains("bucket_id=4")
+                                        && event.contains("entry_kind=file")
+                                        && event.contains("sample_name=first.log")
+                                        && event.contains("action_required=true"));
+    }
+
+    @Test
+    void mtimeUnavailableSampleNameIsSanitizedAndCapped() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        AuditLogger logger = new AuditLogger();
+        String longSuffix = "a".repeat(140);
+
+        try (AuditCapture ignored = new AuditCapture(events)) {
+            logger.logMtimeUnavailableOnce(
+                    ScopeIdentity.global(),
+                    CleanupObjectType.DIRECTORY,
+                    "directory",
+                    "bad path/" + longSuffix);
+        }
+
+        assertThat(events)
+                .anyMatch(
+                        event ->
+                                event.contains("action=mtime_unavailable")
+                                        && event.contains("sample_name=bad_path_")
+                                        && !event.contains(longSuffix));
+    }
+
     private static final class AuditCapture implements AutoCloseable {
         private final LoggerContext context;
         private final LoggerConfig loggerConfig;
@@ -132,7 +182,7 @@ class AuditLoggerTest {
 
         @Override
         public void append(LogEvent event) {
-            events.add(event.getMessage().getFormattedMessage());
+            events.add(event.getLevel().name() + " " + event.getMessage().getFormattedMessage());
         }
     }
 }

@@ -30,16 +30,19 @@ class RuleDecisionCountersTest {
                         .add(RuleDecisionCounters.scanned(20L))
                         .add(RuleDecisionCounters.scanned(30L))
                         .add(RuleDecisionCounters.scanned(40L))
+                        .add(RuleDecisionCounters.scanned(50L))
                         .add(RuleDecisionCounters.keepActive(10L))
                         .add(RuleDecisionCounters.newerThanCutoff(20L))
                         .add(RuleDecisionCounters.unknownFileType(30L))
-                        .add(RuleDecisionCounters.candidate(40L));
+                        .add(RuleDecisionCounters.candidate(40L))
+                        .add(RuleDecisionCounters.mtimeUnavailable(50L));
 
-        assertThat(counters.scannedFiles()).isEqualTo(4L);
+        assertThat(counters.scannedFiles()).isEqualTo(5L);
         assertThat(counters.keepActiveFiles()).isEqualTo(1L);
         assertThat(counters.newerThanCutoffFiles()).isEqualTo(1L);
         assertThat(counters.unknownFileTypeFiles()).isEqualTo(1L);
         assertThat(counters.candidateFiles()).isEqualTo(1L);
+        assertThat(counters.mtimeUnavailableFiles()).isEqualTo(1L);
         assertThat(counters.isConsistent()).isTrue();
     }
 

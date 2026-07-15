@@ -54,7 +54,7 @@ class LogSegmentRuleTest {
     @Test
     void keepActiveWhenInBucketActiveRefs() {
         FileMeta file =
-                file("/log/db/t-1/0/" + SEGMENT_ID + "/00000000000000000000.log", NOW - 2 * DAY_MS);
+                file("/log/db/t-1/0/" + SEGMENT_ID + "/00000000000000000000.log", Long.MAX_VALUE);
         Set<String> liveFiles = new HashSet<String>();
         liveFiles.add(SEGMENT_ID + "/00000000000000000000.log");
         BucketActiveRefs activeRefs =
@@ -64,6 +64,15 @@ class LogSegmentRuleTest {
         Decision decision = rule.evaluate(file, activeRefs, CUTOFF_MS);
 
         assertThat(decision).isEqualTo(Decision.KEEP_ACTIVE);
+    }
+
+    @Test
+    void reportsUnavailableMtimeForKnownInactiveSegment() {
+        FileMeta file =
+                file("/log/db/t-1/0/" + SEGMENT_ID + "/00000000000000000000.log", Long.MAX_VALUE);
+
+        assertThat(rule.evaluate(file, BucketActiveRefs.empty(), CUTOFF_MS))
+                .isEqualTo(Decision.MTIME_UNAVAILABLE);
     }
 
     @Test

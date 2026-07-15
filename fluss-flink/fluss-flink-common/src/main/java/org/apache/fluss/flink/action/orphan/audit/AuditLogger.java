@@ -48,6 +48,8 @@ public final class AuditLogger {
 
     private static final Logger AUDIT = LoggerFactory.getLogger("fluss.orphan.audit");
 
+    private boolean mtimeUnavailableSampleLogged;
+
     /**
      * Formats cutoff epoch-ms back to the {@code yyyy-MM-dd HH:mm:ss} CLI grammar in the server's
      * local zone, so the audit line and the original {@code --older-than} value can be compared
@@ -298,6 +300,48 @@ public final class AuditLogger {
         AUDIT.warn("action=skip_unknown rule={} path={} ts={}", ruleId, path, Instant.now());
     }
 
+    /** Emits at most one actionable unavailable-mtime sample for this scan subtask. */
+    public void logMtimeUnavailableOnce(
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            String entryKind,
+            String sampleName) {
+        if (mtimeUnavailableSampleLogged) {
+            return;
+        }
+        mtimeUnavailableSampleLogged = true;
+        AUDIT.error(
+                "audit_version=1 stage=scan action=mtime_unavailable"
+                        + " database={} table={} table_id={} partition_id={} bucket_id={}"
+                        + " object_type={} entry_kind={} sample_name={}"
+                        + " action_required=true ts={}",
+                scope.database(),
+                scope.table(),
+                nullable(scope.tableId()),
+                nullable(scope.partitionId()),
+                nullable(scope.bucketId()),
+                lower(objectType.name()),
+                entryKind,
+                sanitizeSampleName(sampleName),
+                Instant.now());
+    }
+
+    private static String sanitizeSampleName(String value) {
+        StringBuilder sanitized = new StringBuilder(Math.min(value.length(), 128));
+        for (int i = 0; i < value.length() && sanitized.length() < 128; i++) {
+            char c = value.charAt(i);
+            boolean allowed =
+                    (c >= 'a' && c <= 'z')
+                            || (c >= 'A' && c <= 'Z')
+                            || (c >= '0' && c <= '9')
+                            || c == '.'
+                            || c == '_'
+                            || c == '-';
+            sanitized.append(allowed ? c : '_');
+        }
+        return sanitized.length() == 0 ? "empty" : sanitized.toString();
+    }
+
     public void logBucketAborted(String bucketStr, String reason) {
         AUDIT.error(
                 "action=bucket_aborted bucket={} reason={} ts={}",
@@ -497,13 +541,18 @@ public final class AuditLogger {
         AUDIT.info(
                 "action=coverage_summary no_remote_manifest_targets={}"
                         + " empty_active_set_targets={} metadata_read_failed_targets={}"
-                        + " directory_list_failed_targets={} rpc_failed_targets={} complete={}"
+                        + " directory_list_failed_targets={} rpc_failed_targets={}"
+                        + " mtime_unavailable_files={} mtime_unavailable_bytes={}"
+                        + " mtime_unavailable_dirs={} complete={}"
                         + " action_required={} dry_run={} ts={}",
                 reasonCount(report, SkipReasonCode.NO_REMOTE_MANIFEST),
                 reasonCount(report, SkipReasonCode.EMPTY_KV_ACTIVE_SET),
                 report.metadataFailures(),
                 reasonCount(report, SkipReasonCode.DIRECTORY_LIST_FAILED),
                 reasonCount(report, SkipReasonCode.RPC_ERROR),
+                report.mtimeUnavailableFiles(),
+                report.mtimeUnavailableBytes(),
+                report.mtimeUnavailableDirs(),
                 report.coverageComplete(),
                 !report.coverageComplete(),
                 dryRun,
@@ -530,7 +579,8 @@ public final class AuditLogger {
         AUDIT.info(
                 "action={} {} scanned_files={} scanned_bytes={} keep_active_files={}"
                         + " keep_active_bytes={} newer_than_cutoff_files={}"
-                        + " newer_than_cutoff_bytes={} unknown_file_type_files={}"
+                        + " newer_than_cutoff_bytes={} mtime_unavailable_files={}"
+                        + " mtime_unavailable_bytes={} unknown_file_type_files={}"
                         + " unknown_file_type_bytes={} candidate_files={} candidate_bytes={}"
                         + " dry_run={} ts={}",
                 action,
@@ -541,6 +591,8 @@ public final class AuditLogger {
                 counters.keepActiveBytes(),
                 counters.newerThanCutoffFiles(),
                 counters.newerThanCutoffBytes(),
+                counters.mtimeUnavailableFiles(),
+                counters.mtimeUnavailableBytes(),
                 counters.unknownFileTypeFiles(),
                 counters.unknownFileTypeBytes(),
                 counters.candidateFiles(),

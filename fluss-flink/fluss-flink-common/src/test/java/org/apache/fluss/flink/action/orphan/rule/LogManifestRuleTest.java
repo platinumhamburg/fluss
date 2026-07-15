@@ -52,7 +52,7 @@ class LogManifestRuleTest {
 
     @Test
     void keepsManifestListedInActiveManifestPaths() {
-        FileMeta file = file("/log/db/t-1/0/metadata/active.manifest", NOW - 2 * DAY_MS);
+        FileMeta file = file("/log/db/t-1/0/metadata/active.manifest", Long.MAX_VALUE);
         BucketActiveRefs activeRefs =
                 new BucketActiveRefs(
                         Collections.<String>emptySet(),
@@ -60,6 +60,21 @@ class LogManifestRuleTest {
                         Collections.singleton("/log/db/t-1/0/metadata/active.manifest"));
 
         assertThat(optInRule.evaluate(file, activeRefs, CUTOFF_MS)).isEqualTo(Decision.KEEP_ACTIVE);
+    }
+
+    @Test
+    void reportsUnavailableMtimeOnlyWhenManifestDeletionIsEnabled() {
+        FileMeta file = file("/log/db/t-1/0/metadata/orphan.manifest", Long.MAX_VALUE);
+        BucketActiveRefs activeRefs =
+                new BucketActiveRefs(
+                        Collections.<String>emptySet(),
+                        Collections.<String>emptySet(),
+                        Collections.singleton("/log/db/t-1/0/metadata/current.manifest"));
+
+        assertThat(defaultRule.evaluate(file, activeRefs, CUTOFF_MS))
+                .isEqualTo(Decision.KEEP_ACTIVE);
+        assertThat(optInRule.evaluate(file, activeRefs, CUTOFF_MS))
+                .isEqualTo(Decision.MTIME_UNAVAILABLE);
     }
 
     @Test
