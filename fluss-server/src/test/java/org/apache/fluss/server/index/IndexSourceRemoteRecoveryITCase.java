@@ -490,9 +490,7 @@ class IndexSourceRemoteRecoveryITCase {
             Replica sourceReplica, long baselinePushedOffset, long committedSourceEnd) {
         LogTablet sourceLog = sourceReplica.getLogTablet();
         RemoteLogManager remoteLogManager =
-                sourceTabletServer(fixture.sourceLeader)
-                        .getReplicaManager()
-                        .getRemoteLogManager();
+                sourceTabletServer(fixture.sourceLeader).getReplicaManager().getRemoteLogManager();
         RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(fixture.sourceTableBucket);
         LOG.info(
                 "Task 7 initial remote coverage state: {}",
@@ -509,10 +507,7 @@ class IndexSourceRemoteRecoveryITCase {
         } catch (AssertionError | RuntimeException failure) {
             String state =
                     safeRemoteCoverageState(
-                            sourceReplica,
-                            remoteLog,
-                            baselinePushedOffset,
-                            committedSourceEnd);
+                            sourceReplica, remoteLog, baselinePushedOffset, committedSourceEnd);
             throw new AssertionError(
                     "raw remote source WAL coverage timed out; final tiering state: " + state,
                     failure);

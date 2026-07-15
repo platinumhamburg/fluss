@@ -410,8 +410,7 @@ class IndexPushFailoverITCase {
                                             mainTableId,
                                             0,
                                             1,
-                                            genKvRecordBatch(
-                                                    new Object[] {1, selectedValue})));
+                                            genKvRecordBatch(new Object[] {1, selectedValue})));
 
             // IndexBatch.attempts() increments only when a failed batch is put back into this
             // exact target bucket's deque. With the coordinator stopped, a replacement cannot
@@ -557,12 +556,13 @@ class IndexPushFailoverITCase {
         }
     }
 
-    private static void reportCleanupFailures(Throwable primaryFailure, List<Throwable> cleanupFailures)
-            throws Throwable {
+    private static void reportCleanupFailures(
+            Throwable primaryFailure, List<Throwable> cleanupFailures) throws Throwable {
         if (cleanupFailures.isEmpty()) {
             return;
         }
-        AssertionError cleanupFailure = new AssertionError("index target failover IT cleanup failed");
+        AssertionError cleanupFailure =
+                new AssertionError("index target failover IT cleanup failed");
         cleanupFailures.forEach(cleanupFailure::addSuppressed);
         if (primaryFailure != null) {
             primaryFailure.addSuppressed(cleanupFailure);

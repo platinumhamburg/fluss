@@ -1977,16 +1977,13 @@ public class IndexSenderTest {
                         5_000L);
         IndexReplicator firstOwner = owner(accumulator);
         IndexWindow firstWindow = new IndexWindow("idx", 10L, 1, firstOwner);
-        IndexBatch first =
-                batchOfSize(new TableBucket(240L, 0), firstWindow, 1, 3L);
+        IndexBatch first = batchOfSize(new TableBucket(240L, 0), firstWindow, 1, 3L);
         IndexReplicator secondOwner = owner(accumulator);
         IndexWindow secondWindow = new IndexWindow("idx", 20L, 1, secondOwner);
-        IndexBatch second =
-                batchOfSize(new TableBucket(240L, 1), secondWindow, 1, 3L);
+        IndexBatch second = batchOfSize(new TableBucket(240L, 1), secondWindow, 1, 3L);
         IndexReplicator rejectedOwner = owner(accumulator);
         IndexWindow rejectedWindow = new IndexWindow("idx", 30L, 1, rejectedOwner);
-        IndexBatch rejected =
-                batchOfSize(new TableBucket(241L, 0), rejectedWindow, 1, 3L);
+        IndexBatch rejected = batchOfSize(new TableBucket(241L, 0), rejectedWindow, 1, 3L);
         try {
             assertThat(accumulator.tryAppendWindow(Collections.singletonList(first))).isTrue();
             assertThat(accumulator.tryAppendWindow(Collections.singletonList(second))).isTrue();
@@ -2015,8 +2012,7 @@ public class IndexSenderTest {
 
             assertThat(rejectedWindow.tryRetireAndDrain()).containsExactly(rejected);
             IndexWindow rebuiltWindow = new IndexWindow("idx", 30L, 1, rejectedOwner);
-            IndexBatch rebuilt =
-                    batchOfSize(new TableBucket(241L, 0), rebuiltWindow, 1, 3L);
+            IndexBatch rebuilt = batchOfSize(new TableBucket(241L, 0), rebuiltWindow, 1, 3L);
             assertThat(accumulator.tryAppendWindow(Collections.singletonList(rebuilt))).isTrue();
             await(() -> rejectedOwner.getSyncIndexPushedOffset() == 30L);
 

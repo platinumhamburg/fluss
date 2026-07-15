@@ -17,10 +17,10 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -49,8 +49,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -104,7 +104,8 @@ class ReplicaIndexControllerTest {
         assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.RUNNING);
         assertThat(controller.getIndexReplicator()).isSameAs(replacement);
 
-        controller.onIndexReplicatorFailed(replacement, new RuntimeException("replacement failure"));
+        controller.onIndexReplicatorFailed(
+                replacement, new RuntimeException("replacement failure"));
         assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.FAILED);
         assertThat(controller.isFailed()).isTrue();
 
@@ -121,7 +122,8 @@ class ReplicaIndexControllerTest {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
         AtomicBoolean exposeCorruption = new AtomicBoolean();
         IndexReplicator replicator =
-                corruptingReplicator(readContext, controller::onIndexReplicatorFailed, exposeCorruption);
+                corruptingReplicator(
+                        readContext, controller::onIndexReplicatorFailed, exposeCorruption);
 
         controller.installIndexReplicator(replicator);
         assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.RUNNING);
@@ -134,7 +136,8 @@ class ReplicaIndexControllerTest {
         }
         awaitFailed(controller);
 
-        assertThat(replicator.terminalFailure()).isInstanceOf(IndexSourceWalCorruptionException.class);
+        assertThat(replicator.terminalFailure())
+                .isInstanceOf(IndexSourceWalCorruptionException.class);
         assertThat(controller.getIndexReplicator()).isSameAs(replicator);
         assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.FAILED);
         verify(readContext, times(1)).close();
@@ -176,8 +179,7 @@ class ReplicaIndexControllerTest {
         IndexBatch queued =
                 new IndexBatch(
                         TARGET_BUCKET,
-                        new MemorySegmentBytesView(
-                                MemorySegment.wrap(new byte[] {1}), 0, 1),
+                        new MemorySegmentBytesView(MemorySegment.wrap(new byte[] {1}), 0, 1),
                         window);
         accumulator.append(queued);
         assertThat(accumulator.pendingBytes(old)).isPositive();
@@ -215,8 +217,7 @@ class ReplicaIndexControllerTest {
     private static IndexReplicator idleReplicator(
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
-        return idleReplicator(
-                new IndexAccumulator(), readContext, onTerminalFailure, () -> {});
+        return idleReplicator(new IndexAccumulator(), readContext, onTerminalFailure, () -> {});
     }
 
     private static IndexReplicator idleReplicator(
@@ -258,12 +259,7 @@ class ReplicaIndexControllerTest {
                                         Arrays.asList(record(0L), record(2L)).iterator()));
         IndexSourceReader reader =
                 new IndexSourceReader(
-                        sourceLog(
-                                0L,
-                                0L,
-                                3L,
-                                records(batch),
-                                exposeCorruption),
+                        sourceLog(0L, 0L, 3L, records(batch), exposeCorruption),
                         null,
                         Runnable::run,
                         readContext);
@@ -335,11 +331,9 @@ class ReplicaIndexControllerTest {
     }
 
     private static IndexSourceReader.SourceLog sourceLog(
-            long logStartOffset,
-            long localLogStartOffset,
-            long highWatermark,
-            LogRecords records) {
-        return sourceLog(logStartOffset, localLogStartOffset, highWatermark, records, null, () -> {});
+            long logStartOffset, long localLogStartOffset, long highWatermark, LogRecords records) {
+        return sourceLog(
+                logStartOffset, localLogStartOffset, highWatermark, records, null, () -> {});
     }
 
     private static IndexSourceReader.SourceLog sourceLog(

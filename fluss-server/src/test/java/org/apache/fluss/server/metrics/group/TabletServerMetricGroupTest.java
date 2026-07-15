@@ -86,10 +86,7 @@ class TabletServerMetricGroupTest {
                 .isEqualTo(expectedInFlight);
         assertThat(metricValue(metrics, MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS))
                 .isEqualTo(expectedAge);
-        assertThat(
-                        metricValue(
-                                metrics,
-                                MetricNames.INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT))
+        assertThat(metricValue(metrics, MetricNames.INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT))
                 .isEqualTo(expectedFailedSources);
     }
 

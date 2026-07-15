@@ -241,8 +241,7 @@ public final class IndexAccumulator {
         return bytes;
     }
 
-    private boolean reserve(
-            List<IndexBatch> windowBatches, IndexWindow window, long windowBytes) {
+    private boolean reserve(List<IndexBatch> windowBatches, IndexWindow window, long windowBytes) {
         synchronized (admissionLock) {
             if (!window.isActive() || window.owner().isClosed()) {
                 return false;
@@ -280,8 +279,7 @@ public final class IndexAccumulator {
         }
     }
 
-    private void rollbackReservation(
-            List<IndexBatch> windowBatches, IndexReplicator owner) {
+    private void rollbackReservation(List<IndexBatch> windowBatches, IndexReplicator owner) {
         for (IndexBatch batch : windowBatches) {
             if (batch.wasAccounted()) {
                 release(batch);

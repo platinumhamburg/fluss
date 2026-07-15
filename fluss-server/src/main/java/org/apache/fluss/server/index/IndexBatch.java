@@ -63,7 +63,8 @@ final class IndexBatch {
         this(targetBucket, encoded, encoded.getBytesLength(), window);
     }
 
-    IndexBatch(TableBucket targetBucket, BytesView encoded, long retainedBytes, IndexWindow window) {
+    IndexBatch(
+            TableBucket targetBucket, BytesView encoded, long retainedBytes, IndexWindow window) {
         this.targetBucket = checkNotNull(targetBucket, "targetBucket");
         this.encoded = checkNotNull(encoded, "encoded");
         checkArgument(
