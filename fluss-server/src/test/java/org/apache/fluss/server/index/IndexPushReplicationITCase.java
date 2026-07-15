@@ -90,7 +90,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * </ul>
  *
  * <p>Leader-failover scenarios (main-table and index-table leader switchover) are covered by {@link
- * IndexPushFailoverITCase} which uses a 3-node cluster with replication factor 3.
+ * IndexPushFailoverITCase}.
  *
  * <p>Each test uses a distinct main-table name so that the shared {@link FlussClusterExtension}
  * cluster does not see colliding paths across scenarios.

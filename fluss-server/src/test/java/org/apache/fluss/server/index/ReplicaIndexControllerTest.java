@@ -40,6 +40,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
@@ -49,6 +50,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -277,14 +279,11 @@ class ReplicaIndexControllerTest {
                 onTerminalFailure);
     }
 
-    private static void awaitFailed(ReplicaIndexController controller) throws InterruptedException {
-        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
-        while (!controller.isFailed()) {
-            if (System.nanoTime() >= deadline) {
-                throw new AssertionError("controller did not receive the terminal callback");
-            }
-            Thread.sleep(10L);
-        }
+    private static void awaitFailed(ReplicaIndexController controller) {
+        waitUntil(
+                controller::isFailed,
+                Duration.ofSeconds(10),
+                "controller did not receive the terminal callback");
     }
 
     private static IndexSpec spec() {
