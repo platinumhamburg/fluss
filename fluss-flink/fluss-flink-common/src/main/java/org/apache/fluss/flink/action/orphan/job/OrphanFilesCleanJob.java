@@ -36,8 +36,8 @@ import java.util.List;
  *
  * <pre>
  * Stage 1: ScopeEnumerator (p=1)   — coordinator RPCs, emits CleanTask
- * Stage 2: ScanAndClean (p=N)      — FS scan + rate-limited delete, emits CleanStats
- * Stage 3: StatsAggregate (p=1)    — merge stats, emits final CleanStats
+ * Stage 2: ScanAndClean (p=N)      — FS scan + rate-limited delete, emits CleanupStats
+ * Stage 3: StatsAggregate (p=1)    — merge stats, emits final CleanupSummary
  * </pre>
  */
 @Internal
@@ -52,9 +52,9 @@ public final class OrphanFilesCleanJob {
      * @param env the Flink execution environment (caller configures classpath, etc.)
      * @param config parsed orphan cleanup configuration
      * @param parallelism the parallelism for Stage 2 (ScanAndClean); null uses env default
-     * @return the final cleanup report
+     * @return the final cleanup summary
      */
-    public static CleanupReport execute(
+    public static CleanupSummary execute(
             StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism)
             throws Exception {
         env.setRuntimeMode(RuntimeExecutionMode.BATCH);
@@ -71,41 +71,42 @@ public final class OrphanFilesCleanJob {
                         .name("ScopeEnumerator");
 
         // Stage 2: ScanAndClean (parallelism=N)
-        SingleOutputStreamOperator<CleanStats> stats =
+        SingleOutputStreamOperator<CleanupStats> stats =
                 tasks.rebalance()
                         .process(
                                 new ScanAndCleanFunction(
                                         config.remoteFsOpRateLimitPerSecond(),
                                         config.extraConfigs()))
-                        .returns(TypeInformation.of(new TypeHint<CleanStats>() {}))
+                        .returns(TypeInformation.of(new TypeHint<CleanupStats>() {}))
                         .name("ScanAndClean");
         if (parallelism != null) {
             stats = stats.setParallelism(parallelism);
         }
 
         // Stage 3: StatsAggregate (parallelism=1)
-        SingleOutputStreamOperator<CleanupReport> result =
+        SingleOutputStreamOperator<CleanupSummary> result =
                 stats.transform(
                                 "StatsAggregate",
-                                TypeInformation.of(new TypeHint<CleanupReport>() {}),
+                                TypeInformation.of(new TypeHint<CleanupSummary>() {}),
                                 new StatsAggregateOperator(config.dryRun()))
                         .setParallelism(1)
                         .setMaxParallelism(1);
 
         // Execute and collect the single result
-        List<CleanupReport> collected = collectResults(result);
-        if (collected.isEmpty()) {
-            return CleanupReport.aggregate(
-                    Collections.emptyList(), Collections.emptyList(), config.dryRun());
+        List<CleanupSummary> collected = collectResults(result);
+        if (collected.size() != 1) {
+            throw new IllegalStateException(
+                    "StatsAggregate must emit exactly one cleanup summary, but emitted "
+                            + collected.size());
         }
         return collected.get(0);
     }
 
     @SuppressWarnings("deprecation")
-    private static List<CleanupReport> collectResults(DataStream<CleanupReport> result)
+    private static List<CleanupSummary> collectResults(DataStream<CleanupSummary> result)
             throws Exception {
-        Iterator<CleanupReport> iterator = result.executeAndCollect("OrphanFilesClean");
-        List<CleanupReport> results = new java.util.ArrayList<CleanupReport>();
+        Iterator<CleanupSummary> iterator = result.executeAndCollect("OrphanFilesClean");
+        List<CleanupSummary> results = new java.util.ArrayList<CleanupSummary>();
         while (iterator.hasNext()) {
             results.add(iterator.next());
         }

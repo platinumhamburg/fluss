@@ -21,7 +21,7 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.Action;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
-import org.apache.fluss.flink.action.orphan.job.CleanupReport;
+import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.OrphanFilesCleanJob;
 
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -52,9 +52,9 @@ public class OrphanFilesCleanAction implements Action {
     @Override
     public void run() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        CleanupReport report =
+        CleanupSummary summary =
                 OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null));
-        CleanupCounters stats = report.global();
+        CleanupCounters stats = summary.globalCounters();
         LOG.info(
                 "remove_orphan_files done: scope={} scannedFiles={} plannedFiles={} plannedDirs={}"
                         + " plannedBytes={} deletedFiles={} emptyDirsRemoved={} failures={}"
@@ -68,7 +68,7 @@ public class OrphanFilesCleanAction implements Action {
                 stats.emptyDirsRemoved(),
                 stats.deleteFailures(),
                 stats.bytesReclaimed(),
-                config.dryRun());
+                summary.dryRun());
     }
 
     private String scopeDescription() {
