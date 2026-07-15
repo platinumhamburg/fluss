@@ -243,6 +243,9 @@ public final class Replica {
     // ------- index management
     private final ReplicaIndexController indexManager;
 
+    /** Whether this main-table schema declares at least one secondary index. */
+    private final boolean hasSecondaryIndexes;
+
     /**
      * Whether PutKv acks on this replica must block until the SYNC secondary-index mutations they
      * generate are applied. False for ASYNC-only tables, index tables and tables without indexes.
@@ -250,12 +253,12 @@ public final class Replica {
     private final boolean hasSyncIndexes;
 
     /** Monotonically advancing SYNC index-pushed-offset used by PutKv acknowledgements. */
-    private volatile long syncIndexPushedOffset = -1L;
+    private volatile long syncIndexPushedOffset;
 
     /**
      * Conservative all-index replay floor, persisted in snapshots and restored on leader startup.
      */
-    private volatile long allIndexPushedOffset = -1L;
+    private volatile long allIndexPushedOffset;
 
     // ------- metrics
     private Counter isrShrinks;
@@ -330,9 +333,13 @@ public final class Replica {
                         indexAccumulator,
                         remoteLogManager,
                         serverMetricGroup);
+        List<Schema.Index> secondaryIndexes = tableInfo.getSchema().getIndexes();
+        this.hasSecondaryIndexes = !secondaryIndexes.isEmpty();
         this.hasSyncIndexes =
-                tableInfo.getSchema().getIndexes().stream()
+                secondaryIndexes.stream()
                         .anyMatch(index -> index.getVisibility() == IndexVisibility.SYNC);
+        this.syncIndexPushedOffset = hasSyncIndexes ? 0L : -1L;
+        this.allIndexPushedOffset = hasSecondaryIndexes ? 0L : -1L;
         registerMetrics();
     }
 
@@ -825,11 +832,22 @@ public final class Replica {
      * replay floor, so it is captured in the snapshot alongside flushed log offset and row count.
      */
     private TabletState augmentTabletState(TabletState base) {
-        long offset = allIndexPushedOffset;
+        Long indexPushedOffset = null;
+        if (hasSecondaryIndexes) {
+            long currentOffset = allIndexPushedOffset;
+            if (currentOffset < 0) {
+                throw new IllegalStateException(
+                        "Indexed main table "
+                                + tableBucket
+                                + " has invalid allIndexPushedOffset "
+                                + currentOffset);
+            }
+            indexPushedOffset = currentOffset;
+        }
         return new TabletState(
                 base.getFlushedLogOffset(),
                 base.getRowCount(),
-                offset >= 0 ? offset : null,
+                indexPushedOffset,
                 base.getAutoIncIDRanges());
     }
 

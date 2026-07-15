@@ -104,6 +104,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
@@ -571,6 +572,54 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(f.replica.isIndexReplicatorInitDeferred())
                 .as("deferred flag must be raised")
                 .isTrue();
+        assertThat(f.replica.getAllIndexPushedOffset())
+                .as("an indexed main table must retain source WAL from offset zero while deferred")
+                .isZero();
+        assertThat(f.replica.getSyncIndexPushedOffset())
+                .as("the first SYNC write must wait beyond the offset-zero baseline")
+                .isZero();
+    }
+
+    @Test
+    void testSnapshotBeforeIndexReplicatorRetainsSourceWalFromZero(@TempDir Path snapshotDir)
+            throws Exception {
+        TestSnapshotContext snapshotContext = new TestSnapshotContext(snapshotDir.toString());
+        IndexedFixture f = setupIndexedMainTableReplica(snapshotContext);
+        TableBucket sourceBucket = new TableBucket(f.mainTableId, 0);
+
+        makeIndexedMainReplicaAsLeader(f, 0);
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        putRecordsToLeader(
+                f.replica,
+                org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch(
+                        new Object[] {1, "before-snapshot"}));
+        long expectedLogOffset = f.replica.getLocalLogEndOffset();
+        assertThat(expectedLogOffset).isPositive();
+
+        makeIndexedMainReplicaAsFollower(f, 1);
+        assertThat(f.replica.isLeader()).isFalse();
+        assertThat(f.replica.getKvTablet()).isNull();
+
+        AtomicReference<CompletedSnapshot> snapshotTakenBeforeReplicator = new AtomicReference<>();
+        f.replica.setKvSnapshotInitializationFaultInjector(
+                manager -> {
+                    assertThat(f.replica.getIndexReplicator()).isNull();
+                    manager.triggerSnapshot();
+                    snapshotTakenBeforeReplicator.set(
+                            snapshotContext.testKvSnapshotStore.waitUntilSnapshotComplete(
+                                    sourceBucket, 0));
+                });
+
+        makeIndexedMainReplicaAsLeader(f, 2);
+
+        CompletedSnapshot snapshot = snapshotTakenBeforeReplicator.get();
+        assertThat(snapshot).isNotNull();
+        assertThat(snapshot.getLogOffset()).isEqualTo(expectedLogOffset);
+        assertThat(snapshot.getIndexPushedOffset()).isEqualTo(0L);
+        assertThat(snapshot.getMinRetainLogOffset()).isZero();
+        assertThat(f.replica.getLogTablet().getMinRetainOffset()).isZero();
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
     }
 
     @Test
@@ -1487,6 +1536,11 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     private IndexedFixture setupIndexedMainTableReplica() throws Exception {
+        return setupIndexedMainTableReplica(null);
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica(TestSnapshotContext snapshotContext)
+            throws Exception {
         String indexName = "idx_b";
         String mainName = "test_indexed_main";
         long mainTableId = 9001L;
@@ -1552,7 +1606,14 @@ final class ReplicaTest extends ReplicaTestBase {
         }
 
         TableBucket mainBucket = new TableBucket(mainTableId, 0);
-        Replica replica = makeKvReplica(PhysicalTablePath.of(mainPath), mainBucket, mainTableInfo);
+        Replica replica =
+                snapshotContext == null
+                        ? makeKvReplica(PhysicalTablePath.of(mainPath), mainBucket, mainTableInfo)
+                        : makeKvReplica(
+                                PhysicalTablePath.of(mainPath),
+                                mainBucket,
+                                snapshotContext,
+                                mainTableInfo);
         return new IndexedFixture(
                 replica, mainPath, mainTableId, indexPath, indexTableId, indexTableInfo);
     }
@@ -1572,6 +1633,23 @@ final class ReplicaTest extends ReplicaTestBase {
                                 TABLET_SERVER_ID,
                                 leaderEpoch,
                                 Collections.singletonList(TABLET_SERVER_ID),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                leaderEpoch)));
+    }
+
+    private void makeIndexedMainReplicaAsFollower(IndexedFixture f, int leaderEpoch) {
+        int remoteLeader = TABLET_SERVER_ID + 1;
+        List<Integer> replicas = Arrays.asList(TABLET_SERVER_ID, remoteLeader);
+        f.replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(f.mainPath),
+                        new TableBucket(f.mainTableId, 0),
+                        replicas,
+                        new LeaderAndIsr(
+                                remoteLeader,
+                                leaderEpoch,
+                                replicas,
                                 Collections.emptyList(),
                                 INITIAL_COORDINATOR_EPOCH,
                                 leaderEpoch)));

@@ -521,6 +521,15 @@ public class ReplicaTestBase {
         return makeReplica(physicalTablePath, tableBucket, true, null, tableInfo);
     }
 
+    protected Replica makeKvReplica(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            SnapshotContext snapshotContext,
+            TableInfo tableInfo)
+            throws Exception {
+        return makeReplica(physicalTablePath, tableBucket, true, snapshotContext, tableInfo);
+    }
+
     private Replica makeReplica(
             PhysicalTablePath physicalTablePath,
             TableBucket tableBucket,
