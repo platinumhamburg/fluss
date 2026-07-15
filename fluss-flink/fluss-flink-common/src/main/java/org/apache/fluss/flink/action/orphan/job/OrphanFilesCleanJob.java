@@ -52,9 +52,9 @@ public final class OrphanFilesCleanJob {
      * @param env the Flink execution environment (caller configures classpath, etc.)
      * @param config parsed orphan cleanup configuration
      * @param parallelism the parallelism for Stage 2 (ScanAndClean); null uses env default
-     * @return the final cleanup statistics
+     * @return the final cleanup report
      */
-    public static CleanStats execute(
+    public static CleanupReport execute(
             StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism)
             throws Exception {
         env.setRuntimeMode(RuntimeExecutionMode.BATCH);
@@ -84,26 +84,28 @@ public final class OrphanFilesCleanJob {
         }
 
         // Stage 3: StatsAggregate (parallelism=1)
-        SingleOutputStreamOperator<CleanStats> result =
+        SingleOutputStreamOperator<CleanupReport> result =
                 stats.transform(
                                 "StatsAggregate",
-                                TypeInformation.of(new TypeHint<CleanStats>() {}),
+                                TypeInformation.of(new TypeHint<CleanupReport>() {}),
                                 new StatsAggregateOperator(config.dryRun()))
                         .setParallelism(1)
                         .setMaxParallelism(1);
 
         // Execute and collect the single result
-        List<CleanStats> collected = collectResults(result);
+        List<CleanupReport> collected = collectResults(result);
         if (collected.isEmpty()) {
-            return CleanStats.empty();
+            return CleanupReport.aggregate(
+                    Collections.emptyList(), Collections.emptyList(), config.dryRun());
         }
         return collected.get(0);
     }
 
     @SuppressWarnings("deprecation")
-    private static List<CleanStats> collectResults(DataStream<CleanStats> result) throws Exception {
-        Iterator<CleanStats> iterator = result.executeAndCollect("OrphanFilesClean");
-        List<CleanStats> results = new java.util.ArrayList<CleanStats>();
+    private static List<CleanupReport> collectResults(DataStream<CleanupReport> result)
+            throws Exception {
+        Iterator<CleanupReport> iterator = result.executeAndCollect("OrphanFilesClean");
+        List<CleanupReport> results = new java.util.ArrayList<CleanupReport>();
         while (iterator.hasNext()) {
             results.add(iterator.next());
         }
