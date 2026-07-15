@@ -49,10 +49,18 @@ class KvSnapshotFileRuleTest {
 
     @Test
     void keepsActiveSnapshotFile() {
-        FileMeta file = file("/kv/db/t-1/0/snap-5/001.sst", NOW - 2 * DAY_MS);
+        FileMeta file = file("/kv/db/t-1/0/snap-5/001.sst", Long.MAX_VALUE);
 
         assertThat(rule.evaluate(file, kvActiveSnapDirs("snap-5"), CUTOFF_MS))
                 .isEqualTo(Decision.KEEP_ACTIVE);
+    }
+
+    @Test
+    void reportsUnavailableMtimeForKnownInactiveSnapshotFile() {
+        FileMeta file = file("/kv/db/t-1/0/snap-5/001.sst", Long.MAX_VALUE);
+
+        assertThat(rule.evaluate(file, BucketActiveRefs.empty(), CUTOFF_MS))
+                .isEqualTo(Decision.MTIME_UNAVAILABLE);
     }
 
     @Test

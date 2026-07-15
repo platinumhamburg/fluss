@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 
 import org.junit.jupiter.api.Test;
 
@@ -68,5 +69,51 @@ class CleanupReportTest {
                                         true))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("dry-run report contains actual deletion counters");
+    }
+
+    @Test
+    void unavailableMtimeIsActionRequiredAndKeepsPlanEmpty() {
+        ScopeIdentity scope = ScopeIdentity.table("db", "orders", 7L);
+        RuleDecisionCounters decisions =
+                RuleDecisionCounters.scanned(256L).add(RuleDecisionCounters.mtimeUnavailable(256L));
+        CleanStats stats =
+                CleanStats.builder(scope)
+                        .scanned(CleanupObjectType.LOG_SEGMENT, 1L)
+                        .skipped(SkipReasonCode.MTIME_UNAVAILABLE, 2L)
+                        .ruleDecision(CleanupObjectType.LOG_SEGMENT, decisions)
+                        .build();
+
+        CleanupReport report =
+                CleanupReport.aggregate(
+                        Collections.emptyList(), Collections.singletonList(stats), true);
+
+        assertThat(report.global().plannedFiles()).isZero();
+        assertThat(report.global().plannedDirs()).isZero();
+        assertThat(report.global().deletedFiles()).isZero();
+        assertThat(report.mtimeUnavailableFiles()).isEqualTo(1L);
+        assertThat(report.mtimeUnavailableBytes()).isEqualTo(256L);
+        assertThat(report.mtimeUnavailableDirs()).isEqualTo(1L);
+        assertThat(report.coverageComplete()).isFalse();
+        assertThat(report.ruleCountersConsistent()).isTrue();
+    }
+
+    @Test
+    void unavailableMtimeReasonAndRuleCountersMustReconcile() {
+        ScopeIdentity scope = ScopeIdentity.table("db", "orders", 7L);
+        CleanStats stats =
+                CleanStats.builder(scope)
+                        .scanned(CleanupObjectType.LOG_SEGMENT, 1L)
+                        .ruleDecision(
+                                CleanupObjectType.LOG_SEGMENT,
+                                RuleDecisionCounters.scanned(256L)
+                                        .add(RuleDecisionCounters.mtimeUnavailable(256L)))
+                        .build();
+
+        CleanupReport report =
+                CleanupReport.aggregate(
+                        Collections.emptyList(), Collections.singletonList(stats), true);
+
+        assertThat(report.mtimeUnavailableDirs()).isEqualTo(-1L);
+        assertThat(report.ruleCountersConsistent()).isFalse();
     }
 }

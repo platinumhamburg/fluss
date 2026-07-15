@@ -28,6 +28,7 @@ import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
+import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
@@ -137,7 +138,8 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         audit,
                         task.cutoffMillis(),
                         remoteFsOpRateLimiter,
-                        task.dryRun());
+                        task.dryRun(),
+                        task.scope());
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
@@ -176,14 +178,21 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
         remoteFsOpRateLimiter.acquire();
         FileStatus rootStatus = fs.getFileStatus(dirPath);
+        long rootModificationTime = rootStatus.getModificationTime();
+        if (MtimePolicy.isUnavailable(rootModificationTime)) {
+            stats.skipped(SkipReasonCode.MTIME_UNAVAILABLE, 1L);
+            audit.logMtimeUnavailableOnce(
+                    task.scope(), CleanupObjectType.DIRECTORY, "directory", dirPath.getName());
+        }
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
         stack.push(
                 new DirVisit(
                         dirPath,
                         false,
                         rootStatus.isDir()
-                                && rootStatus.getModificationTime() < task.cutoffMillis(),
-                        rootStatus.getModificationTime(),
+                                && MtimePolicy.isOlderThanCutoff(
+                                        rootModificationTime, task.cutoffMillis()),
+                        rootModificationTime,
                         null));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
@@ -243,12 +252,22 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             for (FileStatus child : children) {
                 FsPath childPath = child.getPath();
                 if (child.isDir()) {
+                    long modificationTime = child.getModificationTime();
+                    if (MtimePolicy.isUnavailable(modificationTime)) {
+                        stats.skipped(SkipReasonCode.MTIME_UNAVAILABLE, 1L);
+                        audit.logMtimeUnavailableOnce(
+                                task.scope(),
+                                CleanupObjectType.DIRECTORY,
+                                "directory",
+                                childPath.getName());
+                    }
                     stack.push(
                             new DirVisit(
                                     childPath,
                                     false,
-                                    child.getModificationTime() < task.cutoffMillis(),
-                                    child.getModificationTime(),
+                                    MtimePolicy.isOlderThanCutoff(
+                                            modificationTime, task.cutoffMillis()),
+                                    modificationTime,
                                     visit));
                     continue;
                 }
@@ -258,15 +277,18 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.scanned(objectType, 1L);
                 stats.ruleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
-                if (child.getModificationTime() >= task.cutoffMillis()) {
-                    stats.ruleDecision(
-                            objectType, RuleDecisionCounters.newerThanCutoff(meta.size()));
-                    stats.skipped(SkipReasonCode.NEWER_THAN_CUTOFF, 1L);
-                    visit.hasRemainingChild = true;
-                    continue;
+                Decision decision;
+                if (MtimePolicy.isUnavailable(meta.modificationTime())) {
+                    decision =
+                            MtimePolicy.failClosed(
+                                    rule.evaluate(
+                                            meta, BucketActiveRefs.empty(), task.cutoffMillis()),
+                                    meta.modificationTime());
+                } else if (meta.modificationTime() >= task.cutoffMillis()) {
+                    decision = Decision.DEFER;
+                } else {
+                    decision = rule.evaluate(meta, BucketActiveRefs.empty(), task.cutoffMillis());
                 }
-                Decision decision =
-                        rule.evaluate(meta, BucketActiveRefs.empty(), task.cutoffMillis());
                 switch (decision) {
                     case DELETE:
                         stats.ruleDecision(objectType, RuleDecisionCounters.candidate(meta.size()));
@@ -291,6 +313,14 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         stats.ruleDecision(
                                 objectType, RuleDecisionCounters.keepActive(meta.size()));
                         stats.skipped(SkipReasonCode.KEEP_ACTIVE, 1L);
+                        visit.hasRemainingChild = true;
+                        break;
+                    case MTIME_UNAVAILABLE:
+                        stats.ruleDecision(
+                                objectType, RuleDecisionCounters.mtimeUnavailable(meta.size()));
+                        stats.skipped(SkipReasonCode.MTIME_UNAVAILABLE, 1L);
+                        audit.logMtimeUnavailableOnce(
+                                task.scope(), objectType, "file", meta.path().getName());
                         visit.hasRemainingChild = true;
                         break;
                     case DEFER:

@@ -99,4 +99,30 @@ public final class TableCleanupSummary implements Serializable {
     public Map<CleanupObjectType, RuleDecisionCounters> byRuleDecision() {
         return Collections.unmodifiableMap(byRuleDecision);
     }
+
+    public long mtimeUnavailableFiles() {
+        long total = 0L;
+        for (RuleDecisionCounters counters : byRuleDecision.values()) {
+            total += counters.mtimeUnavailableFiles();
+        }
+        return total;
+    }
+
+    public long mtimeUnavailableBytes() {
+        long total = 0L;
+        for (RuleDecisionCounters counters : byRuleDecision.values()) {
+            total += counters.mtimeUnavailableBytes();
+        }
+        return total;
+    }
+
+    public long mtimeUnavailableDirs() {
+        return bySkipReason.getOrDefault(SkipReasonCode.MTIME_UNAVAILABLE, 0L)
+                - mtimeUnavailableFiles();
+    }
+
+    public boolean mtimeCountersConsistent() {
+        return bySkipReason.getOrDefault(SkipReasonCode.MTIME_UNAVAILABLE, 0L)
+                >= mtimeUnavailableFiles();
+    }
 }
