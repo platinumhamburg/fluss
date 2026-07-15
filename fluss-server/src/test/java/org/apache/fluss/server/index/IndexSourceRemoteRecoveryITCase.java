@@ -118,122 +118,116 @@ class IndexSourceRemoteRecoveryITCase {
                     .setClusterConf(configuration())
                     .build();
 
-    private Fixture fixture;
-
     @Test
     void recoverAsyncIndexFromRawRemoteSourceWalAndContinueLocally() throws Throwable {
-        fixture = createFixture();
-        Set<Integer> stoppedServers = new LinkedHashSet<>();
-        ReplayGate replayGate = null;
-        Throwable primaryFailure = null;
-
-        try {
-            stopAndTrack(fixture.recoveryFollower, stoppedServers);
+        try (RemoteRecoveryFixture recovery = setUpRemoteRecovery()) {
+            recovery.stopServer(recovery.recoveryFollower);
             CLUSTER.waitUntilReplicaShrinkFromIsr(
-                    fixture.sourceTableBucket, fixture.recoveryFollower);
-            stopAndTrack(fixture.offlineFollower, stoppedServers);
+                    recovery.sourceTableBucket, recovery.recoveryFollower);
+            recovery.stopServer(recovery.offlineFollower);
             CLUSTER.waitUntilReplicaShrinkFromIsr(
-                    fixture.sourceTableBucket, fixture.offlineFollower);
+                    recovery.sourceTableBucket, recovery.offlineFollower);
 
             Map<Integer, String> expectedRows = new LinkedHashMap<>();
             for (int key = 0; key < BASELINE_ROW_COUNT; key++) {
-                putSourceRow(fixture.sourceLeader, key, fixture.firstIndexValue);
-                expectedRows.put(key, fixture.firstIndexValue);
+                putSourceRow(recovery, recovery.sourceLeader, key, recovery.firstIndexValue);
+                expectedRows.put(key, recovery.firstIndexValue);
             }
-            waitForExactPhysicalRows(expectedRows);
+            waitForExactPhysicalRows(recovery, expectedRows);
             waitUntil(
                     () ->
-                            fixture.sourceReplica.getAllIndexPushedOffset()
-                                    == fixture.sourceReplica.getLocalLogEndOffset(),
+                            recovery.sourceReplica.getAllIndexPushedOffset()
+                                    == recovery.sourceReplica.getLocalLogEndOffset(),
                     TIMEOUT,
                     "wait for the exact baseline index prefix");
-            long baselinePushedOffset = fixture.sourceReplica.getLocalLogEndOffset();
+            long baselinePushedOffset = recovery.sourceReplica.getLocalLogEndOffset();
             assertThat(baselinePushedOffset).isPositive();
-            assertThat(fixture.sourceReplica.getAllIndexPushedOffset())
+            assertThat(recovery.sourceReplica.getAllIndexPushedOffset())
                     .as("the conservative baseline must cover the complete first source prefix")
                     .isEqualTo(baselinePushedOffset);
 
-            CompletedSnapshot snapshot = CLUSTER.triggerAndWaitSnapshot(fixture.sourceTableBucket);
+            CompletedSnapshot snapshot =
+                    CLUSTER.triggerAndWaitSnapshot(recovery.sourceTableBucket);
             assertThat(snapshot.getLogOffset()).isEqualTo(baselinePushedOffset);
             assertThat(snapshot.getIndexPushedOffset())
                     .as("the source snapshot must persist the exact conservative index prefix")
                     .isEqualTo(baselinePushedOffset);
 
-            IndexReplicator oldReplicator = fixture.sourceReplica.getIndexReplicator();
+            IndexReplicator oldReplicator = recovery.sourceReplica.getIndexReplicator();
             assertThat(oldReplicator).isNotNull();
             oldReplicator.close();
             assertThat(oldReplicator.isClosed()).isTrue();
-            sourceTabletServer(fixture.sourceLeader)
+            sourceTabletServer(recovery.sourceLeader)
                     .getReplicaManager()
                     .getIndexReplicatorPool()
-                    .unregister(fixture.sourceTableBucket);
-            assertThat(fixture.sourceReplica.getIndexReplicator())
+                    .unregister(recovery.sourceTableBucket);
+            assertThat(recovery.sourceReplica.getIndexReplicator())
                     .as("the retired source controller must still identify the exact old run")
                     .isSameAs(oldReplicator);
 
             for (int key = 0; key < UPDATED_ROW_COUNT; key++) {
-                putSourceRow(fixture.sourceLeader, key, fixture.secondIndexValue);
-                expectedRows.put(key, fixture.secondIndexValue);
+                putSourceRow(recovery, recovery.sourceLeader, key, recovery.secondIndexValue);
+                expectedRows.put(key, recovery.secondIndexValue);
             }
             int replayInsertEnd = BASELINE_ROW_COUNT + REPLAY_INSERT_COUNT;
             for (int key = BASELINE_ROW_COUNT; key < replayInsertEnd; key++) {
-                putSourceRow(fixture.sourceLeader, key, fixture.secondIndexValue);
-                expectedRows.put(key, fixture.secondIndexValue);
+                putSourceRow(recovery, recovery.sourceLeader, key, recovery.secondIndexValue);
+                expectedRows.put(key, recovery.secondIndexValue);
             }
-            waitForSourceCommit(fixture.sourceReplica);
-            long committedSourceEnd = fixture.sourceReplica.getLocalLogEndOffset();
+            waitForSourceCommit(recovery.sourceReplica);
+            long committedSourceEnd = recovery.sourceReplica.getLocalLogEndOffset();
             assertThat(committedSourceEnd).isGreaterThan(baselinePushedOffset);
-            assertThat(fixture.sourceReplica.getAllIndexPushedOffset())
+            assertThat(recovery.sourceReplica.getAllIndexPushedOffset())
                     .as("the closed old run must not advance over the second source prefix")
                     .isEqualTo(baselinePushedOffset);
 
-            LogTablet sourceLog = fixture.sourceReplica.getLogTablet();
+            LogTablet sourceLog = recovery.sourceReplica.getLogTablet();
             sourceLog.roll(Optional.empty());
             assertThat(sourceLog.activeLogSegment().getBaseOffset())
                     .as("the explicit roll must close the complete committed replay range")
                     .isEqualTo(committedSourceEnd);
             waitForRawRemoteReplayCoverage(
-                    fixture.sourceReplica, baselinePushedOffset, committedSourceEnd);
+                    recovery, recovery.sourceReplica, baselinePushedOffset, committedSourceEnd);
 
-            startAndUntrack(fixture.recoveryFollower, stoppedServers);
+            recovery.startServer(recovery.recoveryFollower);
             CLUSTER.waitUntilReplicaExpandToIsr(
-                    fixture.sourceTableBucket, fixture.recoveryFollower);
+                    recovery.sourceTableBucket, recovery.recoveryFollower);
             Replica recoveryFollowerReplica =
                     CLUSTER.waitAndGetFollowerReplica(
-                            fixture.sourceTableBucket, fixture.recoveryFollower);
+                            recovery.sourceTableBucket, recovery.recoveryFollower);
             long followerLocalStart = recoveryFollowerReplica.getLogTablet().localLogStartOffset();
             assertThat(followerLocalStart)
                     .as("the selected recovery follower must have discarded the baseline range")
                     .isGreaterThan(baselinePushedOffset);
 
-            assertThat(CLUSTER.waitAndGetLeader(fixture.gatedTargetBucket))
+            assertThat(CLUSTER.waitAndGetLeader(recovery.gatedTargetBucket))
                     .as("the gated target must remain led by the target-only server")
-                    .isEqualTo(fixture.targetOnlyServer);
-            Replica gatedTargetReplica = CLUSTER.waitAndGetLeaderReplica(fixture.gatedTargetBucket);
-            WriterKey writerKey = IndexWriterKey.encode(fixture.sourceTableBucket);
-            replayGate = new ReplayGate(gatedTargetReplica, writerKey, baselinePushedOffset);
+                    .isEqualTo(recovery.targetOnlyServer);
+            Replica gatedTargetReplica = CLUSTER.waitAndGetLeaderReplica(recovery.gatedTargetBucket);
+            WriterKey writerKey = IndexWriterKey.encode(recovery.sourceTableBucket);
+            recovery.installReplayGate(gatedTargetReplica, writerKey, baselinePushedOffset);
 
-            TabletServer recoveryTabletServer = sourceTabletServer(fixture.recoveryFollower);
+            TabletServer recoveryTabletServer = sourceTabletServer(recovery.recoveryFollower);
             TabletServerMetricGroup recoveryMetrics =
                     recoveryTabletServer.getReplicaManager().getServerMetricGroup();
             long remoteBytesBefore = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
 
-            stopAndTrack(fixture.sourceLeader, stoppedServers);
+            recovery.stopServer(recovery.sourceLeader);
             waitUntil(
                     () ->
-                            CLUSTER.waitAndGetLeader(fixture.sourceTableBucket)
-                                    == fixture.recoveryFollower,
+                            CLUSTER.waitAndGetLeader(recovery.sourceTableBucket)
+                                    == recovery.recoveryFollower,
                     TIMEOUT,
                     "wait for the exact remote-recovery follower to lead the source bucket");
-            Replica newSourceReplica = CLUSTER.waitAndGetLeaderReplica(fixture.sourceTableBucket);
-            assertThat(CLUSTER.waitAndGetLeader(fixture.sourceTableBucket))
-                    .isEqualTo(fixture.recoveryFollower);
+            Replica newSourceReplica = CLUSTER.waitAndGetLeaderReplica(recovery.sourceTableBucket);
+            assertThat(CLUSTER.waitAndGetLeader(recovery.sourceTableBucket))
+                    .isEqualTo(recovery.recoveryFollower);
             waitUntil(
                     () -> newSourceReplica.getIndexReplicator() != null,
                     TIMEOUT,
                     "wait for the recovered source IndexReplicator");
 
-            replayGate.awaitAdmission();
+            recovery.replayGate().awaitAdmission();
             long remoteBytesWhileAckHeld = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
             assertThat(newSourceReplica.getLogTablet().localLogStartOffset())
                     .as("the replay start must be unavailable from local source WAL")
@@ -245,20 +239,22 @@ class IndexSourceRemoteRecoveryITCase {
                     .as("raw remote source bytes must be consumed before target progress advances")
                     .isGreaterThan(remoteBytesBefore);
 
-            replayGate.release();
+            recovery.replayGate().release();
             waitUntil(
                     () -> newSourceReplica.getAllIndexPushedOffset() == committedSourceEnd,
                     TIMEOUT,
                     "wait for exact recovered source replay progress");
             assertThat(newSourceReplica.getAllIndexPushedOffset()).isEqualTo(committedSourceEnd);
-            assertExactIndexProjection(expectedRows);
-            assertIndexKeyAbsent(fixture.firstIndexValue, 0, "known stale pre-update key");
+            assertExactIndexProjection(recovery, expectedRows);
             assertIndexKeyAbsent(
-                    fixture.secondIndexValue, NEVER_WRITTEN_KEY, "never-written index key");
+                    recovery, recovery.firstIndexValue, 0, "known stale pre-update key");
+            assertIndexKeyAbsent(
+                    recovery, recovery.secondIndexValue, NEVER_WRITTEN_KEY, "never-written index key");
 
             int continuationKey = replayInsertEnd;
-            putSourceRow(fixture.recoveryFollower, continuationKey, fixture.firstIndexValue);
-            expectedRows.put(continuationKey, fixture.firstIndexValue);
+            putSourceRow(
+                    recovery, recovery.recoveryFollower, continuationKey, recovery.firstIndexValue);
+            expectedRows.put(continuationKey, recovery.firstIndexValue);
             waitForSourceCommit(newSourceReplica);
             long continuationEnd = newSourceReplica.getLocalLogEndOffset();
             assertThat(continuationEnd).isGreaterThan(committedSourceEnd);
@@ -267,42 +263,25 @@ class IndexSourceRemoteRecoveryITCase {
                     TIMEOUT,
                     "wait for exact local continuation progress");
             assertThat(newSourceReplica.getAllIndexPushedOffset()).isEqualTo(continuationEnd);
-            assertExactIndexProjection(expectedRows);
+            assertExactIndexProjection(recovery, expectedRows);
 
             LOG.info(
                     "Task 7 evidence: roles sourceLeader={}, recoveryFollower={}, "
                             + "offlineFollower={}, targetOnly={}, targetBucket={}; "
                             + "baseline={}, committedEnd={}, followerLocalStart={}, "
                             + "replaySequence={}, remoteBytes={}->{}, continuationEnd={}",
-                    fixture.sourceLeader,
-                    fixture.recoveryFollower,
-                    fixture.offlineFollower,
-                    fixture.targetOnlyServer,
-                    fixture.gatedTargetBucket,
+                    recovery.sourceLeader,
+                    recovery.recoveryFollower,
+                    recovery.offlineFollower,
+                    recovery.targetOnlyServer,
+                    recovery.gatedTargetBucket,
                     baselinePushedOffset,
                     committedSourceEnd,
                     followerLocalStart,
-                    replayGate.admittedSequence(),
+                    recovery.replayGate().admittedSequence(),
                     remoteBytesBefore,
                     remoteBytesWhileAckHeld,
                     continuationEnd);
-        } catch (Throwable failure) {
-            primaryFailure = failure;
-            throw failure;
-        } finally {
-            List<Throwable> cleanupFailures = new ArrayList<>();
-            if (replayGate != null) {
-                replayGate.release();
-            }
-            ReplayGate finalReplayGate = replayGate;
-            cleanup(cleanupFailures, () -> closeGate(finalReplayGate));
-            for (int stoppedServer : new LinkedHashSet<>(stoppedServers)) {
-                cleanup(cleanupFailures, () -> startAndUntrack(stoppedServer, stoppedServers));
-            }
-            cleanup(
-                    cleanupFailures,
-                    () -> CLUSTER.assertHasTabletServerNumber(TABLET_SERVER_COUNT));
-            reportCleanupFailures(primaryFailure, cleanupFailures);
         }
     }
 
@@ -320,7 +299,7 @@ class IndexSourceRemoteRecoveryITCase {
         return conf;
     }
 
-    private static Fixture createFixture() throws Exception {
+    private static RemoteRecoveryFixture setUpRemoteRecovery() throws Exception {
         String tableName = "source_remote_recovery_" + System.nanoTime();
         TablePath mainPath = TablePath.of("task7", tableName);
         TablePath indexPath =
@@ -446,7 +425,7 @@ class IndexSourceRemoteRecoveryITCase {
                 gatedTargetBucket,
                 firstIndexValue,
                 secondIndexValue);
-        return new Fixture(
+        return new RemoteRecoveryFixture(
                 mainTableId,
                 indexTableId,
                 sourceTableBucket,
@@ -460,12 +439,14 @@ class IndexSourceRemoteRecoveryITCase {
                 sourceReplica);
     }
 
-    private void putSourceRow(int sourceLeader, int key, String indexedValue) throws Exception {
+    private static void putSourceRow(
+            RemoteRecoveryFixture recovery, int sourceLeader, int key, String indexedValue)
+            throws Exception {
         TabletServerGateway gateway = CLUSTER.newTabletServerClientForNode(sourceLeader);
         PutKvResponse response =
                 gateway.putKv(
                                 newPutKvRequest(
-                                                fixture.mainTableId,
+                                                recovery.mainTableId,
                                                 0,
                                                 1,
                                                 genKvRecordBatch(new Object[] {key, indexedValue}))
@@ -486,12 +467,15 @@ class IndexSourceRemoteRecoveryITCase {
                 .isEqualTo(sourceReplica.getLocalLogEndOffset());
     }
 
-    private void waitForRawRemoteReplayCoverage(
-            Replica sourceReplica, long baselinePushedOffset, long committedSourceEnd) {
+    private static void waitForRawRemoteReplayCoverage(
+            RemoteRecoveryFixture recovery,
+            Replica sourceReplica,
+            long baselinePushedOffset,
+            long committedSourceEnd) {
         LogTablet sourceLog = sourceReplica.getLogTablet();
         RemoteLogManager remoteLogManager =
-                sourceTabletServer(fixture.sourceLeader).getReplicaManager().getRemoteLogManager();
-        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(fixture.sourceTableBucket);
+                sourceTabletServer(recovery.sourceLeader).getReplicaManager().getRemoteLogManager();
+        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(recovery.sourceTableBucket);
         LOG.info(
                 "Task 7 initial remote coverage state: {}",
                 safeRemoteCoverageState(
@@ -618,13 +602,14 @@ class IndexSourceRemoteRecoveryITCase {
                 .collect(Collectors.toList());
     }
 
-    private void waitForExactPhysicalRows(Map<Integer, String> expectedRows) throws Exception {
-        int schemaId = liveIndexTableInfo().getSchemaId();
+    private static void waitForExactPhysicalRows(
+            RemoteRecoveryFixture recovery, Map<Integer, String> expectedRows) throws Exception {
+        int schemaId = liveIndexTableInfo(recovery).getSchemaId();
         for (Map.Entry<Integer, String> expectedRow : expectedRows.entrySet()) {
             PhysicalIndexRow physical =
                     physicalIndexRow(expectedRow.getKey(), expectedRow.getValue(), schemaId);
             TableBucket target =
-                    new TableBucket(fixture.indexTableId, indexBucket(expectedRow.getValue()));
+                    new TableBucket(recovery.indexTableId, indexBucket(expectedRow.getValue()));
             waitUntil(
                     () -> {
                         byte[] value =
@@ -638,22 +623,23 @@ class IndexSourceRemoteRecoveryITCase {
         }
     }
 
-    private void assertExactIndexProjection(Map<Integer, String> expectedRows) throws Exception {
-        int schemaId = liveIndexTableInfo().getSchemaId();
-        Map<TableBucket, Map<String, String>> expected = emptyIndexProjection();
+    private static void assertExactIndexProjection(
+            RemoteRecoveryFixture recovery, Map<Integer, String> expectedRows) throws Exception {
+        int schemaId = liveIndexTableInfo(recovery).getSchemaId();
+        Map<TableBucket, Map<String, String>> expected = emptyIndexProjection(recovery);
         for (Map.Entry<Integer, String> sourceRow : expectedRows.entrySet()) {
             PhysicalIndexRow physical =
                     physicalIndexRow(sourceRow.getKey(), sourceRow.getValue(), schemaId);
             TableBucket bucket =
-                    new TableBucket(fixture.indexTableId, indexBucket(sourceRow.getValue()));
+                    new TableBucket(recovery.indexTableId, indexBucket(sourceRow.getValue()));
             String previous =
                     expected.get(bucket).put(encode(physical.key), encode(physical.value));
             assertThat(previous).as("physical index keys must be unique").isNull();
         }
 
-        Map<TableBucket, Map<String, String>> actual = emptyIndexProjection();
+        Map<TableBucket, Map<String, String>> actual = emptyIndexProjection(recovery);
         for (int bucket = 0; bucket < INDEX_BUCKET_COUNT; bucket++) {
-            TableBucket tableBucket = new TableBucket(fixture.indexTableId, bucket);
+            TableBucket tableBucket = new TableBucket(recovery.indexTableId, bucket);
             Replica replica = CLUSTER.waitAndGetLeaderReplica(tableBucket);
             replica.getKvTablet().flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
             try (ReadOptions readOptions = new ReadOptions();
@@ -679,11 +665,12 @@ class IndexSourceRemoteRecoveryITCase {
                 .isEqualTo(expected);
     }
 
-    private void assertIndexKeyAbsent(String indexedValue, int primaryKey, String description)
+    private static void assertIndexKeyAbsent(
+            RemoteRecoveryFixture recovery, String indexedValue, int primaryKey, String description)
             throws Exception {
         PhysicalIndexRow physical =
-                physicalIndexRow(primaryKey, indexedValue, liveIndexTableInfo().getSchemaId());
-        TableBucket target = new TableBucket(fixture.indexTableId, indexBucket(indexedValue));
+                physicalIndexRow(primaryKey, indexedValue, liveIndexTableInfo(recovery).getSchemaId());
+        TableBucket target = new TableBucket(recovery.indexTableId, indexBucket(indexedValue));
         assertThat(
                         CLUSTER.waitAndGetLeaderReplica(target)
                                 .lookups(Collections.singletonList(physical.key))
@@ -692,15 +679,16 @@ class IndexSourceRemoteRecoveryITCase {
                 .isNull();
     }
 
-    private TableInfo liveIndexTableInfo() {
-        return CLUSTER.waitAndGetLeaderReplica(new TableBucket(fixture.indexTableId, 0))
+    private static TableInfo liveIndexTableInfo(RemoteRecoveryFixture recovery) {
+        return CLUSTER.waitAndGetLeaderReplica(new TableBucket(recovery.indexTableId, 0))
                 .getTableInfo();
     }
 
-    private Map<TableBucket, Map<String, String>> emptyIndexProjection() {
+    private static Map<TableBucket, Map<String, String>> emptyIndexProjection(
+            RemoteRecoveryFixture recovery) {
         Map<TableBucket, Map<String, String>> projection = new LinkedHashMap<>();
         for (int bucket = 0; bucket < INDEX_BUCKET_COUNT; bucket++) {
-            projection.put(new TableBucket(fixture.indexTableId, bucket), new LinkedHashMap<>());
+            projection.put(new TableBucket(recovery.indexTableId, bucket), new LinkedHashMap<>());
         }
         return projection;
     }
@@ -864,7 +852,7 @@ class IndexSourceRemoteRecoveryITCase {
         }
     }
 
-    private static final class Fixture {
+    private static final class RemoteRecoveryFixture implements AutoCloseable {
         private final long mainTableId;
         private final long indexTableId;
         private final TableBucket sourceTableBucket;
@@ -876,8 +864,10 @@ class IndexSourceRemoteRecoveryITCase {
         private final String firstIndexValue;
         private final String secondIndexValue;
         private final Replica sourceReplica;
+        private final Set<Integer> stoppedServers = new LinkedHashSet<>();
+        @Nullable private ReplayGate replayGate;
 
-        private Fixture(
+        private RemoteRecoveryFixture(
                 long mainTableId,
                 long indexTableId,
                 TableBucket sourceTableBucket,
@@ -900,6 +890,40 @@ class IndexSourceRemoteRecoveryITCase {
             this.firstIndexValue = firstIndexValue;
             this.secondIndexValue = secondIndexValue;
             this.sourceReplica = sourceReplica;
+        }
+
+        private void stopServer(int serverId) throws Exception {
+            stopAndTrack(serverId, stoppedServers);
+        }
+
+        private void startServer(int serverId) throws Exception {
+            startAndUntrack(serverId, stoppedServers);
+        }
+
+        private ReplayGate installReplayGate(
+                Replica targetReplica, WriterKey writerKey, long baselineSequence) {
+            assertThat(replayGate).as("a replay gate may be installed only once").isNull();
+            replayGate = new ReplayGate(targetReplica, writerKey, baselineSequence);
+            return replayGate;
+        }
+
+        private ReplayGate replayGate() {
+            assertThat(replayGate).as("the replay gate must be installed").isNotNull();
+            return replayGate;
+        }
+
+        @Override
+        public void close() {
+            List<Throwable> failures = new ArrayList<>();
+            if (replayGate != null) {
+                replayGate.release();
+            }
+            cleanup(failures, () -> closeGate(replayGate));
+            for (int stoppedServer : new LinkedHashSet<>(stoppedServers)) {
+                cleanup(failures, () -> startAndUntrack(stoppedServer, stoppedServers));
+            }
+            cleanup(failures, () -> CLUSTER.assertHasTabletServerNumber(TABLET_SERVER_COUNT));
+            reportCleanupFailures(null, failures);
         }
     }
 }
