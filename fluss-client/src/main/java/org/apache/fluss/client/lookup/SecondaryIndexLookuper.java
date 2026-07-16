@@ -19,6 +19,7 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.utils.ValueEquality;
 
@@ -29,7 +30,9 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
@@ -42,8 +45,10 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * <p>Hop 1: prefix-scan the Index Table by the provided {@code lookupKey} to obtain candidate Index
  * Table rows (each carrying the base table's primary key in trailing positions).
  *
- * <p>Hop 2: for every candidate row, extract the basePK via {@code basePkExtractorFromIndexRow} and
- * point-get the main table. A main lookup returning an empty result list means the row was deleted
+ * <p>Hop 2: extract the logical basePK via {@code basePkExtractorFromIndexRow}, deduplicate
+ * physical candidates by that key, and point-get the main table once per key. The deduplication
+ * prevents old and new physical Index Table rows for a recreated partition from emitting the same
+ * current main row twice. A main lookup returning an empty result list means the row was deleted
  * (stale Index Table pointer) and is skipped from the aggregated output.
  *
  * <p>Recheck: after Hop 2 returns, every surviving main row is re-validated against the user's
@@ -65,7 +70,7 @@ public final class SecondaryIndexLookuper implements Lookuper {
     private final int[] idxColumnIndicesInMainRow;
     private final InternalRow.FieldGetter[] idxColumnGettersInLookupKey;
     private final InternalRow.FieldGetter[] idxColumnGettersInMainRow;
-    private final Function<InternalRow, InternalRow> basePkExtractorFromIndexRow;
+    private final Function<InternalRow, GenericRow> basePkExtractorFromIndexRow;
 
     public SecondaryIndexLookuper(
             Lookuper indexTablePrefixLookuper,
@@ -73,7 +78,7 @@ public final class SecondaryIndexLookuper implements Lookuper {
             int[] idxColumnIndicesInMainRow,
             InternalRow.FieldGetter[] idxColumnGettersInLookupKey,
             InternalRow.FieldGetter[] idxColumnGettersInMainRow,
-            Function<InternalRow, InternalRow> basePkExtractorFromIndexRow) {
+            Function<InternalRow, GenericRow> basePkExtractorFromIndexRow) {
         this.indexTablePrefixLookuper =
                 checkNotNull(indexTablePrefixLookuper, "indexTablePrefixLookuper");
         this.mainTablePointLookuper =
@@ -117,9 +122,12 @@ public final class SecondaryIndexLookuper implements Lookuper {
         }
         List<CompletableFuture<LookupResult>> mainFutures =
                 new ArrayList<>(candidateIndexRows.size());
+        Set<GenericRow> seenBasePrimaryKeys = new HashSet<>();
         for (InternalRow indexRow : candidateIndexRows) {
-            InternalRow basePk = basePkExtractorFromIndexRow.apply(indexRow);
-            mainFutures.add(mainTablePointLookuper.lookup(basePk));
+            GenericRow basePk = basePkExtractorFromIndexRow.apply(indexRow);
+            if (seenBasePrimaryKeys.add(basePk)) {
+                mainFutures.add(mainTablePointLookuper.lookup(basePk));
+            }
         }
         return CompletableFuture.allOf(mainFutures.toArray(new CompletableFuture[0]))
                 .thenApply(

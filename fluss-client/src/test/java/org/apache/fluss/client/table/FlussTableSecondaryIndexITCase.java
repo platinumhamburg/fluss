@@ -17,6 +17,8 @@
 
 package org.apache.fluss.client.table;
 
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
@@ -26,6 +28,8 @@ import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.PartitionInfo;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -33,6 +37,8 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.TimestampNtz;
+import org.apache.fluss.server.metadata.TabletServerMetadataCache;
+import org.apache.fluss.server.tablet.TabletServer;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
@@ -45,7 +51,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -304,6 +312,151 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             assertThat(charlieRow.getInt(0)).isEqualTo(3);
             assertThat(charlieRow.getString(2).toString()).isEqualTo("charlie@example.com");
             assertThat(charlieRow.getString(3).toString()).isEqualTo("2024");
+        }
+    }
+
+    @Test
+    void testPartitionRecreationWithStaleEmptyTombstoneReturnsOneRow() throws Exception {
+        TablePath tablePath = TablePath.of(DB, "test_partition_recreation_sec_idx_lookup");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("year", DataTypes.STRING())
+                        .column("payload", DataTypes.STRING())
+                        .primaryKey("id", "year")
+                        .index(
+                                "idx_name",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("name"),
+                                IndexVisibility.SYNC,
+                                1)
+                        .build();
+        long mainTableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder()
+                                .schema(schema)
+                                .distributedBy(1, "id")
+                                .partitionedBy("year")
+                                .build(),
+                        true);
+        TablePath indexTablePath =
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(tablePath.getTableName(), "idx_name"));
+        waitAllReplicasReady(admin.getTableInfo(indexTablePath).get().getTableId(), 1);
+
+        admin.createPartition(tablePath, newPartitionSpec("year", "2024"), false).get();
+        PartitionInfo oldPartition =
+                admin.listPartitionInfos(tablePath, newPartitionSpec("year", "2024")).get().get(0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTablePartitionReady(
+                mainTableId, oldPartition.getPartitionId());
+
+        try (Table table = conn.getTable(tablePath);
+                Table indexTable = conn.getTable(indexTablePath)) {
+            Lookuper rawIndexLookuper = indexTable.newLookup().lookupBy("name").createLookuper();
+
+            UpsertWriter writer = table.newUpsert().createWriter();
+            writer.upsert(row(1, "Alice", "2024", "old"));
+            writer.flush();
+            waitUntil(
+                    () -> rawIndexLookuper.lookup(row("Alice")).get().getRowList().size() == 1,
+                    INDEX_VISIBILITY_TIMEOUT,
+                    "wait for the old partition's physical index row");
+        }
+
+        admin.dropPartition(tablePath, newPartitionSpec("year", "2024"), false).get();
+        waitUntil(
+                () ->
+                        admin.listPartitionInfos(tablePath, newPartitionSpec("year", "2024"))
+                                .get()
+                                .isEmpty(),
+                INDEX_VISIBILITY_TIMEOUT,
+                "wait for the old partition metadata to be removed");
+        waitUntil(
+                () ->
+                        FLUSS_CLUSTER_EXTENSION.getTabletServers().stream()
+                                .allMatch(
+                                        server ->
+                                                server.getMetadataCache()
+                                                        .getInitializedPartitionTombstone(
+                                                                mainTableId)
+                                                        .map(
+                                                                tombstone ->
+                                                                        tombstone.isTombstoned(
+                                                                                oldPartition
+                                                                                        .getPartitionId()))
+                                                        .orElse(false)),
+                INDEX_VISIBILITY_TIMEOUT,
+                "wait for the dropped partition tombstone on every TabletServer");
+
+        admin.createPartition(tablePath, newPartitionSpec("year", "2024"), false).get();
+        PartitionInfo newPartition =
+                admin.listPartitionInfos(tablePath, newPartitionSpec("year", "2024")).get().get(0);
+        assertThat(newPartition.getPartitionId()).isNotEqualTo(oldPartition.getPartitionId());
+        FLUSS_CLUSTER_EXTENSION.waitUntilTablePartitionReady(
+                mainTableId, newPartition.getPartitionId());
+
+        try (Connection recreatedConnection = ConnectionFactory.createConnection(clientConf);
+                Table table = recreatedConnection.getTable(tablePath);
+                Table indexTable = recreatedConnection.getTable(indexTablePath)) {
+            Lookuper rawIndexLookuper = indexTable.newLookup().lookupBy("name").createLookuper();
+            Lookuper secondaryIndexLookuper =
+                    ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
+
+            UpsertWriter recreatedPartitionWriter = table.newUpsert().createWriter();
+            recreatedPartitionWriter.upsert(row(1, "Alice", "2024", "new"));
+            recreatedPartitionWriter.flush();
+            waitUntil(
+                    () -> {
+                        LookupResult result = secondaryIndexLookuper.lookup(row("Alice")).get();
+                        return result.getRowList().size() == 1;
+                    },
+                    INDEX_VISIBILITY_TIMEOUT,
+                    "wait for the recreated partition's index row");
+
+            Map<TabletServerMetadataCache, PartitionTombstone> originalTombstones = new HashMap<>();
+            for (TabletServer tabletServer : FLUSS_CLUSTER_EXTENSION.getTabletServers()) {
+                TabletServerMetadataCache cache = tabletServer.getMetadataCache();
+                PartitionTombstone original =
+                        cache.getInitializedPartitionTombstone(mainTableId)
+                                .orElseThrow(
+                                        () ->
+                                                new AssertionError(
+                                                        "partition tombstone must be initialized"));
+                originalTombstones.put(cache, original);
+            }
+            try {
+                PartitionTombstone staleEmptyTombstone =
+                        new PartitionTombstone(-1L, Collections.emptySet(), Long.MAX_VALUE);
+                for (TabletServerMetadataCache cache : originalTombstones.keySet()) {
+                    // Empty content has the same read behavior as a missing baseline. The high
+                    // version keeps background metadata publication from replacing this
+                    // deliberately stale content before both assertions complete.
+                    cache.updatePartitionTombstone(mainTableId, staleEmptyTombstone);
+                }
+
+                LookupResult physicalRows = rawIndexLookuper.lookup(row("Alice")).get();
+                assertThat(physicalRows.getRowList()).hasSize(2);
+                assertThat(physicalRows.getRowList())
+                        .extracting(indexRow -> indexRow.getLong(3))
+                        .containsExactlyInAnyOrder(
+                                oldPartition.getPartitionId(), newPartition.getPartitionId());
+
+                LookupResult result = secondaryIndexLookuper.lookup(row("Alice")).get();
+                assertThat(result.getRowList()).hasSize(1);
+                InternalRow currentRow = result.getRowList().get(0);
+                assertThat(currentRow.getInt(0)).isEqualTo(1);
+                assertThat(currentRow.getString(1).toString()).isEqualTo("Alice");
+                assertThat(currentRow.getString(2).toString()).isEqualTo("2024");
+                assertThat(currentRow.getString(3).toString()).isEqualTo("new");
+            } finally {
+                originalTombstones.forEach(
+                        (cache, tombstone) -> {
+                            cache.removePartitionTombstone(mainTableId);
+                            cache.updatePartitionTombstone(mainTableId, tombstone);
+                        });
+            }
         }
     }
 

@@ -114,8 +114,9 @@ public class FlussTable implements Table {
      * <ul>
      *   <li>Hop 1: prefix-scan the Index Table by the user-provided index-column key to retrieve
      *       candidate {@code (idxCols, basePK)} rows.
-     *   <li>Hop 2: point-get the main table for each candidate {@code basePK}. Rows that have been
-     *       deleted upstream are dropped (empty main lookup result).
+     *   <li>Hop 2: deduplicate candidates by logical {@code basePK}, then point-get the main table
+     *       once per distinct key. Rows that have been deleted upstream are dropped (empty main
+     *       lookup result).
      *   <li>Recheck: re-evaluate the index columns of every surviving main row against the lookup
      *       key values captured at lookup entry; rows that no longer match are discarded as stale
      *       index pointers.
@@ -178,7 +179,7 @@ public class FlussTable implements Table {
             basePkGettersInIndexRow[i] =
                     InternalRow.createFieldGetter(indexRowType.getTypeAt(posInIndex), posInIndex);
         }
-        Function<InternalRow, InternalRow> basePkExtractor =
+        Function<InternalRow, GenericRow> basePkExtractor =
                 indexRow -> {
                     GenericRow pk = new GenericRow(pkSize);
                     for (int i = 0; i < pkSize; i++) {

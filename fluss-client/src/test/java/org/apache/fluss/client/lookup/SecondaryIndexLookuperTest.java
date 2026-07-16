@@ -67,7 +67,7 @@ class SecondaryIndexLookuperTest {
                         new int[] {0},
                         new InternalRow.FieldGetter[] {row -> row},
                         new InternalRow.FieldGetter[] {row -> row},
-                        indexRow -> indexRow);
+                        indexRow -> (GenericRow) indexRow);
 
         LookupResult result = lookuper.lookup(expectedKey).get();
 
@@ -492,6 +492,132 @@ class SecondaryIndexLookuperTest {
     }
 
     @Test
+    void testDeduplicatesNonAdjacentPhysicalRowsByLogicalPrimaryKey() throws Exception {
+        GenericRow lookupKey = GenericRow.of("matched");
+
+        GenericRow oldPartitionRow = GenericRow.of("matched", 1, "2024", 10L);
+        GenericRow otherRow = GenericRow.of("matched", 2, "2024", 20L);
+        GenericRow recreatedPartitionRow = GenericRow.of("matched", 1, "2024", 30L);
+        GenericRow currentMainRow = GenericRow.of(1, "matched", "2024");
+        GenericRow otherMainRow = GenericRow.of(2, "matched", "2024");
+
+        StubLookuper indexLookuper =
+                new StubLookuper(
+                        key ->
+                                CompletableFuture.completedFuture(
+                                        new LookupResult(
+                                                Arrays.asList(
+                                                        oldPartitionRow,
+                                                        otherRow,
+                                                        recreatedPartitionRow))));
+        List<InternalRow> mainLookupKeys = new ArrayList<>();
+        StubLookuper mainLookuper =
+                new StubLookuper(
+                        key -> {
+                            mainLookupKeys.add(key);
+                            InternalRow mainRow =
+                                    key.getInt(0) == 1 ? currentMainRow : otherMainRow;
+                            return CompletableFuture.completedFuture(
+                                    new LookupResult(Collections.singletonList(mainRow)));
+                        });
+
+        SecondaryIndexLookuper lookuper =
+                new SecondaryIndexLookuper(
+                        indexLookuper,
+                        mainLookuper,
+                        new int[] {1},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(1)},
+                        SecondaryIndexLookuperTest::extractPartitionedBasePrimaryKey);
+
+        LookupResult result = lookuper.lookup(lookupKey).get();
+
+        assertThat(mainLookupKeys)
+                .containsExactly(GenericRow.of(1, "2024"), GenericRow.of(2, "2024"));
+        assertThat(result.getRowList()).containsExactly(currentMainRow, otherMainRow);
+    }
+
+    @Test
+    void testDeduplicatesBinaryPrimaryKeysByContent() throws Exception {
+        GenericRow lookupKey = GenericRow.of("matched");
+        GenericRow oldPartitionRow = GenericRow.of("matched", new byte[] {1, 2, 3}, 10L);
+        GenericRow recreatedPartitionRow = GenericRow.of("matched", new byte[] {1, 2, 3}, 20L);
+        GenericRow currentMainRow = GenericRow.of(new byte[] {1, 2, 3}, "matched");
+
+        StubLookuper indexLookuper =
+                new StubLookuper(
+                        key ->
+                                CompletableFuture.completedFuture(
+                                        new LookupResult(
+                                                Arrays.asList(
+                                                        oldPartitionRow, recreatedPartitionRow))));
+        AtomicInteger mainLookupCount = new AtomicInteger();
+        StubLookuper mainLookuper =
+                new StubLookuper(
+                        key -> {
+                            mainLookupCount.incrementAndGet();
+                            return CompletableFuture.completedFuture(
+                                    new LookupResult(Collections.singletonList(currentMainRow)));
+                        });
+
+        SecondaryIndexLookuper lookuper =
+                new SecondaryIndexLookuper(
+                        indexLookuper,
+                        mainLookuper,
+                        new int[] {1},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(1)},
+                        indexRow -> GenericRow.of(((GenericRow) indexRow).getField(1)));
+
+        LookupResult result = lookuper.lookup(lookupKey).get();
+
+        assertThat(mainLookupCount).hasValue(1);
+        assertThat(result.getRowList()).containsExactly(currentMainRow);
+    }
+
+    @Test
+    void testConcurrentLookupsKeepDeduplicationStatePerCall() throws Exception {
+        CompletableFuture<LookupResult> firstHop1 = new CompletableFuture<>();
+        CompletableFuture<LookupResult> secondHop1 = new CompletableFuture<>();
+        AtomicInteger hop1Invocation = new AtomicInteger();
+        StubLookuper indexLookuper =
+                new StubLookuper(
+                        key -> hop1Invocation.getAndIncrement() == 0 ? firstHop1 : secondHop1);
+
+        GenericRow currentMainRow = GenericRow.of(1, "matched", "2024");
+        AtomicInteger mainLookupCount = new AtomicInteger();
+        StubLookuper mainLookuper =
+                new StubLookuper(
+                        key -> {
+                            mainLookupCount.incrementAndGet();
+                            return CompletableFuture.completedFuture(
+                                    new LookupResult(Collections.singletonList(currentMainRow)));
+                        });
+        SecondaryIndexLookuper lookuper =
+                new SecondaryIndexLookuper(
+                        indexLookuper,
+                        mainLookuper,
+                        new int[] {1},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
+                        new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(1)},
+                        SecondaryIndexLookuperTest::extractPartitionedBasePrimaryKey);
+
+        CompletableFuture<LookupResult> firstResult = lookuper.lookup(GenericRow.of("matched"));
+        CompletableFuture<LookupResult> secondResult = lookuper.lookup(GenericRow.of("matched"));
+        List<InternalRow> duplicatePhysicalRows =
+                Arrays.asList(
+                        GenericRow.of("matched", 1, "2024", 10L),
+                        GenericRow.of("matched", 1, "2024", 20L));
+
+        secondHop1.complete(new LookupResult(duplicatePhysicalRows));
+        firstHop1.complete(new LookupResult(duplicatePhysicalRows));
+
+        assertThat(firstResult.get().getRowList()).containsExactly(currentMainRow);
+        assertThat(secondResult.get().getRowList()).containsExactly(currentMainRow);
+        assertThat(mainLookupCount).hasValue(2);
+    }
+
+    @Test
     void testWarnsWhenHop1CandidateCountReachesLowSelectivityThreshold() throws Exception {
         int candidateCount = 1024;
         List<InternalRow> indexRows = new ArrayList<>(candidateCount);
@@ -520,7 +646,7 @@ class SecondaryIndexLookuperTest {
                         new int[] {0},
                         new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
                         new InternalRow.FieldGetter[] {row -> ((GenericRow) row).getField(0)},
-                        indexRow -> indexRow);
+                        indexRow -> (GenericRow) indexRow);
 
         List<LogEvent> events = new ArrayList<>();
         AbstractAppender appender =
@@ -557,6 +683,11 @@ class SecondaryIndexLookuperTest {
             loggerContext.updateLoggers();
             appender.stop();
         }
+    }
+
+    private static GenericRow extractPartitionedBasePrimaryKey(InternalRow indexRow) {
+        GenericRow genericIndexRow = (GenericRow) indexRow;
+        return GenericRow.of(genericIndexRow.getField(1), genericIndexRow.getField(2));
     }
 
     private static final class StubLookuper implements Lookuper {
