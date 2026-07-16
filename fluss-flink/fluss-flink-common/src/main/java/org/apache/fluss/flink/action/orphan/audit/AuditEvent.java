@@ -235,9 +235,13 @@ public final class AuditEvent {
         if (value == null || value.isEmpty()) {
             throw new IllegalArgumentException(field);
         }
+        UUID parsed;
         try {
-            UUID.fromString(value);
+            parsed = UUID.fromString(value);
         } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(field);
+        }
+        if (!parsed.toString().equalsIgnoreCase(value)) {
             throw new IllegalArgumentException(field);
         }
         return value;

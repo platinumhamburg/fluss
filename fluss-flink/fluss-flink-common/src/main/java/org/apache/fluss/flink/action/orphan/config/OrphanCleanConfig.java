@@ -18,21 +18,32 @@
 package org.apache.fluss.flink.action.orphan.config;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec;
 import org.apache.fluss.flink.adapter.MultipleParameterToolAdapter;
 import org.apache.fluss.utils.StringUtils;
 
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.regex.Pattern;
 
 /** Parsed command-line options for the orphan files cleanup action. */
 @Internal
@@ -53,6 +64,14 @@ public final class OrphanCleanConfig implements Serializable {
 
     private static final long DEFAULT_REMOTE_FS_OP_RATE_LIMIT_PER_SECOND = 100L;
 
+    private static final String AUDIT_RUN_ID = "audit.run-id";
+    private static final String AUDIT_REPORTERS = "audit.reporters";
+    private static final String AUDIT_REPORTER_PREFIX = "audit.reporter.";
+    private static final Pattern REPORTER_IDENTIFIER_PATTERN = Pattern.compile("[a-z][a-z0-9_-]*");
+    private static final Set<String> SENSITIVE_OPTION_TOKENS =
+            new LinkedHashSet<>(
+                    java.util.Arrays.asList("password", "secret", "token", "credential"));
+
     private final String bootstrapServer;
     private final boolean allDatabases;
     private final @Nullable String database;
@@ -64,6 +83,7 @@ public final class OrphanCleanConfig implements Serializable {
     private final boolean allowDeleteManifest;
     private final boolean allowCleanOrphanTables;
     private final boolean allowCleanOrphanPartitions;
+    private final AuditReporterSpec auditReporterSpec;
     private final Map<String, String> extraConfigs;
 
     private OrphanCleanConfig(
@@ -78,6 +98,7 @@ public final class OrphanCleanConfig implements Serializable {
             boolean allowDeleteManifest,
             boolean allowCleanOrphanTables,
             boolean allowCleanOrphanPartitions,
+            AuditReporterSpec auditReporterSpec,
             Map<String, String> extraConfigs) {
         this.bootstrapServer = bootstrapServer;
         this.allDatabases = allDatabases;
@@ -90,7 +111,8 @@ public final class OrphanCleanConfig implements Serializable {
         this.allowDeleteManifest = allowDeleteManifest;
         this.allowCleanOrphanTables = allowCleanOrphanTables;
         this.allowCleanOrphanPartitions = allowCleanOrphanPartitions;
-        this.extraConfigs = Collections.unmodifiableMap(new HashMap<>(extraConfigs));
+        this.auditReporterSpec = auditReporterSpec;
+        this.extraConfigs = Collections.unmodifiableMap(new LinkedHashMap<>(extraConfigs));
     }
 
     /** Parses a cleanup config from CLI parameters. */
@@ -127,6 +149,8 @@ public final class OrphanCleanConfig implements Serializable {
         boolean allowDeleteManifest = params.has("allow-delete-manifest");
         boolean allowCleanOrphanTables = params.has("allow-clean-orphan-tables");
         boolean allowCleanOrphanPartitions = params.has("allow-clean-orphan-partitions");
+        LinkedHashMap<String, String> allConfigs = parseConfigs(params.getMultiParameter("conf"));
+        AuditReporterSpec auditReporterSpec = parseAuditReporterSpec(allConfigs);
 
         return new OrphanCleanConfig(
                 bootstrapServer,
@@ -140,7 +164,8 @@ public final class OrphanCleanConfig implements Serializable {
                 allowDeleteManifest,
                 allowCleanOrphanTables,
                 allowCleanOrphanPartitions,
-                parseExtraConfigs(params.getMultiParameter("conf")));
+                auditReporterSpec,
+                extractExtraConfigs(allConfigs));
     }
 
     /**
@@ -204,20 +229,160 @@ public final class OrphanCleanConfig implements Serializable {
         return p;
     }
 
-    private static Map<String, String> parseExtraConfigs(@Nullable Collection<String> values) {
+    private static LinkedHashMap<String, String> parseConfigs(@Nullable Collection<String> values) {
+        LinkedHashMap<String, String> configs = new LinkedHashMap<>();
         if (values == null || values.isEmpty()) {
-            return Collections.emptyMap();
+            return configs;
         }
-        Map<String, String> configs = new HashMap<String, String>();
         for (String kv : values) {
-            int eqIdx = kv.indexOf('=');
+            int eqIdx = kv == null ? -1 : kv.indexOf('=');
             if (eqIdx <= 0) {
-                throw new IllegalArgumentException(
-                        "--conf must be in key=value format, got: " + kv);
+                throw new IllegalArgumentException("--conf must be in key=value format");
             }
-            configs.put(kv.substring(0, eqIdx), kv.substring(eqIdx + 1));
+            String key = kv.substring(0, eqIdx);
+            String value = kv.substring(eqIdx + 1);
+            if (configs.containsKey(key)) {
+                if (!configs.get(key).equals(value)) {
+                    throw new IllegalArgumentException("Duplicate --conf key: " + key);
+                }
+                continue;
+            }
+            configs.put(key, value);
         }
         return configs;
+    }
+
+    private static AuditReporterSpec parseAuditReporterSpec(LinkedHashMap<String, String> configs) {
+        String runId = parseRunId(configs.get(AUDIT_RUN_ID));
+        List<String> identifiers = parseReporterIdentifiers(configs.get(AUDIT_REPORTERS));
+        LinkedHashMap<String, ReporterOptions> optionsByIdentifier = new LinkedHashMap<>();
+        for (String identifier : identifiers) {
+            optionsByIdentifier.put(identifier, new ReporterOptions());
+        }
+
+        for (Map.Entry<String, String> entry : configs.entrySet()) {
+            String key = entry.getKey();
+            if (!key.startsWith("audit.")
+                    || AUDIT_RUN_ID.equals(key)
+                    || AUDIT_REPORTERS.equals(key)) {
+                continue;
+            }
+            if (!key.startsWith(AUDIT_REPORTER_PREFIX)) {
+                throw auditConfigError(key);
+            }
+
+            String reporterOption = key.substring(AUDIT_REPORTER_PREFIX.length());
+            int optionSeparator = reporterOption.indexOf('.');
+            if (optionSeparator <= 0 || optionSeparator == reporterOption.length() - 1) {
+                throw auditConfigError(key);
+            }
+            String identifier = reporterOption.substring(0, optionSeparator);
+            String option = reporterOption.substring(optionSeparator + 1);
+            ReporterOptions reporterOptions = optionsByIdentifier.get(identifier);
+            if (reporterOptions == null) {
+                throw auditConfigError(key);
+            }
+
+            if ("required".equals(option)) {
+                reporterOptions.required = parseRequired(key, entry.getValue());
+            } else {
+                validateReporterOption(key, option, entry.getValue());
+                reporterOptions.options.put(option, entry.getValue());
+            }
+        }
+
+        List<ReporterSpec> reporterSpecs = new ArrayList<>();
+        for (Map.Entry<String, ReporterOptions> entry : optionsByIdentifier.entrySet()) {
+            ReporterOptions options = entry.getValue();
+            reporterSpecs.add(new ReporterSpec(entry.getKey(), options.required, options.options));
+        }
+        return new AuditReporterSpec(runId, reporterSpecs);
+    }
+
+    private static String parseRunId(@Nullable String configuredRunId) {
+        if (configuredRunId == null) {
+            return UUID.randomUUID().toString();
+        }
+        UUID parsed;
+        try {
+            parsed = UUID.fromString(configuredRunId);
+        } catch (IllegalArgumentException e) {
+            throw auditConfigError(AUDIT_RUN_ID);
+        }
+        if (!parsed.toString().equalsIgnoreCase(configuredRunId)) {
+            throw auditConfigError(AUDIT_RUN_ID);
+        }
+        return configuredRunId;
+    }
+
+    private static List<String> parseReporterIdentifiers(@Nullable String configuredReporters) {
+        if (configuredReporters == null || configuredReporters.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> identifiers = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (String identifier : configuredReporters.split(",", -1)) {
+            if ("log".equals(identifier)
+                    || !REPORTER_IDENTIFIER_PATTERN.matcher(identifier).matches()
+                    || !seen.add(identifier)) {
+                throw auditConfigError(AUDIT_REPORTERS);
+            }
+            identifiers.add(identifier);
+        }
+        return identifiers;
+    }
+
+    private static boolean parseRequired(String key, String value) {
+        if ("true".equals(value)) {
+            return true;
+        }
+        if ("false".equals(value)) {
+            return false;
+        }
+        throw auditConfigError(key);
+    }
+
+    private static void validateReporterOption(String key, String option, String value) {
+        String lowercaseOption = option.toLowerCase(Locale.ROOT);
+        boolean sensitive = false;
+        for (String token : lowercaseOption.split("[._-]")) {
+            if (SENSITIVE_OPTION_TOKENS.contains(token)) {
+                sensitive = true;
+                break;
+            }
+        }
+        boolean fileOption = lowercaseOption.endsWith("-file");
+        if (sensitive && !fileOption) {
+            throw auditConfigError(key);
+        }
+        if (fileOption) {
+            try {
+                if (value.isEmpty() || !Paths.get(value).isAbsolute()) {
+                    throw auditConfigError(key);
+                }
+            } catch (InvalidPathException e) {
+                throw auditConfigError(key);
+            }
+        }
+    }
+
+    private static Map<String, String> extractExtraConfigs(LinkedHashMap<String, String> configs) {
+        LinkedHashMap<String, String> extraConfigs = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : configs.entrySet()) {
+            if (!entry.getKey().startsWith("audit.")) {
+                extraConfigs.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return extraConfigs;
+    }
+
+    private static IllegalArgumentException auditConfigError(String key) {
+        return new IllegalArgumentException(key);
+    }
+
+    private static final class ReporterOptions {
+        private boolean required = true;
+        private final LinkedHashMap<String, String> options = new LinkedHashMap<>();
     }
 
     /** Returns the bootstrap server list used to connect to Fluss. */
@@ -297,6 +462,11 @@ public final class OrphanCleanConfig implements Serializable {
      */
     public boolean allowCleanOrphanPartitions() {
         return allowCleanOrphanPartitions;
+    }
+
+    /** Returns the immutable external audit reporter configuration for this cleanup run. */
+    public AuditReporterSpec auditReporterSpec() {
+        return auditReporterSpec;
     }
 
     /**

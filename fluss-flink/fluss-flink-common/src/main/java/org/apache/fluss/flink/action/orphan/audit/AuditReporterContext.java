@@ -93,9 +93,13 @@ public final class AuditReporterContext {
         if (runId == null || runId.isEmpty()) {
             throw new IllegalArgumentException("runId");
         }
+        UUID parsed;
         try {
-            UUID.fromString(runId);
+            parsed = UUID.fromString(runId);
         } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("runId");
+        }
+        if (!parsed.toString().equalsIgnoreCase(runId)) {
             throw new IllegalArgumentException("runId");
         }
         return runId;
