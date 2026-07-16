@@ -20,6 +20,11 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
+import org.apache.fluss.flink.action.orphan.audit.AuditReportingException;
+import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
@@ -30,12 +35,14 @@ import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
 import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
+import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,14 +78,25 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
     private final long remoteFsOpRateLimitPerSecond;
     private final Map<String, String> extraConfigs;
+    private final AuditReporterSpec auditReporterSpec;
 
+    private transient AuditReporterRuntime auditReporterRuntime;
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
+    private transient Throwable taskFailure;
 
     public ScanAndCleanFunction(
             long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
+        this(remoteFsOpRateLimitPerSecond, extraConfigs, null);
+    }
+
+    public ScanAndCleanFunction(
+            long remoteFsOpRateLimitPerSecond,
+            Map<String, String> extraConfigs,
+            AuditReporterSpec auditReporterSpec) {
         this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
         this.extraConfigs = extraConfigs;
+        this.auditReporterSpec = auditReporterSpec;
     }
 
     @Override
@@ -88,9 +106,29 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         if (!extraConfigs.isEmpty()) {
             FileSystem.initialize(Configuration.fromMap(extraConfigs), null);
         }
-        audit = new AuditLogger();
-        int parallelism = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
-        int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
+        taskFailure = null;
+        if (auditReporterSpec == null) {
+            audit = new AuditLogger();
+        } else {
+            AuditReporterContext reporterContext =
+                    new AuditReporterContext(
+                            auditReporterSpec.runId(),
+                            false,
+                            AuditStage.SCAN,
+                            "ScanAndClean",
+                            RuntimeContextAdapter.getIndexOfThisSubtask(
+                                    (StreamingRuntimeContext) getRuntimeContext()),
+                            RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()),
+                            getRuntimeContext().getUserCodeClassLoader());
+            auditReporterRuntime = AuditReporterRuntime.open(auditReporterSpec, reporterContext);
+            audit = new AuditLogger(auditReporterRuntime, reporterContext);
+        }
+        int parallelism =
+                RuntimeContextAdapter.getNumberOfParallelSubtasks(
+                        (StreamingRuntimeContext) getRuntimeContext());
+        int subtaskIndex =
+                RuntimeContextAdapter.getIndexOfThisSubtask(
+                        (StreamingRuntimeContext) getRuntimeContext());
         // Distribute the configured rate as base + 1 extra for the first `remainder` subtasks.
         // Flink does not provide a cross-JVM limiter here, so this is a best-effort job-level
         // target. Each subtask gets at least 1/s; if parallelism exceeds the configured rate, the
@@ -103,12 +141,49 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     @Override
     public void processElement(CleanTask task, Context ctx, Collector<CleanupStats> out)
             throws Exception {
-        if (task instanceof ScopeSummaryTask) {
-            out.collect(((ScopeSummaryTask) task).stats());
-        } else if (task instanceof BucketCleanTask) {
-            out.collect(processBucketTask((BucketCleanTask) task));
-        } else if (task instanceof OrphanDirCleanTask) {
-            out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
+        try {
+            if (task instanceof ScopeSummaryTask) {
+                out.collect(((ScopeSummaryTask) task).stats());
+            } else if (task instanceof BucketCleanTask) {
+                out.collect(processBucketTask((BucketCleanTask) task));
+            } else if (task instanceof OrphanDirCleanTask) {
+                out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
+            }
+        } catch (Exception | Error e) {
+            taskFailure = e;
+            throw e;
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        AuditReporterRuntime runtime = auditReporterRuntime;
+        auditReporterRuntime = null;
+        audit = null;
+        if (runtime == null) {
+            return;
+        }
+
+        AuditReportingException failure = null;
+        try {
+            runtime.flush();
+        } catch (AuditReportingException e) {
+            failure = e;
+        }
+        try {
+            runtime.close();
+        } catch (AuditReportingException e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        if (failure != null) {
+            if (taskFailure == null) {
+                throw failure;
+            }
+            taskFailure.addSuppressed(failure);
         }
     }
 
