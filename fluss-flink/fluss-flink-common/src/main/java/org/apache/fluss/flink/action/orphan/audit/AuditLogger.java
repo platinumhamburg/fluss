@@ -32,41 +32,90 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
- * Structured audit log writer for the orphan files cleanup action.
+ * Structured audit writer for the orphan files cleanup action.
  *
- * <p>The dedicated logger name {@code fluss.orphan.audit} can be routed to a separate sink (e.g.
- * SLS) by deployment-specific log4j configuration.
+ * <p>The dedicated logger name {@code fluss.orphan.audit} can be routed to a separate sink. Every
+ * legacy text record is written before the same-source event is passed to configured reporters.
  */
 @Internal
 public final class AuditLogger {
 
     private static final Logger AUDIT = LoggerFactory.getLogger("fluss.orphan.audit");
 
-    private boolean mtimeUnavailableSampleLogged;
-
-    /**
-     * Formats cutoff epoch-ms back to the {@code yyyy-MM-dd HH:mm:ss} CLI grammar in the server's
-     * local zone, so the audit line and the original {@code --older-than} value can be compared
-     * verbatim.
-     */
     private static final DateTimeFormatter CUTOFF_FORMATTER =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault());
 
-    /**
-     * One-shot startup event recording the frozen file cutoff that drives this run's deletion
-     * decisions. Emitted before any other audit line so log readers can recover the exact threshold
-     * without having to re-parse the original CLI arguments.
-     */
+    private final AuditReporterRuntime reporterRuntime;
+    private final AuditReporterContext context;
+    private final LongSupplier clock;
+    private final Supplier<String> eventIdSupplier;
+
+    private boolean mtimeUnavailableSampleLogged;
+
+    /** Creates a compatibility logger that writes only the fixed text audit record. */
+    public AuditLogger() {
+        String runId = UUID.randomUUID().toString();
+        this.reporterRuntime = null;
+        this.context =
+                new AuditReporterContext(
+                        runId,
+                        false,
+                        AuditStage.RUN,
+                        null,
+                        null,
+                        null,
+                        AuditLogger.class.getClassLoader());
+        this.clock = System::currentTimeMillis;
+        this.eventIdSupplier = () -> UUID.randomUUID().toString();
+    }
+
+    /** Creates a logger backed by an explicitly opened reporter runtime. */
+    public AuditLogger(AuditReporterRuntime reporterRuntime, AuditReporterContext context) {
+        this(
+                reporterRuntime,
+                context,
+                System::currentTimeMillis,
+                () -> UUID.randomUUID().toString());
+    }
+
+    AuditLogger(
+            AuditReporterRuntime reporterRuntime,
+            AuditReporterContext context,
+            LongSupplier clock,
+            Supplier<String> eventIdSupplier) {
+        this.reporterRuntime = Objects.requireNonNull(reporterRuntime, "reporterRuntime");
+        this.context = Objects.requireNonNull(context, "context");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        this.eventIdSupplier = Objects.requireNonNull(eventIdSupplier, "eventIdSupplier");
+    }
+
+    /** One-shot startup event recording the frozen file cutoff that drives deletion decisions. */
     public void logCutoff(long olderThanMillis) {
-        AUDIT.info(
-                "action=cutoff older_than_iso={} older_than_ms={} ts={}",
+        Map<String, String> dimensions = new LinkedHashMap<>();
+        dimensions.put(
+                "older_than_iso", CUTOFF_FORMATTER.format(Instant.ofEpochMilli(olderThanMillis)));
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("older_than_ms", olderThanMillis);
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.RUN, "cutoff")
+                        .dimensions(dimensions)
+                        .metrics(metrics)
+                        .build();
+        emit(
+                event,
+                "action=cutoff older_than_iso={} older_than_ms={}",
                 CUTOFF_FORMATTER.format(Instant.ofEpochMilli(olderThanMillis)),
-                olderThanMillis,
-                Instant.now());
+                olderThanMillis);
     }
 
     /** One-shot, non-secret execution configuration at normal INFO level. */
@@ -75,10 +124,32 @@ public final class AuditLogger {
         if (config.table().isPresent()) {
             scope = scope + "." + config.table().get();
         }
-        AUDIT.info(
+        String parallelism =
+                config.parallelism().isPresent()
+                        ? config.parallelism().get().toString()
+                        : "default";
+        Map<String, String> dimensions = new LinkedHashMap<>();
+        dimensions.put("parallelism", parallelism);
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("older_than_ms", config.olderThanMillis());
+        metrics.put("remote_fs_rate_limit", config.remoteFsOpRateLimitPerSecond());
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("dry_run", config.dryRun());
+        flags.put("allow_delete_manifest", config.allowDeleteManifest());
+        flags.put("allow_clean_orphan_tables", config.allowCleanOrphanTables());
+        flags.put("allow_clean_orphan_partitions", config.allowCleanOrphanPartitions());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.RUN, "run_start")
+                        .scopeKind(scope)
+                        .dimensions(dimensions)
+                        .metrics(metrics)
+                        .flags(flags)
+                        .build();
+        emit(
+                event,
                 "action=run_start scope={} older_than_ms={} dry_run={} parallelism={}"
                         + " remote_fs_rate_limit={} allow_delete_manifest={}"
-                        + " allow_clean_orphan_tables={} allow_clean_orphan_partitions={} ts={}",
+                        + " allow_clean_orphan_tables={} allow_clean_orphan_partitions={}",
                 scope,
                 config.olderThanMillis(),
                 config.dryRun(),
@@ -86,17 +157,32 @@ public final class AuditLogger {
                 config.remoteFsOpRateLimitPerSecond(),
                 config.allowDeleteManifest(),
                 config.allowCleanOrphanTables(),
-                config.allowCleanOrphanPartitions(),
-                Instant.now());
+                config.allowCleanOrphanPartitions());
     }
 
     /** One-shot aggregate of discovered scope, expected skips, and emitted cleanup work. */
     public void logScopePlan(ScopePlanStats stats) {
-        AUDIT.info(
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("databases", stats.databases());
+        metrics.put("tables", stats.tables());
+        metrics.put("partitions", stats.partitions());
+        metrics.put("discovered_buckets", stats.discoveredBuckets());
+        metrics.put("bucket_tasks", stats.bucketTasks());
+        metrics.put("orphan_dir_tasks", stats.orphanDirTasks());
+        metrics.put("skipped_no_remote_manifest", stats.skippedNoRemoteManifestCount());
+        metrics.put("skipped_empty_kv_active_set", stats.skippedEmptyKvActiveSetCount());
+        metrics.put("skipped_out_of_scope_root", stats.skippedOutOfScopeRootCount());
+        metrics.put("metadata_failures", stats.metadataFailures());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scope_plan")
+                        .metrics(metrics)
+                        .build();
+        emit(
+                event,
                 "action=scope_plan databases={} tables={} partitions={} discovered_buckets={}"
                         + " bucket_tasks={} orphan_dir_tasks={} skipped_no_remote_manifest={}"
                         + " skipped_empty_kv_active_set={} skipped_out_of_scope_root={}"
-                        + " metadata_failures={} ts={}",
+                        + " metadata_failures={}",
                 stats.databases(),
                 stats.tables(),
                 stats.partitions(),
@@ -106,16 +192,28 @@ public final class AuditLogger {
                 stats.skippedNoRemoteManifestCount(),
                 stats.skippedEmptyKvActiveSetCount(),
                 stats.skippedOutOfScopeRootCount(),
-                stats.metadataFailures(),
-                Instant.now());
+                stats.metadataFailures());
     }
 
     public void logDeleted(FsPath path, RuleId ruleId, boolean ok) {
-        AUDIT.info("action=deleted rule={} path={} ok={} ts={}", ruleId, path, ok, Instant.now());
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("ok", ok);
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCAN, "deleted")
+                        .path(path.toString())
+                        .rule(ruleId.toString())
+                        .flags(flags)
+                        .build();
+        emit(event, "action=deleted rule={} path={} ok={}", ruleId, path, ok);
     }
 
     public void logWouldDelete(FsPath path, RuleId ruleId) {
-        AUDIT.info("action=would_delete rule={} path={} ts={}", ruleId, path, Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCAN, "would_delete")
+                        .path(path.toString())
+                        .rule(ruleId.toString())
+                        .build();
+        emit(event, "action=would_delete rule={} path={}", ruleId, path);
     }
 
     public void logWouldDelete(FileMeta file, RuleId ruleId, ScopeIdentity scope) {
@@ -164,13 +262,26 @@ public final class AuditLogger {
             boolean dryRun,
             boolean retryable,
             boolean actionRequired) {
-        AUDIT.info(
+        Map<String, Boolean> flags = actionFlags(dryRun, retryable, actionRequired);
+        AuditEvent event =
+                scopeEvent(AuditSeverity.INFO, AuditStage.SCAN, action, scope)
+                        .objectType(lower(ruleId.objectType().name()))
+                        .path(file.path().toString())
+                        .sizeBytes(file.size())
+                        .mtimeMs(file.modificationTime())
+                        .rule(ruleId.toString())
+                        .reasonCode(reasonCode)
+                        .result(result)
+                        .flags(flags)
+                        .build();
+        emit(
+                event,
                 "audit_version=1 stage=scan action={} object_type={} path={}"
                         + " size_bytes={} mtime_ms={} rule={} reason_code={} result={}"
                         + " database={} table={} table_id={} partition_id={} bucket_id={}"
-                        + " dry_run={} retryable={} action_required={} ts={}",
+                        + " dry_run={} retryable={} action_required={}",
                 action,
-                ruleId.objectType().name().toLowerCase(Locale.ROOT),
+                lower(ruleId.objectType().name()),
                 file.path(),
                 file.size(),
                 file.modificationTime(),
@@ -184,16 +295,25 @@ public final class AuditLogger {
                 scope.bucketId(),
                 dryRun,
                 retryable,
-                actionRequired,
-                Instant.now());
+                actionRequired);
     }
 
     public void logDirDeleted(FsPath dir) {
-        AUDIT.info("action=dir_deleted path={} ts={}", dir, Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCAN, "dir_deleted")
+                        .objectType("directory")
+                        .path(dir.toString())
+                        .build();
+        emit(event, "action=dir_deleted path={}", dir);
     }
 
     public void logWouldDeleteDir(FsPath dir) {
-        AUDIT.info("action=would_delete_dir path={} ts={}", dir, Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCAN, "would_delete_dir")
+                        .objectType("directory")
+                        .path(dir.toString())
+                        .build();
+        emit(event, "action=would_delete_dir path={}", dir);
     }
 
     public void logWouldDeleteDirectory(
@@ -263,7 +383,7 @@ public final class AuditLogger {
                 true);
     }
 
-    private static void logDirectoryAction(
+    private void logDirectoryAction(
             String action,
             FsPath dir,
             long modificationTime,
@@ -273,11 +393,23 @@ public final class AuditLogger {
             boolean dryRun,
             boolean retryable,
             boolean actionRequired) {
-        AUDIT.info(
+        AuditEvent event =
+                scopeEvent(AuditSeverity.INFO, AuditStage.SCAN, action, scope)
+                        .objectType("directory")
+                        .path(dir.toString())
+                        .sizeBytes(0L)
+                        .mtimeMs(modificationTime)
+                        .rule("empty-directory")
+                        .reasonCode(reasonCode)
+                        .result(result)
+                        .flags(actionFlags(dryRun, retryable, actionRequired))
+                        .build();
+        emit(
+                event,
                 "audit_version=1 stage=scan action={} object_type=directory path={}"
                         + " size_bytes=0 mtime_ms={} rule=empty-directory reason_code={} result={}"
                         + " database={} table={} table_id={} partition_id={} bucket_id={}"
-                        + " dry_run={} retryable={} action_required={} ts={}",
+                        + " dry_run={} retryable={} action_required={}",
                 action,
                 dir,
                 modificationTime,
@@ -290,12 +422,16 @@ public final class AuditLogger {
                 nullable(scope.bucketId()),
                 dryRun,
                 retryable,
-                actionRequired,
-                Instant.now());
+                actionRequired);
     }
 
     public void logSkipUnknown(FsPath path, RuleId ruleId) {
-        AUDIT.warn("action=skip_unknown rule={} path={} ts={}", ruleId, path, Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCAN, "skip_unknown")
+                        .path(path.toString())
+                        .rule(ruleId.toString())
+                        .build();
+        emit(event, "action=skip_unknown rule={} path={}", ruleId, path);
     }
 
     /** Emits at most one actionable unavailable-mtime sample for this scan subtask. */
@@ -308,11 +444,23 @@ public final class AuditLogger {
             return;
         }
         mtimeUnavailableSampleLogged = true;
-        AUDIT.error(
+        String sanitizedSampleName = sanitizeSampleName(sampleName);
+        Map<String, String> dimensions = new LinkedHashMap<>();
+        dimensions.put("entry_kind", entryKind);
+        dimensions.put("sample_name", sanitizedSampleName);
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("action_required", true);
+        AuditEvent event =
+                scopeEvent(AuditSeverity.ERROR, AuditStage.SCAN, "mtime_unavailable", scope)
+                        .objectType(lower(objectType.name()))
+                        .dimensions(dimensions)
+                        .flags(flags)
+                        .build();
+        emit(
+                event,
                 "audit_version=1 stage=scan action=mtime_unavailable"
                         + " database={} table={} table_id={} partition_id={} bucket_id={}"
-                        + " object_type={} entry_kind={} sample_name={}"
-                        + " action_required=true ts={}",
+                        + " object_type={} entry_kind={} sample_name={} action_required=true",
                 scope.database(),
                 scope.table(),
                 nullable(scope.tableId()),
@@ -320,8 +468,7 @@ public final class AuditLogger {
                 nullable(scope.bucketId()),
                 lower(objectType.name()),
                 entryKind,
-                sanitizeSampleName(sampleName),
-                Instant.now());
+                sanitizedSampleName);
     }
 
     private static String sanitizeSampleName(String value) {
@@ -341,139 +488,164 @@ public final class AuditLogger {
     }
 
     public void logBucketAborted(String bucketStr, String reason) {
-        AUDIT.error(
-                "action=bucket_aborted bucket={} reason={} ts={}",
-                bucketStr,
-                reason,
-                Instant.now());
+        Map<String, String> dimensions = new LinkedHashMap<>();
+        dimensions.put("bucket", bucketStr);
+        AuditEvent event =
+                newEvent(AuditSeverity.ERROR, AuditStage.SCOPE, "bucket_aborted")
+                        .reasonCode(reason)
+                        .dimensions(dimensions)
+                        .build();
+        emit(event, "action=bucket_aborted bucket={} reason={}", bucketStr, reason);
     }
 
     /** Skip an entire database during scope enumeration due to listTables failure. */
     public void logSkipDb(String dbName, String reason) {
-        AUDIT.warn("action=skip_db reason={} db={} ts={}", reason, dbName, Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_db")
+                        .database(dbName)
+                        .reasonCode(reason)
+                        .build();
+        emit(event, "action=skip_db reason={} db={}", reason, dbName);
     }
 
     /** Skip a single table during scope enumeration due to getTableInfo or RPC failure. */
     public void logSkipTable(String dbName, String tableName, String reason) {
-        AUDIT.warn(
-                "action=skip_table reason={} db={} table={} ts={}",
-                reason,
-                dbName,
-                tableName,
-                Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_table")
+                        .database(dbName)
+                        .table(tableName)
+                        .reasonCode(reason)
+                        .build();
+        emit(event, "action=skip_table reason={} db={} table={}", reason, dbName, tableName);
     }
 
-    /**
-     * Skip listPartitionInfos for a table due to RPC failure (both active-partition cleanup and
-     * orphan-partition scan are suppressed for this table).
-     */
     public void logSkipPartitionList(String dbName, String tableName, String reason) {
-        AUDIT.warn(
-                "action=skip_partition_list reason={} db={} table={} ts={}",
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_partition_list")
+                        .database(dbName)
+                        .table(tableName)
+                        .reasonCode(reason)
+                        .build();
+        emit(
+                event,
+                "action=skip_partition_list reason={} db={} table={}",
                 reason,
                 dbName,
-                tableName,
-                Instant.now());
+                tableName);
     }
 
-    /**
-     * Skip KV cleanup for one (tableId, partitionId) target — emitted when {@code ListKvSnapshots}
-     * fails after retries. {@code partitionId} is null for non-partitioned tables.
-     */
     public void logSkipKvTarget(long tableId, Long partitionId, String reason) {
-        AUDIT.warn(
-                "action=skip_kv_target reason={} table_id={} partition_id={} ts={}",
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_kv_target")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .reasonCode(reason)
+                        .build();
+        emit(
+                event,
+                "action=skip_kv_target reason={} table_id={} partition_id={}",
                 reason,
                 tableId,
-                partitionId,
-                Instant.now());
+                partitionId);
     }
 
-    /**
-     * Skip KV cleanup for a single bucket whose {@code ListKvSnapshots} response carried no
-     * active-snapshot entries. Empty per-bucket active set is treated as "cannot prove what is
-     * active" and the bucket is skipped to avoid mis-deletion.
-     */
     public void logSkipKvBucket(long tableId, Long partitionId, int bucketId, String reason) {
-        AUDIT.warn(
-                "action=skip_kv_bucket reason={} table_id={} partition_id={} bucket_id={} ts={}",
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_kv_bucket")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .bucketId(bucketId)
+                        .reasonCode(reason)
+                        .build();
+        emit(
+                event,
+                "action=skip_kv_bucket reason={} table_id={} partition_id={} bucket_id={}",
                 reason,
                 tableId,
                 partitionId,
-                bucketId,
-                Instant.now());
+                bucketId);
     }
 
-    /**
-     * Skip log cleanup for one (tableId, partitionId) target — emitted when {@code
-     * ListRemoteLogManifests} fails after retries. {@code partitionId} is null for non-partitioned
-     * tables.
-     */
     public void logSkipLogTarget(long tableId, Long partitionId, String reason) {
-        AUDIT.warn(
-                "action=skip_log_target reason={} table_id={} partition_id={} ts={}",
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_log_target")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .reasonCode(reason)
+                        .build();
+        emit(
+                event,
+                "action=skip_log_target reason={} table_id={} partition_id={}",
                 reason,
                 tableId,
-                partitionId,
-                Instant.now());
+                partitionId);
     }
 
-    /**
-     * Skip log cleanup for a single bucket whose remote manifest was not returned by the {@code
-     * ListRemoteLogManifests} RPC (the bucket has not yet committed any remote manifest).
-     */
     public void logSkipLogBucket(long tableId, Long partitionId, int bucketId, String reason) {
-        AUDIT.warn(
-                "action=skip_log_bucket reason={} table_id={} partition_id={} bucket_id={} ts={}",
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_log_bucket")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .bucketId(bucketId)
+                        .reasonCode(reason)
+                        .build();
+        emit(
+                event,
+                "action=skip_log_bucket reason={} table_id={} partition_id={} bucket_id={}",
                 reason,
                 tableId,
                 partitionId,
-                bucketId,
-                Instant.now());
+                bucketId);
     }
 
-    /** Default-conservative skip of an orphan-table dir (opt-in flag not set). */
     public void logSkipOrphanTable(FsPath dir, String reason) {
-        AUDIT.info("action=skip_orphan_table reason={} path={} ts={}", reason, dir, Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "skip_orphan_table")
+                        .objectType("directory")
+                        .path(dir.toString())
+                        .reasonCode(reason)
+                        .build();
+        emit(event, "action=skip_orphan_table reason={} path={}", reason, dir);
     }
 
-    /**
-     * Skip the orphan-table scan for a database whose table-info set is incomplete (e.g. {@code
-     * --table} single-table mode, or {@code listTables}/{@code getTableInfo} failures left holes in
-     * the active table id set). Distinct from {@link #logSkipDb}, which means the whole database
-     * scope is dropped.
-     */
     public void logSkipOrphanTableScan(String dbName, String reason) {
-        AUDIT.warn(
-                "action=skip_orphan_table_scan reason={} db={} ts={}",
-                reason,
-                dbName,
-                Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_orphan_table_scan")
+                        .database(dbName)
+                        .reasonCode(reason)
+                        .build();
+        emit(event, "action=skip_orphan_table_scan reason={} db={}", reason, dbName);
     }
 
-    /** Default-conservative skip of an orphan-partition dir (opt-in flag not set). */
     public void logSkipOrphanPartition(FsPath dir, String reason) {
-        AUDIT.info(
-                "action=skip_orphan_partition reason={} path={} ts={}", reason, dir, Instant.now());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "skip_orphan_partition")
+                        .objectType("directory")
+                        .path(dir.toString())
+                        .reasonCode(reason)
+                        .build();
+        emit(event, "action=skip_orphan_partition reason={} path={}", reason, dir);
     }
 
-    /** Skip a bucket target because its metadata-resolved root is outside cluster config. */
     public void logSkipBucketOutOfScope(long tableId, Long partitionId, String resolvedRoot) {
-        AUDIT.info(
+        Map<String, String> dimensions = new LinkedHashMap<>();
+        dimensions.put("resolved_root", resolvedRoot);
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "skip_bucket_target")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .reasonCode("out-of-scope-root")
+                        .dimensions(dimensions)
+                        .build();
+        emit(
+                event,
                 "action=skip_bucket_target reason=out-of-scope-root table_id={} partition_id={}"
-                        + " resolved_root={} ts={}",
+                        + " resolved_root={}",
                 tableId,
                 partitionId,
-                resolvedRoot,
-                Instant.now());
+                resolvedRoot);
     }
 
-    /**
-     * Final summary event emitted once at the end of a run, carrying the headline counters that
-     * operators query most often ("how many files were removed and how much space was reclaimed").
-     * Routed through the dedicated audit logger so the result is queryable from the same sink as
-     * the per-file {@code action=deleted} / {@code action=skip_*} lines.
-     */
     public void logSummary(
             long scanned,
             long deletedFiles,
@@ -481,17 +653,31 @@ public final class AuditLogger {
             long deleteFailures,
             long bytesReclaimed,
             boolean dryRun) {
-        AUDIT.info(
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("scanned", scanned);
+        metrics.put("deleted_total", deletedFiles + emptyDirsRemoved);
+        metrics.put("deleted_files", deletedFiles);
+        metrics.put("empty_dirs_removed", emptyDirsRemoved);
+        metrics.put("delete_failures", deleteFailures);
+        metrics.put("bytes_reclaimed", bytesReclaimed);
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("dry_run", dryRun);
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SUMMARY, "summary")
+                        .metrics(metrics)
+                        .flags(flags)
+                        .build();
+        emit(
+                event,
                 "action=summary scanned={} deleted_total={} deleted_files={} empty_dirs_removed={}"
-                        + " delete_failures={} bytes_reclaimed={} dry_run={} ts={}",
+                        + " delete_failures={} bytes_reclaimed={} dry_run={}",
                 scanned,
                 deletedFiles + emptyDirsRemoved,
                 deletedFiles,
                 emptyDirsRemoved,
                 deleteFailures,
                 bytesReclaimed,
-                dryRun,
-                Instant.now());
+                dryRun);
     }
 
     public void logTableRuleSummary(
@@ -509,6 +695,8 @@ public final class AuditLogger {
                         + nullable(scope.tableId())
                         + " object_type="
                         + lower(objectType.name()),
+                scope,
+                objectType,
                 counters,
                 dryRun);
     }
@@ -518,6 +706,8 @@ public final class AuditLogger {
         logRuleDecisions(
                 "summary_by_rule",
                 "scope=global object_type=" + lower(objectType.name()),
+                ScopeIdentity.global(),
+                objectType,
                 counters,
                 dryRun);
     }
@@ -530,52 +720,117 @@ public final class AuditLogger {
             long mtimeUnavailableDirs,
             boolean coverageComplete,
             boolean dryRun) {
-        AUDIT.info(
+        long noRemoteManifest = skipped.getOrDefault(SkipReasonCode.NO_REMOTE_MANIFEST, 0L);
+        long emptyActiveSet = skipped.getOrDefault(SkipReasonCode.EMPTY_KV_ACTIVE_SET, 0L);
+        long directoryListFailed = skipped.getOrDefault(SkipReasonCode.DIRECTORY_LIST_FAILED, 0L);
+        long rpcFailed = skipped.getOrDefault(SkipReasonCode.RPC_ERROR, 0L);
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("no_remote_manifest_targets", noRemoteManifest);
+        metrics.put("empty_active_set_targets", emptyActiveSet);
+        metrics.put("metadata_read_failed_targets", metadataFailures);
+        metrics.put("directory_list_failed_targets", directoryListFailed);
+        metrics.put("rpc_failed_targets", rpcFailed);
+        metrics.put("mtime_unavailable_files", mtimeUnavailableFiles);
+        metrics.put("mtime_unavailable_bytes", mtimeUnavailableBytes);
+        metrics.put("mtime_unavailable_dirs", mtimeUnavailableDirs);
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("complete", coverageComplete);
+        flags.put("action_required", !coverageComplete);
+        flags.put("dry_run", dryRun);
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SUMMARY, "coverage_summary")
+                        .metrics(metrics)
+                        .flags(flags)
+                        .build();
+        emit(
+                event,
                 "action=coverage_summary no_remote_manifest_targets={}"
                         + " empty_active_set_targets={} metadata_read_failed_targets={}"
                         + " directory_list_failed_targets={} rpc_failed_targets={}"
                         + " mtime_unavailable_files={} mtime_unavailable_bytes={}"
-                        + " mtime_unavailable_dirs={} complete={}"
-                        + " action_required={} dry_run={} ts={}",
-                skipped.getOrDefault(SkipReasonCode.NO_REMOTE_MANIFEST, 0L),
-                skipped.getOrDefault(SkipReasonCode.EMPTY_KV_ACTIVE_SET, 0L),
+                        + " mtime_unavailable_dirs={} complete={} action_required={} dry_run={}",
+                noRemoteManifest,
+                emptyActiveSet,
                 metadataFailures,
-                skipped.getOrDefault(SkipReasonCode.DIRECTORY_LIST_FAILED, 0L),
-                skipped.getOrDefault(SkipReasonCode.RPC_ERROR, 0L),
+                directoryListFailed,
+                rpcFailed,
                 mtimeUnavailableFiles,
                 mtimeUnavailableBytes,
                 mtimeUnavailableDirs,
                 coverageComplete,
                 !coverageComplete,
-                dryRun,
-                Instant.now());
+                dryRun);
     }
 
     public void logAuditIntegrity(CleanupSummary summary) {
-        AUDIT.info(
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("inconsistent_object_types", summary.inconsistentObjectTypes());
+        metrics.put("inconsistent_scopes", summary.inconsistentScopes());
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("rule_counters_consistent", summary.ruleCountersConsistent());
+        flags.put("coverage_complete", summary.coverageComplete());
+        flags.put("dry_run_counters_consistent", summary.dryRunCountersConsistent());
+        flags.put("dry_run", summary.dryRun());
+        AuditEvent event =
+                newEvent(AuditSeverity.INFO, AuditStage.SUMMARY, "audit_integrity")
+                        .metrics(metrics)
+                        .flags(flags)
+                        .build();
+        emit(
+                event,
                 "action=audit_integrity rule_counters_consistent={} coverage_complete={}"
                         + " dry_run_counters_consistent={} inconsistent_object_types={}"
-                        + " inconsistent_scopes={} dry_run={} ts={}",
+                        + " inconsistent_scopes={} dry_run={}",
                 summary.ruleCountersConsistent(),
                 summary.coverageComplete(),
                 summary.dryRunCountersConsistent(),
                 summary.inconsistentObjectTypes(),
                 summary.inconsistentScopes(),
-                summary.dryRun(),
-                Instant.now());
+                summary.dryRun());
     }
 
-    private static void logRuleDecisions(
-            String action, String dimensions, RuleDecisionCounters counters, boolean dryRun) {
-        AUDIT.info(
+    private void logRuleDecisions(
+            String action,
+            String legacyDimensions,
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            RuleDecisionCounters counters,
+            boolean dryRun) {
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("scanned_files", counters.scannedFiles());
+        metrics.put("scanned_bytes", counters.scannedBytes());
+        metrics.put("keep_active_files", counters.keepActiveFiles());
+        metrics.put("keep_active_bytes", counters.keepActiveBytes());
+        metrics.put("newer_than_cutoff_files", counters.newerThanCutoffFiles());
+        metrics.put("newer_than_cutoff_bytes", counters.newerThanCutoffBytes());
+        metrics.put("mtime_unavailable_files", counters.mtimeUnavailableFiles());
+        metrics.put("mtime_unavailable_bytes", counters.mtimeUnavailableBytes());
+        metrics.put("unknown_file_type_files", counters.unknownFileTypeFiles());
+        metrics.put("unknown_file_type_bytes", counters.unknownFileTypeBytes());
+        metrics.put("candidate_files", counters.candidateFiles());
+        metrics.put("candidate_bytes", counters.candidateBytes());
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("dry_run", dryRun);
+        AuditEvent.Builder builder =
+                newEvent(AuditSeverity.INFO, AuditStage.SUMMARY, action)
+                        .scopeKind(lower(scope.kind().name()))
+                        .objectType(lower(objectType.name()))
+                        .metrics(metrics)
+                        .flags(flags);
+        if (scope.kind() != ScopeKind.GLOBAL) {
+            builder.database(scope.database()).table(scope.table()).tableId(scope.tableId());
+        }
+        AuditEvent event = builder.build();
+        emit(
+                event,
                 "action={} {} scanned_files={} scanned_bytes={} keep_active_files={}"
                         + " keep_active_bytes={} newer_than_cutoff_files={}"
                         + " newer_than_cutoff_bytes={} mtime_unavailable_files={}"
                         + " mtime_unavailable_bytes={} unknown_file_type_files={}"
                         + " unknown_file_type_bytes={} candidate_files={} candidate_bytes={}"
-                        + " dry_run={} ts={}",
+                        + " dry_run={}",
                 action,
-                dimensions,
+                legacyDimensions,
                 counters.scannedFiles(),
                 counters.scannedBytes(),
                 counters.keepActiveFiles(),
@@ -588,8 +843,72 @@ public final class AuditLogger {
                 counters.unknownFileTypeBytes(),
                 counters.candidateFiles(),
                 counters.candidateBytes(),
-                dryRun,
-                Instant.now());
+                dryRun);
+    }
+
+    private AuditEvent.Builder newEvent(AuditSeverity severity, AuditStage stage, String action) {
+        long eventTimeMillis = clock.getAsLong();
+        String eventId = eventIdSupplier.get();
+        return AuditEvent.builder()
+                .eventId(eventId)
+                .runId(context.getRunId())
+                .eventTimeMillis(eventTimeMillis)
+                .severity(severity)
+                .stage(stage)
+                .action(action)
+                .operatorName(context.getOperatorName())
+                .subtaskIndex(context.getSubtaskIndex())
+                .attemptNumber(context.getAttemptNumber());
+    }
+
+    private AuditEvent.Builder scopeEvent(
+            AuditSeverity severity, AuditStage stage, String action, ScopeIdentity scope) {
+        return newEvent(severity, stage, action)
+                .database(scope.database())
+                .table(scope.table())
+                .tableId(scope.tableId())
+                .partitionId(scope.partitionId())
+                .bucketId(scope.bucketId())
+                .scopeKind(lower(scope.kind().name()));
+    }
+
+    private void emit(
+            AuditEvent event, String legacyTemplateWithoutTimestamp, Object... legacyArgs) {
+        String template =
+                legacyTemplateWithoutTimestamp
+                        + " ts={} run_id={} event_id={} operator={} subtask={} attempt={}";
+        Object[] args = Arrays.copyOf(legacyArgs, legacyArgs.length + 6);
+        args[legacyArgs.length] = Instant.ofEpochMilli(event.getEventTimeMillis());
+        args[legacyArgs.length + 1] = event.getRunId();
+        args[legacyArgs.length + 2] = event.getEventId();
+        args[legacyArgs.length + 3] = nullable(event.getOperatorName());
+        args[legacyArgs.length + 4] = nullable(event.getSubtaskIndex());
+        args[legacyArgs.length + 5] = nullable(event.getAttemptNumber());
+        switch (event.getSeverity()) {
+            case INFO:
+                AUDIT.info(template, args);
+                break;
+            case WARN:
+                AUDIT.warn(template, args);
+                break;
+            case ERROR:
+                AUDIT.error(template, args);
+                break;
+            default:
+                throw new IllegalArgumentException("severity");
+        }
+        if (reporterRuntime != null) {
+            reporterRuntime.report(event);
+        }
+    }
+
+    private static Map<String, Boolean> actionFlags(
+            boolean dryRun, boolean retryable, boolean actionRequired) {
+        Map<String, Boolean> flags = new LinkedHashMap<>();
+        flags.put("dry_run", dryRun);
+        flags.put("retryable", retryable);
+        flags.put("action_required", actionRequired);
+        return flags;
     }
 
     private static String nullable(Object value) {
