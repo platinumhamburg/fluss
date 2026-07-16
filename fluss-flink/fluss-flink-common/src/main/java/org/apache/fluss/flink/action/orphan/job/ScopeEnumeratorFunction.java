@@ -29,6 +29,9 @@ import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
+import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
 import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
@@ -37,6 +40,7 @@ import org.apache.fluss.flink.action.orphan.build.LogActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.MaxKnownIdsTracker;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.rule.OrphanDirDetector;
+import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -49,6 +53,7 @@ import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -94,55 +99,89 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
     private final OrphanCleanConfig config;
 
+    private transient AuditReporterRuntime auditRuntime;
+    private transient AuditLogger audit;
+
     public ScopeEnumeratorFunction(OrphanCleanConfig config) {
         this.config = config;
     }
 
     @Override
+    public void open(org.apache.flink.api.common.functions.OpenContext openContext)
+            throws Exception {
+        super.open(openContext);
+        StreamingRuntimeContext runtimeContext = (StreamingRuntimeContext) getRuntimeContext();
+        AuditReporterContext reporterContext =
+                new AuditReporterContext(
+                        config.auditReporterSpec().runId(),
+                        config.dryRun(),
+                        AuditStage.SCOPE,
+                        "ScopeEnumerator",
+                        RuntimeContextAdapter.getIndexOfThisSubtask(runtimeContext),
+                        RuntimeContextAdapter.getAttemptNumber(runtimeContext),
+                        getRuntimeContext().getUserCodeClassLoader());
+        auditRuntime = AuditReporterRuntime.open(config.auditReporterSpec(), reporterContext);
+        audit = new AuditLogger(auditRuntime, reporterContext);
+    }
+
+    @Override
     public void processElement(Integer trigger, Context ctx, Collector<CleanTask> out)
             throws Exception {
-        Configuration flussConfig = createFlussClientConfiguration(config);
+        Throwable processingFailure = null;
+        try {
+            if (!config.extraConfigs().isEmpty()) {
+                FileSystem.initialize(Configuration.fromMap(config.extraConfigs()), null);
+            }
+            Configuration flussConfig = createFlussClientConfiguration(config);
 
-        try (Connection connection = ConnectionFactory.createConnection(flussConfig);
-                Admin admin = connection.getAdmin()) {
-            // Fail fast on incompatible servers: the action jar may be deployed against an
-            // older cluster that does not implement ListRemoteLogManifests / ListKvSnapshots.
-            // Without this guard, every per-target fetch would degrade to skip_log_target /
-            // skip_kv_target audit events and the job would exit "successfully" with
-            // deleted=0, masking the incompatibility.
-            verifyServerSupportsRequiredApis(admin);
+            try (Connection connection = ConnectionFactory.createConnection(flussConfig);
+                    Admin admin = connection.getAdmin()) {
+                // Fail fast on incompatible servers: the action jar may be deployed against an
+                // older cluster that does not implement ListRemoteLogManifests / ListKvSnapshots.
+                // Without this guard, every per-target fetch would degrade to skip_log_target /
+                // skip_kv_target audit events and the job would exit "successfully" with
+                // deleted=0, masking the incompatibility.
+                verifyServerSupportsRequiredApis(admin);
 
-            AuditLogger audit = new AuditLogger();
-            ScopePlanStats planStats = new ScopePlanStats();
-            audit.logRunStart(config);
-            audit.logCutoff(config.olderThanMillis());
+                ScopePlanStats planStats = new ScopePlanStats();
+                audit.logRunStart(config);
+                audit.logCutoff(config.olderThanMillis());
 
-            RateLimiter remoteFsOpRateLimiter =
-                    RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
-            ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3, remoteFsOpRateLimiter);
-            MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
-            Map<String, String> clusterConfigMap = fetchClusterConfigMap(admin);
-            String clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
-            List<String> clusterRoots =
-                    normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
+                RateLimiter remoteFsOpRateLimiter =
+                        RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
+                ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3, remoteFsOpRateLimiter);
+                MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
+                Map<String, String> clusterConfigMap = fetchClusterConfigMap(admin);
+                String clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
+                List<String> clusterRoots =
+                        normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
 
-            Map<String, DbScanState> dbStates =
-                    enumerateActiveScope(admin, audit, tracker, planStats);
-            Set<Long> activeTableIds = collectActiveTableIds(dbStates);
-            Set<Long> activePartitionIds = collectActivePartitionIds(dbStates);
+                Map<String, DbScanState> dbStates =
+                        enumerateActiveScope(admin, audit, tracker, planStats);
+                Set<Long> activeTableIds = collectActiveTableIds(dbStates);
+                Set<Long> activePartitionIds = collectActivePartitionIds(dbStates);
 
-            for (DbScanState dbState : dbStates.values()) {
-                for (LiveTableScope liveTable : dbState.liveTables) {
-                    emitBucketTasks(
-                            liveTable,
-                            fetcher,
-                            audit,
-                            clusterRemoteDataDir,
-                            clusterRoots,
-                            planStats,
-                            out);
-                    emitOrphanPartitionDirTasks(
-                            liveTable,
+                for (DbScanState dbState : dbStates.values()) {
+                    for (LiveTableScope liveTable : dbState.liveTables) {
+                        emitBucketTasks(
+                                liveTable,
+                                fetcher,
+                                audit,
+                                clusterRemoteDataDir,
+                                clusterRoots,
+                                planStats,
+                                out);
+                        emitOrphanPartitionDirTasks(
+                                liveTable,
+                                tracker,
+                                clusterRoots,
+                                audit,
+                                remoteFsOpRateLimiter,
+                                planStats,
+                                out);
+                    }
+                    emitOrphanTableDirTasks(
+                            dbState,
                             tracker,
                             clusterRoots,
                             audit,
@@ -150,29 +189,70 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             planStats,
                             out);
                 }
-                emitOrphanTableDirTasks(
-                        dbState,
+                emitOrphanDirTasksUnderUnknownDatabases(
+                        dbStates.keySet(),
+                        activeTableIds,
+                        activeTableIdsComplete(dbStates),
+                        activePartitionIds,
+                        activePartitionIdsComplete(dbStates),
                         tracker,
                         clusterRoots,
                         audit,
                         remoteFsOpRateLimiter,
                         planStats,
                         out);
+                audit.logScopePlan(planStats);
+                out.collect(ScopeSummaryTask.from(planStats));
             }
-            emitOrphanDirTasksUnderUnknownDatabases(
-                    dbStates.keySet(),
-                    activeTableIds,
-                    activeTableIdsComplete(dbStates),
-                    activePartitionIds,
-                    activePartitionIdsComplete(dbStates),
-                    tracker,
-                    clusterRoots,
-                    audit,
-                    remoteFsOpRateLimiter,
-                    planStats,
-                    out);
-            audit.logScopePlan(planStats);
-            out.collect(ScopeSummaryTask.from(planStats));
+        } catch (Exception | Error failure) {
+            processingFailure = failure;
+            throw failure;
+        } finally {
+            try {
+                closeAuditRuntime();
+            } catch (RuntimeException | Error lifecycleFailure) {
+                if (processingFailure == null) {
+                    throw lifecycleFailure;
+                }
+                processingFailure.addSuppressed(lifecycleFailure);
+            }
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        try {
+            closeAuditRuntime();
+        } finally {
+            super.close();
+        }
+    }
+
+    private void closeAuditRuntime() {
+        AuditReporterRuntime runtime = auditRuntime;
+        auditRuntime = null;
+        audit = null;
+        if (runtime == null) {
+            return;
+        }
+
+        RuntimeException failure = null;
+        try {
+            runtime.flush();
+        } catch (RuntimeException flushFailure) {
+            failure = flushFailure;
+        }
+        try {
+            runtime.close();
+        } catch (RuntimeException closeFailure) {
+            if (failure == null) {
+                failure = closeFailure;
+            } else {
+                failure.addSuppressed(closeFailure);
+            }
+        }
+        if (failure != null) {
+            throw failure;
         }
     }
 

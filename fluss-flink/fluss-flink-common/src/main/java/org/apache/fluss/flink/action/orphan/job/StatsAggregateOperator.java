@@ -19,9 +19,14 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
+import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
+import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
@@ -42,6 +47,10 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
     private static final long serialVersionUID = 4L;
 
     private final boolean dryRun;
+    private final AuditReporterSpec auditReporterSpec;
+
+    private transient AuditReporterRuntime auditRuntime;
+    private transient AuditLogger audit;
     private transient boolean scopeSummarySeen;
     private transient CleanupCounters global;
     private transient long tasksPlanned;
@@ -52,7 +61,12 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
     private transient EnumMap<CleanupObjectType, RuleDecisionCounters> byRuleDecision;
 
     public StatsAggregateOperator(boolean dryRun) {
+        this(dryRun, null);
+    }
+
+    public StatsAggregateOperator(boolean dryRun, AuditReporterSpec auditReporterSpec) {
         this.dryRun = dryRun;
+        this.auditReporterSpec = auditReporterSpec;
     }
 
     @Override
@@ -66,6 +80,22 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
         byObjectType = new EnumMap<>(CleanupObjectType.class);
         bySkipReason = new EnumMap<>(SkipReasonCode.class);
         byRuleDecision = new EnumMap<>(CleanupObjectType.class);
+        if (auditReporterSpec == null) {
+            audit = new AuditLogger();
+            return;
+        }
+
+        AuditReporterContext reporterContext =
+                new AuditReporterContext(
+                        auditReporterSpec.runId(),
+                        dryRun,
+                        AuditStage.SUMMARY,
+                        "StatsAggregate",
+                        RuntimeContextAdapter.getIndexOfThisSubtask(getRuntimeContext()),
+                        RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()),
+                        getRuntimeContext().getUserCodeClassLoader());
+        auditRuntime = AuditReporterRuntime.open(auditReporterSpec, reporterContext);
+        audit = new AuditLogger(auditRuntime, reporterContext);
     }
 
     @Override
@@ -96,19 +126,45 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
     }
 
     @Override
-    public void endInput() {
+    public void endInput() throws Exception {
         if (!scopeSummarySeen) {
             throw new IllegalStateException("Missing scope summary");
         }
 
         CleanupSummary summary = buildSummary();
-        AuditLogger audit = new AuditLogger();
         emitDetailedAudit(audit, summary);
 
-        if (!summary.ruleCountersConsistent() || !summary.dryRunCountersConsistent()) {
-            throw new IllegalStateException("Orphan cleanup audit integrity check failed");
+        IllegalStateException integrityFailure =
+                !summary.ruleCountersConsistent() || !summary.dryRunCountersConsistent()
+                        ? new IllegalStateException("Orphan cleanup audit integrity check failed")
+                        : null;
+        RuntimeException flushFailure = null;
+        if (auditRuntime != null) {
+            try {
+                auditRuntime.flush();
+            } catch (RuntimeException failure) {
+                flushFailure = failure;
+            }
+        }
+        if (integrityFailure != null) {
+            if (flushFailure != null) {
+                integrityFailure.addSuppressed(flushFailure);
+            }
+            throw integrityFailure;
+        }
+        if (flushFailure != null) {
+            throw flushFailure;
         }
         output.collect(new StreamRecord<>(summary));
+    }
+
+    @Override
+    public void close() throws Exception {
+        try {
+            closeAuditRuntime();
+        } finally {
+            super.close();
+        }
     }
 
     private CleanupSummary buildSummary() {
@@ -261,6 +317,34 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
                     entry.getKey(),
                     target.getOrDefault(entry.getKey(), RuleDecisionCounters.empty())
                             .add(entry.getValue()));
+        }
+    }
+
+    private void closeAuditRuntime() {
+        AuditReporterRuntime runtime = auditRuntime;
+        auditRuntime = null;
+        audit = null;
+        if (runtime == null) {
+            return;
+        }
+
+        RuntimeException failure = null;
+        try {
+            runtime.flush();
+        } catch (RuntimeException flushFailure) {
+            failure = flushFailure;
+        }
+        try {
+            runtime.close();
+        } catch (RuntimeException closeFailure) {
+            if (failure == null) {
+                failure = closeFailure;
+            } else {
+                failure.addSuppressed(closeFailure);
+            }
+        }
+        if (failure != null) {
+            throw failure;
         }
     }
 
