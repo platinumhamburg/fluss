@@ -210,28 +210,23 @@ public final class AuditReporterRuntime implements AutoCloseable {
             ReporterSpec reporterSpec,
             String phase,
             AuditReporter partialReporter) {
-        boolean required = reporterSpec.required();
         AuditReportingException aggregate =
-                required ? failure(reporterSpec.identifier(), phase) : null;
-        if (!required) {
-            warn(reporterSpec.identifier(), phase);
-        }
-
+                reporterSpec.required() ? failure(reporterSpec.identifier(), phase) : null;
         if (partialReporter != null) {
             try {
                 partialReporter.close();
             } catch (Exception | ServiceConfigurationError e) {
-                if (required) {
+                if (aggregate != null) {
                     aggregate.addSuppressed(failure(reporterSpec.identifier(), "close"));
-                } else {
-                    warn(reporterSpec.identifier(), "close");
                 }
             }
         }
 
-        if (!required) {
+        if (!reporterSpec.required()) {
+            warn(reporterSpec.identifier(), phase);
             return;
         }
+
         throw closeReporters(opened, aggregate);
     }
 

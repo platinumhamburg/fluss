@@ -17,10 +17,11 @@
 
 package org.apache.fluss.flink.action.orphan.job;
 
-import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
-import org.apache.fluss.flink.action.orphan.audit.AuditReportingException;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
-import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory;
+import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory.OpenContextSnapshot;
 
 import org.apache.flink.streaming.api.operators.ProcessOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -29,20 +30,22 @@ import org.apache.flink.util.Collector;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.catchThrowable;
 
 class ScanAndCleanFunctionTest {
 
+    private static final String RUN_ID = "00000000-0000-0000-0000-000000000005";
+
     @BeforeEach
-    void resetReporter() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory("reset", new Class<?>[0]);
+    void resetReporterProbe() {
+        TestingAuditReporterFactory.reset();
     }
 
     @Test
@@ -50,9 +53,7 @@ class ScanAndCleanFunctionTest {
         ScopePlanStats plan = new ScopePlanStats();
         ScopeSummaryTask marker = ScopeSummaryTask.from(plan);
         CleanupStats expected = marker.stats();
-        ScanAndCleanFunction function =
-                new ScanAndCleanFunction(
-                        100L, Collections.emptyMap(), OrphanFilesCleanJobTest.reporterSpec(false));
+        ScanAndCleanFunction function = newScanFunction(disabledReporterSpec(), true);
         List<CleanupStats> output = new ArrayList<>();
 
         function.processElement(marker, null, new ListCollector(output));
@@ -61,97 +62,152 @@ class ScanAndCleanFunctionTest {
     }
 
     @Test
-    void opensOneReporterRuntimePerAttemptAndNoTaskCloseFlushesThenCloses() throws Exception {
-        ScanAndCleanFunction function =
-                new ScanAndCleanFunction(
-                        100L, Collections.emptyMap(), OrphanFilesCleanJobTest.reporterSpec(true));
-        ProcessOperator<CleanTask, CleanupStats> operator = new ProcessOperator<>(function);
-        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
-                new OneInputStreamOperatorTestHarness<>(operator, 5, 5, 3);
+    void scanOpenUsesActualRuntimeIdentity() throws Exception {
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        try (OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
+                scanHarness(function)) {
+            harness.open();
 
-        harness.open();
-        AuditReporterContext context = OrphanFilesCleanJobTest.auditContext(function);
-        assertThat(context.getStage()).isEqualTo(AuditStage.SCAN);
-        assertThat(context.getOperatorName()).isEqualTo("ScanAndClean");
-        assertThat(context.getSubtaskIndex()).isEqualTo(3);
-        assertThat(context.getAttemptNumber()).isZero();
-        assertThat(context.getUserCodeClassLoader())
-                .isSameAs(function.getRuntimeContext().getUserCodeClassLoader());
-        assertThat(harness.getRecordOutput()).isEmpty();
-        harness.close();
+            assertThat(TestingAuditReporterFactory.openContexts("testing"))
+                    .singleElement()
+                    .satisfies(context -> assertRuntimeIdentity(context, harness));
+        }
+    }
+
+    @Test
+    void requiredReporterOpenFailureFailsScanHarnessOpen() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "open", "injected-open-failure");
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        try (OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
+                scanHarness(function)) {
+            assertThatThrownBy(harness::open)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("open")
+                    .hasMessageNotContaining("injected-open-failure");
+        }
+    }
+
+    @Test
+    void noTaskAttemptFlushesThenClosesReporterExactlyOnce() throws Exception {
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness = scanHarness(function);
+        try {
+            harness.open();
+            assertThat(harness.getOutput()).isEmpty();
+        } finally {
+            harness.close();
+        }
+
         function.close();
 
-        assertThat(OrphanFilesCleanJobTest.testingCalls())
+        assertThat(TestingAuditReporterFactory.calls())
                 .containsExactly(
                         "testing:validate",
                         "testing:create",
                         "testing:open",
                         "testing:flush",
                         "testing:close");
+        assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+        assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
     }
 
     @Test
-    void requiredReporterOpenFailureFailsScanOpen() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "open",
-                "not-exposed");
-        ScanAndCleanFunction function =
-                new ScanAndCleanFunction(
-                        100L, Collections.emptyMap(), OrphanFilesCleanJobTest.reporterSpec(true));
-        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
-                new OneInputStreamOperatorTestHarness<>(
-                        new ProcessOperator<CleanTask, CleanupStats>(function), 1, 1, 0);
+    void scanCloseStillClosesAfterRequiredFlushFailure() throws Exception {
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness = scanHarness(function);
+        try {
+            harness.open();
+            TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
+            TestingAuditReporterFactory.fail("testing", "close", "injected-close-failure");
 
-        assertThatThrownBy(harness::open)
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("testing")
-                .hasMessageContaining("open")
-                .hasMessageNotContaining("not-exposed");
-        assertThatCode(function::close).doesNotThrowAnyException();
+            assertThatThrownBy(function::close)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("flush")
+                    .hasMessageNotContaining("injected-flush-failure")
+                    .satisfies(
+                            failure ->
+                                    assertThat(failure.getSuppressed())
+                                            .singleElement()
+                                            .satisfies(
+                                                    suppressed ->
+                                                            assertThat(suppressed)
+                                                                    .hasMessageContaining("testing")
+                                                                    .hasMessageContaining("close")
+                                                                    .hasMessageNotContaining(
+                                                                            "injected-close-failure")));
+        } finally {
+            harness.close();
+        }
+
+        assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+        assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
     }
 
     @Test
-    void scanCloseAttachesSanitizedFailureToTheExactProcessFailure() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "close",
-                "raw-provider-secret");
-        ScanAndCleanFunction function =
-                new ScanAndCleanFunction(
-                        100L, Collections.emptyMap(), OrphanFilesCleanJobTest.reporterSpec(true));
-        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
-                new OneInputStreamOperatorTestHarness<>(
-                        new ProcessOperator<CleanTask, CleanupStats>(function), 1, 1, 0);
-        harness.open();
-        ScopeIdentity scope =
-                ScopeIdentity.table("db", "table", 1L).withPartitionAndBucket(null, 0);
-        BucketCleanTask task =
-                new BucketCleanTask(
-                        scope,
-                        "unknownfs://host/tablet",
-                        null,
-                        Collections.emptySet(),
-                        Collections.emptySet(),
-                        Collections.emptySet(),
-                        Long.MAX_VALUE,
-                        true,
-                        false);
+    void optionalReporterOpenFailureDoesNotChangeForwardedCleanupStats() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "open", "injected-optional-open-failure");
+        ScopeSummaryTask marker = ScopeSummaryTask.from(new ScopePlanStats());
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(false), true);
+        try (OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
+                scanHarness(function)) {
+            harness.open();
+            harness.processElement(new StreamRecord<CleanTask>(marker));
 
-        Throwable primary =
-                catchThrowable(() -> harness.processElement(new StreamRecord<CleanTask>(task)));
-        assertThat(primary)
-                .isNotNull()
-                .isNotInstanceOf(AuditReportingException.class)
-                .hasNoSuppressedExceptions();
+            assertThat(harness.extractOutputValues())
+                    .singleElement()
+                    .usingRecursiveComparison()
+                    .isEqualTo(marker.stats());
+            assertThat(TestingAuditReporterFactory.events("testing")).isEmpty();
+        }
+    }
 
-        harness.close();
-        assertThatCode(function::close).doesNotThrowAnyException();
-        OrphanFilesCleanJobTest.assertSanitizedCleanupSuppressed(primary, "close");
+    private static OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> scanHarness(
+            ScanAndCleanFunction function) throws Exception {
+        return new OneInputStreamOperatorTestHarness<>(new ProcessOperator<>(function), 8, 3, 2);
+    }
+
+    private static void assertRuntimeIdentity(
+            OpenContextSnapshot context,
+            OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness) {
+        assertThat(context.getRunId()).isEqualTo(RUN_ID);
+        assertThat(context.isDryRun()).isTrue();
+        assertThat(context.getStage()).isEqualTo(AuditStage.SCAN);
+        assertThat(context.getOperatorName()).isEqualTo("ScanAndClean");
+        assertThat(context.getSubtaskIndex()).isEqualTo(2);
+        assertThat(context.getAttemptNumber()).isZero();
+        assertThat(context.getUserCodeClassLoader())
+                .isSameAs(harness.getEnvironment().getUserCodeClassLoader().asClassLoader());
+    }
+
+    private static AuditReporterSpec disabledReporterSpec() {
+        return new AuditReporterSpec(RUN_ID, Collections.<ReporterSpec>emptyList());
+    }
+
+    private static AuditReporterSpec reportingSpec(boolean required) {
+        return new AuditReporterSpec(
+                RUN_ID,
+                Collections.singletonList(
+                        new ReporterSpec(
+                                "testing", required, Collections.<String, String>emptyMap())));
+    }
+
+    private static ScanAndCleanFunction newScanFunction(
+            AuditReporterSpec reporterSpec, boolean dryRun) {
+        try {
+            Constructor<ScanAndCleanFunction> constructor =
+                    ScanAndCleanFunction.class.getDeclaredConstructor(
+                            long.class, Map.class, AuditReporterSpec.class, boolean.class);
+            return constructor.newInstance(
+                    100L, Collections.<String, String>emptyMap(), reporterSpec, dryRun);
+        } catch (NoSuchMethodException missingTaskFiveConstructor) {
+            throw new AssertionError(
+                    "Task 5 requires ScanAndCleanFunction(long, Map, AuditReporterSpec, boolean)",
+                    missingTaskFiveConstructor);
+        } catch (ReflectiveOperationException reflectionFailure) {
+            throw new AssertionError("Unable to construct ScanAndCleanFunction", reflectionFailure);
+        }
     }
 
     private static final class ListCollector implements Collector<CleanupStats> {
