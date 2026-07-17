@@ -68,9 +68,6 @@ public final class OrphanCleanConfig implements Serializable {
     private static final String AUDIT_REPORTERS = "audit.reporters";
     private static final String AUDIT_REPORTER_PREFIX = "audit.reporter.";
     private static final Pattern REPORTER_IDENTIFIER_PATTERN = Pattern.compile("[a-z][a-z0-9_-]*");
-    private static final Set<String> SENSITIVE_OPTION_TOKENS =
-            new LinkedHashSet<>(
-                    java.util.Arrays.asList("password", "secret", "token", "credential"));
 
     private final String bootstrapServer;
     private final boolean allDatabases;
@@ -344,17 +341,7 @@ public final class OrphanCleanConfig implements Serializable {
 
     private static void validateReporterOption(String key, String option, String value) {
         String lowercaseOption = option.toLowerCase(Locale.ROOT);
-        boolean sensitive = false;
-        for (String token : lowercaseOption.split("[._-]")) {
-            if (SENSITIVE_OPTION_TOKENS.contains(token)) {
-                sensitive = true;
-                break;
-            }
-        }
         boolean fileOption = lowercaseOption.endsWith("-file");
-        if (sensitive && !fileOption) {
-            throw auditConfigError(key);
-        }
         if (fileOption) {
             try {
                 if (value.isEmpty() || !Paths.get(value).isAbsolute()) {
