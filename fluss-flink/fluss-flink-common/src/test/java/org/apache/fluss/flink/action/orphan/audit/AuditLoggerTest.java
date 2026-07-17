@@ -1000,7 +1000,7 @@ class AuditLoggerTest {
     }
 
     @Test
-    void publicLogMethodSurfaceRemainsExactlyTheThirtyThreeMethodBaseline() {
+    void publicLogMethodSurfaceRemainsExactlyTheThirtyFourMethodCloudBaseline() {
         Set<String> actual =
                 Arrays.stream(AuditLogger.class.getDeclaredMethods())
                         .filter(method -> Modifier.isPublic(method.getModifiers()))
@@ -1032,6 +1032,7 @@ class AuditLoggerTest {
                         "logSkipPartitionList(String,String,String)",
                         "logSkipKvTarget(long,Long,String)",
                         "logSkipKvBucket(long,Long,int,String)",
+                        "logSkipKvSharedSst(long,Long,int,String)",
                         "logSkipLogTarget(long,Long,String)",
                         "logSkipLogBucket(long,Long,int,String)",
                         "logSkipOrphanTable(FsPath,String)",
@@ -1043,7 +1044,7 @@ class AuditLoggerTest {
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",
                         "logAuditIntegrity(CleanupSummary)");
-        assertThat(actual).hasSize(33);
+        assertThat(actual).hasSize(34);
         assertThat(actual)
                 .noneMatch(
                         method ->
