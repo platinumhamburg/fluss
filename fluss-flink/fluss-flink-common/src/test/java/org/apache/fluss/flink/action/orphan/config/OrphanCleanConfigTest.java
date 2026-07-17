@@ -424,20 +424,30 @@ class OrphanCleanConfigTest {
     }
 
     @Test
-    void rejectsDirectSensitiveReporterOptions() {
-        for (String suffix :
-                Arrays.asList(
-                        "password",
-                        "db.password",
-                        "access-key-secret",
-                        "security-token",
-                        "credential",
-                        "db.Password",
-                        "password_file")) {
-            String key = "audit.reporter.jdbc." + suffix;
-            assertRejectedAuditKey(
-                    key, "audit.reporters=jdbc", key + "=value-that-must-not-be-echoed");
-        }
+    void passesDirectReporterOptionsThroughAsOpaqueStrings() {
+        String sensitiveValue = "value-that-must-not-be-echoed";
+
+        ReporterSpec reporter =
+                fromConfs(
+                                "audit.reporters=sls",
+                                "audit.reporter.sls.access-key-id=plain-access-key-id",
+                                "audit.reporter.sls.access-key-secret=" + sensitiveValue,
+                                "audit.reporter.sls.security-token=plain-security-token",
+                                "audit.reporter.sls.db.password=plain-password",
+                                "audit.reporter.sls.credential=plain-credential",
+                                "audit.reporter.sls.password_file=plain-underscore-option")
+                        .auditReporterSpec()
+                        .reporters()
+                        .get(0);
+
+        assertThat(reporter.options())
+                .containsExactly(
+                        entry("access-key-id", "plain-access-key-id"),
+                        entry("access-key-secret", sensitiveValue),
+                        entry("security-token", "plain-security-token"),
+                        entry("db.password", "plain-password"),
+                        entry("credential", "plain-credential"),
+                        entry("password_file", "plain-underscore-option"));
     }
 
     @Test
