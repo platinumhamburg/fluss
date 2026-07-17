@@ -24,6 +24,7 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -399,9 +400,8 @@ public class KvRecoverHelper {
                         // e.g, arrow vs. compacted, thus needs a conversion here.
                         BinaryRow row = toKvRow(logRow);
                         value =
-                                valueEncoder
-                                        .createValue(currentSchemaId.shortValue(), row)
-                                        .encodeValue();
+                                valueEncoder.encodeValue(
+                                        new BinaryValue(currentSchemaId.shortValue(), row));
                     }
                     resumeRecordConsumer.accept(
                             new KeyValueAndLogOffset(

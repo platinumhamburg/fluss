@@ -37,6 +37,7 @@ import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
@@ -350,10 +351,11 @@ public class TableDescriptorValidation {
                             "Unsupported kv format version %d. The maximum supported version is %d.",
                             version, CURRENT_KV_FORMAT_VERSION));
         }
-        if (version < KV_FORMAT_VERSION_3) {
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(version);
+        if (!layout.hasValueTag()) {
             return;
         }
-        if (isPartitionedIndexTable(tableDescriptor)) {
+        if (version == KV_FORMAT_VERSION_3 && isPartitionedIndexTable(tableDescriptor)) {
             return;
         }
         throw new InvalidConfigException(

@@ -18,6 +18,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.exception.StaleMetadataException;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
@@ -42,7 +43,7 @@ import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.aligned.AlignedRowWriter;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
-import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.MergeMode;
@@ -63,7 +64,6 @@ import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
-import org.apache.fluss.utils.UnsafeUtils;
 import org.apache.fluss.utils.crc.Crc32C;
 
 import org.junit.jupiter.api.Test;
@@ -85,6 +85,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
@@ -132,7 +133,9 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         fixture.put(mutation(writerKey, 100L, row, key));
 
         byte[] encodedValue = fixture.kv.getKvPreWriteBuffer().get(Key.of(key)).get();
-        assertThat(UnsafeUtils.getLong(encodedValue, ValueEncoder.TAG_OFFSET))
+        assertThat(
+                        KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3)
+                                .readValueTag(MemorySegment.wrap(encodedValue)))
                 .isEqualTo(PARTITION_ID);
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
         assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();

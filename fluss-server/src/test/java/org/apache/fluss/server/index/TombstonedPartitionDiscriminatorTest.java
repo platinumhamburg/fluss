@@ -20,20 +20,27 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.IndexTableUtils;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Tests for {@link TombstonedPartitionDiscriminator}. */
 class TombstonedPartitionDiscriminatorTest {
@@ -72,6 +79,41 @@ class TombstonedPartitionDiscriminatorTest {
                                         ConfigOptions.KV_FORMAT_VERSION_3),
                                 /* metadataCache= */ null))
                 .isNotNull();
+    }
+
+    @Test
+    void testForIndexTableRejectsUnknownNewerKvFormatVersion() {
+        assertThatThrownBy(
+                        () ->
+                                TombstonedPartitionDiscriminator.forIndexTable(
+                                        partitionedIndexTableInfoWithKvFormatVersion(4),
+                                        /* metadataCache= */ null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("kvFormatVersion 3");
+    }
+
+    @Test
+    void testTagOnlyValueUsesBigEndianLayoutAndShortValuesFailOpen() {
+        TabletServerMetadataCache metadataCache = mock(TabletServerMetadataCache.class);
+        when(metadataCache.getPartitionTombstone(1001L))
+                .thenReturn(new PartitionTombstone(-1L, Collections.singleton(42L), 1L));
+        TombstonedPartitionDiscriminator discriminator =
+                TombstonedPartitionDiscriminator.forIndexTable(
+                        partitionedIndexTableInfoWithKvFormatVersion(KV_FORMAT_VERSION_3),
+                        metadataCache);
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3);
+        byte[] tagOnlyValue = new byte[layout.rowPayloadOffset()];
+        layout.writeValueTag(tagOnlyValue, 42L);
+
+        assertThat(discriminator.isTombstoned(tagOnlyValue)).isTrue();
+        layout.writeValueTag(tagOnlyValue, 43L);
+        assertThat(discriminator.isTombstoned(tagOnlyValue)).isFalse();
+        assertThat(discriminator.isTombstoned(null)).isFalse();
+        for (int length = 0; length < layout.rowPayloadOffset(); length++) {
+            assertThat(discriminator.isTombstoned(new byte[length]))
+                    .as("value length %s", length)
+                    .isFalse();
+        }
     }
 
     private static TableInfo partitionedIndexTableInfoWithoutKvFormatVersion() {

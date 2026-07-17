@@ -19,14 +19,14 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.utils.IndexTableUtils;
-import org.apache.fluss.utils.UnsafeUtils;
 
 import org.rocksdb.AbstractCompactionFilterFactory;
 
@@ -56,6 +56,9 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  */
 @Internal
 final class TombstonedPartitionDiscriminator {
+
+    private static final KvValueLayout INDEX_VALUE_LAYOUT =
+            KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3);
 
     private final long mainTableId;
     private final int partitionIdPosition;
@@ -93,8 +96,8 @@ final class TombstonedPartitionDiscriminator {
                         .getKvFormatVersion()
                         .orElse(ConfigOptions.KV_FORMAT_VERSION_2);
         checkArgument(
-                kvFormatVersion >= KV_FORMAT_VERSION_3,
-                "Partitioned Index Table must use kvFormatVersion >= 3, but got %s",
+                kvFormatVersion == KV_FORMAT_VERSION_3,
+                "Partitioned Index Table must use kvFormatVersion 3, but got %s",
                 kvFormatVersion);
         return new TombstonedPartitionDiscriminator(
                 tableInfo.getMainTableId().getAsLong(), pidPos, metadataCache);
@@ -102,14 +105,13 @@ final class TombstonedPartitionDiscriminator {
 
     /**
      * Returns {@code true} when the encoded v3 value bytes contain a tag (partition ID) that is
-     * tombstoned. The tag is read at {@link ValueEncoder#TAG_OFFSET} without deserializing the row.
+     * tombstoned. The tag is read through the version 3 layout without deserializing the row.
      */
     boolean isTombstoned(byte[] valueBytes) {
-        if (valueBytes == null
-                || valueBytes.length < ValueEncoder.SCHEMA_ID_LENGTH + ValueEncoder.TAG_LENGTH) {
+        if (valueBytes == null || valueBytes.length < INDEX_VALUE_LAYOUT.rowPayloadOffset()) {
             return false;
         }
-        long tag = UnsafeUtils.getLong(valueBytes, ValueEncoder.TAG_OFFSET);
+        long tag = INDEX_VALUE_LAYOUT.readValueTag(MemorySegment.wrap(valueBytes));
         return currentTombstone().isTombstoned(tag);
     }
 

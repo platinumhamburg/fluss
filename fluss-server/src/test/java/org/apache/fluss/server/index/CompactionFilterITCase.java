@@ -30,7 +30,7 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
@@ -42,7 +42,6 @@ import org.apache.fluss.server.log.LogTestUtils;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
-import org.apache.fluss.utils.UnsafeUtils;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
 
@@ -56,6 +55,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.ToLongFunction;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -202,27 +202,14 @@ class CompactionFilterITCase {
         }
     }
 
-    /**
-     * Builds a value in v3 format: schemaId (2 bytes, native endian) + tag (8 bytes, native endian)
-     * + dummy payload. The FloorSetCompactionFilter reads the tag at offset 2.
-     */
+    /** Builds a value in the V3 layout consumed by the native compaction filter. */
     private static byte[] buildIndexValue(short schemaId, long partitionId) {
-        // v3 format: [schemaId(2)][tag(8)][payload]
-        // payload can be anything - the compaction filter only cares about the tag
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3);
         byte[] dummyPayload = new byte[] {0x00, 0x00, 0x00, 0x00};
-        byte[] result =
-                new byte
-                        [ValueEncoder.SCHEMA_ID_LENGTH
-                                + ValueEncoder.TAG_LENGTH
-                                + dummyPayload.length];
-        UnsafeUtils.putShort(result, 0, schemaId);
-        UnsafeUtils.putLong(result, ValueEncoder.TAG_OFFSET, partitionId);
-        System.arraycopy(
-                dummyPayload,
-                0,
-                result,
-                ValueEncoder.SCHEMA_ID_LENGTH + ValueEncoder.TAG_LENGTH,
-                dummyPayload.length);
+        byte[] result = new byte[layout.rowPayloadOffset() + dummyPayload.length];
+        layout.writeSchemaId(result, schemaId);
+        layout.writeValueTag(result, partitionId);
+        System.arraycopy(dummyPayload, 0, result, layout.rowPayloadOffset(), dummyPayload.length);
         return result;
     }
 }

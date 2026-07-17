@@ -258,9 +258,7 @@ public class DefaultValueRecordBatch implements ValueRecordBatch {
             currentRecordNumber++;
         }
 
-        /**
-         * @param valueBytes consisted of schema id and the row encoded in the value bytes
-         */
+        /** Appends a complete raw value encoded with the table's KV format version. */
         public void append(byte[] valueBytes) throws IOException {
             if (isClosed) {
                 throw new IllegalStateException(

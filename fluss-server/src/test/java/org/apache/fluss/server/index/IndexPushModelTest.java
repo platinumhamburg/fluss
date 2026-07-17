@@ -37,6 +37,7 @@ import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.aligned.AlignedRowWriter;
 import org.apache.fluss.row.compacted.CompactedKeyWriter;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
@@ -55,7 +56,6 @@ import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
-import org.apache.fluss.utils.UnsafeUtils;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -88,6 +88,8 @@ class IndexPushModelTest {
     private static final int KEYS_PER_INCARNATION = 4;
     private static final int[] ALL_TARGET_COLUMNS = {0, 1, 2, 3};
     private static final short SCHEMA_ID = 1;
+    private static final KvValueLayout KV_VALUE_LAYOUT =
+            KvValueLayout.forKvFormatVersion(ConfigOptions.KV_FORMAT_VERSION_3);
     private static final RowType INDEX_ROW_TYPE =
             DataTypes.ROW(
                     DataTypes.FIELD("user_id", DataTypes.BIGINT()),
@@ -543,10 +545,11 @@ class IndexPushModelTest {
             rowWriter.writeLong(3, mutation.incarnation.partitionId);
             rowWriter.complete();
 
-            byte[] value = new byte[Short.BYTES + Long.BYTES + oracleRow.getSizeInBytes()];
-            UnsafeUtils.putShort(value, 0, SCHEMA_ID);
-            UnsafeUtils.putLong(value, Short.BYTES, mutation.incarnation.partitionId);
-            oracleRow.copyTo(value, Short.BYTES + Long.BYTES);
+            byte[] value =
+                    new byte[KV_VALUE_LAYOUT.rowPayloadOffset() + oracleRow.getSizeInBytes()];
+            KV_VALUE_LAYOUT.writeSchemaId(value, SCHEMA_ID);
+            KV_VALUE_LAYOUT.writeValueTag(value, mutation.incarnation.partitionId);
+            oracleRow.copyTo(value, KV_VALUE_LAYOUT.rowPayloadOffset());
             return new OraclePhysicalRow(keyWriter.toBytes(), value);
         }
     }

@@ -17,7 +17,11 @@
 
 package org.apache.fluss.server.replica.delay;
 
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.entity.ProduceLogResultForBucket;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.log.LogAppendInfo;
@@ -26,6 +30,7 @@ import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestBase;
 import org.apache.fluss.server.replica.delay.DelayedWrite.DelayedBucketStatus;
 import org.apache.fluss.server.replica.delay.DelayedWrite.DelayedWriteMetadata;
+import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
@@ -50,12 +55,14 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
 
     private static final int DELAY_MS = 10_000;
     private static final long REQUIRED_HW = 10L;
+    private static final long SYNC_INDEXED_TABLE_ID = 160_001L;
+    private static final TablePath SYNC_INDEXED_TABLE_PATH =
+            TablePath.of("test_db_1", "sync_indexed_table");
 
     @Test
     void testCompletesWhenBothHwAndIndexOffsetMet() throws Exception {
-        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 1);
-        makeLogTableAsLeader(tb.getBucket());
-        Replica replica = replicaManager.getReplicaOrException(tb);
+        TableBucket tb = new TableBucket(SYNC_INDEXED_TABLE_ID, 1);
+        Replica replica = makeSyncIndexedTableAsLeader(tb);
 
         AtomicReference<List<ProduceLogResultForBucket>> callbackResult = new AtomicReference<>();
         DelayedWrite<?> delayedWrite =
@@ -81,9 +88,8 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
 
     @Test
     void testStallsWhenHwMetButIndexOffsetNotMet() throws Exception {
-        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 1);
-        makeLogTableAsLeader(tb.getBucket());
-        Replica replica = replicaManager.getReplicaOrException(tb);
+        TableBucket tb = new TableBucket(SYNC_INDEXED_TABLE_ID, 1);
+        Replica replica = makeSyncIndexedTableAsLeader(tb);
 
         AtomicReference<List<ProduceLogResultForBucket>> callbackResult = new AtomicReference<>();
         DelayedWrite<?> delayedWrite =
@@ -95,9 +101,9 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
                         DELAY_MS,
                         callbackResult::set);
 
-        // HW satisfied, index offset still at the sentinel (-1L): stall.
+        // HW satisfied, index offset still at the initial indexed-table value: stall.
         replica.getLogTablet().updateHighWatermark(REQUIRED_HW);
-        assertThat(replica.getSyncIndexPushedOffset()).isEqualTo(-1L);
+        assertThat(replica.getSyncIndexPushedOffset()).isZero();
         assertThat(delayedWrite.tryComplete()).isFalse();
         assertThat(callbackResult.get()).isNull();
 
@@ -109,9 +115,8 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
 
     @Test
     void testCompletesImmediatelyWhenRequiredIndexOffsetIsMinusOne() throws Exception {
-        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 1);
-        makeLogTableAsLeader(tb.getBucket());
-        Replica replica = replicaManager.getReplicaOrException(tb);
+        TableBucket tb = new TableBucket(SYNC_INDEXED_TABLE_ID, 1);
+        Replica replica = makeSyncIndexedTableAsLeader(tb);
 
         AtomicReference<List<ProduceLogResultForBucket>> callbackResult = new AtomicReference<>();
         DelayedWrite<?> delayedWrite =
@@ -124,7 +129,7 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
                         callbackResult::set);
 
         // Legacy single-watermark behavior: completing on HW alone, no index check.
-        assertThat(replica.getSyncIndexPushedOffset()).isEqualTo(-1L);
+        assertThat(replica.getSyncIndexPushedOffset()).isZero();
         replica.getLogTablet().updateHighWatermark(REQUIRED_HW);
         assertThat(delayedWrite.tryComplete()).isTrue();
         assertThat(callbackResult.get()).hasSize(1);
@@ -133,9 +138,8 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
 
     @Test
     void testNoLongerStallsAfterIndexOffsetAdvances() throws Exception {
-        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 1);
-        makeLogTableAsLeader(tb.getBucket());
-        Replica replica = replicaManager.getReplicaOrException(tb);
+        TableBucket tb = new TableBucket(SYNC_INDEXED_TABLE_ID, 1);
+        Replica replica = makeSyncIndexedTableAsLeader(tb);
 
         AtomicReference<List<ProduceLogResultForBucket>> callbackResult = new AtomicReference<>();
         DelayedWrite<?> delayedWrite =
@@ -217,5 +221,31 @@ final class DelayedWriteDoubleWatermarkTest extends ReplicaTestBase {
                 replicaManager,
                 callback,
                 TestingMetricGroups.TABLET_SERVER_METRICS);
+    }
+
+    private Replica makeSyncIndexedTableAsLeader(TableBucket tableBucket) throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .primaryKey("a")
+                        .index(
+                                "idx_b",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                IndexVisibility.SYNC,
+                                1)
+                        .build();
+        registerTableInZkClient(
+                SYNC_INDEXED_TABLE_PATH,
+                schema,
+                SYNC_INDEXED_TABLE_ID,
+                Collections.singletonList("a"),
+                Collections.emptyMap());
+        makeKvTableAsLeader(
+                SYNC_INDEXED_TABLE_ID, SYNC_INDEXED_TABLE_PATH, tableBucket.getBucket());
+        Replica replica = replicaManager.getReplicaOrException(tableBucket);
+        assertThat(replica.requiresSyncIndexVisibility()).isTrue();
+        return replica;
     }
 }

@@ -20,6 +20,7 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.bucketing.FlussBucketingFunction;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
@@ -40,7 +41,7 @@ import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.aligned.AlignedRowWriter;
 import org.apache.fluss.row.decode.CompactedKeyDecoder;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
-import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -57,7 +58,6 @@ import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
-import org.apache.fluss.utils.UnsafeUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
@@ -69,6 +69,7 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.Collections;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.row.BinaryString.fromString;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createPartition;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
@@ -387,7 +388,9 @@ class PartitionTTLGoldenPathITCase {
 
     private static void assertV3Tag(byte[] value, long partitionId, String description) {
         assertThat(value).as(description).isNotNull();
-        assertThat(UnsafeUtils.getLong(value, ValueEncoder.TAG_OFFSET))
+        assertThat(
+                        KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3)
+                                .readValueTag(MemorySegment.wrap(value)))
                 .as(description)
                 .isEqualTo(partitionId);
     }

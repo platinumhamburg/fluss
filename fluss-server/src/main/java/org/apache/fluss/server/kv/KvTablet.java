@@ -49,6 +49,7 @@ import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
@@ -149,13 +150,6 @@ public final class KvTablet {
 
     private final SchemaGetter schemaGetter;
 
-    /**
-     * Optional function to extract the tag value from a row for v3 value encoding. When non-null,
-     * values are encoded in v3 format: [schemaId(2)][tag(8)][BinaryRow]. For partition TTL on Index
-     * Tables, this extracts the partitionId from the row.
-     */
-    @Nullable private final ToLongFunction<BinaryRow> tagExtractor;
-
     /** The KV format version of this table (determines value layout). */
     private final int kvFormatVersion;
 
@@ -230,20 +224,21 @@ public final class KvTablet {
         this.autoIncrementManager = autoIncrementManager;
         // disable row count for WAL image mode.
         this.rowCount = changelogImage == ChangelogImage.WAL ? ROW_COUNT_DISABLED : 0L;
-        this.tagExtractor = tagExtractor;
         this.kvFormatVersion = kvFormatVersion;
-        this.valueEncoder = ValueEncoder.forVersion(kvFormatVersion, tagExtractor);
+        this.valueEncoder = ValueEncoder.forKvFormatVersion(kvFormatVersion, tagExtractor);
         this.writeGuard = writeGuard;
     }
 
     private static void validateValueFormatVersion(
             int kvFormatVersion, @Nullable ToLongFunction<BinaryRow> tagExtractor) {
-        if (kvFormatVersion >= ConfigOptions.KV_FORMAT_VERSION_3 && tagExtractor == null) {
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(kvFormatVersion);
+        if (layout.hasValueTag() && tagExtractor == null) {
             throw new IllegalArgumentException(
-                    "tagExtractor must be non-null for kvFormatVersion >= 3");
+                    "tagExtractor must be non-null for a KV value layout with a value tag");
         }
-        if (kvFormatVersion < ConfigOptions.KV_FORMAT_VERSION_3 && tagExtractor != null) {
-            throw new IllegalArgumentException("tagExtractor must be null for kvFormatVersion < 3");
+        if (!layout.hasValueTag() && tagExtractor != null) {
+            throw new IllegalArgumentException(
+                    "tagExtractor must be null for a KV value layout without a value tag");
         }
     }
 
@@ -740,7 +735,7 @@ public final class KvTablet {
             if (row == null) {
                 currentValue = null;
             } else {
-                currentValue = valueEncoder.createValue(schemaIdOfNewData, row);
+                currentValue = new BinaryValue(schemaIdOfNewData, row);
             }
 
             if (currentValue == null) {
@@ -820,11 +815,10 @@ public final class KvTablet {
             throws Exception {
         java.util.function.Predicate<byte[]> filter = this.valueFilter;
         if (filter != NO_OP_VALUE_FILTER) {
-            // The filter contract takes the encoded value bytes (schemaId + row), matching the
-            // format produced by BinaryValue#encodeValue and consumed by the read/compaction
-            // filter paths. Feeding raw row bytes here would shift the column offsets by
-            // SCHEMA_ID_LENGTH and silently misread filter inputs.
-            byte[] encodedValueBytes = currentValue.encodeValue();
+            // The filter consumes the complete versioned KV value, including every internal
+            // header field before the row payload. Passing raw row bytes would make it interpret
+            // row data as header fields.
+            byte[] encodedValueBytes = valueEncoder.encodeValue(currentValue);
             if (filter.test(encodedValueBytes)) {
                 return logOffset;
             }
@@ -888,7 +882,7 @@ public final class KvTablet {
             throws Exception {
         BinaryValue newValue = autoIncrementUpdater.updateAutoIncrementColumns(currentValue);
         walBuilder.append(ChangeType.INSERT, latestSchemaRow.replaceRow(newValue.row));
-        kvPreWriteBuffer.insert(key, newValue.encodeValue(), logOffset);
+        kvPreWriteBuffer.insert(key, valueEncoder.encodeValue(newValue), logOffset);
         return logOffset + 1;
     }
 
@@ -903,11 +897,11 @@ public final class KvTablet {
         if (changelogImage.hasUpdateBefore()) {
             walBuilder.append(ChangeType.UPDATE_BEFORE, latestSchemaRow.replaceRow(oldValue.row));
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset + 1);
+            kvPreWriteBuffer.update(key, valueEncoder.encodeValue(newValue), logOffset + 1);
             return logOffset + 2;
         } else {
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset);
+            kvPreWriteBuffer.update(key, valueEncoder.encodeValue(newValue), logOffset);
             return logOffset + 1;
         }
     }

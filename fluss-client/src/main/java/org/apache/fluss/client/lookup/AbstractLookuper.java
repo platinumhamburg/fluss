@@ -25,6 +25,7 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.decode.FixedSchemaDecoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.utils.CopyOnWriteMap;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
@@ -52,7 +53,7 @@ abstract class AbstractLookuper implements Lookuper {
 
     private final SchemaGetter schemaGetter;
 
-    private final int kvFormatVersion;
+    private final KvValueLayout kvValueLayout;
 
     /**
      * Cache for row decoders for different schema ids. Use CopyOnWriteMap for fast access, as it is
@@ -70,8 +71,12 @@ abstract class AbstractLookuper implements Lookuper {
         this.lookupClient = lookupClient;
         this.targetSchemaId = (short) tableInfo.getSchemaId();
         this.schemaGetter = schemaGetter;
-        this.kvFormatVersion =
-                tableInfo.getTableConfig().getKvFormatVersion().orElse(KV_FORMAT_VERSION_2);
+        this.kvValueLayout =
+                KvValueLayout.forKvFormatVersion(
+                        tableInfo
+                                .getTableConfig()
+                                .getKvFormatVersion()
+                                .orElse(KV_FORMAT_VERSION_2));
         this.decoders = new CopyOnWriteMap<>();
         // initialize the decoder for the same schema
         this.decoders.put(
@@ -79,7 +84,7 @@ abstract class AbstractLookuper implements Lookuper {
                 new FixedSchemaDecoder(
                         tableInfo.getTableConfig().getKvFormat(),
                         tableInfo.getSchema(),
-                        kvFormatVersion));
+                        kvValueLayout));
     }
 
     protected void handleLookupResponse(
@@ -92,7 +97,7 @@ abstract class AbstractLookuper implements Lookuper {
                 continue;
             }
             MemorySegment memorySegment = MemorySegment.wrap(valueBytes);
-            short schemaId = memorySegment.getShort(0);
+            short schemaId = kvValueLayout.readSchemaId(memorySegment);
             if (targetSchemaId != schemaId) {
                 allTargetSchema = false;
                 if (!decoders.containsKey(schemaId)) {
@@ -148,7 +153,7 @@ abstract class AbstractLookuper implements Lookuper {
     protected LookupResult processSchemaMismatchedRows(List<MemorySegment> valueList) {
         List<InternalRow> rowList = new ArrayList<>(valueList.size());
         for (MemorySegment value : valueList) {
-            short schemaId = value.getShort(0);
+            short schemaId = kvValueLayout.readSchemaId(value);
             FixedSchemaDecoder decoder = decoders.get(schemaId);
             checkArgument(decoder != null, "Decoder for schema id %s not found", schemaId);
             InternalRow row = decoder.decode(value);
@@ -168,7 +173,7 @@ abstract class AbstractLookuper implements Lookuper {
         // process the value list to convert to target schema
         List<InternalRow> rowList = new ArrayList<>(valueList.size());
         for (MemorySegment value : valueList) {
-            short schemaId = value.getShort(0);
+            short schemaId = kvValueLayout.readSchemaId(value);
             FixedSchemaDecoder decoder =
                     decoders.computeIfAbsent(
                             schemaId,
@@ -178,7 +183,7 @@ abstract class AbstractLookuper implements Lookuper {
                                         tableInfo.getTableConfig().getKvFormat(),
                                         sourceSchema,
                                         tableInfo.getSchema(),
-                                        kvFormatVersion);
+                                        kvValueLayout);
                             });
             InternalRow row = decoder.decode(value);
             rowList.add(row);

@@ -25,6 +25,7 @@ import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.AggFunctions;
@@ -37,6 +38,7 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.FileLogProjection;
@@ -56,6 +58,8 @@ import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.BinaryRow;
+import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
@@ -334,6 +338,57 @@ class KvTabletTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("tagExtractor");
         assertThat(invalidKvTabletDir).doesNotExist();
+    }
+
+    @Test
+    void testVersionThreeTagIsExtractedFromFinalMergedRow() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.STRING())
+                        .column("partition_id", DataTypes.BIGINT())
+                        .primaryKey("id")
+                        .build();
+        PhysicalTablePath tablePath =
+                PhysicalTablePath.of(TablePath.of("testDb", "v3_final_row_tag"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, tablePath);
+        Map<String, String> tableConfig = new HashMap<>();
+        tableConfig.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_3));
+        kvTablet =
+                createKvTablet(
+                        tablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        tableConfig,
+                        row -> row.getLong(2));
+        KvRecordTestUtils.KvRecordFactory records =
+                KvRecordTestUtils.KvRecordFactory.of(schema.getRowType());
+
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        records.ofRecord("k1".getBytes(), new Object[] {1, "before", 41L})),
+                new int[] {0, 1, 2});
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        records.ofRecord("k1".getBytes(), new Object[] {1, "after", null})),
+                new int[] {0, 1});
+
+        Value storedValue = kvTablet.getKvPreWriteBuffer().get(Key.of("k1".getBytes()));
+        assertThat(storedValue).isNotNull();
+        byte[] stored = storedValue.get();
+        assertThat(stored).isNotNull();
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3);
+        assertThat(layout.readValueTag(MemorySegment.wrap(stored))).isEqualTo(41L);
+
+        BinaryValue decoded =
+                new ValueDecoder(schemaGetter, KvFormat.COMPACTED, layout).decodeValue(stored);
+        assertThat(decoded.row.getInt(0)).isEqualTo(1);
+        assertThat(decoded.row.getString(1).toString()).isEqualTo("after");
+        assertThat(decoded.row.getLong(2)).isEqualTo(41L);
     }
 
     @Test

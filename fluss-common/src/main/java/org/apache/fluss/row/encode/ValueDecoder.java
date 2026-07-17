@@ -29,50 +29,35 @@ import org.apache.fluss.types.DataType;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
-import static org.apache.fluss.row.encode.ValueEncoder.SCHEMA_ID_LENGTH;
-import static org.apache.fluss.row.encode.ValueEncoder.TAG_LENGTH;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 
-/**
- * A decoder to decode a schema id and {@link BinaryRow} from a byte array value which is encoded by
- * {@link ValueEncoder#encodeValue(short, BinaryRow)} (v2) or {@link ValueEncoder#encodeValue(short,
- * long, BinaryRow)} (v3).
- *
- * <p>The decoder is version-aware: the {@code kvFormatVersion} parameter determines the value
- * layout. For v3 (version >= 3), the decoded {@link BinaryValue} includes the 8-byte tag.
- */
+/** Decodes a schema id and {@link BinaryRow} from bytes described by a {@link KvValueLayout}. */
 public class ValueDecoder {
 
     private final Map<Short, RowDecoder> rowDecoders;
     private final SchemaGetter schemaGetter;
     private final KvFormat kvFormat;
-    private final int kvFormatVersion;
+    private final KvValueLayout kvValueLayout;
 
-    /** Creates a v2 decoder (no tag prefix in value). */
     public ValueDecoder(SchemaGetter schemaGetter, KvFormat kvFormat) {
-        this(schemaGetter, kvFormat, 2);
+        this(schemaGetter, kvFormat, KV_FORMAT_VERSION_2);
     }
 
-    /**
-     * Creates a version-aware decoder.
-     *
-     * @param kvFormatVersion the KV format version of the table; version >= 3 means the value
-     *     contains an 8-byte tag after the schemaId
-     */
     public ValueDecoder(SchemaGetter schemaGetter, KvFormat kvFormat, int kvFormatVersion) {
+        this(schemaGetter, kvFormat, KvValueLayout.forKvFormatVersion(kvFormatVersion));
+    }
+
+    public ValueDecoder(SchemaGetter schemaGetter, KvFormat kvFormat, KvValueLayout kvValueLayout) {
         this.rowDecoders = new ConcurrentHashMap<>();
         this.schemaGetter = schemaGetter;
         this.kvFormat = kvFormat;
-        this.kvFormatVersion = kvFormatVersion;
+        this.kvValueLayout = kvValueLayout;
     }
 
-    /** Decode the value bytes and return the schema id, tag (if v3), and row. */
+    /** Decode the value bytes and return the schema id and the row encoded in the value bytes. */
     public BinaryValue decodeValue(byte[] valueBytes) {
         MemorySegment memorySegment = MemorySegment.wrap(valueBytes);
-        short schemaId = memorySegment.getShort(0);
-
-        boolean hasTag = kvFormatVersion >= KV_FORMAT_VERSION_3;
-        int rowOffset = hasTag ? SCHEMA_ID_LENGTH + TAG_LENGTH : SCHEMA_ID_LENGTH;
+        short schemaId = kvValueLayout.readSchemaId(memorySegment);
 
         RowDecoder rowDecoder =
                 rowDecoders.computeIfAbsent(
@@ -84,12 +69,11 @@ public class ValueDecoder {
                                     schema.getRowType().getChildren().toArray(new DataType[0]));
                         });
 
-        BinaryRow row = rowDecoder.decode(memorySegment, rowOffset, valueBytes.length - rowOffset);
-
-        if (hasTag) {
-            long tag = memorySegment.getLong(SCHEMA_ID_LENGTH);
-            return new BinaryValue(schemaId, tag, row);
-        }
+        BinaryRow row =
+                rowDecoder.decode(
+                        memorySegment,
+                        kvValueLayout.rowPayloadOffset(),
+                        kvValueLayout.rowPayloadLength(valueBytes.length));
         return new BinaryValue(schemaId, row);
     }
 }

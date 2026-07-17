@@ -27,44 +27,15 @@ public class BinaryValue {
 
     public final short schemaId;
     public final BinaryRow row;
-    private final long tag;
-    private final boolean hasTag;
 
-    /** Creates a v2 value (no tag prefix). */
     public BinaryValue(short schemaId, BinaryRow row) {
         this.schemaId = schemaId;
         this.row = row;
-        this.tag = 0;
-        this.hasTag = false;
     }
 
-    /** Creates a v3 value with an 8-byte tag prefix (e.g. partitionId for partition TTL). */
-    public BinaryValue(short schemaId, long tag, BinaryRow row) {
-        this.schemaId = schemaId;
-        this.row = row;
-        this.tag = tag;
-        this.hasTag = true;
-    }
-
-    /**
-     * Creates a new BinaryValue with a different schemaId and row, preserving the tag attribute
-     * from this value. This is used by mergers/updaters to propagate the tag through merge
-     * operations without leaking format version knowledge into business logic.
-     */
-    public BinaryValue withRow(short schemaId, BinaryRow row) {
-        return hasTag ? new BinaryValue(schemaId, tag, row) : new BinaryValue(schemaId, row);
-    }
-
-    /**
-     * Encode the value to a byte array to be persisted to kv store.
-     *
-     * <p>v2 format: {@code [schemaId(2)][BinaryRow]}<br>
-     * v3 format: {@code [schemaId(2)][tag(8)][BinaryRow]}
-     */
+    /** Encodes this logical value using the version 2 physical layout. */
     public byte[] encodeValue() {
-        return hasTag
-                ? ValueEncoder.encodeValue(schemaId, tag, row)
-                : ValueEncoder.encodeValue(schemaId, row);
+        return ValueEncoder.encodeValue(schemaId, row);
     }
 
     @Override
@@ -73,22 +44,16 @@ public class BinaryValue {
             return false;
         }
         BinaryValue that = (BinaryValue) o;
-        return schemaId == that.schemaId
-                && hasTag == that.hasTag
-                && tag == that.tag
-                && Objects.equals(row, that.row);
+        return schemaId == that.schemaId && Objects.equals(row, that.row);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(schemaId, hasTag, tag, row);
+        return Objects.hash(schemaId, row);
     }
 
     @Override
     public String toString() {
-        if (hasTag) {
-            return "BinaryValue{schemaId=" + schemaId + ", tag=" + tag + ", row=" + row + '}';
-        }
-        return "BinaryValue{schemaId=" + schemaId + ", row=" + row + '}';
+        return "BinaryValue{" + "schemaId=" + schemaId + ", row=" + row + '}';
     }
 }

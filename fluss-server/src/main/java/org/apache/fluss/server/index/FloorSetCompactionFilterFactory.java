@@ -19,7 +19,7 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.PartitionTombstone;
-import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 
 import org.rocksdb.AbstractCompactionFilter;
 import org.rocksdb.AbstractCompactionFilterFactory;
@@ -29,6 +29,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Set;
 import java.util.function.Supplier;
+
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 
 /**
  * Factory that creates per-compaction {@link FloorSetCompactionFilter} instances.
@@ -62,7 +64,7 @@ public final class FloorSetCompactionFilterFactory
      */
     public FloorSetCompactionFilterFactory(Supplier<PartitionTombstone> tombstoneSupplier) {
         super();
-        this.tagOffset = ValueEncoder.TAG_OFFSET;
+        this.tagOffset = KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3).valueTagOffset();
         this.tombstoneSupplier = tombstoneSupplier;
     }
 
