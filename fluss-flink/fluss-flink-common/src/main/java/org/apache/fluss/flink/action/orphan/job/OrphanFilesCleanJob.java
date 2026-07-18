@@ -57,7 +57,9 @@ public final class OrphanFilesCleanJob {
     public static CleanupSummary execute(
             StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism)
             throws Exception {
-        SingleOutputStreamOperator<CleanupSummary> result = buildPipeline(env, config, parallelism);
+        env.setRuntimeMode(RuntimeExecutionMode.BATCH);
+
+        DataStream<CleanupSummary> result = buildPipeline(env, config, parallelism);
 
         // Execute and collect the single result
         List<CleanupSummary> collected = collectResults(result);
@@ -69,10 +71,8 @@ public final class OrphanFilesCleanJob {
         return collected.get(0);
     }
 
-    static SingleOutputStreamOperator<CleanupSummary> buildPipeline(
+    static DataStream<CleanupSummary> buildPipeline(
             StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism) {
-        env.setRuntimeMode(RuntimeExecutionMode.BATCH);
-
         // Stage 1: ScopeEnumerator (parallelism=1)
         DataStream<Integer> trigger =
                 env.fromCollection(Collections.singletonList(1), TypeInformation.of(Integer.class));
@@ -91,7 +91,8 @@ public final class OrphanFilesCleanJob {
                                 new ScanAndCleanFunction(
                                         config.remoteFsOpRateLimitPerSecond(),
                                         config.extraConfigs(),
-                                        config.auditReporterSpec()))
+                                        config.auditReporterSpec(),
+                                        config.dryRun()))
                         .returns(TypeInformation.of(new TypeHint<CleanupStats>() {}))
                         .name("ScanAndClean");
         if (parallelism != null) {

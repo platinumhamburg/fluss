@@ -379,6 +379,7 @@ class AuditReporterRuntimeTest {
         TestingAuditReporterFactory.fail("testing", "validate", THROWABLE_SECRET + "Validate");
         TestingAuditReporterFactory.fail("first", "create", THROWABLE_SECRET + "Create");
         TestingAuditReporterFactory.fail("second", "open", THROWABLE_SECRET + "Open");
+        TestingAuditReporterFactory.fail("second", "close", THROWABLE_SECRET + "Close");
         List<CapturedLog> logs = new CopyOnWriteArrayList<>();
 
         try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs)) {
@@ -404,42 +405,8 @@ class AuditReporterRuntimeTest {
         assertLogsAreRedacted(logs);
         assertThat(TestingAuditReporterFactory.calls())
                 .containsSubsequence("third:open", "third:report", "third:close")
+                .contains("second:close")
                 .doesNotContain("testing:create", "first:open", "second:report");
-    }
-
-    @Test
-    void optionalOpenFailureClosesFailedReporterWarnsForCleanupAndContinues() {
-        TestingAuditReporterFactory.fail("second", "open", THROWABLE_SECRET + "Open");
-        TestingAuditReporterFactory.fail("second", "close", THROWABLE_SECRET + "Close");
-        List<CapturedLog> logs = new CopyOnWriteArrayList<>();
-
-        try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs)) {
-            AuditReporterRuntime runtime =
-                    AuditReporterRuntime.open(
-                            spec(reporter("second", false), reporter("third", true)),
-                            context(getClass().getClassLoader()));
-            runtime.report(secretEvent());
-            runtime.close();
-        }
-
-        assertThat(logs).hasSize(2).allMatch(log -> log.level == Level.WARN);
-        assertThat(logs)
-                .extracting(log -> log.message)
-                .containsExactly(
-                        "Audit reporter 'second' failed during open",
-                        "Audit reporter 'second' failed during close");
-        assertLogsAreRedacted(logs);
-        assertThat(TestingAuditReporterFactory.calls())
-                .containsExactly(
-                        "second:validate",
-                        "second:create",
-                        "second:open",
-                        "second:close",
-                        "third:validate",
-                        "third:create",
-                        "third:open",
-                        "third:report",
-                        "third:close");
     }
 
     @Test

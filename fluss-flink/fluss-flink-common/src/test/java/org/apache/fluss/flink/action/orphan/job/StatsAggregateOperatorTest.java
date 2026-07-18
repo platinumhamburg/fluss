@@ -18,16 +18,20 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.flink.action.orphan.audit.AuditEvent;
-import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory;
+import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory.OpenContextSnapshot;
 
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.List;
@@ -35,15 +39,15 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.catchThrowable;
 
 class StatsAggregateOperatorTest {
 
+    private static final String RUN_ID = "00000000-0000-0000-0000-000000000005";
+
     @BeforeEach
-    void resetReporter() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory("reset", new Class<?>[0]);
+    void resetReporterProbe() {
+        TestingAuditReporterFactory.reset();
     }
 
     @Test
@@ -192,82 +196,30 @@ class StatsAggregateOperatorTest {
     }
 
     @Test
-    void opensReporterWithRuntimeIdentity() throws Exception {
-        StatsAggregateOperator operator =
-                new StatsAggregateOperator(true, OrphanFilesCleanJobTest.reporterSpec(true));
-        try (OneInputStreamOperatorTestHarness<CleanupStats, CleanupSummary> harness =
-                new OneInputStreamOperatorTestHarness<>(operator, 4, 4, 2)) {
+    void statsOpenUsesActualRuntimeIdentity() throws Exception {
+        try (Harness harness = new Harness(true, reportingSpec(true))) {
             harness.open();
 
-            AuditReporterContext context = OrphanFilesCleanJobTest.auditContext(operator);
-            assertThat(context.getStage()).isEqualTo(AuditStage.SUMMARY);
-            assertThat(context.getOperatorName()).isEqualTo("StatsAggregate");
-            assertThat(context.getSubtaskIndex()).isEqualTo(2);
-            assertThat(context.getAttemptNumber()).isZero();
-            assertThat(context.getUserCodeClassLoader())
-                    .isSameAs(operator.getRuntimeContext().getUserCodeClassLoader());
-            assertThat(harness.getRecordOutput()).isEmpty();
+            assertThat(TestingAuditReporterFactory.openContexts("testing"))
+                    .singleElement()
+                    .satisfies(context -> assertRuntimeIdentity(context, harness));
         }
     }
 
     @Test
-    void requiredReporterOpenFailureFailsStatsOpen() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "open",
-                "not-exposed");
-        OneInputStreamOperatorTestHarness<CleanupStats, CleanupSummary> harness =
-                new OneInputStreamOperatorTestHarness<>(
-                        new StatsAggregateOperator(
-                                true, OrphanFilesCleanJobTest.reporterSpec(true)),
-                        1,
-                        1,
-                        0);
-
-        assertThatThrownBy(harness::open)
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("testing")
-                .hasMessageContaining("open")
-                .hasMessageNotContaining("not-exposed");
-        assertThatCode(harness.getOperator()::close).doesNotThrowAnyException();
-        assertThatCode(harness.getOperator()::close).doesNotThrowAnyException();
+    void requiredReporterOpenFailureFailsStatsHarnessOpen() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "open", "injected-open-failure");
+        try (Harness harness = new Harness(true, reportingSpec(true))) {
+            assertThatThrownBy(harness::open)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("open")
+                    .hasMessageNotContaining("injected-open-failure");
+        }
     }
 
     @Test
-    void reporterCloseFailureDoesNotReplaceAnExistingTaskFailure() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "close",
-                "not-exposed");
-        Harness harness = new Harness(true, true);
-        harness.open();
-        CleanupStats marker = CleanupStats.scope(0L, 0L, Collections.emptyMap());
-        harness.processElement(new StreamRecord<>(marker));
-
-        Throwable primary =
-                catchThrowable(() -> harness.processElement(new StreamRecord<>(marker)));
-        assertThat(primary)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("Duplicate scope summary")
-                .hasNoSuppressedExceptions();
-
-        harness.close();
-        assertThatCode(harness.getOperator()::close).doesNotThrowAnyException();
-        OrphanFilesCleanJobTest.assertSanitizedCleanupSuppressed(primary, "close");
-    }
-
-    @Test
-    void flushesTerminalAuditSequenceBeforeIntegrityFailure() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "close",
-                "raw-provider-secret");
+    void terminalAuditOrderFlushesBeforeIntegrityFailureAndEmitsNoRecord() throws Exception {
         ScopeIdentity scope = ScopeIdentity.table("db", "table", 15L);
         CleanupStats inconsistent =
                 CleanupStats.scanBuilder(scope)
@@ -276,99 +228,238 @@ class StatsAggregateOperatorTest {
                         .ruleDecision(
                                 CleanupObjectType.LOG_SEGMENT, RuleDecisionCounters.scanned(10L))
                         .build();
-        Harness harness = new Harness(true, true);
-        harness.open();
-        harness.processElement(
-                new StreamRecord<>(CleanupStats.scope(1L, 0L, Collections.emptyMap())));
-        harness.processElement(new StreamRecord<>(inconsistent));
 
-        Throwable primary = catchThrowable(harness::endInput);
-        assertThat(primary)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("audit integrity")
-                .hasNoSuppressedExceptions();
-        assertThat(testingEvents())
-                .extracting(AuditEvent::getAction)
-                .containsExactly(
-                        "table_rule_summary",
-                        "summary_by_rule",
-                        "coverage_summary",
-                        "audit_integrity",
-                        "summary");
-        assertThat(OrphanFilesCleanJobTest.testingCalls())
-                .endsWith(
-                        "testing:report",
-                        "testing:report",
-                        "testing:report",
-                        "testing:report",
-                        "testing:report",
-                        "testing:flush");
-        assertThat(harness.summaries()).isEmpty();
+        try (Harness harness = new Harness(true, reportingSpec(true))) {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(CleanupStats.scope(1L, 0L, Collections.emptyMap())));
+            harness.processElement(new StreamRecord<>(inconsistent));
 
-        harness.close();
-        assertThatCode(harness.getOperator()::close).doesNotThrowAnyException();
-        OrphanFilesCleanJobTest.assertSanitizedCleanupSuppressed(primary, "close");
+            assertThatThrownBy(harness::endInput)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("audit integrity");
+
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .extracting(AuditEvent::getAction)
+                    .containsExactly(
+                            "table_rule_summary",
+                            "summary_by_rule",
+                            "coverage_summary",
+                            "audit_integrity",
+                            "summary");
+            assertThat(TestingAuditReporterFactory.calls())
+                    .containsExactly(
+                            "testing:validate",
+                            "testing:create",
+                            "testing:open",
+                            "testing:report",
+                            "testing:report",
+                            "testing:report",
+                            "testing:report",
+                            "testing:report",
+                            "testing:flush");
+            assertThat(harness.summaries()).isEmpty();
+        }
     }
 
     @Test
-    void optionalReporterFailureDoesNotChangeSummaryCounters() throws Exception {
-        OrphanFilesCleanJobTest.invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "report",
-                "not-exposed");
+    void requiredFlushFailureFailsValidSummaryBeforeAnyOutputRecord() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
+        Harness harness = new Harness(true, reportingSpec(true));
+        try {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(CleanupStats.scope(0L, 0L, Collections.emptyMap())));
+
+            assertThatThrownBy(harness::endInput)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("flush")
+                    .hasMessageNotContaining("injected-flush-failure");
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .extracting(AuditEvent::getAction)
+                    .containsExactly("coverage_summary", "audit_integrity", "summary");
+            assertThat(harness.summaries()).isEmpty();
+        } finally {
+            TestingAuditReporterFactory.reset();
+            harness.close();
+        }
+    }
+
+    @Test
+    void integrityFailureRemainsPrimaryWhenRequiredFlushAlsoFails() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
+        ScopeIdentity scope = ScopeIdentity.table("db", "table", 17L);
+        CleanupStats inconsistent =
+                CleanupStats.scanBuilder(scope)
+                        .scanned(CleanupObjectType.LOG_SEGMENT, 1L)
+                        .planned(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
+                        .ruleDecision(
+                                CleanupObjectType.LOG_SEGMENT, RuleDecisionCounters.scanned(10L))
+                        .build();
+        Harness harness = new Harness(true, reportingSpec(true));
+        try {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(CleanupStats.scope(1L, 0L, Collections.emptyMap())));
+            harness.processElement(new StreamRecord<>(inconsistent));
+
+            assertThatThrownBy(harness::endInput)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("audit integrity")
+                    .satisfies(
+                            failure ->
+                                    assertThat(failure.getSuppressed())
+                                            .singleElement()
+                                            .satisfies(
+                                                    suppressed ->
+                                                            assertThat(suppressed)
+                                                                    .hasMessageContaining("testing")
+                                                                    .hasMessageContaining("flush")
+                                                                    .hasMessageNotContaining(
+                                                                            "injected-flush-failure")));
+            assertThat(harness.summaries()).isEmpty();
+        } finally {
+            TestingAuditReporterFactory.reset();
+            harness.close();
+        }
+    }
+
+    @Test
+    void statsCloseFallbackFlushesThenClosesReporterExactlyOnce() throws Exception {
+        StatsAggregateOperator operator = newStatsOperator(true, reportingSpec(true));
+        Harness harness = new Harness(operator);
+        try {
+            harness.open();
+        } finally {
+            harness.close();
+        }
+
+        operator.close();
+
+        assertThat(TestingAuditReporterFactory.calls())
+                .containsExactly(
+                        "testing:validate",
+                        "testing:create",
+                        "testing:open",
+                        "testing:flush",
+                        "testing:close");
+    }
+
+    @Test
+    void optionalReporterFailuresDoNotChangeCleanupSummaryCounters() throws Exception {
+        CleanupSummary baseline = aggregateScopeOnly(disabledReporterSpec());
+
+        TestingAuditReporterFactory.reset();
+        TestingAuditReporterFactory.fail("testing", "report", "injected-optional-report-failure");
+        CleanupSummary withOptionalFailure = aggregateScopeOnly(reportingSpec(false));
+
+        assertThat(withOptionalFailure).usingRecursiveComparison().isEqualTo(baseline);
+        assertThat(TestingAuditReporterFactory.callCount("testing:report")).isEqualTo(3);
+    }
+
+    @Test
+    void reporterEventsStayOutOfCleanupTaskStatsAndStreamRecords() throws Exception {
         ScopeIdentity scope = ScopeIdentity.table("db", "table", 16L);
         CleanupStats scan =
                 CleanupStats.scanBuilder(scope)
                         .scanned(CleanupObjectType.LOG_SEGMENT, 1L)
-                        .planned(CleanupObjectType.LOG_SEGMENT, 1L, 23L)
+                        .planned(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
                         .ruleDecision(
                                 CleanupObjectType.LOG_SEGMENT,
-                                RuleDecisionCounters.scanned(23L)
-                                        .add(RuleDecisionCounters.candidate(23L)))
+                                RuleDecisionCounters.scanned(10L)
+                                        .add(RuleDecisionCounters.candidate(10L)))
                         .build();
-        try (Harness harness = new Harness(true, false)) {
+        try (Harness harness = new Harness(true, reportingSpec(true))) {
             harness.open();
             harness.processElement(
                     new StreamRecord<>(CleanupStats.scope(1L, 0L, Collections.emptyMap())));
             harness.processElement(new StreamRecord<>(scan));
             harness.endInput();
 
-            assertThat(harness.summaries())
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .hasSize(5)
+                    .allSatisfy(
+                            event ->
+                                    assertThat((Object) event)
+                                            .isNotInstanceOf(CleanTask.class)
+                                            .isNotInstanceOf(CleanupStats.class)
+                                            .isNotInstanceOf(StreamRecord.class));
+            assertThat(harness.getOutput())
                     .singleElement()
-                    .satisfies(
-                            summary -> {
-                                assertThat(summary.globalCounters().scannedFiles()).isEqualTo(1L);
-                                assertThat(summary.globalCounters().plannedFiles()).isEqualTo(1L);
-                                assertThat(summary.globalCounters().plannedBytes()).isEqualTo(23L);
-                                assertThat(summary.ruleCandidateFiles()).isEqualTo(1L);
-                                assertThat(summary.ruleCandidateBytes()).isEqualTo(23L);
-                            });
+                    .isInstanceOfSatisfying(
+                            StreamRecord.class,
+                            record ->
+                                    assertThat(((StreamRecord<?>) record).getValue())
+                                            .isInstanceOf(CleanupSummary.class)
+                                            .isNotInstanceOf(AuditEvent.class));
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private static List<AuditEvent> testingEvents() throws Exception {
-        return (List<AuditEvent>)
-                OrphanFilesCleanJobTest.invokeTestingFactory(
-                        "events", new Class<?>[] {String.class}, "testing");
+    private static CleanupSummary aggregateScopeOnly(AuditReporterSpec reporterSpec)
+            throws Exception {
+        try (Harness harness = new Harness(true, reporterSpec)) {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(CleanupStats.scope(0L, 0L, Collections.emptyMap())));
+            harness.endInput();
+            return harness.summaries().get(0);
+        }
+    }
+
+    private static void assertRuntimeIdentity(OpenContextSnapshot context, Harness harness) {
+        assertThat(context.getRunId()).isEqualTo(RUN_ID);
+        assertThat(context.isDryRun()).isTrue();
+        assertThat(context.getStage()).isEqualTo(AuditStage.SUMMARY);
+        assertThat(context.getOperatorName()).isEqualTo("StatsAggregate");
+        assertThat(context.getSubtaskIndex()).isZero();
+        assertThat(context.getAttemptNumber()).isZero();
+        assertThat(context.getUserCodeClassLoader())
+                .isSameAs(harness.getEnvironment().getUserCodeClassLoader().asClassLoader());
+    }
+
+    private static AuditReporterSpec disabledReporterSpec() {
+        return new AuditReporterSpec(RUN_ID, Collections.<ReporterSpec>emptyList());
+    }
+
+    private static AuditReporterSpec reportingSpec(boolean required) {
+        return new AuditReporterSpec(
+                RUN_ID,
+                Collections.singletonList(
+                        new ReporterSpec(
+                                "testing", required, Collections.<String, String>emptyMap())));
+    }
+
+    private static StatsAggregateOperator newStatsOperator(
+            boolean dryRun, AuditReporterSpec reporterSpec) {
+        try {
+            Constructor<StatsAggregateOperator> constructor =
+                    StatsAggregateOperator.class.getDeclaredConstructor(
+                            boolean.class, AuditReporterSpec.class);
+            return constructor.newInstance(dryRun, reporterSpec);
+        } catch (NoSuchMethodException missingTaskFiveConstructor) {
+            throw new AssertionError(
+                    "Task 5 requires StatsAggregateOperator(boolean, AuditReporterSpec)",
+                    missingTaskFiveConstructor);
+        } catch (ReflectiveOperationException reflectionFailure) {
+            throw new AssertionError(
+                    "Unable to construct StatsAggregateOperator", reflectionFailure);
+        }
     }
 
     private static final class Harness
             extends OneInputStreamOperatorTestHarness<CleanupStats, CleanupSummary> {
 
         private Harness(boolean dryRun) throws Exception {
-            super(new StatsAggregateOperator(dryRun), 1, 1, 0);
+            this(dryRun, disabledReporterSpec());
         }
 
-        private Harness(boolean dryRun, boolean required) throws Exception {
-            super(
-                    new StatsAggregateOperator(
-                            dryRun, OrphanFilesCleanJobTest.reporterSpec(required)),
-                    1,
-                    1,
-                    0);
+        private Harness(boolean dryRun, AuditReporterSpec reporterSpec) throws Exception {
+            this(newStatsOperator(dryRun, reporterSpec));
+        }
+
+        private Harness(StatsAggregateOperator operator) throws Exception {
+            super(operator, 1, 1, 0);
         }
 
         @SuppressWarnings("unchecked")

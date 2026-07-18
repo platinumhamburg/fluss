@@ -18,20 +18,24 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
-import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
-import org.apache.fluss.flink.action.orphan.audit.AuditReportingException;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory;
+import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory.OpenContextSnapshot;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.adapter.MultipleParameterToolAdapter;
 
+import org.apache.flink.api.common.TaskInfoImpl;
+import org.apache.flink.api.common.functions.OpenContext;
+import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.graph.StreamEdge;
 import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.streaming.api.graph.StreamNode;
 import org.apache.flink.streaming.api.operators.ProcessOperator;
+import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.streaming.runtime.partitioner.RebalancePartitioner;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
@@ -39,273 +43,374 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.ObjectOutputStream;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
-import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
-import java.util.List;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.catchThrowable;
-import static org.assertj.core.api.Assertions.tuple;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class OrphanFilesCleanJobTest {
 
-    private static final String RUN_ID = "123e4567-e89b-12d3-a456-426614174000";
+    private static final String RUN_ID = "00000000-0000-0000-0000-000000000005";
 
     @BeforeEach
-    void resetReporter() throws Exception {
-        invokeTestingFactory("reset", new Class<?>[0]);
+    void resetReporterProbe() {
+        TestingAuditReporterFactory.reset();
     }
 
     @Test
-    void scopeOpensReporterWithRuntimeIdentityAndEmitsNoReporterRecords() throws Exception {
-        ScopeEnumeratorFunction function = new ScopeEnumeratorFunction(configWithReporter(true));
-        ProcessOperator<Integer, CleanTask> operator = new ProcessOperator<>(function);
-        try (OneInputStreamOperatorTestHarness<Integer, CleanTask> harness =
-                new OneInputStreamOperatorTestHarness<>(operator, 3, 3, 2)) {
-            harness.open();
+    void scopeOpenUsesActualRuntimeIdentity() throws Exception {
+        ScopeEnumeratorFunction function = new ScopeEnumeratorFunction(reportingConfig(true));
+        int attemptNumber = 4;
+        ClassLoader userCodeClassLoader = getClass().getClassLoader();
+        StreamingRuntimeContext runtimeContext = mock(StreamingRuntimeContext.class);
+        when(runtimeContext.getTaskInfo())
+                .thenReturn(new TaskInfoImpl("ScopeEnumerator", 1, 0, 1, attemptNumber));
+        when(runtimeContext.getUserCodeClassLoader()).thenReturn(userCodeClassLoader);
+        function.setRuntimeContext(runtimeContext);
 
-            AuditReporterContext context = auditContext(function);
-            assertThat(context.getRunId()).isEqualTo(RUN_ID);
-            assertThat(context.getStage()).isEqualTo(AuditStage.SCOPE);
-            assertThat(context.getOperatorName()).isEqualTo("ScopeEnumerator");
-            assertThat(context.getSubtaskIndex()).isEqualTo(2);
-            assertThat(context.getAttemptNumber()).isZero();
-            assertThat(context.getUserCodeClassLoader())
-                    .isSameAs(function.getRuntimeContext().getUserCodeClassLoader());
-            assertThat(harness.getRecordOutput()).isEmpty();
+        try {
+            function.open(new OpenContext() {});
+
+            assertThat(TestingAuditReporterFactory.openContexts("testing"))
+                    .singleElement()
+                    .satisfies(
+                            context ->
+                                    assertRuntimeIdentity(
+                                            context,
+                                            AuditStage.SCOPE,
+                                            "ScopeEnumerator",
+                                            0,
+                                            attemptNumber,
+                                            userCodeClassLoader));
+        } finally {
+            function.close();
+        }
+    }
+
+    @Test
+    void requiredReporterOpenFailureFailsScopeHarnessOpen() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "open", "injected-open-failure");
+        ScopeEnumeratorFunction function = new ScopeEnumeratorFunction(reportingConfig(true));
+        try (OneInputStreamOperatorTestHarness<Integer, CleanTask> harness =
+                scopeHarness(function)) {
+            assertThatThrownBy(harness::open)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("open")
+                    .hasMessageNotContaining("injected-open-failure");
+        }
+    }
+
+    @Test
+    void scopeCloseFallbackFlushesThenClosesReporterExactlyOnce() throws Exception {
+        ScopeEnumeratorFunction function = new ScopeEnumeratorFunction(reportingConfig(true));
+        OneInputStreamOperatorTestHarness<Integer, CleanTask> harness = scopeHarness(function);
+        try {
+            harness.open();
+        } finally {
+            harness.close();
         }
 
-        assertThat(testingCalls())
+        function.close();
+
+        assertThat(TestingAuditReporterFactory.calls())
                 .containsExactly(
-                        "testing:validate", "testing:create", "testing:open", "testing:close");
+                        "testing:validate",
+                        "testing:create",
+                        "testing:open",
+                        "testing:flush",
+                        "testing:close");
     }
 
     @Test
-    void requiredReporterOpenFailureFailsScopeOpen() throws Exception {
-        invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "open",
-                "not-exposed");
-        ScopeEnumeratorFunction function = new ScopeEnumeratorFunction(configWithReporter(true));
-        OneInputStreamOperatorTestHarness<Integer, CleanTask> harness =
-                new OneInputStreamOperatorTestHarness<>(
-                        new ProcessOperator<Integer, CleanTask>(function), 1, 1, 0);
-
-        assertThatThrownBy(harness::open)
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("testing")
-                .hasMessageContaining("open")
-                .hasMessageNotContaining("not-exposed");
-        assertThatCode(function::close).doesNotThrowAnyException();
-        assertThatCode(function::close).doesNotThrowAnyException();
-    }
-
-    @Test
-    void scopeCloseAttachesSanitizedFailureToTheExactProcessFailure() throws Exception {
-        invokeTestingFactory(
-                "fail",
-                new Class<?>[] {String.class, String.class, String.class},
-                "testing",
-                "close",
-                "raw-provider-secret");
+    void scopeTriggerFailurePreservesProcessingFailureAndSuppressesLifecycleFailures()
+            throws Exception {
+        TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
+        TestingAuditReporterFactory.fail("testing", "close", "injected-close-failure");
         ScopeEnumeratorFunction function =
-                new ScopeEnumeratorFunction(configWithReporter(true, "127.0.0.1:1"));
-        OneInputStreamOperatorTestHarness<Integer, CleanTask> harness =
-                new OneInputStreamOperatorTestHarness<>(
-                        new ProcessOperator<Integer, CleanTask>(function), 1, 1, 0);
-        harness.open();
+                new ScopeEnumeratorFunction(reportingConfigWithUnreachableBootstrap());
+        OneInputStreamOperatorTestHarness<Integer, CleanTask> harness = scopeHarness(function);
+        try {
+            harness.open();
 
-        Throwable primary =
-                catchThrowable(() -> harness.processElement(new StreamRecord<Integer>(1)));
-        assertThat(primary)
-                .isNotNull()
-                .isNotInstanceOf(AuditReportingException.class)
-                .hasNoSuppressedExceptions();
+            assertThatThrownBy(() -> harness.processElement(new StreamRecord<>(1)))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("bootstrap servers")
+                    .satisfies(
+                            processingFailure ->
+                                    assertThat(processingFailure.getSuppressed())
+                                            .singleElement()
+                                            .satisfies(
+                                                    lifecycleFailure -> {
+                                                        assertThat(lifecycleFailure)
+                                                                .hasMessageContaining("testing")
+                                                                .hasMessageContaining("flush")
+                                                                .hasMessageNotContaining(
+                                                                        "injected-flush-failure");
+                                                        assertThat(lifecycleFailure.getSuppressed())
+                                                                .singleElement()
+                                                                .satisfies(
+                                                                        closeFailure ->
+                                                                                assertThat(
+                                                                                                closeFailure)
+                                                                                        .hasMessageContaining(
+                                                                                                "testing")
+                                                                                        .hasMessageContaining(
+                                                                                                "close")
+                                                                                        .hasMessageNotContaining(
+                                                                                                "injected-close-failure"));
+                                                    }));
 
-        harness.close();
-        assertThatCode(function::close).doesNotThrowAnyException();
-        assertSanitizedCleanupSuppressed(primary, "close");
+            assertThat(TestingAuditReporterFactory.calls())
+                    .containsExactly(
+                            "testing:validate",
+                            "testing:create",
+                            "testing:open",
+                            "testing:flush",
+                            "testing:close");
+
+            function.close();
+            assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+            assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
+        } finally {
+            harness.close();
+        }
+
+        assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+        assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
     }
 
     @Test
-    void unopenedStagesSerializeOnlyConfigurationAndDoNotInstantiateReporter() throws Exception {
-        OrphanCleanConfig config = configWithReporter(true);
-        AuditReporterSpec reporterSpec = config.auditReporterSpec();
+    void unopenedStagesSerializeOnlyConfigurationAndDoNotInstantiateReporters() throws Exception {
+        OrphanCleanConfig config = reportingConfig(true);
+        ScopeEnumeratorFunction scope = new ScopeEnumeratorFunction(config);
+        ScanAndCleanFunction scan = newScanFunction(config.auditReporterSpec(), config.dryRun());
+        StatsAggregateOperator stats =
+                newStatsOperator(config.dryRun(), config.auditReporterSpec());
 
-        serialize(new ScopeEnumeratorFunction(config));
-        serialize(
-                new ScanAndCleanFunction(
-                        config.remoteFsOpRateLimitPerSecond(),
-                        config.extraConfigs(),
-                        reporterSpec));
-        serialize(new StatsAggregateOperator(config.dryRun(), reporterSpec));
-
-        assertThat(testingInstantiations()).isZero();
-        assertNonTransientFields(ScopeEnumeratorFunction.class, OrphanCleanConfig.class);
-        assertNonTransientFields(
-                ScanAndCleanFunction.class, long.class, Map.class, AuditReporterSpec.class);
-        assertNonTransientFields(
-                StatsAggregateOperator.class, boolean.class, AuditReporterSpec.class);
-        assertTransientField(
-                ScopeEnumeratorFunction.class, "auditReporterRuntime", AuditReporterRuntime.class);
-        assertTransientField(ScopeEnumeratorFunction.class, "taskFailure", Throwable.class);
-        assertTransientField(
-                ScanAndCleanFunction.class, "auditReporterRuntime", AuditReporterRuntime.class);
-        assertTransientField(ScanAndCleanFunction.class, "taskFailure", Throwable.class);
-        assertTransientField(
-                StatsAggregateOperator.class, "auditReporterRuntime", AuditReporterRuntime.class);
-        assertTransientField(StatsAggregateOperator.class, "taskFailure", Throwable.class);
+        assertSerializedConfigurationOnly(
+                scope, new HashSet<Class<?>>(Collections.singletonList(OrphanCleanConfig.class)));
+        assertSerializedConfigurationOnly(
+                scan, new HashSet<Class<?>>(Arrays.asList(Map.class, AuditReporterSpec.class)));
+        assertSerializedConfigurationOnly(
+                stats, new HashSet<Class<?>>(Collections.singletonList(AuditReporterSpec.class)));
+        assertThat(TestingAuditReporterFactory.totalInstantiations()).isZero();
+        assertThat(TestingAuditReporterFactory.calls()).isEmpty();
     }
 
     @Test
-    void buildPipelinePreservesTheThreeStageTopology() throws Exception {
+    void buildPipelinePreservesTheExistingFourNodeDag() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        OrphanFilesCleanJob.buildPipeline(env, configWithReporter(true), 4);
+        int scanParallelism = 3;
 
-        StreamGraph graph = env.getStreamGraph();
-        List<StreamNode> nodes = new ArrayList<>(graph.getStreamNodes());
-        assertThat(nodes).hasSize(4);
-        assertThat(nodes)
-                .extracting(StreamNode::getOperatorName)
+        DataStream<CleanupSummary> result =
+                invokeBuildPipeline(env, reportingConfig(true), scanParallelism);
+
+        assertThat(result).isNotNull();
+        assertThat(env.getTransformations())
+                .extracting(Transformation::getName)
+                .containsExactly("ScopeEnumerator", "ScanAndClean", "StatsAggregate");
+
+        Map<String, Transformation<?>> transformations =
+                env.getTransformations().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        Transformation::getName, transformation -> transformation));
+        assertParallelism(transformations.get("ScopeEnumerator"), 1, 1);
+        assertThat(transformations.get("ScanAndClean").getParallelism()).isEqualTo(scanParallelism);
+        assertParallelism(transformations.get("StatsAggregate"), 1, 1);
+
+        StreamGraph graph = env.getStreamGraph(false);
+        Map<Integer, String> namesById =
+                graph.getStreamNodes().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        StreamNode::getId,
+                                        node -> semanticOperatorName(node.getOperatorName())));
+        assertThat(namesById.values())
                 .containsExactlyInAnyOrder(
-                        "Source: Collection Source",
-                        "ScopeEnumerator",
-                        "ScanAndClean",
-                        "StatsAggregate");
-        assertThat(nodes)
-                .extracting(StreamNode::getOperatorName)
-                .noneMatch(
-                        name ->
-                                name.contains("Reporter")
-                                        || name.contains("JDBC")
-                                        || name.contains("SLS")
-                                        || name.contains("Sink"));
+                        "Collection Source", "ScopeEnumerator", "ScanAndClean", "StatsAggregate");
 
-        StreamNode source = node(nodes, "Source: Collection Source");
-        StreamNode scope = node(nodes, "ScopeEnumerator");
-        StreamNode scan = node(nodes, "ScanAndClean");
-        StreamNode stats = node(nodes, "StatsAggregate");
-        assertThat(scope.getParallelism()).isEqualTo(1);
-        assertThat(maxParallelism(scope)).isEqualTo(1);
-        assertThat(scan.getParallelism()).isEqualTo(4);
-        assertThat(stats.getParallelism()).isEqualTo(1);
-        assertThat(maxParallelism(stats)).isEqualTo(1);
-
-        List<StreamEdge> edges =
-                nodes.stream()
+        Collection<StreamEdge> edges =
+                graph.getStreamNodes().stream()
                         .flatMap(node -> node.getOutEdges().stream())
                         .collect(Collectors.toList());
-        assertThat(edges).hasSize(3);
         assertThat(edges)
-                .extracting(StreamEdge::getSourceId, StreamEdge::getTargetId)
+                .extracting(
+                        edge ->
+                                namesById.get(edge.getSourceId())
+                                        + " -> "
+                                        + namesById.get(edge.getTargetId()))
                 .containsExactlyInAnyOrder(
-                        tuple(source.getId(), scope.getId()),
-                        tuple(scope.getId(), scan.getId()),
-                        tuple(scan.getId(), stats.getId()));
-        assertThat(scope.getOutEdges())
+                        "Collection Source -> ScopeEnumerator",
+                        "ScopeEnumerator -> ScanAndClean",
+                        "ScanAndClean -> StatsAggregate");
+        assertThat(edges)
+                .filteredOn(
+                        edge ->
+                                "ScopeEnumerator".equals(namesById.get(edge.getSourceId()))
+                                        && "ScanAndClean".equals(namesById.get(edge.getTargetId())))
                 .singleElement()
                 .extracting(StreamEdge::getPartitioner)
                 .isInstanceOf(RebalancePartitioner.class);
+
+        assertThat(transformations.keySet())
+                .allSatisfy(
+                        name ->
+                                assertThat(name.toLowerCase())
+                                        .doesNotContain("reporter", "jdbc", "sls", "sink"));
     }
 
-    static AuditReporterSpec reporterSpec(boolean required) {
-        return new AuditReporterSpec(
-                RUN_ID,
-                Collections.singletonList(
-                        new AuditReporterSpec.ReporterSpec(
-                                "testing", required, Collections.emptyMap())));
+    private static String semanticOperatorName(String operatorName) {
+        String sourcePrefix = "Source: ";
+        return operatorName.startsWith(sourcePrefix)
+                ? operatorName.substring(sourcePrefix.length())
+                : operatorName;
     }
 
-    static AuditReporterContext auditContext(Object stage) throws Exception {
-        Field auditField = stage.getClass().getDeclaredField("audit");
-        auditField.setAccessible(true);
-        AuditLogger audit = (AuditLogger) auditField.get(stage);
-        Field contextField = AuditLogger.class.getDeclaredField("context");
-        contextField.setAccessible(true);
-        return (AuditReporterContext) contextField.get(audit);
+    private static OneInputStreamOperatorTestHarness<Integer, CleanTask> scopeHarness(
+            ScopeEnumeratorFunction function) throws Exception {
+        return new OneInputStreamOperatorTestHarness<>(new ProcessOperator<>(function), 1, 1, 0);
     }
 
-    static List<String> testingCalls() throws Exception {
-        return (List<String>) invokeTestingFactory("calls", new Class<?>[0]);
-    }
+    private static void assertSerializedConfigurationOnly(
+            Object stage, Set<Class<?>> allowedReferenceTypes) throws IOException {
+        byte[] serialized = serialize(stage);
+        String descriptors = new String(serialized, StandardCharsets.ISO_8859_1);
+        assertThat(descriptors).contains(AuditReporterSpec.class.getName());
+        assertThat(descriptors)
+                .doesNotContain(
+                        AuditReporterRuntime.class.getName(),
+                        AuditLogger.class.getName(),
+                        TestingAuditReporterFactory.class.getName());
 
-    static void assertSanitizedCleanupSuppressed(Throwable primary, String phase) {
-        assertThat(primary.getSuppressed()).hasSize(1);
-        assertThat(primary.getSuppressed()[0])
-                .isInstanceOf(AuditReportingException.class)
-                .hasMessage("Audit reporter 'testing' failed during " + phase)
-                .hasMessageNotContaining("raw-provider-secret")
-                .hasNoCause();
-    }
-
-    static Object invokeTestingFactory(String method, Class<?>[] parameterTypes, Object... args)
-            throws Exception {
-        Method target = TestingAuditReporterFactory.class.getDeclaredMethod(method, parameterTypes);
-        target.setAccessible(true);
-        return target.invoke(null, args);
-    }
-
-    private static int testingInstantiations() throws Exception {
-        return (Integer) invokeTestingFactory("totalInstantiations", new Class<?>[0]);
-    }
-
-    private static void serialize(Object value) throws Exception {
-        try (ObjectOutputStream output = new ObjectOutputStream(new ByteArrayOutputStream())) {
-            output.writeObject(value);
-        }
-    }
-
-    private static void assertNonTransientFields(Class<?> type, Class<?>... expectedTypes) {
-        assertThat(Arrays.stream(type.getDeclaredFields()))
+        assertThat(Arrays.asList(stage.getClass().getDeclaredFields()))
                 .filteredOn(
                         field ->
                                 !Modifier.isStatic(field.getModifiers())
-                                        && !Modifier.isTransient(field.getModifiers()))
+                                        && !Modifier.isTransient(field.getModifiers())
+                                        && !field.getType().isPrimitive())
                 .extracting(Field::getType)
-                .containsExactly(expectedTypes);
+                .allMatch(allowedReferenceTypes::contains);
     }
 
-    private static void assertTransientField(Class<?> type, String name, Class<?> fieldType)
-            throws Exception {
-        Field field = type.getDeclaredField(name);
-        assertThat(field.getType()).isEqualTo(fieldType);
-        assertThat(Modifier.isTransient(field.getModifiers())).isTrue();
+    private static byte[] serialize(Object value) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+            output.writeObject(value);
+        }
+        return bytes.toByteArray();
     }
 
-    private static int maxParallelism(StreamNode node) throws Exception {
-        Method method = StreamNode.class.getDeclaredMethod("getMaxParallelism");
-        method.setAccessible(true);
-        return (Integer) method.invoke(node);
+    private static void assertParallelism(
+            Transformation<?> transformation, int parallelism, int maxParallelism) {
+        assertThat(transformation.getParallelism()).isEqualTo(parallelism);
+        assertThat(transformation.getMaxParallelism()).isEqualTo(maxParallelism);
     }
 
-    private static StreamNode node(List<StreamNode> nodes, String name) {
-        return nodes.stream()
-                .filter(node -> name.equals(node.getOperatorName()))
-                .findFirst()
-                .orElseThrow(() -> new AssertionError("Missing transformation " + name));
+    @SuppressWarnings("unchecked")
+    private static DataStream<CleanupSummary> invokeBuildPipeline(
+            StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism) {
+        Method method;
+        try {
+            method =
+                    OrphanFilesCleanJob.class.getDeclaredMethod(
+                            "buildPipeline",
+                            StreamExecutionEnvironment.class,
+                            OrphanCleanConfig.class,
+                            Integer.class);
+        } catch (NoSuchMethodException missingTaskFiveMethod) {
+            throw new AssertionError(
+                    "Task 5 requires package-visible static OrphanFilesCleanJob.buildPipeline",
+                    missingTaskFiveMethod);
+        }
+        int modifiers = method.getModifiers();
+        assertThat(Modifier.isStatic(modifiers)).isTrue();
+        assertThat(Modifier.isPublic(modifiers)).isFalse();
+        assertThat(Modifier.isProtected(modifiers)).isFalse();
+        assertThat(Modifier.isPrivate(modifiers)).isFalse();
+        try {
+            return (DataStream<CleanupSummary>) method.invoke(null, env, config, parallelism);
+        } catch (IllegalAccessException | InvocationTargetException reflectionFailure) {
+            throw new AssertionError(
+                    "Unable to invoke OrphanFilesCleanJob.buildPipeline", reflectionFailure);
+        }
     }
 
-    private static OrphanCleanConfig configWithReporter(boolean required) {
-        return configWithReporter(required, "h:9123");
+    private static ScanAndCleanFunction newScanFunction(
+            AuditReporterSpec reporterSpec, boolean dryRun) {
+        try {
+            Constructor<ScanAndCleanFunction> constructor =
+                    ScanAndCleanFunction.class.getDeclaredConstructor(
+                            long.class, Map.class, AuditReporterSpec.class, boolean.class);
+            Map<String, String> fileConfigs = new HashMap<>();
+            fileConfigs.put("fs.test.root", "file:///tmp/orphan-cleanup");
+            return constructor.newInstance(100L, fileConfigs, reporterSpec, dryRun);
+        } catch (NoSuchMethodException missingTaskFiveConstructor) {
+            throw new AssertionError(
+                    "Task 5 requires ScanAndCleanFunction(long, Map, AuditReporterSpec, boolean)",
+                    missingTaskFiveConstructor);
+        } catch (ReflectiveOperationException reflectionFailure) {
+            throw new AssertionError("Unable to construct ScanAndCleanFunction", reflectionFailure);
+        }
     }
 
-    private static OrphanCleanConfig configWithReporter(boolean required, String bootstrapServer) {
+    private static StatsAggregateOperator newStatsOperator(
+            boolean dryRun, AuditReporterSpec reporterSpec) {
+        try {
+            Constructor<StatsAggregateOperator> constructor =
+                    StatsAggregateOperator.class.getDeclaredConstructor(
+                            boolean.class, AuditReporterSpec.class);
+            return constructor.newInstance(dryRun, reporterSpec);
+        } catch (NoSuchMethodException missingTaskFiveConstructor) {
+            throw new AssertionError(
+                    "Task 5 requires StatsAggregateOperator(boolean, AuditReporterSpec)",
+                    missingTaskFiveConstructor);
+        } catch (ReflectiveOperationException reflectionFailure) {
+            throw new AssertionError(
+                    "Unable to construct StatsAggregateOperator", reflectionFailure);
+        }
+    }
+
+    private static void assertRuntimeIdentity(
+            OpenContextSnapshot context,
+            AuditStage stage,
+            String operatorName,
+            int subtaskIndex,
+            int attemptNumber,
+            ClassLoader userCodeClassLoader) {
+        assertThat(context.getRunId()).isEqualTo(RUN_ID);
+        assertThat(context.isDryRun()).isTrue();
+        assertThat(context.getStage()).isEqualTo(stage);
+        assertThat(context.getOperatorName()).isEqualTo(operatorName);
+        assertThat(context.getSubtaskIndex()).isEqualTo(subtaskIndex);
+        assertThat(context.getAttemptNumber()).isEqualTo(attemptNumber);
+        assertThat(context.getUserCodeClassLoader()).isSameAs(userCodeClassLoader);
+    }
+
+    private static OrphanCleanConfig reportingConfig(boolean required) {
         return OrphanCleanConfig.fromParams(
                 MultipleParameterToolAdapter.fromArgs(
                         new String[] {
                             "--bootstrap-server",
-                            bootstrapServer,
+                            "localhost:9123",
                             "--all-databases",
                             "--dry-run",
                             "--conf",
@@ -314,6 +419,23 @@ class OrphanFilesCleanJobTest {
                             "audit.reporters=testing",
                             "--conf",
                             "audit.reporter.testing.required=" + required
+                        }));
+    }
+
+    private static OrphanCleanConfig reportingConfigWithUnreachableBootstrap() {
+        return OrphanCleanConfig.fromParams(
+                MultipleParameterToolAdapter.fromArgs(
+                        new String[] {
+                            "--bootstrap-server",
+                            "localhost:9123",
+                            "--all-databases",
+                            "--dry-run",
+                            "--conf",
+                            "audit.run-id=" + RUN_ID,
+                            "--conf",
+                            "audit.reporters=testing",
+                            "--conf",
+                            "audit.reporter.testing.required=true"
                         }));
     }
 }

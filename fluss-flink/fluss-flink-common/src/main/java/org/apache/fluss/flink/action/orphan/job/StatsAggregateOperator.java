@@ -22,7 +22,6 @@ import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
-import org.apache.fluss.flink.action.orphan.audit.AuditReportingException;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
@@ -49,9 +48,9 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
 
     private final boolean dryRun;
     private final AuditReporterSpec auditReporterSpec;
-    private transient AuditReporterRuntime auditReporterRuntime;
+
+    private transient AuditReporterRuntime auditRuntime;
     private transient AuditLogger audit;
-    private transient Throwable taskFailure;
     private transient boolean scopeSummarySeen;
     private transient CleanupCounters global;
     private transient long tasksPlanned;
@@ -73,7 +72,6 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
     @Override
     public void open() throws Exception {
         super.open();
-        taskFailure = null;
         scopeSummarySeen = false;
         global = CleanupCounters.empty();
         tasksPlanned = 0L;
@@ -84,103 +82,88 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
         byRuleDecision = new EnumMap<>(CleanupObjectType.class);
         if (auditReporterSpec == null) {
             audit = new AuditLogger();
-        } else {
-            AuditReporterContext reporterContext =
-                    new AuditReporterContext(
-                            auditReporterSpec.runId(),
-                            dryRun,
-                            AuditStage.SUMMARY,
-                            "StatsAggregate",
-                            RuntimeContextAdapter.getIndexOfThisSubtask(getRuntimeContext()),
-                            RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()),
-                            getRuntimeContext().getUserCodeClassLoader());
-            auditReporterRuntime = AuditReporterRuntime.open(auditReporterSpec, reporterContext);
-            audit = new AuditLogger(auditReporterRuntime, reporterContext);
+            return;
         }
+
+        AuditReporterContext reporterContext =
+                new AuditReporterContext(
+                        auditReporterSpec.runId(),
+                        dryRun,
+                        AuditStage.SUMMARY,
+                        "StatsAggregate",
+                        RuntimeContextAdapter.getIndexOfThisSubtask(getRuntimeContext()),
+                        RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()),
+                        getRuntimeContext().getUserCodeClassLoader());
+        auditRuntime = AuditReporterRuntime.open(auditReporterSpec, reporterContext);
+        audit = new AuditLogger(auditRuntime, reporterContext);
     }
 
     @Override
     public void processElement(StreamRecord<CleanupStats> element) {
-        try {
-            CleanupStats stats = element.getValue();
-            if (stats.sourceStage() == CleanupStats.SourceStage.SCOPE) {
-                if (scopeSummarySeen) {
-                    throw new IllegalStateException("Duplicate scope summary");
-                }
-                scopeSummarySeen = true;
+        CleanupStats stats = element.getValue();
+        if (stats.sourceStage() == CleanupStats.SourceStage.SCOPE) {
+            if (scopeSummarySeen) {
+                throw new IllegalStateException("Duplicate scope summary");
             }
+            scopeSummarySeen = true;
+        }
 
-            global = global.add(stats.counters());
-            tasksPlanned += stats.tasksPlanned();
-            metadataFailures += stats.metadataFailures();
-            mergeCounters(byObjectType, stats.byObjectType());
-            mergeReasons(bySkipReason, stats.skipped());
-            mergeRuleDecisions(byRuleDecision, stats.ruleDecisions());
+        global = global.add(stats.counters());
+        tasksPlanned += stats.tasksPlanned();
+        metadataFailures += stats.metadataFailures();
+        mergeCounters(byObjectType, stats.byObjectType());
+        mergeReasons(bySkipReason, stats.skipped());
+        mergeRuleDecisions(byRuleDecision, stats.ruleDecisions());
 
-            if (stats.sourceStage() == CleanupStats.SourceStage.SCAN) {
-                ScopeIdentity scope = stats.scope().tableKey();
-                ScopeAccumulator accumulator =
-                        scopes.computeIfAbsent(scope, ignored -> new ScopeAccumulator());
-                mergeCounters(accumulator.byObjectType, stats.byObjectType());
-                mergeReasons(accumulator.bySkipReason, stats.skipped());
-                mergeRuleDecisions(accumulator.byRuleDecision, stats.ruleDecisions());
-            }
-        } catch (RuntimeException | Error e) {
-            taskFailure = e;
-            throw e;
+        if (stats.sourceStage() == CleanupStats.SourceStage.SCAN) {
+            ScopeIdentity scope = stats.scope().tableKey();
+            ScopeAccumulator accumulator =
+                    scopes.computeIfAbsent(scope, ignored -> new ScopeAccumulator());
+            mergeCounters(accumulator.byObjectType, stats.byObjectType());
+            mergeReasons(accumulator.bySkipReason, stats.skipped());
+            mergeRuleDecisions(accumulator.byRuleDecision, stats.ruleDecisions());
         }
     }
 
     @Override
     public void endInput() throws Exception {
-        try {
-            if (!scopeSummarySeen) {
-                throw new IllegalStateException("Missing scope summary");
-            }
-
-            CleanupSummary summary = buildSummary();
-            emitDetailedAudit(audit, summary);
-            if (auditReporterRuntime != null) {
-                auditReporterRuntime.flush();
-            }
-
-            if (!summary.ruleCountersConsistent() || !summary.dryRunCountersConsistent()) {
-                throw new IllegalStateException("Orphan cleanup audit integrity check failed");
-            }
-            output.collect(new StreamRecord<>(summary));
-        } catch (Exception | Error e) {
-            taskFailure = e;
-            throw e;
+        if (!scopeSummarySeen) {
+            throw new IllegalStateException("Missing scope summary");
         }
+
+        CleanupSummary summary = buildSummary();
+        emitDetailedAudit(audit, summary);
+
+        IllegalStateException integrityFailure =
+                !summary.ruleCountersConsistent() || !summary.dryRunCountersConsistent()
+                        ? new IllegalStateException("Orphan cleanup audit integrity check failed")
+                        : null;
+        RuntimeException flushFailure = null;
+        if (auditRuntime != null) {
+            try {
+                auditRuntime.flush();
+            } catch (RuntimeException failure) {
+                flushFailure = failure;
+            }
+        }
+        if (integrityFailure != null) {
+            if (flushFailure != null) {
+                integrityFailure.addSuppressed(flushFailure);
+            }
+            throw integrityFailure;
+        }
+        if (flushFailure != null) {
+            throw flushFailure;
+        }
+        output.collect(new StreamRecord<>(summary));
     }
 
     @Override
     public void close() throws Exception {
-        AuditReporterRuntime runtime = auditReporterRuntime;
-        auditReporterRuntime = null;
-        audit = null;
-        Exception failure = null;
-        if (runtime != null) {
-            try {
-                runtime.close();
-            } catch (AuditReportingException e) {
-                failure = e;
-            }
-        }
         try {
+            closeAuditRuntime();
+        } finally {
             super.close();
-        } catch (Exception e) {
-            if (failure == null) {
-                failure = e;
-            } else {
-                failure.addSuppressed(e);
-            }
-        }
-        if (failure != null) {
-            if (taskFailure == null) {
-                throw failure;
-            }
-            taskFailure.addSuppressed(failure);
         }
     }
 
@@ -334,6 +317,34 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
                     entry.getKey(),
                     target.getOrDefault(entry.getKey(), RuleDecisionCounters.empty())
                             .add(entry.getValue()));
+        }
+    }
+
+    private void closeAuditRuntime() {
+        AuditReporterRuntime runtime = auditRuntime;
+        auditRuntime = null;
+        audit = null;
+        if (runtime == null) {
+            return;
+        }
+
+        RuntimeException failure = null;
+        try {
+            runtime.flush();
+        } catch (RuntimeException flushFailure) {
+            failure = flushFailure;
+        }
+        try {
+            runtime.close();
+        } catch (RuntimeException closeFailure) {
+            if (failure == null) {
+                failure = closeFailure;
+            } else {
+                failure.addSuppressed(closeFailure);
+            }
+        }
+        if (failure != null) {
+            throw failure;
         }
     }
 

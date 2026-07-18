@@ -221,7 +221,6 @@ public final class AuditReporterRuntime implements AutoCloseable {
         logFailure(reporterSpec.identifier(), phase, reporterSpec.required(), context);
         AuditReportingException aggregate =
                 reporterSpec.required() ? failure(reporterSpec.identifier(), phase) : null;
-
         if (partialReporter != null) {
             try {
                 partialReporter.close();

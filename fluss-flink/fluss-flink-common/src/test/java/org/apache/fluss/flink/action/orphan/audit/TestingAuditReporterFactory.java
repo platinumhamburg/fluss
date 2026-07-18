@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.audit;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -39,10 +40,11 @@ public final class TestingAuditReporterFactory {
     private static final Map<String, Boolean> VALIDATE_IMMUTABLE = new HashMap<>();
     private static final Map<String, Boolean> CREATE_IMMUTABLE = new HashMap<>();
     private static final Map<String, List<AuditEvent>> EVENTS = new HashMap<>();
+    private static final Map<String, List<OpenContextSnapshot>> OPEN_CONTEXTS = new HashMap<>();
 
     private TestingAuditReporterFactory() {}
 
-    static void reset() {
+    public static void reset() {
         synchronized (LOCK) {
             CALLS.clear();
             INSTANTIATIONS.clear();
@@ -54,10 +56,11 @@ public final class TestingAuditReporterFactory {
             VALIDATE_IMMUTABLE.clear();
             CREATE_IMMUTABLE.clear();
             EVENTS.clear();
+            OPEN_CONTEXTS.clear();
         }
     }
 
-    static void fail(String identifier, String phase, String message) {
+    public static void fail(String identifier, String phase, String message) {
         synchronized (LOCK) {
             FAILURES.put(key(identifier, phase), message);
         }
@@ -75,13 +78,13 @@ public final class TestingAuditReporterFactory {
         }
     }
 
-    static List<String> calls() {
+    public static List<String> calls() {
         synchronized (LOCK) {
             return new ArrayList<>(CALLS);
         }
     }
 
-    static int callCount(String call) {
+    public static int callCount(String call) {
         synchronized (LOCK) {
             int count = 0;
             for (String actual : CALLS) {
@@ -93,7 +96,7 @@ public final class TestingAuditReporterFactory {
         }
     }
 
-    static int totalInstantiations() {
+    public static int totalInstantiations() {
         synchronized (LOCK) {
             int total = 0;
             for (Integer count : INSTANTIATIONS.values()) {
@@ -127,10 +130,21 @@ public final class TestingAuditReporterFactory {
         }
     }
 
-    static List<AuditEvent> events(String identifier) {
+    public static List<AuditEvent> events(String identifier) {
         synchronized (LOCK) {
             List<AuditEvent> events = EVENTS.get(identifier);
             return events == null ? new ArrayList<AuditEvent>() : new ArrayList<>(events);
+        }
+    }
+
+    /** Returns immutable snapshots of the contexts supplied to a reporter's {@code open}. */
+    public static List<OpenContextSnapshot> openContexts(String identifier) {
+        synchronized (LOCK) {
+            List<OpenContextSnapshot> contexts = OPEN_CONTEXTS.get(identifier);
+            if (contexts == null) {
+                return Collections.emptyList();
+            }
+            return Collections.unmodifiableList(new ArrayList<>(contexts));
         }
     }
 
@@ -155,6 +169,17 @@ public final class TestingAuditReporterFactory {
                 EVENTS.put(identifier, events);
             }
             events.add(event);
+        }
+    }
+
+    private static void recordOpenContext(String identifier, AuditReporterContext context) {
+        synchronized (LOCK) {
+            List<OpenContextSnapshot> contexts = OPEN_CONTEXTS.get(identifier);
+            if (contexts == null) {
+                contexts = new ArrayList<>();
+                OPEN_CONTEXTS.put(identifier, contexts);
+            }
+            contexts.add(new OpenContextSnapshot(context));
         }
     }
 
@@ -329,6 +354,7 @@ public final class TestingAuditReporterFactory {
         @Override
         public void open(AuditReporterContext context) throws Exception {
             called(identifier, "open");
+            recordOpenContext(identifier, context);
             throwIfConfigured(identifier, "open");
         }
 
@@ -354,6 +380,55 @@ public final class TestingAuditReporterFactory {
         @Override
         public String toString() {
             throw new AssertionError("ReporterToStringSecret");
+        }
+    }
+
+    /** Immutable test probe for one reporter-open context. */
+    public static final class OpenContextSnapshot {
+        private final String runId;
+        private final boolean dryRun;
+        private final AuditStage stage;
+        private final String operatorName;
+        private final Integer subtaskIndex;
+        private final Integer attemptNumber;
+        private final ClassLoader userCodeClassLoader;
+
+        private OpenContextSnapshot(AuditReporterContext context) {
+            this.runId = context.getRunId();
+            this.dryRun = context.isDryRun();
+            this.stage = context.getStage();
+            this.operatorName = context.getOperatorName();
+            this.subtaskIndex = context.getSubtaskIndex();
+            this.attemptNumber = context.getAttemptNumber();
+            this.userCodeClassLoader = context.getUserCodeClassLoader();
+        }
+
+        public String getRunId() {
+            return runId;
+        }
+
+        public boolean isDryRun() {
+            return dryRun;
+        }
+
+        public AuditStage getStage() {
+            return stage;
+        }
+
+        public String getOperatorName() {
+            return operatorName;
+        }
+
+        public Integer getSubtaskIndex() {
+            return subtaskIndex;
+        }
+
+        public Integer getAttemptNumber() {
+            return attemptNumber;
+        }
+
+        public ClassLoader getUserCodeClassLoader() {
+            return userCodeClassLoader;
         }
     }
 }
