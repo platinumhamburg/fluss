@@ -72,7 +72,7 @@ public final class AuditReporterRuntime implements AutoCloseable {
             try {
                 factory.validate(copyOptions(reporterSpec.options()));
             } catch (RuntimeException | ServiceConfigurationError e) {
-                handleOpenFailure(opened, reporterSpec, "validate", null);
+                handleOpenFailure(opened, reporterSpec, "validate", null, context);
                 continue;
             }
 
@@ -83,14 +83,14 @@ public final class AuditReporterRuntime implements AutoCloseable {
                     throw new IllegalStateException();
                 }
             } catch (RuntimeException | ServiceConfigurationError e) {
-                handleOpenFailure(opened, reporterSpec, "create", null);
+                handleOpenFailure(opened, reporterSpec, "create", null, context);
                 continue;
             }
 
             try {
                 reporter.open(context);
             } catch (Exception | ServiceConfigurationError e) {
-                handleOpenFailure(opened, reporterSpec, "open", reporter);
+                handleOpenFailure(opened, reporterSpec, "open", reporter, context);
                 continue;
             }
             opened.add(
@@ -210,8 +210,9 @@ public final class AuditReporterRuntime implements AutoCloseable {
             List<ActiveReporter> opened,
             ReporterSpec reporterSpec,
             String phase,
-            AuditReporter partialReporter) {
-        logFailure(reporterSpec.identifier(), phase, reporterSpec.required());
+            AuditReporter partialReporter,
+            AuditReporterContext context) {
+        logFailure(reporterSpec.identifier(), phase, reporterSpec.required(), context);
         AuditReportingException aggregate =
                 reporterSpec.required() ? failure(reporterSpec.identifier(), phase) : null;
         if (partialReporter != null) {
@@ -247,7 +248,7 @@ public final class AuditReporterRuntime implements AutoCloseable {
 
     private static AuditReportingException handleLifecycleFailure(
             AuditReportingException aggregate, ActiveReporter active, String phase) {
-        logFailure(active.identifier, phase, active.required);
+        logFailure(active.identifier, phase, active.required, active.context);
         if (!active.required) {
             return aggregate;
         }
@@ -260,15 +261,28 @@ public final class AuditReporterRuntime implements AutoCloseable {
         return aggregate;
     }
 
-    private static void warn(String identifier, String phase) {
-        LOG.warn("Audit reporter '{}' failed during {}", identifier, phase);
-    }
-
-    private static void logFailure(String identifier, String phase, boolean required) {
+    private static void logFailure(
+            String identifier, String phase, boolean required, AuditReporterContext context) {
         if (required) {
-            LOG.error("Audit reporter '{}' failed during {}", identifier, phase);
+            LOG.error(
+                    "Audit reporter '{}' failed during {} run_id={} stage={} operator={} subtask={} attempt={}",
+                    identifier,
+                    phase,
+                    context.getRunId(),
+                    context.getStage(),
+                    context.getOperatorName(),
+                    context.getSubtaskIndex(),
+                    context.getAttemptNumber());
         } else {
-            warn(identifier, phase);
+            LOG.warn(
+                    "Audit reporter '{}' failed during {} run_id={} stage={} operator={} subtask={} attempt={}",
+                    identifier,
+                    phase,
+                    context.getRunId(),
+                    context.getStage(),
+                    context.getOperatorName(),
+                    context.getSubtaskIndex(),
+                    context.getAttemptNumber());
         }
     }
 
