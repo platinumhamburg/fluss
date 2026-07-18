@@ -593,7 +593,18 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                         planStats.metadataFailure();
                         break;
                     case NOT_LISTED:
-                        planStats.skippedNoRemoteManifest();
+                        // No committed manifest proves that there are no active remote log
+                        // references, not that the physical bucket directory is empty. Scan it
+                        // with an empty active set so partial uploads from a failed first tiering
+                        // attempt can be reclaimed after the cutoff.
+                        logTabletDir =
+                                FlussPaths.remoteLogTabletDir(
+                                                remoteLogDir,
+                                                physicalPath(liveTable.tablePath, partitionInfo),
+                                                tableBucket)
+                                        .toString();
+                        audit.logScanLogBucketWithoutManifest(
+                                liveTable.tableId, partitionId, bucketId);
                         break;
                     default:
                         break;
@@ -616,6 +627,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     // The successful ListKvSnapshots response is authoritative: this bucket has
                     // no active snapshots, hence no active shared SST references.
                     kvSharedSstRefsComplete = true;
+                    audit.logScanKvBucketWithoutActiveSnapshots(
+                            liveTable.tableId, partitionId, bucketId);
                 } else {
                     KvSharedSstFetchResult sstResult =
                             fetcher.fetchKvSharedSstFileNames(

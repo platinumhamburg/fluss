@@ -32,7 +32,6 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.time.Instant;
-import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -59,13 +58,8 @@ public final class AuditLogger {
 
     private boolean mtimeUnavailableSampleLogged;
 
-    /**
-     * Formats cutoff epoch-ms back to the {@code yyyy-MM-dd HH:mm:ss} CLI grammar in the server's
-     * local zone, so the audit line and the original {@code --older-than} value can be compared
-     * verbatim.
-     */
-    private static final DateTimeFormatter CUTOFF_FORMATTER =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault());
+    /** Formats the frozen cutoff with an unambiguous UTC offset. */
+    private static final DateTimeFormatter CUTOFF_FORMATTER = DateTimeFormatter.ISO_INSTANT;
 
     /** Creates a legacy text-only logger without an external reporter or producer identity. */
     public AuditLogger() {
@@ -115,21 +109,31 @@ public final class AuditLogger {
         }
         Object parallelism =
                 config.parallelism().isPresent() ? config.parallelism().get() : "default";
+        String cutoffSource = config.olderThanConfigured() ? "explicit" : "default";
+        long eventTimeMillis = clock.getAsLong();
+        long cutoffAgeMillis = eventTimeMillis - config.olderThanMillis();
         emit(
-                newEvent(AuditSeverity.INFO, AuditStage.RUN, "run_start")
+                newEvent(AuditSeverity.INFO, AuditStage.RUN, "run_start", eventTimeMillis)
                         .dimension("scope", scope)
                         .dimension("parallelism", parallelism.toString())
+                        .dimension("cutoff_source", cutoffSource)
                         .metric("older_than_ms", config.olderThanMillis())
+                        .metric("cutoff_age_ms", cutoffAgeMillis)
                         .metric("remote_fs_rate_limit", config.remoteFsOpRateLimitPerSecond())
+                        .flag("cutoff_in_future", cutoffAgeMillis < 0L)
                         .flag("dry_run", config.dryRun())
                         .flag("allow_delete_manifest", config.allowDeleteManifest())
                         .flag("allow_clean_orphan_tables", config.allowCleanOrphanTables())
                         .flag("allow_clean_orphan_partitions", config.allowCleanOrphanPartitions()),
-                "action=run_start scope={} older_than_ms={} dry_run={} parallelism={}"
+                "action=run_start scope={} older_than_ms={} cutoff_source={} cutoff_age_ms={}"
+                        + " cutoff_in_future={} dry_run={} parallelism={}"
                         + " remote_fs_rate_limit={} allow_delete_manifest={}"
                         + " allow_clean_orphan_tables={} allow_clean_orphan_partitions={}",
                 scope,
                 config.olderThanMillis(),
+                cutoffSource,
+                cutoffAgeMillis,
+                cutoffAgeMillis < 0L,
                 config.dryRun(),
                 parallelism,
                 config.remoteFsOpRateLimitPerSecond(),
@@ -541,6 +545,21 @@ public final class AuditLogger {
                 bucketId);
     }
 
+    /** Skip shared-SST cleanup when active snapshot metadata cannot be resolved completely. */
+    public void logSkipKvSharedSst(long tableId, Long partitionId, int bucketId, String reason) {
+        emit(
+                newEvent(AuditSeverity.WARN, AuditStage.SCOPE, "skip_kv_shared_sst")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .bucketId(bucketId)
+                        .reasonCode("metadata_read_failed"),
+                "action=skip_kv_shared_sst reason={} table_id={} partition_id={} bucket_id={}",
+                reason,
+                tableId,
+                partitionId,
+                bucketId);
+    }
+
     /**
      * Skip shared SST cleanup for a single bucket because the active set could not be determined
      * (metadata read failure). The bucket's snap-private and log cleanup proceed normally.
@@ -586,6 +605,40 @@ public final class AuditLogger {
                         .reasonCode(reason),
                 "action=skip_log_bucket reason={} table_id={} partition_id={} bucket_id={}",
                 reason,
+                tableId,
+                partitionId,
+                bucketId);
+    }
+
+    /** Scan a log bucket with no committed remote manifest and therefore no active references. */
+    public void logScanLogBucketWithoutManifest(long tableId, Long partitionId, int bucketId) {
+        emit(
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scan_log_bucket_without_manifest")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .bucketId(bucketId)
+                        .reasonCode("no_remote_manifest"),
+                "action=scan_log_bucket_without_manifest reason=no_remote_manifest"
+                        + " table_id={} partition_id={} bucket_id={}",
+                tableId,
+                partitionId,
+                bucketId);
+    }
+
+    /** Scan a KV bucket after the RPC authoritatively reports no active snapshots. */
+    public void logScanKvBucketWithoutActiveSnapshots(
+            long tableId, Long partitionId, int bucketId) {
+        emit(
+                newEvent(
+                                AuditSeverity.INFO,
+                                AuditStage.SCOPE,
+                                "scan_kv_bucket_without_active_snapshots")
+                        .tableId(tableId)
+                        .partitionId(partitionId)
+                        .bucketId(bucketId)
+                        .reasonCode("no_active_snapshots"),
+                "action=scan_kv_bucket_without_active_snapshots reason=no_active_snapshots"
+                        + " table_id={} partition_id={} bucket_id={}",
                 tableId,
                 partitionId,
                 bucketId);
@@ -698,6 +751,7 @@ public final class AuditLogger {
                         + nullable(scope.tableId())
                         + " object_type="
                         + lower(objectType.name()),
+                objectType,
                 counters,
                 dryRun);
     }
@@ -710,6 +764,7 @@ public final class AuditLogger {
                         .objectType(lower(objectType.name())),
                 "summary_by_rule",
                 "scope=global object_type=" + lower(objectType.name()),
+                objectType,
                 counters,
                 dryRun);
     }
@@ -727,6 +782,8 @@ public final class AuditLogger {
         long directoryListFailedTargets =
                 skipped.getOrDefault(SkipReasonCode.DIRECTORY_LIST_FAILED, 0L);
         long rpcFailedTargets = skipped.getOrDefault(SkipReasonCode.RPC_ERROR, 0L);
+        boolean physicalScanComplete =
+                coverageComplete && noRemoteManifestTargets == 0L && emptyActiveSetTargets == 0L;
         emit(
                 newEvent(AuditSeverity.INFO, AuditStage.SUMMARY, "coverage_summary")
                         .metric("no_remote_manifest_targets", noRemoteManifestTargets)
@@ -738,13 +795,14 @@ public final class AuditLogger {
                         .metric("mtime_unavailable_bytes", mtimeUnavailableBytes)
                         .metric("mtime_unavailable_dirs", mtimeUnavailableDirs)
                         .flag("complete", coverageComplete)
+                        .flag("physical_scan_complete", physicalScanComplete)
                         .flag("action_required", !coverageComplete)
                         .flag("dry_run", dryRun),
                 "action=coverage_summary no_remote_manifest_targets={}"
                         + " empty_active_set_targets={} metadata_read_failed_targets={}"
                         + " directory_list_failed_targets={} rpc_failed_targets={}"
                         + " mtime_unavailable_files={} mtime_unavailable_bytes={}"
-                        + " mtime_unavailable_dirs={} complete={}"
+                        + " mtime_unavailable_dirs={} complete={} physical_scan_complete={}"
                         + " action_required={} dry_run={}",
                 noRemoteManifestTargets,
                 emptyActiveSetTargets,
@@ -755,6 +813,7 @@ public final class AuditLogger {
                 mtimeUnavailableBytes,
                 mtimeUnavailableDirs,
                 coverageComplete,
+                physicalScanComplete,
                 !coverageComplete,
                 dryRun);
     }
@@ -783,8 +842,20 @@ public final class AuditLogger {
             EventDraft draft,
             String action,
             String dimensions,
+            CleanupObjectType objectType,
             RuleDecisionCounters counters,
             boolean dryRun) {
+        boolean referenceMatchAbsent =
+                (objectType == CleanupObjectType.LOG_SEGMENT
+                                || objectType == CleanupObjectType.KV_SHARED_SST)
+                        && counters.scannedFiles() > 0L
+                        && counters.keepActiveFiles() == 0L;
+        boolean allScannedNewerThanCutoff =
+                counters.scannedFiles() > 0L
+                        && counters.newerThanCutoffFiles() == counters.scannedFiles();
+        boolean allScannedKeepActive =
+                counters.scannedFiles() > 0L
+                        && counters.keepActiveFiles() == counters.scannedFiles();
         emit(
                 draft.metric("scanned_files", counters.scannedFiles())
                         .metric("scanned_bytes", counters.scannedBytes())
@@ -798,13 +869,17 @@ public final class AuditLogger {
                         .metric("unknown_file_type_bytes", counters.unknownFileTypeBytes())
                         .metric("candidate_files", counters.candidateFiles())
                         .metric("candidate_bytes", counters.candidateBytes())
+                        .flag("reference_match_absent", referenceMatchAbsent)
+                        .flag("all_scanned_newer_than_cutoff", allScannedNewerThanCutoff)
+                        .flag("all_scanned_keep_active", allScannedKeepActive)
                         .flag("dry_run", dryRun),
                 "action={} {} scanned_files={} scanned_bytes={} keep_active_files={}"
                         + " keep_active_bytes={} newer_than_cutoff_files={}"
                         + " newer_than_cutoff_bytes={} mtime_unavailable_files={}"
                         + " mtime_unavailable_bytes={} unknown_file_type_files={}"
                         + " unknown_file_type_bytes={} candidate_files={} candidate_bytes={}"
-                        + " dry_run={}",
+                        + " reference_match_absent={} all_scanned_newer_than_cutoff={}"
+                        + " all_scanned_keep_active={} dry_run={}",
                 action,
                 dimensions,
                 counters.scannedFiles(),
@@ -819,11 +894,18 @@ public final class AuditLogger {
                 counters.unknownFileTypeBytes(),
                 counters.candidateFiles(),
                 counters.candidateBytes(),
+                referenceMatchAbsent,
+                allScannedNewerThanCutoff,
+                allScannedKeepActive,
                 dryRun);
     }
 
     private EventDraft newEvent(AuditSeverity severity, AuditStage stage, String action) {
-        long eventTimeMillis = clock.getAsLong();
+        return newEvent(severity, stage, action, clock.getAsLong());
+    }
+
+    private EventDraft newEvent(
+            AuditSeverity severity, AuditStage stage, String action, long eventTimeMillis) {
         if (runtime == null) {
             return new EventDraft(severity, eventTimeMillis, null);
         }
