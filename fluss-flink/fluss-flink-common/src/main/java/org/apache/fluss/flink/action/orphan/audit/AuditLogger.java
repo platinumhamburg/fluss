@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
+import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
@@ -637,31 +638,32 @@ public final class AuditLogger {
      * Routed through the dedicated audit logger so the result is queryable from the same sink as
      * the per-file {@code action=deleted} / {@code action=skip_*} lines.
      */
-    public void logSummary(
-            long scanned,
-            long deletedFiles,
-            long emptyDirsRemoved,
-            long deleteFailures,
-            long bytesReclaimed,
-            boolean dryRun) {
-        long deletedTotal = deletedFiles + emptyDirsRemoved;
+    public void logSummary(CleanupCounters counters, boolean dryRun) {
+        long deletedTotal = counters.deletedFiles() + counters.emptyDirsRemoved();
         emit(
                 newEvent(AuditSeverity.INFO, AuditStage.SUMMARY, "summary")
-                        .metric("scanned", scanned)
+                        .metric("scanned", counters.scannedFiles())
+                        .metric("planned_files", counters.plannedFiles())
+                        .metric("planned_dirs", counters.plannedDirs())
+                        .metric("planned_bytes", counters.plannedBytes())
                         .metric("deleted_total", deletedTotal)
-                        .metric("deleted_files", deletedFiles)
-                        .metric("empty_dirs_removed", emptyDirsRemoved)
-                        .metric("delete_failures", deleteFailures)
-                        .metric("bytes_reclaimed", bytesReclaimed)
+                        .metric("deleted_files", counters.deletedFiles())
+                        .metric("empty_dirs_removed", counters.emptyDirsRemoved())
+                        .metric("delete_failures", counters.deleteFailures())
+                        .metric("bytes_reclaimed", counters.bytesReclaimed())
                         .flag("dry_run", dryRun),
-                "action=summary scanned={} deleted_total={} deleted_files={} empty_dirs_removed={}"
+                "action=summary scanned={} planned_files={} planned_dirs={} planned_bytes={}"
+                        + " deleted_total={} deleted_files={} empty_dirs_removed={}"
                         + " delete_failures={} bytes_reclaimed={} dry_run={}",
-                scanned,
+                counters.scannedFiles(),
+                counters.plannedFiles(),
+                counters.plannedDirs(),
+                counters.plannedBytes(),
                 deletedTotal,
-                deletedFiles,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed,
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed(),
                 dryRun);
     }
 

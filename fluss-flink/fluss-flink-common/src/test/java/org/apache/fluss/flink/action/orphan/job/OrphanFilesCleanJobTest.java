@@ -279,10 +279,69 @@ class OrphanFilesCleanJobTest {
                                         .doesNotContain("reporter", "jdbc", "sls", "sink"));
     }
 
+    @Test
+    void executablePipelineUsesDiscardingTerminalSinkInsteadOfCollectSink() throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        int scanParallelism = 3;
+
+        OrphanFilesCleanJob.buildExecutablePipeline(env, reportingConfig(true), scanParallelism);
+
+        assertThat(env.getTransformations())
+                .extracting(Transformation::getName)
+                .containsExactly("ScopeEnumerator", "ScanAndClean", "StatsAggregate", "end");
+
+        Map<String, Transformation<?>> transformations =
+                env.getTransformations().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        Transformation::getName, transformation -> transformation));
+        assertParallelism(transformations.get("ScopeEnumerator"), 1, 1);
+        assertThat(transformations.get("ScanAndClean").getParallelism()).isEqualTo(scanParallelism);
+        assertParallelism(transformations.get("StatsAggregate"), 1, 1);
+        assertThat(transformations.get("end").getParallelism()).isEqualTo(1);
+
+        StreamGraph graph = env.getStreamGraph(false);
+        Map<Integer, String> namesById =
+                graph.getStreamNodes().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        StreamNode::getId,
+                                        node -> semanticOperatorName(node.getOperatorName())));
+        assertThat(namesById.values())
+                .containsExactlyInAnyOrder(
+                        "Collection Source",
+                        "ScopeEnumerator",
+                        "ScanAndClean",
+                        "StatsAggregate",
+                        "end: Writer");
+
+        Collection<StreamEdge> edges =
+                graph.getStreamNodes().stream()
+                        .flatMap(node -> node.getOutEdges().stream())
+                        .collect(Collectors.toList());
+        assertThat(edges)
+                .extracting(
+                        edge ->
+                                namesById.get(edge.getSourceId())
+                                        + " -> "
+                                        + namesById.get(edge.getTargetId()))
+                .containsExactlyInAnyOrder(
+                        "Collection Source -> ScopeEnumerator",
+                        "ScopeEnumerator -> ScanAndClean",
+                        "ScanAndClean -> StatsAggregate",
+                        "StatsAggregate -> end: Writer");
+        assertThat(namesById.values())
+                .allSatisfy(name -> assertThat(name.toLowerCase()).doesNotContain("collect sink"));
+    }
+
     private static String semanticOperatorName(String operatorName) {
         String sourcePrefix = "Source: ";
-        return operatorName.startsWith(sourcePrefix)
-                ? operatorName.substring(sourcePrefix.length())
+        String sinkPrefix = "Sink: ";
+        if (operatorName.startsWith(sourcePrefix)) {
+            return operatorName.substring(sourcePrefix.length());
+        }
+        return operatorName.startsWith(sinkPrefix)
+                ? operatorName.substring(sinkPrefix.length())
                 : operatorName;
     }
 

@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
+import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.CleanupStats;
 import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
@@ -617,20 +618,26 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    "action=summary scanned=20 deleted_total=5 deleted_files=3"
+                                    "action=summary scanned=20 planned_files=7 planned_dirs=2"
+                                            + " planned_bytes=123 deleted_total=5 deleted_files=3"
                                             + " empty_dirs_removed=2 delete_failures=1"
                                             + " bytes_reclaimed=99 dry_run=true",
                                     AuditSeverity.INFO,
                                     AuditStage.SUMMARY,
                                     "summary")
                             .metric("scanned", 20L)
+                            .metric("planned_files", 7L)
+                            .metric("planned_dirs", 2L)
+                            .metric("planned_bytes", 123L)
                             .metric("deleted_total", 5L)
                             .metric("deleted_files", 3L)
                             .metric("empty_dirs_removed", 2L)
                             .metric("delete_failures", 1L)
                             .metric("bytes_reclaimed", 99L)
                             .flag("dry_run", true),
-                    () -> logger.logSummary(20L, 3L, 2L, 1L, 99L, true));
+                    () ->
+                            logger.logSummary(
+                                    new CleanupCounters(20L, 7L, 2L, 123L, 3L, 2L, 1L, 99L), true));
 
             harness.assertEmission(
                     expected(
@@ -1038,7 +1045,7 @@ class AuditLoggerTest {
                         "logSkipOrphanTableScan(String,String)",
                         "logSkipOrphanPartition(FsPath,String)",
                         "logSkipBucketOutOfScope(long,Long,String)",
-                        "logSummary(long,long,long,long,long,boolean)",
+                        "logSummary(CleanupCounters,boolean)",
                         "logTableRuleSummary(ScopeIdentity,CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",

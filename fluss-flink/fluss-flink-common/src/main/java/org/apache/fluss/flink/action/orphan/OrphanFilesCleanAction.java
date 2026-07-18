@@ -20,13 +20,9 @@ package org.apache.fluss.flink.action.orphan;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.Action;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
-import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
-import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.OrphanFilesCleanJob;
 
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Orphan files cleanup action. Delegates to a distributed Flink Batch job ({@link
@@ -41,8 +37,6 @@ import org.slf4j.LoggerFactory;
 @Internal
 public class OrphanFilesCleanAction implements Action {
 
-    private static final Logger LOG = LoggerFactory.getLogger(OrphanFilesCleanAction.class);
-
     private final OrphanCleanConfig config;
 
     public OrphanFilesCleanAction(OrphanCleanConfig config) {
@@ -52,31 +46,6 @@ public class OrphanFilesCleanAction implements Action {
     @Override
     public void run() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        CleanupSummary summary =
-                OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null));
-        CleanupCounters stats = summary.globalCounters();
-        LOG.info(
-                "remove_orphan_files done: scope={} scannedFiles={} plannedFiles={} plannedDirs={}"
-                        + " plannedBytes={} deletedFiles={} emptyDirsRemoved={} failures={}"
-                        + " bytesReclaimed={} dryRun={}",
-                scopeDescription(),
-                stats.scannedFiles(),
-                stats.plannedFiles(),
-                stats.plannedDirs(),
-                stats.plannedBytes(),
-                stats.deletedFiles(),
-                stats.emptyDirsRemoved(),
-                stats.deleteFailures(),
-                stats.bytesReclaimed(),
-                summary.dryRun());
-    }
-
-    private String scopeDescription() {
-        String scope =
-                config.allDatabases() ? "all-databases" : config.database().orElse("unknown");
-        if (config.table().isPresent()) {
-            return scope + "." + config.table().get();
-        }
-        return scope;
+        OrphanFilesCleanJob.execute(env, config, config.parallelism().orElse(null));
     }
 }
