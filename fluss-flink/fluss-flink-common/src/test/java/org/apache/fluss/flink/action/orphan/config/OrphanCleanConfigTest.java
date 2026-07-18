@@ -61,6 +61,7 @@ class OrphanCleanConfigTest {
         long olderThanLow = beforeParse - Duration.ofDays(3).toMillis();
         long olderThanHigh = afterParse - Duration.ofDays(3).toMillis();
         assertThat(config.olderThanMillis()).isBetween(olderThanLow, olderThanHigh);
+        assertThat(config.olderThanConfigured()).isFalse();
         assertThat(config.dryRun()).isFalse();
         assertThat(config.remoteFsOpRateLimitPerSecond()).isEqualTo(100L);
         assertThat(config.allowDeleteManifest()).isFalse();
@@ -166,6 +167,7 @@ class OrphanCleanConfigTest {
                                     cutoff.format(CUTOFF_FORMATTER)
                                 }));
         assertThat(cfg.olderThanMillis()).isEqualTo(cutoff.toInstant().toEpochMilli());
+        assertThat(cfg.olderThanConfigured()).isTrue();
     }
 
     @Test
