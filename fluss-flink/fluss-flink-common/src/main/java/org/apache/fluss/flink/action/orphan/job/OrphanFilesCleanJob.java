@@ -57,6 +57,20 @@ public final class OrphanFilesCleanJob {
     public static CleanupSummary execute(
             StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism)
             throws Exception {
+        SingleOutputStreamOperator<CleanupSummary> result = buildPipeline(env, config, parallelism);
+
+        // Execute and collect the single result
+        List<CleanupSummary> collected = collectResults(result);
+        if (collected.size() != 1) {
+            throw new IllegalStateException(
+                    "StatsAggregate must emit exactly one cleanup summary, but emitted "
+                            + collected.size());
+        }
+        return collected.get(0);
+    }
+
+    static SingleOutputStreamOperator<CleanupSummary> buildPipeline(
+            StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism) {
         env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
         // Stage 1: ScopeEnumerator (parallelism=1)
@@ -76,7 +90,8 @@ public final class OrphanFilesCleanJob {
                         .process(
                                 new ScanAndCleanFunction(
                                         config.remoteFsOpRateLimitPerSecond(),
-                                        config.extraConfigs()))
+                                        config.extraConfigs(),
+                                        config.auditReporterSpec()))
                         .returns(TypeInformation.of(new TypeHint<CleanupStats>() {}))
                         .name("ScanAndClean");
         if (parallelism != null) {
@@ -88,18 +103,11 @@ public final class OrphanFilesCleanJob {
                 stats.transform(
                                 "StatsAggregate",
                                 TypeInformation.of(new TypeHint<CleanupSummary>() {}),
-                                new StatsAggregateOperator(config.dryRun()))
+                                new StatsAggregateOperator(
+                                        config.dryRun(), config.auditReporterSpec()))
                         .setParallelism(1)
                         .setMaxParallelism(1);
-
-        // Execute and collect the single result
-        List<CleanupSummary> collected = collectResults(result);
-        if (collected.size() != 1) {
-            throw new IllegalStateException(
-                    "StatsAggregate must emit exactly one cleanup summary, but emitted "
-                            + collected.size());
-        }
-        return collected.get(0);
+        return result;
     }
 
     @SuppressWarnings("deprecation")

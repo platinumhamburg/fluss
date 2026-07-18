@@ -29,6 +29,10 @@ import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
+import org.apache.fluss.flink.action.orphan.audit.AuditReportingException;
+import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
 import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
@@ -37,6 +41,7 @@ import org.apache.fluss.flink.action.orphan.build.LogActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.MaxKnownIdsTracker;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.rule.OrphanDirDetector;
+import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -49,6 +54,7 @@ import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -94,13 +100,46 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
     private final OrphanCleanConfig config;
 
+    private transient AuditReporterRuntime auditReporterRuntime;
+    private transient AuditLogger audit;
+    private transient Throwable taskFailure;
+
     public ScopeEnumeratorFunction(OrphanCleanConfig config) {
         this.config = config;
     }
 
     @Override
+    public void open(org.apache.flink.api.common.functions.OpenContext openContext)
+            throws Exception {
+        super.open(openContext);
+        taskFailure = null;
+        AuditReporterContext reporterContext =
+                new AuditReporterContext(
+                        config.auditReporterSpec().runId(),
+                        config.dryRun(),
+                        AuditStage.SCOPE,
+                        "ScopeEnumerator",
+                        RuntimeContextAdapter.getIndexOfThisSubtask(
+                                (StreamingRuntimeContext) getRuntimeContext()),
+                        RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()),
+                        getRuntimeContext().getUserCodeClassLoader());
+        auditReporterRuntime =
+                AuditReporterRuntime.open(config.auditReporterSpec(), reporterContext);
+        audit = new AuditLogger(auditReporterRuntime, reporterContext);
+    }
+
+    @Override
     public void processElement(Integer trigger, Context ctx, Collector<CleanTask> out)
             throws Exception {
+        try {
+            processTrigger(out);
+        } catch (Exception | Error e) {
+            taskFailure = e;
+            throw e;
+        }
+    }
+
+    private void processTrigger(Collector<CleanTask> out) throws Exception {
         if (!config.extraConfigs().isEmpty()) {
             FileSystem.initialize(Configuration.fromMap(config.extraConfigs()), null);
         }
@@ -123,7 +162,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             // deleted=0, masking the incompatibility.
             verifyServerSupportsRequiredApis(admin);
 
-            AuditLogger audit = new AuditLogger();
             ScopePlanStats planStats = new ScopePlanStats();
             audit.logRunStart(config);
             audit.logCutoff(config.olderThanMillis());
@@ -184,6 +222,25 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     out);
             audit.logScopePlan(planStats);
             out.collect(ScopeSummaryTask.from(planStats));
+            auditReporterRuntime.flush();
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        AuditReporterRuntime runtime = auditReporterRuntime;
+        auditReporterRuntime = null;
+        audit = null;
+        if (runtime == null) {
+            return;
+        }
+        try {
+            runtime.close();
+        } catch (AuditReportingException e) {
+            if (taskFailure == null) {
+                throw e;
+            }
+            taskFailure.addSuppressed(e);
         }
     }
 
