@@ -162,6 +162,29 @@ class AuditReporterRuntimeTest {
     }
 
     @Test
+    void discoveryFailureLogsSafeRuntimeContext() {
+        List<CapturedLog> logs = new CopyOnWriteArrayList<>();
+
+        try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs, Level.INFO)) {
+            AuditReportingException failure =
+                    catchThrowableOfType(
+                            () ->
+                                    AuditReporterRuntime.open(
+                                            spec(reporter("missing", true, OPTION_SECRET)),
+                                            context(getClass().getClassLoader())),
+                            AuditReportingException.class);
+            assertFailure(failure, "missing", "discovery");
+        }
+
+        assertThat(logs)
+                .extracting(log -> log.level, log -> log.message)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.ERROR, runtimeFailureLog("discovery")));
+        assertLogsAreRedacted(logs);
+    }
+
+    @Test
     void duplicateVisibleIdentifierFailsDiscoveryBeforeAnyReporterOpens(@TempDir Path tempDir)
             throws Exception {
         try (URLClassLoader loader = duplicateProviderLoader(tempDir)) {
@@ -375,9 +398,9 @@ class AuditReporterRuntimeTest {
         assertThat(logs)
                 .extracting(log -> log.message)
                 .containsExactly(
-                        "Audit reporter 'testing' failed during validate",
-                        "Audit reporter 'first' failed during create",
-                        "Audit reporter 'second' failed during open");
+                        reporterRuntimeLog("testing", "failed during validate"),
+                        reporterRuntimeLog("first", "failed during create"),
+                        reporterRuntimeLog("second", "failed during open"));
         assertLogsAreRedacted(logs);
         assertThat(TestingAuditReporterFactory.calls())
                 .containsSubsequence("third:open", "third:report", "third:close")
@@ -475,6 +498,54 @@ class AuditReporterRuntimeTest {
     }
 
     @Test
+    void logsOpenedAndClosedReporterLifecycleWithOnlySafeContext() {
+        List<CapturedLog> logs = new CopyOnWriteArrayList<>();
+
+        try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs, Level.INFO)) {
+            AuditReporterRuntime runtime =
+                    AuditReporterRuntime.open(
+                            spec(reporter("testing", true, OPTION_SECRET)),
+                            context(getClass().getClassLoader()));
+            runtime.close();
+        }
+
+        assertThat(logs)
+                .extracting(log -> log.level, log -> log.message)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.INFO, reporterRuntimeLog("testing", "opened")),
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.INFO, reporterRuntimeLog("testing", "closed")));
+        assertLogsAreRedacted(logs);
+    }
+
+    @Test
+    void requiredReportFailureLogsErrorWithoutEventOrThrowableSecrets() {
+        TestingAuditReporterFactory.fail("testing", "report", THROWABLE_SECRET + "RequiredReport");
+        AuditReporterRuntime runtime =
+                AuditReporterRuntime.open(
+                        spec(reporter("testing", true, OPTION_SECRET)),
+                        context(getClass().getClassLoader()));
+        List<CapturedLog> logs = new CopyOnWriteArrayList<>();
+
+        try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs, Level.INFO)) {
+            AuditReportingException failure =
+                    catchThrowableOfType(
+                            () -> runtime.report(secretEvent()), AuditReportingException.class);
+            assertFailure(failure, "testing", "report");
+        }
+
+        assertThat(logs)
+                .extracting(log -> log.level, log -> log.message)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.ERROR,
+                                reporterRuntimeLog("testing", "failed during report")));
+        assertLogsAreRedacted(logs);
+        runtime.close();
+    }
+
+    @Test
     void optionalReportFailureWarnsExactlyOnceWithoutEventOrThrowableSecrets() {
         TestingAuditReporterFactory.fail("first", "report", THROWABLE_SECRET + "OptionalReport");
         List<CapturedLog> logs = new CopyOnWriteArrayList<>();
@@ -489,7 +560,8 @@ class AuditReporterRuntimeTest {
 
         assertThat(logs).hasSize(1);
         assertThat(logs.get(0).level).isEqualTo(Level.WARN);
-        assertThat(logs.get(0).message).isEqualTo("Audit reporter 'first' failed during report");
+        assertThat(logs.get(0).message)
+                .isEqualTo(reporterRuntimeLog("first", "failed during report"));
         assertLogsAreRedacted(logs);
         assertThat(TestingAuditReporterFactory.calls())
                 .containsSubsequence("first:report", "second:report");
@@ -515,8 +587,8 @@ class AuditReporterRuntimeTest {
         assertThat(logs)
                 .extracting(log -> log.message)
                 .containsExactly(
-                        "Audit reporter 'first' failed during flush",
-                        "Audit reporter 'second' failed during close");
+                        reporterRuntimeLog("first", "failed during flush"),
+                        reporterRuntimeLog("second", "failed during close"));
         assertLogsAreRedacted(logs);
     }
 
@@ -574,6 +646,18 @@ class AuditReporterRuntimeTest {
     private static AuditReporterContext context(ClassLoader classLoader) {
         return new AuditReporterContext(
                 RUN_ID, true, AuditStage.SCAN, "runtime-test", 1, 0, classLoader);
+    }
+
+    private static String reporterRuntimeLog(String identifier, String state) {
+        return "Audit reporter '" + identifier + "' " + state + runtimeLogContext();
+    }
+
+    private static String runtimeFailureLog(String phase) {
+        return "Audit reporter runtime failed during " + phase + runtimeLogContext();
+    }
+
+    private static String runtimeLogContext() {
+        return " run_id=" + RUN_ID + " stage=SCAN operator=runtime-test subtask=1 attempt=0";
     }
 
     private static AuditEvent secretEvent() {
@@ -700,13 +784,17 @@ class AuditReporterRuntimeTest {
         private final CapturingAppender appender;
 
         private RuntimeLogCapture(List<CapturedLog> logs) {
+            this(logs, Level.WARN);
+        }
+
+        private RuntimeLogCapture(List<CapturedLog> logs, Level level) {
             context = (LoggerContext) LogManager.getContext(false);
             configuration = context.getConfiguration();
             loggerName = AuditReporterRuntime.class.getName();
             appender = new CapturingAppender("audit-reporter-runtime-test", logs);
             appender.start();
-            loggerConfig = new LoggerConfig(loggerName, Level.WARN, false);
-            loggerConfig.addAppender(appender, Level.WARN, null);
+            loggerConfig = new LoggerConfig(loggerName, level, false);
+            loggerConfig.addAppender(appender, level, null);
             configuration.addLogger(loggerName, loggerConfig);
             context.updateLoggers();
         }
