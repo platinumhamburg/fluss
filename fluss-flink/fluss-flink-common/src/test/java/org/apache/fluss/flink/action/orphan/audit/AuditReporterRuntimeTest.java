@@ -376,9 +376,9 @@ class AuditReporterRuntimeTest {
         assertThat(logs)
                 .extracting(log -> log.message)
                 .containsExactly(
-                        "Audit reporter 'testing' failed during validate",
-                        "Audit reporter 'first' failed during create",
-                        "Audit reporter 'second' failed during open");
+                        reporterRuntimeLog("testing", "failed during validate"),
+                        reporterRuntimeLog("first", "failed during create"),
+                        reporterRuntimeLog("second", "failed during open"));
         assertLogsAreRedacted(logs);
         assertThat(TestingAuditReporterFactory.calls())
                 .containsSubsequence("third:open", "third:report", "third:close")
@@ -457,15 +457,9 @@ class AuditReporterRuntimeTest {
                 .extracting(log -> log.level, log -> log.message)
                 .containsExactly(
                         org.assertj.core.groups.Tuple.tuple(
-                                Level.INFO,
-                                "Audit reporter 'testing' opened run_id="
-                                        + RUN_ID
-                                        + " stage=SCAN operator=runtime-test subtask=1 attempt=0"),
+                                Level.INFO, reporterRuntimeLog("testing", "opened")),
                         org.assertj.core.groups.Tuple.tuple(
-                                Level.INFO,
-                                "Audit reporter 'testing' closed run_id="
-                                        + RUN_ID
-                                        + " stage=SCAN operator=runtime-test subtask=1 attempt=0"));
+                                Level.INFO, reporterRuntimeLog("testing", "closed")));
         assertLogsAreRedacted(logs);
     }
 
@@ -489,7 +483,8 @@ class AuditReporterRuntimeTest {
                 .extracting(log -> log.level, log -> log.message)
                 .containsExactly(
                         org.assertj.core.groups.Tuple.tuple(
-                                Level.ERROR, "Audit reporter 'testing' failed during report"));
+                                Level.ERROR,
+                                reporterRuntimeLog("testing", "failed during report")));
         assertLogsAreRedacted(logs);
         runtime.close();
     }
@@ -509,7 +504,8 @@ class AuditReporterRuntimeTest {
 
         assertThat(logs).hasSize(1);
         assertThat(logs.get(0).level).isEqualTo(Level.WARN);
-        assertThat(logs.get(0).message).isEqualTo("Audit reporter 'first' failed during report");
+        assertThat(logs.get(0).message)
+                .isEqualTo(reporterRuntimeLog("first", "failed during report"));
         assertLogsAreRedacted(logs);
         assertThat(TestingAuditReporterFactory.calls())
                 .containsSubsequence("first:report", "second:report");
@@ -535,8 +531,8 @@ class AuditReporterRuntimeTest {
         assertThat(logs)
                 .extracting(log -> log.message)
                 .containsExactly(
-                        "Audit reporter 'first' failed during flush",
-                        "Audit reporter 'second' failed during close");
+                        reporterRuntimeLog("first", "failed during flush"),
+                        reporterRuntimeLog("second", "failed during close"));
         assertLogsAreRedacted(logs);
     }
 
@@ -594,6 +590,16 @@ class AuditReporterRuntimeTest {
     private static AuditReporterContext context(ClassLoader classLoader) {
         return new AuditReporterContext(
                 RUN_ID, true, AuditStage.SCAN, "runtime-test", 1, 0, classLoader);
+    }
+
+    private static String reporterRuntimeLog(String identifier, String state) {
+        return "Audit reporter '"
+                + identifier
+                + "' "
+                + state
+                + " run_id="
+                + RUN_ID
+                + " stage=SCAN operator=runtime-test subtask=1 attempt=0";
     }
 
     private static AuditEvent secretEvent() {
