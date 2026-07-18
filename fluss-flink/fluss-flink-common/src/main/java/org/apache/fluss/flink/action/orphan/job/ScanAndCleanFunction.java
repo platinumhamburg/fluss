@@ -186,7 +186,8 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                         task.logSegmentRelativePaths(),
                         task.kvActiveSnapDirs(),
                         task.logActiveManifestPaths(),
-                        task.kvSharedSstFileNames());
+                        task.kvSharedSstFileNames(),
+                        task.kvSharedSstRefsComplete());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
         SafeDeleter safeDeleter =
                 createSafeDeleter(anyDir.getFileSystem(), task.dryRun(), task.scope());
@@ -341,12 +342,15 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                     decision =
                             MtimePolicy.failClosed(
                                     rule.evaluate(
-                                            meta, BucketActiveRefs.empty(), task.cutoffMillis()),
+                                            meta,
+                                            BucketActiveRefs.knownEmpty(),
+                                            task.cutoffMillis()),
                                     meta.modificationTime());
                 } else if (meta.modificationTime() >= task.cutoffMillis()) {
                     decision = Decision.DEFER;
                 } else {
-                    decision = rule.evaluate(meta, BucketActiveRefs.empty(), task.cutoffMillis());
+                    decision =
+                            rule.evaluate(meta, BucketActiveRefs.knownEmpty(), task.cutoffMillis());
                 }
                 switch (decision) {
                     case DELETE:
