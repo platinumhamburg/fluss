@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.action.orphan.config;
 
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
+import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec;
 import org.apache.fluss.flink.adapter.MultipleParameterToolAdapter;
 
 import org.junit.jupiter.api.Test;
@@ -25,12 +27,22 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
 
 /** Tests for {@link OrphanCleanConfig}. */
 class OrphanCleanConfigTest {
+
+    private static final String RUN_ID = "3b5939f1-9837-49d8-8a02-945273a0d7e2";
+    private static final String UPPERCASE_RUN_ID = "3B5939F1-9837-49D8-8A02-945273A0D7E2";
+    private static final String NON_CANONICAL_UUID = "1-1-1-1-1";
 
     private static final DateTimeFormatter CUTOFF_FORMATTER =
             DateTimeFormatter.ISO_OFFSET_DATE_TIME;
@@ -268,6 +280,7 @@ class OrphanCleanConfigTest {
 
     @Test
     void extraConfigsRejectsMalformedEntry() {
+        String rawEntry = "raw-entry-that-must-not-be-echoed";
         assertThatThrownBy(
                         () ->
                                 OrphanCleanConfig.fromParams(
@@ -277,9 +290,236 @@ class OrphanCleanConfigTest {
                                                     "h:9123",
                                                     "--all-databases",
                                                     "--conf",
-                                                    "noEqualsSign"
+                                                    rawEntry
                                                 })))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("key=value");
+                .hasMessage("--conf must be in key=value format")
+                .hasMessageNotContaining(rawEntry);
+    }
+
+    @Test
+    void missingRunIdGeneratesOneUuidPerConfig() {
+        OrphanCleanConfig first = fromConfs();
+        OrphanCleanConfig second = fromConfs();
+
+        AuditReporterSpec firstSpec = first.auditReporterSpec();
+        assertThat(first.auditReporterSpec()).isSameAs(firstSpec);
+        assertThat(firstSpec.runId()).isEqualTo(UUID.fromString(firstSpec.runId()).toString());
+        assertThat(firstSpec.reporters()).isEmpty();
+        assertThat(second.auditReporterSpec().runId()).isNotEqualTo(firstSpec.runId());
+    }
+
+    @Test
+    void explicitRunIdIsPreserved() {
+        OrphanCleanConfig config = fromConfs("audit.run-id=" + RUN_ID);
+
+        assertThat(config.auditReporterSpec().runId()).isEqualTo(RUN_ID);
+        assertThat(config.extraConfigs()).isEmpty();
+    }
+
+    @Test
+    void explicitRunIdRequiresCanonicalUuidText() {
+        assertThatThrownBy(() -> fromConfs("audit.run-id=" + NON_CANONICAL_UUID))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("audit.run-id")
+                .hasMessageNotContaining(NON_CANONICAL_UUID);
+        OrphanCleanConfig config = fromConfs("audit.run-id=" + UPPERCASE_RUN_ID);
+
+        assertThat(config.auditReporterSpec().runId()).isEqualTo(UPPERCASE_RUN_ID);
+    }
+
+    @Test
+    void parsesOrderedReportersAndIsolatesTheirOptions() {
+        OrphanCleanConfig config =
+                fromConfs(
+                        "audit.run-id=" + RUN_ID,
+                        "audit.reporters=jdbc,sls",
+                        "audit.reporter.jdbc.required=true",
+                        "audit.reporter.jdbc.url=jdbc:postgresql://audit-db:5432/fluss",
+                        "audit.reporter.jdbc.username=orphan_auditor",
+                        "audit.reporter.jdbc.password-file=/var/run/secrets/orphan-jdbc/password",
+                        "audit.reporter.sls.required=false",
+                        "audit.reporter.sls.endpoint=cn-example.log.aliyuncs.com",
+                        "audit.reporter.sls.access-key-id-file=/var/run/secrets/orphan-sls/access-key-id",
+                        "audit.reporter.sls.access-key-secret-file=/var/run/secrets/orphan-sls/access-key-secret",
+                        "fs.oss.accessKeySecret=filesystem-value",
+                        "client.fs.protocol= client-value=with-equals ");
+
+        List<ReporterSpec> reporters = config.auditReporterSpec().reporters();
+        assertThat(reporters).extracting(ReporterSpec::identifier).containsExactly("jdbc", "sls");
+        assertThat(reporters.get(0).required()).isTrue();
+        assertThat(reporters.get(0).options())
+                .containsExactly(
+                        entry("url", "jdbc:postgresql://audit-db:5432/fluss"),
+                        entry("username", "orphan_auditor"),
+                        entry("password-file", "/var/run/secrets/orphan-jdbc/password"));
+        assertThat(reporters.get(1).required()).isFalse();
+        assertThat(reporters.get(1).options())
+                .containsExactly(
+                        entry("endpoint", "cn-example.log.aliyuncs.com"),
+                        entry("access-key-id-file", "/var/run/secrets/orphan-sls/access-key-id"),
+                        entry(
+                                "access-key-secret-file",
+                                "/var/run/secrets/orphan-sls/access-key-secret"));
+        assertThat(config.extraConfigs())
+                .containsOnly(
+                        entry("fs.oss.accessKeySecret", "filesystem-value"),
+                        entry("client.fs.protocol", " client-value=with-equals "));
+        assertThat(config.extraConfigs().keySet()).noneMatch(key -> key.startsWith("audit."));
+    }
+
+    @Test
+    void emptyReporterListIsAllowedAndRequiredDefaultsToTrue() {
+        assertThat(fromConfs("audit.reporters=").auditReporterSpec().reporters()).isEmpty();
+
+        ReporterSpec reporter =
+                fromConfs(
+                                "audit.reporters=jdbc",
+                                "audit.reporter.jdbc.url=jdbc:postgresql://audit-db:5432/fluss")
+                        .auditReporterSpec()
+                        .reporters()
+                        .get(0);
+        assertThat(reporter.required()).isTrue();
+        assertThat(reporter.options())
+                .containsExactly(entry("url", "jdbc:postgresql://audit-db:5432/fluss"));
+    }
+
+    @Test
+    void rejectsInvalidReporterListsWithoutEchoingValues() {
+        for (String invalid :
+                Arrays.asList(
+                        "jdbc,jdbc",
+                        "jdbc,,sls",
+                        "log",
+                        "JDBC",
+                        " ",
+                        " jdbc",
+                        "jdbc ",
+                        "jdbc sls",
+                        "1jdbc",
+                        "jdbc.sls")) {
+            assertThatThrownBy(() -> fromConfs("audit.reporters=" + invalid))
+                    .as("invalid reporter list %s", invalid)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("audit.reporters")
+                    .hasMessageNotContaining(invalid);
+        }
+    }
+
+    @Test
+    void rejectsInvalidRunIdWithoutEchoingValue() {
+        String invalid = "run-id-value-that-must-not-be-echoed";
+
+        assertThatThrownBy(() -> fromConfs("audit.run-id=" + invalid))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("audit.run-id")
+                .hasMessageNotContaining(invalid);
+    }
+
+    @Test
+    void requiredAcceptsOnlyLowercaseBooleanLiterals() {
+        assertThat(
+                        fromConfs("audit.reporters=jdbc", "audit.reporter.jdbc.required=false")
+                                .auditReporterSpec()
+                                .reporters()
+                                .get(0)
+                                .required())
+                .isFalse();
+
+        for (String invalid : Arrays.asList("TRUE", "False", "", " true", "yes")) {
+            assertThatThrownBy(
+                            () ->
+                                    fromConfs(
+                                            "audit.reporters=jdbc",
+                                            "audit.reporter.jdbc.required=" + invalid))
+                    .as("invalid required value %s", invalid)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("audit.reporter.jdbc.required");
+        }
+    }
+
+    @Test
+    void rejectsUnknownAndMisScopedAuditKeys() {
+        assertRejectedAuditKey("audit.enabled", "audit.enabled=true");
+        assertRejectedAuditKey(
+                "audit.reporter.sls.endpoint",
+                "audit.reporters=jdbc",
+                "audit.reporter.sls.endpoint=endpoint-value-that-must-not-be-echoed");
+        assertRejectedAuditKey(
+                "audit.reporter.jdbc",
+                "audit.reporters=jdbc",
+                "audit.reporter.jdbc=value-that-must-not-be-echoed");
+        assertRejectedAuditKey(
+                "audit.reporter.jdbc.",
+                "audit.reporters=jdbc",
+                "audit.reporter.jdbc.=value-that-must-not-be-echoed");
+    }
+
+    @Test
+    void rejectsDirectSensitiveReporterOptions() {
+        for (String suffix :
+                Arrays.asList(
+                        "password",
+                        "db.password",
+                        "access-key-secret",
+                        "security-token",
+                        "credential",
+                        "db.Password",
+                        "password_file")) {
+            String key = "audit.reporter.jdbc." + suffix;
+            assertRejectedAuditKey(
+                    key, "audit.reporters=jdbc", key + "=value-that-must-not-be-echoed");
+        }
+    }
+
+    @Test
+    void fileOptionsRequireNonEmptyAbsolutePaths() {
+        ReporterSpec reporter =
+                fromConfs(
+                                "audit.reporters=jdbc",
+                                "audit.reporter.jdbc.password-file=/var/run/secrets/password",
+                                "audit.reporter.jdbc.config-file=/etc/fluss/audit.properties")
+                        .auditReporterSpec()
+                        .reporters()
+                        .get(0);
+        assertThat(reporter.options())
+                .containsExactly(
+                        entry("password-file", "/var/run/secrets/password"),
+                        entry("config-file", "/etc/fluss/audit.properties"));
+
+        String key = "audit.reporter.jdbc.password-file";
+        for (String invalid : Arrays.asList("", "relative/path", " /absolute/path")) {
+            assertRejectedAuditKey(key, "audit.reporters=jdbc", key + "=" + invalid);
+        }
+    }
+
+    @Test
+    void duplicateConfKeysMustHaveIdenticalValues() {
+        OrphanCleanConfig config = fromConfs("client.mode=stable", "client.mode=stable");
+        assertThat(config.extraConfigs()).containsExactly(entry("client.mode", "stable"));
+
+        String first = "first-value-that-must-not-be-echoed";
+        String second = "second-value-that-must-not-be-echoed";
+        assertThatThrownBy(() -> fromConfs("client.mode=" + first, "client.mode=" + second))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Duplicate --conf key: client.mode")
+                .hasMessageNotContaining(first)
+                .hasMessageNotContaining(second);
+    }
+
+    private static void assertRejectedAuditKey(String key, String... configs) {
+        assertThatThrownBy(() -> fromConfs(configs))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(key);
+    }
+
+    private static OrphanCleanConfig fromConfs(String... configs) {
+        List<String> args =
+                new ArrayList<>(Arrays.asList("--bootstrap-server", "h:9123", "--all-databases"));
+        for (String config : configs) {
+            Collections.addAll(args, "--conf", config);
+        }
+        return OrphanCleanConfig.fromParams(
+                MultipleParameterToolAdapter.fromArgs(args.toArray(new String[0])));
     }
 }

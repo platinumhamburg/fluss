@@ -36,6 +36,9 @@ class AuditEventTest {
 
     private static final String EVENT_ID = "43c08df6-8b20-4902-8ff4-205cb8b59fe1";
     private static final String RUN_ID = "3b5939f1-9837-49d8-8a02-945273a0d7e2";
+    private static final String UPPERCASE_EVENT_ID = "43C08DF6-8B20-4902-8FF4-205CB8B59FE1";
+    private static final String UPPERCASE_RUN_ID = "3B5939F1-9837-49D8-8A02-945273A0D7E2";
+    private static final String NON_CANONICAL_UUID = "1-1-1-1-1";
 
     @Test
     void rejectsMissingRequiredFields() {
@@ -114,6 +117,42 @@ class AuditEventTest {
         assertThatThrownBy(() -> validEventBuilder().eventTimeMillis(-1L).build())
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("eventTimeMillis");
+    }
+
+    @Test
+    void requiresCanonicalUuidTextForEventAndReporterContext() {
+        assertThatThrownBy(() -> validEventBuilder().eventId(NON_CANONICAL_UUID).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("eventId")
+                .hasMessageNotContaining(NON_CANONICAL_UUID);
+        assertThatThrownBy(() -> validEventBuilder().runId(NON_CANONICAL_UUID).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("runId")
+                .hasMessageNotContaining(NON_CANONICAL_UUID);
+        AuditEvent event =
+                validEventBuilder().eventId(UPPERCASE_EVENT_ID).runId(UPPERCASE_RUN_ID).build();
+
+        assertThat(event.getEventId()).isEqualTo(UPPERCASE_EVENT_ID);
+        assertThat(event.getRunId()).isEqualTo(UPPERCASE_RUN_ID);
+
+        ClassLoader classLoader = getClass().getClassLoader();
+        assertThatThrownBy(
+                        () ->
+                                new AuditReporterContext(
+                                        NON_CANONICAL_UUID,
+                                        false,
+                                        AuditStage.RUN,
+                                        null,
+                                        null,
+                                        null,
+                                        classLoader))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("runId")
+                .hasMessageNotContaining(NON_CANONICAL_UUID);
+        AuditReporterContext context =
+                new AuditReporterContext(
+                        UPPERCASE_RUN_ID, false, AuditStage.RUN, null, null, null, classLoader);
+        assertThat(context.getRunId()).isEqualTo(UPPERCASE_RUN_ID);
     }
 
     @Test
