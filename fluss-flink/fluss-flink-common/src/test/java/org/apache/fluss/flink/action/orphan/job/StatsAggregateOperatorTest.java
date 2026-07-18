@@ -39,7 +39,9 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 class StatsAggregateOperatorTest {
 
@@ -319,6 +321,112 @@ class StatsAggregateOperatorTest {
                                                                     .hasMessageNotContaining(
                                                                             "injected-flush-failure")));
             assertThat(harness.summaries()).isEmpty();
+        } finally {
+            TestingAuditReporterFactory.reset();
+            harness.close();
+        }
+    }
+
+    @Test
+    void statsProcessingFailureRemainsPrimaryWhenReporterTeardownFails() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
+        TestingAuditReporterFactory.fail("testing", "close", "injected-close-failure");
+        Harness harness = new Harness(true, reportingSpec(true));
+        try {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(CleanupStats.scope(0L, 0L, Collections.emptyMap())));
+
+            Throwable processingFailure =
+                    catchThrowable(
+                            () ->
+                                    harness.processElement(
+                                            new StreamRecord<>(
+                                                    CleanupStats.scope(
+                                                            0L, 0L, Collections.emptyMap()))));
+
+            assertThat(processingFailure)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("Duplicate scope summary");
+            assertThatCode(harness::close).doesNotThrowAnyException();
+            assertThat(processingFailure.getSuppressed())
+                    .singleElement()
+                    .satisfies(
+                            lifecycleFailure -> {
+                                assertThat(lifecycleFailure)
+                                        .hasMessageContaining("testing")
+                                        .hasMessageContaining("flush")
+                                        .hasMessageNotContaining("injected-flush-failure");
+                                assertThat(lifecycleFailure.getSuppressed())
+                                        .singleElement()
+                                        .satisfies(
+                                                closeFailure ->
+                                                        assertThat(closeFailure)
+                                                                .hasMessageContaining("testing")
+                                                                .hasMessageContaining("close")
+                                                                .hasMessageNotContaining(
+                                                                        "injected-close-failure"));
+                            });
+            assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+            assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
+        } finally {
+            TestingAuditReporterFactory.reset();
+            harness.close();
+        }
+    }
+
+    @Test
+    void statsEndInputFlushesAtMostOnceBeforeClose() throws Exception {
+        Harness harness = new Harness(true, reportingSpec(true));
+        try {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(CleanupStats.scope(0L, 0L, Collections.emptyMap())));
+            harness.endInput();
+            harness.close();
+
+            assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+            assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
+        } finally {
+            TestingAuditReporterFactory.reset();
+            harness.close();
+        }
+    }
+
+    @Test
+    void statsEndInputFailureRemainsPrimaryWhenReporterCloseFails() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "close", "injected-close-failure");
+        ScopeIdentity scope = ScopeIdentity.table("db", "table", 18L);
+        CleanupStats inconsistent =
+                CleanupStats.scanBuilder(scope)
+                        .scanned(CleanupObjectType.LOG_SEGMENT, 1L)
+                        .planned(CleanupObjectType.LOG_SEGMENT, 1L, 10L)
+                        .ruleDecision(
+                                CleanupObjectType.LOG_SEGMENT, RuleDecisionCounters.scanned(10L))
+                        .build();
+        Harness harness = new Harness(true, reportingSpec(true));
+        try {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<>(CleanupStats.scope(1L, 0L, Collections.emptyMap())));
+            harness.processElement(new StreamRecord<>(inconsistent));
+
+            Throwable endInputFailure = catchThrowable(harness::endInput);
+
+            assertThat(endInputFailure)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("audit integrity");
+            assertThatCode(harness::close).doesNotThrowAnyException();
+            assertThat(endInputFailure.getSuppressed())
+                    .singleElement()
+                    .satisfies(
+                            closeFailure ->
+                                    assertThat(closeFailure)
+                                            .hasMessageContaining("testing")
+                                            .hasMessageContaining("close")
+                                            .hasMessageNotContaining("injected-close-failure"));
+            assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+            assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
         } finally {
             TestingAuditReporterFactory.reset();
             harness.close();
