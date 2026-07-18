@@ -273,13 +273,7 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
                 summary.coverageComplete(),
                 dryRun);
         audit.logAuditIntegrity(summary);
-        audit.logSummary(
-                global.scannedFiles(),
-                global.deletedFiles(),
-                global.emptyDirsRemoved(),
-                global.deleteFailures(),
-                global.bytesReclaimed(),
-                dryRun);
+        audit.logSummary(global, dryRun);
     }
 
     private static long countObjectInconsistencies(

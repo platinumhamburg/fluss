@@ -23,13 +23,14 @@ import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.util.ExceptionUtils;
 
 import java.util.Collections;
-import java.util.Iterator;
-import java.util.List;
 
 /**
  * Builds and executes the 3-stage Flink Batch DAG for orphan files cleanup.
@@ -46,29 +47,31 @@ public final class OrphanFilesCleanJob {
     private OrphanFilesCleanJob() {}
 
     /**
-     * Builds the DAG, executes it in batch mode, and returns the final aggregated cleanup
-     * statistics.
+     * Builds the DAG, executes it in batch mode, and waits for the cleanup job to complete.
+     *
+     * <p>The terminal summary is emitted by {@link StatsAggregateOperator} through the audit logger
+     * and reporters. The execution path deliberately uses a regular discarding sink rather than
+     * {@code executeAndCollect} API, which installs a REST result collector in the JobManager.
      *
      * @param env the Flink execution environment (caller configures classpath, etc.)
      * @param config parsed orphan cleanup configuration
      * @param parallelism the parallelism for Stage 2 (ScanAndClean); null uses env default
-     * @return the final cleanup summary
      */
-    public static CleanupSummary execute(
+    public static void execute(
             StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism)
             throws Exception {
         env.setRuntimeMode(RuntimeExecutionMode.BATCH);
+        buildExecutablePipeline(env, config, parallelism);
+        waitForCompletion(env.executeAsync("OrphanFilesClean"));
+    }
 
-        DataStream<CleanupSummary> result = buildPipeline(env, config, parallelism);
-
-        // Execute and collect the single result
-        List<CleanupSummary> collected = collectResults(result);
-        if (collected.size() != 1) {
-            throw new IllegalStateException(
-                    "StatsAggregate must emit exactly one cleanup summary, but emitted "
-                            + collected.size());
-        }
-        return collected.get(0);
+    /** Builds the executable cleanup DAG with the standard terminal discarding sink. */
+    static void buildExecutablePipeline(
+            StreamExecutionEnvironment env, OrphanCleanConfig config, Integer parallelism) {
+        buildPipeline(env, config, parallelism)
+                .sinkTo(new DiscardingSink<CleanupSummary>())
+                .name("end")
+                .setParallelism(1);
     }
 
     static DataStream<CleanupSummary> buildPipeline(
@@ -111,14 +114,11 @@ public final class OrphanFilesCleanJob {
         return result;
     }
 
-    @SuppressWarnings("deprecation")
-    private static List<CleanupSummary> collectResults(DataStream<CleanupSummary> result)
-            throws Exception {
-        Iterator<CleanupSummary> iterator = result.executeAndCollect("OrphanFilesClean");
-        List<CleanupSummary> results = new java.util.ArrayList<CleanupSummary>();
-        while (iterator.hasNext()) {
-            results.add(iterator.next());
+    private static void waitForCompletion(JobClient jobClient) throws Exception {
+        try {
+            jobClient.getJobExecutionResult().get();
+        } catch (Throwable failure) {
+            ExceptionUtils.rethrowException(ExceptionUtils.stripExecutionException(failure));
         }
-        return results;
     }
 }
