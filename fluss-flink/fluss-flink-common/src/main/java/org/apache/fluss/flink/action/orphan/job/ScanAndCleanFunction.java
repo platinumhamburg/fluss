@@ -83,6 +83,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     private transient AuditReporterRuntime auditRuntime;
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
+    private transient Throwable processingFailure;
 
     public ScanAndCleanFunction(
             long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
@@ -104,6 +105,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     public void open(org.apache.flink.api.common.functions.OpenContext openContext)
             throws Exception {
         super.open(openContext);
+        processingFailure = null;
         if (!extraConfigs.isEmpty()) {
             FileSystem.initialize(Configuration.fromMap(extraConfigs), null);
         }
@@ -139,6 +141,11 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     public void close() throws Exception {
         try {
             closeAuditRuntime();
+        } catch (RuntimeException | Error lifecycleFailure) {
+            if (processingFailure == null) {
+                throw lifecycleFailure;
+            }
+            processingFailure.addSuppressed(lifecycleFailure);
         } finally {
             super.close();
         }
@@ -147,12 +154,19 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     @Override
     public void processElement(CleanTask task, Context ctx, Collector<CleanupStats> out)
             throws Exception {
-        if (task instanceof ScopeSummaryTask) {
-            out.collect(((ScopeSummaryTask) task).stats());
-        } else if (task instanceof BucketCleanTask) {
-            out.collect(processBucketTask((BucketCleanTask) task));
-        } else if (task instanceof OrphanDirCleanTask) {
-            out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
+        try {
+            if (task instanceof ScopeSummaryTask) {
+                out.collect(((ScopeSummaryTask) task).stats());
+            } else if (task instanceof BucketCleanTask) {
+                out.collect(processBucketTask((BucketCleanTask) task));
+            } else if (task instanceof OrphanDirCleanTask) {
+                out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
+            }
+        } catch (Exception | Error failure) {
+            if (processingFailure == null) {
+                processingFailure = failure;
+            }
+            throw failure;
         }
     }
 

@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
+import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory;
 import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory.OpenContextSnapshot;
 
@@ -29,8 +30,11 @@ import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.apache.flink.util.Collector;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Constructor;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -38,6 +42,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 class ScanAndCleanFunctionTest {
 
@@ -143,6 +148,67 @@ class ScanAndCleanFunctionTest {
 
         assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
         assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
+    }
+
+    @Test
+    void scanProcessingFailureRemainsPrimaryWhenReporterTeardownFails(@TempDir Path tempDir)
+            throws Exception {
+        Files.write(tempDir.resolve("unknown.bin"), new byte[] {1});
+        TestingAuditReporterFactory.fail("testing", "report", "injected-report-failure");
+        TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
+        TestingAuditReporterFactory.fail("testing", "close", "injected-close-failure");
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness = scanHarness(function);
+
+        try {
+            harness.open();
+            Throwable processingFailure =
+                    catchThrowable(
+                            () ->
+                                    harness.processElement(
+                                            new StreamRecord<CleanTask>(
+                                                    new OrphanDirCleanTask(
+                                                            ScopeIdentity.orphanTable(
+                                                                    "db", "old_table-1", 1L),
+                                                            tempDir.toUri().toString(),
+                                                            System.currentTimeMillis() + 1L,
+                                                            true,
+                                                            false))));
+
+            assertThat(processingFailure)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("report")
+                    .hasMessageNotContaining("injected-report-failure");
+
+            function.close();
+
+            assertThat(processingFailure.getSuppressed())
+                    .singleElement()
+                    .satisfies(
+                            suppressed -> {
+                                assertThat(suppressed)
+                                        .hasMessageContaining("testing")
+                                        .hasMessageContaining("flush")
+                                        .hasMessageNotContaining("injected-flush-failure");
+                                assertThat(suppressed.getSuppressed())
+                                        .singleElement()
+                                        .satisfies(
+                                                closeFailure ->
+                                                        assertThat(closeFailure)
+                                                                .hasMessageContaining("testing")
+                                                                .hasMessageContaining("close")
+                                                                .hasMessageNotContaining(
+                                                                        "injected-close-failure"));
+                            });
+        } finally {
+            TestingAuditReporterFactory.reset();
+            try {
+                function.close();
+            } finally {
+                harness.close();
+            }
+        }
     }
 
     @Test
