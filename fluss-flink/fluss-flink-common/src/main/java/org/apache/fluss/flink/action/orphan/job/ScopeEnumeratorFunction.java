@@ -554,7 +554,18 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                         planStats.metadataFailure();
                         break;
                     case NOT_LISTED:
-                        planStats.skippedNoRemoteManifest();
+                        // No committed manifest proves that there are no active remote log
+                        // references, not that the physical bucket directory is empty. Scan it
+                        // with an empty active set so partial uploads from a failed first tiering
+                        // attempt can be reclaimed after the cutoff.
+                        logTabletDir =
+                                FlussPaths.remoteLogTabletDir(
+                                                remoteLogDir,
+                                                physicalPath(liveTable.tablePath, partitionInfo),
+                                                tableBucket)
+                                        .toString();
+                        audit.logScanLogBucketWithoutManifest(
+                                liveTable.tableId, partitionId, bucketId);
                         break;
                     default:
                         break;
@@ -563,16 +574,18 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
             String kvTabletDir = null;
             Set<String> kvActiveSnaps = Collections.emptySet();
-            if (kvTargetOk && kvActiveByBucket.containsKey(bucketId)) {
+            if (kvTargetOk) {
                 kvTabletDir =
                         FlussPaths.remoteKvTabletDir(
                                         remoteKvDir,
                                         physicalPath(liveTable.tablePath, partitionInfo),
                                         tableBucket)
                                 .toString();
-                kvActiveSnaps = kvActiveByBucket.get(bucketId);
-            } else if (kvTargetOk) {
-                planStats.skippedEmptyKvActiveSet();
+                kvActiveSnaps = kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
+                if (kvActiveSnaps.isEmpty()) {
+                    audit.logScanKvBucketWithoutActiveSnapshots(
+                            liveTable.tableId, partitionId, bucketId);
+                }
             }
 
             if (logTabletDir == null && kvTabletDir == null) {

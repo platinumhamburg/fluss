@@ -46,7 +46,6 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.time.Instant;
-import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.Collections;
@@ -77,8 +76,7 @@ class AuditLoggerTest {
     private static final Object AUDIT_CAPTURE_LOCK = new Object();
     private static int activeAuditCaptures;
     private static Level auditCapturePreviousLevel;
-    private static final DateTimeFormatter CUTOFF_FORMATTER =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault());
+    private static final DateTimeFormatter CUTOFF_FORMATTER = DateTimeFormatter.ISO_INSTANT;
 
     @BeforeEach
     void resetTestingReporter() {
@@ -129,7 +127,9 @@ class AuditLoggerTest {
                     expected(
                                     "action=run_start scope=db.orders older_than_ms="
                                             + CUTOFF_MILLIS
-                                            + " dry_run=true parallelism=3"
+                                            + " cutoff_source=explicit cutoff_age_ms="
+                                            + (EVENT_TIME_MILLIS + 1L - CUTOFF_MILLIS)
+                                            + " cutoff_in_future=false dry_run=true parallelism=3"
                                             + " remote_fs_rate_limit=17 allow_delete_manifest=true"
                                             + " allow_clean_orphan_tables=true"
                                             + " allow_clean_orphan_partitions=true",
@@ -138,8 +138,11 @@ class AuditLoggerTest {
                                     "run_start")
                             .dimension("scope", "db.orders")
                             .dimension("parallelism", "3")
+                            .dimension("cutoff_source", "explicit")
                             .metric("older_than_ms", CUTOFF_MILLIS)
+                            .metric("cutoff_age_ms", EVENT_TIME_MILLIS + 1L - CUTOFF_MILLIS)
                             .metric("remote_fs_rate_limit", 17L)
+                            .flag("cutoff_in_future", false)
                             .flag("dry_run", true)
                             .flag("allow_delete_manifest", true)
                             .flag("allow_clean_orphan_tables", true)
@@ -545,6 +548,19 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
+                                    "action=skip_kv_shared_sst reason=metadata unavailable"
+                                            + " table_id=7 partition_id=11 bucket_id=4",
+                                    AuditSeverity.WARN,
+                                    AuditStage.SCOPE,
+                                    "skip_kv_shared_sst")
+                            .stable("table_id", 7L)
+                            .stable("partition_id", 11L)
+                            .stable("bucket_id", 4)
+                            .stable("reason_code", "metadata_read_failed"),
+                    () -> logger.logSkipKvSharedSst(7L, 11L, 4, "metadata unavailable"));
+
+            harness.assertEmission(
+                    expected(
                                     "action=skip_log_target reason=rpc_error"
                                             + " table_id=7 partition_id=11",
                                     AuditSeverity.WARN,
@@ -567,6 +583,34 @@ class AuditLoggerTest {
                             .stable("bucket_id", 4)
                             .stable("reason_code", "no_remote_manifest"),
                     () -> logger.logSkipLogBucket(7L, 11L, 4, "no_remote_manifest"));
+
+            harness.assertEmission(
+                    expected(
+                                    "action=scan_log_bucket_without_manifest"
+                                            + " reason=no_remote_manifest table_id=7"
+                                            + " partition_id=11 bucket_id=4",
+                                    AuditSeverity.INFO,
+                                    AuditStage.SCOPE,
+                                    "scan_log_bucket_without_manifest")
+                            .stable("table_id", 7L)
+                            .stable("partition_id", 11L)
+                            .stable("bucket_id", 4)
+                            .stable("reason_code", "no_remote_manifest"),
+                    () -> logger.logScanLogBucketWithoutManifest(7L, 11L, 4));
+
+            harness.assertEmission(
+                    expected(
+                                    "action=scan_kv_bucket_without_active_snapshots"
+                                            + " reason=no_active_snapshots table_id=7"
+                                            + " partition_id=11 bucket_id=4",
+                                    AuditSeverity.INFO,
+                                    AuditStage.SCOPE,
+                                    "scan_kv_bucket_without_active_snapshots")
+                            .stable("table_id", 7L)
+                            .stable("partition_id", 11L)
+                            .stable("bucket_id", 4)
+                            .stable("reason_code", "no_active_snapshots"),
+                    () -> logger.logScanKvBucketWithoutActiveSnapshots(7L, 11L, 4));
 
             harness.assertEmission(
                     expected(
@@ -645,6 +689,7 @@ class AuditLoggerTest {
                                             "table_rule_summary",
                                             "database=db table=orders table_id=7"
                                                     + " object_type=log_segment",
+                                            CleanupObjectType.LOG_SEGMENT,
                                             counters,
                                             true),
                                     AuditSeverity.INFO,
@@ -652,7 +697,7 @@ class AuditLoggerTest {
                                     "table_rule_summary")
                             .scope(tableScope)
                             .stable("object_type", "log_segment")
-                            .ruleMetrics(counters)
+                            .ruleMetrics(CleanupObjectType.LOG_SEGMENT, counters)
                             .flag("dry_run", true),
                     () ->
                             logger.logTableRuleSummary(
@@ -663,6 +708,7 @@ class AuditLoggerTest {
                                     ruleSummaryLegacy(
                                             "summary_by_rule",
                                             "scope=global object_type=kv_shared_sst",
+                                            CleanupObjectType.KV_SHARED_SST,
                                             counters,
                                             false),
                                     AuditSeverity.INFO,
@@ -670,7 +716,7 @@ class AuditLoggerTest {
                                     "summary_by_rule")
                             .stable("scope_kind", "global")
                             .stable("object_type", "kv_shared_sst")
-                            .ruleMetrics(counters)
+                            .ruleMetrics(CleanupObjectType.KV_SHARED_SST, counters)
                             .flag("dry_run", false),
                     () ->
                             logger.logGlobalRuleSummary(
@@ -685,6 +731,7 @@ class AuditLoggerTest {
                                             + " rpc_failed_targets=7 mtime_unavailable_files=6"
                                             + " mtime_unavailable_bytes=60"
                                             + " mtime_unavailable_dirs=8 complete=false"
+                                            + " physical_scan_complete=false"
                                             + " action_required=true dry_run=true",
                                     AuditSeverity.INFO,
                                     AuditStage.SUMMARY,
@@ -698,6 +745,7 @@ class AuditLoggerTest {
                             .metric("mtime_unavailable_bytes", 60L)
                             .metric("mtime_unavailable_dirs", 8L)
                             .flag("complete", false)
+                            .flag("physical_scan_complete", false)
                             .flag("action_required", true)
                             .flag("dry_run", true),
                     () -> logger.logCoverageSummary(skipped, 4L, 6L, 60L, 8L, false, true));
@@ -733,10 +781,10 @@ class AuditLoggerTest {
                             .flag("dry_run", integritySummary.dryRun()),
                     () -> logger.logAuditIntegrity(integritySummary));
 
-            assertThat(harness.logs()).hasSize(33);
-            assertThat(TestingAuditReporterFactory.events("testing")).hasSize(33);
-            assertThat(harness.clockCalls()).isEqualTo(33);
-            assertThat(harness.eventIdCalls()).isEqualTo(33);
+            assertThat(harness.logs()).hasSize(36);
+            assertThat(TestingAuditReporterFactory.events("testing")).hasSize(36);
+            assertThat(harness.clockCalls()).isEqualTo(36);
+            assertThat(harness.eventIdCalls()).isEqualTo(36);
             assertThat(TestingAuditReporterFactory.events("testing"))
                     .extracting(AuditEvent::getAction)
                     .doesNotContain(
@@ -808,6 +856,40 @@ class AuditLoggerTest {
                                         || event.contains("action=scan_progress")
                                         || event.contains("action=keep_active")
                                         || event.contains("action=newer_than_cutoff"));
+    }
+
+    @Test
+    void ruleSummarySurfacesReferenceAndCutoffAnomalies() {
+        RuleDecisionCounters allNewer =
+                RuleDecisionCounters.scanned(10L).add(RuleDecisionCounters.newerThanCutoff(10L));
+
+        try (ParityHarness harness = new ParityHarness(AuditStage.SUMMARY, null, null, null)) {
+            harness.assertEmission(
+                    expected(
+                                    ruleSummaryLegacy(
+                                            "summary_by_rule",
+                                            "scope=global object_type=log_segment",
+                                            CleanupObjectType.LOG_SEGMENT,
+                                            allNewer,
+                                            true),
+                                    AuditSeverity.INFO,
+                                    AuditStage.SUMMARY,
+                                    "summary_by_rule")
+                            .stable("scope_kind", "global")
+                            .stable("object_type", "log_segment")
+                            .ruleMetrics(CleanupObjectType.LOG_SEGMENT, allNewer)
+                            .flag("dry_run", true),
+                    () ->
+                            harness.logger()
+                                    .logGlobalRuleSummary(
+                                            CleanupObjectType.LOG_SEGMENT, allNewer, true));
+
+            AuditEvent event = TestingAuditReporterFactory.events("testing").get(0);
+            assertThat(event.getFlags())
+                    .containsEntry("reference_match_absent", true)
+                    .containsEntry("all_scanned_newer_than_cutoff", true)
+                    .containsEntry("all_scanned_keep_active", false);
+        }
     }
 
     @Test
@@ -1007,7 +1089,7 @@ class AuditLoggerTest {
     }
 
     @Test
-    void publicLogMethodSurfaceRemainsExactlyTheThirtyThreeMethodBaseline() {
+    void publicLogMethodSurfaceRemainsBounded() {
         Set<String> actual =
                 Arrays.stream(AuditLogger.class.getDeclaredMethods())
                         .filter(method -> Modifier.isPublic(method.getModifiers()))
@@ -1039,8 +1121,11 @@ class AuditLoggerTest {
                         "logSkipPartitionList(String,String,String)",
                         "logSkipKvTarget(long,Long,String)",
                         "logSkipKvBucket(long,Long,int,String)",
+                        "logSkipKvSharedSst(long,Long,int,String)",
                         "logSkipLogTarget(long,Long,String)",
                         "logSkipLogBucket(long,Long,int,String)",
+                        "logScanLogBucketWithoutManifest(long,Long,int)",
+                        "logScanKvBucketWithoutActiveSnapshots(long,Long,int)",
                         "logSkipOrphanTable(FsPath,String)",
                         "logSkipOrphanTableScan(String,String)",
                         "logSkipOrphanPartition(FsPath,String)",
@@ -1050,7 +1135,7 @@ class AuditLoggerTest {
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",
                         "logAuditIntegrity(CleanupSummary)");
-        assertThat(actual).hasSize(33);
+        assertThat(actual).hasSize(36);
         assertThat(actual)
                 .noneMatch(
                         method ->
@@ -1225,7 +1310,22 @@ class AuditLoggerTest {
     }
 
     private static String ruleSummaryLegacy(
-            String action, String dimensions, RuleDecisionCounters counters, boolean dryRun) {
+            String action,
+            String dimensions,
+            CleanupObjectType objectType,
+            RuleDecisionCounters counters,
+            boolean dryRun) {
+        boolean referenceMatchAbsent =
+                (objectType == CleanupObjectType.LOG_SEGMENT
+                                || objectType == CleanupObjectType.KV_SHARED_SST)
+                        && counters.scannedFiles() > 0L
+                        && counters.keepActiveFiles() == 0L;
+        boolean allScannedNewerThanCutoff =
+                counters.scannedFiles() > 0L
+                        && counters.newerThanCutoffFiles() == counters.scannedFiles();
+        boolean allScannedKeepActive =
+                counters.scannedFiles() > 0L
+                        && counters.keepActiveFiles() == counters.scannedFiles();
         return "action="
                 + action
                 + " "
@@ -1254,6 +1354,12 @@ class AuditLoggerTest {
                 + counters.candidateFiles()
                 + " candidate_bytes="
                 + counters.candidateBytes()
+                + " reference_match_absent="
+                + referenceMatchAbsent
+                + " all_scanned_newer_than_cutoff="
+                + allScannedNewerThanCutoff
+                + " all_scanned_keep_active="
+                + allScannedKeepActive
                 + " dry_run="
                 + dryRun;
     }
@@ -1424,7 +1530,19 @@ class AuditLoggerTest {
             return this;
         }
 
-        private ExpectedEmission ruleMetrics(RuleDecisionCounters counters) {
+        private ExpectedEmission ruleMetrics(
+                CleanupObjectType objectType, RuleDecisionCounters counters) {
+            boolean referenceMatchAbsent =
+                    (objectType == CleanupObjectType.LOG_SEGMENT
+                                    || objectType == CleanupObjectType.KV_SHARED_SST)
+                            && counters.scannedFiles() > 0L
+                            && counters.keepActiveFiles() == 0L;
+            boolean allScannedNewerThanCutoff =
+                    counters.scannedFiles() > 0L
+                            && counters.newerThanCutoffFiles() == counters.scannedFiles();
+            boolean allScannedKeepActive =
+                    counters.scannedFiles() > 0L
+                            && counters.keepActiveFiles() == counters.scannedFiles();
             return metric("scanned_files", counters.scannedFiles())
                     .metric("scanned_bytes", counters.scannedBytes())
                     .metric("keep_active_files", counters.keepActiveFiles())
@@ -1436,7 +1554,10 @@ class AuditLoggerTest {
                     .metric("unknown_file_type_files", counters.unknownFileTypeFiles())
                     .metric("unknown_file_type_bytes", counters.unknownFileTypeBytes())
                     .metric("candidate_files", counters.candidateFiles())
-                    .metric("candidate_bytes", counters.candidateBytes());
+                    .metric("candidate_bytes", counters.candidateBytes())
+                    .flag("reference_match_absent", referenceMatchAbsent)
+                    .flag("all_scanned_newer_than_cutoff", allScannedNewerThanCutoff)
+                    .flag("all_scanned_keep_active", allScannedKeepActive);
         }
     }
 

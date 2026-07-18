@@ -286,6 +286,62 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     }
 
     @Test
+    void logBucketWithoutManifestCleansExpiredSegment() throws Exception {
+        String dbName = newDatabaseName("no_manifest");
+        TablePath tablePath = createLogTable(dbName, "partial_first_tiering");
+        Path orphan = createOldSegmentFile(tablePath, "99999999999999999999.log");
+
+        runCleanerForDatabase(false, dbName);
+
+        assertThat(Files.exists(orphan)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=scan_log_bucket_without_manifest")
+                                        && message.contains("reason=no_remote_manifest"));
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=deleted")
+                                        && message.contains("rule=log-segment")
+                                        && message.contains(orphan.toString()));
+    }
+
+    @Test
+    void kvBucketWithoutActiveSnapshotsCleansExpiredSnapshotFile() throws Exception {
+        String dbName = newDatabaseName("no_snapshot");
+        TablePath tablePath = createPrimaryKeyTable(dbName, "partial_first_snapshot");
+        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), 0);
+        FsPath remoteKvTabletDir =
+                FlussPaths.remoteKvTabletDir(
+                        new FsPath(remoteDataRoot().resolve("kv").toUri().toString()),
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket);
+        FsPath orphanSnapshotDir = FlussPaths.remoteKvSnapshotDir(remoteKvTabletDir, 99L);
+        Path orphan = localPath(orphanSnapshotDir).resolve("_METADATA");
+        Files.createDirectories(orphan.getParent());
+        Files.write(orphan, new byte[] {0x55});
+        makeOld(orphan);
+        makeOld(orphan.getParent());
+
+        runCleanerForDatabase(false, dbName);
+
+        assertThat(Files.exists(orphan)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=scan_kv_bucket_without_active_snapshots")
+                                        && message.contains("reason=no_active_snapshots"));
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=deleted")
+                                        && message.contains("rule=kv-snapshot-file")
+                                        && message.contains(orphan.toString()));
+    }
+
+    @Test
     void dryRunDoesNotDeleteFiles() throws Exception {
         String dbName = newDatabaseName("dryrun");
         TablePath tablePath = createLogTable(dbName, "dry_run");
@@ -319,9 +375,8 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
      * table. Returns the active segment's {@code .log} path so callers can assert it survives
      * cleanup.
      *
-     * <p>Without a manifest the bucket falls back to {@code ManifestReadStatus.NOT_LISTED} and the
-     * active-file cleanup skips the entire bucket (see §4.3.1 of the design doc) — which would
-     * prevent any orphan file under the bucket from being visited at all.
+     * <p>Without a manifest the bucket is scanned with an empty active-reference set. This helper
+     * is still needed by tests that exercise preservation of committed active segments.
      */
     private Path seedActiveBucketManifest(TablePath tablePath) throws Exception {
         TableInfo tableInfo = admin.getTableInfo(tablePath).get();

@@ -74,6 +74,7 @@ public final class OrphanCleanConfig implements Serializable {
     private final @Nullable String database;
     private final @Nullable String table;
     private final long olderThanMillis;
+    private final boolean olderThanConfigured;
     private final boolean dryRun;
     private final long remoteFsOpRateLimitPerSecond;
     private final @Nullable Integer parallelism;
@@ -89,6 +90,7 @@ public final class OrphanCleanConfig implements Serializable {
             @Nullable String database,
             @Nullable String table,
             long olderThanMillis,
+            boolean olderThanConfigured,
             boolean dryRun,
             long remoteFsOpRateLimitPerSecond,
             @Nullable Integer parallelism,
@@ -102,6 +104,7 @@ public final class OrphanCleanConfig implements Serializable {
         this.database = database;
         this.table = table;
         this.olderThanMillis = olderThanMillis;
+        this.olderThanConfigured = olderThanConfigured;
         this.dryRun = dryRun;
         this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
         this.parallelism = parallelism;
@@ -135,8 +138,8 @@ public final class OrphanCleanConfig implements Serializable {
         }
 
         long now = System.currentTimeMillis();
-        long olderThanMillis =
-                parseCutoff("--older-than", params.get("older-than"), now, DEFAULT_OLDER_THAN);
+        String olderThan = params.get("older-than");
+        long olderThanMillis = parseCutoff("--older-than", olderThan, now, DEFAULT_OLDER_THAN);
         long remoteFsOpRateLimitPerSecond =
                 parsePositiveRateLimit(
                         "--remote-fs-op-rate-limit-per-second",
@@ -155,6 +158,7 @@ public final class OrphanCleanConfig implements Serializable {
                 database,
                 params.get("table"),
                 olderThanMillis,
+                !StringUtils.isNullOrWhitespaceOnly(olderThan),
                 params.has("dry-run"),
                 remoteFsOpRateLimitPerSecond,
                 parallelism,
@@ -400,6 +404,11 @@ public final class OrphanCleanConfig implements Serializable {
      */
     public long olderThanMillis() {
         return olderThanMillis;
+    }
+
+    /** Returns whether the cutoff came from an explicit {@code --older-than} argument. */
+    public boolean olderThanConfigured() {
+        return olderThanConfigured;
     }
 
     /** Returns whether the action runs in dry-run mode. */
