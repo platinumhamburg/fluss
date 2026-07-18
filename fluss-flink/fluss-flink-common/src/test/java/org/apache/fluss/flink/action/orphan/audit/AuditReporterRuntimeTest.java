@@ -162,6 +162,29 @@ class AuditReporterRuntimeTest {
     }
 
     @Test
+    void discoveryFailureLogsSafeRuntimeContext() {
+        List<CapturedLog> logs = new CopyOnWriteArrayList<>();
+
+        try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs, Level.INFO)) {
+            AuditReportingException failure =
+                    catchThrowableOfType(
+                            () ->
+                                    AuditReporterRuntime.open(
+                                            spec(reporter("missing", true, OPTION_SECRET)),
+                                            context(getClass().getClassLoader())),
+                            AuditReportingException.class);
+            assertFailure(failure, "missing", "discovery");
+        }
+
+        assertThat(logs)
+                .extracting(log -> log.level, log -> log.message)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.ERROR, runtimeFailureLog("discovery")));
+        assertLogsAreRedacted(logs);
+    }
+
+    @Test
     void duplicateVisibleIdentifierFailsDiscoveryBeforeAnyReporterOpens(@TempDir Path tempDir)
             throws Exception {
         try (URLClassLoader loader = duplicateProviderLoader(tempDir)) {
@@ -593,13 +616,15 @@ class AuditReporterRuntimeTest {
     }
 
     private static String reporterRuntimeLog(String identifier, String state) {
-        return "Audit reporter '"
-                + identifier
-                + "' "
-                + state
-                + " run_id="
-                + RUN_ID
-                + " stage=SCAN operator=runtime-test subtask=1 attempt=0";
+        return "Audit reporter '" + identifier + "' " + state + runtimeLogContext();
+    }
+
+    private static String runtimeFailureLog(String phase) {
+        return "Audit reporter runtime failed during " + phase + runtimeLogContext();
+    }
+
+    private static String runtimeLogContext() {
+        return " run_id=" + RUN_ID + " stage=SCAN operator=runtime-test subtask=1 attempt=0";
     }
 
     private static AuditEvent secretEvent() {

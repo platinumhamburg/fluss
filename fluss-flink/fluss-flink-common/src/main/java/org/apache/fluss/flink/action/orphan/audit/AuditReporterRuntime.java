@@ -63,8 +63,14 @@ public final class AuditReporterRuntime implements AutoCloseable {
             return new AuditReporterRuntime(Collections.<ActiveReporter>emptyList(), true);
         }
 
-        DiscoveredFactories discovered = discover(context);
-        validateSelections(spec.reporters(), discovered);
+        DiscoveredFactories discovered;
+        try {
+            discovered = discover(context);
+            validateSelections(spec.reporters(), discovered);
+        } catch (AuditReportingException failure) {
+            logRuntimeFailure("discovery", context);
+            throw failure;
+        }
 
         List<ActiveReporter> opened = new ArrayList<>();
         for (ReporterSpec reporterSpec : spec.reporters()) {
@@ -284,6 +290,17 @@ public final class AuditReporterRuntime implements AutoCloseable {
                     context.getSubtaskIndex(),
                     context.getAttemptNumber());
         }
+    }
+
+    private static void logRuntimeFailure(String phase, AuditReporterContext context) {
+        LOG.error(
+                "Audit reporter runtime failed during {} run_id={} stage={} operator={} subtask={} attempt={}",
+                phase,
+                context.getRunId(),
+                context.getStage(),
+                context.getOperatorName(),
+                context.getSubtaskIndex(),
+                context.getAttemptNumber());
     }
 
     private static void logLifecycle(
