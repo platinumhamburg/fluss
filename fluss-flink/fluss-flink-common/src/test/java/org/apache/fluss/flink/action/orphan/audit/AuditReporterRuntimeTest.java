@@ -442,6 +442,59 @@ class AuditReporterRuntimeTest {
     }
 
     @Test
+    void logsOpenedAndClosedReporterLifecycleWithOnlySafeContext() {
+        List<CapturedLog> logs = new CopyOnWriteArrayList<>();
+
+        try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs, Level.INFO)) {
+            AuditReporterRuntime runtime =
+                    AuditReporterRuntime.open(
+                            spec(reporter("testing", true, OPTION_SECRET)),
+                            context(getClass().getClassLoader()));
+            runtime.close();
+        }
+
+        assertThat(logs)
+                .extracting(log -> log.level, log -> log.message)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.INFO,
+                                "Audit reporter 'testing' opened run_id="
+                                        + RUN_ID
+                                        + " stage=SCAN operator=runtime-test subtask=1 attempt=0"),
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.INFO,
+                                "Audit reporter 'testing' closed run_id="
+                                        + RUN_ID
+                                        + " stage=SCAN operator=runtime-test subtask=1 attempt=0"));
+        assertLogsAreRedacted(logs);
+    }
+
+    @Test
+    void requiredReportFailureLogsErrorWithoutEventOrThrowableSecrets() {
+        TestingAuditReporterFactory.fail("testing", "report", THROWABLE_SECRET + "RequiredReport");
+        AuditReporterRuntime runtime =
+                AuditReporterRuntime.open(
+                        spec(reporter("testing", true, OPTION_SECRET)),
+                        context(getClass().getClassLoader()));
+        List<CapturedLog> logs = new CopyOnWriteArrayList<>();
+
+        try (RuntimeLogCapture ignored = new RuntimeLogCapture(logs, Level.INFO)) {
+            AuditReportingException failure =
+                    catchThrowableOfType(
+                            () -> runtime.report(secretEvent()), AuditReportingException.class);
+            assertFailure(failure, "testing", "report");
+        }
+
+        assertThat(logs)
+                .extracting(log -> log.level, log -> log.message)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                Level.ERROR, "Audit reporter 'testing' failed during report"));
+        assertLogsAreRedacted(logs);
+        runtime.close();
+    }
+
+    @Test
     void optionalReportFailureWarnsExactlyOnceWithoutEventOrThrowableSecrets() {
         TestingAuditReporterFactory.fail("first", "report", THROWABLE_SECRET + "OptionalReport");
         List<CapturedLog> logs = new CopyOnWriteArrayList<>();
@@ -667,13 +720,17 @@ class AuditReporterRuntimeTest {
         private final CapturingAppender appender;
 
         private RuntimeLogCapture(List<CapturedLog> logs) {
+            this(logs, Level.WARN);
+        }
+
+        private RuntimeLogCapture(List<CapturedLog> logs, Level level) {
             context = (LoggerContext) LogManager.getContext(false);
             configuration = context.getConfiguration();
             loggerName = AuditReporterRuntime.class.getName();
             appender = new CapturingAppender("audit-reporter-runtime-test", logs);
             appender.start();
-            loggerConfig = new LoggerConfig(loggerName, Level.WARN, false);
-            loggerConfig.addAppender(appender, Level.WARN, null);
+            loggerConfig = new LoggerConfig(loggerName, level, false);
+            loggerConfig.addAppender(appender, level, null);
             configuration.addLogger(loggerName, loggerConfig);
             context.updateLoggers();
         }
