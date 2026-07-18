@@ -235,6 +235,38 @@ class OrphanCleanConfigTest {
     }
 
     @Test
+    void parsesAuditReporterSpecWithOpaqueStringOptions() {
+        OrphanCleanConfig cfg =
+                OrphanCleanConfig.fromParams(
+                        MultipleParameterToolAdapter.fromArgs(
+                                new String[] {
+                                    "--bootstrap-server",
+                                    "h:9123",
+                                    "--all-databases",
+                                    "--conf",
+                                    "audit.run-id=00000000-0000-0000-0000-000000000004",
+                                    "--conf",
+                                    "audit.reporters=testing",
+                                    "--conf",
+                                    "audit.reporter.testing.required=true",
+                                    "--conf",
+                                    "audit.reporter.testing.endpoint=opaque-value"
+                                }));
+
+        assertThat(cfg.auditReporterSpec().runId())
+                .isEqualTo("00000000-0000-0000-0000-000000000004");
+        assertThat(cfg.auditReporterSpec().reporters())
+                .singleElement()
+                .satisfies(
+                        reporter -> {
+                            assertThat(reporter.identifier()).isEqualTo("testing");
+                            assertThat(reporter.required()).isTrue();
+                            assertThat(reporter.options())
+                                    .containsEntry("endpoint", "opaque-value");
+                        });
+    }
+
+    @Test
     void extraConfigsRejectsMalformedEntry() {
         assertThatThrownBy(
                         () ->
