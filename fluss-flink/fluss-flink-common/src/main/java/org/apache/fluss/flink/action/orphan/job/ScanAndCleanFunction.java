@@ -342,7 +342,9 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                     decision =
                             MtimePolicy.failClosed(
                                     rule.evaluate(
-                                            meta, BucketActiveRefs.knownEmpty(), task.cutoffMillis()),
+                                            meta,
+                                            BucketActiveRefs.knownEmpty(),
+                                            task.cutoffMillis()),
                                     meta.modificationTime());
                 } else if (meta.modificationTime() >= task.cutoffMillis()) {
                     decision = Decision.DEFER;
