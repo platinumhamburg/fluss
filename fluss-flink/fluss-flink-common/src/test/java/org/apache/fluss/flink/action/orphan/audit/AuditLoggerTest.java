@@ -24,7 +24,9 @@ import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
 import org.apache.fluss.flink.action.orphan.job.StatsAggregateOperator;
+import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
+import org.apache.fluss.flink.action.orphan.rule.RuleEvaluation;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.flink.adapter.MultipleParameterToolAdapter;
 import org.apache.fluss.fs.FsPath;
@@ -886,6 +888,120 @@ class AuditLoggerTest {
     }
 
     @Test
+    void decisionSamplesAreBoundedPerDiagnosticGroup() {
+        ScopeIdentity firstScope =
+                ScopeIdentity.table("db", "orders", 7L).withPartitionAndBucket(11L, 4);
+        ScopeIdentity secondScope =
+                ScopeIdentity.table("db", "customers", 8L).withPartitionAndBucket(12L, 5);
+        RuleEvaluation newer = RuleEvaluation.decision(Decision.DEFER, "newer_than_cutoff");
+
+        try (ParityHarness harness =
+                new ParityHarness(AuditStage.SCAN, OPERATOR_NAME, SUBTASK_INDEX, ATTEMPT_NUMBER)) {
+            for (int i = 0; i < 5; i++) {
+                harness.logger()
+                        .logDecisionSample(
+                                firstScope,
+                                new FileMeta(
+                                        new FsPath("oss://audit-bucket/root/segment-" + i + ".log"),
+                                        10L + i,
+                                        CUTOFF_MILLIS + i),
+                                RuleId.LOG_SEGMENT,
+                                newer,
+                                CUTOFF_MILLIS,
+                                true);
+            }
+            harness.logger()
+                    .logDecisionSample(
+                            secondScope,
+                            new FileMeta(
+                                    new FsPath("oss://audit-bucket/root/other.log"),
+                                    20L,
+                                    CUTOFF_MILLIS + 10L),
+                            RuleId.LOG_SEGMENT,
+                            newer,
+                            CUTOFF_MILLIS,
+                            true);
+            harness.logger().flushDiagnosticSamplingSummaries();
+
+            List<AuditEvent> events = TestingAuditReporterFactory.events("testing");
+            assertThat(events.stream().filter(e -> e.getAction().equals("decision_sample")))
+                    .hasSize(4);
+            AuditEvent summary =
+                    events.stream()
+                            .filter(e -> e.getAction().equals("diagnostic_sampling_summary"))
+                            .findFirst()
+                            .get();
+            assertThat(summary.getTableId()).isEqualTo(7L);
+            assertThat(summary.getObjectType()).isEqualTo("log_segment");
+            assertThat(summary.getReasonCode()).isEqualTo("newer_than_cutoff");
+            assertThat(summary.getMetrics())
+                    .containsEntry("total_count", 5L)
+                    .containsEntry("emitted_samples", 3L)
+                    .containsEntry("suppressed_samples", 2L);
+        }
+    }
+
+    @Test
+    void cutoffAwareWouldDeleteContainsDirectComparisonEvidence() {
+        ScopeIdentity scope =
+                ScopeIdentity.table("db", "orders", 7L).withPartitionAndBucket(11L, 4);
+        FileMeta file =
+                new FileMeta(
+                        new FsPath("oss://audit-bucket/root/orphan.log"),
+                        4096L,
+                        CUTOFF_MILLIS - 321L);
+
+        try (ParityHarness harness =
+                new ParityHarness(AuditStage.SCAN, OPERATOR_NAME, SUBTASK_INDEX, ATTEMPT_NUMBER)) {
+            harness.logger().logWouldDelete(file, RuleId.LOG_SEGMENT, scope, CUTOFF_MILLIS);
+
+            AuditEvent event = TestingAuditReporterFactory.events("testing").get(0);
+            assertThat(event.getMetrics())
+                    .containsEntry("cutoff_ms", CUTOFF_MILLIS)
+                    .containsEntry("mtime_minus_cutoff_ms", -321L);
+        }
+    }
+
+    @Test
+    void structuredFailureDoesNotAcceptOrEmitRawExceptionMessage() {
+        ScopeIdentity scope =
+                ScopeIdentity.table("db", "orders", 7L).withPartitionAndBucket(11L, 4);
+        AuditFailureDetail detail =
+                AuditFailureDetail.builder("read_log_manifest", "not_found")
+                        .metadataPath(new FsPath("oss://audit-bucket/root/current.manifest"))
+                        .exceptionClass("java.io.FileNotFoundException")
+                        .errno("ENOENT")
+                        .attempts(2)
+                        .retryable(true)
+                        .actionRequired(true)
+                        .consistencyRacePossible(true)
+                        .build();
+
+        try (ParityHarness harness =
+                new ParityHarness(AuditStage.SCOPE, OPERATOR_NAME, SUBTASK_INDEX, ATTEMPT_NUMBER)) {
+            harness.logger()
+                    .logMetadataFailure(
+                            AuditStage.SCOPE, scope, CleanupObjectType.LOG_MANIFEST, detail);
+
+            AuditEvent event = TestingAuditReporterFactory.events("testing").get(0);
+            assertThat(event.getAction()).isEqualTo("metadata_failure");
+            assertThat(event.getDimensions())
+                    .containsEntry("operation", "read_log_manifest")
+                    .containsEntry("failure_category", "not_found")
+                    .containsEntry("metadata_path", "oss://audit-bucket/root/current.manifest")
+                    .containsEntry("exception_class", "java.io.FileNotFoundException")
+                    .containsEntry("errno", "ENOENT");
+            assertThat(event.getMetrics()).containsEntry("attempts", 2L);
+            assertThat(event.getFlags())
+                    .containsEntry("retryable", true)
+                    .containsEntry("action_required", true)
+                    .containsEntry("consistency_race_possible", true);
+            assertThat(event.getDimensions().values())
+                    .noneMatch(value -> value.contains("secret exception detail"));
+        }
+    }
+
+    @Test
     void mtimeUnavailableErrorIsBoundedPerLoggerInstance() {
         List<String> events = new CopyOnWriteArrayList<>();
         AuditLogger logger = new AuditLogger();
@@ -1098,8 +1214,15 @@ class AuditLoggerTest {
                         "logDeleted(FsPath,RuleId,boolean)",
                         "logWouldDelete(FsPath,RuleId)",
                         "logWouldDelete(FileMeta,RuleId,ScopeIdentity)",
+                        "logWouldDelete(FileMeta,RuleId,ScopeIdentity,long)",
                         "logDeleted(FileMeta,RuleId,ScopeIdentity)",
+                        "logDeleted(FileMeta,RuleId,ScopeIdentity,long)",
                         "logDeleteFailed(FileMeta,RuleId,ScopeIdentity,String,boolean)",
+                        "logDeleteFailed(FileMeta,RuleId,ScopeIdentity,String,boolean,long)",
+                        "logDecisionSample(ScopeIdentity,FileMeta,RuleId,RuleEvaluation,long,boolean)",
+                        "logMetadataFailure(AuditStage,ScopeIdentity,CleanupObjectType,AuditFailureDetail)",
+                        "logFilesystemFailure(AuditStage,ScopeIdentity,CleanupObjectType,AuditFailureDetail)",
+                        "logRpcFailure(AuditStage,ScopeIdentity,CleanupObjectType,AuditFailureDetail)",
                         "logDirDeleted(FsPath)",
                         "logWouldDeleteDir(FsPath)",
                         "logWouldDeleteDirectory(FsPath,long,ScopeIdentity,boolean)",
@@ -1128,7 +1251,7 @@ class AuditLoggerTest {
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",
                         "logAuditIntegrity(CleanupSummary)");
-        assertThat(actual).hasSize(36);
+        assertThat(actual).hasSize(43);
         assertThat(actual)
                 .noneMatch(
                         method ->
