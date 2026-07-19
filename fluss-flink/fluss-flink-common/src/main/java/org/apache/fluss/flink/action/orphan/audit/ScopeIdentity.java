@@ -59,8 +59,16 @@ public final class ScopeIdentity implements Serializable {
         return GLOBAL;
     }
 
+    public static ScopeIdentity database(String database) {
+        return new ScopeIdentity(ScopeKind.DATABASE, database, "", null, null, null);
+    }
+
     public static ScopeIdentity table(String database, String table, long tableId) {
         return new ScopeIdentity(ScopeKind.TABLE, database, table, tableId, null, null);
+    }
+
+    public static ScopeIdentity unresolvedTable(String database, String table) {
+        return new ScopeIdentity(ScopeKind.TABLE, database, table, null, null, null);
     }
 
     public static ScopeIdentity orphanTable(

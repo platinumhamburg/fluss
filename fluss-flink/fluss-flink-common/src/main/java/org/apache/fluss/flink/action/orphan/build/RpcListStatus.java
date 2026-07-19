@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.action.orphan.build;
 
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
+
 import javax.annotation.Nullable;
 
 /**
@@ -32,19 +34,19 @@ final class RpcListStatus {
     private static final RpcListStatus OK = new RpcListStatus(true, null);
 
     private final boolean ok;
-    @Nullable private final String reason;
+    @Nullable private final AuditFailureDetail failure;
 
-    private RpcListStatus(boolean ok, @Nullable String reason) {
+    private RpcListStatus(boolean ok, @Nullable AuditFailureDetail failure) {
         this.ok = ok;
-        this.reason = reason;
+        this.failure = failure;
     }
 
     static RpcListStatus ok() {
         return OK;
     }
 
-    static RpcListStatus listFailed(String reason) {
-        return new RpcListStatus(false, reason);
+    static RpcListStatus listFailed(AuditFailureDetail failure) {
+        return new RpcListStatus(false, failure);
     }
 
     boolean isOk() {
@@ -52,7 +54,7 @@ final class RpcListStatus {
     }
 
     @Nullable
-    String reason() {
-        return reason;
+    AuditFailureDetail failure() {
+        return failure;
     }
 }

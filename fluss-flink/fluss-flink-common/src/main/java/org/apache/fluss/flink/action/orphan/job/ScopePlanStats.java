@@ -33,6 +33,19 @@ public final class ScopePlanStats {
     private long skippedEmptyKvActiveSet;
     private long skippedOutOfScopeRoot;
     private long metadataFailures;
+    private long scopeTargets;
+    private long targetBuckets;
+    private long kvTargetBuckets;
+    private long logResolvedBuckets;
+    private long logNoManifestBuckets;
+    private long logReadFailedBuckets;
+    private long logUnavailableBuckets;
+    private long outOfScopeBuckets;
+    private long kvOutOfScopeBuckets;
+    private long kvActiveBuckets;
+    private long kvEmptyBuckets;
+    private long kvUnavailableBuckets;
+    private long incompleteTargets;
 
     public void database() {
         databases++;
@@ -48,6 +61,13 @@ public final class ScopePlanStats {
 
     public void discoveredBucket() {
         discoveredBuckets++;
+    }
+
+    public void discoveredBuckets(long count) {
+        if (count < 0L) {
+            throw new IllegalArgumentException("count");
+        }
+        discoveredBuckets += count;
     }
 
     public void bucketTask() {
@@ -72,6 +92,28 @@ public final class ScopePlanStats {
 
     public void metadataFailure() {
         metadataFailures++;
+    }
+
+    public void target(ScopeTargetStats target) {
+        scopeTargets++;
+        targetBuckets += target.expectedBuckets();
+        if (target.kvApplicable()) {
+            kvTargetBuckets += target.expectedBuckets();
+        }
+        logResolvedBuckets += target.logResolvedBuckets();
+        logNoManifestBuckets += target.logNoManifestBuckets();
+        logReadFailedBuckets += target.logReadFailedBuckets();
+        logUnavailableBuckets += target.logUnavailableBuckets();
+        outOfScopeBuckets += target.outOfScopeBuckets();
+        kvOutOfScopeBuckets += target.kvOutOfScopeBuckets();
+        kvActiveBuckets += target.kvActiveBuckets();
+        kvEmptyBuckets += target.kvEmptyBuckets();
+        kvUnavailableBuckets += target.kvUnavailableBuckets();
+        if (!target.complete()
+                || !target.logCoverageConsistent()
+                || !target.kvCoverageConsistent()) {
+            incompleteTargets++;
+        }
     }
 
     public long databases() {
@@ -112,5 +154,76 @@ public final class ScopePlanStats {
 
     public long metadataFailures() {
         return metadataFailures;
+    }
+
+    public long scopeTargets() {
+        return scopeTargets;
+    }
+
+    public long targetBuckets() {
+        return targetBuckets;
+    }
+
+    public long kvTargetBuckets() {
+        return kvTargetBuckets;
+    }
+
+    public long logResolvedBuckets() {
+        return logResolvedBuckets;
+    }
+
+    public long logNoManifestBuckets() {
+        return logNoManifestBuckets;
+    }
+
+    public long logReadFailedBuckets() {
+        return logReadFailedBuckets;
+    }
+
+    public long logUnavailableBuckets() {
+        return logUnavailableBuckets;
+    }
+
+    public long outOfScopeBuckets() {
+        return outOfScopeBuckets;
+    }
+
+    public long kvOutOfScopeBuckets() {
+        return kvOutOfScopeBuckets;
+    }
+
+    public long kvActiveBuckets() {
+        return kvActiveBuckets;
+    }
+
+    public long kvEmptyBuckets() {
+        return kvEmptyBuckets;
+    }
+
+    public long kvUnavailableBuckets() {
+        return kvUnavailableBuckets;
+    }
+
+    public long incompleteTargets() {
+        return incompleteTargets;
+    }
+
+    public boolean countersConsistent() {
+        return discoveredBuckets == targetBuckets
+                && targetBuckets
+                        == logResolvedBuckets
+                                + logNoManifestBuckets
+                                + logReadFailedBuckets
+                                + logUnavailableBuckets
+                                + outOfScopeBuckets
+                && kvTargetBuckets
+                        == kvActiveBuckets
+                                + kvEmptyBuckets
+                                + kvUnavailableBuckets
+                                + kvOutOfScopeBuckets;
+    }
+
+    public boolean coverageComplete() {
+        return metadataFailures == 0L && incompleteTargets == 0L && countersConsistent();
     }
 }
