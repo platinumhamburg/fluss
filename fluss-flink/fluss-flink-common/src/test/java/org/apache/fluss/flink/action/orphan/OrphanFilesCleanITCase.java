@@ -357,7 +357,28 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                         m ->
                                 m.contains("action=would_delete")
                                         && m.contains("rule=log-segment")
-                                        && m.contains(orphan.toString()));
+                                        && m.contains(orphan.toString())
+                                        && m.contains("cutoff_ms=")
+                                        && m.contains("mtime_minus_cutoff_ms="));
+        assertThat(auditMessages())
+                .anyMatch(
+                        m ->
+                                m.contains("action=decision_sample")
+                                        && m.contains("decision=keep_active")
+                                        && m.contains("reference_type=log_segment")
+                                        && m.contains(activeSegment.toString()));
+        assertThat(auditMessages())
+                .anyMatch(
+                        m ->
+                                m.contains("action=scope_target_summary")
+                                        && m.contains("complete=true")
+                                        && m.contains("log_coverage_consistent=true"));
+        assertThat(auditMessages())
+                .anyMatch(
+                        m ->
+                                m.contains("action=scope_plan")
+                                        && m.contains("coverage_complete=true")
+                                        && m.contains("counters_consistent=true"));
         assertThat(auditMessages()).noneMatch(m -> m.contains("action=deleted"));
         // Catch a regression that targets the active segment with a would_delete intent: the
         // file-existence checks above would silently pass under dry-run even if the planner
@@ -469,7 +490,8 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
         assertThat(auditMessages())
                 .noneMatch(
                         m ->
-                                m.contains("rule=kv-shared-sst")
+                                (m.contains("action=would_delete") || m.contains("action=deleted"))
+                                        && m.contains("rule=kv-shared-sst")
                                         && m.contains(layout.orphanFile.toString()));
     }
 
@@ -485,7 +507,8 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
         assertThat(auditMessages())
                 .noneMatch(
                         m ->
-                                m.contains("rule=log-manifest")
+                                (m.contains("action=would_delete") || m.contains("action=deleted"))
+                                        && m.contains("rule=log-manifest")
                                         && m.contains(orphanManifest.toString()));
     }
 
@@ -584,8 +607,16 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
         assertThat(auditMessages())
                 .anyMatch(
                         m ->
-                                m.contains("action=skip_partition_list")
-                                        && m.contains("table=" + tableA.tablePath.getTableName()));
+                                m.contains("action=rpc_failure")
+                                        && m.contains("operation=list_partition_infos")
+                                        && m.contains("table=" + tableA.tablePath.getTableName())
+                                        && m.contains("exception_class=")
+                                        && m.contains("action_required=true"));
+        assertThat(auditMessages())
+                .anyMatch(
+                        m ->
+                                m.contains("action=audit_integrity")
+                                        && m.contains("coverage_complete=false"));
     }
 
     @Test
@@ -782,8 +813,7 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
 
         // Inject a non-numeric child znode under BucketSnapshotsZNode so server-side
         // listBucketSnapshotIds throws NumberFormatException on Long.parseLong. Client-side
-        // fetchKvActiveSnapDirs propagates the exception and cleanActiveTableFiles catches it
-        // to emit skip_kv_target.
+        // fetchKvActiveSnapDirs classifies the exhausted RPC without exposing its raw message.
         ZooKeeperClient zk = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
         String invalidChildPath = BucketSnapshotsZNode.path(tableBucket) + "/not-a-long";
         zk.getCuratorClient().create().forPath(invalidChildPath, new byte[0]);
@@ -793,12 +823,13 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
             zk.getCuratorClient().delete().forPath(invalidChildPath);
         }
 
-        // KV target was skipped: skip_kv_target audit fires AND snap-77 orphan files preserved.
+        // KV target was skipped: rpc_failure audit fires AND snap-77 orphan files preserved.
         assertThat(auditMessages())
-                .as("phase 2: skip_kv_target audit must fire when LIST_KV_SNAPSHOTS RPC fails")
+                .as("phase 2: rpc_failure audit must fire when LIST_KV_SNAPSHOTS RPC fails")
                 .anyMatch(
                         m ->
-                                m.contains("action=skip_kv_target")
+                                m.contains("action=rpc_failure")
+                                        && m.contains("operation=list_kv_snapshots")
                                         && m.contains("table_id=" + tableInfo.getTableId()));
         assertThat(Files.exists(faultInjectionOrphanKvMetadata))
                 .as(
