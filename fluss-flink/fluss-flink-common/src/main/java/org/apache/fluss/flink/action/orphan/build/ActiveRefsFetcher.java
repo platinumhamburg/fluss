@@ -286,11 +286,7 @@ public final class ActiveRefsFetcher {
             } catch (IOException e) {
                 return KvSharedSstFetchResult.failed(
                         snapshotMetadataFailure(
-                                metadataPath,
-                                "snapshot_metadata_parse_failed",
-                                e,
-                                false,
-                                false));
+                                metadataPath, "snapshot_metadata_parse_failed", e, false, false));
             }
         }
         return KvSharedSstFetchResult.ok(sharedSstFileNames);

@@ -982,11 +982,24 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         for (String root : clusterRoots) {
             for (String topLevel : TOP_LEVEL_DIRS) {
                 FsPath topLevelDir = remoteSubDir(root, topLevel);
-                FileSystem fs = getFileSystemIfExists(topLevelDir, remoteFsOpRateLimiter);
+                ScopeIdentity scope = ScopeIdentity.global();
+                FileSystem fs;
+                try {
+                    fs = getFileSystemIfExists(topLevelDir, remoteFsOpRateLimiter);
+                } catch (IOException failure) {
+                    audit.logFilesystemFailure(
+                            AuditStage.SCOPE,
+                            scope,
+                            CleanupObjectType.DIRECTORY,
+                            filesystemFailure("exists", "io_error", topLevelDir, failure));
+                    planStats.metadataFailure();
+                    throw failure;
+                }
                 if (fs == null) {
                     continue;
                 }
-                FileStatus[] entries = listStatuses(fs, topLevelDir, remoteFsOpRateLimiter);
+                FileStatus[] entries =
+                        listStatuses(fs, topLevelDir, remoteFsOpRateLimiter, audit, scope);
                 if (entries == null) {
                     planStats.metadataFailure();
                     continue;
@@ -1025,11 +1038,23 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             ScopePlanStats planStats,
             Collector<CleanTask> out)
             throws IOException {
-        FileSystem fs = getFileSystemIfExists(dbDir, remoteFsOpRateLimiter);
+        ScopeIdentity scope = ScopeIdentity.database(dbDir.getName());
+        FileSystem fs;
+        try {
+            fs = getFileSystemIfExists(dbDir, remoteFsOpRateLimiter);
+        } catch (IOException failure) {
+            audit.logFilesystemFailure(
+                    AuditStage.SCOPE,
+                    scope,
+                    CleanupObjectType.DIRECTORY,
+                    filesystemFailure("exists", "io_error", dbDir, failure));
+            planStats.metadataFailure();
+            throw failure;
+        }
         if (fs == null) {
             return;
         }
-        FileStatus[] entries = listStatuses(fs, dbDir, remoteFsOpRateLimiter);
+        FileStatus[] entries = listStatuses(fs, dbDir, remoteFsOpRateLimiter, audit, scope);
         if (entries == null) {
             planStats.metadataFailure();
             return;
@@ -1056,6 +1081,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                         activePartitionIds,
                         activePartitionIdsComplete,
                         tracker,
+                        audit,
                         remoteFsOpRateLimiter,
                         planStats,
                         out);
@@ -1068,6 +1094,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             Set<Long> activePartitionIds,
             boolean activePartitionIdsComplete,
             MaxKnownIdsTracker tracker,
+            AuditLogger audit,
             RateLimiter remoteFsOpRateLimiter,
             ScopePlanStats planStats,
             Collector<CleanTask> out)
@@ -1089,7 +1116,10 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     out.collect(orphanDirCleanTask(orphanScope, dir));
                     planStats.orphanDirTask();
                 },
-                planStats);
+                planStats,
+                audit,
+                ScopeIdentity.orphanTable(
+                        tableDir.getParent().getName(), tableDir.getName(), null));
     }
 
     private OrphanDirCleanTask orphanDirCleanTask(ScopeIdentity scope, FsPath dir) {
@@ -1181,8 +1211,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             }
         }
         return true;
-    }
-
     }
 
     private static AuditFailureDetail rpcFailure(String operation, Throwable failure) {

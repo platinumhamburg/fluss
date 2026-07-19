@@ -367,7 +367,10 @@ class ActiveRefsFetcherTest {
                 fetcher.fetchKvSharedSstFileNames(kvTabletDir, activeSnapDirs);
 
         assertThat(result.allMetadataReadOk()).isFalse();
-        assertThat(result.failureReason()).contains("Snapshot metadata not found");
+        assertThat(result.failureDetail().operation()).isEqualTo("read_kv_snapshot_metadata");
+        assertThat(result.failureDetail().failureCategory()).isEqualTo("not_found");
+        assertThat(result.failureDetail().metadataPath()).endsWith("snap-10/_METADATA");
+        assertThat(result.failureDetail().consistencyRacePossible()).isTrue();
         assertThat(result.sharedSstFileNames()).isEmpty();
     }
 
@@ -388,7 +391,9 @@ class ActiveRefsFetcherTest {
                 fetcher.fetchKvSharedSstFileNames(kvTabletDir, activeSnapDirs);
 
         assertThat(result.allMetadataReadOk()).isFalse();
-        assertThat(result.failureReason()).contains("connection reset");
+        assertThat(result.failureDetail().operation()).isEqualTo("read_kv_snapshot_metadata");
+        assertThat(result.failureDetail().failureCategory()).isEqualTo("io_error");
+        assertThat(result.failureDetail().exceptionClass()).isEqualTo(IOException.class.getName());
         assertThat(result.sharedSstFileNames()).isEmpty();
     }
 
@@ -410,7 +415,8 @@ class ActiveRefsFetcherTest {
                 fetcher.fetchKvSharedSstFileNames(kvTabletDir, activeSnapDirs);
 
         assertThat(result.allMetadataReadOk()).isFalse();
-        assertThat(result.failureReason()).contains("Failed to parse snapshot metadata");
+        assertThat(result.failureDetail().failureCategory())
+                .isEqualTo("snapshot_metadata_parse_failed");
     }
 
     @Test
@@ -434,7 +440,8 @@ class ActiveRefsFetcherTest {
                 fetcher.fetchKvSharedSstFileNames(kvTabletDir, activeSnapDirs);
 
         assertThat(result.allMetadataReadOk()).isFalse();
-        assertThat(result.failureReason()).contains("outside the expected bucket directory");
+        assertThat(result.failureDetail().failureCategory())
+                .isEqualTo("snapshot_metadata_parse_failed");
         assertThat(result.sharedSstFileNames()).isEmpty();
     }
 

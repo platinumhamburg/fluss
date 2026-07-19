@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
 
 import javax.annotation.Nullable;
 
@@ -45,13 +46,15 @@ public final class KvSharedSstFetchResult {
 
     private final boolean ok;
     private final Set<String> sharedSstFileNames;
-    @Nullable private final String failureReason;
+    @Nullable private final AuditFailureDetail failureDetail;
 
     private KvSharedSstFetchResult(
-            boolean ok, Set<String> sharedSstFileNames, @Nullable String failureReason) {
+            boolean ok,
+            Set<String> sharedSstFileNames,
+            @Nullable AuditFailureDetail failureDetail) {
         this.ok = ok;
         this.sharedSstFileNames = Collections.unmodifiableSet(new HashSet<>(sharedSstFileNames));
-        this.failureReason = failureReason;
+        this.failureDetail = failureDetail;
     }
 
     /** All active snapshot metadata reads succeeded; the active set is complete. */
@@ -63,8 +66,8 @@ public final class KvSharedSstFetchResult {
      * A non-transient IO error prevented safe determination of the active set. Shared SST cleanup
      * must be skipped for this bucket.
      */
-    public static KvSharedSstFetchResult failed(String reason) {
-        return new KvSharedSstFetchResult(false, Collections.emptySet(), reason);
+    public static KvSharedSstFetchResult failed(AuditFailureDetail detail) {
+        return new KvSharedSstFetchResult(false, Collections.emptySet(), detail);
     }
 
     /** Whether all metadata reads completed successfully. */
@@ -80,9 +83,11 @@ public final class KvSharedSstFetchResult {
         return sharedSstFileNames;
     }
 
-    /** Failure reason for audit logging; {@code null} when {@link #allMetadataReadOk()} is true. */
-    @Nullable
-    public String failureReason() {
-        return failureReason;
+    /** Structured failure for audit logging. Only valid when the result is failed. */
+    public AuditFailureDetail failureDetail() {
+        if (failureDetail == null) {
+            throw new IllegalStateException("Shared SST metadata did not fail");
+        }
+        return failureDetail;
     }
 }

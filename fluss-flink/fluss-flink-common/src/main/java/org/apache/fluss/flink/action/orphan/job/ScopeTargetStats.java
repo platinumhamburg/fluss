@@ -87,6 +87,11 @@ public final class ScopeTargetStats {
         }
     }
 
+    /** Marks target coverage incomplete without changing bucket classification counters. */
+    public void metadataFailure() {
+        coverageFailure = true;
+    }
+
     public void taskEmitted() {
         tasksEmitted++;
     }
