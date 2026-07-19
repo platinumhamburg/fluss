@@ -51,20 +51,21 @@ public final class LogManifestRule implements FileRule {
     }
 
     @Override
-    public Decision evaluate(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
+    public RuleEvaluation evaluateDetailed(
+            FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
         FsPath path = file.path();
         FsPath parent = path.getParent();
         if (parent == null
                 || !FlussPaths.REMOTE_LOG_METADATA_DIR_NAME.equals(parent.getName())
                 || !path.getName().endsWith(".manifest")) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
 
         // Default-conservative: never delete a manifest. Keeping orphans is harmless; deleting an
         // active manifest leaves the coordinator's manifest pointer dangling and breaks the
         // bucket's metadata chain.
         if (!allowDeleteManifest) {
-            return Decision.KEEP_ACTIVE;
+            return RuleEvaluation.decision(Decision.KEEP_ACTIVE, "conservative_policy");
         }
 
         // Opt-in path: preserve the original active-set + cutoff semantics. The "current" bucket
@@ -72,9 +73,16 @@ public final class LogManifestRule implements FileRule {
         // bucket in ListRemoteLogManifests), so a single set lookup suffices.
         String pathString = path.toString();
         if (activeRefs.logActiveManifestPaths().contains(pathString)) {
-            return Decision.KEEP_ACTIVE;
+            return RuleEvaluation.active("keep_active", "log_manifest", "remote_path", pathString);
         }
 
-        return MtimePolicy.evaluateInactiveFile(file.modificationTime(), cutoffMillis);
+        Decision decision = MtimePolicy.evaluateInactiveFile(file.modificationTime(), cutoffMillis);
+        if (decision == Decision.MTIME_UNAVAILABLE) {
+            return RuleEvaluation.decision(decision, "mtime_unavailable");
+        }
+        if (decision == Decision.DEFER) {
+            return RuleEvaluation.decision(decision, "newer_than_cutoff");
+        }
+        return RuleEvaluation.decision(decision, "candidate");
     }
 }

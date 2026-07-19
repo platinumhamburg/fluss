@@ -33,9 +33,9 @@ public final class RuleDispatcher {
                 }
 
                 @Override
-                public Decision evaluate(
+                public RuleEvaluation evaluateDetailed(
                         FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
-                    return Decision.SKIP_UNKNOWN;
+                    return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
                 }
             };
 

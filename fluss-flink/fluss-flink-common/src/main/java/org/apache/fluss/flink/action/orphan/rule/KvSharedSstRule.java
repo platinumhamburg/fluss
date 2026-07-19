@@ -47,24 +47,34 @@ public final class KvSharedSstRule implements FileRule {
     }
 
     @Override
-    public Decision evaluate(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
+    public RuleEvaluation evaluateDetailed(
+            FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
         FsPath parent = file.path().getParent();
         if (parent == null || !FlussPaths.REMOTE_KV_SNAPSHOT_SHARED_DIR.equals(parent.getName())) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
         String fileName = file.path().getName();
         if (!fileName.endsWith(".sst") && !REMOTE_FILE_UUID.matcher(fileName).matches()) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
 
         if (activeRefs.kvSharedSstFileNames().contains(fileName)) {
-            return Decision.KEEP_ACTIVE;
+            return RuleEvaluation.active(
+                    "keep_active", "kv_shared_sst", "remote_path_basename", fileName);
         }
 
         if (!activeRefs.kvSharedSstRefsComplete()) {
-            return Decision.KEEP_ACTIVE;
+            return RuleEvaluation.decision(
+                    Decision.KEEP_ACTIVE, "active_references_incomplete");
         }
 
-        return file.modificationTime() < cutoffMillis ? Decision.DELETE : Decision.DEFER;
+        Decision decision = MtimePolicy.evaluateInactiveFile(file.modificationTime(), cutoffMillis);
+        if (decision == Decision.MTIME_UNAVAILABLE) {
+            return RuleEvaluation.decision(decision, "mtime_unavailable");
+        }
+        if (decision == Decision.DEFER) {
+            return RuleEvaluation.decision(decision, "newer_than_cutoff");
+        }
+        return RuleEvaluation.decision(decision, "candidate");
     }
 }
