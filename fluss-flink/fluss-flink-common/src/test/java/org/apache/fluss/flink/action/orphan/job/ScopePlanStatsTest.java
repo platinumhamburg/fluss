@@ -56,4 +56,83 @@ class ScopePlanStatsTest {
         assertThat(task.stats().metadataFailures()).isEqualTo(1L);
         assertThat(task.stats().skipped()).containsEntry(SkipReasonCode.NO_REMOTE_MANIFEST, 1L);
     }
+
+    @Test
+    void aggregatesTargetCoverageCategoriesWithoutLosingBucketEquation() {
+        ScopePlanStats stats = new ScopePlanStats();
+        stats.discoveredBuckets(4L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(
+                        ScopeIdentity.table("db", "table", 7L).withPartitionAndBucket(9L, null),
+                        4L,
+                        true);
+        target.logResolvedBucket();
+        target.logResolvedBucket();
+        target.logNoManifestBucket();
+        target.logReadFailedBucket();
+        target.kvActiveBucket();
+        target.kvActiveBucket();
+        target.kvEmptyBucket();
+        target.kvEmptyBucket();
+        target.taskEmitted();
+        target.taskEmitted();
+        target.taskEmitted();
+        target.incomplete(123L);
+
+        stats.target(target);
+
+        assertThat(target.logCoverageConsistent()).isTrue();
+        assertThat(target.kvCoverageConsistent()).isTrue();
+        assertThat(target.complete()).isFalse();
+        assertThat(stats.scopeTargets()).isEqualTo(1L);
+        assertThat(stats.logResolvedBuckets()).isEqualTo(2L);
+        assertThat(stats.logNoManifestBuckets()).isEqualTo(1L);
+        assertThat(stats.logReadFailedBuckets()).isEqualTo(1L);
+        assertThat(stats.kvActiveBuckets()).isEqualTo(2L);
+        assertThat(stats.kvEmptyBuckets()).isEqualTo(2L);
+        assertThat(stats.incompleteTargets()).isEqualTo(1L);
+        assertThat(stats.countersConsistent()).isTrue();
+        assertThat(stats.coverageComplete()).isFalse();
+    }
+
+    @Test
+    void marksRpcUnavailableTargetIncompleteWithoutClaimingPhysicalCoverage() {
+        ScopePlanStats stats = new ScopePlanStats();
+        stats.discoveredBuckets(3L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(ScopeIdentity.table("db", "table", 7L), 3L, true);
+        target.logRpcFailed();
+        target.kvRpcFailed();
+        target.incomplete(50L);
+
+        stats.target(target);
+
+        assertThat(target.logCoverageConsistent()).isTrue();
+        assertThat(target.kvCoverageConsistent()).isTrue();
+        assertThat(target.complete()).isFalse();
+        assertThat(stats.logUnavailableBuckets()).isEqualTo(3L);
+        assertThat(stats.kvUnavailableBuckets()).isEqualTo(3L);
+        assertThat(stats.incompleteTargets()).isEqualTo(1L);
+        assertThat(stats.countersConsistent()).isTrue();
+        assertThat(stats.coverageComplete()).isFalse();
+    }
+
+    @Test
+    void classifiesOutOfScopeBucketsWithoutInventingKvCoverageForLogOnlyTable() {
+        ScopePlanStats stats = new ScopePlanStats();
+        stats.discoveredBuckets(2L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(ScopeIdentity.table("db", "log_table", 8L), 2L, false);
+        target.outOfScope();
+        target.incomplete(7L);
+
+        stats.target(target);
+
+        assertThat(target.logCoverageConsistent()).isTrue();
+        assertThat(target.kvCoverageConsistent()).isTrue();
+        assertThat(stats.outOfScopeBuckets()).isEqualTo(2L);
+        assertThat(stats.kvOutOfScopeBuckets()).isZero();
+        assertThat(stats.countersConsistent()).isTrue();
+        assertThat(stats.coverageComplete()).isFalse();
+    }
 }

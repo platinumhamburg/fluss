@@ -18,9 +18,8 @@
 package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
-
-import javax.annotation.Nullable;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -66,12 +65,12 @@ public final class LogActiveRefsFetchResult {
 
     private final RpcListStatus list;
     private final Map<Integer, BucketActiveRefs> resolved;
-    private final Map<Integer, String> readFailures;
+    private final Map<Integer, AuditFailureDetail> readFailures;
 
     private LogActiveRefsFetchResult(
             RpcListStatus list,
             Map<Integer, BucketActiveRefs> resolved,
-            Map<Integer, String> readFailures) {
+            Map<Integer, AuditFailureDetail> readFailures) {
         this.list = list;
         this.resolved = Collections.unmodifiableMap(new HashMap<>(resolved));
         this.readFailures = Collections.unmodifiableMap(new HashMap<>(readFailures));
@@ -80,9 +79,9 @@ public final class LogActiveRefsFetchResult {
     /**
      * Result for a target whose {@code LIST_REMOTE_LOG_MANIFESTS} RPC failed and exhausted retries.
      */
-    public static LogActiveRefsFetchResult listFailed(String reason) {
+    public static LogActiveRefsFetchResult listFailed(AuditFailureDetail failure) {
         return new LogActiveRefsFetchResult(
-                RpcListStatus.listFailed(reason), Collections.emptyMap(), Collections.emptyMap());
+                RpcListStatus.listFailed(failure), Collections.emptyMap(), Collections.emptyMap());
     }
 
     /**
@@ -92,7 +91,8 @@ public final class LogActiveRefsFetchResult {
      * reported as {@link ManifestReadStatus#NOT_LISTED}.
      */
     static LogActiveRefsFetchResult ofPerBucket(
-            Map<Integer, BucketActiveRefs> resolved, Map<Integer, String> readFailures) {
+            Map<Integer, BucketActiveRefs> resolved,
+            Map<Integer, AuditFailureDetail> readFailures) {
         return new LogActiveRefsFetchResult(RpcListStatus.ok(), resolved, readFailures);
     }
 
@@ -101,10 +101,13 @@ public final class LogActiveRefsFetchResult {
         return list.isOk();
     }
 
-    /** Reason the per-target RPC failed; {@code null} when {@link #listOk()} is true. */
-    @Nullable
-    public String listFailureReason() {
-        return list.reason();
+    /** Structured detail for a failed per-target RPC. */
+    public AuditFailureDetail listFailureDetail() {
+        AuditFailureDetail failure = list.failure();
+        if (failure == null) {
+            throw new IllegalStateException("Target list did not fail");
+        }
+        return failure;
     }
 
     /**
@@ -133,12 +136,12 @@ public final class LogActiveRefsFetchResult {
         return activeRefs;
     }
 
-    /** Failure reason for a READ_FAILED bucket. */
-    public String readFailureReason(int bucketId) {
-        String reason = readFailures.get(bucketId);
-        if (reason == null) {
+    /** Structured failure detail for a READ_FAILED bucket. */
+    public AuditFailureDetail readFailureDetail(int bucketId) {
+        AuditFailureDetail failure = readFailures.get(bucketId);
+        if (failure == null) {
             throw new IllegalStateException("Bucket " + bucketId + " is not READ_FAILED");
         }
-        return reason;
+        return failure;
     }
 }

@@ -18,8 +18,7 @@
 package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.annotation.Internal;
-
-import javax.annotation.Nullable;
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -53,9 +52,9 @@ public final class KvActiveRefsFetchResult {
     }
 
     /** Result for a target whose {@code LIST_KV_SNAPSHOTS} RPC failed and exhausted retries. */
-    public static KvActiveRefsFetchResult listFailed(String reason) {
+    public static KvActiveRefsFetchResult listFailed(AuditFailureDetail failure) {
         return new KvActiveRefsFetchResult(
-                RpcListStatus.listFailed(reason), Collections.emptyMap());
+                RpcListStatus.listFailed(failure), Collections.emptyMap());
     }
 
     /** Result for a target whose {@code LIST_KV_SNAPSHOTS} RPC succeeded. */
@@ -68,10 +67,13 @@ public final class KvActiveRefsFetchResult {
         return list.isOk();
     }
 
-    /** Reason the per-target RPC failed; {@code null} when {@link #listOk()} is true. */
-    @Nullable
-    public String listFailureReason() {
-        return list.reason();
+    /** Structured detail for a failed per-target RPC. */
+    public AuditFailureDetail listFailureDetail() {
+        AuditFailureDetail failure = list.failure();
+        if (failure == null) {
+            throw new IllegalStateException("Target list did not fail");
+        }
+        return failure;
     }
 
     /**
