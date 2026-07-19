@@ -217,8 +217,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 } finally {
                     endScopePhase(audit, "live_target_planning", phaseStartMillis, phaseComplete);
                 }
-                phaseStartMillis =
-                        startScopePhase(audit, "unknown_database_directory_discovery");
+                phaseStartMillis = startScopePhase(audit, "unknown_database_directory_discovery");
                 phaseComplete = false;
                 try {
                     emitOrphanDirTasksUnderUnknownDatabases(
@@ -1011,7 +1010,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 if (fs == null) {
                     continue;
                 }
-                FileStatus[] entries = listStatuses(fs, topLevelDir, remoteFsOpRateLimiter);
+                FileStatus[] entries =
+                        listStatuses(
+                                fs,
+                                topLevelDir,
+                                remoteFsOpRateLimiter,
+                                audit,
+                                ScopeIdentity.global());
                 if (entries == null) {
                     planStats.metadataFailure();
                     continue;
@@ -1054,7 +1059,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         if (fs == null) {
             return;
         }
-        FileStatus[] entries = listStatuses(fs, dbDir, remoteFsOpRateLimiter);
+        FileStatus[] entries =
+                listStatuses(
+                        fs,
+                        dbDir,
+                        remoteFsOpRateLimiter,
+                        audit,
+                        ScopeIdentity.database(dbDir.getName()));
         if (entries == null) {
             planStats.metadataFailure();
             return;
@@ -1081,6 +1092,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                         activePartitionIds,
                         activePartitionIdsComplete,
                         tracker,
+                        audit,
                         remoteFsOpRateLimiter,
                         planStats,
                         out);
@@ -1093,6 +1105,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             Set<Long> activePartitionIds,
             boolean activePartitionIdsComplete,
             MaxKnownIdsTracker tracker,
+            AuditLogger audit,
             RateLimiter remoteFsOpRateLimiter,
             ScopePlanStats planStats,
             Collector<CleanTask> out)
@@ -1101,6 +1114,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             return;
         }
         long maxKnownPartitionId = tracker.maxKnownPartitionId();
+        ScopeIdentity tableScope =
+                ScopeIdentity.orphanTable(tableDir.getParent().getName(), tableDir.getName(), null);
         forEachOrphanDirUnderParent(
                 tableDir,
                 dirName ->
@@ -1108,13 +1123,12 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 dirName, activePartitionIds, maxKnownPartitionId),
                 remoteFsOpRateLimiter,
                 dir -> {
-                    ScopeIdentity orphanScope =
-                            ScopeIdentity.orphanTable(
-                                    tableDir.getParent().getName(), tableDir.getName(), null);
-                    out.collect(orphanDirCleanTask(orphanScope, dir));
+                    out.collect(orphanDirCleanTask(tableScope, dir));
                     planStats.orphanDirTask();
                 },
-                planStats);
+                planStats,
+                audit,
+                tableScope);
     }
 
     private OrphanDirCleanTask orphanDirCleanTask(ScopeIdentity scope, FsPath dir) {

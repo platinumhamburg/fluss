@@ -264,6 +264,8 @@ class ScanAndCleanFunctionTest {
                                     activePaths,
                                     Collections.<String>emptySet(),
                                     Collections.<String>emptySet(),
+                                    Collections.<String>emptySet(),
+                                    true,
                                     cutoff,
                                     true,
                                     false)));

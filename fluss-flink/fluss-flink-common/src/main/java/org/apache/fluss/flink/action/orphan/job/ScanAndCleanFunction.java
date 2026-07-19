@@ -35,8 +35,8 @@ import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
 import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
-import org.apache.fluss.flink.adapter.ProcessFunctionAdapter;
 import org.apache.fluss.flink.action.orphan.rule.RuleEvaluation;
+import org.apache.fluss.flink.adapter.ProcessFunctionAdapter;
 import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
@@ -365,9 +365,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                             rule.evaluateDetailed(
                                     meta, BucketActiveRefs.knownEmpty(), task.cutoffMillis());
                     decision =
-                            MtimePolicy.failClosed(
-                                    evaluation.decision(),
-                                    meta.modificationTime());
+                            MtimePolicy.failClosed(evaluation.decision(), meta.modificationTime());
                     if (decision != evaluation.decision()) {
                         evaluation = RuleEvaluation.decision(decision, "mtime_unavailable");
                     }

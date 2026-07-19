@@ -85,7 +85,7 @@ class RuleEvaluationTest {
     }
 
     @Test
-    void distinguishesConservativePolicyFromReferenceMatch() {
+    void distinguishesConservativePolicyFromIncompleteReferences() {
         RuleEvaluation manifest =
                 new LogManifestRule()
                         .evaluateDetailed(
@@ -101,7 +101,7 @@ class RuleEvaluationTest {
 
         assertThat(manifest.reasonCode()).isEqualTo("conservative_policy");
         assertThat(manifest.referenceKey()).isEmpty();
-        assertThat(sharedSst.reasonCode()).isEqualTo("conservative_policy");
+        assertThat(sharedSst.reasonCode()).isEqualTo("active_references_incomplete");
         assertThat(sharedSst.referenceKey()).isEmpty();
     }
 

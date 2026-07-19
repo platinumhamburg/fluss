@@ -64,8 +64,7 @@ public final class KvSharedSstRule implements FileRule {
         }
 
         if (!activeRefs.kvSharedSstRefsComplete()) {
-            return RuleEvaluation.decision(
-                    Decision.KEEP_ACTIVE, "active_references_incomplete");
+            return RuleEvaluation.decision(Decision.KEEP_ACTIVE, "active_references_incomplete");
         }
 
         Decision decision = MtimePolicy.evaluateInactiveFile(file.modificationTime(), cutoffMillis);
