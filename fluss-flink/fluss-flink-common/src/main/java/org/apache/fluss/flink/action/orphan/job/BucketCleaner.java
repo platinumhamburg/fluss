@@ -18,7 +18,9 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
@@ -29,6 +31,7 @@ import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
 import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
+import org.apache.fluss.flink.action.orphan.rule.RuleEvaluation;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -160,6 +163,16 @@ public final class BucketCleaner {
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
+                audit.logFilesystemFailure(
+                        AuditStage.SCAN,
+                        scope,
+                        CleanupObjectType.DIRECTORY,
+                        AuditFailureDetail.builder("list_directory", "directory_list_failed")
+                                .targetPath(visit.dir)
+                                .exceptionClass(e.getClass())
+                                .retryable(true)
+                                .actionRequired(true)
+                                .build());
                 stats.recordSkip(SkipReasonCode.DIRECTORY_LIST_FAILED);
                 if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
@@ -185,11 +198,14 @@ public final class BucketCleaner {
                     long modificationTime = child.getModificationTime();
                     if (MtimePolicy.isUnavailable(modificationTime)) {
                         stats.recordSkip(SkipReasonCode.MTIME_UNAVAILABLE);
-                        audit.logMtimeUnavailableOnce(
+                        audit.logSkippedDirectory(
+                                childPath,
+                                modificationTime,
                                 scope,
-                                CleanupObjectType.DIRECTORY,
-                                "directory",
-                                childPath.getName());
+                                "mtime_unavailable",
+                                dryRun,
+                                false,
+                                true);
                     }
                     stack.push(
                             new DirVisit(
@@ -204,10 +220,12 @@ public final class BucketCleaner {
                 FileMeta meta =
                         new FileMeta(childPath, child.getLen(), child.getModificationTime());
                 FileRule rule = dispatcher.dispatch(meta);
+                RuleEvaluation evaluation = rule.evaluateDetailed(meta, activeRefs, cutoffMillis);
                 Decision decision =
-                        MtimePolicy.failClosed(
-                                rule.evaluate(meta, activeRefs, cutoffMillis),
-                                meta.modificationTime());
+                        MtimePolicy.failClosed(evaluation.decision(), meta.modificationTime());
+                if (decision != evaluation.decision()) {
+                    evaluation = RuleEvaluation.decision(decision, "mtime_unavailable");
+                }
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.recordScanned(objectType);
                 stats.recordRuleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
@@ -216,7 +234,7 @@ public final class BucketCleaner {
                         stats.recordRuleDecision(
                                 objectType, RuleDecisionCounters.candidate(meta.size()));
                         stats.recordPlanned(objectType, meta.size());
-                        if (safeDeleter.deleteFile(meta, decision, rule.id())) {
+                        if (safeDeleter.deleteFile(meta, decision, rule.id(), cutoffMillis)) {
                             if (!dryRun) {
                                 stats.recordDeleted(objectType, meta.size());
                             }
@@ -228,13 +246,16 @@ public final class BucketCleaner {
                     case SKIP_UNKNOWN:
                         stats.recordRuleDecision(
                                 objectType, RuleDecisionCounters.unknownFileType(meta.size()));
-                        audit.logSkipUnknown(meta.path(), rule.id());
+                        audit.logDecisionSample(
+                                scope, meta, rule.id(), evaluation, cutoffMillis, dryRun);
                         stats.recordSkip(SkipReasonCode.UNKNOWN_FILE_TYPE);
                         visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
                         stats.recordRuleDecision(
                                 objectType, RuleDecisionCounters.keepActive(meta.size()));
+                        audit.logDecisionSample(
+                                scope, meta, rule.id(), evaluation, cutoffMillis, dryRun);
                         stats.recordSkip(SkipReasonCode.KEEP_ACTIVE);
                         visit.hasRemainingChild = true;
                         break;
@@ -242,13 +263,15 @@ public final class BucketCleaner {
                         stats.recordRuleDecision(
                                 objectType, RuleDecisionCounters.mtimeUnavailable(meta.size()));
                         stats.recordSkip(SkipReasonCode.MTIME_UNAVAILABLE);
-                        audit.logMtimeUnavailableOnce(
-                                scope, objectType, "file", meta.path().getName());
+                        audit.logDecisionSample(
+                                scope, meta, rule.id(), evaluation, cutoffMillis, dryRun);
                         visit.hasRemainingChild = true;
                         break;
                     case DEFER:
                         stats.recordRuleDecision(
                                 objectType, RuleDecisionCounters.newerThanCutoff(meta.size()));
+                        audit.logDecisionSample(
+                                scope, meta, rule.id(), evaluation, cutoffMillis, dryRun);
                         stats.recordSkip(SkipReasonCode.NEWER_THAN_CUTOFF);
                         visit.hasRemainingChild = true;
                         break;

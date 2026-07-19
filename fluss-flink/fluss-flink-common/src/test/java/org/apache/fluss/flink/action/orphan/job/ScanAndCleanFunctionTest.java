@@ -17,12 +17,15 @@
 
 package org.apache.fluss.flink.action.orphan.job;
 
+import org.apache.fluss.flink.action.orphan.audit.AuditEvent;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory;
 import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory.OpenContextSnapshot;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.operators.ProcessOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -35,10 +38,13 @@ import org.junit.jupiter.api.io.TempDir;
 import java.lang.reflect.Constructor;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -229,6 +235,86 @@ class ScanAndCleanFunctionTest {
         }
     }
 
+    @Test
+    void reportsBoundedDecisionEvidenceAndExhaustiveDryRunCandidate(@TempDir Path tempDir)
+            throws Exception {
+        long cutoff = System.currentTimeMillis() - 10_000L;
+        ScopeIdentity scope = ScopeIdentity.table("db", "table", 42L).withPartitionAndBucket(7L, 3);
+        Set<String> activePaths = new HashSet<>();
+
+        Path activeFile = createLogFile(tempDir, 1, ".log", cutoff - 1_000L);
+        activePaths.add(relativeLogPath(activeFile));
+        Path candidateFile = createLogFile(tempDir, 2, ".index", cutoff - 2_000L);
+        Path unknownFile = Files.write(tempDir.resolve("unknown.bin"), new byte[] {1});
+        Files.setLastModifiedTime(unknownFile, FileTime.fromMillis(cutoff - 3_000L));
+        for (int i = 3; i < 7; i++) {
+            createLogFile(tempDir, i, ".timeindex", cutoff + i);
+        }
+
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        try (OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
+                scanHarness(function)) {
+            harness.open();
+            harness.processElement(
+                    new StreamRecord<CleanTask>(
+                            new BucketCleanTask(
+                                    scope,
+                                    tempDir.toUri().toString(),
+                                    null,
+                                    activePaths,
+                                    Collections.<String>emptySet(),
+                                    Collections.<String>emptySet(),
+                                    cutoff,
+                                    true,
+                                    false)));
+        }
+
+        List<AuditEvent> events = TestingAuditReporterFactory.events("testing");
+        assertThat(events)
+                .filteredOn(event -> event.getAction().equals("decision_sample"))
+                .anySatisfy(
+                        event -> {
+                            assertThat(event.getPath()).isEqualTo(auditPath(activeFile));
+                            assertThat(event.getReasonCode()).isEqualTo("keep_active");
+                            assertThat(event.getDimensions())
+                                    .containsEntry("reference_type", "log_segment")
+                                    .containsEntry("reference_match_kind", "relative_path")
+                                    .containsEntry("reference_key", relativeLogPath(activeFile));
+                        })
+                .anySatisfy(
+                        event -> {
+                            assertThat(event.getPath()).isEqualTo(auditPath(unknownFile));
+                            assertThat(event.getReasonCode()).isEqualTo("unknown_file_type");
+                            assertThat(event.getSizeBytes()).isEqualTo(1L);
+                        });
+        assertThat(events)
+                .filteredOn(
+                        event ->
+                                event.getAction().equals("decision_sample")
+                                        && "newer_than_cutoff".equals(event.getReasonCode()))
+                .hasSize(3);
+        assertThat(events)
+                .filteredOn(event -> event.getAction().equals("diagnostic_sampling_summary"))
+                .singleElement()
+                .satisfies(
+                        event ->
+                                assertThat(event.getMetrics())
+                                        .containsEntry("total_count", 4L)
+                                        .containsEntry("emitted_samples", 3L)
+                                        .containsEntry("suppressed_samples", 1L));
+        assertThat(events)
+                .filteredOn(event -> event.getAction().equals("would_delete"))
+                .singleElement()
+                .satisfies(
+                        event -> {
+                            assertThat(event.getPath()).isEqualTo(auditPath(candidateFile));
+                            assertThat(event.getMetrics())
+                                    .containsEntry("cutoff_ms", cutoff)
+                                    .containsEntry("mtime_minus_cutoff_ms", -2_000L);
+                            assertThat(event.getFlags()).containsEntry("dry_run", true);
+                        });
+    }
+
     private static OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> scanHarness(
             ScanAndCleanFunction function) throws Exception {
         return new OneInputStreamOperatorTestHarness<>(new ProcessOperator<>(function), 8, 3, 2);
@@ -274,6 +360,26 @@ class ScanAndCleanFunctionTest {
         } catch (ReflectiveOperationException reflectionFailure) {
             throw new AssertionError("Unable to construct ScanAndCleanFunction", reflectionFailure);
         }
+    }
+
+    private static Path createLogFile(
+            Path root, int directoryNumber, String suffix, long modificationTime) throws Exception {
+        String segment = String.format("00000000-0000-0000-0000-%012d", directoryNumber);
+        Path dir = Files.createDirectories(root.resolve(segment));
+        Path file =
+                Files.write(
+                        dir.resolve(FlussPaths.filenamePrefixFromOffset(0L) + suffix),
+                        new byte[] {1});
+        Files.setLastModifiedTime(file, FileTime.fromMillis(modificationTime));
+        return file;
+    }
+
+    private static String relativeLogPath(Path file) {
+        return file.getParent().getFileName() + "/" + file.getFileName();
+    }
+
+    private static String auditPath(Path file) {
+        return new FsPath(file.toUri().toString()).toString();
     }
 
     private static final class ListCollector implements Collector<CleanupStats> {

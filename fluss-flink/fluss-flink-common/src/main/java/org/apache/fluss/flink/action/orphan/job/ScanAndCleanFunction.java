@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterContext;
 import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
@@ -34,6 +35,7 @@ import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
 import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
+import org.apache.fluss.flink.action.orphan.rule.RuleEvaluation;
 import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
@@ -241,8 +243,14 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         long rootModificationTime = rootStatus.getModificationTime();
         if (MtimePolicy.isUnavailable(rootModificationTime)) {
             stats.skipped(SkipReasonCode.MTIME_UNAVAILABLE, 1L);
-            audit.logMtimeUnavailableOnce(
-                    task.scope(), CleanupObjectType.DIRECTORY, "directory", dirPath.getName());
+            audit.logSkippedDirectory(
+                    dirPath,
+                    rootModificationTime,
+                    task.scope(),
+                    "mtime_unavailable",
+                    task.dryRun(),
+                    false,
+                    true);
         }
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
         stack.push(
@@ -295,6 +303,16 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
+                audit.logFilesystemFailure(
+                        AuditStage.SCAN,
+                        task.scope(),
+                        CleanupObjectType.DIRECTORY,
+                        AuditFailureDetail.builder("list_directory", "directory_list_failed")
+                                .targetPath(visit.dir)
+                                .exceptionClass(e.getClass())
+                                .retryable(true)
+                                .actionRequired(true)
+                                .build());
                 stats.skipped(SkipReasonCode.DIRECTORY_LIST_FAILED, 1L);
                 if (visit.parent != null) {
                     visit.parent.hasRemainingChild = true;
@@ -315,11 +333,14 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                     long modificationTime = child.getModificationTime();
                     if (MtimePolicy.isUnavailable(modificationTime)) {
                         stats.skipped(SkipReasonCode.MTIME_UNAVAILABLE, 1L);
-                        audit.logMtimeUnavailableOnce(
+                        audit.logSkippedDirectory(
+                                childPath,
+                                modificationTime,
                                 task.scope(),
-                                CleanupObjectType.DIRECTORY,
-                                "directory",
-                                childPath.getName());
+                                "mtime_unavailable",
+                                task.dryRun(),
+                                false,
+                                true);
                     }
                     stack.push(
                             new DirVisit(
@@ -337,23 +358,19 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.scanned(objectType, 1L);
                 stats.ruleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
-                Decision decision;
-                if (MtimePolicy.isUnavailable(meta.modificationTime())) {
-                    decision =
-                            MtimePolicy.failClosed(
-                                    rule.evaluate(
-                                            meta, BucketActiveRefs.empty(), task.cutoffMillis()),
-                                    meta.modificationTime());
-                } else if (meta.modificationTime() >= task.cutoffMillis()) {
-                    decision = Decision.DEFER;
-                } else {
-                    decision = rule.evaluate(meta, BucketActiveRefs.empty(), task.cutoffMillis());
+                RuleEvaluation evaluation =
+                        rule.evaluateDetailed(meta, BucketActiveRefs.empty(), task.cutoffMillis());
+                Decision decision =
+                        MtimePolicy.failClosed(evaluation.decision(), meta.modificationTime());
+                if (decision != evaluation.decision()) {
+                    evaluation = RuleEvaluation.decision(decision, "mtime_unavailable");
                 }
                 switch (decision) {
                     case DELETE:
                         stats.ruleDecision(objectType, RuleDecisionCounters.candidate(meta.size()));
                         stats.planned(objectType, 1L, meta.size());
-                        if (safeDeleter.deleteFile(meta, decision, rule.id())) {
+                        if (safeDeleter.deleteFile(
+                                meta, decision, rule.id(), task.cutoffMillis())) {
                             if (!task.dryRun()) {
                                 stats.deleted(objectType, 1L, meta.size());
                             }
@@ -365,13 +382,26 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                     case SKIP_UNKNOWN:
                         stats.ruleDecision(
                                 objectType, RuleDecisionCounters.unknownFileType(meta.size()));
-                        audit.logSkipUnknown(meta.path(), rule.id());
+                        audit.logDecisionSample(
+                                task.scope(),
+                                meta,
+                                rule.id(),
+                                evaluation,
+                                task.cutoffMillis(),
+                                task.dryRun());
                         stats.skipped(SkipReasonCode.UNKNOWN_FILE_TYPE, 1L);
                         visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
                         stats.ruleDecision(
                                 objectType, RuleDecisionCounters.keepActive(meta.size()));
+                        audit.logDecisionSample(
+                                task.scope(),
+                                meta,
+                                rule.id(),
+                                evaluation,
+                                task.cutoffMillis(),
+                                task.dryRun());
                         stats.skipped(SkipReasonCode.KEEP_ACTIVE, 1L);
                         visit.hasRemainingChild = true;
                         break;
@@ -379,13 +409,25 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         stats.ruleDecision(
                                 objectType, RuleDecisionCounters.mtimeUnavailable(meta.size()));
                         stats.skipped(SkipReasonCode.MTIME_UNAVAILABLE, 1L);
-                        audit.logMtimeUnavailableOnce(
-                                task.scope(), objectType, "file", meta.path().getName());
+                        audit.logDecisionSample(
+                                task.scope(),
+                                meta,
+                                rule.id(),
+                                evaluation,
+                                task.cutoffMillis(),
+                                task.dryRun());
                         visit.hasRemainingChild = true;
                         break;
                     case DEFER:
                         stats.ruleDecision(
                                 objectType, RuleDecisionCounters.newerThanCutoff(meta.size()));
+                        audit.logDecisionSample(
+                                task.scope(),
+                                meta,
+                                rule.id(),
+                                evaluation,
+                                task.cutoffMillis(),
+                                task.dryRun());
                         stats.skipped(SkipReasonCode.NEWER_THAN_CUTOFF, 1L);
                         visit.hasRemainingChild = true;
                         break;
@@ -416,25 +458,38 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
     private void closeAuditRuntime() {
         AuditReporterRuntime runtime = auditRuntime;
+        AuditLogger logger = audit;
         auditRuntime = null;
         audit = null;
-        if (runtime == null) {
-            return;
-        }
 
         RuntimeException failure = null;
         try {
-            runtime.flush();
-        } catch (RuntimeException flushFailure) {
-            failure = flushFailure;
+            if (logger != null) {
+                logger.flushDiagnosticSamplingSummaries();
+            }
+        } catch (RuntimeException samplingFailure) {
+            failure = samplingFailure;
         }
-        try {
-            runtime.close();
-        } catch (RuntimeException closeFailure) {
-            if (failure == null) {
-                failure = closeFailure;
-            } else {
-                failure.addSuppressed(closeFailure);
+        if (runtime != null) {
+            try {
+                runtime.flush();
+            } catch (RuntimeException flushFailure) {
+                if (failure == null) {
+                    failure = flushFailure;
+                } else {
+                    failure.addSuppressed(flushFailure);
+                }
+            }
+        }
+        if (runtime != null) {
+            try {
+                runtime.close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) {
+                    failure = closeFailure;
+                } else {
+                    failure.addSuppressed(closeFailure);
+                }
             }
         }
         if (failure != null) {
