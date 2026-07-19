@@ -51,37 +51,46 @@ public final class KvSnapshotFileRule implements FileRule {
     }
 
     @Override
-    public Decision evaluate(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
+    public RuleEvaluation evaluateDetailed(
+            FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
         FsPath parent = file.path().getParent();
         if (parent == null) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
 
         String parentName = parent.getName();
         if (!parentName.startsWith(SNAP_DIR_PREFIX)) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
 
         // Parent must be snap-<digits>; reject e.g. snap-, snap-abc.
         String snapIdPart = parentName.substring(SNAP_DIR_PREFIX.length());
         if (snapIdPart.isEmpty()) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
         for (int i = 0; i < snapIdPart.length(); i++) {
             if (!Character.isDigit(snapIdPart.charAt(i))) {
-                return Decision.SKIP_UNKNOWN;
+                return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
             }
         }
 
         if (!isKnownSnapshotFile(file.path().getName())) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
 
         if (activeRefs.kvActiveSnapDirs().contains(parentName)) {
-            return Decision.KEEP_ACTIVE;
+            return RuleEvaluation.active(
+                    "keep_active", "kv_snapshot", "snapshot_directory", parentName);
         }
 
-        return MtimePolicy.evaluateInactiveFile(file.modificationTime(), cutoffMillis);
+        Decision decision = MtimePolicy.evaluateInactiveFile(file.modificationTime(), cutoffMillis);
+        if (decision == Decision.MTIME_UNAVAILABLE) {
+            return RuleEvaluation.decision(decision, "mtime_unavailable");
+        }
+        if (decision == Decision.DEFER) {
+            return RuleEvaluation.decision(decision, "newer_than_cutoff");
+        }
+        return RuleEvaluation.decision(decision, "candidate");
     }
 
     private static boolean isKnownSnapshotFile(String fileName) {

@@ -34,5 +34,10 @@ public interface FileRule {
      *     cutoffMillis} is {@link Decision#DEFER}red. Pre-frozen at action start; does not slide
      *     during a run.
      */
-    Decision evaluate(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis);
+    default Decision evaluate(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
+        return evaluateDetailed(file, activeRefs, cutoffMillis).decision();
+    }
+
+    /** Decide what to do and retain the exact comparison evidence used by the rule. */
+    RuleEvaluation evaluateDetailed(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis);
 }

@@ -40,14 +40,15 @@ public final class KvSharedSstRule implements FileRule {
     }
 
     @Override
-    public Decision evaluate(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
+    public RuleEvaluation evaluateDetailed(
+            FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
         FsPath parent = file.path().getParent();
         if (parent == null || !FlussPaths.REMOTE_KV_SNAPSHOT_SHARED_DIR.equals(parent.getName())) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
         if (!file.path().getName().endsWith(".sst")) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
-        return Decision.KEEP_ACTIVE;
+        return RuleEvaluation.decision(Decision.KEEP_ACTIVE, "conservative_policy");
     }
 }
