@@ -43,11 +43,7 @@ public final class ScopeSummaryTask implements CleanTask {
         putPositive(
                 skipped, SkipReasonCode.EMPTY_KV_ACTIVE_SET, plan.skippedEmptyKvActiveSetCount());
         putPositive(skipped, SkipReasonCode.OUT_OF_SCOPE_ROOT, plan.skippedOutOfScopeRootCount());
-        return new ScopeSummaryTask(
-                CleanupStats.scope(
-                        plan.bucketTasks() + plan.orphanDirTasks(),
-                        plan.metadataFailures(),
-                        skipped));
+        return new ScopeSummaryTask(CleanupStats.scope(plan, skipped));
     }
 
     public CleanupStats stats() {
