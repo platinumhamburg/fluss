@@ -37,7 +37,9 @@ public final class CleanupSummary implements Serializable {
     private final long inconsistentScopes;
     private final long ruleCandidateFiles;
     private final long ruleCandidateBytes;
+    private final long incompleteScopeTargets;
     private final boolean coverageComplete;
+    private final boolean scopeCountersConsistent;
     private final boolean ruleCountersConsistent;
     private final boolean dryRunCountersConsistent;
 
@@ -51,7 +53,9 @@ public final class CleanupSummary implements Serializable {
             long inconsistentScopes,
             long ruleCandidateFiles,
             long ruleCandidateBytes,
+            long incompleteScopeTargets,
             boolean coverageComplete,
+            boolean scopeCountersConsistent,
             boolean ruleCountersConsistent,
             boolean dryRunCountersConsistent) {
         this.dryRun = dryRun;
@@ -63,7 +67,9 @@ public final class CleanupSummary implements Serializable {
         this.inconsistentScopes = inconsistentScopes;
         this.ruleCandidateFiles = ruleCandidateFiles;
         this.ruleCandidateBytes = ruleCandidateBytes;
+        this.incompleteScopeTargets = incompleteScopeTargets;
         this.coverageComplete = coverageComplete;
+        this.scopeCountersConsistent = scopeCountersConsistent;
         this.ruleCountersConsistent = ruleCountersConsistent;
         this.dryRunCountersConsistent = dryRunCountersConsistent;
     }
@@ -106,6 +112,18 @@ public final class CleanupSummary implements Serializable {
 
     public boolean coverageComplete() {
         return coverageComplete;
+    }
+
+    public long incompleteScopeTargets() {
+        return incompleteScopeTargets;
+    }
+
+    public boolean scopeCountersConsistent() {
+        return scopeCountersConsistent;
+    }
+
+    public boolean countersConsistent() {
+        return scopeCountersConsistent && ruleCountersConsistent;
     }
 
     public boolean ruleCountersConsistent() {

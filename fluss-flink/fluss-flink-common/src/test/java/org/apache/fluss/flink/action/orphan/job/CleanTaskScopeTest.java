@@ -56,4 +56,26 @@ class CleanTaskScopeTest {
 
         assertThat(task.scope()).isEqualTo(scope);
     }
+
+    @Test
+    void scopeSummaryCarriesOnlyFixedSizeCoverageScalars() {
+        ScopePlanStats plan = new ScopePlanStats();
+        plan.discoveredBuckets(1L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(ScopeIdentity.table("db", "table", 7L), 1L, false);
+        target.logNoManifestBucket();
+        target.taskEmitted();
+        target.complete(2L);
+        plan.target(target);
+
+        CleanupStats stats = ScopeSummaryTask.from(plan).stats();
+
+        assertThat(stats.scopeDiscoveredBuckets()).isEqualTo(1L);
+        assertThat(stats.scopeTargetBuckets()).isEqualTo(1L);
+        assertThat(stats.scopeLogClassifiedBuckets()).isEqualTo(1L);
+        assertThat(stats.scopeCountersConsistent()).isTrue();
+        assertThat(stats.incompleteScopeTargets()).isZero();
+        assertThat(stats.byObjectType()).isEmpty();
+        assertThat(stats.ruleDecisions()).isEmpty();
+    }
 }
