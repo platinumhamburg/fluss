@@ -23,6 +23,7 @@ import org.apache.fluss.annotation.Internal;
 @Internal
 public enum ScopeKind {
     GLOBAL,
+    DATABASE,
     TABLE,
     ORPHAN_TABLE,
     ORPHAN_PARTITION,

@@ -23,6 +23,7 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.ActiveKvSnapshots;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FsPath;
@@ -170,8 +171,7 @@ public final class ActiveRefsFetcher {
                                     RpcErrorClassifier.classify(e)
                                             != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
-            return LogActiveRefsFetchResult.listFailed(
-                    formatRpcFailureReason(tableId, partitionId, e.getCause()));
+            return LogActiveRefsFetchResult.listFailed(rpcFailure("list_remote_log_manifests", e));
         }
 
         Map<Integer, List<RemoteLogManifestInfo>> entriesByBucket = new HashMap<>();
@@ -181,37 +181,14 @@ public final class ActiveRefsFetcher {
         }
 
         Map<Integer, BucketActiveRefs> resolved = new HashMap<>();
-        Map<Integer, String> readFailures = new HashMap<>();
+        Map<Integer, AuditFailureDetail> readFailures = new HashMap<>();
         for (Map.Entry<Integer, List<RemoteLogManifestInfo>> bucketEntries :
                 entriesByBucket.entrySet()) {
             int bucketId = bucketEntries.getKey();
             try {
                 resolved.put(bucketId, buildBucketActiveRefs(bucketEntries.getValue()));
-            } catch (FileNotFoundException e) {
-                readFailures.put(
-                        bucketId,
-                        formatBucketReadFailureReason(
-                                "Manifest not found (likely upserted concurrently)",
-                                tableId,
-                                partitionId,
-                                bucketId,
-                                e));
-            } catch (ManifestParseException e) {
-                // Manifest payload is unreadable or violates the shared manifest serde schema.
-                // Distinct reason so operators triage separately from transient FS hiccups.
-                readFailures.put(
-                        bucketId,
-                        formatBucketReadFailureReason(
-                                "Manifest parse failure (corrupt or unexpected schema)",
-                                tableId,
-                                partitionId,
-                                bucketId,
-                                e));
-            } catch (IOException e) {
-                readFailures.put(
-                        bucketId,
-                        formatBucketReadFailureReason(
-                                "IO error reading manifest", tableId, partitionId, bucketId, e));
+            } catch (ManifestReadFailure e) {
+                readFailures.put(bucketId, e.detail());
             }
         }
         return LogActiveRefsFetchResult.ofPerBucket(resolved, readFailures);
@@ -238,8 +215,7 @@ public final class ActiveRefsFetcher {
                                     RpcErrorClassifier.classify(e)
                                             != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
-            return KvActiveRefsFetchResult.listFailed(
-                    formatRpcFailureReason(tableId, partitionId, e.getCause()));
+            return KvActiveRefsFetchResult.listFailed(rpcFailure("list_kv_snapshots", e));
         }
         Map<Integer, Set<String>> dirsByBucket = new HashMap<>();
         for (Map.Entry<Integer, Set<Long>> entry :
@@ -254,44 +230,58 @@ public final class ActiveRefsFetcher {
         return KvActiveRefsFetchResult.ok(dirsByBucket);
     }
 
-    private static String formatRpcFailureReason(
-            long tableId, @Nullable Long partitionId, @Nullable Throwable cause) {
-        String reason =
-                String.format("RPC failure for tableId=%s partitionId=%s", tableId, partitionId);
-        if (cause != null && cause.getMessage() != null) {
-            reason = reason + ": " + cause.getMessage();
-        }
-        return reason;
-    }
-
-    private static String formatBucketReadFailureReason(
-            String prefix,
-            long tableId,
-            @Nullable Long partitionId,
-            int bucketId,
-            Throwable cause) {
-        String reason =
-                String.format(
-                        "%s for tableId=%s partitionId=%s bucketId=%s",
-                        prefix, tableId, partitionId, bucketId);
-        if (cause != null && cause.getMessage() != null) {
-            reason = reason + ": " + cause.getMessage();
-        }
-        return reason;
+    private AuditFailureDetail rpcFailure(String operation, IOException failure) {
+        Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+        RpcErrorClassifier.Category category = RpcErrorClassifier.classify(cause);
+        return AuditFailureDetail.builder(operation, category.name().toLowerCase())
+                .exceptionClass(cause.getClass())
+                .attempts(category == RpcErrorClassifier.Category.NOT_FOUND ? 1 : maxRetries)
+                .retryable(category == RpcErrorClassifier.Category.TRANSIENT)
+                .actionRequired(true)
+                .consistencyRacePossible(category == RpcErrorClassifier.Category.NOT_FOUND)
+                .build();
     }
 
     private BucketActiveRefs buildBucketActiveRefs(List<RemoteLogManifestInfo> entries)
-            throws IOException {
+            throws ManifestReadFailure {
         Set<String> manifestPaths = new HashSet<>();
         Set<String> segmentRelpaths = new HashSet<>();
         for (RemoteLogManifestInfo entry : entries) {
             String path = entry.getRemoteLogManifestPath();
             manifestPaths.add(path);
-            remoteFsOpRateLimiter.acquire();
-            byte[] manifestBytes = metadataReader.read(new FsPath(path));
-            segmentRelpaths.addAll(parseLogSegmentRelativePaths(manifestBytes));
+            FsPath metadataPath = new FsPath(path);
+            try {
+                remoteFsOpRateLimiter.acquire();
+                byte[] manifestBytes = metadataReader.read(metadataPath);
+                segmentRelpaths.addAll(parseLogSegmentRelativePaths(manifestBytes));
+            } catch (FileNotFoundException e) {
+                throw new ManifestReadFailure(
+                        metadataFailure(metadataPath, "not_found", e, true, true));
+            } catch (ManifestParseException e) {
+                throw new ManifestReadFailure(
+                        metadataFailure(metadataPath, "manifest_parse_failed", e, false, false));
+            } catch (IOException e) {
+                throw new ManifestReadFailure(
+                        metadataFailure(metadataPath, "io_error", e, true, false));
+            }
         }
         return new BucketActiveRefs(segmentRelpaths, Collections.emptySet(), manifestPaths);
+    }
+
+    private static AuditFailureDetail metadataFailure(
+            FsPath path,
+            String category,
+            IOException failure,
+            boolean retryable,
+            boolean racePossible) {
+        return AuditFailureDetail.builder("read_log_manifest", category)
+                .metadataPath(path)
+                .exceptionClass(failure.getClass())
+                .attempts(1)
+                .retryable(retryable)
+                .actionRequired(true)
+                .consistencyRacePossible(racePossible)
+                .build();
     }
 
     private Set<String> parseLogSegmentRelativePaths(byte[] manifestBytes)
@@ -329,6 +319,19 @@ public final class ActiveRefsFetcher {
     static final class ManifestParseException extends IOException {
         ManifestParseException(String message, Throwable cause) {
             super(message, cause);
+        }
+    }
+
+    private static final class ManifestReadFailure extends IOException {
+        private final AuditFailureDetail detail;
+
+        private ManifestReadFailure(AuditFailureDetail detail) {
+            super(detail.failureCategory());
+            this.detail = detail;
+        }
+
+        private AuditFailureDetail detail() {
+            return detail;
         }
     }
 

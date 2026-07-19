@@ -24,6 +24,7 @@ import org.apache.fluss.flink.action.orphan.job.CleanupStats;
 import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
+import org.apache.fluss.flink.action.orphan.job.ScopeTargetStats;
 import org.apache.fluss.flink.action.orphan.job.StatsAggregateOperator;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
@@ -157,7 +158,15 @@ class AuditLoggerTest {
                                             + " discovered_buckets=4 bucket_tasks=5"
                                             + " orphan_dir_tasks=6 skipped_no_remote_manifest=7"
                                             + " skipped_empty_kv_active_set=8"
-                                            + " skipped_out_of_scope_root=9 metadata_failures=10",
+                                            + " skipped_out_of_scope_root=9 metadata_failures=10"
+                                            + " scope_targets=0 target_buckets=0"
+                                            + " log_resolved_buckets=0 log_no_manifest_buckets=0"
+                                            + " log_read_failed_buckets=0 log_unavailable_buckets=0"
+                                            + " out_of_scope_buckets=0 kv_target_buckets=0"
+                                            + " kv_active_buckets=0 kv_empty_buckets=0"
+                                            + " kv_unavailable_buckets=0 incomplete_targets=0"
+                                            + " kv_out_of_scope_buckets=0 coverage_complete=false"
+                                            + " counters_consistent=false action_required=true",
                                     AuditSeverity.INFO,
                                     AuditStage.SCOPE,
                                     "scope_plan")
@@ -170,7 +179,23 @@ class AuditLoggerTest {
                             .metric("skipped_no_remote_manifest", 7L)
                             .metric("skipped_empty_kv_active_set", 8L)
                             .metric("skipped_out_of_scope_root", 9L)
-                            .metric("metadata_failures", 10L),
+                            .metric("metadata_failures", 10L)
+                            .metric("scope_targets", 0L)
+                            .metric("target_buckets", 0L)
+                            .metric("log_resolved_buckets", 0L)
+                            .metric("log_no_manifest_buckets", 0L)
+                            .metric("log_read_failed_buckets", 0L)
+                            .metric("log_unavailable_buckets", 0L)
+                            .metric("out_of_scope_buckets", 0L)
+                            .metric("kv_target_buckets", 0L)
+                            .metric("kv_active_buckets", 0L)
+                            .metric("kv_empty_buckets", 0L)
+                            .metric("kv_unavailable_buckets", 0L)
+                            .metric("kv_out_of_scope_buckets", 0L)
+                            .metric("incomplete_targets", 0L)
+                            .flag("coverage_complete", false)
+                            .flag("counters_consistent", false)
+                            .flag("action_required", true),
                     () -> logger.logScopePlan(plan));
 
             harness.assertEmission(
@@ -795,6 +820,71 @@ class AuditLoggerTest {
     }
 
     @Test
+    void emitsScopePhaseAndTargetCoverageEvents() {
+        AuditReporterContext context =
+                new AuditReporterContext(
+                        RUN_ID,
+                        true,
+                        AuditStage.SCOPE,
+                        "ScopeEnumerator",
+                        0,
+                        0,
+                        AuditLoggerTest.class.getClassLoader());
+        AuditReporterRuntime runtime = openTestingRuntime(context);
+        try {
+            AuditLogger logger = new AuditLogger(runtime, context);
+            ScopeTargetStats target =
+                    new ScopeTargetStats(
+                            ScopeIdentity.table("db", "table", 7L).withPartitionAndBucket(9L, null),
+                            2L,
+                            true);
+            target.logResolvedBucket();
+            target.logNoManifestBucket();
+            target.kvActiveBucket();
+            target.kvEmptyBucket();
+            target.taskEmitted();
+            target.complete(41L);
+
+            logger.logScopePhaseStart("metadata_inventory");
+            logger.logScopePhaseEnd("metadata_inventory", 37L, true);
+            logger.logScopeTargetSummary(target);
+
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("scope_phase_end"))
+                    .singleElement()
+                    .satisfies(
+                            event -> {
+                                assertThat(event.getDimensions())
+                                        .containsEntry("phase", "metadata_inventory");
+                                assertThat(event.getMetrics()).containsEntry("duration_ms", 37L);
+                                assertThat(event.getFlags()).containsEntry("complete", true);
+                            });
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("scope_target_summary"))
+                    .singleElement()
+                    .satisfies(
+                            event -> {
+                                assertThat(event.getTableId()).isEqualTo(7L);
+                                assertThat(event.getPartitionId()).isEqualTo(9L);
+                                assertThat(event.getMetrics())
+                                        .containsEntry("expected_buckets", 2L)
+                                        .containsEntry("log_resolved_buckets", 1L)
+                                        .containsEntry("log_no_manifest_buckets", 1L)
+                                        .containsEntry("kv_active_buckets", 1L)
+                                        .containsEntry("kv_empty_buckets", 1L)
+                                        .containsEntry("tasks_emitted", 1L)
+                                        .containsEntry("duration_ms", 41L);
+                                assertThat(event.getFlags())
+                                        .containsEntry("complete", true)
+                                        .containsEntry("log_coverage_consistent", true)
+                                        .containsEntry("kv_coverage_consistent", true);
+                            });
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
     void emitsBoundedRuleAndCoverageSummaries() throws Exception {
         ScopeIdentity orders = ScopeIdentity.table("db", "orders", 7L);
         CleanupStats stats =
@@ -1218,6 +1308,9 @@ class AuditLoggerTest {
                         "logCutoff(long)",
                         "logRunStart(OrphanCleanConfig)",
                         "logScopePlan(ScopePlanStats)",
+                        "logScopePhaseStart(String)",
+                        "logScopePhaseEnd(String,long,boolean)",
+                        "logScopeTargetSummary(ScopeTargetStats)",
                         "logDeleted(FsPath,RuleId,boolean)",
                         "logWouldDelete(FsPath,RuleId)",
                         "logWouldDelete(FileMeta,RuleId,ScopeIdentity)",
@@ -1258,7 +1351,7 @@ class AuditLoggerTest {
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",
                         "logAuditIntegrity(CleanupSummary)");
-        assertThat(actual).hasSize(43);
+        assertThat(actual).hasSize(46);
         assertThat(actual)
                 .noneMatch(
                         method ->

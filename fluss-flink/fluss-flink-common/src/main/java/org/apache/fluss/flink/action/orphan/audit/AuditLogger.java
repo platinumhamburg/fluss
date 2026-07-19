@@ -23,6 +23,7 @@ import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
+import org.apache.fluss.flink.action.orphan.job.ScopeTargetStats;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.RuleEvaluation;
@@ -162,11 +163,33 @@ public final class AuditLogger {
                         .metric("skipped_no_remote_manifest", stats.skippedNoRemoteManifestCount())
                         .metric("skipped_empty_kv_active_set", stats.skippedEmptyKvActiveSetCount())
                         .metric("skipped_out_of_scope_root", stats.skippedOutOfScopeRootCount())
-                        .metric("metadata_failures", stats.metadataFailures()),
+                        .metric("metadata_failures", stats.metadataFailures())
+                        .metric("scope_targets", stats.scopeTargets())
+                        .metric("target_buckets", stats.targetBuckets())
+                        .metric("log_resolved_buckets", stats.logResolvedBuckets())
+                        .metric("log_no_manifest_buckets", stats.logNoManifestBuckets())
+                        .metric("log_read_failed_buckets", stats.logReadFailedBuckets())
+                        .metric("log_unavailable_buckets", stats.logUnavailableBuckets())
+                        .metric("out_of_scope_buckets", stats.outOfScopeBuckets())
+                        .metric("kv_target_buckets", stats.kvTargetBuckets())
+                        .metric("kv_active_buckets", stats.kvActiveBuckets())
+                        .metric("kv_empty_buckets", stats.kvEmptyBuckets())
+                        .metric("kv_unavailable_buckets", stats.kvUnavailableBuckets())
+                        .metric("kv_out_of_scope_buckets", stats.kvOutOfScopeBuckets())
+                        .metric("incomplete_targets", stats.incompleteTargets())
+                        .flag("coverage_complete", stats.coverageComplete())
+                        .flag("counters_consistent", stats.countersConsistent())
+                        .flag("action_required", !stats.coverageComplete()),
                 "action=scope_plan databases={} tables={} partitions={} discovered_buckets={}"
                         + " bucket_tasks={} orphan_dir_tasks={} skipped_no_remote_manifest={}"
                         + " skipped_empty_kv_active_set={} skipped_out_of_scope_root={}"
-                        + " metadata_failures={}",
+                        + " metadata_failures={} scope_targets={} target_buckets={}"
+                        + " log_resolved_buckets={} log_no_manifest_buckets={}"
+                        + " log_read_failed_buckets={} log_unavailable_buckets={}"
+                        + " out_of_scope_buckets={} kv_target_buckets={} kv_active_buckets={}"
+                        + " kv_empty_buckets={} kv_unavailable_buckets={} incomplete_targets={}"
+                        + " kv_out_of_scope_buckets={}"
+                        + " coverage_complete={} counters_consistent={} action_required={}",
                 stats.databases(),
                 stats.tables(),
                 stats.partitions(),
@@ -176,7 +199,103 @@ public final class AuditLogger {
                 stats.skippedNoRemoteManifestCount(),
                 stats.skippedEmptyKvActiveSetCount(),
                 stats.skippedOutOfScopeRootCount(),
-                stats.metadataFailures());
+                stats.metadataFailures(),
+                stats.scopeTargets(),
+                stats.targetBuckets(),
+                stats.logResolvedBuckets(),
+                stats.logNoManifestBuckets(),
+                stats.logReadFailedBuckets(),
+                stats.logUnavailableBuckets(),
+                stats.outOfScopeBuckets(),
+                stats.kvTargetBuckets(),
+                stats.kvActiveBuckets(),
+                stats.kvEmptyBuckets(),
+                stats.kvUnavailableBuckets(),
+                stats.incompleteTargets(),
+                stats.kvOutOfScopeBuckets(),
+                stats.coverageComplete(),
+                stats.countersConsistent(),
+                !stats.coverageComplete());
+    }
+
+    public void logScopePhaseStart(String phase) {
+        emit(
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scope_phase_start")
+                        .dimension("phase", phase),
+                "audit_version=1 stage=scope action=scope_phase_start phase={}",
+                phase);
+    }
+
+    public void logScopePhaseEnd(String phase, long durationMillis, boolean complete) {
+        emit(
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scope_phase_end")
+                        .dimension("phase", phase)
+                        .metric("duration_ms", durationMillis)
+                        .flag("complete", complete)
+                        .flag("action_required", !complete),
+                "audit_version=1 stage=scope action=scope_phase_end phase={} duration_ms={}"
+                        + " complete={} action_required={}",
+                phase,
+                durationMillis,
+                complete,
+                !complete);
+    }
+
+    public void logScopeTargetSummary(ScopeTargetStats stats) {
+        emit(
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scope_target_summary")
+                        .scope(stats.scope())
+                        .metric("expected_buckets", stats.expectedBuckets())
+                        .metric("log_resolved_buckets", stats.logResolvedBuckets())
+                        .metric("log_no_manifest_buckets", stats.logNoManifestBuckets())
+                        .metric("log_read_failed_buckets", stats.logReadFailedBuckets())
+                        .metric("log_unavailable_buckets", stats.logUnavailableBuckets())
+                        .metric("out_of_scope_buckets", stats.outOfScopeBuckets())
+                        .metric("kv_active_buckets", stats.kvActiveBuckets())
+                        .metric("kv_empty_buckets", stats.kvEmptyBuckets())
+                        .metric("kv_unavailable_buckets", stats.kvUnavailableBuckets())
+                        .metric("tasks_emitted", stats.tasksEmitted())
+                        .metric("duration_ms", stats.durationMillis())
+                        .flag("kv_applicable", stats.kvApplicable())
+                        .flag("complete", stats.complete())
+                        .flag("log_coverage_consistent", stats.logCoverageConsistent())
+                        .flag("kv_coverage_consistent", stats.kvCoverageConsistent())
+                        .flag(
+                                "action_required",
+                                !stats.complete()
+                                        || !stats.logCoverageConsistent()
+                                        || !stats.kvCoverageConsistent()),
+                "audit_version=1 stage=scope action=scope_target_summary database={} table={}"
+                        + " table_id={} partition_id={} expected_buckets={}"
+                        + " log_resolved_buckets={} log_no_manifest_buckets={}"
+                        + " log_read_failed_buckets={} log_unavailable_buckets={}"
+                        + " out_of_scope_buckets={}"
+                        + " kv_active_buckets={} kv_empty_buckets={} kv_unavailable_buckets={}"
+                        + " tasks_emitted={} duration_ms={} kv_applicable={} complete={}"
+                        + " log_coverage_consistent={} kv_coverage_consistent={}"
+                        + " action_required={}",
+                stats.scope().database(),
+                stats.scope().table(),
+                nullable(stats.scope().tableId()),
+                nullable(stats.scope().partitionId()),
+                stats.expectedBuckets(),
+                stats.logResolvedBuckets(),
+                stats.logNoManifestBuckets(),
+                stats.logReadFailedBuckets(),
+                stats.logUnavailableBuckets(),
+                stats.outOfScopeBuckets(),
+                stats.kvActiveBuckets(),
+                stats.kvEmptyBuckets(),
+                stats.kvUnavailableBuckets(),
+                stats.tasksEmitted(),
+                stats.durationMillis(),
+                stats.kvApplicable(),
+                stats.complete(),
+                stats.logCoverageConsistent(),
+                stats.kvCoverageConsistent(),
+                !stats.complete()
+                        || !stats.logCoverageConsistent()
+                        || !stats.kvCoverageConsistent());
     }
 
     public void logDeleted(FsPath path, RuleId ruleId, boolean ok) {

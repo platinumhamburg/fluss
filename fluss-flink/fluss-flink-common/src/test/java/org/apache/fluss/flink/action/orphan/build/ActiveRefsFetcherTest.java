@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.client.metadata.ActiveKvSnapshots;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.utils.FlussPaths;
@@ -87,9 +88,14 @@ class ActiveRefsFetcherTest {
         assertThat(result.listOk()).isTrue();
         assertThat(result.statusFor(0))
                 .isEqualTo(LogActiveRefsFetchResult.ManifestReadStatus.READ_FAILED);
-        assertThat(result.readFailureReason(0))
-                .contains("Manifest not found (likely upserted concurrently)")
-                .contains("bucketId=0");
+        AuditFailureDetail failure = result.readFailureDetail(0);
+        assertThat(failure.operation()).isEqualTo("read_log_manifest");
+        assertThat(failure.failureCategory()).isEqualTo("not_found");
+        assertThat(failure.metadataPath()).isEqualTo(p0.toString());
+        assertThat(failure.exceptionClass()).isEqualTo(FileNotFoundException.class.getName());
+        assertThat(failure.attempts()).isEqualTo(1);
+        assertThat(failure.retryable()).isTrue();
+        assertThat(failure.consistencyRacePossible()).isTrue();
         // Per-target RPC issued exactly once; no per-bucket retry burst.
         assertThat(rpcCalls.get()).isEqualTo(1);
     }
@@ -130,9 +136,8 @@ class ActiveRefsFetcherTest {
                         "11111111-1111-1111-1111-111111111111/"
                                 + FlussPaths.filenamePrefixFromOffset(9L)
                                 + ".writer_snapshot");
-        assertThat(result.readFailureReason(1))
-                .contains("Manifest not found (likely upserted concurrently)")
-                .contains("bucketId=1");
+        assertThat(result.readFailureDetail(1).failureCategory()).isEqualTo("not_found");
+        assertThat(result.readFailureDetail(1).metadataPath()).isEqualTo(p1.toString());
         assertThat(result.statusFor(2))
                 .isEqualTo(LogActiveRefsFetchResult.ManifestReadStatus.NOT_LISTED);
         // Per-target RPC issued exactly once; per-bucket failure does not trigger any extra RPC.
@@ -149,7 +154,9 @@ class ActiveRefsFetcherTest {
         LogActiveRefsFetchResult result = builder.fetchLogActiveRefsByBucket(7L, null);
 
         assertThat(result.listOk()).isFalse();
-        assertThat(result.listFailureReason()).contains("RPC failure for tableId=7");
+        assertThat(result.listFailureDetail().operation()).isEqualTo("list_remote_log_manifests");
+        assertThat(result.listFailureDetail().attempts()).isEqualTo(3);
+        assertThat(result.listFailureDetail().exceptionClass()).isNotEmpty();
         // Per-bucket queries are not meaningful when listOk=false.
         assertThatThrownBy(() -> result.statusFor(0)).isInstanceOf(IllegalStateException.class);
         // Per-target RPC is retried up to maxRetries times before giving up.
@@ -171,9 +178,10 @@ class ActiveRefsFetcherTest {
         assertThat(result.listOk()).isTrue();
         assertThat(result.statusFor(0))
                 .isEqualTo(LogActiveRefsFetchResult.ManifestReadStatus.READ_FAILED);
-        assertThat(result.readFailureReason(0))
-                .contains("Manifest parse failure")
-                .contains("bucketId=0");
+        assertThat(result.readFailureDetail(0).failureCategory())
+                .isEqualTo("manifest_parse_failed");
+        assertThat(result.readFailureDetail(0).metadataPath()).isEqualTo(p0.toString());
+        assertThat(result.readFailureDetail(0).retryable()).isFalse();
     }
 
     @Test
@@ -191,7 +199,10 @@ class ActiveRefsFetcherTest {
         assertThat(result.listOk()).isTrue();
         assertThat(result.statusFor(0))
                 .isEqualTo(LogActiveRefsFetchResult.ManifestReadStatus.READ_FAILED);
-        assertThat(result.readFailureReason(0)).contains("IO error reading manifest");
+        assertThat(result.readFailureDetail(0).failureCategory()).isEqualTo("io_error");
+        assertThat(result.readFailureDetail(0).metadataPath()).isEqualTo(p0.toString());
+        assertThat(result.readFailureDetail(0).exceptionClass())
+                .isEqualTo(IOException.class.getName());
     }
 
     @Test
@@ -228,7 +239,8 @@ class ActiveRefsFetcherTest {
 
         assertThat(result.listOk()).isFalse();
         // Reason is classified via RpcErrorClassifier for audit compatibility.
-        assertThat(result.listFailureReason()).isNotEmpty();
+        assertThat(result.listFailureDetail().operation()).isEqualTo("list_kv_snapshots");
+        assertThat(result.listFailureDetail().attempts()).isEqualTo(3);
         // Per-target RPC is retried up to maxRetries times before giving up.
         assertThat(rpcCalls.get()).isEqualTo(3);
     }
