@@ -60,23 +60,25 @@ public final class LogSegmentRule implements FileRule {
     }
 
     @Override
-    public Decision evaluate(FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
+    public RuleEvaluation evaluateDetailed(
+            FileMeta file, BucketActiveRefs activeRefs, long cutoffMillis) {
         FsPath path = file.path();
         FsPath parent = path.getParent();
         if (parent == null || !isSegmentDir(parent.getName()) || !hasKnownSuffix(path.getName())) {
-            return Decision.SKIP_UNKNOWN;
+            return RuleEvaluation.decision(Decision.SKIP_UNKNOWN, "unknown_file_type");
         }
 
         String relativePath = parent.getName() + "/" + path.getName();
         if (activeRefs.logSegmentRelativePaths().contains(relativePath)) {
-            return Decision.KEEP_ACTIVE;
+            return RuleEvaluation.active(
+                    "keep_active", "log_segment", "relative_path", relativePath);
         }
 
         if (path.getName().endsWith(FlussPaths.WRITER_SNAPSHOT_FILE_SUFFIX) && !orphanDirMode) {
-            return Decision.KEEP_ACTIVE;
+            return RuleEvaluation.decision(Decision.KEEP_ACTIVE, "conservative_writer_snapshot");
         }
 
-        return MtimePolicy.evaluateInactiveFile(file.modificationTime(), cutoffMillis);
+        return inactiveEvaluation(file.modificationTime(), cutoffMillis);
     }
 
     static boolean isSegmentDir(String dirName) {
@@ -94,5 +96,16 @@ public final class LogSegmentRule implements FileRule {
             }
         }
         return false;
+    }
+
+    private static RuleEvaluation inactiveEvaluation(long modificationTime, long cutoffMillis) {
+        Decision decision = MtimePolicy.evaluateInactiveFile(modificationTime, cutoffMillis);
+        if (decision == Decision.MTIME_UNAVAILABLE) {
+            return RuleEvaluation.decision(decision, "mtime_unavailable");
+        }
+        if (decision == Decision.DEFER) {
+            return RuleEvaluation.decision(decision, "newer_than_cutoff");
+        }
+        return RuleEvaluation.decision(decision, "candidate");
     }
 }
