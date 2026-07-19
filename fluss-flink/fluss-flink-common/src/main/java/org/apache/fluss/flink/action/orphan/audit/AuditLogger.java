@@ -23,7 +23,9 @@ import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.CleanupSummary;
 import org.apache.fluss.flink.action.orphan.job.RuleDecisionCounters;
 import org.apache.fluss.flink.action.orphan.job.ScopePlanStats;
+import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.FileMeta;
+import org.apache.fluss.flink.action.orphan.rule.RuleEvaluation;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
 
@@ -58,6 +60,10 @@ public final class AuditLogger {
     private final Supplier<String> eventIds;
 
     private boolean mtimeUnavailableSampleLogged;
+    private final Map<DiagnosticSampleKey, SampleCounter> diagnosticSamples = new LinkedHashMap<>();
+    private boolean diagnosticSamplingSummariesFlushed;
+
+    private static final int MAX_NORMAL_DECISION_SAMPLES = 3;
 
     /** Formats the frozen cutoff with an unambiguous UTC offset. */
     private static final DateTimeFormatter CUTOFF_FORMATTER = DateTimeFormatter.ISO_INSTANT;
@@ -205,7 +211,23 @@ public final class AuditLogger {
                 "planned",
                 true,
                 false,
-                false);
+                false,
+                null);
+    }
+
+    public void logWouldDelete(
+            FileMeta file, RuleId ruleId, ScopeIdentity scope, long cutoffMillis) {
+        logObjectAction(
+                "would_delete",
+                file,
+                ruleId,
+                scope,
+                "older_than_cutoff",
+                "planned",
+                true,
+                false,
+                false,
+                cutoffMillis);
     }
 
     public void logDeleted(FileMeta file, RuleId ruleId, ScopeIdentity scope) {
@@ -218,7 +240,22 @@ public final class AuditLogger {
                 "success",
                 false,
                 false,
-                false);
+                false,
+                null);
+    }
+
+    public void logDeleted(FileMeta file, RuleId ruleId, ScopeIdentity scope, long cutoffMillis) {
+        logObjectAction(
+                "deleted",
+                file,
+                ruleId,
+                scope,
+                "older_than_cutoff",
+                "success",
+                false,
+                false,
+                false,
+                cutoffMillis);
     }
 
     public void logDeleteFailed(
@@ -228,7 +265,36 @@ public final class AuditLogger {
             String reasonCode,
             boolean retryable) {
         logObjectAction(
-                "delete_failed", file, ruleId, scope, reasonCode, "failed", false, retryable, true);
+                "delete_failed",
+                file,
+                ruleId,
+                scope,
+                reasonCode,
+                "failed",
+                false,
+                retryable,
+                true,
+                null);
+    }
+
+    public void logDeleteFailed(
+            FileMeta file,
+            RuleId ruleId,
+            ScopeIdentity scope,
+            String reasonCode,
+            boolean retryable,
+            long cutoffMillis) {
+        logObjectAction(
+                "delete_failed",
+                file,
+                ruleId,
+                scope,
+                reasonCode,
+                "failed",
+                false,
+                retryable,
+                true,
+                cutoffMillis);
     }
 
     private void logObjectAction(
@@ -240,8 +306,9 @@ public final class AuditLogger {
             String result,
             boolean dryRun,
             boolean retryable,
-            boolean actionRequired) {
-        emit(
+            boolean actionRequired,
+            @Nullable Long cutoffMillis) {
+        EventDraft draft =
                 newEvent(AuditSeverity.INFO, AuditStage.SCAN, action)
                         .scope(scope)
                         .object(ruleId)
@@ -252,7 +319,41 @@ public final class AuditLogger {
                         .result(result)
                         .flag("dry_run", dryRun)
                         .flag("retryable", retryable)
-                        .flag("action_required", actionRequired),
+                        .flag("action_required", actionRequired);
+        if (cutoffMillis != null) {
+            draft.metric("cutoff_ms", cutoffMillis)
+                    .metric(
+                            "mtime_minus_cutoff_ms",
+                            subtractSaturated(file.modificationTime(), cutoffMillis));
+            emit(
+                    draft,
+                    "audit_version=1 stage=scan action={} object_type={} path={}"
+                            + " size_bytes={} mtime_ms={} cutoff_ms={}"
+                            + " mtime_minus_cutoff_ms={} rule={} reason_code={} result={}"
+                            + " database={} table={} table_id={} partition_id={} bucket_id={}"
+                            + " dry_run={} retryable={} action_required={}",
+                    action,
+                    ruleId.objectType().name().toLowerCase(Locale.ROOT),
+                    file.path(),
+                    file.size(),
+                    file.modificationTime(),
+                    cutoffMillis,
+                    subtractSaturated(file.modificationTime(), cutoffMillis),
+                    ruleId,
+                    reasonCode,
+                    result,
+                    scope.database(),
+                    scope.table(),
+                    scope.tableId(),
+                    scope.partitionId(),
+                    scope.bucketId(),
+                    dryRun,
+                    retryable,
+                    actionRequired);
+            return;
+        }
+        emit(
+                draft,
                 "audit_version=1 stage=scan action={} object_type={} path={}"
                         + " size_bytes={} mtime_ms={} rule={} reason_code={} result={}"
                         + " database={} table={} table_id={} partition_id={} bucket_id={}"
@@ -273,6 +374,123 @@ public final class AuditLogger {
                 dryRun,
                 retryable,
                 actionRequired);
+    }
+
+    /** Emits a bounded normal-decision sample while counting every matching decision. */
+    public void logDecisionSample(
+            ScopeIdentity scope,
+            FileMeta file,
+            RuleId ruleId,
+            RuleEvaluation evaluation,
+            long cutoffMillis,
+            boolean dryRun) {
+        String objectType = lower(ruleId.objectType().name());
+        DiagnosticSampleKey key =
+                new DiagnosticSampleKey(
+                        scope,
+                        objectType,
+                        evaluation.reasonCode(),
+                        context == null ? null : context.getSubtaskIndex(),
+                        context == null ? null : context.getAttemptNumber());
+        SampleCounter counter = diagnosticSamples.get(key);
+        if (counter == null) {
+            counter = new SampleCounter(scope, objectType, evaluation);
+            diagnosticSamples.put(key, counter);
+        }
+        counter.totalCount++;
+        if (counter.emittedSamples >= MAX_NORMAL_DECISION_SAMPLES) {
+            return;
+        }
+        counter.emittedSamples++;
+
+        boolean actionRequired = evaluation.decision() == Decision.MTIME_UNAVAILABLE;
+        AuditSeverity severity = actionRequired ? AuditSeverity.ERROR : AuditSeverity.INFO;
+        EventDraft draft =
+                newEvent(severity, AuditStage.SCAN, "decision_sample")
+                        .scope(scope)
+                        .object(ruleId)
+                        .path(file.path().toString())
+                        .sizeBytes(file.size())
+                        .mtimeMs(file.modificationTime())
+                        .reasonCode(evaluation.reasonCode())
+                        .result("skipped")
+                        .dimension("decision", lower(evaluation.decision().name()))
+                        .metric("cutoff_ms", cutoffMillis)
+                        .metric(
+                                "mtime_minus_cutoff_ms",
+                                subtractSaturated(file.modificationTime(), cutoffMillis))
+                        .flag("dry_run", dryRun)
+                        .flag("retryable", false)
+                        .flag("action_required", actionRequired);
+        evaluation.referenceType().ifPresent(value -> draft.dimension("reference_type", value));
+        evaluation
+                .referenceMatchKind()
+                .ifPresent(value -> draft.dimension("reference_match_kind", value));
+        evaluation.referenceKey().ifPresent(value -> draft.dimension("reference_key", value));
+        emit(
+                draft,
+                "audit_version=1 stage=scan action=decision_sample object_type={} path={}"
+                        + " size_bytes={} mtime_ms={} cutoff_ms={} mtime_minus_cutoff_ms={}"
+                        + " rule={} decision={} reason_code={} database={} table={} table_id={}"
+                        + " partition_id={} bucket_id={} reference_type={}"
+                        + " reference_match_kind={} reference_key={} dry_run={} retryable=false"
+                        + " action_required={}",
+                objectType,
+                file.path(),
+                file.size(),
+                file.modificationTime(),
+                cutoffMillis,
+                subtractSaturated(file.modificationTime(), cutoffMillis),
+                ruleId,
+                lower(evaluation.decision().name()),
+                evaluation.reasonCode(),
+                scope.database(),
+                scope.table(),
+                nullable(scope.tableId()),
+                nullable(scope.partitionId()),
+                nullable(scope.bucketId()),
+                evaluation.referenceType().orElse("none"),
+                evaluation.referenceMatchKind().orElse("none"),
+                evaluation.referenceKey().orElse("none"),
+                dryRun,
+                actionRequired);
+    }
+
+    /** Emits one accounting event for each diagnostic group whose samples were suppressed. */
+    public void flushDiagnosticSamplingSummaries() {
+        if (diagnosticSamplingSummariesFlushed) {
+            return;
+        }
+        diagnosticSamplingSummariesFlushed = true;
+        for (SampleCounter counter : diagnosticSamples.values()) {
+            long suppressed = counter.totalCount - counter.emittedSamples;
+            if (suppressed == 0L) {
+                continue;
+            }
+            emit(
+                    newEvent(AuditSeverity.INFO, AuditStage.SCAN, "diagnostic_sampling_summary")
+                            .scope(counter.scope)
+                            .objectType(counter.objectType)
+                            .reasonCode(counter.evaluation.reasonCode())
+                            .dimension("decision", lower(counter.evaluation.decision().name()))
+                            .metric("total_count", counter.totalCount)
+                            .metric("emitted_samples", counter.emittedSamples)
+                            .metric("suppressed_samples", suppressed),
+                    "audit_version=1 stage=scan action=diagnostic_sampling_summary"
+                            + " database={} table={} table_id={} partition_id={} object_type={}"
+                            + " decision={} reason_code={} total_count={} emitted_samples={}"
+                            + " suppressed_samples={}",
+                    counter.scope.database(),
+                    counter.scope.table(),
+                    nullable(counter.scope.tableId()),
+                    nullable(counter.scope.partitionId()),
+                    counter.objectType,
+                    lower(counter.evaluation.decision().name()),
+                    counter.evaluation.reasonCode(),
+                    counter.totalCount,
+                    counter.emittedSamples,
+                    suppressed);
+        }
     }
 
     public void logDirDeleted(FsPath dir) {
@@ -843,6 +1061,85 @@ public final class AuditLogger {
                 summary.dryRun());
     }
 
+    public void logMetadataFailure(
+            AuditStage stage,
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            AuditFailureDetail detail) {
+        logFailure("metadata_failure", stage, scope, objectType, detail);
+    }
+
+    public void logFilesystemFailure(
+            AuditStage stage,
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            AuditFailureDetail detail) {
+        logFailure("filesystem_failure", stage, scope, objectType, detail);
+    }
+
+    public void logRpcFailure(
+            AuditStage stage,
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            AuditFailureDetail detail) {
+        logFailure("rpc_failure", stage, scope, objectType, detail);
+    }
+
+    private void logFailure(
+            String action,
+            AuditStage stage,
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            AuditFailureDetail detail) {
+        AuditSeverity severity = detail.actionRequired() ? AuditSeverity.ERROR : AuditSeverity.WARN;
+        EventDraft draft =
+                newEvent(severity, stage, action)
+                        .scope(scope)
+                        .objectType(lower(objectType.name()))
+                        .reasonCode(detail.failureCategory())
+                        .dimension("operation", detail.operation())
+                        .dimension("failure_category", detail.failureCategory())
+                        .dimension("exception_class", detail.exceptionClass())
+                        .metric("attempts", detail.attempts())
+                        .flag("retryable", detail.retryable())
+                        .flag("action_required", detail.actionRequired())
+                        .flag("consistency_race_possible", detail.consistencyRacePossible());
+        if (detail.targetPath() != null) {
+            draft.path(detail.targetPath()).dimension("target_path", detail.targetPath());
+        }
+        if (detail.metadataPath() != null) {
+            draft.path(detail.metadataPath()).dimension("metadata_path", detail.metadataPath());
+        }
+        if (detail.errno() != null) {
+            draft.dimension("errno", detail.errno());
+        }
+        emit(
+                draft,
+                "audit_version=1 stage={} action={} database={} table={} table_id={}"
+                        + " partition_id={} bucket_id={} object_type={} operation={}"
+                        + " failure_category={} target_path={} metadata_path={}"
+                        + " exception_class={} errno={} attempts={} retryable={}"
+                        + " action_required={} consistency_race_possible={}",
+                lower(stage.name()),
+                action,
+                scope.database(),
+                scope.table(),
+                nullable(scope.tableId()),
+                nullable(scope.partitionId()),
+                nullable(scope.bucketId()),
+                lower(objectType.name()),
+                detail.operation(),
+                detail.failureCategory(),
+                nullable(detail.targetPath()),
+                nullable(detail.metadataPath()),
+                detail.exceptionClass(),
+                nullable(detail.errno()),
+                detail.attempts(),
+                detail.retryable(),
+                detail.actionRequired(),
+                detail.consistencyRacePossible());
+    }
+
     private void logRuleDecisions(
             EventDraft draft,
             String action,
@@ -988,6 +1285,28 @@ public final class AuditLogger {
 
     private static String lower(String value) {
         return value.toLowerCase(Locale.ROOT);
+    }
+
+    private static long subtractSaturated(long left, long right) {
+        try {
+            return Math.subtractExact(left, right);
+        } catch (ArithmeticException overflow) {
+            return left < right ? Long.MIN_VALUE : Long.MAX_VALUE;
+        }
+    }
+
+    private static final class SampleCounter {
+        private final ScopeIdentity scope;
+        private final String objectType;
+        private final RuleEvaluation evaluation;
+        private long totalCount;
+        private long emittedSamples;
+
+        private SampleCounter(ScopeIdentity scope, String objectType, RuleEvaluation evaluation) {
+            this.scope = scope;
+            this.objectType = objectType;
+            this.evaluation = evaluation;
+        }
     }
 
     private static final class EventDraft {
