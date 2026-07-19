@@ -46,6 +46,12 @@ public final class CleanupStats implements Serializable {
     private final CleanupCounters counters;
     private final long tasksPlanned;
     private final long metadataFailures;
+    private final long scopeDiscoveredBuckets;
+    private final long scopeTargetBuckets;
+    private final long scopeLogClassifiedBuckets;
+    private final long scopeKvTargetBuckets;
+    private final long scopeKvClassifiedBuckets;
+    private final long incompleteScopeTargets;
     private final Map<SkipReasonCode, Long> skipped;
     private final Map<CleanupObjectType, CleanupCounters> byObjectType;
     private final Map<CleanupObjectType, RuleDecisionCounters> ruleDecisions;
@@ -56,6 +62,12 @@ public final class CleanupStats implements Serializable {
             CleanupCounters counters,
             long tasksPlanned,
             long metadataFailures,
+            long scopeDiscoveredBuckets,
+            long scopeTargetBuckets,
+            long scopeLogClassifiedBuckets,
+            long scopeKvTargetBuckets,
+            long scopeKvClassifiedBuckets,
+            long incompleteScopeTargets,
             Map<SkipReasonCode, Long> skipped,
             Map<CleanupObjectType, CleanupCounters> byObjectType,
             Map<CleanupObjectType, RuleDecisionCounters> ruleDecisions) {
@@ -64,6 +76,12 @@ public final class CleanupStats implements Serializable {
         this.counters = Objects.requireNonNull(counters);
         this.tasksPlanned = tasksPlanned;
         this.metadataFailures = metadataFailures;
+        this.scopeDiscoveredBuckets = scopeDiscoveredBuckets;
+        this.scopeTargetBuckets = scopeTargetBuckets;
+        this.scopeLogClassifiedBuckets = scopeLogClassifiedBuckets;
+        this.scopeKvTargetBuckets = scopeKvTargetBuckets;
+        this.scopeKvClassifiedBuckets = scopeKvClassifiedBuckets;
+        this.incompleteScopeTargets = incompleteScopeTargets;
         this.skipped = copyMap(skipped);
         this.byObjectType = copyMap(byObjectType);
         this.ruleDecisions = copyMap(ruleDecisions);
@@ -77,6 +95,37 @@ public final class CleanupStats implements Serializable {
                 CleanupCounters.empty(),
                 tasksPlanned,
                 metadataFailures,
+                0L,
+                0L,
+                0L,
+                0L,
+                0L,
+                0L,
+                skipped,
+                Collections.emptyMap(),
+                Collections.emptyMap());
+    }
+
+    static CleanupStats scope(ScopePlanStats plan, Map<SkipReasonCode, Long> skipped) {
+        return new CleanupStats(
+                SourceStage.SCOPE,
+                ScopeIdentity.global(),
+                CleanupCounters.empty(),
+                plan.bucketTasks() + plan.orphanDirTasks(),
+                plan.metadataFailures(),
+                plan.discoveredBuckets(),
+                plan.targetBuckets(),
+                plan.logResolvedBuckets()
+                        + plan.logNoManifestBuckets()
+                        + plan.logReadFailedBuckets()
+                        + plan.logUnavailableBuckets()
+                        + plan.outOfScopeBuckets(),
+                plan.kvTargetBuckets(),
+                plan.kvActiveBuckets()
+                        + plan.kvEmptyBuckets()
+                        + plan.kvUnavailableBuckets()
+                        + plan.kvOutOfScopeBuckets(),
+                plan.incompleteTargets(),
                 skipped,
                 Collections.emptyMap(),
                 Collections.emptyMap());
@@ -89,7 +138,20 @@ public final class CleanupStats implements Serializable {
             Map<SkipReasonCode, Long> skipped,
             Map<CleanupObjectType, RuleDecisionCounters> ruleDecisions) {
         return new CleanupStats(
-                SourceStage.SCAN, scope, counters, 0L, 0L, skipped, byObjectType, ruleDecisions);
+                SourceStage.SCAN,
+                scope,
+                counters,
+                0L,
+                0L,
+                0L,
+                0L,
+                0L,
+                0L,
+                0L,
+                0L,
+                skipped,
+                byObjectType,
+                ruleDecisions);
     }
 
     public static CleanupStats emptyScan(ScopeIdentity scope) {
@@ -123,6 +185,36 @@ public final class CleanupStats implements Serializable {
 
     public long metadataFailures() {
         return metadataFailures;
+    }
+
+    public long scopeTargetBuckets() {
+        return scopeTargetBuckets;
+    }
+
+    public long scopeDiscoveredBuckets() {
+        return scopeDiscoveredBuckets;
+    }
+
+    public long scopeLogClassifiedBuckets() {
+        return scopeLogClassifiedBuckets;
+    }
+
+    public long scopeKvTargetBuckets() {
+        return scopeKvTargetBuckets;
+    }
+
+    public long scopeKvClassifiedBuckets() {
+        return scopeKvClassifiedBuckets;
+    }
+
+    public long incompleteScopeTargets() {
+        return incompleteScopeTargets;
+    }
+
+    public boolean scopeCountersConsistent() {
+        return scopeDiscoveredBuckets == scopeTargetBuckets
+                && scopeTargetBuckets == scopeLogClassifiedBuckets
+                && scopeKvTargetBuckets == scopeKvClassifiedBuckets;
     }
 
     public Map<SkipReasonCode, Long> skipped() {

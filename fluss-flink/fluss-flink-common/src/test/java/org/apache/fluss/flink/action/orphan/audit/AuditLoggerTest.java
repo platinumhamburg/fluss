@@ -772,8 +772,12 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    "action=audit_integrity rule_counters_consistent="
+                                    "action=audit_integrity scope_counters_consistent="
+                                            + integritySummary.scopeCountersConsistent()
+                                            + " rule_counters_consistent="
                                             + integritySummary.ruleCountersConsistent()
+                                            + " counters_consistent="
+                                            + integritySummary.countersConsistent()
                                             + " coverage_complete="
                                             + integritySummary.coverageComplete()
                                             + " dry_run_counters_consistent="
@@ -782,6 +786,8 @@ class AuditLoggerTest {
                                             + integritySummary.inconsistentObjectTypes()
                                             + " inconsistent_scopes="
                                             + integritySummary.inconsistentScopes()
+                                            + " incomplete_scope_targets="
+                                            + integritySummary.incompleteScopeTargets()
                                             + " dry_run="
                                             + integritySummary.dryRun(),
                                     AuditSeverity.INFO,
@@ -791,9 +797,16 @@ class AuditLoggerTest {
                                     "inconsistent_object_types",
                                     integritySummary.inconsistentObjectTypes())
                             .metric("inconsistent_scopes", integritySummary.inconsistentScopes())
+                            .metric(
+                                    "incomplete_scope_targets",
+                                    integritySummary.incompleteScopeTargets())
+                            .flag(
+                                    "scope_counters_consistent",
+                                    integritySummary.scopeCountersConsistent())
                             .flag(
                                     "rule_counters_consistent",
                                     integritySummary.ruleCountersConsistent())
+                            .flag("counters_consistent", integritySummary.countersConsistent())
                             .flag("coverage_complete", integritySummary.coverageComplete())
                             .flag(
                                     "dry_run_counters_consistent",

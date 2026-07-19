@@ -55,6 +55,12 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
     private transient CleanupCounters global;
     private transient long tasksPlanned;
     private transient long metadataFailures;
+    private transient long scopeDiscoveredBuckets;
+    private transient long scopeTargetBuckets;
+    private transient long scopeLogClassifiedBuckets;
+    private transient long scopeKvTargetBuckets;
+    private transient long scopeKvClassifiedBuckets;
+    private transient long incompleteScopeTargets;
     private transient Map<ScopeIdentity, ScopeAccumulator> scopes;
     private transient EnumMap<CleanupObjectType, CleanupCounters> byObjectType;
     private transient EnumMap<SkipReasonCode, Long> bySkipReason;
@@ -80,6 +86,12 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
         global = CleanupCounters.empty();
         tasksPlanned = 0L;
         metadataFailures = 0L;
+        scopeDiscoveredBuckets = 0L;
+        scopeTargetBuckets = 0L;
+        scopeLogClassifiedBuckets = 0L;
+        scopeKvTargetBuckets = 0L;
+        scopeKvClassifiedBuckets = 0L;
+        incompleteScopeTargets = 0L;
         scopes = new HashMap<>();
         byObjectType = new EnumMap<>(CleanupObjectType.class);
         bySkipReason = new EnumMap<>(SkipReasonCode.class);
@@ -111,6 +123,12 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
                     throw new IllegalStateException("Duplicate scope summary");
                 }
                 scopeSummarySeen = true;
+                scopeDiscoveredBuckets = stats.scopeDiscoveredBuckets();
+                scopeTargetBuckets = stats.scopeTargetBuckets();
+                scopeLogClassifiedBuckets = stats.scopeLogClassifiedBuckets();
+                scopeKvTargetBuckets = stats.scopeKvTargetBuckets();
+                scopeKvClassifiedBuckets = stats.scopeKvClassifiedBuckets();
+                incompleteScopeTargets = stats.incompleteScopeTargets();
             }
 
             global = global.add(stats.counters());
@@ -147,7 +165,7 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
             emitDetailedAudit(audit, summary);
 
             IllegalStateException integrityFailure =
-                    !summary.ruleCountersConsistent() || !summary.dryRunCountersConsistent()
+                    !summary.countersConsistent() || !summary.dryRunCountersConsistent()
                             ? new IllegalStateException(
                                     "Orphan cleanup audit integrity check failed")
                             : null;
@@ -198,13 +216,22 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
         }
 
         long inconsistentObjectTypes = countObjectInconsistencies(byObjectType, byRuleDecision);
-        long inconsistentScopes = 0L;
+        long ruleInconsistentScopes = 0L;
         for (ScopeAccumulator scope : scopes.values()) {
             if (countObjectInconsistencies(scope.byObjectType, scope.byRuleDecision) > 0L
                     || scope.bySkipReason.getOrDefault(SkipReasonCode.MTIME_UNAVAILABLE, 0L)
                             < sumMtimeUnavailableFiles(scope.byRuleDecision.values())) {
-                inconsistentScopes++;
+                ruleInconsistentScopes++;
             }
+        }
+
+        boolean scopeCountersConsistent =
+                scopeDiscoveredBuckets == scopeTargetBuckets
+                        && scopeTargetBuckets == scopeLogClassifiedBuckets
+                        && scopeKvTargetBuckets == scopeKvClassifiedBuckets;
+        long inconsistentScopes = ruleInconsistentScopes + incompleteScopeTargets;
+        if (!scopeCountersConsistent && incompleteScopeTargets == 0L) {
+            inconsistentScopes++;
         }
 
         long candidateFiles = 0L;
@@ -214,16 +241,21 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
             candidateBytes += counters.candidateBytes();
         }
 
-        boolean coverageComplete = metadataFailures == 0L && actionRequiredSkips == 0L;
         boolean mtimeCountersConsistent =
                 bySkipReason.getOrDefault(SkipReasonCode.MTIME_UNAVAILABLE, 0L)
                         >= sumMtimeUnavailableFiles(byRuleDecision.values());
         boolean ruleCountersConsistent =
                 mtimeCountersConsistent
                         && inconsistentObjectTypes == 0L
-                        && inconsistentScopes == 0L
+                        && ruleInconsistentScopes == 0L
                         && candidateFiles == global.plannedFiles()
                         && candidateBytes == global.plannedBytes();
+        boolean coverageComplete =
+                metadataFailures == 0L
+                        && actionRequiredSkips == 0L
+                        && incompleteScopeTargets == 0L
+                        && scopeCountersConsistent
+                        && ruleCountersConsistent;
         boolean dryRunCountersConsistent =
                 !dryRun
                         || (global.deletedFiles() == 0L
@@ -240,7 +272,9 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
                 inconsistentScopes,
                 candidateFiles,
                 candidateBytes,
+                incompleteScopeTargets,
                 coverageComplete,
+                scopeCountersConsistent,
                 ruleCountersConsistent,
                 dryRunCountersConsistent);
     }

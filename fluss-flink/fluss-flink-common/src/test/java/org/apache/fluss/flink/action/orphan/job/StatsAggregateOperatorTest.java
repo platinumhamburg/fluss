@@ -102,6 +102,87 @@ class StatsAggregateOperatorTest {
     }
 
     @Test
+    void carriesConsistentScopeBucketEquationsIntoTerminalSummary() throws Exception {
+        try (Harness harness = new Harness(true)) {
+            harness.open();
+            harness.processElement(new StreamRecord<>(consistentScopeStats()));
+            harness.endInput();
+
+            assertThat(harness.summaries())
+                    .singleElement()
+                    .satisfies(
+                            summary -> {
+                                assertThat(summary.scopeCountersConsistent()).isTrue();
+                                assertThat(summary.incompleteScopeTargets()).isZero();
+                                assertThat(summary.coverageComplete()).isTrue();
+                                assertThat(summary.inconsistentScopes()).isZero();
+                            });
+        }
+    }
+
+    @Test
+    void incompleteButClassifiedScopeDoesNotClaimCoverageComplete() throws Exception {
+        ScopePlanStats plan = new ScopePlanStats();
+        plan.discoveredBuckets(2L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(ScopeIdentity.table("db", "table", 12L), 2L, true);
+        target.logRpcFailed();
+        target.kvRpcFailed();
+        target.incomplete(5L);
+        plan.target(target);
+        plan.metadataFailure();
+
+        try (Harness harness = new Harness(true)) {
+            harness.open();
+            harness.processElement(new StreamRecord<>(ScopeSummaryTask.from(plan).stats()));
+            harness.endInput();
+
+            assertThat(harness.summaries())
+                    .singleElement()
+                    .satisfies(
+                            summary -> {
+                                assertThat(summary.scopeCountersConsistent()).isTrue();
+                                assertThat(summary.incompleteScopeTargets()).isEqualTo(1L);
+                                assertThat(summary.coverageComplete()).isFalse();
+                                assertThat(summary.inconsistentScopes()).isEqualTo(1L);
+                                assertThat(summary.globalCounters().deletedFiles()).isZero();
+                            });
+        }
+    }
+
+    @Test
+    void inconsistentScopeBucketEquationEmitsIntegrityEvidenceAndFailsClosed() throws Exception {
+        ScopePlanStats plan = new ScopePlanStats();
+        plan.discoveredBuckets(2L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(ScopeIdentity.table("db", "table", 12L), 2L, false);
+        target.logResolvedBucket();
+        target.incomplete(3L);
+        plan.target(target);
+
+        try (Harness harness = new Harness(true, reportingSpec(true))) {
+            harness.open();
+            harness.processElement(new StreamRecord<>(ScopeSummaryTask.from(plan).stats()));
+
+            assertThatThrownBy(harness::endInput)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("audit integrity");
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("audit_integrity"))
+                    .singleElement()
+                    .satisfies(
+                            event -> {
+                                assertThat(event.getFlags())
+                                        .containsEntry("scope_counters_consistent", false)
+                                        .containsEntry("coverage_complete", false);
+                                assertThat(event.getMetrics())
+                                        .containsEntry("incomplete_scope_targets", 1L);
+                            });
+            assertThat(harness.summaries()).isEmpty();
+        }
+    }
+
+    @Test
     void rejectsMissingOrDuplicateScopeSummary() throws Exception {
         try (Harness missing = new Harness(true)) {
             missing.open();
@@ -513,6 +594,20 @@ class StatsAggregateOperatorTest {
             harness.endInput();
             return harness.summaries().get(0);
         }
+    }
+
+    private static CleanupStats consistentScopeStats() {
+        ScopePlanStats plan = new ScopePlanStats();
+        plan.discoveredBuckets(2L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(ScopeIdentity.table("db", "table", 12L), 2L, false);
+        target.logResolvedBucket();
+        target.logNoManifestBucket();
+        target.taskEmitted();
+        target.taskEmitted();
+        target.complete(4L);
+        plan.target(target);
+        return ScopeSummaryTask.from(plan).stats();
     }
 
     private static void assertRuntimeIdentity(OpenContextSnapshot context, Harness harness) {

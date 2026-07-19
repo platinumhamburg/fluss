@@ -1145,18 +1145,25 @@ public final class AuditLogger {
                 newEvent(AuditSeverity.INFO, AuditStage.SUMMARY, "audit_integrity")
                         .metric("inconsistent_object_types", summary.inconsistentObjectTypes())
                         .metric("inconsistent_scopes", summary.inconsistentScopes())
+                        .metric("incomplete_scope_targets", summary.incompleteScopeTargets())
+                        .flag("scope_counters_consistent", summary.scopeCountersConsistent())
                         .flag("rule_counters_consistent", summary.ruleCountersConsistent())
+                        .flag("counters_consistent", summary.countersConsistent())
                         .flag("coverage_complete", summary.coverageComplete())
                         .flag("dry_run_counters_consistent", summary.dryRunCountersConsistent())
                         .flag("dry_run", summary.dryRun()),
-                "action=audit_integrity rule_counters_consistent={} coverage_complete={}"
+                "action=audit_integrity scope_counters_consistent={}"
+                        + " rule_counters_consistent={} counters_consistent={} coverage_complete={}"
                         + " dry_run_counters_consistent={} inconsistent_object_types={}"
-                        + " inconsistent_scopes={} dry_run={}",
+                        + " inconsistent_scopes={} incomplete_scope_targets={} dry_run={}",
+                summary.scopeCountersConsistent(),
                 summary.ruleCountersConsistent(),
+                summary.countersConsistent(),
                 summary.coverageComplete(),
                 summary.dryRunCountersConsistent(),
                 summary.inconsistentObjectTypes(),
                 summary.inconsistentScopes(),
+                summary.incompleteScopeTargets(),
                 summary.dryRun());
     }
 
