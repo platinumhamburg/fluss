@@ -367,6 +367,7 @@ class ActiveRefsFetcherTest {
                 fetcher.fetchKvSharedSstFileNames(kvTabletDir, activeSnapDirs);
 
         assertThat(result.allMetadataReadOk()).isFalse();
+        assertThat(result.metadataNotFound()).isTrue();
         assertThat(result.failureDetail().operation()).isEqualTo("read_kv_snapshot_metadata");
         assertThat(result.failureDetail().failureCategory()).isEqualTo("not_found");
         assertThat(result.failureDetail().metadataPath()).endsWith("snap-10/_METADATA");
@@ -391,6 +392,7 @@ class ActiveRefsFetcherTest {
                 fetcher.fetchKvSharedSstFileNames(kvTabletDir, activeSnapDirs);
 
         assertThat(result.allMetadataReadOk()).isFalse();
+        assertThat(result.metadataNotFound()).isFalse();
         assertThat(result.failureDetail().operation()).isEqualTo("read_kv_snapshot_metadata");
         assertThat(result.failureDetail().failureCategory()).isEqualTo("io_error");
         assertThat(result.failureDetail().exceptionClass()).isEqualTo(IOException.class.getName());
@@ -415,6 +417,7 @@ class ActiveRefsFetcherTest {
                 fetcher.fetchKvSharedSstFileNames(kvTabletDir, activeSnapDirs);
 
         assertThat(result.allMetadataReadOk()).isFalse();
+        assertThat(result.metadataNotFound()).isFalse();
         assertThat(result.failureDetail().failureCategory())
                 .isEqualTo("snapshot_metadata_parse_failed");
     }

@@ -75,6 +75,11 @@ public final class KvSharedSstFetchResult {
         return ok;
     }
 
+    /** Whether the failure was caused by missing snapshot metadata. */
+    public boolean metadataNotFound() {
+        return failureDetail != null && "not_found".equals(failureDetail.failureCategory());
+    }
+
     /**
      * Union of remote shared SST object basenames referenced by active snapshots. Empty when {@link
      * #allMetadataReadOk()} is false.
