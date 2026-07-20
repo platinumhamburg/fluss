@@ -97,6 +97,7 @@ public class MetadataManager {
     private static final Logger LOG = LoggerFactory.getLogger(MetadataManager.class);
     private static final int PARTITION_TOMBSTONE_CAS_RETRY_LIMIT = 3;
     private static final long TABLE_DELETION_RETRY_DELAY_MILLIS = 1000L;
+    private static final int DATABASE_MUTATION_LOCK_COUNT = 64;
 
     private final ZooKeeperClient zookeeperClient;
     private final int maxPartitionNum;
@@ -104,10 +105,9 @@ public class MetadataManager {
     private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
     private final Executor tableDeletionExecutor;
     private final Consumer<Runnable> tableDeletionRetryScheduler;
-    // Coordinator epochs fence different leaders. This lock serializes read-modify-write metadata
-    // mutations issued by the current leader, including automatic partition management and
-    // watcher repairs, so a deleted path cannot be recreated between validation and commit.
-    private final Object metadataMutationLock = new Object();
+    // The fixed set avoids retaining one lock for every database name. A hash collision only
+    // serializes otherwise independent metadata changes and does not affect correctness.
+    private final Object[] databaseMutationLocks = createDatabaseMutationLocks();
 
     public static final Set<String> SENSITIVE_TABLE_OPTIONS = new HashSet<>();
 
@@ -162,6 +162,34 @@ public class MetadataManager {
         this.tableDeletionRetryScheduler = tableDeletionRetryScheduler;
     }
 
+    private static Object[] createDatabaseMutationLocks() {
+        Object[] locks = new Object[DATABASE_MUTATION_LOCK_COUNT];
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new Object();
+        }
+        return locks;
+    }
+
+    private Object databaseMutationLock(String databaseName) {
+        return databaseMutationLocks[
+                Math.floorMod(databaseName.hashCode(), databaseMutationLocks.length)];
+    }
+
+    private static String getSingleDatabaseName(Collection<TablePath> tablePaths) {
+        Iterator<TablePath> iterator = tablePaths.iterator();
+        if (!iterator.hasNext()) {
+            throw new IllegalArgumentException("At least one table is required.");
+        }
+
+        String databaseName = iterator.next().getDatabaseName();
+        while (iterator.hasNext()) {
+            if (!databaseName.equals(iterator.next().getDatabaseName())) {
+                throw new IllegalArgumentException("All tables must belong to the same database.");
+            }
+        }
+        return databaseName;
+    }
+
     /** Validates the table descriptor. */
     public void validateTableDescriptor(TableDescriptor tableDescriptor) {
         TableDescriptorValidation.validateTableDescriptor(
@@ -173,7 +201,7 @@ public class MetadataManager {
     public void createDatabase(
             String databaseName, DatabaseDescriptor databaseDescriptor, boolean ignoreIfExists)
             throws DatabaseAlreadyExistException {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(databaseName)) {
             createDatabaseInternal(databaseName, databaseDescriptor, ignoreIfExists);
         }
     }
@@ -209,7 +237,7 @@ public class MetadataManager {
             String databaseName,
             DatabasePropertyChanges databasePropertyChanges,
             boolean ignoreIfNotExists) {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(databaseName)) {
             alterDatabasePropertiesInternal(
                     databaseName, databasePropertyChanges, ignoreIfNotExists);
         }
@@ -383,7 +411,7 @@ public class MetadataManager {
 
     public void dropDatabase(String name, boolean ignoreIfNotExists, boolean cascade)
             throws DatabaseNotExistException, DatabaseNotEmptyException {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(name)) {
             dropDatabaseInternal(name, ignoreIfNotExists, cascade);
         }
     }
@@ -405,7 +433,7 @@ public class MetadataManager {
 
     public void dropTable(TablePath tablePath, boolean ignoreIfNotExists)
             throws TableNotExistException {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(tablePath.getDatabaseName())) {
             dropTableInternal(tablePath, ignoreIfNotExists);
         }
     }
@@ -426,7 +454,15 @@ public class MetadataManager {
 
     public void deleteTables(List<TableDeletion> tableDeletions, int coordinatorZkVersion) {
         List<TableDeletion> deletions = new ArrayList<>(tableDeletions);
-        synchronized (metadataMutationLock) {
+        if (deletions.isEmpty()) {
+            return;
+        }
+        String databaseName =
+                getSingleDatabaseName(
+                        deletions.stream()
+                                .map(TableDeletion::getTablePath)
+                                .collect(Collectors.toList()));
+        synchronized (databaseMutationLock(databaseName)) {
             uncheck(
                     () -> zookeeperClient.markTablesForDeletion(deletions, coordinatorZkVersion),
                     "Fail to mark tables for deletion: " + deletions);
@@ -543,7 +579,7 @@ public class MetadataManager {
             @Nullable TableAssignment tableAssignment,
             boolean ignoreIfExists)
             throws TableAlreadyExistException, DatabaseNotExistException {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(tablePath.getDatabaseName())) {
             return createTableInternal(tablePath, tableToCreate, tableAssignment, ignoreIfExists);
         }
     }
@@ -608,7 +644,15 @@ public class MetadataManager {
             List<TableCreation> tableCreations,
             boolean ignoreIfFirstTableExists,
             int coordinatorZkVersion) {
-        synchronized (metadataMutationLock) {
+        if (tableCreations.isEmpty()) {
+            throw new IllegalArgumentException("At least one table is required.");
+        }
+        String databaseName =
+                getSingleDatabaseName(
+                        tableCreations.stream()
+                                .map(TableCreation::getTablePath)
+                                .collect(Collectors.toList()));
+        synchronized (databaseMutationLock(databaseName)) {
             createTablesAtomicallyInternal(
                     tableCreations, ignoreIfFirstTableExists, coordinatorZkVersion);
         }
@@ -618,10 +662,6 @@ public class MetadataManager {
             List<TableCreation> tableCreations,
             boolean ignoreIfFirstTableExists,
             int coordinatorZkVersion) {
-        if (tableCreations.isEmpty()) {
-            throw new IllegalArgumentException("At least one table is required.");
-        }
-
         TablePath firstTablePath = tableCreations.get(0).getTablePath();
         if (!databaseExists(firstTablePath.getDatabaseName())) {
             throw new DatabaseNotExistException(
@@ -674,7 +714,7 @@ public class MetadataManager {
             FlussPrincipal flussPrincipal,
             int coordinatorZkVersion)
             throws TableNotExistException, TableNotPartitionedException {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(tablePath.getDatabaseName())) {
             alterTableSchemaInternal(
                     tablePath,
                     schemaChanges,
@@ -786,7 +826,7 @@ public class MetadataManager {
             boolean ignoreIfNotExists,
             FlussPrincipal flussPrincipal,
             int coordinatorZkVersion) {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(tablePath.getDatabaseName())) {
             alterTablePropertiesInternal(
                     tablePath,
                     tableChanges,
@@ -1113,7 +1153,7 @@ public class MetadataManager {
             ResolvedPartitionSpec partition,
             boolean ignoreIfExists,
             int coordinatorZkVersion) {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(tablePath.getDatabaseName())) {
             createPartitionInternal(
                     tablePath,
                     tableId,
@@ -1233,7 +1273,7 @@ public class MetadataManager {
             ResolvedPartitionSpec partition,
             boolean ignoreIfNotExists,
             int coordinatorZkVersion) {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(tablePath.getDatabaseName())) {
             dropPartitionInternal(
                     tablePath, expectedTableId, partition, ignoreIfNotExists, coordinatorZkVersion);
         }
@@ -1295,7 +1335,7 @@ public class MetadataManager {
             Collection<Long> alivePartitionIdsAfterDrop,
             int coordinatorZkVersion)
             throws Exception {
-        synchronized (metadataMutationLock) {
+        synchronized (databaseMutationLock(tablePath.getDatabaseName())) {
             return PartitionTombstoneAdvancer.advanceAndPersist(
                     zookeeperClient,
                     tablePath,

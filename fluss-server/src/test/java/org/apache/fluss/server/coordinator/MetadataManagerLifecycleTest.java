@@ -21,12 +21,15 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableDeletion;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
+import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
@@ -44,12 +47,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class MetadataManagerLifecycleTest {
@@ -135,6 +140,161 @@ class MetadataManagerLifecycleTest {
         assertThat(firstFailure).hasValue(null);
         assertThat(secondFailure).hasValue(null);
         assertThat(partitionReads).hasValue(2);
+    }
+
+    @Test
+    void testPartitionMutationsInDifferentDatabasesCanProceedConcurrently() throws Exception {
+        ZooKeeperClient zkClient = mock(ZooKeeperClient.class);
+        TablePath blockedTable = TablePath.of("db_a", "partitioned_table");
+        TablePath independentTable = TablePath.of("db_b", "partitioned_table");
+        CountDownLatch blockedReadEntered = new CountDownLatch(1);
+        CountDownLatch releaseBlockedRead = new CountDownLatch(1);
+        CountDownLatch independentStarted = new CountDownLatch(1);
+        CountDownLatch independentReadEntered = new CountDownLatch(1);
+
+        when(zkClient.getPartition(eq(blockedTable), anyString()))
+                .thenAnswer(
+                        ignored -> {
+                            blockedReadEntered.countDown();
+                            assertThat(releaseBlockedRead.await(30, TimeUnit.SECONDS)).isTrue();
+                            return Optional.empty();
+                        });
+        when(zkClient.getPartition(eq(independentTable), anyString()))
+                .thenAnswer(
+                        ignored -> {
+                            independentReadEntered.countDown();
+                            return Optional.empty();
+                        });
+        when(zkClient.getPartitionNumber(any(TablePath.class))).thenReturn(0);
+        when(zkClient.getPartitionIdAndIncrement()).thenReturn(1L, 2L);
+        when(zkClient.getPartitionTombstone(any(TablePath.class)))
+                .thenReturn(PartitionTombstone.EMPTY);
+        when(zkClient.getDefaultRemoteDataDir()).thenReturn("/tmp");
+
+        MetadataManager metadataManager = newMetadataManager(zkClient);
+        PartitionAssignment assignment =
+                new PartitionAssignment(
+                        11L, Collections.singletonMap(0, BucketAssignment.of(1)));
+        AtomicReference<Throwable> blockedFailure = new AtomicReference<>();
+        AtomicReference<Throwable> independentFailure = new AtomicReference<>();
+        CountDownLatch blockedDone = new CountDownLatch(1);
+        CountDownLatch independentDone = new CountDownLatch(1);
+
+        Thread blocked =
+                new Thread(
+                        () ->
+                                createPartition(
+                                        metadataManager,
+                                        blockedTable,
+                                        assignment,
+                                        blockedFailure,
+                                        blockedDone));
+        Thread independent =
+                new Thread(
+                        () -> {
+                            independentStarted.countDown();
+                            createPartition(
+                                    metadataManager,
+                                    independentTable,
+                                    assignment,
+                                    independentFailure,
+                                    independentDone);
+                        });
+
+        blocked.start();
+        assertThat(blockedReadEntered.await(10, TimeUnit.SECONDS)).isTrue();
+        try {
+            independent.start();
+            assertThat(independentStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(independentReadEntered.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(independentDone.await(10, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            releaseBlockedRead.countDown();
+        }
+
+        assertThat(blockedDone.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(blockedFailure).hasValue(null);
+        assertThat(independentFailure).hasValue(null);
+    }
+
+    @Test
+    void testTableDeletionRejectsTablesFromDifferentDatabases() {
+        ZooKeeperClient zkClient = mock(ZooKeeperClient.class);
+        MetadataManager metadataManager = newMetadataManager(zkClient);
+
+        assertThatThrownBy(
+                        () ->
+                                metadataManager.deleteTables(
+                                        Arrays.asList(
+                                                new TableDeletion(
+                                                        TablePath.of("db_a", "main"), 1L),
+                                                new TableDeletion(
+                                                        TablePath.of("db_b", "index"), 2L)),
+                                        7))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("same database");
+
+        verifyNoInteractions(zkClient);
+    }
+
+    @Test
+    void testAtomicTableCreationRejectsTablesFromDifferentDatabases() {
+        ZooKeeperClient zkClient = mock(ZooKeeperClient.class);
+        MetadataManager metadataManager = newMetadataManager(zkClient);
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .primaryKey("id")
+                                        .build())
+                        .build();
+
+        assertThatThrownBy(
+                        () ->
+                                metadataManager.createTablesAtomically(
+                                        Arrays.asList(
+                                                new TableCreation(
+                                                        TablePath.of("db_a", "main"),
+                                                        1L,
+                                                        descriptor,
+                                                        null),
+                                                new TableCreation(
+                                                        TablePath.of("db_b", "index"),
+                                                        2L,
+                                                        descriptor,
+                                                        null)),
+                                        false,
+                                        7))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("same database");
+
+        verifyNoInteractions(zkClient);
+    }
+
+    @Test
+    void testEmptyTableDeletionIsNoOp() {
+        ZooKeeperClient zkClient = mock(ZooKeeperClient.class);
+        MetadataManager metadataManager = newMetadataManager(zkClient);
+
+        metadataManager.deleteTables(Collections.emptyList(), 7);
+
+        verifyNoInteractions(zkClient);
+    }
+
+    @Test
+    void testEmptyAtomicTableCreationIsRejected() {
+        ZooKeeperClient zkClient = mock(ZooKeeperClient.class);
+        MetadataManager metadataManager = newMetadataManager(zkClient);
+
+        assertThatThrownBy(
+                        () ->
+                                metadataManager.createTablesAtomically(
+                                        Collections.emptyList(), false, 7))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("At least one table");
+
+        verifyNoInteractions(zkClient);
     }
 
     @Test
@@ -224,5 +384,26 @@ class MetadataManagerLifecycleTest {
                 new LakeCatalogDynamicLoader(configuration, null, true),
                 Runnable::run,
                 retries::addLast);
+    }
+
+    private static void createPartition(
+            MetadataManager metadataManager,
+            TablePath tablePath,
+            PartitionAssignment assignment,
+            AtomicReference<Throwable> failure,
+            CountDownLatch done) {
+        try {
+            metadataManager.createPartition(
+                    tablePath,
+                    11L,
+                    assignment,
+                    ResolvedPartitionSpec.fromPartitionValue("p", "1"),
+                    false,
+                    7);
+        } catch (Throwable t) {
+            failure.set(t);
+        } finally {
+            done.countDown();
+        }
     }
 }
