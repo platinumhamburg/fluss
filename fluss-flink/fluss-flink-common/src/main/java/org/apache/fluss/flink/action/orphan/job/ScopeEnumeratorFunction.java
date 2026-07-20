@@ -64,6 +64,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -676,7 +677,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             KvActiveRefsFetchResult kvResult =
                     fetcher.fetchKvActiveSnapDirs(liveTable.tableId, partitionId);
             if (kvResult.listOk()) {
-                kvActiveByBucket = kvResult.activeSnapDirsByBucket();
+                kvActiveByBucket = new HashMap<>(kvResult.activeSnapDirsByBucket());
                 kvTargetOk = true;
             } else {
                 targetStats.kvRpcFailed();
@@ -756,30 +757,33 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                         tableBucket)
                                 .toString();
                 kvActiveSnaps = kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
+                KvSharedSstFetchResult sstResult =
+                        fetcher.fetchKvSharedSstFileNamesWithRefresh(
+                                liveTable.tableId,
+                                partitionId,
+                                bucketId,
+                                new FsPath(kvTabletDir),
+                                kvActiveByBucket);
+                kvActiveSnaps =
+                        kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
                 if (kvActiveSnaps.isEmpty()) {
                     targetStats.kvEmptyBucket();
-                    // The successful ListKvSnapshots response is authoritative: this bucket has
-                    // no active snapshots, hence no active shared SST references.
-                    kvSharedSstRefsComplete = true;
                     audit.logScanKvBucketWithoutActiveSnapshots(
                             liveTable.tableId, partitionId, bucketId);
                 } else {
                     targetStats.kvActiveBucket();
-                    KvSharedSstFetchResult sstResult =
-                            fetcher.fetchKvSharedSstFileNames(
-                                    new FsPath(kvTabletDir), kvActiveSnaps);
-                    if (sstResult.allMetadataReadOk()) {
-                        kvSharedSstFileNames = sstResult.sharedSstFileNames();
-                        kvSharedSstRefsComplete = true;
-                    } else {
-                        targetStats.metadataFailure();
-                        audit.logMetadataFailure(
-                                AuditStage.SCOPE,
-                                targetScope.withPartitionAndBucket(partitionId, bucketId),
-                                CleanupObjectType.KV_SHARED_SST,
-                                sstResult.failureDetail());
-                        planStats.metadataFailure();
-                    }
+                }
+                if (sstResult.allMetadataReadOk()) {
+                    kvSharedSstFileNames = sstResult.sharedSstFileNames();
+                    kvSharedSstRefsComplete = true;
+                } else {
+                    targetStats.metadataFailure();
+                    audit.logMetadataFailure(
+                            AuditStage.SCOPE,
+                            targetScope.withPartitionAndBucket(partitionId, bucketId),
+                            CleanupObjectType.KV_SHARED_SST,
+                            sstResult.failureDetail());
+                    planStats.metadataFailure();
                 }
             }
 
