@@ -764,8 +764,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 bucketId,
                                 new FsPath(kvTabletDir),
                                 kvActiveByBucket);
-                kvActiveSnaps =
-                        kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
+                kvActiveSnaps = kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
                 if (kvActiveSnaps.isEmpty()) {
                     targetStats.kvEmptyBucket();
                     audit.logScanKvBucketWithoutActiveSnapshots(
