@@ -74,7 +74,7 @@ import static org.apache.fluss.utils.PartitionUtils.PARTITION_KEY_SUPPORTED_TYPE
 public class TableDescriptorValidation {
 
     private static final String TABLE_LEVEL_INDEX_VISIBILITY = "index.visibility";
-    private static final String LEGACY_SECONDARY_INDEX_PREFIX = "secondary-index.";
+    private static final String SECONDARY_INDEX_PROPERTY_PREFIX = "secondary-index.";
 
     private static final Set<String> SYSTEM_COLUMNS =
             Collections.unmodifiableSet(
@@ -105,12 +105,12 @@ public class TableDescriptorValidation {
 
             if (key.equals(TABLE_LEVEL_INDEX_VISIBILITY)) {
                 throw new InvalidConfigException(
-                        "'index.visibility' is no longer supported. Use "
+                        "'index.visibility' is not a valid table property. Use "
                                 + "'secondary-index.<index-name>.visibility' in DDL so visibility is stored "
                                 + "inside Schema.Index metadata.");
             }
 
-            if (key.startsWith(LEGACY_SECONDARY_INDEX_PREFIX)) {
+            if (key.startsWith(SECONDARY_INDEX_PROPERTY_PREFIX)) {
                 throw new InvalidConfigException(
                         "Secondary index options must be stored in Schema.Index metadata, not table properties: "
                                 + key);
@@ -150,9 +150,10 @@ public class TableDescriptorValidation {
         } catch (IllegalArgumentException e) {
             throw new InvalidConfigException(e.getMessage());
         }
-        if (protocol == KvIdempotenceProtocol.V1_FENCED && !tableDescriptor.isIndexTable()) {
+        if (protocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
+                && !tableDescriptor.isIndexTable()) {
             throw new InvalidConfigException(
-                    "KV idempotence protocol version 1 is reserved for system-managed Index Tables");
+                    "The cumulative-progress KV idempotence protocol is reserved for system-managed Index Tables");
         }
 
         // check distribution
@@ -364,9 +365,6 @@ public class TableDescriptorValidation {
 
     private static boolean isPartitionedIndexTable(TableDescriptor tableDescriptor) {
         return tableDescriptor.isIndexTable()
-                && tableDescriptor
-                        .getProperties()
-                        .containsKey(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key())
                 && tableDescriptor
                         .getSchema()
                         .getRowType()

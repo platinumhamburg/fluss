@@ -28,11 +28,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Regression guard for {@link PartialUpdater}: secondary-index columns MUST NOT be exempted from
- * the "non-target columns must be nullable" sanity check. In Fluss V1 there was a code path that
- * silently allowed NOT NULL index columns to sit outside the target column set, which caused
- * partial-update merges to push wrong index entries downstream. The V2 implementation has no such
- * exemption and these tests pin that contract.
+ * Verifies that secondary-index columns follow the same partial-update nullable requirement as
+ * every other non-primary-key, non-auto-increment column.
  */
 class PartialUpdaterIndexColumnsTest {
 
@@ -70,6 +67,22 @@ class PartialUpdaterIndexColumnsTest {
                         .column("note", DataTypes.STRING().copy(true))
                         .primaryKey("id")
                         .index("idx_user", "user_id")
+                        .build();
+
+        PartialUpdater updater =
+                new PartialUpdater(KvFormat.COMPACTED, SCHEMA_ID, schema, new int[] {0, 2});
+        assertThat(updater).isNotNull();
+    }
+
+    @Test
+    void testNotNullAutoIncrementColumnIsAccepted() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT().copy(false))
+                        .column("sequence_id", DataTypes.BIGINT().copy(false))
+                        .column("note", DataTypes.STRING().copy(true))
+                        .primaryKey("id")
+                        .enableAutoIncrement("sequence_id")
                         .build();
 
         PartialUpdater updater =

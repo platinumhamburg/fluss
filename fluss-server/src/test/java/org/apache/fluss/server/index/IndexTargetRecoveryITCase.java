@@ -28,8 +28,8 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.BinaryRow;
@@ -40,8 +40,8 @@ import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
-import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.replica.fetcher.InitialFetchStatus;
@@ -221,20 +221,24 @@ class IndexTargetRecoveryITCase {
 
         byte[] insertedValueBefore = recoveredValues.get(3);
         long walEndBefore = recoveredReplica.getLogTablet().localLogEndOffset();
-        FencedWriterStateEntry writerStateBefore =
+        WriterProgressStateEntry writerStateBefore =
                 recoveredReplica
                         .getLogTablet()
                         .writerStateManager()
-                        .lastFencedEntry(writerKey)
+                        .lastProgressEntry(writerKey)
                         .orElseThrow(AssertionError::new);
-        assertThat(writerStateBefore.lastSequence()).isEqualTo(expectedFence);
+        assertThat(writerStateBefore.lastProgress()).isEqualTo(expectedFence);
 
         TabletServerGateway promotedGateway =
                 FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(followerToPromote);
         putIndexMutation(promotedGateway, indexTableId, writerKey, 0L, insertedKey, false);
 
         assertThat(recoveredReplica.getLogTablet().localLogEndOffset()).isEqualTo(walEndBefore);
-        assertThat(recoveredReplica.getLogTablet().writerStateManager().lastFencedEntry(writerKey))
+        assertThat(
+                        recoveredReplica
+                                .getLogTablet()
+                                .writerStateManager()
+                                .lastProgressEntry(writerKey))
                 .contains(writerStateBefore);
         assertThat(recoveredReplica.lookups(Collections.singletonList(insertedKey)).get(0))
                 .isEqualTo(insertedValueBefore);
@@ -286,19 +290,19 @@ class IndexTargetRecoveryITCase {
             TabletServerGateway gateway,
             long indexTableId,
             WriterKey writerKey,
-            long sequence,
+            long progress,
             byte[] key,
             boolean upsert)
             throws Exception {
         BinaryRow row = compactedRow(INDEX_ROW_TYPE, new Object[] {"latest", 1});
-        try (FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+        try (ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         1,
                         Integer.MAX_VALUE,
                         new UnmanagedPagedOutputView(4096),
                         KvFormat.COMPACTED)) {
             builder.append(key, upsert ? row : null);
-            builder.setWriterState(writerKey, sequence);
+            builder.setWriterState(writerKey, progress);
             BytesView batch = builder.build();
             PutKvRequest request =
                     new PutKvRequest().setTableId(indexTableId).setAcks(-1).setTimeoutMs(30_000);

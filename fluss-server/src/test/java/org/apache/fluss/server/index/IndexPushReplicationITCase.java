@@ -29,12 +29,13 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
-import org.apache.fluss.row.aligned.AlignedRow;
-import org.apache.fluss.row.aligned.AlignedRowWriter;
+import org.apache.fluss.row.compacted.CompactedRow;
+import org.apache.fluss.row.compacted.CompactedRowWriter;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
@@ -44,6 +45,7 @@ import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.types.DataField;
+import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
@@ -57,7 +59,6 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.Collections;
-import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.row.BinaryString.fromString;
@@ -139,13 +140,10 @@ class IndexPushReplicationITCase {
                             IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN,
                             DataTypes.BIGINT().copy(false)));
 
-    /** Bounded poll deadline for index visibility checks — well above the longest observed push. */
+    /** Bounded poll deadline for asynchronous index visibility checks. */
     private static final Duration INDEX_VISIBILITY_TIMEOUT = Duration.ofSeconds(30);
 
-    /**
-     * Happy-path scenario #1 (FIP V2 §3, sync visibility): write 1 row to the indexed main table,
-     * verify the corresponding entry shows up in the Index Table.
-     */
+    /** A SYNC write is acknowledged only after its Index Table entry is visible. */
     @Test
     void testInsertOnMainTablePushesEntryToIndexTable() throws Exception {
         String mainName = "main_t_insert";
@@ -158,17 +156,7 @@ class IndexPushReplicationITCase {
 
         byte[] indexKey = encodeIndexKey("hello", 1);
 
-        // SYNC visibility (the default) means the PutKv ack only returns AFTER the index push has
-        // been applied, so the entry must be visible IMMEDIATELY — without any polling. A
-        // regression
-        // that turned SYNC into async would leave this synchronous lookup empty.
-        int indexBucket = computeIndexBucket("hello");
-        Replica indexLeader =
-                FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(
-                        new TableBucket(f.indexTableId, indexBucket));
-        assertThat(indexLeader.lookups(Collections.singletonList(indexKey)).get(0))
-                .as("under SYNC visibility the index entry must be visible right after the ack")
-                .isNotNull();
+        assertIndexEntry(f.indexTableId, indexKey, "hello", true);
 
         // The sync push completed before the ack, so the sync pushed offset must have advanced to
         // the write log end offset. A single row at log offset 0 advances it to 1.
@@ -178,11 +166,7 @@ class IndexPushReplicationITCase {
                 .isEqualTo(1L);
     }
 
-    /**
-     * Scenario #2 (FIP V2 §2.5 update rule): an UPDATE that changes the indexed column emits a
-     * DELETE for the old key plus an UPSERT for the new key. After a brief poll the old key must be
-     * gone and the new key must be present.
-     */
+    /** Updating an indexed column deletes the old index key and writes the new key. */
     @Test
     void testUpdateRewritesIndexEntry() throws Exception {
         String mainName = "main_t_update";
@@ -195,7 +179,7 @@ class IndexPushReplicationITCase {
                                 f.mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "hello"})))
                 .get();
         byte[] oldIndexKey = encodeIndexKey("hello", 1);
-        waitForIndexEntry(f.indexGateway, f.indexTableId, oldIndexKey, "hello", true);
+        assertIndexEntry(f.indexTableId, oldIndexKey, "hello", true);
 
         // (2) Update the same PK row with a different idx column value.
         f.mainGateway
@@ -206,14 +190,11 @@ class IndexPushReplicationITCase {
 
         // (3) The old composite key disappears, the new one appears.
         byte[] newIndexKey = encodeIndexKey("world", 1);
-        waitForIndexEntry(f.indexGateway, f.indexTableId, newIndexKey, "world", true);
-        waitForIndexEntry(f.indexGateway, f.indexTableId, oldIndexKey, "hello", false);
+        assertIndexEntry(f.indexTableId, newIndexKey, "world", true);
+        assertIndexEntry(f.indexTableId, oldIndexKey, "hello", false);
     }
 
-    /**
-     * Scenario #3 (FIP V2 §2.5 delete rule): a DELETE on the main table emits a DELETE on the index
-     * entry. After polling, the index lookup for the previously-inserted key must come back empty.
-     */
+    /** Deleting a main-table row removes its Index Table entry. */
     @Test
     void testDeleteRemovesIndexEntry() throws Exception {
         String mainName = "main_t_delete";
@@ -226,7 +207,7 @@ class IndexPushReplicationITCase {
                                 f.mainTableId, 0, 1, genKvRecordBatch(new Object[] {1, "hello"})))
                 .get();
         byte[] indexKey = encodeIndexKey("hello", 1);
-        waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, "hello", true);
+        assertIndexEntry(f.indexTableId, indexKey, "hello", true);
 
         // (2) Delete the row by sending a KvRecord with a null value (tombstone) for the same PK.
         KvRecordBatch deleteBatch =
@@ -235,7 +216,7 @@ class IndexPushReplicationITCase {
         f.mainGateway.putKv(newPutKvRequest(f.mainTableId, 0, 1, deleteBatch)).get();
 
         // (3) The index entry for ("hello", 1) goes away.
-        waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, "hello", false);
+        assertIndexEntry(f.indexTableId, indexKey, "hello", false);
     }
 
     @Test
@@ -256,12 +237,7 @@ class IndexPushReplicationITCase {
                 .isEqualTo(1L);
     }
 
-    /**
-     * Scenario #4 (FIP V2 §2.6, async visibility): with async {@code Schema.Index} visibility the
-     * PutKv ack returns BEFORE the index push completes; the entry is only eventually visible. We
-     * don't assert immediate invisibility (would be flaky on fast machines / single-process
-     * self-RPC) — the contract under test is "eventual visibility under ASYNC".
-     */
+    /** An ASYNC index becomes visible eventually after the main-table write is acknowledged. */
     @Test
     void testAsyncVisibilityEventuallyVisible() throws Exception {
         String mainName = "main_t_async";
@@ -274,26 +250,18 @@ class IndexPushReplicationITCase {
                 .get();
 
         byte[] indexKey = encodeIndexKey("hello", 1);
-        waitForIndexEntry(f.indexGateway, f.indexTableId, indexKey, "hello", true);
+        waitForIndexEntry(f.indexTableId, indexKey, "hello", true);
     }
 
     /**
-     * Scenario #5 (Plan 3 §2.9.8, partition tombstone): once the TabletServer's metadata cache
-     * holds a tombstone for a given {@code (mainTableId, partitionId)} pair, any subsequent Index
-     * Table PutKv whose physical value carries that partitionId must be silently dropped by the
-     * apply-path filter — no KV state change, no error, the surrounding batch is still acked
-     * normally.
-     *
-     * <p><b>Pragmatic scoping (per P3T13 spec):</b> driving the full multi-partition + drop +
-     * propagation chain through {@link FlussClusterExtension} is fixture-heavy and largely covered
-     * by per-component tests (advancer, JSON serde, ZK persistence, propagation, filter). This
-     * ITCase therefore exercises the end-to-end apply-path drop in-process by:
+     * Verifies that the Index Table apply path drops an UPSERT whose physical value belongs to a
+     * tombstoned main-table partition. The test controls the encoded value directly and therefore
+     * isolates the apply-path behavior from Coordinator metadata propagation:
      *
      * <ol>
      *   <li>asserting a live partition entry lands in the Index Table (apply path is healthy);
      *   <li>injecting a tombstone for the {@code mainTableId} back-link the Index Table replica was
-     *       constructed with directly into the TabletServer's metadata cache (simulating the
-     *       Coordinator → TabletServer propagation that P3T6/P3T7 already cover);
+     *       constructed with directly into the TabletServer's metadata cache;
      *   <li>sending a synthetic PutKv straight to the Index Table whose value bytes carry the
      *       tombstoned partitionId — bypassing the main table to control the wire bytes exactly the
      *       way a partitioned production push would shape them;
@@ -309,7 +277,7 @@ class IndexPushReplicationITCase {
         // (1) Prove a live partition entry reaches the Index Table before installing a tombstone.
         byte[] controlIndexKey =
                 putPartitionedIndexEntry(f, "hello", 1, "p-live-before", 1001L, 1L);
-        waitForIndexEntry(f.indexGateway, f.indexTableId, controlIndexKey, "hello", true);
+        assertIndexEntry(f.indexTableId, controlIndexKey, "hello", true);
 
         // (2) Inject a tombstone into the TabletServer's metadata cache.
         int indexLeaderServerId =
@@ -331,19 +299,20 @@ class IndexPushReplicationITCase {
                     .as("tombstone is observable on the Index Table leader's metadata cache")
                     .isTrue();
 
-            // (3) Send a fenced PutKv directly to the Index Table with a physical row carrying the
+            // (3) Send a cumulative-progress PutKv directly to the Index Table with a physical row
+            // carrying the
             // tombstoned partition ID, matching the production partitioned index-push shape.
             byte[] droppedIndexKey =
                     putPartitionedIndexEntry(f, "dropped", 99, "p-dropped", droppedPartitionId, 1L);
 
             // (4) The filter dropped the record silently (no WAL append, no KV state change), so
             // the lookup for the synthetic key must return empty.
-            waitForIndexEntry(f.indexGateway, f.indexTableId, droppedIndexKey, "dropped", false);
+            assertIndexEntry(f.indexTableId, droppedIndexKey, "dropped", false);
 
             // (5) Send a non-tombstoned entry and verify it survives the filter.
             byte[] liveKey = putPartitionedIndexEntry(f, "alive", 77, "p-live-after", 9999L, 1L);
-            waitForIndexEntry(f.indexGateway, f.indexTableId, liveKey, "alive", true);
-            waitForIndexEntry(f.indexGateway, f.indexTableId, controlIndexKey, "hello", true);
+            assertIndexEntry(f.indexTableId, liveKey, "alive", true);
+            assertIndexEntry(f.indexTableId, controlIndexKey, "hello", true);
         } finally {
             // Reset the tombstone for this test's main-table id so any later interaction with
             // the same cache instance sees a clean state.
@@ -378,12 +347,11 @@ class IndexPushReplicationITCase {
     }
 
     /**
-     * Creates the main table only — the Coordinator auto-derives the matching Index Table as part
-     * of {@code processCreateTable} (P3T8). The {@code IndexReplicator} init on the main-table
-     * leader uses the defer-and-retry path (P3T14): if {@code NotifyLeaderAndIsr} for the main
-     * table reaches the TabletServer before the auto-derived Index Table's metadata broadcast, the
-     * scheduler init is deferred and retried once the cache catches up. This helper polls until the
-     * scheduler is wired so the rest of the test can proceed deterministically.
+     * Creates the main table only. The Coordinator derives the matching Index Table as part of
+     * {@code processCreateTable}. If {@code NotifyLeaderAndIsr} for the main table reaches the
+     * TabletServer before the auto-derived Index Table's metadata broadcast, the scheduler init is
+     * deferred and retried once the cache catches up. This helper polls until the scheduler is
+     * wired so the rest of the test can proceed deterministically.
      */
     private static Fixture setupTables(String mainName, @Nullable IndexVisibility visibility)
             throws Exception {
@@ -398,8 +366,8 @@ class IndexPushReplicationITCase {
         Replica mainLeaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
         int mainLeaderServer = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(mainBucket);
 
-        // Look up the auto-derived Index Table id directly from ZK — the Coordinator persisted
-        // it during {@code processCreateTable} (P3T8) before returning.
+        // Look up the derived Index Table id directly from ZK. The Coordinator persists it during
+        // processCreateTable before returning.
         long indexTableId =
                 FLUSS_CLUSTER_EXTENSION
                         .getZooKeeperClient()
@@ -453,7 +421,7 @@ class IndexPushReplicationITCase {
 
     /**
      * Sets up a partitioned main table so its auto-derived Index Table includes the {@code
-     * __partition_id} system column and uses {@code KvFormat.ALIGNED}. Required for testing the
+     * __partition_id} system column and uses {@code KvFormat.COMPACTED}. Required for testing the
      * partition tombstone value filter which only installs on partitioned Index Tables.
      */
     private static Fixture setupPartitionedTables(String mainName) throws Exception {
@@ -505,26 +473,27 @@ class IndexPushReplicationITCase {
         return new Fixture(mainTableId, indexTableId, null, null, indexGateway);
     }
 
-    /**
-     * Polls the Index Table until the lookup for {@code key} matches the expected presence.
-     * "Present" means the bucket response contains a value with non-null payload; "absent" means
-     * the bucket returns no value or returns a tombstone.
-     */
     private static final int INDEX_BUCKET_COUNT = 3;
 
-    /** Bucket key type for the Index Table — only the indexed column(s), matching production. */
+    /** Bucket key type for the Index Table, containing only the indexed columns. */
     private static final RowType INDEX_BUCKET_KEY_TYPE =
             DataTypes.ROW(new DataField("b", DataTypes.STRING().copy(false)));
 
+    private static void assertIndexEntry(
+            long indexTableId, byte[] key, String indexValue, boolean expectPresent)
+            throws Exception {
+        boolean present = indexEntryPresent(indexTableId, key, indexValue);
+        assertThat(present)
+                .as(
+                        expectPresent
+                                ? "index entry must be visible when the write is acknowledged"
+                                : "index entry must be absent when the write is acknowledged")
+                .isEqualTo(expectPresent);
+    }
+
+    /** Waits until an asynchronous Index Table update reaches the expected state. */
     private static void waitForIndexEntry(
-            TabletServerGateway indexLeaderGateway,
-            long indexTableId,
-            byte[] key,
-            String bValue,
-            boolean expectPresent) {
-        int bucketId = computeIndexBucket(bValue);
-        TableBucket tb = new TableBucket(indexTableId, bucketId);
-        Replica replica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tb);
+            long indexTableId, byte[] key, String indexValue, boolean expectPresent) {
         String desc =
                 expectPresent
                         ? "wait for index entry to be visible on the Index Table"
@@ -532,15 +501,22 @@ class IndexPushReplicationITCase {
         waitUntil(
                 () -> {
                     try {
-                        List<byte[]> result = replica.lookups(Collections.singletonList(key));
-                        boolean present = result.get(0) != null;
-                        return present == expectPresent;
+                        return indexEntryPresent(indexTableId, key, indexValue) == expectPresent;
                     } catch (Exception e) {
                         return false;
                     }
                 },
                 INDEX_VISIBILITY_TIMEOUT,
                 desc);
+    }
+
+    private static boolean indexEntryPresent(long indexTableId, byte[] key, String indexValue)
+            throws Exception {
+        int bucketId = computeIndexBucket(indexValue);
+        Replica replica =
+                FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(
+                        new TableBucket(indexTableId, bucketId));
+        return replica.lookups(Collections.singletonList(key)).get(0) != null;
     }
 
     private static Schema buildMainSchema(@Nullable IndexVisibility visibility) {
@@ -590,39 +566,41 @@ class IndexPushReplicationITCase {
         return new FlussBucketingFunction().bucketing(bucketKey, INDEX_BUCKET_COUNT);
     }
 
-    private static AlignedRow encodePartitionedIndexValue(
+    private static CompactedRow encodePartitionedIndexValue(
             String b, int a, String p, long partitionId) {
-        AlignedRow row = new AlignedRow(PARTITIONED_INDEX_VALUE_ROW_TYPE.getFieldCount());
-        AlignedRowWriter writer = new AlignedRowWriter(row);
-        writer.reset();
-        writer.writeString(0, fromString(b));
-        writer.writeInt(1, a);
-        writer.writeString(2, fromString(p));
-        writer.writeLong(3, partitionId);
-        writer.complete();
+        CompactedRow row =
+                new CompactedRow(
+                        PARTITIONED_INDEX_VALUE_ROW_TYPE.getChildren().toArray(new DataType[0]));
+        CompactedRowWriter writer =
+                new CompactedRowWriter(PARTITIONED_INDEX_VALUE_ROW_TYPE.getFieldCount());
+        writer.writeString(fromString(b));
+        writer.writeInt(a);
+        writer.writeString(fromString(p));
+        writer.writeLong(partitionId);
+        row.pointTo(writer.segment(), 0, writer.position());
         return row;
     }
 
     /**
-     * Writes one physical partitioned Index Table row through the protocol-V1 tablet path and
-     * returns its complete physical key.
+     * Writes one physical partitioned Index Table row through the cumulative-progress tablet path
+     * and returns its complete physical key.
      */
     private static byte[] putPartitionedIndexEntry(
-            Fixture fixture, String b, int a, String p, long partitionId, long sequence)
+            Fixture fixture, String b, int a, String p, long partitionId, long progress)
             throws IOException {
-        AlignedRow row = encodePartitionedIndexValue(b, a, p, partitionId);
+        BinaryRow row = encodePartitionedIndexValue(b, a, p, partitionId);
         byte[] key = new CompactedKeyEncoder(PARTITIONED_INDEX_VALUE_ROW_TYPE).encodeKey(row);
         int targetBucket = computeIndexBucket(b);
         TableBucket sourceBucket = new TableBucket(fixture.mainTableId, partitionId, 0);
 
-        try (FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+        try (ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         1,
                         Integer.MAX_VALUE,
                         new UnmanagedPagedOutputView(4096),
-                        KvFormat.ALIGNED)) {
+                        KvFormat.COMPACTED)) {
             builder.append(key, row);
-            builder.setWriterState(IndexWriterKey.encode(sourceBucket), sequence);
+            builder.setWriterState(IndexWriterKey.encode(sourceBucket), progress);
             BytesView batch = builder.build();
 
             PutKvRequest request =

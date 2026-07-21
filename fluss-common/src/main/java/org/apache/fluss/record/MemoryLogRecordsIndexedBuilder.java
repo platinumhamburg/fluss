@@ -53,7 +53,7 @@ public class MemoryLogRecordsIndexedBuilder extends MemoryLogRecordsRowBuilder<I
                 appendOnly);
     }
 
-    public static MemoryLogRecordsIndexedBuilder fencedBuilder(
+    public static MemoryLogRecordsIndexedBuilder progressBuilder(
             int schemaId, int writeLimit, AbstractPagedOutputView outputView, boolean appendOnly) {
         return new MemoryLogRecordsIndexedBuilder(
                 BUILDER_DEFAULT_OFFSET,

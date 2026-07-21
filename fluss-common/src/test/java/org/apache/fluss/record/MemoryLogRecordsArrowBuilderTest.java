@@ -657,7 +657,7 @@ public class MemoryLogRecordsArrowBuilderTest {
     }
 
     @Test
-    void testNonEmptyFencedBatchWithStatistics() throws Exception {
+    void testNonEmptyProgressBatchWithStatistics() throws Exception {
         ArrowWriter writer =
                 provider.getOrCreateWriter(
                         1L, DEFAULT_SCHEMA_ID, 1024, DATA1_ROW_TYPE, DEFAULT_COMPRESSION);
@@ -665,23 +665,23 @@ public class MemoryLogRecordsArrowBuilderTest {
                 new LogRecordBatchStatisticsCollector(
                         writer.getSchema(), createAllColumnsStatsMapping(writer.getSchema()));
         MemoryLogRecordsArrowBuilder builder =
-                MemoryLogRecordsArrowBuilder.fencedBuilder(
+                MemoryLogRecordsArrowBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID,
                         writer,
                         new ManagedPagedOutputView(new TestingMemorySegmentPool(1024)),
                         false,
                         statisticsCollector);
         WriterKey writerKey = new WriterKey(71L, Long.MIN_VALUE | 5L);
-        long sequence = (long) Integer.MAX_VALUE + 71L;
+        long progress = (long) Integer.MAX_VALUE + 71L;
         builder.append(ChangeType.INSERT, row(4, "statistics"));
-        builder.setFencedWriterState(writerKey, sequence);
+        builder.setWriterProgress(writerKey, progress);
         builder.close();
 
         LogRecordBatch batch =
                 MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
         assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
-        assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
-        assertThat(batch.fencedSequence()).isEqualTo(sequence);
+        assertThat(batch.writerKey()).isEqualTo(writerKey);
+        assertThat(batch.writerProgress()).isEqualTo(progress);
         assertThat(batch.getRecordCount()).isEqualTo(1);
         batch.ensureValid();
 

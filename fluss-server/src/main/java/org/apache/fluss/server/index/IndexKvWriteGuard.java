@@ -36,7 +36,6 @@ import java.util.List;
 import java.util.OptionalLong;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
-import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Validates source-partition identity for physical Index Table V1 mutations. */
 public final class IndexKvWriteGuard implements KvWriteGuard {
@@ -50,10 +49,6 @@ public final class IndexKvWriteGuard implements KvWriteGuard {
 
     public IndexKvWriteGuard(TableInfo tableInfo, TabletServerMetadataCache metadataCache) {
         checkArgument(tableInfo.isIndexTable(), "KV write guard requires an Index Table");
-        checkState(
-                tableInfo.getMainTableId().isPresent(),
-                "Index Table %s has no main-table back-link",
-                tableInfo.getTableId());
         this.mainTableId = tableInfo.getMainTableId().getAsLong();
         this.metadataCache = metadataCache;
 

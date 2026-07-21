@@ -55,16 +55,16 @@ public class FileLogInputStreamTest extends LogTestBase {
     private @TempDir File tempDir;
 
     @Test
-    void testV3WriterKeyAndLongSequenceSurviveFileRoundTrip() throws Exception {
+    void testV3WriterKeyAndLongProgressSurviveFileRoundTrip() throws Exception {
         WriterKey writerKey = new WriterKey(17L, Long.MIN_VALUE | 3L);
-        long sequence = (long) Integer.MAX_VALUE + 17L;
+        long progress = (long) Integer.MAX_VALUE + 17L;
         MemoryLogRecordsIndexedBuilder builder =
-                MemoryLogRecordsIndexedBuilder.fencedBuilder(
+                MemoryLogRecordsIndexedBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID,
                         Integer.MAX_VALUE,
                         new UnmanagedPagedOutputView(100),
                         false);
-        builder.setFencedWriterState(writerKey, sequence);
+        builder.setWriterProgress(writerKey, progress);
         MemoryLogRecords records = MemoryLogRecords.pointToBytesView(builder.build());
 
         try (FileLogRecords fileLogRecords =
@@ -77,8 +77,8 @@ public class FileLogInputStreamTest extends LogTestBase {
                             .nextBatch();
             assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
             assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
-            assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
-            assertThat(batch.fencedSequence()).isEqualTo(sequence);
+            assertThat(batch.writerKey()).isEqualTo(writerKey);
+            assertThat(batch.writerProgress()).isEqualTo(progress);
         }
     }
 

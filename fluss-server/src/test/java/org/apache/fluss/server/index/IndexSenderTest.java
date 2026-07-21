@@ -23,9 +23,9 @@ import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
@@ -813,8 +813,8 @@ public class IndexSenderTest {
                     KvRecordBatchReader.pointToByteBuffer(
                             encodedBatch.encoded().getByteBuf().nioBuffer());
             assertThat(parsed.magic()).isEqualTo(KvRecordBatch.KV_MAGIC_VALUE_V1);
-            assertThat(parsed.fencedWriterKey()).isEqualTo(new WriterKey(9L, 3L));
-            assertThat(parsed.fencedSequence()).isEqualTo(10L);
+            assertThat(parsed.writerKey()).isEqualTo(new WriterKey(9L, 3L));
+            assertThat(parsed.writerProgress()).isEqualTo(10L);
             accumulator.append(encodedBatch);
 
             await(() -> gateway.apiVersionsCalls == 1);
@@ -1427,10 +1427,13 @@ public class IndexSenderTest {
             await(() -> gateway.requests.size() == 1);
             senderWakeup.accept(largeBucket);
             await(() -> owner.terminalFailure() != null);
-            await(() -> sender.inFlightRequestCount() == 0);
+            assertThat(sender.inFlightRequestCount())
+                    .as("the sent PutKv RPC remains in flight until its late completion arrives")
+                    .isOne();
 
             completePutKv(gateway, 0, true);
             await(() -> accumulator.pendingBytes() == 0L);
+            assertThat(sender.inFlightRequestCount()).isZero();
 
             assertThat(owner.getSyncIndexPushedOffset()).isZero();
             assertThat(gateway.requests).hasSize(1);
@@ -1671,8 +1674,8 @@ public class IndexSenderTest {
 
     private static IndexBatch v1Batch(TableBucket targetBucket, IndexWindow window)
             throws Exception {
-        FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         1, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
         builder.append(new byte[] {7, 8, 9}, null);
         builder.setWriterState(new WriterKey(9L, 3L), 10L);
@@ -1880,6 +1883,86 @@ public class IndexSenderTest {
             gateway.pending.get(0).complete(ackResponse(0));
             await(() -> owner.getSyncIndexPushedOffset() == 10L);
         } finally {
+            sender.close();
+        }
+    }
+
+    @Test
+    void inFlightRequestMetricCountsConsolidatedPutKvRpc() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, bucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L);
+        try {
+            IndexReplicator owner = owner(accumulator);
+            IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+            IndexBatch first = batch(new TableBucket(91L, 0), window);
+            IndexBatch second = batch(new TableBucket(91L, 1), window);
+            assertThat(accumulator.tryAppendWindow(Arrays.asList(first, second))).isTrue();
+
+            await(() -> gateway.pending.size() == 1);
+            assertThat(gateway.requests.get(0).getBucketsReqsCount()).isEqualTo(2);
+            assertThat(sender.inFlightRequestCount())
+                    .as("one consolidated PutKv RPC must count as one in-flight request")
+                    .isOne();
+
+            completePutKv(gateway, 0, true);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+            assertThat(sender.inFlightRequestCount()).isZero();
+        } finally {
+            for (int i = 0; i < gateway.pending.size(); i++) {
+                if (!gateway.pending.get(i).isDone()) {
+                    completePutKv(gateway, i, true);
+                }
+            }
+            sender.close();
+        }
+    }
+
+    @Test
+    void capabilityProbeIsNotCountedAsInFlightPutKvRequest() throws Exception {
+        IndexAccumulator accumulator = new IndexAccumulator();
+        RecordingGateway gateway = new RecordingGateway();
+        gateway.pendingApiVersions = new CompletableFuture<>();
+        IndexSender sender =
+                new IndexSender(
+                        accumulator,
+                        (tableId, bucket) -> OptionalInt.of(1),
+                        serverId -> gateway,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        1,
+                        5L);
+        try {
+            IndexReplicator owner = owner(accumulator);
+            accumulator.append(
+                    batch(new TableBucket(92L, 0), new IndexWindow("idx", 10L, 1, owner)));
+
+            await(() -> gateway.apiVersionsCalls == 1);
+            assertThat(sender.inFlightRequestCount()).isZero();
+            assertThat(sender.oldestInFlightAgeMs()).isZero();
+
+            gateway.completeApiVersions(true);
+            await(() -> gateway.pending.size() == 1);
+            assertThat(sender.inFlightRequestCount()).isOne();
+            await(() -> sender.oldestInFlightAgeMs() > 0L);
+
+            completePutKv(gateway, 0, true);
+            await(() -> owner.getSyncIndexPushedOffset() == 10L);
+            assertThat(sender.inFlightRequestCount()).isZero();
+            assertThat(sender.oldestInFlightAgeMs()).isZero();
+        } finally {
+            gateway.completeApiVersions(true);
+            for (int i = 0; i < gateway.pending.size(); i++) {
+                if (!gateway.pending.get(i).isDone()) {
+                    completePutKv(gateway, i, true);
+                }
+            }
             sender.close();
         }
     }

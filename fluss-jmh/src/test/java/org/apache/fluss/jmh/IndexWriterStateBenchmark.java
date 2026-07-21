@@ -20,9 +20,9 @@ package org.apache.fluss.jmh;
 import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.WriterKey;
-import org.apache.fluss.server.log.FencedWriterAppendInfo;
 import org.apache.fluss.server.log.LogOffsetMetadata;
 import org.apache.fluss.server.log.WriterAppendInfo;
+import org.apache.fluss.server.log.WriterProgressAppendInfo;
 import org.apache.fluss.server.log.WriterStateEntry;
 import org.apache.fluss.server.log.WriterStateManager;
 import org.apache.fluss.utils.FileUtils;
@@ -50,7 +50,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** Capacity curves for the existing V0 and offset-fenced V1 WriterState representations. */
+/** Capacity curves for contiguous-sequence and cumulative-progress WriterState. */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
 @Warmup(iterations = 3, time = 100, timeUnit = TimeUnit.MILLISECONDS)
@@ -75,14 +75,14 @@ public class IndexWriterStateBenchmark {
     public long freshAppendValidation(TopologyState state) {
         WriterStateManager manager = state.nextFreshManager();
         int writer = state.nextFreshWriter();
-        if (state.protocol == KvIdempotenceProtocol.V0_COMPACT) {
+        if (state.protocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
             WriterAppendInfo update = manager.prepareUpdate(writer);
             update.appendDataBatch(
                     5, new LogOffsetMetadata(5L), 5L, false, true, state.stateTimestampMs);
             return update.toEntry().lastBatchSequence();
         }
-        FencedWriterAppendInfo update =
-                manager.prepareFencedUpdate(
+        WriterProgressAppendInfo update =
+                manager.prepareProgressUpdate(
                         state.newWriterKey(writer, WriterKeyUse.INCOMING_REQUEST));
         update.append(1L, 1L, state.stateTimestampMs);
         return update.updatedEntry().lastSequence();
@@ -120,7 +120,7 @@ public class IndexWriterStateBenchmark {
     public long staleFenceLookup(StaleState state) {
         WriterStateManager manager = state.nextStaleManager();
         int writer = state.nextStaleWriter();
-        return manager.findStaleFencedBatch(
+        return manager.findStaleProgressBatch(
                         state.newWriterKey(writer, WriterKeyUse.INCOMING_REQUEST), 0L)
                 .orElseThrow(AssertionError::new)
                 .lastSequence();
@@ -193,7 +193,7 @@ public class IndexWriterStateBenchmark {
         }
 
         private void populate(WriterStateManager manager) {
-            if (protocol == KvIdempotenceProtocol.V0_COMPACT) {
+            if (protocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
                 for (int writer = 0; writer < sourceWriters; writer++) {
                     WriterStateEntry entry = WriterStateEntry.empty(writer);
                     for (int sequence = 0; sequence < 5; sequence++) {
@@ -204,9 +204,9 @@ public class IndexWriterStateBenchmark {
             } else {
                 for (int writer = 0; writer < sourceWriters; writer++) {
                     WriterKey writerKey = newWriterKey(writer, WriterKeyUse.RETAINED_STATE);
-                    FencedWriterAppendInfo update = manager.prepareFencedUpdate(writerKey);
+                    WriterProgressAppendInfo update = manager.prepareProgressUpdate(writerKey);
                     update.append(0L, 0L, stateTimestampMs);
-                    manager.updateFenced(update);
+                    manager.updateProgress(update);
                 }
             }
         }
@@ -220,7 +220,7 @@ public class IndexWriterStateBenchmark {
                                     protocol, manager.writerIdCount(), sourceWriters));
                 }
             }
-            if (protocol == KvIdempotenceProtocol.V0_COMPACT) {
+            if (protocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
                 Field writers = WriterStateManager.class.getDeclaredField("writers");
                 if (!writers.getGenericType().getTypeName().contains("java.lang.Long")) {
                     throw new AssertionError("V0 WriterState no longer uses Map<Long,...>");
@@ -337,7 +337,7 @@ public class IndexWriterStateBenchmark {
     /** State shared by the three protocol-comparison benchmark methods. */
     @State(Scope.Benchmark)
     public static class TopologyState extends BaseState {
-        @Param({"V0_COMPACT", "V1_FENCED"})
+        @Param({"CONTIGUOUS_BATCH_SEQUENCE", "CUMULATIVE_PROGRESS"})
         public String protocolName;
 
         @Param({"64", "1024", "16384"})
@@ -363,7 +363,7 @@ public class IndexWriterStateBenchmark {
 
         @Setup(Level.Trial)
         public void setup() throws Exception {
-            initialize("V1_FENCED", configuredSourceWriters, configuredTargetBuckets);
+            initialize("CUMULATIVE_PROGRESS", configuredSourceWriters, configuredTargetBuckets);
         }
     }
 }

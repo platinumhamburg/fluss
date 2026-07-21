@@ -30,8 +30,8 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  * Versioned physical layout of raw KV value bytes.
  *
  * <p>The schema id retains the little-endian encoding used by existing KV formats. The optional
- * value tag uses big-endian encoding so Java and native compaction filters share an explicit,
- * platform-independent representation.
+ * value tag uses big-endian encoding so Java readers and the native compaction filter share an
+ * explicit, platform-independent representation.
  */
 @Internal
 public final class KvValueLayout {

@@ -69,10 +69,11 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
  * pre-encoded {@link IndexBatch}es from the shared {@link IndexAccumulator}, groups them by target
  * Index Table leader server, and dispatches consolidated multi-bucket {@code PutKvRequest}s.
  *
- * <p>Each target index bucket is owned by exactly one worker ({@code bucket.hashCode() % M}),
- * giving per-bucket serialization for free. In addition, a bucket with an in-flight request is
- * "muted" so the worker does not send a second batch for it concurrently; per-bucket in-order
- * delivery is thus guaranteed.
+ * <p>Within one {@code IndexSender} instance, each target index bucket is owned by exactly one
+ * worker ({@code bucket.hashCode() % M}). A bucket with an in-flight request is also "muted", so a
+ * later local batch cannot overtake it. This local ordering does not serialize requests from other
+ * TabletServers or late requests from a previous source leader; the target WriterState handles
+ * those cases.
  *
  * <p>Reliability follows at-least-once semantics: on RPC failure (or unresolved leader) the batch
  * is re-enqueued to the front of its bucket queue via {@link
@@ -149,11 +150,10 @@ public final class IndexSender implements AutoCloseable {
     /** Timeout applied to each index {@code PutKv} request. */
     private final long requestTimeoutMs;
 
-    /** Buckets with an in-flight request; value is the request send timestamp in millis. */
-    private final ConcurrentMap<TableBucket, Long> inFlightSinceMs = MapUtils.newConcurrentMap();
-
     private final ConcurrentMap<TableBucket, IndexBatch> inFlightBatches =
             MapUtils.newConcurrentMap();
+    private final Set<InFlightRequest> inFlightRequests =
+            Collections.newSetFromMap(MapUtils.newConcurrentMap());
     private final ReentrantLock lifecycleLock = new ReentrantLock();
     private final Condition lifecycleDrained = lifecycleLock.newCondition();
     private final Map<Integer, TargetContext> targetsByServer = new HashMap<>();
@@ -431,7 +431,6 @@ public final class IndexSender implements AutoCloseable {
             for (IndexBatch batch : batchesToRelease) {
                 TableBucket bucket = batch.targetBucket();
                 inFlightBatches.remove(bucket, batch);
-                inFlightSinceMs.remove(bucket);
             }
         } finally {
             lifecycleLock.unlock();
@@ -606,7 +605,7 @@ public final class IndexSender implements AutoCloseable {
                     if (lifecyclePhase != LifecyclePhase.OPEN) {
                         break;
                     }
-                    if (ownerOf(bucket) != workerId || inFlightSinceMs.containsKey(bucket)) {
+                    if (ownerOf(bucket) != workerId || inFlightBatches.containsKey(bucket)) {
                         continue;
                     }
                     IndexBatch batch = accumulator.pollFirstReady(bucket, now);
@@ -616,7 +615,6 @@ public final class IndexSender implements AutoCloseable {
                         }
                         continue;
                     }
-                    inFlightSinceMs.put(bucket, now);
                     inFlightBatches.put(bucket, batch);
                     ownedBatches.add(batch);
                     claimed.add(batch);
@@ -873,7 +871,6 @@ public final class IndexSender implements AutoCloseable {
             }
             List<IndexBatch> requestBatches = requestChunk.batches;
             PutKvRequest request = buildRequest(tableId, requestBatches);
-            long startNs = System.nanoTime();
             boolean leadersCurrent = leadersMatch(target.serverId, requestBatches);
             List<BatchAction> actions = new ArrayList<>();
             boolean registered = false;
@@ -898,6 +895,8 @@ public final class IndexSender implements AutoCloseable {
             if (!registered) {
                 return;
             }
+            InFlightRequest inFlightRequest = new InFlightRequest();
+            inFlightRequests.add(inFlightRequest);
             CompletableFuture<PutKvResponse> future;
             try {
                 future = target.gateway.putKv(request);
@@ -910,10 +909,15 @@ public final class IndexSender implements AutoCloseable {
                                 (resp, err) -> {
                                     lifecycleHooks.beforePutKvCompletion();
                                     completePutKvRequest(
-                                            target, tableId, requestBatches, startNs, resp, err);
+                                            target,
+                                            tableId,
+                                            requestBatches,
+                                            inFlightRequest,
+                                            resp,
+                                            err);
                                 });
             } catch (Throwable t) {
-                completePutKvRequest(target, tableId, requestBatches, startNs, null, t);
+                completePutKvRequest(target, tableId, requestBatches, inFlightRequest, null, t);
             }
         }
 
@@ -951,9 +955,10 @@ public final class IndexSender implements AutoCloseable {
                 TargetContext target,
                 long tableId,
                 List<IndexBatch> chunk,
-                long startNs,
+                InFlightRequest inFlightRequest,
                 @Nullable PutKvResponse response,
                 @Nullable Throwable error) {
+            inFlightRequests.remove(inFlightRequest);
             boolean leadersCurrent = leadersMatch(target.serverId, chunk);
             List<BatchAction> actions = new ArrayList<>();
             lifecycleLock.lock();
@@ -974,7 +979,8 @@ public final class IndexSender implements AutoCloseable {
             } finally {
                 lifecycleLock.unlock();
             }
-            metrics.indexPushLatencyHistogram().update((System.nanoTime() - startNs) / 1_000_000L);
+            metrics.indexPushLatencyHistogram()
+                    .update((System.nanoTime() - inFlightRequest.startNs) / 1_000_000L);
             try {
                 runAccountingAndCallbacks(actions);
             } finally {
@@ -1386,7 +1392,6 @@ public final class IndexSender implements AutoCloseable {
         try {
             ownedBatches.remove(batch);
             if (inFlightBatches.remove(bucket, batch)) {
-                inFlightSinceMs.remove(bucket);
                 unmuted = true;
             }
         } finally {
@@ -1438,7 +1443,6 @@ public final class IndexSender implements AutoCloseable {
         if (!inFlightBatches.remove(bucket, batch)) {
             return;
         }
-        inFlightSinceMs.remove(bucket);
         BatchDisposition disposition = requestedDisposition;
         if (lifecyclePhase != LifecyclePhase.OPEN || !batch.ownerActive()) {
             disposition = BatchDisposition.RELEASE;
@@ -1536,8 +1540,12 @@ public final class IndexSender implements AutoCloseable {
         }
     }
 
+    private static final class InFlightRequest {
+        private final long startNs = System.nanoTime();
+    }
+
     public int inFlightRequestCount() {
-        return inFlightSinceMs.size();
+        return inFlightRequests.size();
     }
 
     @VisibleForTesting
@@ -1599,13 +1607,12 @@ public final class IndexSender implements AutoCloseable {
     }
 
     public long oldestInFlightAgeMs() {
-        long oldest = Long.MAX_VALUE;
-        for (Long startMs : inFlightSinceMs.values()) {
-            if (startMs < oldest) {
-                oldest = startMs;
-            }
+        long nowNs = System.nanoTime();
+        long oldestAgeMs = 0L;
+        for (InFlightRequest request : inFlightRequests) {
+            oldestAgeMs = Math.max(oldestAgeMs, (nowNs - request.startNs) / 1_000_000L);
         }
-        return oldest == Long.MAX_VALUE ? 0L : System.currentTimeMillis() - oldest;
+        return oldestAgeMs;
     }
 
     private PutKvRequest buildRequest(long tableId, List<IndexBatch> batches) {

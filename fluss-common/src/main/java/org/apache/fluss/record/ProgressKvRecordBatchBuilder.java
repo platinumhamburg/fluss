@@ -24,7 +24,6 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.compacted.CompactedRow;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.utils.crc.Crc32C;
@@ -33,14 +32,14 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 
-import static org.apache.fluss.record.FencedKvRecordBatch.CRC_OFFSET;
-import static org.apache.fluss.record.FencedKvRecordBatch.LENGTH_LENGTH;
-import static org.apache.fluss.record.FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
-import static org.apache.fluss.record.FencedKvRecordBatch.SCHEMA_ID_OFFSET;
+import static org.apache.fluss.record.ProgressKvRecordBatch.CRC_OFFSET;
+import static org.apache.fluss.record.ProgressKvRecordBatch.LENGTH_LENGTH;
+import static org.apache.fluss.record.ProgressKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
+import static org.apache.fluss.record.ProgressKvRecordBatch.SCHEMA_ID_OFFSET;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
-/** Builder for magic-1 {@link FencedKvRecordBatch} memory bytes. */
-public class FencedKvRecordBatchBuilder implements AutoCloseable {
+/** Builder for magic-1 {@link ProgressKvRecordBatch} memory bytes. */
+public class ProgressKvRecordBatchBuilder implements AutoCloseable {
 
     private final int schemaId;
     private final int writeLimit;
@@ -50,14 +49,14 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
 
     private BytesView builtBuffer;
     private WriterKey writerKey;
-    private long sequence;
+    private long writerProgress;
     private int currentRecordNumber;
     private int sizeInBytes;
     private boolean writerStateSet;
     private volatile boolean isClosed;
     private boolean aborted;
 
-    private FencedKvRecordBatchBuilder(
+    private ProgressKvRecordBatchBuilder(
             int schemaId,
             int writeLimit,
             AbstractPagedOutputView pagedOutputView,
@@ -74,9 +73,9 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
         pagedOutputView.setPosition(RECORD_BATCH_HEADER_SIZE);
     }
 
-    public static FencedKvRecordBatchBuilder builder(
+    public static ProgressKvRecordBatchBuilder builder(
             int schemaId, int writeLimit, AbstractPagedOutputView outputView, KvFormat kvFormat) {
-        return new FencedKvRecordBatchBuilder(schemaId, writeLimit, outputView, kvFormat);
+        return new ProgressKvRecordBatchBuilder(schemaId, writeLimit, outputView, kvFormat);
     }
 
     /** Returns whether there is room for the supplied record. */
@@ -88,11 +87,11 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
     public void append(byte[] key, @Nullable BinaryRow row) throws IOException {
         if (aborted) {
             throw new IllegalStateException(
-                    "Tried to append a record, but FencedKvRecordBatchBuilder has already been aborted");
+                    "Tried to append a record, but ProgressKvRecordBatchBuilder has already been aborted");
         }
         if (isClosed) {
             throw new IllegalStateException(
-                    "Tried to put a record, but FencedKvRecordBatchBuilder is closed for record puts.");
+                    "Tried to put a record, but ProgressKvRecordBatchBuilder is closed for record puts.");
         }
         int recordBytes = DefaultKvRecord.writeTo(pagedOutputView, key, validateRowFormat(row));
         currentRecordNumber++;
@@ -104,25 +103,26 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
         sizeInBytes += recordBytes;
     }
 
-    /** Sets the opaque writer identity and non-negative fenced sequence for this batch. */
-    public void setWriterState(WriterKey writerKey, long sequence) {
+    /** Sets the writer identity and non-negative cumulative progress for this batch. */
+    public void setWriterState(WriterKey writerKey, long writerProgress) {
         if (writerKey == null) {
             throw new NullPointerException("writerKey must not be null");
         }
-        checkArgument(sequence >= 0, "fenced sequence must be non-negative");
+        checkArgument(writerProgress >= 0, "writer progress must be non-negative");
         this.builtBuffer = null;
         this.writerKey = writerKey;
-        this.sequence = sequence;
+        this.writerProgress = writerProgress;
         this.writerStateSet = true;
     }
 
-    /** Builds the fenced KV batch. */
+    /** Builds the cumulative-progress KV batch. */
     public BytesView build() throws IOException {
         if (aborted) {
             throw new IllegalStateException("Attempting to build an aborted record batch");
         }
         if (!writerStateSet) {
-            throw new IllegalStateException("Fenced KV batch requires writer state before build");
+            throw new IllegalStateException(
+                    "Cumulative-progress KV batch requires writer progress before build");
         }
         if (builtBuffer == null) {
             writeBatchHeader();
@@ -142,7 +142,7 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
     public void close() {
         if (aborted) {
             throw new IllegalStateException(
-                    "Cannot close FencedKvRecordBatchBuilder as it has already been aborted");
+                    "Cannot close ProgressKvRecordBatchBuilder as it has already been aborted");
         }
         isClosed = true;
     }
@@ -156,7 +156,7 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
         outputView.writeByte(0);
         outputView.writeLong(writerKey.high());
         outputView.writeLong(writerKey.low());
-        outputView.writeLong(sequence);
+        outputView.writeLong(writerProgress);
         outputView.writeInt(currentRecordNumber);
         long crc = Crc32C.compute(pagedOutputView.getWrittenSegments(), SCHEMA_ID_OFFSET);
         outputView.setPosition(CRC_OFFSET);
@@ -171,9 +171,6 @@ public class FencedKvRecordBatchBuilder implements AutoCloseable {
             return row;
         }
         if (kvFormat == KvFormat.INDEXED && row instanceof IndexedRow) {
-            return row;
-        }
-        if (kvFormat == KvFormat.ALIGNED && row instanceof AlignedRow) {
             return row;
         }
         throw new IllegalArgumentException(

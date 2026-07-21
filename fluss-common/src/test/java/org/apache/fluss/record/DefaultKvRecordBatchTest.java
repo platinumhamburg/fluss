@@ -79,9 +79,8 @@ class DefaultKvRecordBatchTest extends KvTestBase {
         assertThat(batch.batchSequence()).isEqualTo(Integer.MAX_VALUE);
         assertThat(DefaultKvRecordBatch.RECORD_BATCH_HEADER_SIZE).isEqualTo(28);
         assertThat(bytes).isEqualTo(EXPECTED_V0_FIXTURE);
-        assertThatThrownBy(batch::fencedWriterKey)
-                .isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(batch::fencedSequence).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::writerKey).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::writerProgress).isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test

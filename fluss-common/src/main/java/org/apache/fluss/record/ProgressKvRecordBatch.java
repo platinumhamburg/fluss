@@ -28,14 +28,14 @@ import java.util.Iterator;
 import java.util.NoSuchElementException;
 
 /**
- * KV record batch implementation for magic 1 with an opaque 128-bit writer key and a 64-bit fenced
- * sequence.
+ * KV record batch implementation for magic 1 with a 128-bit writer key and 64-bit cumulative writer
+ * progress.
  *
- * <p>The CRC covers the bytes from schema id through the end of the batch, matching the V0 CRC
- * coverage.
+ * <p>The CRC covers the bytes from schema id through the end of the batch, matching the magic-0
+ * batch CRC coverage.
  */
 @PublicEvolving
-public class FencedKvRecordBatch implements KvRecordBatch {
+public class ProgressKvRecordBatch implements KvRecordBatch {
 
     static final int LENGTH_LENGTH = 4;
     static final int MAGIC_LENGTH = 1;
@@ -43,7 +43,7 @@ public class FencedKvRecordBatch implements KvRecordBatch {
     static final int SCHEMA_ID_LENGTH = 2;
     static final int ATTRIBUTES_LENGTH = 1;
     static final int WRITER_KEY_PART_LENGTH = 8;
-    static final int FENCED_SEQUENCE_LENGTH = 8;
+    static final int WRITER_PROGRESS_LENGTH = 8;
     static final int RECORDS_COUNT_LENGTH = 4;
 
     static final int LENGTH_OFFSET = 0;
@@ -53,8 +53,8 @@ public class FencedKvRecordBatch implements KvRecordBatch {
     static final int ATTRIBUTES_OFFSET = SCHEMA_ID_OFFSET + SCHEMA_ID_LENGTH;
     static final int WRITER_KEY_HIGH_OFFSET = ATTRIBUTES_OFFSET + ATTRIBUTES_LENGTH;
     static final int WRITER_KEY_LOW_OFFSET = WRITER_KEY_HIGH_OFFSET + WRITER_KEY_PART_LENGTH;
-    static final int FENCED_SEQUENCE_OFFSET = WRITER_KEY_LOW_OFFSET + WRITER_KEY_PART_LENGTH;
-    static final int RECORDS_COUNT_OFFSET = FENCED_SEQUENCE_OFFSET + FENCED_SEQUENCE_LENGTH;
+    static final int WRITER_PROGRESS_OFFSET = WRITER_KEY_LOW_OFFSET + WRITER_KEY_PART_LENGTH;
+    static final int RECORDS_COUNT_OFFSET = WRITER_PROGRESS_OFFSET + WRITER_PROGRESS_LENGTH;
     static final int RECORDS_OFFSET = RECORDS_COUNT_OFFSET + RECORDS_COUNT_LENGTH;
     public static final int RECORD_BATCH_HEADER_SIZE = RECORDS_OFFSET;
 
@@ -111,12 +111,14 @@ public class FencedKvRecordBatch implements KvRecordBatch {
 
     @Override
     public long writerId() {
-        throw new UnsupportedOperationException("V1 batch has no V0 writer id");
+        throw new UnsupportedOperationException(
+                "Cumulative-progress batch has no contiguous-sequence writer id");
     }
 
     @Override
     public int batchSequence() {
-        throw new UnsupportedOperationException("V1 batch has no V0 batch sequence");
+        throw new UnsupportedOperationException(
+                "Cumulative-progress batch has no contiguous batch sequence");
     }
 
     @Override
@@ -125,15 +127,15 @@ public class FencedKvRecordBatch implements KvRecordBatch {
     }
 
     @Override
-    public WriterKey fencedWriterKey() {
+    public WriterKey writerKey() {
         return new WriterKey(
                 segment.getLong(position + WRITER_KEY_HIGH_OFFSET),
                 segment.getLong(position + WRITER_KEY_LOW_OFFSET));
     }
 
     @Override
-    public long fencedSequence() {
-        return segment.getLong(position + FENCED_SEQUENCE_OFFSET);
+    public long writerProgress() {
+        return segment.getLong(position + WRITER_PROGRESS_OFFSET);
     }
 
     @Override
@@ -196,20 +198,21 @@ public class FencedKvRecordBatch implements KvRecordBatch {
         int recordCount = getRecordCount();
         if (recordCount < 0) {
             throw new CorruptMessageException(
-                    "Fenced KV batch has negative record count " + recordCount);
+                    "Cumulative-progress KV batch has negative record count " + recordCount);
         }
         int payloadSize = sizeInBytes() - RECORD_BATCH_HEADER_SIZE;
         long minimumPayloadSize = (long) recordCount * (DefaultKvRecord.LENGTH_LENGTH + 1L);
         if (minimumPayloadSize > payloadSize) {
             throw new CorruptMessageException(
-                    "Fenced KV batch record count "
+                    "Cumulative-progress KV batch record count "
                             + recordCount
                             + " does not fit payload size "
                             + payloadSize);
         }
         if (recordCount == 0 && payloadSize != 0) {
             throw new CorruptMessageException(
-                    "Fenced KV batch record count 0 does not match payload size " + payloadSize);
+                    "Cumulative-progress KV batch record count 0 does not match payload size "
+                            + payloadSize);
         }
     }
 
@@ -258,8 +261,8 @@ public class FencedKvRecordBatch implements KvRecordBatch {
         return Crc32C.compute(buffer, SCHEMA_ID_OFFSET, sizeInBytes() - SCHEMA_ID_OFFSET);
     }
 
-    public static FencedKvRecordBatch pointToMemory(MemorySegment segment, int position) {
-        FencedKvRecordBatch batch = new FencedKvRecordBatch();
+    public static ProgressKvRecordBatch pointToMemory(MemorySegment segment, int position) {
+        ProgressKvRecordBatch batch = new ProgressKvRecordBatch();
         batch.pointTo(segment, position);
         return batch;
     }

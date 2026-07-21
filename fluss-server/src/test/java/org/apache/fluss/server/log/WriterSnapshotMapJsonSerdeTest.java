@@ -18,8 +18,8 @@
 package org.apache.fluss.server.log;
 
 import org.apache.fluss.record.WriterKey;
-import org.apache.fluss.server.log.WriterStateManager.FencedWriterSnapshotEntry;
-import org.apache.fluss.server.log.WriterStateManager.FencedWriterSnapshotMap;
+import org.apache.fluss.server.log.WriterStateManager.WriterProgressSnapshotEntry;
+import org.apache.fluss.server.log.WriterStateManager.WriterProgressSnapshotMap;
 import org.apache.fluss.server.log.WriterStateManager.WriterSnapshotEntry;
 import org.apache.fluss.server.log.WriterStateManager.WriterSnapshotMap;
 import org.apache.fluss.utils.json.JsonSerdeTestBase;
@@ -64,11 +64,11 @@ public class WriterSnapshotMapJsonSerdeTest extends JsonSerdeTestBase<WriterSnap
     }
 
     @Test
-    void testFencedSnapshotV2ExactSchemaAndRoundTrip() {
-        FencedWriterSnapshotMap expected =
-                new FencedWriterSnapshotMap(
+    void testProgressSnapshotV2ExactSchemaAndRoundTrip() {
+        WriterProgressSnapshotMap expected =
+                new WriterProgressSnapshotMap(
                         Collections.singletonList(
-                                new FencedWriterSnapshotEntry(
+                                new WriterProgressSnapshotEntry(
                                         new WriterKey(Long.MAX_VALUE, Long.MIN_VALUE | 3L),
                                         (long) Integer.MAX_VALUE + 1L,
                                         Long.MAX_VALUE - 1L,
@@ -76,7 +76,7 @@ public class WriterSnapshotMapJsonSerdeTest extends JsonSerdeTestBase<WriterSnap
 
         byte[] json =
                 JsonSerdeUtils.writeValueAsBytes(
-                        expected, WriterStateManager.FencedWriterSnapshotMapJsonSerde.INSTANCE);
+                        expected, WriterStateManager.WriterProgressSnapshotMapJsonSerde.INSTANCE);
 
         assertThat(new String(json, StandardCharsets.UTF_8))
                 .isEqualTo(
@@ -88,25 +88,26 @@ public class WriterSnapshotMapJsonSerdeTest extends JsonSerdeTestBase<WriterSnap
                                 + "\"last_timestamp\":42}]}");
         assertThat(
                         JsonSerdeUtils.readValue(
-                                json, WriterStateManager.FencedWriterSnapshotMapJsonSerde.INSTANCE))
+                                json,
+                                WriterStateManager.WriterProgressSnapshotMapJsonSerde.INSTANCE))
                 .isEqualTo(expected);
     }
 
     @Test
-    void testFencedSnapshotRejectsWrongOrMissingProtocol() {
-        assertInvalidFencedSnapshot(
+    void testProgressSnapshotRejectsWrongOrMissingProtocol() {
+        assertInvalidProgressSnapshot(
                 "{\"version\":1,\"kv_idempotence_protocol_version\":1,\"writer_entries\":[]}");
-        assertInvalidFencedSnapshot("{\"version\":2,\"writer_entries\":[]}");
-        assertInvalidFencedSnapshot(
+        assertInvalidProgressSnapshot("{\"version\":2,\"writer_entries\":[]}");
+        assertInvalidProgressSnapshot(
                 "{\"version\":2,\"kv_idempotence_protocol_version\":0,\"writer_entries\":[]}");
     }
 
     @Test
-    void testFencedSnapshotRejectsDuplicateWriterKeys() {
+    void testProgressSnapshotRejectsDuplicateWriterKeys() {
         String entry =
                 "{\"writer_key_high\":4,\"writer_key_low\":5,\"last_sequence\":100,"
                         + "\"last_target_wal_offset\":10,\"last_timestamp\":1}";
-        assertInvalidFencedSnapshot(
+        assertInvalidProgressSnapshot(
                 "{\"version\":2,\"kv_idempotence_protocol_version\":1,\"writer_entries\":["
                         + entry
                         + ","
@@ -115,36 +116,36 @@ public class WriterSnapshotMapJsonSerdeTest extends JsonSerdeTestBase<WriterSnap
     }
 
     @Test
-    void testFencedSnapshotRejectsNegativeSequence() {
-        assertInvalidFencedSnapshot(
-                validFencedSnapshotEntry()
+    void testProgressSnapshotRejectsNegativeProgress() {
+        assertInvalidProgressSnapshot(
+                validProgressSnapshotEntry()
                         .replace("\"last_sequence\":100", "\"last_sequence\":-1"));
     }
 
     @Test
-    void testFencedSnapshotRejectsMissingOrMalformedFields() {
-        assertInvalidFencedSnapshot(
-                validFencedSnapshotEntry().replace("\"writer_key_high\":4,", ""));
-        assertInvalidFencedSnapshot(
-                validFencedSnapshotEntry()
+    void testProgressSnapshotRejectsMissingOrMalformedFields() {
+        assertInvalidProgressSnapshot(
+                validProgressSnapshotEntry().replace("\"writer_key_high\":4,", ""));
+        assertInvalidProgressSnapshot(
+                validProgressSnapshotEntry()
                         .replace("\"writer_key_low\":5", "\"writer_key_low\":\"5\""));
-        assertInvalidFencedSnapshot(
-                validFencedSnapshotEntry()
+        assertInvalidProgressSnapshot(
+                validProgressSnapshotEntry()
                         .replace("\"last_timestamp\":1", "\"last_timestamp\":1.5"));
     }
 
-    private static String validFencedSnapshotEntry() {
+    private static String validProgressSnapshotEntry() {
         return "{\"version\":2,\"kv_idempotence_protocol_version\":1,\"writer_entries\":[{"
                 + "\"writer_key_high\":4,\"writer_key_low\":5,\"last_sequence\":100,"
                 + "\"last_target_wal_offset\":10,\"last_timestamp\":1}]}";
     }
 
-    private static void assertInvalidFencedSnapshot(String json) {
+    private static void assertInvalidProgressSnapshot(String json) {
         assertThatThrownBy(
                         () ->
                                 JsonSerdeUtils.readValue(
                                         json.getBytes(StandardCharsets.UTF_8),
-                                        WriterStateManager.FencedWriterSnapshotMapJsonSerde
+                                        WriterStateManager.WriterProgressSnapshotMapJsonSerde
                                                 .INSTANCE))
                 .isInstanceOf(IllegalArgumentException.class);
     }

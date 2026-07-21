@@ -58,7 +58,7 @@ public final class KvRecordBatchReader {
         if (magic == KvRecordBatch.KV_MAGIC_VALUE_V0) {
             headerSize = DefaultKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
         } else if (magic == KvRecordBatch.KV_MAGIC_VALUE_V1) {
-            headerSize = FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
+            headerSize = ProgressKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
         } else {
             throw new CorruptMessageException(
                     "Unsupported KV batch magic " + Byte.toUnsignedInt(magic));
@@ -86,7 +86,7 @@ public final class KvRecordBatchReader {
         if (magic == KvRecordBatch.KV_MAGIC_VALUE_V0) {
             return DefaultKvRecordBatch.pointToMemory(segment, position);
         }
-        FencedKvRecordBatch batch = FencedKvRecordBatch.pointToMemory(segment, position);
+        ProgressKvRecordBatch batch = ProgressKvRecordBatch.pointToMemory(segment, position);
         batch.validateRecordCountAndPayloadSize();
         return batch;
     }

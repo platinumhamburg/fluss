@@ -67,7 +67,7 @@ class IndexTableDescriptorFactoryTest {
     }
 
     @Test
-    void testDerivePartitionedIndexTableUsesAlignedWalAndAddsPartitionId() {
+    void testDerivePartitionedIndexTableUsesCompactedKvAndAddsPartitionId() {
         Schema mainSchema =
                 Schema.newBuilder()
                         .column("order_id", DataTypes.BIGINT())
@@ -96,7 +96,7 @@ class IndexTableDescriptorFactoryTest {
                         /* mainTableName= */ "tdb.orders",
                         "idx_user");
 
-        assertThat(derived.getKvFormat()).isEqualTo(KvFormat.ALIGNED);
+        assertThat(derived.getKvFormat()).isEqualTo(KvFormat.COMPACTED);
         assertThat(derived.getLogFormat()).isEqualTo(LogFormat.COMPACTED);
         assertThat(derived.getChangelogImage()).isEqualTo(ChangelogImage.WAL);
 
@@ -142,7 +142,7 @@ class IndexTableDescriptorFactoryTest {
     }
 
     @Test
-    void testDeriveIndexTableUsesFencedPhysicalMutationContract() {
+    void testDeriveIndexTableUsesInternalPhysicalMutationContract() {
         Schema mainSchema =
                 Schema.newBuilder()
                         .column("id", DataTypes.BIGINT())

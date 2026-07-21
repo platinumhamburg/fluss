@@ -31,7 +31,7 @@ public interface WalBuilder {
 
     void setWriterState(long writerId, int batchSequence);
 
-    void setFencedWriterState(WriterKey writerKey, long sequence);
+    void setWriterProgress(WriterKey writerKey, long progress);
 
     void deallocate();
 }

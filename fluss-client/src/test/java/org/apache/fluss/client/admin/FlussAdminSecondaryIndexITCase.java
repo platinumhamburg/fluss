@@ -34,7 +34,6 @@ import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.IndexTableUtils;
 
@@ -282,7 +281,6 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                                         .primaryKey("id")
                                         .build())
                         .distributedBy(1, "id")
-                        .property(ConfigOptions.TABLE_TYPE, TableType.INDEX_TABLE)
                         .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, 1L)
                         .build();
 

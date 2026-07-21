@@ -71,15 +71,15 @@ import static org.apache.fluss.utils.FlussPaths.writerSnapshotFile;
  * additional information regarding copyright ownership. */
 
 /**
- * Maintains a mapping from Writer Ids to metadata about the last appended entries (e.g. batch
- * sequence.)
+ * Maintains the WriterState required by the table's immutable KV idempotence protocol.
  *
- * <p>The batch sequence is the last number successfully appended to the bucket for given
- * identifier.
+ * <p>{@link KvIdempotenceProtocol#CONTIGUOUS_BATCH_SEQUENCE} validates a dense batch sequence for
+ * each writer id and may expire inactive writers. {@link KvIdempotenceProtocol#CUMULATIVE_PROGRESS}
+ * stores the greatest progress accepted for each writer key and never expires it by TTL.
  *
- * <p>As long as a writer id is contained in the map, the corresponding writer can continue to write
- * data. However, writer ids can be expired due to lack of recent use or if the last written entry
- * has been deleted from the log (e.g. if the retention policy is "delete").
+ * <p>Cumulative progress does not detect missing batches. Its caller must guarantee that accepting
+ * a greater progress cannot skip target mutations which are neither durable nor included in the
+ * current replay.
  */
 @NotThreadSafe
 public class WriterStateManager {
@@ -89,7 +89,7 @@ public class WriterStateManager {
     private final int writerExpirationMs;
     private final KvIdempotenceProtocol protocol;
     @Nullable private final Map<Long, WriterStateEntry> writers;
-    @Nullable private Map<WriterKey, FencedWriterStateEntry> fencedWriters;
+    @Nullable private Map<WriterKey, WriterProgressStateEntry> progressWriters;
 
     private final File logTabletDir;
     /** The selected protocol map size, available without acquiring the manager's owning lock. */
@@ -102,7 +102,11 @@ public class WriterStateManager {
 
     public WriterStateManager(TableBucket tableBucket, File logTabletDir, int writerExpirationMs)
             throws IOException {
-        this(tableBucket, logTabletDir, writerExpirationMs, KvIdempotenceProtocol.V0_COMPACT);
+        this(
+                tableBucket,
+                logTabletDir,
+                writerExpirationMs,
+                KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
     }
 
     public WriterStateManager(
@@ -115,8 +119,12 @@ public class WriterStateManager {
         this.writerExpirationMs = writerExpirationMs;
         this.logTabletDir = logTabletDir;
         this.protocol = Objects.requireNonNull(protocol, "protocol");
-        this.writers = protocol == KvIdempotenceProtocol.V0_COMPACT ? new HashMap<>() : null;
-        this.fencedWriters = protocol == KvIdempotenceProtocol.V1_FENCED ? new HashMap<>() : null;
+        this.writers =
+                protocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE
+                        ? new HashMap<>()
+                        : null;
+        this.progressWriters =
+                protocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS ? new HashMap<>() : null;
         this.snapshots = loadSnapshots();
     }
 
@@ -141,10 +149,10 @@ public class WriterStateManager {
         lastMapOffset = lastOffset;
     }
 
-    /** Validate continuous V1 WriterState coverage over the half-open recovery range. */
+    /** Validate continuous WriterState coverage over the half-open recovery range. */
     public void validateRecoveryCoverage(long logStartOffset, long recoveryEndOffset)
             throws CorruptSnapshotException {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
         if (logStartOffset < 0L || recoveryEndOffset < logStartOffset) {
             throw new CorruptSnapshotException(
                     String.format(
@@ -154,7 +162,7 @@ public class WriterStateManager {
         if (loadedSnapshotOffset == null && logStartOffset > 0L) {
             throw new CorruptSnapshotException(
                     String.format(
-                            "No V1 WriterState snapshot covers recovery end %d and retained WAL starts at %d",
+                            "No cumulative-progress WriterState snapshot covers recovery end %d and retained WAL starts at %d",
                             recoveryEndOffset, logStartOffset));
         }
         if (loadedSnapshotOffset != null
@@ -162,7 +170,7 @@ public class WriterStateManager {
                         || loadedSnapshotOffset > recoveryEndOffset)) {
             throw new CorruptSnapshotException(
                     String.format(
-                            "V1 WriterState snapshot at %d does not cover retained WAL range [%d,%d)",
+                            "Cumulative-progress WriterState snapshot at %d does not cover retained WAL range [%d,%d)",
                             loadedSnapshotOffset, logStartOffset, recoveryEndOffset));
         }
         if (lastMapOffset != recoveryEndOffset) {
@@ -173,11 +181,11 @@ public class WriterStateManager {
         }
     }
 
-    /** Validate that a V1 snapshot is a complete proof for the exact exclusive end offset. */
-    public static void validateFencedSnapshot(File snapshotFile, long expectedEndOffset) {
+    /** Validate that a progress snapshot covers the exact exclusive end offset. */
+    public static void validateProgressSnapshot(File snapshotFile, long expectedEndOffset) {
         if (expectedEndOffset < 0L) {
             throw new CorruptSnapshotException(
-                    "Invalid V1 writer snapshot end offset " + expectedEndOffset);
+                    "Invalid writer progress snapshot end offset " + expectedEndOffset);
         }
         Path expectedPath =
                 writerSnapshotFile(snapshotFile.getParentFile(), expectedEndOffset)
@@ -188,16 +196,16 @@ public class WriterStateManager {
         if (!actualPath.equals(expectedPath)) {
             throw new CorruptSnapshotException(
                     String.format(
-                            "V1 writer snapshot %s does not prove exact end offset %d",
+                            "Writer progress snapshot %s does not cover exact end offset %d",
                             snapshotFile, expectedEndOffset));
         }
 
-        for (FencedWriterStateEntry entry : readFencedSnapshot(snapshotFile)) {
-            long targetWalOffset = entry.dominatingTargetWalOffset();
+        for (WriterProgressStateEntry entry : readProgressSnapshot(snapshotFile)) {
+            long targetWalOffset = entry.progressWalOffset();
             if (targetWalOffset < 0L || targetWalOffset >= expectedEndOffset) {
                 throw new CorruptSnapshotException(
                         String.format(
-                                "V1 writer snapshot at %d contains target WAL offset %d outside [0,%d)",
+                                "Writer progress snapshot at %d contains target WAL offset %d outside [0,%d)",
                                 expectedEndOffset, targetWalOffset, expectedEndOffset));
             }
         }
@@ -205,24 +213,24 @@ public class WriterStateManager {
 
     /** Get the last written entry for the given writer id. */
     public Optional<WriterStateEntry> lastEntry(long writerId) {
-        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
+        requireProtocol(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         return Optional.ofNullable(writers.get(writerId));
     }
 
     /** Get a copy of the active writers. */
     public Map<Long, WriterStateEntry> activeWriters() {
-        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
+        requireProtocol(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         return Collections.unmodifiableMap(writers);
     }
 
     public boolean isEmpty() {
-        return protocol == KvIdempotenceProtocol.V0_COMPACT
+        return protocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE
                 ? writers.isEmpty()
-                : fencedWriters.isEmpty();
+                : progressWriters.isEmpty();
     }
 
     public void removeExpiredWriters(long currentTimeMs) {
-        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
+        if (protocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
             return;
         }
         List<Long> keys =
@@ -244,8 +252,8 @@ public class WriterStateManager {
      */
     public void truncateAndReload(long logStartOffset, long logEndOffset, long currentTimeMs)
             throws IOException {
-        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
-            truncateAndReloadFenced(logStartOffset, logEndOffset, true);
+        if (protocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
+            truncateAndReloadProgress(logStartOffset, logEndOffset, true);
             return;
         }
 
@@ -267,14 +275,14 @@ public class WriterStateManager {
         }
     }
 
-    WriterStateManager fencedRecoveryCandidate(long logStartOffset, long logEndOffset)
+    WriterStateManager progressRecoveryCandidate(long logStartOffset, long logEndOffset)
             throws IOException {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
         CorruptSnapshotException latestFailure = null;
         for (Optional<Long> snapshotOffset :
-                fencedRecoveryCandidateOffsets(logStartOffset, logEndOffset)) {
+                progressRecoveryCandidateOffsets(logStartOffset, logEndOffset)) {
             try {
-                return fencedRecoveryCandidate(logStartOffset, logEndOffset, snapshotOffset);
+                return progressRecoveryCandidate(logStartOffset, logEndOffset, snapshotOffset);
             } catch (CorruptSnapshotException failure) {
                 if (latestFailure == null) {
                     latestFailure = failure;
@@ -282,16 +290,16 @@ public class WriterStateManager {
                 snapshotOffset.ifPresent(
                         offset ->
                                 LOG.warn(
-                                        "Ignoring invalid V1 writer snapshot at {} while looking for a covering snapshot",
+                                        "Ignoring invalid writer progress snapshot at {} while looking for a covering snapshot",
                                         offset,
                                         failure));
             }
         }
-        throw noFencedRecoveryCandidate(logStartOffset, logEndOffset, latestFailure);
+        throw noProgressRecoveryCandidate(logStartOffset, logEndOffset, latestFailure);
     }
 
-    List<Optional<Long>> fencedRecoveryCandidateOffsets(long logStartOffset, long logEndOffset) {
-        validateFencedRecoveryRange(logStartOffset, logEndOffset);
+    List<Optional<Long>> progressRecoveryCandidateOffsets(long logStartOffset, long logEndOffset) {
+        validateProgressRecoveryRange(logStartOffset, logEndOffset);
         List<Optional<Long>> candidateOffsets = new ArrayList<>();
         for (SnapshotFile snapshot :
                 snapshots.headMap(logEndOffset, true).descendingMap().values()) {
@@ -306,41 +314,41 @@ public class WriterStateManager {
         return candidateOffsets;
     }
 
-    WriterStateManager fencedRecoveryCandidate(
+    WriterStateManager progressRecoveryCandidate(
             long logStartOffset, long logEndOffset, Optional<Long> snapshotOffset)
             throws IOException {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
         WriterStateManager candidate =
                 new WriterStateManager(tableBucket, logTabletDir, writerExpirationMs, protocol);
-        candidate.loadFencedRecoveryCandidate(logStartOffset, logEndOffset, snapshotOffset);
+        candidate.loadProgressRecoveryCandidate(logStartOffset, logEndOffset, snapshotOffset);
         return candidate;
     }
 
-    void publishFencedRecovery(WriterStateManager candidate, long recoveryEndOffset)
+    void publishProgressRecovery(WriterStateManager candidate, long recoveryEndOffset)
             throws IOException {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
-        candidate.requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        candidate.requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
         if (!tableBucket.equals(candidate.tableBucket)
                 || !logTabletDir.equals(candidate.logTabletDir)
                 || candidate.lastMapOffset != recoveryEndOffset) {
-            throw new IllegalArgumentException("Invalid V1 WriterState recovery candidate");
+            throw new IllegalArgumentException("Invalid writer progress recovery candidate");
         }
         for (SnapshotFile snapshot : snapshots.tailMap(recoveryEndOffset, false).values()) {
             removeAndDeleteSnapshot(snapshot.offset);
         }
-        fencedWriters = new HashMap<>(candidate.fencedWriters);
-        writerIdCount = fencedWriters.size();
+        progressWriters = new HashMap<>(candidate.progressWriters);
+        writerIdCount = progressWriters.size();
         loadedSnapshotOffset = candidate.loadedSnapshotOffset;
         lastSnapOffset = candidate.lastSnapOffset;
         lastMapOffset = candidate.lastMapOffset;
     }
 
-    private void truncateAndReloadFenced(
+    private void truncateAndReloadProgress(
             long logStartOffset, long logEndOffset, boolean deleteFutureSnapshots)
             throws IOException {
-        WriterStateManager candidate = fencedRecoveryCandidate(logStartOffset, logEndOffset);
-        fencedWriters = new HashMap<>(candidate.fencedWriters);
-        writerIdCount = fencedWriters.size();
+        WriterStateManager candidate = progressRecoveryCandidate(logStartOffset, logEndOffset);
+        progressWriters = new HashMap<>(candidate.progressWriters);
+        writerIdCount = progressWriters.size();
         loadedSnapshotOffset = candidate.loadedSnapshotOffset;
         lastSnapOffset = candidate.lastSnapOffset;
         lastMapOffset = candidate.lastMapOffset;
@@ -352,14 +360,14 @@ public class WriterStateManager {
         }
     }
 
-    private void loadFencedRecoveryCandidate(
+    private void loadProgressRecoveryCandidate(
             long logStartOffset, long logEndOffset, Optional<Long> snapshotOffset) {
-        validateFencedRecoveryRange(logStartOffset, logEndOffset);
+        validateProgressRecoveryRange(logStartOffset, logEndOffset);
         if (!snapshotOffset.isPresent()) {
             if (logStartOffset != 0L) {
-                throw noFencedRecoveryCandidate(logStartOffset, logEndOffset, null);
+                throw noProgressRecoveryCandidate(logStartOffset, logEndOffset, null);
             }
-            fencedWriters = new HashMap<>();
+            progressWriters = new HashMap<>();
             writerIdCount = 0;
             loadedSnapshotOffset = null;
             lastSnapOffset = 0L;
@@ -371,32 +379,32 @@ public class WriterStateManager {
         if (offset < logStartOffset || offset > logEndOffset) {
             throw new CorruptSnapshotException(
                     String.format(
-                            "V1 WriterState snapshot at %d is outside recovery range [%d,%d)",
+                            "Writer progress snapshot at %d is outside recovery range [%d,%d)",
                             offset, logStartOffset, logEndOffset));
         }
         SnapshotFile snapshot = snapshots.get(offset);
         if (snapshot == null) {
-            throw new CorruptSnapshotException("Missing V1 writer snapshot at " + offset);
+            throw new CorruptSnapshotException("Missing writer progress snapshot at " + offset);
         }
 
-        LOG.info("Loading fenced writer state from snapshot file '{}'", snapshot);
-        validateFencedSnapshot(snapshot.file(), offset);
-        Map<WriterKey, FencedWriterStateEntry> candidateWriters = new HashMap<>();
-        for (FencedWriterStateEntry entry : readFencedSnapshot(snapshot.file())) {
-            FencedWriterStateEntry previous = candidateWriters.put(entry.writerKey(), entry);
+        LOG.info("Loading writer progress from snapshot file '{}'", snapshot);
+        validateProgressSnapshot(snapshot.file(), offset);
+        Map<WriterKey, WriterProgressStateEntry> candidateWriters = new HashMap<>();
+        for (WriterProgressStateEntry entry : readProgressSnapshot(snapshot.file())) {
+            WriterProgressStateEntry previous = candidateWriters.put(entry.writerKey(), entry);
             if (previous != null) {
                 throw new CorruptSnapshotException(
-                        "Duplicate fenced writer key in snapshot: " + entry.writerKey());
+                        "Duplicate writer key in progress snapshot: " + entry.writerKey());
             }
         }
-        fencedWriters = candidateWriters;
-        writerIdCount = fencedWriters.size();
+        progressWriters = candidateWriters;
+        writerIdCount = progressWriters.size();
         loadedSnapshotOffset = offset;
         lastSnapOffset = offset;
         lastMapOffset = offset;
     }
 
-    private static void validateFencedRecoveryRange(long logStartOffset, long logEndOffset) {
+    private static void validateProgressRecoveryRange(long logStartOffset, long logEndOffset) {
         if (logStartOffset < 0L || logEndOffset < logStartOffset) {
             throw new CorruptSnapshotException(
                     String.format(
@@ -405,7 +413,7 @@ public class WriterStateManager {
         }
     }
 
-    private static CorruptSnapshotException noFencedRecoveryCandidate(
+    private static CorruptSnapshotException noProgressRecoveryCandidate(
             long logStartOffset,
             long logEndOffset,
             @Nullable CorruptSnapshotException latestFailure) {
@@ -447,10 +455,10 @@ public class WriterStateManager {
             SnapshotFile snapshotFile =
                     new SnapshotFile(writerSnapshotFile(logTabletDir, lastMapOffset));
             long start = System.currentTimeMillis();
-            if (protocol == KvIdempotenceProtocol.V0_COMPACT) {
+            if (protocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
                 writeSnapshot(snapshotFile.file(), writers);
             } else {
-                writeFencedSnapshot(snapshotFile.file(), fencedWriters);
+                writeProgressSnapshot(snapshotFile.file(), progressWriters);
             }
             LOG.info(
                     "Wrote writer snapshot at offset {} with {} producer ids for table bucket {} in {} ms.",
@@ -487,7 +495,7 @@ public class WriterStateManager {
     }
 
     public WriterAppendInfo prepareUpdate(long writerId) {
-        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
+        requireProtocol(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         WriterStateEntry currentEntry =
                 lastEntry(writerId).orElse(WriterStateEntry.empty(writerId));
         return new WriterAppendInfo(writerId, tableBucket, currentEntry);
@@ -495,7 +503,7 @@ public class WriterStateManager {
 
     /** Update the mapping with the given append information. */
     public void update(WriterAppendInfo appendInfo) {
-        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
+        requireProtocol(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         long writerId = appendInfo.writerId();
         if (writerId == NO_WRITER_ID) {
             throw new IllegalArgumentException(
@@ -516,53 +524,53 @@ public class WriterStateManager {
         }
     }
 
-    /** Get the latest accepted V1 fence for the opaque writer key. */
-    public Optional<FencedWriterStateEntry> lastFencedEntry(WriterKey writerKey) {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
-        return Optional.ofNullable(fencedWriters.get(writerKey));
+    /** Get the latest accepted cumulative progress for the writer key. */
+    public Optional<WriterProgressStateEntry> lastProgressEntry(WriterKey writerKey) {
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        return Optional.ofNullable(progressWriters.get(writerKey));
     }
 
-    /** Return the state which dominates a stale V1 sequence, if one exists. */
-    public Optional<FencedWriterStateEntry> findStaleFencedBatch(
-            WriterKey writerKey, long sequence) {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
-        if (sequence < 0L) {
-            throw new IllegalArgumentException("sequence must be non-negative");
+    /** Return the state which makes the supplied progress stale, if one exists. */
+    public Optional<WriterProgressStateEntry> findStaleProgressBatch(
+            WriterKey writerKey, long progress) {
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        if (progress < 0L) {
+            throw new IllegalArgumentException("writer progress must be non-negative");
         }
-        return lastFencedEntry(writerKey).filter(entry -> sequence <= entry.lastSequence());
+        return lastProgressEntry(writerKey).filter(entry -> progress <= entry.lastProgress());
     }
 
-    /** Prepare a V1 update without mutating the published state. */
-    public FencedWriterAppendInfo prepareFencedUpdate(WriterKey writerKey) {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
-        return new FencedWriterAppendInfo(writerKey, tableBucket, fencedWriters.get(writerKey));
+    /** Prepare a progress update without mutating the published state. */
+    public WriterProgressAppendInfo prepareProgressUpdate(WriterKey writerKey) {
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        return new WriterProgressAppendInfo(writerKey, tableBucket, progressWriters.get(writerKey));
     }
 
-    /** Publish a prepared V1 update after the corresponding target WAL append succeeds. */
-    public void updateFenced(FencedWriterAppendInfo appendInfo) {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+    /** Publish a prepared progress update after the corresponding target WAL append succeeds. */
+    public void updateProgress(WriterProgressAppendInfo appendInfo) {
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
         Objects.requireNonNull(appendInfo, "appendInfo");
         if (!tableBucket.equals(appendInfo.tableBucket())) {
             throw new IllegalArgumentException(
-                    "Fenced writer update belongs to a different table bucket");
+                    "Writer progress update belongs to a different table bucket");
         }
-        Optional<FencedWriterStateEntry> current =
-                Optional.ofNullable(fencedWriters.get(appendInfo.writerKey()));
+        Optional<WriterProgressStateEntry> current =
+                Optional.ofNullable(progressWriters.get(appendInfo.writerKey()));
         if (!current.equals(appendInfo.currentEntry())) {
             throw new IllegalStateException(
-                    "Fenced writer state changed after the update was prepared");
+                    "Writer progress changed after the update was prepared");
         }
-        FencedWriterStateEntry updatedEntry = appendInfo.takeUpdatedEntryForPublish();
-        fencedWriters.put(appendInfo.writerKey(), updatedEntry);
-        writerIdCount = fencedWriters.size();
+        WriterProgressStateEntry updatedEntry = appendInfo.takeUpdatedEntryForPublish();
+        progressWriters.put(appendInfo.writerKey(), updatedEntry);
+        writerIdCount = progressWriters.size();
     }
 
-    /** Explicitly retire V1 writer keys matching the predicate. */
-    public void removeFencedWriters(Predicate<WriterKey> predicate) {
-        requireProtocol(KvIdempotenceProtocol.V1_FENCED);
+    /** Explicitly retire cumulative-progress writer keys matching the predicate. */
+    public void removeProgressWriters(Predicate<WriterKey> predicate) {
+        requireProtocol(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
         Objects.requireNonNull(predicate, "predicate");
-        fencedWriters.keySet().removeIf(predicate);
-        writerIdCount = fencedWriters.size();
+        progressWriters.keySet().removeIf(predicate);
+        writerIdCount = progressWriters.size();
     }
 
     /**
@@ -671,10 +679,10 @@ public class WriterStateManager {
     }
 
     private void clearWriterIds() {
-        if (protocol == KvIdempotenceProtocol.V0_COMPACT) {
+        if (protocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
             writers.clear();
         } else {
-            fencedWriters.clear();
+            progressWriters.clear();
         }
         writerIdCount = 0;
     }
@@ -729,7 +737,7 @@ public class WriterStateManager {
 
     @VisibleForTesting
     public void loadWriterEntry(WriterStateEntry entry) {
-        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
+        requireProtocol(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         long writerId = entry.writerId();
         addWriterId(writerId, entry);
     }
@@ -739,7 +747,7 @@ public class WriterStateManager {
     }
 
     public boolean isWriterInBatchExpired(long currentTimeMs, LogRecordBatch recordBatch) {
-        requireProtocol(KvIdempotenceProtocol.V0_COMPACT);
+        requireProtocol(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         return currentTimeMs - recordBatch.commitTimestamp() > writerExpirationMs;
     }
 
@@ -776,16 +784,16 @@ public class WriterStateManager {
         }
     }
 
-    private static List<FencedWriterStateEntry> readFencedSnapshot(File file) {
+    private static List<WriterProgressStateEntry> readProgressSnapshot(File file) {
         try {
             byte[] json = Files.readAllBytes(file.toPath());
-            FencedWriterSnapshotMap snapshotMap = FencedWriterSnapshotMap.fromJsonBytes(json);
+            WriterProgressSnapshotMap snapshotMap = WriterProgressSnapshotMap.fromJsonBytes(json);
             return snapshotMap.snapshotEntries.stream()
                     .map(
                             entry ->
-                                    new FencedWriterStateEntry(
+                                    new WriterProgressStateEntry(
                                             entry.writerKey,
-                                            entry.lastSequence,
+                                            entry.lastProgress,
                                             entry.lastTargetWalOffset,
                                             entry.lastTimestamp))
                     .collect(Collectors.toList());
@@ -811,18 +819,18 @@ public class WriterStateManager {
         writeSnapshotAtomically(file, jsonBytes);
     }
 
-    private static void writeFencedSnapshot(
-            File file, Map<WriterKey, FencedWriterStateEntry> entries) throws IOException {
-        List<FencedWriterSnapshotEntry> snapshotEntries = new ArrayList<>();
+    private static void writeProgressSnapshot(
+            File file, Map<WriterKey, WriterProgressStateEntry> entries) throws IOException {
+        List<WriterProgressSnapshotEntry> snapshotEntries = new ArrayList<>();
         entries.forEach(
                 (writerKey, entry) ->
                         snapshotEntries.add(
-                                new FencedWriterSnapshotEntry(
+                                new WriterProgressSnapshotEntry(
                                         writerKey,
-                                        entry.lastSequence(),
-                                        entry.dominatingTargetWalOffset(),
+                                        entry.lastProgress(),
+                                        entry.progressWalOffset(),
                                         entry.lastTimestamp())));
-        byte[] jsonBytes = new FencedWriterSnapshotMap(snapshotEntries).toJsonBytes();
+        byte[] jsonBytes = new WriterProgressSnapshotMap(snapshotEntries).toJsonBytes();
 
         writeSnapshotAtomically(file, jsonBytes);
     }
@@ -921,7 +929,7 @@ public class WriterStateManager {
             JsonNode versionNode = node.get(VERSION_KEY);
             if (versionNode != null && versionNode.asInt() != WRITER_ID_SNAPSHOT_VERSION) {
                 throw new IllegalArgumentException(
-                        "Unsupported V0 writer snapshot version " + versionNode);
+                        "Unsupported contiguous-sequence writer snapshot version " + versionNode);
             }
             Iterator<JsonNode> entriesJson = node.get(WRITER_ID_ENTRIES_FILED).elements();
             List<WriterSnapshotEntry> snapshotEntries = new ArrayList<>();
@@ -945,36 +953,37 @@ public class WriterStateManager {
         }
     }
 
-    /** V1 fenced writer snapshot map json serde. */
-    public static class FencedWriterSnapshotMapJsonSerde
-            implements JsonSerializer<FencedWriterSnapshotMap>,
-                    JsonDeserializer<FencedWriterSnapshotMap> {
-        public static final FencedWriterSnapshotMapJsonSerde INSTANCE =
-                new FencedWriterSnapshotMapJsonSerde();
+    /** Cumulative-progress WriterState snapshot serde. */
+    public static class WriterProgressSnapshotMapJsonSerde
+            implements JsonSerializer<WriterProgressSnapshotMap>,
+                    JsonDeserializer<WriterProgressSnapshotMap> {
+        public static final WriterProgressSnapshotMapJsonSerde INSTANCE =
+                new WriterProgressSnapshotMapJsonSerde();
 
         private static final String VERSION_KEY = "version";
         private static final String PROTOCOL_VERSION_KEY = "kv_idempotence_protocol_version";
         private static final String WRITER_ENTRIES_FIELD = "writer_entries";
         private static final String WRITER_KEY_HIGH_FIELD = "writer_key_high";
         private static final String WRITER_KEY_LOW_FIELD = "writer_key_low";
-        private static final String LAST_SEQUENCE_FIELD = "last_sequence";
+        // Keep the persisted field name stable for protocol version 1 snapshots.
+        private static final String LAST_PROGRESS_FIELD = "last_sequence";
         private static final String LAST_TARGET_WAL_OFFSET_FIELD = "last_target_wal_offset";
         private static final String LAST_TIMESTAMP_FIELD = "last_timestamp";
         private static final int SNAPSHOT_VERSION = 2;
 
         @Override
-        public void serialize(FencedWriterSnapshotMap snapshotMap, JsonGenerator generator)
+        public void serialize(WriterProgressSnapshotMap snapshotMap, JsonGenerator generator)
                 throws IOException {
             generator.writeStartObject();
             generator.writeNumberField(VERSION_KEY, SNAPSHOT_VERSION);
             generator.writeNumberField(
-                    PROTOCOL_VERSION_KEY, KvIdempotenceProtocol.V1_FENCED.version());
+                    PROTOCOL_VERSION_KEY, KvIdempotenceProtocol.CUMULATIVE_PROGRESS.version());
             generator.writeArrayFieldStart(WRITER_ENTRIES_FIELD);
-            for (FencedWriterSnapshotEntry entry : snapshotMap.snapshotEntries) {
+            for (WriterProgressSnapshotEntry entry : snapshotMap.snapshotEntries) {
                 generator.writeStartObject();
                 generator.writeNumberField(WRITER_KEY_HIGH_FIELD, entry.writerKey.high());
                 generator.writeNumberField(WRITER_KEY_LOW_FIELD, entry.writerKey.low());
-                generator.writeNumberField(LAST_SEQUENCE_FIELD, entry.lastSequence);
+                generator.writeNumberField(LAST_PROGRESS_FIELD, entry.lastProgress);
                 generator.writeNumberField(LAST_TARGET_WAL_OFFSET_FIELD, entry.lastTargetWalOffset);
                 generator.writeNumberField(LAST_TIMESTAMP_FIELD, entry.lastTimestamp);
                 generator.writeEndObject();
@@ -984,10 +993,12 @@ public class WriterStateManager {
         }
 
         @Override
-        public FencedWriterSnapshotMap deserialize(JsonNode node) {
+        public WriterProgressSnapshotMap deserialize(JsonNode node) {
             requireExactValue(node, VERSION_KEY, SNAPSHOT_VERSION);
             requireExactValue(
-                    node, PROTOCOL_VERSION_KEY, KvIdempotenceProtocol.V1_FENCED.version());
+                    node,
+                    PROTOCOL_VERSION_KEY,
+                    KvIdempotenceProtocol.CUMULATIVE_PROGRESS.version());
 
             JsonNode entriesNode = node.get(WRITER_ENTRIES_FIELD);
             if (entriesNode == null || !entriesNode.isArray()) {
@@ -995,33 +1006,34 @@ public class WriterStateManager {
                         "Missing or malformed field " + WRITER_ENTRIES_FIELD);
             }
 
-            List<FencedWriterSnapshotEntry> entries = new ArrayList<>();
+            List<WriterProgressSnapshotEntry> entries = new ArrayList<>();
             HashSet<WriterKey> writerKeys = new HashSet<>();
             Iterator<JsonNode> entriesJson = entriesNode.elements();
             while (entriesJson.hasNext()) {
                 JsonNode entryJson = entriesJson.next();
                 if (!entryJson.isObject()) {
-                    throw new IllegalArgumentException("Malformed fenced writer snapshot entry");
+                    throw new IllegalArgumentException("Malformed writer progress snapshot entry");
                 }
                 WriterKey writerKey =
                         new WriterKey(
                                 requireLong(entryJson, WRITER_KEY_HIGH_FIELD),
                                 requireLong(entryJson, WRITER_KEY_LOW_FIELD));
-                long lastSequence = requireLong(entryJson, LAST_SEQUENCE_FIELD);
-                if (lastSequence < 0L) {
-                    throw new IllegalArgumentException("last_sequence must be non-negative");
+                long lastProgress = requireLong(entryJson, LAST_PROGRESS_FIELD);
+                if (lastProgress < 0L) {
+                    throw new IllegalArgumentException(
+                            "last_sequence (writer progress) must be non-negative");
                 }
                 long lastTargetWalOffset = requireLong(entryJson, LAST_TARGET_WAL_OFFSET_FIELD);
                 long lastTimestamp = requireLong(entryJson, LAST_TIMESTAMP_FIELD);
                 if (!writerKeys.add(writerKey)) {
                     throw new IllegalArgumentException(
-                            "Duplicate WriterKey in fenced writer snapshot");
+                            "Duplicate WriterKey in writer progress snapshot");
                 }
                 entries.add(
-                        new FencedWriterSnapshotEntry(
-                                writerKey, lastSequence, lastTargetWalOffset, lastTimestamp));
+                        new WriterProgressSnapshotEntry(
+                                writerKey, lastProgress, lastTargetWalOffset, lastTimestamp));
             }
-            return new FencedWriterSnapshotMap(entries);
+            return new WriterProgressSnapshotMap(entries);
         }
 
         private static void requireExactValue(JsonNode node, String field, long expected) {
@@ -1041,23 +1053,23 @@ public class WriterStateManager {
         }
     }
 
-    /** Serialized V1 fenced writer entry. */
-    public static class FencedWriterSnapshotEntry {
+    /** Serialized cumulative-progress writer entry. */
+    public static class WriterProgressSnapshotEntry {
         public final WriterKey writerKey;
-        public final long lastSequence;
+        public final long lastProgress;
         public final long lastTargetWalOffset;
         public final long lastTimestamp;
 
-        public FencedWriterSnapshotEntry(
+        public WriterProgressSnapshotEntry(
                 WriterKey writerKey,
-                long lastSequence,
+                long lastProgress,
                 long lastTargetWalOffset,
                 long lastTimestamp) {
             this.writerKey = Objects.requireNonNull(writerKey, "writerKey");
-            if (lastSequence < 0L) {
-                throw new IllegalArgumentException("lastSequence must be non-negative");
+            if (lastProgress < 0L) {
+                throw new IllegalArgumentException("lastProgress must be non-negative");
             }
-            this.lastSequence = lastSequence;
+            this.lastProgress = lastProgress;
             this.lastTargetWalOffset = lastTargetWalOffset;
             this.lastTimestamp = lastTimestamp;
         }
@@ -1067,11 +1079,11 @@ public class WriterStateManager {
             if (this == other) {
                 return true;
             }
-            if (!(other instanceof FencedWriterSnapshotEntry)) {
+            if (!(other instanceof WriterProgressSnapshotEntry)) {
                 return false;
             }
-            FencedWriterSnapshotEntry that = (FencedWriterSnapshotEntry) other;
-            return lastSequence == that.lastSequence
+            WriterProgressSnapshotEntry that = (WriterProgressSnapshotEntry) other;
+            return lastProgress == that.lastProgress
                     && lastTargetWalOffset == that.lastTargetWalOffset
                     && lastTimestamp == that.lastTimestamp
                     && writerKey.equals(that.writerKey);
@@ -1079,25 +1091,25 @@ public class WriterStateManager {
 
         @Override
         public int hashCode() {
-            return Objects.hash(writerKey, lastSequence, lastTargetWalOffset, lastTimestamp);
+            return Objects.hash(writerKey, lastProgress, lastTargetWalOffset, lastTimestamp);
         }
     }
 
-    /** Serialized V1 fenced writer map. */
-    public static class FencedWriterSnapshotMap {
-        private final List<FencedWriterSnapshotEntry> snapshotEntries;
+    /** Serialized cumulative-progress writer map. */
+    public static class WriterProgressSnapshotMap {
+        private final List<WriterProgressSnapshotEntry> snapshotEntries;
 
-        public FencedWriterSnapshotMap(List<FencedWriterSnapshotEntry> snapshotEntries) {
+        public WriterProgressSnapshotMap(List<WriterProgressSnapshotEntry> snapshotEntries) {
             this.snapshotEntries = new ArrayList<>(snapshotEntries);
         }
 
-        private static FencedWriterSnapshotMap fromJsonBytes(byte[] json) {
-            return JsonSerdeUtils.readValue(json, FencedWriterSnapshotMapJsonSerde.INSTANCE);
+        private static WriterProgressSnapshotMap fromJsonBytes(byte[] json) {
+            return JsonSerdeUtils.readValue(json, WriterProgressSnapshotMapJsonSerde.INSTANCE);
         }
 
         private byte[] toJsonBytes() {
             return JsonSerdeUtils.writeValueAsBytes(
-                    this, FencedWriterSnapshotMapJsonSerde.INSTANCE);
+                    this, WriterProgressSnapshotMapJsonSerde.INSTANCE);
         }
 
         @Override
@@ -1105,10 +1117,10 @@ public class WriterStateManager {
             if (this == other) {
                 return true;
             }
-            if (!(other instanceof FencedWriterSnapshotMap)) {
+            if (!(other instanceof WriterProgressSnapshotMap)) {
                 return false;
             }
-            FencedWriterSnapshotMap that = (FencedWriterSnapshotMap) other;
+            WriterProgressSnapshotMap that = (WriterProgressSnapshotMap) other;
             return snapshotEntries.equals(that.snapshotEntries);
         }
 

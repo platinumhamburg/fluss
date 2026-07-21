@@ -22,10 +22,10 @@ import org.apache.fluss.row.BinaryRow;
 
 import javax.annotation.Nullable;
 
-/** Table-owned validation invoked by the generic V1 KV write path under its write lock. */
+/** Table-owned validation invoked by cumulative-progress KV writes under the tablet write lock. */
 public interface KvWriteGuard {
 
-    /** Whether the V1 batch should proceed to WriterState or succeed without applying. */
+    /** Whether the batch should proceed to WriterState or succeed without applying. */
     enum Decision {
         APPLY,
         NO_OP

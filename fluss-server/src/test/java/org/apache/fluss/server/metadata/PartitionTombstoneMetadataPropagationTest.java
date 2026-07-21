@@ -39,7 +39,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Verifies that {@link PartitionTombstone} entries flow from the Coordinator to the TabletServer
- * via the existing {@code UpdateMetadataRequest} channel (P3T6).
+ * via the existing {@code UpdateMetadataRequest} channel.
  *
  * <p>Two layers are exercised:
  *

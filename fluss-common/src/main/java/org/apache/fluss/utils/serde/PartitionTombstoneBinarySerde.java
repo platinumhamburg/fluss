@@ -31,7 +31,7 @@ import java.util.Set;
 /**
  * Binary serializer/deserializer for {@link PartitionTombstone} stored in ZooKeeper.
  *
- * <p>Wire format: {@code formatVersion(1B) + reserved(3B) + inBandVersion(8B) + floor(8B) +
+ * <p>Wire format: {@code formatVersion(1B) + reserved(3B) + version(8B) + floor(8B) +
  * explicitCount(4B) + explicit[i](8B * N)}.
  */
 @Internal
@@ -92,7 +92,7 @@ public final class PartitionTombstoneBinarySerde {
         buf.get();
         buf.get();
         buf.get();
-        long inBandVersion = buf.getLong();
+        long tombstoneVersion = buf.getLong();
         long floor = buf.getLong();
         int count = buf.getInt();
         long expectedLength = HEADER_SIZE + (long) count * Long.BYTES;
@@ -119,6 +119,6 @@ public final class PartitionTombstoneBinarySerde {
             explicitSet.add(partitionId);
             previous = partitionId;
         }
-        return new PartitionTombstone(floor, explicitSet, inBandVersion);
+        return new PartitionTombstone(floor, explicitSet, tombstoneVersion);
     }
 }

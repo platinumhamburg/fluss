@@ -173,8 +173,7 @@ class MetadataManagerLifecycleTest {
 
         MetadataManager metadataManager = newMetadataManager(zkClient);
         PartitionAssignment assignment =
-                new PartitionAssignment(
-                        11L, Collections.singletonMap(0, BucketAssignment.of(1)));
+                new PartitionAssignment(11L, Collections.singletonMap(0, BucketAssignment.of(1)));
         AtomicReference<Throwable> blockedFailure = new AtomicReference<>();
         AtomicReference<Throwable> independentFailure = new AtomicReference<>();
         CountDownLatch blockedDone = new CountDownLatch(1);
@@ -226,8 +225,7 @@ class MetadataManagerLifecycleTest {
                         () ->
                                 metadataManager.deleteTables(
                                         Arrays.asList(
-                                                new TableDeletion(
-                                                        TablePath.of("db_a", "main"), 1L),
+                                                new TableDeletion(TablePath.of("db_a", "main"), 1L),
                                                 new TableDeletion(
                                                         TablePath.of("db_b", "index"), 2L)),
                                         7))

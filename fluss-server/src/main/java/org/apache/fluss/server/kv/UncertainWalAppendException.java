@@ -21,7 +21,7 @@ import org.apache.fluss.metadata.TableBucket;
 
 import java.io.IOException;
 
-/** Signals that a V1 target WAL append was invoked but its outcome cannot be determined safely. */
+/** Signals that a cumulative-progress WAL append has an uncertain outcome. */
 public final class UncertainWalAppendException extends IOException {
 
     public UncertainWalAppendException(TableBucket tableBucket, Throwable cause) {

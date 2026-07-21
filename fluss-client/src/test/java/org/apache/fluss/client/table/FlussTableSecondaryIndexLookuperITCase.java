@@ -44,32 +44,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * End-to-end ITCase for {@link FlussTable#getSecondaryIndexLookuper(String)} and its underlying
- * {@link SecondaryIndexLookuper} (Plan 4 §2.7 — two-hop lookup with stale-pointer recheck).
+ * End-to-end ITCase for {@link Table#getSecondaryIndexLookuper(String)} and its underlying {@link
+ * SecondaryIndexLookuper}.
  *
  * <p>Scenarios:
  *
  * <ul>
  *   <li>{@link #testLookupReturnsNoStalePointers()} — async-visibility update from {@code idxCol=A}
- *       to {@code idxCol=B}. Lookup by {@code A} must return empty regardless of whether the Plan 2
- *       DELETE for the stale {@code (A, pk)} entry has already landed in the Index Table: the
- *       recheck step filters surviving stale pointers, and the standard cleanup path eventually
- *       removes them.
+ *       to {@code idxCol=B}. Lookup by {@code A} must return empty regardless of whether the DELETE
+ *       for the stale {@code (A, pk)} entry has already landed in the Index Table: the recheck step
+ *       filters surviving stale pointers, and the standard cleanup path eventually removes them.
  *   <li>{@link #testGetSecondaryIndexLookuperRejectsUnknownIndexName()} — exercising the public
- *       validation path on a live {@link FlussTable} (the unit-level {@code
- *       FlussTable.findIndexOrThrow} is also covered by {@code
- *       FlussTableSecondaryIndexLookuperTest} but it skips the public surface because {@link
- *       org.apache.fluss.client.FlussConnection} is {@code final} and not Mockito-mockable).
+ *       validation path on a live {@link Table}.
  * </ul>
- *
- * <h2>Note on test location</h2>
- *
- * <p>Plan 4 Task 7's spec named {@code fluss-server/src/test/java/.../IndexPushReplicationITCase}
- * as the host file, but {@code fluss-server} cannot depend on {@code fluss-client} (it would form a
- * reactor cycle with {@code fluss-client}'s existing test-scope dep on {@code fluss-server}), so
- * the test must live in {@code fluss-client} to reach {@link FlussTable} and {@link Lookuper}. The
- * server-side scenarios that prepare the data shape this test consumes are already covered by the
- * gateway-level scenarios in {@code IndexPushReplicationITCase}.
  */
 class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
 
@@ -105,7 +92,7 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
             //   - The async DELETE already removed ("A", 1) -> Hop 1 returns 0 candidate rows.
             //   - The DELETE has not landed yet -> Hop 1 returns the stale ("A", 1) row, Hop 2
             //     point-gets pk=1 and finds (1, "B"), recheck sees "B" != "A" and discards.
-            Lookuper lookuper = ((FlussTable) mainTable).getSecondaryIndexLookuper(INDEX_NAME);
+            Lookuper lookuper = mainTable.getSecondaryIndexLookuper(INDEX_NAME);
             LookupResult lookupAResult = lookuper.lookup(row("A")).get();
             assertThat(lookupAResult.getRowList())
                     .as("stale lookup by old idxCol value must be filtered out")
@@ -125,8 +112,7 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
         TablePath mainPath = TablePath.of(DB, "main_t_unknown_idx");
         createMainTableWithIndex(mainPath, /* visibility */ null);
         try (Table table = conn.getTable(mainPath)) {
-            FlussTable flussTable = (FlussTable) table;
-            assertThatThrownBy(() -> flussTable.getSecondaryIndexLookuper("nonexistent"))
+            assertThatThrownBy(() -> table.getSecondaryIndexLookuper("nonexistent"))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("nonexistent");
         }

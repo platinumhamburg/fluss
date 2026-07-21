@@ -270,7 +270,7 @@ public class LogTieringTask implements Runnable {
             throws Exception {
         long endOffset = -1;
         List<Path> requiredWriterSnapshots = new ArrayList<>(segments.size());
-        if (log.writerStateManager().protocol() == KvIdempotenceProtocol.V1_FENCED) {
+        if (log.writerStateManager().protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
             for (EnrichedLogSegment segment : segments) {
                 long segmentEndOffset = segment.nextSegmentOffset;
                 requiredWriterSnapshots.add(
@@ -280,11 +280,11 @@ public class LogTieringTask implements Runnable {
                                 .orElseThrow(
                                         () ->
                                                 new LogStorageException(
-                                                        "Missing V1 writer snapshot at "
+                                                        "Missing writer progress snapshot at "
                                                                 + segmentEndOffset)));
             }
             for (int segmentIndex = 0; segmentIndex < segments.size(); segmentIndex++) {
-                WriterStateManager.validateFencedSnapshot(
+                WriterStateManager.validateProgressSnapshot(
                         requiredWriterSnapshots.get(segmentIndex).toFile(),
                         segments.get(segmentIndex).nextSegmentOffset);
             }
@@ -303,7 +303,7 @@ public class LogTieringTask implements Runnable {
             long segmentEndOffset = enrichedSegment.nextSegmentOffset;
 
             Path writerSnapshot =
-                    log.writerStateManager().protocol() == KvIdempotenceProtocol.V1_FENCED
+                    log.writerStateManager().protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
                             ? requiredWriterSnapshots.get(segmentIndex)
                             : log.writerStateManager()
                                     .fetchSnapshot(segmentEndOffset)
@@ -332,7 +332,8 @@ public class LogTieringTask implements Runnable {
                 remoteLogStorage.copyLogSegmentFiles(copyRemoteLogSegment, logSegmentFiles);
             } catch (RemoteStorageException e) {
                 metricGroup.remoteLogCopyErrors().inc();
-                if (log.writerStateManager().protocol() == KvIdempotenceProtocol.V1_FENCED) {
+                if (log.writerStateManager().protocol()
+                        == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
                     if (!copiedSegments.isEmpty()) {
                         deleteRemoteLogSegmentFiles(copiedSegments, metricGroup);
                         copiedSegments.clear();
@@ -452,7 +453,7 @@ public class LogTieringTask implements Runnable {
         }
 
         if (replica.getLogTablet().writerStateManager().protocol()
-                != KvIdempotenceProtocol.V1_FENCED) {
+                != KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
             LOG.error(
                     "Commit remote log manifest failed after retry 10 times for table-bucket {}.",
                     tableBucket);

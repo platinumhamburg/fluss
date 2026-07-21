@@ -466,9 +466,9 @@ class FileLogProjectionTest {
     }
 
     @Test
-    void testV3WriterKeyAndLongSequenceSurviveProjection() throws Exception {
+    void testV3WriterKeyAndLongProgressSurviveProjection() throws Exception {
         WriterKey writerKey = new WriterKey(17L, Long.MIN_VALUE | 3L);
-        long sequence = (long) Integer.MAX_VALUE + 17L;
+        long progress = (long) Integer.MAX_VALUE + 17L;
         MemoryLogRecords records;
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
                 ArrowWriterPool writerPool = new ArrowWriterPool(allocator)) {
@@ -480,14 +480,14 @@ class FileLogProjectionTest {
                             TestData.DATA1_ROW_TYPE,
                             DEFAULT_COMPRESSION);
             MemoryLogRecordsArrowBuilder builder =
-                    MemoryLogRecordsArrowBuilder.fencedBuilder(
+                    MemoryLogRecordsArrowBuilder.progressBuilder(
                             DEFAULT_SCHEMA_ID,
                             writer,
                             new ManagedPagedOutputView(new TestingMemorySegmentPool(1024)),
                             false,
                             null);
             builder.append(ChangeType.APPEND_ONLY, row(new Object[] {1, "a"}));
-            builder.setFencedWriterState(writerKey, sequence);
+            builder.setWriterProgress(writerKey, progress);
             builder.close();
             records = MemoryLogRecords.pointToBytesView(builder.build());
         }
@@ -512,8 +512,8 @@ class FileLogProjectionTest {
                             .next();
             assertThat(projectedBatch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
             assertThat(projectedBatch.idempotenceProtocolVersion()).isEqualTo(1);
-            assertThat(projectedBatch.fencedWriterKey()).isEqualTo(writerKey);
-            assertThat(projectedBatch.fencedSequence()).isEqualTo(sequence);
+            assertThat(projectedBatch.writerKey()).isEqualTo(writerKey);
+            assertThat(projectedBatch.writerProgress()).isEqualTo(progress);
             assertThat(projectedBatch.isValid()).isTrue();
             projectedBatch.ensureValid();
         }

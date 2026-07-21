@@ -44,10 +44,7 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/**
- * Tests for {@link ZooKeeperClient}'s {@link PartitionTombstone} CRUD methods (Plan 3 Task 4 of the
- * Global Secondary Index design).
- */
+/** Tests for {@link ZooKeeperClient}'s {@link PartitionTombstone} CRUD methods. */
 class ZooKeeperClientPartitionTombstoneTest {
 
     @RegisterExtension

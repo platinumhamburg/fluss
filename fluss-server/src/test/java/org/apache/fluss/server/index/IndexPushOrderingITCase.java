@@ -30,7 +30,6 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
@@ -38,6 +37,7 @@ import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
@@ -52,9 +52,9 @@ import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
-import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestHooks;
 import org.apache.fluss.server.tablet.TabletServer;
@@ -148,8 +148,8 @@ class IndexPushOrderingITCase {
         List<CompletableFuture<PutKvResponse>> pendingSourceResponses = new ArrayList<>();
         CompletableFuture<Void> sourceStop = null;
         CompletableFuture<Void> targetStop = null;
-        SequenceGate oldKeyGate = null;
-        SequenceGate newKeyGate = null;
+        ProgressGate oldKeyGate = null;
+        ProgressGate newKeyGate = null;
         boolean sourceRestarted = false;
         boolean targetRestarted = false;
         Throwable primaryFailure = null;
@@ -185,13 +185,13 @@ class IndexPushOrderingITCase {
 
             WriterKey writerKey = IndexWriterKey.encode(fixture.sourceTableBucket);
             oldKeyGate =
-                    new SequenceGate(
+                    new ProgressGate(
                             fixture.failoverTarget.replica,
                             writerKey,
                             physicalRow(movementOldValue, movementPk),
                             true);
             newKeyGate =
-                    new SequenceGate(
+                    new ProgressGate(
                             fixture.otherTarget.replica,
                             writerKey,
                             physicalRow(movementNewValue, movementPk),
@@ -201,8 +201,8 @@ class IndexPushOrderingITCase {
             pendingSourceResponses.add(putSourceAndWait(fixture, movement, false));
             oldKeyGate.awaitOldAdmission();
             newKeyGate.awaitOldAdmission();
-            long oldWindowEnd = oldKeyGate.oldSequence();
-            assertThat(newKeyGate.oldSequence())
+            long oldWindowEnd = oldKeyGate.oldProgress();
+            assertThat(newKeyGate.oldProgress())
                     .as("all target batches derived from one source window share its end offset")
                     .isEqualTo(oldWindowEnd);
             assertThat(oldWindowEnd).isGreaterThan(snapshotOffset);
@@ -269,10 +269,10 @@ class IndexPushOrderingITCase {
                     .as("new source leader must restore the exact conservative snapshot offset")
                     .isEqualTo(snapshotOffset);
             assertThat(newSourceReplica.getAllIndexPushedOffset()).isEqualTo(snapshotOffset);
-            assertThat(oldKeyGate.newSequence())
+            assertThat(oldKeyGate.newProgress())
                     .as("new leader must choose a larger replay window than the held old leader")
                     .isGreaterThan(oldWindowEnd)
-                    .isEqualTo(newKeyGate.newSequence())
+                    .isEqualTo(newKeyGate.newProgress())
                     .isEqualTo(committedSourceEnd);
 
             newKeyGate.releaseNew();
@@ -283,17 +283,18 @@ class IndexPushOrderingITCase {
                     "wait for the dominating source replay window");
             assertThat(newSourceReplica.getAllIndexPushedOffset()).isEqualTo(committedSourceEnd);
 
-            FencedWriterStateEntry dominatingEntry =
-                    waitForFence(fixture.failoverTarget.tableBucket, writerKey, committedSourceEnd);
-            FencedWriterStateEntry otherDominatingEntry =
-                    waitForFence(fixture.otherTarget.tableBucket, writerKey, committedSourceEnd);
+            WriterProgressStateEntry latestEntry =
+                    waitForProgress(
+                            fixture.failoverTarget.tableBucket, writerKey, committedSourceEnd);
+            WriterProgressStateEntry otherLatestEntry =
+                    waitForProgress(fixture.otherTarget.tableBucket, writerKey, committedSourceEnd);
             Replica targetBeforeFailover =
                     CLUSTER.waitAndGetLeaderReplica(fixture.failoverTarget.tableBucket);
             assertThat(targetBeforeFailover.getLogTablet().getHighWatermark())
-                    .as("the dominating target WAL record must be committed before failover")
-                    .isGreaterThan(dominatingEntry.dominatingTargetWalOffset());
+                    .as("the latest target WAL record must be committed before failover")
+                    .isGreaterThan(latestEntry.progressWalOffset());
 
-            byte[] lostResponseRetry = oldKeyGate.dominatingBatch();
+            byte[] lostResponseRetry = oldKeyGate.replayBatch();
             long walBeforeLostResponseRetry = targetBeforeFailover.getLocalLogEndOffset();
             TabletServer targetServerBeforeFailover =
                     CLUSTER.getTabletServerById(
@@ -301,13 +302,13 @@ class IndexPushOrderingITCase {
             long staleBeforeLostResponseRetry = staleCount(targetServerBeforeFailover);
             sendCapturedBatch(fixture, fixture.failoverTarget.bucket, lostResponseRetry);
             assertThat(staleCount(targetServerBeforeFailover))
-                    .as("a lost-response retry must be observed as one duplicate fence")
+                    .as("a lost-response retry must be observed as one stale progress batch")
                     .isEqualTo(staleBeforeLostResponseRetry + 1L);
             assertThat(targetBeforeFailover.getLocalLogEndOffset())
                     .as("an identical successful retry must append no target WAL")
                     .isEqualTo(walBeforeLostResponseRetry);
-            assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
-                    .isEqualTo(dominatingEntry);
+            assertThat(currentProgress(fixture.failoverTarget.tableBucket, writerKey))
+                    .isEqualTo(latestEntry);
 
             int oldTargetLeader = fixture.failoverTarget.leader;
             targetStop =
@@ -317,17 +318,18 @@ class IndexPushOrderingITCase {
                     () -> currentLeader(fixture.failoverTarget.tableBucket) != oldTargetLeader,
                     TIMEOUT,
                     "wait for target leader failover");
-            FencedWriterStateEntry recoveredEntry =
-                    waitForFence(fixture.failoverTarget.tableBucket, writerKey, committedSourceEnd);
+            WriterProgressStateEntry recoveredEntry =
+                    waitForProgress(
+                            fixture.failoverTarget.tableBucket, writerKey, committedSourceEnd);
             assertThat(recoveredEntry)
-                    .as("new target leader must recover the exact committed dominating fence")
-                    .isEqualTo(dominatingEntry);
+                    .as("new target leader must recover the exact committed writer progress")
+                    .isEqualTo(latestEntry);
             Replica recoveredTarget =
                     CLUSTER.waitAndGetLeaderReplica(fixture.failoverTarget.tableBucket);
             assertThat(recoveredTarget.getLogTablet().getHighWatermark())
-                    .isGreaterThan(recoveredEntry.dominatingTargetWalOffset());
+                    .isGreaterThan(recoveredEntry.progressWalOffset());
             targetStop.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
+            assertThat(currentProgress(fixture.failoverTarget.tableBucket, writerKey))
                     .isEqualTo(recoveredEntry);
 
             Map<TableBucket, Long> walBeforeStaleDelivery =
@@ -353,19 +355,11 @@ class IndexPushOrderingITCase {
             sendCapturedBatch(fixture, fixture.otherTarget.bucket, delayedNewKeyUpsert);
             assertThat(totalStaleCount(staleMetricServers)).isEqualTo(staleBefore + 1L);
             assertStaleDeliveryHasNoSideEffects(
-                    fixture,
-                    writerKey,
-                    walBeforeStaleDelivery,
-                    recoveredEntry,
-                    otherDominatingEntry);
+                    fixture, writerKey, walBeforeStaleDelivery, recoveredEntry, otherLatestEntry);
             sendCapturedBatch(fixture, fixture.failoverTarget.bucket, delayedOldKeyDelete);
             assertThat(totalStaleCount(staleMetricServers)).isEqualTo(staleBefore + 2L);
             assertStaleDeliveryHasNoSideEffects(
-                    fixture,
-                    writerKey,
-                    walBeforeStaleDelivery,
-                    recoveredEntry,
-                    otherDominatingEntry);
+                    fixture, writerKey, walBeforeStaleDelivery, recoveredEntry, otherLatestEntry);
 
             assertIndexEqualsCommittedSourceWal(fixture, committedSourceEnd);
 
@@ -385,9 +379,9 @@ class IndexPushOrderingITCase {
             if (oldKeyGate != null) {
                 oldKeyGate.releaseAll();
             }
-            SequenceGate finalNewKeyGate = newKeyGate;
+            ProgressGate finalNewKeyGate = newKeyGate;
             cleanup(cleanupFailures, () -> closeGate(finalNewKeyGate));
-            SequenceGate finalOldKeyGate = oldKeyGate;
+            ProgressGate finalOldKeyGate = oldKeyGate;
             cleanup(cleanupFailures, () -> closeGate(finalOldKeyGate));
             for (CompletableFuture<PutKvResponse> response : pendingSourceResponses) {
                 response.cancel(true);
@@ -526,8 +520,8 @@ class IndexPushOrderingITCase {
 
     private static CapturedBatch copyBatch(
             KvRecordBatch batch, PhysicalRow expectedRow, boolean delete) throws IOException {
-        try (FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+        try (ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         batch.schemaId(),
                         Integer.MAX_VALUE,
                         new UnmanagedPagedOutputView(1024),
@@ -546,7 +540,7 @@ class IndexPushOrderingITCase {
                     containsExpectedMutation = true;
                 }
             }
-            builder.setWriterState(batch.fencedWriterKey(), batch.fencedSequence());
+            builder.setWriterState(batch.writerKey(), batch.writerProgress());
             BytesView encoded = builder.build();
             byte[] bytes = new byte[encoded.getBytesLength()];
             encoded.getByteBuf().getBytes(encoded.getByteBuf().readerIndex(), bytes);
@@ -573,30 +567,31 @@ class IndexPushOrderingITCase {
         assertSuccess(gateway.putKv(request).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
     }
 
-    private static FencedWriterStateEntry waitForFence(
-            TableBucket target, WriterKey writerKey, long expectedSequence) {
-        AtomicLong observedSequence = new AtomicLong(-1L);
+    private static WriterProgressStateEntry waitForProgress(
+            TableBucket target, WriterKey writerKey, long expectedProgress) {
+        AtomicLong observedProgress = new AtomicLong(-1L);
         waitUntil(
                 () -> {
-                    Optional<FencedWriterStateEntry> entry =
+                    Optional<WriterProgressStateEntry> entry =
                             CLUSTER.waitAndGetLeaderReplica(target)
                                     .getLogTablet()
                                     .writerStateManager()
-                                    .lastFencedEntry(writerKey);
-                    entry.ifPresent(value -> observedSequence.set(value.lastSequence()));
-                    return entry.map(value -> value.lastSequence() == expectedSequence)
+                                    .lastProgressEntry(writerKey);
+                    entry.ifPresent(value -> observedProgress.set(value.lastProgress()));
+                    return entry.map(value -> value.lastProgress() == expectedProgress)
                             .orElse(false);
                 },
                 TIMEOUT,
-                "wait for target fence " + expectedSequence + ", observed=" + observedSequence);
-        return currentFence(target, writerKey);
+                "wait for target progress " + expectedProgress + ", observed=" + observedProgress);
+        return currentProgress(target, writerKey);
     }
 
-    private static FencedWriterStateEntry currentFence(TableBucket target, WriterKey writerKey) {
+    private static WriterProgressStateEntry currentProgress(
+            TableBucket target, WriterKey writerKey) {
         return CLUSTER.waitAndGetLeaderReplica(target)
                 .getLogTablet()
                 .writerStateManager()
-                .lastFencedEntry(writerKey)
+                .lastProgressEntry(writerKey)
                 .orElseThrow(AssertionError::new);
     }
 
@@ -614,14 +609,14 @@ class IndexPushOrderingITCase {
             Fixture fixture,
             WriterKey writerKey,
             Map<TableBucket, Long> expectedWalEnds,
-            FencedWriterStateEntry expectedFailoverTargetEntry,
-            FencedWriterStateEntry expectedOtherTargetEntry) {
+            WriterProgressStateEntry expectedFailoverTargetEntry,
+            WriterProgressStateEntry expectedOtherTargetEntry) {
         assertThat(currentWalEnds(fixture.failoverTarget, fixture.otherTarget))
                 .as("released original old-source requests must append no target WAL")
                 .isEqualTo(expectedWalEnds);
-        assertThat(currentFence(fixture.failoverTarget.tableBucket, writerKey))
+        assertThat(currentProgress(fixture.failoverTarget.tableBucket, writerKey))
                 .isEqualTo(expectedFailoverTargetEntry);
-        assertThat(currentFence(fixture.otherTarget.tableBucket, writerKey))
+        assertThat(currentProgress(fixture.otherTarget.tableBucket, writerKey))
                 .isEqualTo(expectedOtherTargetEntry);
     }
 
@@ -778,7 +773,7 @@ class IndexPushOrderingITCase {
         return tabletServer
                 .getReplicaManager()
                 .getServerMetricGroup()
-                .indexPushStaleV1Batches()
+                .indexPushStaleProgressBatches()
                 .getCount();
     }
 
@@ -798,7 +793,7 @@ class IndexPushOrderingITCase {
         }
     }
 
-    private static void closeGate(@Nullable SequenceGate gate) throws Exception {
+    private static void closeGate(@Nullable ProgressGate gate) throws Exception {
         if (gate != null) {
             gate.close();
         }
@@ -857,23 +852,23 @@ class IndexPushOrderingITCase {
         void run() throws Exception;
     }
 
-    private static final class SequenceGate implements AutoCloseable {
+    private static final class ProgressGate implements AutoCloseable {
         private final WriterKey writerKey;
         private final PhysicalRow expectedRow;
         private final boolean delete;
-        private final AtomicLong oldSequence = new AtomicLong(-1L);
-        private final AtomicLong newSequence = new AtomicLong(-1L);
+        private final AtomicLong oldProgress = new AtomicLong(-1L);
+        private final AtomicLong newProgress = new AtomicLong(-1L);
         private final CountDownLatch oldAdmitted = new CountDownLatch(1);
         private final CountDownLatch oldAbandoned = new CountDownLatch(1);
         private final CountDownLatch newAdmitted = new CountDownLatch(1);
         private final CountDownLatch releaseOld = new CountDownLatch(1);
         private final CountDownLatch releaseNew = new CountDownLatch(1);
         private final AtomicReference<byte[]> capturedBatch = new AtomicReference<>();
-        private final AtomicReference<byte[]> dominatingBatch = new AtomicReference<>();
+        private final AtomicReference<byte[]> replayBatch = new AtomicReference<>();
         private final AtomicReference<String> captureFailure = new AtomicReference<>();
         private final AutoCloseable registration;
 
-        private SequenceGate(
+        private ProgressGate(
                 Replica replica, WriterKey writerKey, PhysicalRow expectedRow, boolean delete) {
             this.writerKey = writerKey;
             this.expectedRow = expectedRow;
@@ -883,12 +878,12 @@ class IndexPushOrderingITCase {
         }
 
         private void afterAdmission(KvRecordBatch batch) {
-            if (!writerKey.equals(batch.fencedWriterKey())) {
+            if (!writerKey.equals(batch.writerKey())) {
                 return;
             }
-            long sequence = batch.fencedSequence();
-            oldSequence.compareAndSet(-1L, sequence);
-            if (sequence == oldSequence.get()) {
+            long progress = batch.writerProgress();
+            oldProgress.compareAndSet(-1L, progress);
+            if (progress == oldProgress.get()) {
                 byte[] captured = captureEquivalentBatch(batch);
                 if (captured == null) {
                     oldAdmitted.countDown();
@@ -899,14 +894,14 @@ class IndexPushOrderingITCase {
                     abandonAfterCancellation();
                 }
                 throw AbandonedOldRequest.INSTANCE;
-            } else if (sequence > oldSequence.get()) {
+            } else if (progress > oldProgress.get()) {
                 byte[] captured = captureEquivalentBatch(batch);
                 if (captured == null) {
                     newAdmitted.countDown();
                     throw AbandonedOldRequest.INSTANCE;
                 }
-                dominatingBatch.compareAndSet(null, captured);
-                newSequence.accumulateAndGet(sequence, Math::max);
+                replayBatch.compareAndSet(null, captured);
+                newProgress.accumulateAndGet(progress, Math::max);
                 newAdmitted.countDown();
                 await(releaseNew, "wait to release new source-leader replay");
             }
@@ -929,8 +924,8 @@ class IndexPushOrderingITCase {
                         null, "admitted source batch does not contain expected mutation");
             } else if (reconstructed.magic() != batch.magic()
                     || reconstructed.schemaId() != batch.schemaId()
-                    || !reconstructed.fencedWriterKey().equals(batch.fencedWriterKey())
-                    || reconstructed.fencedSequence() != batch.fencedSequence()
+                    || !reconstructed.writerKey().equals(batch.writerKey())
+                    || reconstructed.writerProgress() != batch.writerProgress()
                     || reconstructed.sizeInBytes() != batch.sizeInBytes()
                     || reconstructed.checksum() != batch.checksum()
                     || reconstructed.getRecordCount() != batch.getRecordCount()) {
@@ -973,12 +968,12 @@ class IndexPushOrderingITCase {
             assertThat(captureFailure.get()).isNull();
         }
 
-        private long oldSequence() {
-            return oldSequence.get();
+        private long oldProgress() {
+            return oldProgress.get();
         }
 
-        private long newSequence() {
-            return newSequence.get();
+        private long newProgress() {
+            return newProgress.get();
         }
 
         private void releaseOld() {
@@ -1001,9 +996,9 @@ class IndexPushOrderingITCase {
             return bytes.clone();
         }
 
-        private byte[] dominatingBatch() {
-            byte[] bytes = dominatingBatch.get();
-            assertThat(bytes).as("captured dominating source batch").isNotNull();
+        private byte[] replayBatch() {
+            byte[] bytes = replayBatch.get();
+            assertThat(bytes).as("captured new-leader replay batch").isNotNull();
             assertThat(captureFailure.get()).isNull();
             return bytes.clone();
         }

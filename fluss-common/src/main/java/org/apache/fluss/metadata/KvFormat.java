@@ -35,15 +35,7 @@ public enum KvFormat {
      * The kv record batches are stored in {@link IndexedRow} format. It is more efficient for read
      * partial columns from snapshot as it won't need to deserialize the whole row.
      */
-    INDEXED,
-
-    /**
-     * The kv record batches are stored in {@link org.apache.fluss.row.aligned.AlignedRow} format.
-     * Each field occupies a fixed 8-byte slot, enabling O(1) random column access without full
-     * deserialization. Used by partitioned Index Tables so the RocksDB native compaction filter and
-     * query-time tombstone filter can read the source partition id at a stable offset.
-     */
-    ALIGNED;
+    INDEXED;
 
     /** Creates a {@link KvFormat} from the given string. */
     public static KvFormat fromString(String format) {
@@ -52,8 +44,6 @@ public enum KvFormat {
                 return COMPACTED;
             case "INDEXED":
                 return INDEXED;
-            case "ALIGNED":
-                return ALIGNED;
             default:
                 throw new IllegalArgumentException("Unsupported kv format: " + format);
         }

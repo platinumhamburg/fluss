@@ -22,7 +22,6 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.lookup.Lookup;
 import org.apache.fluss.client.lookup.LookupType;
 import org.apache.fluss.client.lookup.Lookuper;
-import org.apache.fluss.client.table.FlussTable;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.TableNotExistException;
@@ -114,7 +113,7 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
             String indexName =
                     LookupNormalizer.findMatchingSecondaryIndexName(
                             table.getTableInfo().getSchema(), lookupColumns);
-            lookuper = ((FlussTable) table).getSecondaryIndexLookuper(indexName);
+            lookuper = table.getSecondaryIndexLookuper(indexName);
         } else {
             Lookup lookup = table.newLookup();
             if (lookupNormalizer.getLookupType() == LookupType.PREFIX_LOOKUP) {

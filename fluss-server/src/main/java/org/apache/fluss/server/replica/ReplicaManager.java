@@ -338,7 +338,8 @@ public class ReplicaManager implements ServerReconfigurable {
                         this::failedIndexReplicationSourceBucketCount);
         this.indexWriterStateGaugeRegistration =
                 serverMetricGroup.registerIndexWriterStateGauges(
-                        this::fencedWriterStateEntryCount, this::fencedWriterStateSnapshotBytes);
+                        this::writerProgressStateEntryCount,
+                        this::writerProgressStateSnapshotBytes);
 
         this.highWatermarkCheckpoints = new HashMap<>();
         for (File dataDir : localDiskManager.dataDirs()) {
@@ -517,12 +518,12 @@ public class ReplicaManager implements ServerReconfigurable {
         return onlineReplicas().map(Replica::writerIdCount).reduce(0, Integer::sum);
     }
 
-    private long fencedWriterStateEntryCount() {
-        return onlineReplicas().mapToLong(Replica::fencedWriterStateEntryCount).sum();
+    private long writerProgressStateEntryCount() {
+        return onlineReplicas().mapToLong(Replica::writerProgressStateEntryCount).sum();
     }
 
-    private long fencedWriterStateSnapshotBytes() {
-        return onlineReplicas().mapToLong(Replica::fencedWriterStateSnapshotBytes).sum();
+    private long writerProgressStateSnapshotBytes() {
+        return onlineReplicas().mapToLong(Replica::writerProgressStateSnapshotBytes).sum();
     }
 
     private long logicalStorageLogSize() {
@@ -668,8 +669,7 @@ public class ReplicaManager implements ServerReconfigurable {
             return;
         }
         for (Replica replica : getOnlineReplicaList()) {
-            if (!replica.getTableInfo().isIndexTable()
-                    || !replica.getTableInfo().getMainTableId().isPresent()) {
+            if (!replica.getTableInfo().isIndexTable()) {
                 continue;
             }
             long mainTableId = replica.getTableInfo().getMainTableId().getAsLong();

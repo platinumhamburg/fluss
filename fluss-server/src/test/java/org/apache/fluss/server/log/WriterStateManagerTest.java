@@ -61,7 +61,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test for {@link WriterStateManager}. */
 public class WriterStateManagerTest {
 
-    private static final byte[] V0_SNAPSHOT_FIXTURE =
+    private static final byte[] CONTIGUOUS_SEQUENCE_SNAPSHOT_FIXTURE =
             ("{\"version\":1,\"writer_id_entries\":[{\"writer_id\":5,"
                             + "\"last_batch_sequence\":0,\"last_batch_base_offset\":8,"
                             + "\"offset_delta\":0,\"last_batch_timestamp\":9}]}")
@@ -88,10 +88,11 @@ public class WriterStateManagerTest {
     }
 
     @Test
-    void testThreeArgumentConstructorRemainsV0Compact() {
+    void testThreeArgumentConstructorDefaultsToContiguousBatchSequence() {
         append(stateManager, 5L, 0, 8L, false, 9L);
 
-        assertThat(stateManager.protocol()).isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
+        assertThat(stateManager.protocol())
+                .isEqualTo(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         assertThat(stateManager.activeWriters()).containsOnlyKeys(5L);
         assertThat(stateManager.writerIdCount()).isEqualTo(1);
     }
@@ -131,139 +132,139 @@ public class WriterStateManagerTest {
     }
 
     @Test
-    void testV0SnapshotMatchesLiteralBaseFixture() throws Exception {
+    void testContiguousSequenceSnapshotMatchesLiteralFixture() throws Exception {
         append(stateManager, 5L, 0, 8L, false, 9L);
         stateManager.takeSnapshot();
 
         assertThat(Files.readAllBytes(writerSnapshotFile(logDir, 9L).toPath()))
-                .isEqualTo(V0_SNAPSHOT_FIXTURE);
+                .isEqualTo(CONTIGUOUS_SEQUENCE_SNAPSHOT_FIXTURE);
     }
 
     @Test
-    void testV1SparseSequenceUsesLatestFenceOnly() throws Exception {
-        WriterStateManager manager = fencedManager();
+    void testCumulativeProgressKeepsLatestValueAcrossGaps() throws Exception {
+        WriterStateManager manager = progressManager();
         WriterKey key = new WriterKey(4L, 5L);
 
-        appendFenced(manager, key, 100L, 10L, 1L);
-        appendFenced(manager, key, 500L, 20L, 2L);
-        appendFenced(manager, key, (long) Integer.MAX_VALUE + 1L, 30L, 3L);
+        appendProgress(manager, key, 100L, 10L, 1L);
+        appendProgress(manager, key, 500L, 20L, 2L);
+        appendProgress(manager, key, (long) Integer.MAX_VALUE + 1L, 30L, 3L);
 
-        FencedWriterStateEntry entry =
-                manager.lastFencedEntry(key).orElseThrow(AssertionError::new);
-        assertThat(entry.lastSequence()).isEqualTo((long) Integer.MAX_VALUE + 1L);
-        assertThat(entry.dominatingTargetWalOffset()).isEqualTo(30L);
-        assertThat(manager.findStaleFencedBatch(key, 500L)).contains(entry);
-        assertThat(manager.findStaleFencedBatch(key, entry.lastSequence())).contains(entry);
-        assertThat(manager.findStaleFencedBatch(key, entry.lastSequence() + 1L)).isEmpty();
+        WriterProgressStateEntry entry =
+                manager.lastProgressEntry(key).orElseThrow(AssertionError::new);
+        assertThat(entry.lastProgress()).isEqualTo((long) Integer.MAX_VALUE + 1L);
+        assertThat(entry.progressWalOffset()).isEqualTo(30L);
+        assertThat(manager.findStaleProgressBatch(key, 500L)).contains(entry);
+        assertThat(manager.findStaleProgressBatch(key, entry.lastProgress())).contains(entry);
+        assertThat(manager.findStaleProgressBatch(key, entry.lastProgress() + 1L)).isEmpty();
         assertThat(manager.writerIdCount()).isEqualTo(1);
     }
 
     @Test
-    void testV1PreparedUpdateIsOneShotAndPublishesOnlyOnUpdate() throws Exception {
-        WriterStateManager manager = fencedManager();
+    void testProgressUpdateIsOneShotAndPublishesOnlyOnUpdate() throws Exception {
+        WriterStateManager manager = progressManager();
         WriterKey key = new WriterKey(4L, 5L);
-        FencedWriterAppendInfo appendInfo = manager.prepareFencedUpdate(key);
-        FencedWriterAppendInfo superseded = manager.prepareFencedUpdate(key);
+        WriterProgressAppendInfo appendInfo = manager.prepareProgressUpdate(key);
+        WriterProgressAppendInfo superseded = manager.prepareProgressUpdate(key);
 
         appendInfo.append(100L, 10L, 1L);
         superseded.append(101L, 11L, 2L);
-        assertThat(manager.lastFencedEntry(key)).isEmpty();
+        assertThat(manager.lastProgressEntry(key)).isEmpty();
         assertThatThrownBy(() -> appendInfo.append(101L, 11L, 2L))
                 .isInstanceOf(IllegalStateException.class);
 
-        manager.updateFenced(appendInfo);
-        assertThat(manager.lastFencedEntry(key)).contains(appendInfo.updatedEntry());
-        assertThatThrownBy(() -> manager.updateFenced(superseded))
+        manager.updateProgress(appendInfo);
+        assertThat(manager.lastProgressEntry(key)).contains(appendInfo.updatedEntry());
+        assertThatThrownBy(() -> manager.updateProgress(superseded))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> manager.updateFenced(manager.prepareFencedUpdate(key)))
+        assertThatThrownBy(() -> manager.updateProgress(manager.prepareProgressUpdate(key)))
                 .isInstanceOf(IllegalStateException.class);
     }
 
     @Test
-    void testV1RejectsEqualLowerAndNegativeFreshUpdates() throws Exception {
-        WriterStateManager manager = fencedManager();
+    void testProgressRejectsEqualLowerAndNegativeFreshUpdates() throws Exception {
+        WriterStateManager manager = progressManager();
         WriterKey key = new WriterKey(4L, 5L);
-        appendFenced(manager, key, 100L, 10L, 1L);
+        appendProgress(manager, key, 100L, 10L, 1L);
 
-        assertThatThrownBy(() -> manager.prepareFencedUpdate(key).append(100L, 11L, 2L))
+        assertThatThrownBy(() -> manager.prepareProgressUpdate(key).append(100L, 11L, 2L))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> manager.prepareFencedUpdate(key).append(99L, 11L, 2L))
+        assertThatThrownBy(() -> manager.prepareProgressUpdate(key).append(99L, 11L, 2L))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(
                         () ->
-                                manager.prepareFencedUpdate(new WriterKey(6L, 7L))
+                                manager.prepareProgressUpdate(new WriterKey(6L, 7L))
                                         .append(-1L, 11L, 2L))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    void testV1WriterDoesNotExpireAndCanBeExplicitlyRetired() throws Exception {
-        WriterStateManager manager = fencedManager();
+    void testProgressWriterDoesNotExpireAndCanBeExplicitlyRetired() throws Exception {
+        WriterStateManager manager = progressManager();
         WriterKey retained = new WriterKey(4L, 5L);
         WriterKey retired = new WriterKey(6L, 7L);
-        appendFenced(manager, retained, 100L, 10L, 1L);
-        appendFenced(manager, retired, 200L, 20L, 2L);
+        appendProgress(manager, retained, 100L, 10L, 1L);
+        appendProgress(manager, retired, 200L, 20L, 2L);
 
         manager.removeExpiredWriters(Long.MAX_VALUE);
         assertThat(manager.writerIdCount()).isEqualTo(2);
 
-        manager.removeFencedWriters(retired::equals);
-        assertThat(manager.lastFencedEntry(retained)).isPresent();
-        assertThat(manager.lastFencedEntry(retired)).isEmpty();
+        manager.removeProgressWriters(retired::equals);
+        assertThat(manager.lastProgressEntry(retained)).isPresent();
+        assertThat(manager.lastProgressEntry(retired)).isEmpty();
         assertThat(manager.writerIdCount()).isEqualTo(1);
         assertThat(manager.isEmpty()).isFalse();
-        manager.removeFencedWriters(key -> true);
+        manager.removeProgressWriters(key -> true);
         assertThat(manager.isEmpty()).isTrue();
     }
 
     @Test
     void testProtocolSpecificApisFailFastAcrossProtocols() throws Exception {
-        WriterStateManager fenced = fencedManager();
+        WriterStateManager progress = progressManager();
         WriterKey key = new WriterKey(4L, 5L);
 
-        assertThatThrownBy(() -> stateManager.lastFencedEntry(key))
+        assertThatThrownBy(() -> stateManager.lastProgressEntry(key))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> stateManager.findStaleFencedBatch(key, 0L))
+        assertThatThrownBy(() -> stateManager.findStaleProgressBatch(key, 0L))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> stateManager.prepareFencedUpdate(key))
+        assertThatThrownBy(() -> stateManager.prepareProgressUpdate(key))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> stateManager.removeFencedWriters(ignored -> true))
+        assertThatThrownBy(() -> stateManager.removeProgressWriters(ignored -> true))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> stateManager.updateFenced(fenced.prepareFencedUpdate(key)))
+        assertThatThrownBy(() -> stateManager.updateProgress(progress.prepareProgressUpdate(key)))
                 .isInstanceOf(IllegalStateException.class);
 
-        assertThatThrownBy(() -> fenced.lastEntry(1L)).isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(fenced::activeWriters).isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> fenced.prepareUpdate(1L))
+        assertThatThrownBy(() -> progress.lastEntry(1L)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(progress::activeWriters).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> progress.prepareUpdate(1L))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> fenced.update(stateManager.prepareUpdate(1L)))
+        assertThatThrownBy(() -> progress.update(stateManager.prepareUpdate(1L)))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> fenced.loadWriterEntry(WriterStateEntry.empty(1L)))
+        assertThatThrownBy(() -> progress.loadWriterEntry(WriterStateEntry.empty(1L)))
                 .isInstanceOf(IllegalStateException.class);
     }
 
     @Test
-    void testV1SnapshotRoundTripPreservesFullKeyAndLongValues() throws Exception {
-        WriterStateManager manager = fencedManager();
+    void testProgressSnapshotRoundTripPreservesFullKeyAndLongValues() throws Exception {
+        WriterStateManager manager = progressManager();
         WriterKey key = new WriterKey(Long.MAX_VALUE, Long.MIN_VALUE | 3L);
-        appendFenced(manager, key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L);
+        appendProgress(manager, key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L);
         manager.updateMapEndOffset(Long.MAX_VALUE);
         manager.takeSnapshot();
 
-        WriterStateManager recovered = fencedManager();
+        WriterStateManager recovered = progressManager();
         recovered.truncateAndReload(0L, Long.MAX_VALUE, Long.MAX_VALUE);
 
-        assertThat(recovered.lastFencedEntry(key))
+        assertThat(recovered.lastProgressEntry(key))
                 .contains(
-                        new FencedWriterStateEntry(
+                        new WriterProgressStateEntry(
                                 key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L));
     }
 
     @Test
     void testSnapshotReplacesStaleTemporaryFileAndPublishesCompleteContents() throws Exception {
-        WriterStateManager manager = fencedManager();
+        WriterStateManager manager = progressManager();
         WriterKey key = new WriterKey(4L, 5L);
-        appendFenced(manager, key, 100L, 10L, 1L);
+        appendProgress(manager, key, 100L, 10L, 1L);
         manager.updateMapEndOffset(11L);
         Path snapshot = writerSnapshotFile(logDir, 11L).toPath();
         Path temporary = snapshot.resolveSibling(snapshot.getFileName() + ".tmp");
@@ -273,10 +274,10 @@ public class WriterStateManagerTest {
 
         assertThat(temporary).doesNotExist();
         assertThat(Files.readAllBytes(snapshot)).isEqualTo(v2SnapshotBytes(100L, 10L));
-        WriterStateManager recovered = fencedManager();
+        WriterStateManager recovered = progressManager();
         recovered.truncateAndReload(0L, 11L, Long.MAX_VALUE);
-        assertThat(recovered.lastFencedEntry(key))
-                .contains(new FencedWriterStateEntry(key, 100L, 10L, 1L));
+        assertThat(recovered.lastProgressEntry(key))
+                .contains(new WriterProgressStateEntry(key, 100L, 10L, 1L));
     }
 
     @Test
@@ -286,27 +287,27 @@ public class WriterStateManagerTest {
         stateManager.truncateAndReload(0L, 1L, Long.MAX_VALUE);
         assertThat(writerSnapshotFile(logDir, 1L)).doesNotExist();
 
-        Files.write(writerSnapshotFile(logDir, 2L).toPath(), V0_SNAPSHOT_FIXTURE);
-        WriterStateManager fenced = fencedManager();
-        assertThatThrownBy(() -> fenced.truncateAndReload(1L, 2L, Long.MAX_VALUE))
+        Files.write(writerSnapshotFile(logDir, 2L).toPath(), CONTIGUOUS_SEQUENCE_SNAPSHOT_FIXTURE);
+        WriterStateManager progress = progressManager();
+        assertThatThrownBy(() -> progress.truncateAndReload(1L, 2L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class);
         assertThat(writerSnapshotFile(logDir, 2L)).exists();
     }
 
     @Test
-    void testV1CorruptSnapshotIsPropagatedWithoutFallback() throws Exception {
+    void testProgressCorruptSnapshotIsPropagatedWithoutFallback() throws Exception {
         File snapshot = writerSnapshotFile(logDir, 1L);
         Files.write(snapshot.toPath(), "{\"version\":2}".getBytes(StandardCharsets.UTF_8));
-        WriterStateManager fenced = fencedManager();
+        WriterStateManager progress = progressManager();
 
-        assertThatThrownBy(() -> fenced.truncateAndReload(1L, 1L, Long.MAX_VALUE))
+        assertThatThrownBy(() -> progress.truncateAndReload(1L, 1L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class);
         assertThat(snapshot).exists();
     }
 
     @Test
-    void testV1RecoveryCoverageUsesHalfOpenOffsets() throws Exception {
-        WriterStateManager empty = fencedManager();
+    void testProgressRecoveryCoverageUsesHalfOpenOffsets() throws Exception {
+        WriterStateManager empty = progressManager();
 
         assertThatThrownBy(() -> empty.validateRecoveryCoverage(1L, 1L))
                 .isInstanceOf(CorruptSnapshotException.class)
@@ -315,12 +316,12 @@ public class WriterStateManagerTest {
         empty.updateMapEndOffset(5L);
         empty.validateRecoveryCoverage(0L, 5L);
 
-        WriterStateManager snapshotWriter = fencedManager();
-        appendFenced(snapshotWriter, new WriterKey(4L, 5L), 100L, 4L, 1L);
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, new WriterKey(4L, 5L), 100L, 4L, 1L);
         snapshotWriter.updateMapEndOffset(5L);
         snapshotWriter.takeSnapshot();
 
-        WriterStateManager exactEnd = fencedManager();
+        WriterStateManager exactEnd = progressManager();
         exactEnd.truncateAndReload(5L, 5L, Long.MAX_VALUE);
         exactEnd.validateRecoveryCoverage(5L, 5L);
 
@@ -331,10 +332,10 @@ public class WriterStateManagerTest {
     }
 
     @Test
-    void testV1FallsBackToOlderValidSnapshotWithoutDeletingCorruptLatest() throws Exception {
+    void testProgressFallsBackToOlderValidSnapshotWithoutDeletingCorruptLatest() throws Exception {
         WriterKey olderKey = new WriterKey(4L, 5L);
-        WriterStateManager snapshotWriter = fencedManager();
-        appendFenced(snapshotWriter, olderKey, 100L, 4L, 1L);
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, olderKey, 100L, 4L, 1L);
         snapshotWriter.updateMapEndOffset(5L);
         snapshotWriter.takeSnapshot();
 
@@ -342,26 +343,26 @@ public class WriterStateManagerTest {
         byte[] corruptBytes = "{\"version\":2}".getBytes(StandardCharsets.UTF_8);
         Files.write(corruptLatest.toPath(), corruptBytes);
 
-        WriterStateManager recovered = fencedManager();
+        WriterStateManager recovered = progressManager();
         recovered.truncateAndReload(5L, 10L, Long.MAX_VALUE);
 
-        assertThat(recovered.lastFencedEntry(olderKey)).isPresent();
+        assertThat(recovered.lastProgressEntry(olderKey)).isPresent();
         assertThat(recovered.mapEndOffset()).isEqualTo(5L);
         assertThat(recovered.fetchSnapshot(10L)).contains(corruptLatest);
         assertThat(Files.readAllBytes(corruptLatest.toPath())).isEqualTo(corruptBytes);
     }
 
     @Test
-    void testV1RejectsFallbackWhoseReplayRangeStartsBeforeRetainedWal() throws Exception {
-        WriterStateManager snapshotWriter = fencedManager();
-        appendFenced(snapshotWriter, new WriterKey(4L, 5L), 100L, 3L, 1L);
+    void testProgressRejectsFallbackWhoseReplayRangeStartsBeforeRetainedWal() throws Exception {
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, new WriterKey(4L, 5L), 100L, 3L, 1L);
         snapshotWriter.updateMapEndOffset(4L);
         snapshotWriter.takeSnapshot();
 
         File corruptLatest = writerSnapshotFile(logDir, 10L);
         Files.write(corruptLatest.toPath(), "{\"version\":2}".getBytes(StandardCharsets.UTF_8));
 
-        WriterStateManager recovered = fencedManager();
+        WriterStateManager recovered = progressManager();
         assertThatThrownBy(() -> recovered.truncateAndReload(5L, 10L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class)
                 .hasMessageContaining("continuous WriterState recovery");
@@ -370,13 +371,13 @@ public class WriterStateManagerTest {
     }
 
     @Test
-    void testV1RejectsSnapshotAfterTruncationTarget() throws Exception {
-        WriterStateManager snapshotWriter = fencedManager();
-        appendFenced(snapshotWriter, new WriterKey(4L, 5L), 100L, 9L, 1L);
+    void testProgressRejectsSnapshotAfterTruncationTarget() throws Exception {
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, new WriterKey(4L, 5L), 100L, 9L, 1L);
         snapshotWriter.updateMapEndOffset(10L);
         snapshotWriter.takeSnapshot();
 
-        WriterStateManager recovered = fencedManager();
+        WriterStateManager recovered = progressManager();
         assertThatThrownBy(() -> recovered.truncateAndReload(5L, 8L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class)
                 .hasMessageContaining("recovery end 8");
@@ -384,10 +385,10 @@ public class WriterStateManagerTest {
     }
 
     @Test
-    void testV1FailedReloadPreservesLiveStateAndSnapshotMetadata() throws Exception {
-        WriterStateManager manager = fencedManager();
+    void testProgressFailedReloadPreservesLiveStateAndSnapshotMetadata() throws Exception {
+        WriterStateManager manager = progressManager();
         WriterKey liveKey = new WriterKey(4L, 5L);
-        appendFenced(manager, liveKey, 100L, 10L, 1L);
+        appendProgress(manager, liveKey, 100L, 10L, 1L);
         manager.updateMapEndOffset(20L);
 
         File corruptSnapshot = writerSnapshotFile(logDir, 15L);
@@ -398,14 +399,14 @@ public class WriterStateManagerTest {
         Files.write(outOfRangeSnapshot.toPath(), outOfRangeBytes);
         manager.reloadSnapshots();
 
-        Optional<FencedWriterStateEntry> liveEntry = manager.lastFencedEntry(liveKey);
+        Optional<WriterProgressStateEntry> liveEntry = manager.lastProgressEntry(liveKey);
         Optional<Long> latestSnapshotOffset = manager.latestSnapshotOffset();
         Optional<Long> oldestSnapshotOffset = manager.oldestSnapshotOffset();
 
         assertThatThrownBy(() -> manager.truncateAndReload(1L, 15L, Long.MAX_VALUE))
                 .isInstanceOf(CorruptSnapshotException.class);
 
-        assertThat(manager.lastFencedEntry(liveKey)).isEqualTo(liveEntry);
+        assertThat(manager.lastProgressEntry(liveKey)).isEqualTo(liveEntry);
         assertThat(manager.writerIdCount()).isEqualTo(1);
         assertThat(manager.mapEndOffset()).isEqualTo(20L);
         assertThat(manager.latestSnapshotOffset()).isEqualTo(latestSnapshotOffset);
@@ -417,69 +418,69 @@ public class WriterStateManagerTest {
     }
 
     @Test
-    void testV1RecoveryCandidateFailureDoesNotPublishSelectedSnapshot() throws Exception {
+    void testProgressRecoveryCandidateFailureDoesNotPublishSelectedSnapshot() throws Exception {
         WriterKey writerKey = new WriterKey(4L, 5L);
-        WriterStateManager manager = fencedManager();
-        appendFenced(manager, writerKey, 100L, 4L, 1L);
+        WriterStateManager manager = progressManager();
+        appendProgress(manager, writerKey, 100L, 4L, 1L);
         manager.updateMapEndOffset(5L);
         manager.takeSnapshot();
-        appendFenced(manager, writerKey, 900L, 9L, 2L);
+        appendProgress(manager, writerKey, 900L, 9L, 2L);
         manager.updateMapEndOffset(10L);
 
-        WriterStateManager candidate = manager.fencedRecoveryCandidate(5L, 10L);
+        WriterStateManager candidate = manager.progressRecoveryCandidate(5L, 10L);
         assertThatThrownBy(() -> candidate.validateRecoveryCoverage(5L, 10L))
                 .isInstanceOf(CorruptSnapshotException.class);
 
         assertThat(manager.mapEndOffset()).isEqualTo(10L);
-        assertThat(manager.lastFencedEntry(writerKey))
+        assertThat(manager.lastProgressEntry(writerKey))
                 .get()
-                .extracting(FencedWriterStateEntry::lastSequence)
+                .extracting(WriterProgressStateEntry::lastProgress)
                 .isEqualTo(900L);
     }
 
     @ParameterizedTest
     @ValueSource(longs = {-1L, 5L})
-    void testLocalV1CandidateRejectsInvalidDominatingOffsetAndKeepsOlderEligible(
+    void testProgressCandidateRejectsInvalidTargetWalOffsetAndKeepsOlderEligible(
             long invalidTargetOffset) throws Exception {
         WriterKey writerKey = new WriterKey(4L, 5L);
-        WriterStateManager snapshotWriter = fencedManager();
-        appendFenced(snapshotWriter, writerKey, 100L, 0L, 1L);
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, writerKey, 100L, 0L, 1L);
         snapshotWriter.updateMapEndOffset(2L);
         snapshotWriter.takeSnapshot();
         File invalidSnapshot = writerSnapshotFile(logDir, 5L);
         byte[] invalidBytes = v2SnapshotBytes(900L, invalidTargetOffset);
         Files.write(invalidSnapshot.toPath(), invalidBytes);
 
-        WriterStateManager manager = fencedManager();
-        WriterStateManager candidate = manager.fencedRecoveryCandidate(0L, 5L);
+        WriterStateManager manager = progressManager();
+        WriterStateManager candidate = manager.progressRecoveryCandidate(0L, 5L);
 
         assertThat(candidate.mapEndOffset()).isEqualTo(2L);
-        assertThat(candidate.lastFencedEntry(writerKey))
+        assertThat(candidate.lastProgressEntry(writerKey))
                 .get()
-                .extracting(FencedWriterStateEntry::lastSequence)
+                .extracting(WriterProgressStateEntry::lastProgress)
                 .isEqualTo(100L);
         assertThat(Files.readAllBytes(invalidSnapshot.toPath())).isEqualTo(invalidBytes);
     }
 
     @Test
-    void testV1SuccessfulReloadAtomicallyReplacesLiveState() throws Exception {
-        WriterStateManager manager = fencedManager();
+    void testProgressSuccessfulReloadAtomicallyReplacesLiveState() throws Exception {
+        WriterStateManager manager = progressManager();
         WriterKey oldKey = new WriterKey(4L, 5L);
         WriterKey snapshotKey = new WriterKey(6L, 7L);
-        appendFenced(manager, oldKey, 100L, 10L, 1L);
+        appendProgress(manager, oldKey, 100L, 10L, 1L);
         manager.updateMapEndOffset(20L);
 
-        WriterStateManager snapshotWriter = fencedManager();
-        appendFenced(snapshotWriter, snapshotKey, 200L, 14L, 2L);
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, snapshotKey, 200L, 14L, 2L);
         snapshotWriter.updateMapEndOffset(15L);
         snapshotWriter.takeSnapshot();
         manager.reloadSnapshots();
 
         manager.truncateAndReload(0L, 15L, Long.MAX_VALUE);
 
-        assertThat(manager.lastFencedEntry(oldKey)).isEmpty();
-        assertThat(manager.lastFencedEntry(snapshotKey))
-                .contains(new FencedWriterStateEntry(snapshotKey, 200L, 14L, 2L));
+        assertThat(manager.lastProgressEntry(oldKey)).isEmpty();
+        assertThat(manager.lastProgressEntry(snapshotKey))
+                .contains(new WriterProgressStateEntry(snapshotKey, 200L, 14L, 2L));
         assertThat(manager.writerIdCount()).isEqualTo(1);
         assertThat(manager.mapEndOffset()).isEqualTo(15L);
     }
@@ -937,33 +938,33 @@ public class WriterStateManagerTest {
         stateManager.updateMapEndOffset(offset + 1);
     }
 
-    private WriterStateManager fencedManager() throws IOException {
+    private WriterStateManager progressManager() throws IOException {
         return new WriterStateManager(
                 tableBucket,
                 logDir,
                 (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis(),
-                KvIdempotenceProtocol.V1_FENCED);
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
     }
 
-    private static void appendFenced(
+    private static void appendProgress(
             WriterStateManager manager,
             WriterKey writerKey,
-            long sequence,
+            long progress,
             long targetWalOffset,
             long timestamp) {
-        FencedWriterAppendInfo appendInfo = manager.prepareFencedUpdate(writerKey);
-        appendInfo.append(sequence, targetWalOffset, timestamp);
-        manager.updateFenced(appendInfo);
+        WriterProgressAppendInfo appendInfo = manager.prepareProgressUpdate(writerKey);
+        appendInfo.append(progress, targetWalOffset, timestamp);
+        manager.updateProgress(appendInfo);
     }
 
     private static byte[] v2SnapshotBytes() {
         return v2SnapshotBytes(100L, 10L);
     }
 
-    private static byte[] v2SnapshotBytes(long sequence, long targetOffset) {
+    private static byte[] v2SnapshotBytes(long progress, long targetOffset) {
         return ("{\"version\":2,\"kv_idempotence_protocol_version\":1,\"writer_entries\":[{"
                         + "\"writer_key_high\":4,\"writer_key_low\":5,\"last_sequence\":"
-                        + sequence
+                        + progress
                         + ",\"last_target_wal_offset\":"
                         + targetOffset
                         + ",\"last_timestamp\":1}]}")

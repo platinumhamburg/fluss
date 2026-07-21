@@ -43,7 +43,7 @@ public final class SecondaryIndexColumnNames {
         }
     }
 
-    /** Decodes the JSON representation, while accepting the original comma-separated syntax. */
+    /** Decodes either a JSON string array or a comma-separated list of column names. */
     public static List<String> decode(String value) {
         if (value.trim().startsWith("[")) {
             try {

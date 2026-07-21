@@ -50,14 +50,17 @@ public class CompactedWalBuilder implements WalBuilder {
     }
 
     private CompactedWalBuilder(
-            int schemaId, RowType rowType, MemorySegmentPool memorySegmentPool, boolean fenced)
+            int schemaId,
+            RowType rowType,
+            MemorySegmentPool memorySegmentPool,
+            boolean progressMode)
             throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         // unlimited write size as we don't know the WAL size in advance
         this.recordsBuilder =
-                fenced
-                        ? MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                progressMode
+                        ? MemoryLogRecordsCompactedBuilder.progressBuilder(
                                 schemaId, Integer.MAX_VALUE, outputView, false)
                         : MemoryLogRecordsCompactedBuilder.builder(
                                 schemaId, Integer.MAX_VALUE, outputView, /*appendOnly*/ false);
@@ -67,7 +70,7 @@ public class CompactedWalBuilder implements WalBuilder {
         this.fieldCount = rowType.getFieldCount();
     }
 
-    public static CompactedWalBuilder fencedBuilder(
+    public static CompactedWalBuilder progressBuilder(
             int schemaId, RowType rowType, MemorySegmentPool memorySegmentPool) throws IOException {
         return new CompactedWalBuilder(schemaId, rowType, memorySegmentPool, true);
     }
@@ -101,8 +104,8 @@ public class CompactedWalBuilder implements WalBuilder {
     }
 
     @Override
-    public void setFencedWriterState(WriterKey writerKey, long sequence) {
-        recordsBuilder.setFencedWriterState(writerKey, sequence);
+    public void setWriterProgress(WriterKey writerKey, long progress) {
+        recordsBuilder.setWriterProgress(writerKey, progress);
     }
 
     @Override

@@ -86,9 +86,6 @@ final class TombstonedPartitionDiscriminator {
         if (pidPos < 0) {
             return null;
         }
-        if (!tableInfo.getMainTableId().isPresent()) {
-            return null;
-        }
         // Defensive guard: partitioned index tables MUST use v3 format to carry the tag.
         int kvFormatVersion =
                 tableInfo

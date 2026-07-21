@@ -18,7 +18,6 @@
 package org.apache.fluss.client.table;
 
 import org.apache.fluss.annotation.PublicEvolving;
-import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.FlussConnection;
 import org.apache.fluss.client.lookup.Lookup;
 import org.apache.fluss.client.lookup.Lookuper;
@@ -129,6 +128,7 @@ public class FlussTable implements Table {
      * @throws IllegalArgumentException if no secondary index with the given name is declared on
      *     this table.
      */
+    @Override
     public Lookuper getSecondaryIndexLookuper(String indexName) {
         Schema mainSchema = tableInfo.getSchema();
         Schema.Index index = findIndexOrThrow(mainSchema, tablePath, indexName);
@@ -197,13 +197,8 @@ public class FlussTable implements Table {
                 basePkExtractor);
     }
 
-    /**
-     * Looks up an {@link Schema.Index} by name in the given main-table schema. Extracted from
-     * {@link #getSecondaryIndexLookuper(String)} for unit-test coverage of the validation step
-     * without standing up a {@link FlussConnection}.
-     */
-    @VisibleForTesting
-    static Schema.Index findIndexOrThrow(Schema schema, TablePath tablePath, String indexName) {
+    private static Schema.Index findIndexOrThrow(
+            Schema schema, TablePath tablePath, String indexName) {
         for (Schema.Index i : schema.getIndexes()) {
             if (i.getIndexName().equals(indexName)) {
                 return i;

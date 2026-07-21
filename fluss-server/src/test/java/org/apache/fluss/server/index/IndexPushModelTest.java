@@ -29,13 +29,13 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
-import org.apache.fluss.row.aligned.AlignedRow;
-import org.apache.fluss.row.aligned.AlignedRowWriter;
 import org.apache.fluss.row.compacted.CompactedKeyWriter;
+import org.apache.fluss.row.compacted.CompactedRow;
+import org.apache.fluss.row.compacted.CompactedRowWriter;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.protocol.MergeMode;
@@ -53,6 +53,7 @@ import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.NOPErrorHandler;
+import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
@@ -97,6 +98,8 @@ class IndexPushModelTest {
                     DataTypes.FIELD("dt", DataTypes.STRING()),
                     DataTypes.FIELD(
                             IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN, DataTypes.BIGINT()));
+    private static final DataType[] INDEX_FIELD_TYPES =
+            INDEX_ROW_TYPE.getChildren().toArray(new DataType[0]);
 
     @RegisterExtension
     static final FlussClusterExtension CLUSTER =
@@ -489,9 +492,9 @@ class IndexPushModelTest {
 
     private static final class ProductionMutation {
         private final byte[] key;
-        private final AlignedRow value;
+        private final CompactedRow value;
 
-        private ProductionMutation(byte[] key, AlignedRow value) {
+        private ProductionMutation(byte[] key, CompactedRow value) {
             this.key = key;
             this.value = value;
         }
@@ -502,14 +505,13 @@ class IndexPushModelTest {
                 new CompactedKeyEncoder(INDEX_ROW_TYPE);
 
         private static ProductionMutation project(SourceMutation mutation) {
-            AlignedRow row = new AlignedRow(4);
-            AlignedRowWriter writer = new AlignedRowWriter(row);
-            writer.reset();
-            writer.writeLong(0, mutation.seed * 100L + mutation.key);
-            writer.writeLong(1, mutation.seed * 100L + mutation.key);
-            writer.writeString(2, fromString(mutation.partition));
-            writer.writeLong(3, mutation.incarnation.partitionId);
-            writer.complete();
+            CompactedRow row = new CompactedRow(INDEX_FIELD_TYPES);
+            CompactedRowWriter writer = new CompactedRowWriter(INDEX_FIELD_TYPES.length);
+            writer.writeLong(mutation.seed * 100L + mutation.key);
+            writer.writeLong(mutation.seed * 100L + mutation.key);
+            writer.writeString(fromString(mutation.partition));
+            writer.writeLong(mutation.incarnation.partitionId);
+            row.pointTo(writer.segment(), 0, writer.position());
             return new ProductionMutation(KEY_ENCODER.encodeKey(row), row);
         }
     }
@@ -536,14 +538,13 @@ class IndexPushModelTest {
             keyWriter.writeString(mutation.partition);
             keyWriter.writeLong(mutation.incarnation.partitionId);
 
-            AlignedRow oracleRow = new AlignedRow(4);
-            AlignedRowWriter rowWriter = new AlignedRowWriter(oracleRow);
-            rowWriter.reset();
-            rowWriter.writeLong(0, mutation.seed * 100L + mutation.key);
-            rowWriter.writeLong(1, mutation.seed * 100L + mutation.key);
-            rowWriter.writeString(2, fromString(mutation.partition));
-            rowWriter.writeLong(3, mutation.incarnation.partitionId);
-            rowWriter.complete();
+            CompactedRow oracleRow = new CompactedRow(INDEX_FIELD_TYPES);
+            CompactedRowWriter rowWriter = new CompactedRowWriter(INDEX_FIELD_TYPES.length);
+            rowWriter.writeLong(mutation.seed * 100L + mutation.key);
+            rowWriter.writeLong(mutation.seed * 100L + mutation.key);
+            rowWriter.writeString(fromString(mutation.partition));
+            rowWriter.writeLong(mutation.incarnation.partitionId);
+            oracleRow.pointTo(rowWriter.segment(), 0, rowWriter.position());
 
             byte[] value =
                     new byte[KV_VALUE_LAYOUT.rowPayloadOffset() + oracleRow.getSizeInBytes()];
@@ -580,25 +581,25 @@ class IndexPushModelTest {
 
     private static final class Delivery {
         private final String label;
-        private final long sequence;
+        private final long progress;
         private final WriterKey writerKey;
         private final List<SourceMutation> mutations;
 
         private Delivery(
-                String label, long sequence, WriterKey writerKey, List<SourceMutation> mutations) {
+                String label, long progress, WriterKey writerKey, List<SourceMutation> mutations) {
             this.label = label;
-            this.sequence = sequence;
+            this.progress = progress;
             this.writerKey = writerKey;
             this.mutations = mutations;
         }
     }
 
     private static final class WriterStateView {
-        private final long sequence;
+        private final long progress;
         private final long targetWalOffset;
 
-        private WriterStateView(long sequence, long targetWalOffset) {
-            this.sequence = sequence;
+        private WriterStateView(long progress, long targetWalOffset) {
+            this.progress = progress;
             this.targetWalOffset = targetWalOffset;
         }
 
@@ -611,17 +612,17 @@ class IndexPushModelTest {
                 return false;
             }
             WriterStateView that = (WriterStateView) obj;
-            return sequence == that.sequence && targetWalOffset == that.targetWalOffset;
+            return progress == that.progress && targetWalOffset == that.targetWalOffset;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(sequence, targetWalOffset);
+            return Objects.hash(progress, targetWalOffset);
         }
 
         @Override
         public String toString() {
-            return "WriterStateView{" + sequence + ", wal=" + targetWalOffset + '}';
+            return "WriterStateView{" + progress + ", wal=" + targetWalOffset + '}';
         }
     }
 
@@ -787,7 +788,7 @@ class IndexPushModelTest {
                     .as("%s starts with a flushed prewrite map", context(seed, delivery))
                     .isEmpty();
             FreshExpectation expected = FreshExpectation.from(before, delivery, !throughReplica);
-            long staleBefore = metrics.indexPushStaleV1Batches().getCount();
+            long staleBefore = metrics.indexPushStaleProgressBatches().getCount();
             long tombstoneBefore = metrics.indexPushTombstoneNoOpBatches().getCount();
             LogAppendInfo result = apply(delivery, throughReplica);
             PhysicalState after = physicalState(delivery.writerKey, allPhysicalKeys);
@@ -808,14 +809,14 @@ class IndexPushModelTest {
                     .isEqualTo(expected.walEndOffset);
             assertThat(after.writerState)
                     .as(context(seed, delivery))
-                    .contains(new WriterStateView(delivery.sequence, expected.lastWalOffset));
+                    .contains(new WriterStateView(delivery.progress, expected.lastWalOffset));
             assertThat(after.prewriteMaxLsn)
                     .as(context(seed, delivery))
                     .isEqualTo(expected.prewriteMaxLsn);
             assertThat(after.rows)
                     .as("%s exact physical rows", context(seed, delivery))
                     .isEqualTo(throughReplica ? expected.rows : before.rows);
-            assertThat(metrics.indexPushStaleV1Batches().getCount())
+            assertThat(metrics.indexPushStaleProgressBatches().getCount())
                     .as(context(seed, delivery))
                     .isEqualTo(staleBefore);
             assertThat(metrics.indexPushTombstoneNoOpBatches().getCount())
@@ -836,7 +837,7 @@ class IndexPushModelTest {
                 assertThat(after.prewriteValues).as(context(seed, delivery)).isEmpty();
                 committedWriterStates.put(
                         delivery.writerKey,
-                        new WriterStateView(delivery.sequence, expected.lastWalOffset));
+                        new WriterStateView(delivery.progress, expected.lastWalOffset));
             } else {
                 assertThat(kv.getKvPreWriteBuffer().getAllKvEntries())
                         .as("%s exact uncommitted prewrite entries", context(seed, delivery))
@@ -861,7 +862,7 @@ class IndexPushModelTest {
                 int seed)
                 throws Exception {
             PhysicalState before = physicalState(delivery.writerKey, allPhysicalKeys);
-            long staleBefore = metrics.indexPushStaleV1Batches().getCount();
+            long staleBefore = metrics.indexPushStaleProgressBatches().getCount();
             long tombstoneBefore = metrics.indexPushTombstoneNoOpBatches().getCount();
 
             LogAppendInfo result = apply(delivery, true);
@@ -869,7 +870,7 @@ class IndexPushModelTest {
             if (expectedOutcome == ExpectedOutcome.STALE) {
                 assertThat(result.duplicated()).as(context(seed, delivery)).isTrue();
                 assertThat(result.hasNoAppend()).as(context(seed, delivery)).isFalse();
-                assertThat(metrics.indexPushStaleV1Batches().getCount())
+                assertThat(metrics.indexPushStaleProgressBatches().getCount())
                         .as(context(seed, delivery))
                         .isEqualTo(staleBefore + 1L);
                 assertThat(metrics.indexPushTombstoneNoOpBatches().getCount())
@@ -880,7 +881,7 @@ class IndexPushModelTest {
                 assertThat(metrics.indexPushTombstoneNoOpBatches().getCount())
                         .as(context(seed, delivery))
                         .isEqualTo(tombstoneBefore + 1L);
-                assertThat(metrics.indexPushStaleV1Batches().getCount())
+                assertThat(metrics.indexPushStaleProgressBatches().getCount())
                         .as(context(seed, delivery))
                         .isEqualTo(staleBefore);
             }
@@ -895,12 +896,12 @@ class IndexPushModelTest {
 
         private LogAppendInfo apply(Delivery delivery, boolean throughReplica) throws Exception {
             assertThat(delivery.mutations).as(delivery.label).isNotEmpty();
-            FencedKvRecordBatchBuilder builder =
-                    FencedKvRecordBatchBuilder.builder(
+            ProgressKvRecordBatchBuilder builder =
+                    ProgressKvRecordBatchBuilder.builder(
                             SCHEMA_ID,
                             Integer.MAX_VALUE,
                             new UnmanagedPagedOutputView(4096),
-                            KvFormat.ALIGNED);
+                            KvFormat.COMPACTED);
             try {
                 int appended = 0;
                 for (SourceMutation mutation : delivery.mutations) {
@@ -913,7 +914,7 @@ class IndexPushModelTest {
                 assertThat(appended)
                         .as("%s carries only its mutation delta", delivery.label)
                         .isEqualTo(delivery.mutations.size());
-                builder.setWriterState(delivery.writerKey, delivery.sequence);
+                builder.setWriterState(delivery.writerKey, delivery.progress);
                 ByteBuffer bytes = builder.build().getByteBuf().nioBuffer();
                 KvRecordBatch records = KvRecordBatchReader.pointToByteBuffer(bytes);
                 return throughReplica
@@ -955,12 +956,11 @@ class IndexPushModelTest {
 
         private Optional<WriterStateView> writerState(WriterKey writerKey) {
             return log.writerStateManager()
-                    .lastFencedEntry(writerKey)
+                    .lastProgressEntry(writerKey)
                     .map(
                             state ->
                                     new WriterStateView(
-                                            state.lastSequence(),
-                                            state.dominatingTargetWalOffset()));
+                                            state.lastProgress(), state.progressWalOffset()));
         }
 
         private PhysicalState physicalState(WriterKey writerKey, List<byte[]> allPhysicalKeys) {
@@ -1009,8 +1009,8 @@ class IndexPushModelTest {
                     + seed
                     + ", delivery="
                     + delivery.label
-                    + ", sequence="
-                    + delivery.sequence;
+                    + ", progress="
+                    + delivery.progress;
         }
     }
 

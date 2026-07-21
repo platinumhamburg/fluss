@@ -17,10 +17,10 @@
 
 package org.apache.fluss.metadata;
 
-/** Immutable KV idempotence protocol versions. */
+/** KV idempotent write modes selected by their persisted numeric values. */
 public enum KvIdempotenceProtocol {
-    V0_COMPACT(0),
-    V1_FENCED(1);
+    CONTIGUOUS_BATCH_SEQUENCE(0),
+    CUMULATIVE_PROGRESS(1);
 
     private final int version;
 
@@ -35,9 +35,9 @@ public enum KvIdempotenceProtocol {
     public static KvIdempotenceProtocol forVersion(int version) {
         switch (version) {
             case 0:
-                return V0_COMPACT;
+                return CONTIGUOUS_BATCH_SEQUENCE;
             case 1:
-                return V1_FENCED;
+                return CUMULATIVE_PROGRESS;
             default:
                 throw new IllegalArgumentException(
                         "Unsupported KV idempotence protocol version " + version);

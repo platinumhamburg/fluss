@@ -74,9 +74,9 @@ import org.apache.fluss.server.kv.wal.ArrowWalBuilder;
 import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.kv.wal.IndexWalBuilder;
 import org.apache.fluss.server.kv.wal.WalBuilder;
-import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.utils.ResourceGuard;
@@ -129,7 +129,7 @@ public final class KvTablet {
     private final MemorySegmentPool memorySegmentPool;
 
     private final File kvTabletDir;
-    @Nullable private volatile Runnable afterFencedPrecheck;
+    @Nullable private volatile Runnable afterProgressPrecheck;
     @Nullable private volatile Runnable putLockContentionHook;
     private final long writeBatchSize;
     private final RocksDBKv rocksDBKv;
@@ -511,16 +511,18 @@ public final class KvTablet {
                     rocksDBKv.checkIfRocksDBClosed();
 
                     KvIdempotenceProtocol tableProtocol = logTablet.getWriterStateProtocol();
-                    boolean fenced = tableProtocol == KvIdempotenceProtocol.V1_FENCED;
-                    if (fenced) {
+                    boolean progressMode =
+                            tableProtocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS;
+                    if (progressMode) {
                         kvRecords.ensureValid();
                     }
                     int batchProtocolVersion = kvRecords.idempotenceProtocolVersion();
                     if (batchProtocolVersion != tableProtocol.version()) {
                         throw new CorruptRecordException(
                                 String.format(
-                                        "KV batch protocol V%d does not match table protocol V%d for %s",
+                                        "KV batch protocol value %d does not match table mode %s (value %d) for %s",
                                         batchProtocolVersion,
+                                        tableProtocol,
                                         tableProtocol.version(),
                                         tableBucket));
                     }
@@ -530,26 +532,27 @@ public final class KvTablet {
                     short latestSchemaId = (short) schemaInfo.getSchemaId();
                     validateSchemaId(kvRecords.schemaId(), latestSchemaId);
 
-                    if (fenced) {
-                        WriterKey writerKey = kvRecords.fencedWriterKey();
-                        long fencedSequence = kvRecords.fencedSequence();
-                        if (fencedSequence < 0L) {
-                            throw new IllegalArgumentException("sequence must be non-negative");
+                    if (progressMode) {
+                        WriterKey writerKey = kvRecords.writerKey();
+                        long writerProgress = kvRecords.writerProgress();
+                        if (writerProgress < 0L) {
+                            throw new IllegalArgumentException(
+                                    "writer progress must be non-negative");
                         }
                         if (writeGuard.beforeWriterState(writerKey)
                                 == KvWriteGuard.Decision.NO_OP) {
                             serverMetricGroup.indexPushTombstoneNoOpBatches().inc();
                             return LogAppendInfo.noAppend();
                         }
-                        Optional<FencedWriterStateEntry> stale =
-                                logTablet.findStaleFencedBatch(writerKey, fencedSequence);
+                        Optional<WriterProgressStateEntry> stale =
+                                logTablet.findStaleProgressBatch(writerKey, writerProgress);
                         if (stale.isPresent()) {
-                            FencedWriterStateEntry entry = stale.get();
-                            serverMetricGroup.indexPushStaleV1Batches().inc();
+                            WriterProgressStateEntry entry = stale.get();
+                            serverMetricGroup.indexPushStaleProgressBatches().inc();
                             return LogAppendInfo.duplicatedAt(
-                                    entry.dominatingTargetWalOffset(), entry.lastTimestamp());
+                                    entry.progressWalOffset(), entry.lastTimestamp());
                         }
-                        Runnable hook = afterFencedPrecheck;
+                        Runnable hook = afterProgressPrecheck;
                         if (hook != null) {
                             hook.run();
                         }
@@ -574,10 +577,11 @@ public final class KvTablet {
                                             targetColumns, latestSchemaId, latestSchema);
 
                     RowType latestRowType = latestSchema.getRowType();
-                    WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType, fenced);
-                    if (fenced) {
-                        walBuilder.setFencedWriterState(
-                                kvRecords.fencedWriterKey(), kvRecords.fencedSequence());
+                    WalBuilder walBuilder =
+                            createWalBuilder(latestSchemaId, latestRowType, progressMode);
+                    if (progressMode) {
+                        walBuilder.setWriterProgress(
+                                kvRecords.writerKey(), kvRecords.writerProgress());
                     } else {
                         walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
                     }
@@ -598,7 +602,7 @@ public final class KvTablet {
                                 walBuilder,
                                 latestSchemaRow,
                                 logEndOffsetOfPrevBatch,
-                                fenced ? kvRecords.fencedWriterKey() : null);
+                                progressMode ? kvRecords.writerKey() : null);
 
                         // There will be a situation that these batches of kvRecordBatch have not
                         // generated any CDC logs, for example, when client attempts to delete
@@ -621,8 +625,8 @@ public final class KvTablet {
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
                         if (logAppendInfo.duplicated()) {
-                            if (fenced) {
-                                serverMetricGroup.indexPushStaleV1Batches().inc();
+                            if (progressMode) {
+                                serverMetricGroup.indexPushStaleProgressBatches().inc();
                             }
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
@@ -635,7 +639,7 @@ public final class KvTablet {
                         // retry-send batch will produce incorrect CDC logs.
                         // TODO for some errors, the cdc logs may already be written to disk, for
                         //  those errors, we should not truncate the kvPreWriteBuffer.
-                        if (fenced && appendInvoked) {
+                        if (progressMode && appendInvoked) {
                             if (t instanceof Error) {
                                 uncertainWalAppendFailure = t;
                                 throw (Error) t;
@@ -683,8 +687,8 @@ public final class KvTablet {
     }
 
     @VisibleForTesting
-    void setAfterFencedPrecheck(@Nullable Runnable afterFencedPrecheck) {
-        this.afterFencedPrecheck = afterFencedPrecheck;
+    void setAfterProgressPrecheck(@Nullable Runnable afterProgressPrecheck) {
+        this.afterProgressPrecheck = afterProgressPrecheck;
     }
 
     @VisibleForTesting
@@ -906,7 +910,7 @@ public final class KvTablet {
         }
     }
 
-    private WalBuilder createWalBuilder(int schemaId, RowType rowType, boolean fenced)
+    private WalBuilder createWalBuilder(int schemaId, RowType rowType, boolean progressMode)
             throws Exception {
         switch (logFormat) {
             case INDEXED:
@@ -918,16 +922,16 @@ public final class KvTablet {
                     throw new IllegalArgumentException(
                             "Primary Key Table with COMPACTED kv format doesn't support INDEXED cdc log format.");
                 }
-                return fenced
-                        ? IndexWalBuilder.fencedBuilder(schemaId, memorySegmentPool)
+                return progressMode
+                        ? IndexWalBuilder.progressBuilder(schemaId, memorySegmentPool)
                         : new IndexWalBuilder(schemaId, memorySegmentPool);
             case COMPACTED:
-                return fenced
-                        ? CompactedWalBuilder.fencedBuilder(schemaId, rowType, memorySegmentPool)
+                return progressMode
+                        ? CompactedWalBuilder.progressBuilder(schemaId, rowType, memorySegmentPool)
                         : new CompactedWalBuilder(schemaId, rowType, memorySegmentPool);
             case ARROW:
-                return fenced
-                        ? ArrowWalBuilder.fencedBuilder(
+                return progressMode
+                        ? ArrowWalBuilder.progressBuilder(
                                 schemaId,
                                 arrowWriterProvider.getOrCreateWriter(
                                         tableBucket.getTableId(),

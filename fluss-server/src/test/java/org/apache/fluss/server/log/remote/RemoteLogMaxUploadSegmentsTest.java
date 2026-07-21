@@ -113,7 +113,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
     void testV1TieringRequiresExactEndWriterSnapshot(boolean retry) throws Exception {
         TableBucket tb = makeIndexTableAsLeader(9910L);
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
-        addFencedSegments(log, 3);
+        addProgressSegments(log, 3);
         long localStartBefore = log.localLogStartOffset();
         long firstClosedEnd = log.getSegments().get(1).getBaseOffset();
         assertThat(FlussPaths.writerSnapshotFile(log.getLogDir(), firstClosedEnd).delete())
@@ -136,7 +136,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
             InvalidV1Snapshot invalidSnapshot) throws Exception {
         TableBucket tb = makeIndexTableAsLeader(9920L + invalidSnapshot.ordinal());
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
-        addFencedSegments(log, 3);
+        addProgressSegments(log, 3);
         long localStartBefore = log.localLogStartOffset();
         long firstClosedEnd = log.getSegments().get(1).getBaseOffset();
         Files.write(
@@ -159,7 +159,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
             throws Exception {
         TableBucket tb = makeIndexTableAsLeader(manifestFailure ? 9911L : 9912L);
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
-        addFencedSegments(log, 4);
+        addProgressSegments(log, 4);
         long localStartBefore = log.localLogStartOffset();
         if (manifestFailure) {
             remoteLogStorage.writeManifestFail.set(true);
@@ -180,7 +180,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
     void testV1PostCommitResponseLossResolvesAuthoritativeManifest(boolean retry) throws Exception {
         TableBucket tb = makeIndexTableAsLeader(retry ? 9913L : 9914L);
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
-        addFencedSegments(log, 4);
+        addProgressSegments(log, 4);
         testCoordinatorGateway.loseRemoteLogManifestResponseAfterCommit.set(true);
 
         remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
@@ -203,7 +203,7 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
     void testV1AmbiguousCommitIsBoundedAndReconcilesBeforeNewUpload() throws Exception {
         TableBucket tb = makeIndexTableAsLeader(9915L);
         LogTablet log = replicaManager.getReplicaOrException(tb).getLogTablet();
-        addFencedSegments(log, 4);
+        addProgressSegments(log, 4);
         RemoteLogManifestHandle authoritativeReplacement =
                 new RemoteLogManifestHandle(new FsPath("file:///authoritative-replacement"), 4L);
         testCoordinatorGateway.authoritativeManifestOverride.set(authoritativeReplacement);
@@ -330,13 +330,13 @@ class RemoteLogMaxUploadSegmentsTest extends RemoteLogTestBase {
         return tb;
     }
 
-    private static void addFencedSegments(LogTablet log, int segmentCount) throws Exception {
+    private static void addProgressSegments(LogTablet log, int segmentCount) throws Exception {
         WriterKey writerKey = new WriterKey(0L, 0L);
         for (int i = 0; i < segmentCount; i++) {
             MemoryLogRecordsCompactedBuilder builder =
-                    MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                    MemoryLogRecordsCompactedBuilder.progressBuilder(
                             1, 1024, new UnmanagedPagedOutputView(128), false);
-            builder.setFencedWriterState(writerKey, 100L + i * 100L);
+            builder.setWriterProgress(writerKey, 100L + i * 100L);
             builder.close();
             log.appendAsLeader(
                     MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer()));

@@ -26,7 +26,6 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
-import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.utils.ArrayUtils;
 
 import java.lang.reflect.Field;
@@ -856,9 +855,9 @@ public class ConfigOptions {
                     .defaultValue(1)
                     .withDescription(
                             "Number of sender worker threads that dispatch derived index batches to "
-                                    + "target Index Table leaders. Each target index bucket is owned "
-                                    + "by a single sender worker, giving per-bucket in-order "
-                                    + "delivery.");
+                                    + "target Index Table leaders. Within one TabletServer, each "
+                                    + "target index bucket is owned by one sender worker so a later "
+                                    + "local batch cannot overtake an in-flight batch.");
 
     public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_WINDOW_BYTES =
             key("index.replication.max-window-bytes")
@@ -1567,10 +1566,10 @@ public class ConfigOptions {
                     .intType()
                     .defaultValue(0)
                     .withDescription(
-                            "The immutable KV idempotence protocol version. Version 0 is the "
-                                    + "compact writer-id protocol and is the default. Version 1 "
-                                    + "is the fenced WriterKey protocol reserved for system-managed "
-                                    + "Index Tables.");
+                            "The immutable KV idempotence protocol. Version 0 uses contiguous "
+                                    + "batch sequences and is the default. Version 1 uses a 128-bit "
+                                    + "WriterKey with cumulative 64-bit writer progress and is "
+                                    + "reserved for system-managed Index Tables.");
 
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")
@@ -1778,18 +1777,9 @@ public class ConfigOptions {
                                     + "as older versions cannot parse the extended batch format.");
 
     // ------------------------------------------------------------------------
-    //  Table Type & Index Table Metadata Configs
+    //  Index Table Metadata Configs
     //  (index table metadata: table.index-meta.*)
     // ------------------------------------------------------------------------
-
-    public static final ConfigOption<TableType> TABLE_TYPE =
-            key("table.type")
-                    .enumType(TableType.class)
-                    .defaultValue(TableType.DATA_TABLE)
-                    .withDescription(
-                            "Table type identifying whether this table is a user-facing DATA_TABLE "
-                                    + "or an internal INDEX_TABLE managed by Fluss for global secondary "
-                                    + "indexes. INDEX_TABLE is system-set and must not be configured by users.");
 
     public static final ConfigOption<Long> TABLE_INDEX_META_MAIN_TABLE_ID =
             key("table.index-meta.main-table-id")
@@ -1798,8 +1788,8 @@ public class ConfigOptions {
                     .withDescription(
                             "The table id of the main table that this index table belongs to. "
                                     + "Set automatically by the system when creating index tables; "
-                                    + "users must not modify it. Used to look up the main table during "
-                                    + "index push and lookup paths.");
+                                    + "users must not modify it. Its presence identifies an internal "
+                                    + "Index Table, and its value links that table to the main table.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv

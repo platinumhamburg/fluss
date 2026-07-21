@@ -1154,7 +1154,7 @@ public class ServerRpcMessageUtils {
                             == KvRecordBatch.KV_MAGIC_VALUE_V1
                     && apiVersion < 2) {
                 throw new UnsupportedVersionException(
-                        "KV idempotence protocol V1 requires PutKv API v2");
+                        "Cumulative-progress KV batches require PutKv API v2");
             }
             KvRecordBatch kvRecords = KvRecordBatchReader.pointToByteBuffer(recordsBuffer);
             TableBucket tb =

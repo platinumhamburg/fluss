@@ -24,7 +24,6 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.aligned.AlignedRow;
 import org.apache.fluss.row.compacted.CompactedRow;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.utils.crc.Crc32C;
@@ -235,15 +234,6 @@ public class KvRecordBatchBuilder implements AutoCloseable {
                 throw new IllegalArgumentException(
                         "The row to be appended to kv record batch "
                                 + "with indexed format should be a indexed row, but got "
-                                + row.getClass().getSimpleName());
-            }
-        } else if (kvFormat == KvFormat.ALIGNED) {
-            if (row instanceof AlignedRow) {
-                return row;
-            } else {
-                throw new IllegalArgumentException(
-                        "The row to be appended to kv record batch "
-                                + "with aligned format should be an aligned row, but got "
                                 + row.getClass().getSimpleName());
             }
         } else {

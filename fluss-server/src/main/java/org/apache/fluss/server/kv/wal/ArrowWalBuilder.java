@@ -42,19 +42,22 @@ public class ArrowWalBuilder implements WalBuilder {
     }
 
     private ArrowWalBuilder(
-            int schemaId, ArrowWriter writer, MemorySegmentPool memorySegmentPool, boolean fenced)
+            int schemaId,
+            ArrowWriter writer,
+            MemorySegmentPool memorySegmentPool,
+            boolean progressMode)
             throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         this.recordsBuilder =
-                fenced
-                        ? MemoryLogRecordsArrowBuilder.fencedBuilder(
+                progressMode
+                        ? MemoryLogRecordsArrowBuilder.progressBuilder(
                                 schemaId, writer, outputView, false, null)
                         : MemoryLogRecordsArrowBuilder.builder(
                                 schemaId, writer, outputView, false, null);
     }
 
-    public static ArrowWalBuilder fencedBuilder(
+    public static ArrowWalBuilder progressBuilder(
             int schemaId, ArrowWriter writer, MemorySegmentPool memorySegmentPool)
             throws IOException {
         return new ArrowWalBuilder(schemaId, writer, memorySegmentPool, true);
@@ -81,8 +84,8 @@ public class ArrowWalBuilder implements WalBuilder {
     }
 
     @Override
-    public void setFencedWriterState(WriterKey writerKey, long sequence) {
-        recordsBuilder.setFencedWriterState(writerKey, sequence);
+    public void setWriterProgress(WriterKey writerKey, long progress) {
+        recordsBuilder.setWriterProgress(writerKey, progress);
     }
 
     @Override

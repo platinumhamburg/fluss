@@ -116,7 +116,7 @@ final class LogLoader {
         writerStateManager.removeStraySnapshots(logSegments.baseOffsets());
 
         long retainedLogStartOffset =
-                writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
+                writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
                         ? logSegments
                                 .firstSegment()
                                 .map(LogSegment::getBaseOffset)
@@ -139,16 +139,17 @@ final class LogLoader {
     }
 
     private void validateWalProtocol() throws IOException {
-        int expectedProtocol = writerStateManager.protocol().version();
+        KvIdempotenceProtocol expectedProtocol = writerStateManager.protocol();
         for (LogSegment segment : logSegments.values()) {
             try {
                 for (LogRecordBatch batch : segment.getFileLogRecords().batches()) {
-                    if (batch.idempotenceProtocolVersion() != expectedProtocol) {
+                    if (batch.idempotenceProtocolVersion() != expectedProtocol.version()) {
                         throw new CorruptRecordException(
                                 String.format(
-                                        "Target WAL magic v%s does not match table protocol V%s while recovering %s",
+                                        "Target WAL magic %s does not match table mode %s (value %s) while recovering %s",
                                         batch.magic(),
                                         expectedProtocol,
+                                        expectedProtocol.version(),
                                         logSegments.getTableBucket()));
                     }
                 }
@@ -308,7 +309,7 @@ final class LogLoader {
                         this.writerStateManager.writerExpirationMs(),
                         this.writerStateManager.protocol());
         long retainedLogStartOffset =
-                writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
+                writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
                         ? logSegments
                                 .firstSegment()
                                 .map(LogSegment::getBaseOffset)

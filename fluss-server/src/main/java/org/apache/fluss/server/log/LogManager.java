@@ -280,7 +280,7 @@ public final class LogManager extends TabletManagerBase {
                 logFormat,
                 tieredLogLocalSegments,
                 isChangelog,
-                KvIdempotenceProtocol.V0_COMPACT);
+                KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
     }
 
     public LogTablet getOrCreateLog(
@@ -419,7 +419,7 @@ public final class LogManager extends TabletManagerBase {
         KvIdempotenceProtocol protocol =
                 tableInfo.hasPrimaryKey()
                         ? tableInfo.getKvIdempotenceProtocol()
-                        : KvIdempotenceProtocol.V0_COMPACT;
+                        : KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE;
         LogTablet logTablet =
                 LogTablet.create(
                         dataDir,

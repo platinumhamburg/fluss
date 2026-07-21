@@ -400,18 +400,12 @@ public final class TableInfo {
         return modifiedTime;
     }
 
-    /**
-     * Returns true if this table is an internal {@link TableType#INDEX_TABLE} managed by Fluss for
-     * a global secondary index, as identified by the {@link ConfigOptions#TABLE_TYPE} property.
-     */
+    /** Returns true if this table carries the main-table link of an internal Index Table. */
     public boolean isIndexTable() {
-        return TableType.INDEX_TABLE == properties.get(ConfigOptions.TABLE_TYPE);
+        return properties.containsKey(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key());
     }
 
-    /**
-     * Returns the table id of the main table that this index table belongs to, or empty if this
-     * table is not an index table (or the back-link is not set).
-     */
+    /** Returns the owning main-table id, or empty if this is not an Index Table. */
     public OptionalLong getMainTableId() {
         Optional<Long> v = properties.getOptional(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID);
         return v.isPresent() ? OptionalLong.of(v.get()) : OptionalLong.empty();

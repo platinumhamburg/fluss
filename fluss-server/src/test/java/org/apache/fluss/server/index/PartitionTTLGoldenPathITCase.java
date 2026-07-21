@@ -30,15 +30,16 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.ByteBufBytesView;
 import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.aligned.AlignedRow;
-import org.apache.fluss.row.aligned.AlignedRowWriter;
+import org.apache.fluss.row.compacted.CompactedRow;
+import org.apache.fluss.row.compacted.CompactedRowWriter;
 import org.apache.fluss.row.decode.CompactedKeyDecoder;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.KvValueLayout;
@@ -49,12 +50,13 @@ import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
-import org.apache.fluss.server.log.FencedWriterStateEntry;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.types.DataField;
+import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
@@ -160,7 +162,7 @@ class PartitionTTLGoldenPathITCase {
         int mainBucket = mainBucket(PRIMARY_KEY);
         TableBucket oldSourceBucket = new TableBucket(mainTableId, oldPartitionId, mainBucket);
         CLUSTER.waitAndGetLeaderReplica(oldSourceBucket);
-        AlignedRow oldPhysicalRow = physicalRow(oldPartitionId);
+        CompactedRow oldPhysicalRow = physicalRow(oldPartitionId);
         byte[] oldPhysicalKey = physicalKey(oldPhysicalRow);
         int indexBucket = indexBucket(INDEXED_VALUE);
         TableBucket targetBucket = new TableBucket(indexTableId, indexBucket);
@@ -195,7 +197,7 @@ class PartitionTTLGoldenPathITCase {
                         !targetReplica
                                 .getLogTablet()
                                 .writerStateManager()
-                                .lastFencedEntry(oldWriter)
+                                .lastProgressEntry(oldWriter)
                                 .isPresent(),
                 TIMEOUT,
                 "old WriterState retirement");
@@ -213,7 +215,7 @@ class PartitionTTLGoldenPathITCase {
         assertThat(newPartitionId).isNotEqualTo(oldPartitionId);
         TableBucket newSourceBucket = new TableBucket(mainTableId, newPartitionId, mainBucket);
         CLUSTER.waitAndGetLeaderReplica(newSourceBucket);
-        AlignedRow newPhysicalRow = physicalRow(newPartitionId);
+        CompactedRow newPhysicalRow = physicalRow(newPartitionId);
         byte[] newPhysicalKey = physicalKey(newPhysicalRow);
         assertSameLogicalRowDifferentIncarnation(
                 oldPhysicalKey, oldPartitionId, newPhysicalKey, newPartitionId);
@@ -232,7 +234,7 @@ class PartitionTTLGoldenPathITCase {
         assertThat(targetReplica.getLogTablet().localLogEndOffset())
                 .as("delayed old UPSERT and DELETE must append no target WAL")
                 .isEqualTo(walBeforeDelayed);
-        assertThat(targetReplica.getLogTablet().writerStateManager().lastFencedEntry(oldWriter))
+        assertThat(targetReplica.getLogTablet().writerStateManager().lastProgressEntry(oldWriter))
                 .as("delayed requests must not resurrect retired old WriterState")
                 .isEmpty();
         assertExactWriterState(targetReplica, newWriter, 1L);
@@ -287,16 +289,15 @@ class PartitionTTLGoldenPathITCase {
     }
 
     private static BytesView indexMutation(
-            WriterKey writer, long sequence, byte[] key, @Nullable AlignedRow row)
-            throws Exception {
-        try (FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+            WriterKey writer, long progress, byte[] key, @Nullable BinaryRow row) throws Exception {
+        try (ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         1,
                         Integer.MAX_VALUE,
                         new UnmanagedPagedOutputView(4096),
-                        KvFormat.ALIGNED)) {
+                        KvFormat.COMPACTED)) {
             builder.append(key, row);
-            builder.setWriterState(writer, sequence);
+            builder.setWriterState(writer, progress);
             ByteBuffer buffer = builder.build().getByteBuf().nioBuffer();
             byte[] copy = new byte[buffer.remaining()];
             buffer.get(copy);
@@ -304,19 +305,19 @@ class PartitionTTLGoldenPathITCase {
         }
     }
 
-    private static AlignedRow physicalRow(long partitionId) {
-        AlignedRow row = new AlignedRow(INDEX_VALUE_ROW_TYPE.getFieldCount());
-        AlignedRowWriter writer = new AlignedRowWriter(row);
-        writer.reset();
-        writer.writeString(0, fromString(INDEXED_VALUE));
-        writer.writeInt(1, PRIMARY_KEY);
-        writer.writeString(2, fromString(PARTITION_NAME));
-        writer.writeLong(3, partitionId);
-        writer.complete();
+    private static CompactedRow physicalRow(long partitionId) {
+        CompactedRow row =
+                new CompactedRow(INDEX_VALUE_ROW_TYPE.getChildren().toArray(new DataType[0]));
+        CompactedRowWriter writer = new CompactedRowWriter(INDEX_VALUE_ROW_TYPE.getFieldCount());
+        writer.writeString(fromString(INDEXED_VALUE));
+        writer.writeInt(PRIMARY_KEY);
+        writer.writeString(fromString(PARTITION_NAME));
+        writer.writeLong(partitionId);
+        row.pointTo(writer.segment(), 0, writer.position());
         return row;
     }
 
-    private static byte[] physicalKey(AlignedRow row) {
+    private static byte[] physicalKey(BinaryRow row) {
         return new CompactedKeyEncoder(INDEX_VALUE_ROW_TYPE).encodeKey(row);
     }
 
@@ -349,24 +350,24 @@ class PartitionTTLGoldenPathITCase {
     }
 
     private static void assertExactWriterState(
-            Replica replica, WriterKey writer, long expectedSequence) {
+            Replica replica, WriterKey writer, long expectedProgress) {
         waitUntil(
                 () ->
                         replica.getLogTablet()
                                         .writerStateManager()
-                                        .lastFencedEntry(writer)
-                                        .map(FencedWriterStateEntry::lastSequence)
+                                        .lastProgressEntry(writer)
+                                        .map(WriterProgressStateEntry::lastProgress)
                                         .orElse(-1L)
-                                == expectedSequence,
+                                == expectedProgress,
                 TIMEOUT,
-                "exact WriterState sequence " + expectedSequence);
+                "exact WriterState progress " + expectedProgress);
         assertThat(
                         replica.getLogTablet()
                                 .writerStateManager()
-                                .lastFencedEntry(writer)
+                                .lastProgressEntry(writer)
                                 .orElseThrow(AssertionError::new)
-                                .lastSequence())
-                .isEqualTo(expectedSequence);
+                                .lastProgress())
+                .isEqualTo(expectedProgress);
     }
 
     private static void assertPhysicalKey(byte[] key, long partitionId) {

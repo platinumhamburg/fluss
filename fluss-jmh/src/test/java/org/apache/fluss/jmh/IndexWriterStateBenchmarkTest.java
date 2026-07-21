@@ -26,14 +26,14 @@ class IndexWriterStateBenchmarkTest {
 
     @Test
     void testV1ManagersRetainKeysCreatedAfterHeapBaseline() throws Exception {
-        IndexWriterStateBenchmark.TopologyState state = topology("V1_FENCED", 64, 2);
+        IndexWriterStateBenchmark.TopologyState state = topology("CUMULATIVE_PROGRESS", 64, 2);
         RecordingWriterKeyObserver observer = new RecordingWriterKeyObserver();
         state.setWriterKeyObserver(observer);
         try {
             state.setup();
             WriterStateManager[] managers = managers(state);
-            Map<WriterKey, ?> first = fencedWriters(managers[0]);
-            Map<WriterKey, ?> second = fencedWriters(managers[1]);
+            Map<WriterKey, ?> first = progressWriters(managers[0]);
+            Map<WriterKey, ?> second = progressWriters(managers[1]);
 
             assertThat(observer.heapBaselineCount).isOne();
             assertThat(observer.keysCreatedBeforeBaseline).isEmpty();
@@ -54,10 +54,10 @@ class IndexWriterStateBenchmarkTest {
     }
 
     @Test
-    void testFencedOperationsMaterializeAnIncomingWriterKeyPerInvocation() throws Exception {
+    void testProgressOperationsMaterializeAnIncomingWriterKeyPerInvocation() throws Exception {
         IndexWriterStateBenchmark benchmark = new IndexWriterStateBenchmark();
         RecordingWriterKeyObserver freshObserver = new RecordingWriterKeyObserver();
-        IndexWriterStateBenchmark.TopologyState freshState = topology("V1_FENCED", 64, 2);
+        IndexWriterStateBenchmark.TopologyState freshState = topology("CUMULATIVE_PROGRESS", 64, 2);
         freshState.setWriterKeyObserver(freshObserver);
         try {
             freshState.setup();
@@ -83,7 +83,7 @@ class IndexWriterStateBenchmarkTest {
 
     @Test
     void testFreshTraversalCoversEveryManagerAndWriter() throws Exception {
-        IndexWriterStateBenchmark.TopologyState state = topology("V1_FENCED", 64, 16);
+        IndexWriterStateBenchmark.TopologyState state = topology("CUMULATIVE_PROGRESS", 64, 16);
         try {
             state.setup();
             state.assertAndResetFreshTraversalCoverage();
@@ -93,7 +93,7 @@ class IndexWriterStateBenchmarkTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"V0_COMPACT", "V1_FENCED"})
+    @ValueSource(strings = {"CONTIGUOUS_BATCH_SEQUENCE", "CUMULATIVE_PROGRESS"})
     void testSnapshotReloadRetainsEveryConfiguredWriter(String protocol) throws Exception {
         IndexWriterStateBenchmark benchmark = new IndexWriterStateBenchmark();
         IndexWriterStateBenchmark.TopologyState state = topology(protocol, 64, 16);
@@ -135,8 +135,8 @@ class IndexWriterStateBenchmarkTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<WriterKey, ?> fencedWriters(WriterStateManager manager) throws Exception {
-        Field field = WriterStateManager.class.getDeclaredField("fencedWriters");
+    private static Map<WriterKey, ?> progressWriters(WriterStateManager manager) throws Exception {
+        Field field = WriterStateManager.class.getDeclaredField("progressWriters");
         field.setAccessible(true);
         return (Map<WriterKey, ?>) field.get(manager);
     }

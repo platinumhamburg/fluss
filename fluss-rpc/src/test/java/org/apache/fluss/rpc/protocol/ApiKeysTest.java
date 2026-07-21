@@ -40,7 +40,7 @@ class ApiKeysTest {
     }
 
     @Test
-    void testPutKvVersionRangeIncludesFencedBatches() {
+    void testPutKvVersionRangeIncludesProgressBatches() {
         assertThat(ApiKeys.PUT_KV.lowestSupportedVersion).isZero();
         assertThat(ApiKeys.PUT_KV.highestSupportedVersion).isEqualTo((short) 2);
     }

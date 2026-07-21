@@ -50,7 +50,7 @@ public class LogRecordBatchFormat {
     private static final int LAST_OFFSET_DELTA_LENGTH = 4;
     private static final int WRITE_CLIENT_ID_LENGTH = 8;
     private static final int BATCH_SEQUENCE_LENGTH = 4;
-    private static final int FENCED_SEQUENCE_LENGTH = 8;
+    private static final int WRITER_PROGRESS_LENGTH = 8;
     private static final int RECORDS_COUNT_LENGTH = 4;
 
     public static final int BASE_OFFSET_OFFSET = 0;
@@ -153,8 +153,8 @@ public class LogRecordBatchFormat {
     // ----------------------------------------------------------------------------------------
 
     /**
-     * Target WAL format for idempotence protocol V1. V3 shares the V2 prefix through
-     * LastOffsetDelta, then stores an opaque WriterKey and a 64-bit fenced sequence.
+     * Target WAL format for cumulative-progress writes. V3 shares the V2 prefix through
+     * LastOffsetDelta, then stores a WriterKey and 64-bit writer progress.
      */
     public static final byte LOG_MAGIC_VALUE_V3 = 3;
 
@@ -162,10 +162,10 @@ public class LogRecordBatchFormat {
             V2_LAST_OFFSET_DELTA_OFFSET + LAST_OFFSET_DELTA_LENGTH;
     private static final int V3_WRITER_KEY_LOW_OFFSET =
             V3_WRITER_KEY_HIGH_OFFSET + WRITE_CLIENT_ID_LENGTH;
-    private static final int V3_FENCED_SEQUENCE_OFFSET =
+    private static final int V3_WRITER_PROGRESS_OFFSET =
             V3_WRITER_KEY_LOW_OFFSET + WRITE_CLIENT_ID_LENGTH;
     private static final int V3_RECORDS_COUNT_OFFSET =
-            V3_FENCED_SEQUENCE_OFFSET + FENCED_SEQUENCE_LENGTH;
+            V3_WRITER_PROGRESS_OFFSET + WRITER_PROGRESS_LENGTH;
     private static final int V3_STATISTICS_LENGTH_OFFSET =
             V3_RECORDS_COUNT_OFFSET + RECORDS_COUNT_LENGTH;
     private static final int V3_STATISTICS_DATA_OFFSET =
@@ -491,7 +491,7 @@ public class LogRecordBatchFormat {
     public static int writerKeyHighOffset(byte magic) {
         if (magic != LOG_MAGIC_VALUE_V3) {
             throw new UnsupportedOperationException(
-                    "Fenced writer key is not supported in magic version " + magic);
+                    "Writer key is not supported in magic version " + magic);
         }
         return V3_WRITER_KEY_HIGH_OFFSET;
     }
@@ -499,16 +499,16 @@ public class LogRecordBatchFormat {
     public static int writerKeyLowOffset(byte magic) {
         if (magic != LOG_MAGIC_VALUE_V3) {
             throw new UnsupportedOperationException(
-                    "Fenced writer key is not supported in magic version " + magic);
+                    "Writer key is not supported in magic version " + magic);
         }
         return V3_WRITER_KEY_LOW_OFFSET;
     }
 
-    public static int fencedSequenceOffset(byte magic) {
+    public static int writerProgressOffset(byte magic) {
         if (magic != LOG_MAGIC_VALUE_V3) {
             throw new UnsupportedOperationException(
-                    "Fenced sequence is not supported in magic version " + magic);
+                    "Writer progress is not supported in magic version " + magic);
         }
-        return V3_FENCED_SEQUENCE_OFFSET;
+        return V3_WRITER_PROGRESS_OFFSET;
     }
 }

@@ -152,7 +152,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             autoIncrementColumnSet.set(autoIncrementColumnIndex);
         }
 
-        // check the columns not in targetColumns should be nullable
+        // Ordinary non-primary-key columns must be nullable for a partial merge.
         for (int i = 0; i < rowType.getFieldCount(); i++) {
             // column not in primary key and not in auto increment column
             if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i)) {
@@ -160,7 +160,7 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
                 if (!rowType.getTypeAt(i).isNullable()) {
                     throw new IllegalArgumentException(
                             String.format(
-                                    "Partial Update requires all columns except primary key to be nullable, but column %s is NOT NULL.",
+                                    "Partial Update requires all columns except primary key and auto-increment columns to be nullable, but column %s is NOT NULL.",
                                     rowType.getFieldNames().get(i)));
                 }
             }

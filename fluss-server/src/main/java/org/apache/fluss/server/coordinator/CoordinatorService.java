@@ -1458,10 +1458,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
      */
     private void validateTableCreationPermission(
             TableDescriptor tableDescriptor, TablePath tablePath) {
-        if (tableDescriptor.isIndexTable()
-                || tableDescriptor
-                        .getProperties()
-                        .containsKey(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key())) {
+        if (tableDescriptor.isIndexTable()) {
             throw new InvalidTableException(
                     String.format(
                             "Table %s cannot be created as an internal secondary index table.",

@@ -20,7 +20,7 @@ package org.apache.fluss.server.index;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.encode.AlignedRowEncoder;
+import org.apache.fluss.row.encode.CompactedRowEncoder;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.types.DataType;
@@ -43,7 +43,7 @@ class ValueEncoderCompactionFilterCompatTest {
     void testEncodedValueMatchesFloorSetFilterLayout() throws Exception {
         DataType[] fieldTypes = new DataType[] {DataTypes.INT()};
         BinaryRow testRow;
-        try (AlignedRowEncoder encoder = new AlignedRowEncoder(fieldTypes)) {
+        try (CompactedRowEncoder encoder = new CompactedRowEncoder(fieldTypes)) {
             encoder.startNewRow();
             encoder.encodeField(0, 42);
             testRow = encoder.finishRow();

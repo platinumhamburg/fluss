@@ -36,30 +36,30 @@ import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Tests for {@link FencedKvRecordBatch}. */
-class FencedKvRecordBatchTest {
+/** Tests for {@link ProgressKvRecordBatch}. */
+class ProgressKvRecordBatchTest {
 
     @ParameterizedTest
     @ValueSource(longs = {0L, 1L, Integer.MAX_VALUE, 2147483648L, Long.MAX_VALUE})
-    void testV1WriterKeyAndSequenceRoundTrip(long sequence) throws Exception {
+    void testWriterKeyAndProgressRoundTrip(long progress) throws Exception {
         WriterKey writerKey = new WriterKey(33L, Long.MIN_VALUE | 7L);
         KvRecordBatch batch =
                 KvRecordBatchReader.pointToByteBuffer(
-                        ByteBuffer.wrap(buildV1Batch(writerKey, sequence)));
+                        ByteBuffer.wrap(buildProgressBatch(writerKey, progress)));
 
-        assertThat(batch).isInstanceOf(FencedKvRecordBatch.class);
+        assertThat(batch).isInstanceOf(ProgressKvRecordBatch.class);
         assertThat(batch.magic()).isEqualTo(KvRecordBatch.KV_MAGIC_VALUE_V1);
         assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
-        assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
-        assertThat(batch.fencedSequence()).isEqualTo(sequence);
-        assertThat(FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE).isEqualTo(40);
+        assertThat(batch.writerKey()).isEqualTo(writerKey);
+        assertThat(batch.writerProgress()).isEqualTo(progress);
+        assertThat(ProgressKvRecordBatch.RECORD_BATCH_HEADER_SIZE).isEqualTo(40);
         batch.ensureValid();
     }
 
     @Test
-    void testV1HeaderUsesFencedLayout() throws Exception {
+    void testProgressHeaderLayout() throws Exception {
         WriterKey writerKey = new WriterKey(33L, Long.MIN_VALUE | 7L);
-        byte[] bytes = buildV1Batch(writerKey, Long.MAX_VALUE);
+        byte[] bytes = buildProgressBatch(writerKey, Long.MAX_VALUE);
         ByteBuffer header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
 
         assertThat(bytes).hasSize(40);
@@ -74,8 +74,8 @@ class FencedKvRecordBatchTest {
     }
 
     @Test
-    void testV1CrcCoversFencedHeaderFields() throws Exception {
-        byte[] bytes = buildV1Batch(new WriterKey(33L, Long.MIN_VALUE | 7L), 1L);
+    void testProgressCrcCoversWriterStateHeader() throws Exception {
+        byte[] bytes = buildProgressBatch(new WriterKey(33L, Long.MIN_VALUE | 7L), 1L);
         bytes[12] ^= 1;
 
         KvRecordBatch batch = KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
@@ -84,10 +84,10 @@ class FencedKvRecordBatchTest {
     }
 
     @Test
-    void testV1RejectsNegativeSequence() {
+    void testRejectsNegativeProgress() {
         assertThatThrownBy(
                         () ->
-                                FencedKvRecordBatchBuilder.builder(
+                                ProgressKvRecordBatchBuilder.builder(
                                                 1,
                                                 1024,
                                                 new UnmanagedPagedOutputView(100),
@@ -97,10 +97,10 @@ class FencedKvRecordBatchTest {
     }
 
     @Test
-    void testV1RequiresWriterStateBeforeBuild() {
+    void testRequiresWriterProgressBeforeBuild() {
         assertThatThrownBy(
                         () ->
-                                FencedKvRecordBatchBuilder.builder(
+                                ProgressKvRecordBatchBuilder.builder(
                                                 1,
                                                 1024,
                                                 new UnmanagedPagedOutputView(100),
@@ -132,7 +132,7 @@ class FencedKvRecordBatchTest {
 
     @Test
     void testReaderRejectsV1HeaderShorterThanFortyBytes() {
-        ByteBuffer buffer = ByteBuffer.allocate(FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE - 1);
+        ByteBuffer buffer = ByteBuffer.allocate(ProgressKvRecordBatch.RECORD_BATCH_HEADER_SIZE - 1);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
         buffer.putInt(0, buffer.capacity() - Integer.BYTES);
         buffer.put(4, KvRecordBatch.KV_MAGIC_VALUE_V1);
@@ -142,9 +142,9 @@ class FencedKvRecordBatchTest {
 
     @Test
     void testReaderRejectsDeclaredBatchBeyondRemainingBytes() {
-        ByteBuffer buffer = ByteBuffer.allocate(FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE);
+        ByteBuffer buffer = ByteBuffer.allocate(ProgressKvRecordBatch.RECORD_BATCH_HEADER_SIZE);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
-        buffer.putInt(0, FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE);
+        buffer.putInt(0, ProgressKvRecordBatch.RECORD_BATCH_HEADER_SIZE);
         buffer.put(4, KvRecordBatch.KV_MAGIC_VALUE_V1);
 
         assertReaderRejects(buffer, "exceeds remaining bytes 40");
@@ -152,7 +152,7 @@ class FencedKvRecordBatchTest {
 
     @Test
     void testReaderHonorsNonZeroPositionAndConstrainedLimit() throws Exception {
-        byte[] batchBytes = buildV1Batch(new WriterKey(3L, 4L), 5L);
+        byte[] batchBytes = buildProgressBatch(new WriterKey(3L, 4L), 5L);
         byte[] framedBytes = new byte[batchBytes.length + 9];
         System.arraycopy(batchBytes, 0, framedBytes, 3, batchBytes.length);
         ByteBuffer buffer = ByteBuffer.wrap(framedBytes);
@@ -161,15 +161,15 @@ class FencedKvRecordBatchTest {
 
         KvRecordBatch batch = KvRecordBatchReader.pointToByteBuffer(buffer);
 
-        assertThat(batch.fencedWriterKey()).isEqualTo(new WriterKey(3L, 4L));
-        assertThat(batch.fencedSequence()).isEqualTo(5L);
+        assertThat(batch.writerKey()).isEqualTo(new WriterKey(3L, 4L));
+        assertThat(batch.writerProgress()).isEqualTo(5L);
         assertThat(buffer.position()).isEqualTo(3);
         assertThat(buffer.limit()).isEqualTo(3 + batchBytes.length);
     }
 
     @Test
     void testReaderDoesNotAdvanceReadOnlyHeapBufferWhenCopying() throws Exception {
-        byte[] batchBytes = buildV1Batch(new WriterKey(6L, 7L), 8L);
+        byte[] batchBytes = buildProgressBatch(new WriterKey(6L, 7L), 8L);
         byte[] framedBytes = new byte[batchBytes.length + 5];
         System.arraycopy(batchBytes, 0, framedBytes, 2, batchBytes.length);
         ByteBuffer buffer = ByteBuffer.wrap(framedBytes).asReadOnlyBuffer();
@@ -180,16 +180,16 @@ class FencedKvRecordBatchTest {
 
         KvRecordBatch batch = KvRecordBatchReader.pointToByteBuffer(buffer);
 
-        assertThat(batch.fencedWriterKey()).isEqualTo(new WriterKey(6L, 7L));
-        assertThat(batch.fencedSequence()).isEqualTo(8L);
+        assertThat(batch.writerKey()).isEqualTo(new WriterKey(6L, 7L));
+        assertThat(batch.writerProgress()).isEqualTo(8L);
         assertThat(buffer.position()).isEqualTo(2);
         assertThat(buffer.limit()).isEqualTo(2 + batchBytes.length);
     }
 
     @Test
     void testReaderRejectsRecordCountWithoutPayload() throws Exception {
-        byte[] bytes = buildV1Batch(new WriterKey(1L, 2L), 3L);
-        putInt(bytes, FencedKvRecordBatch.RECORDS_COUNT_OFFSET, 1);
+        byte[] bytes = buildProgressBatch(new WriterKey(1L, 2L), 3L);
+        putInt(bytes, ProgressKvRecordBatch.RECORDS_COUNT_OFFSET, 1);
         updateCrc(bytes, bytes.length);
 
         assertReaderRejects(ByteBuffer.wrap(bytes), "record count 1 does not fit payload size 0");
@@ -197,8 +197,8 @@ class FencedKvRecordBatchTest {
 
     @Test
     void testReaderRejectsNegativeRecordCount() throws Exception {
-        byte[] bytes = buildV1Batch(new WriterKey(1L, 2L), 3L);
-        putInt(bytes, FencedKvRecordBatch.RECORDS_COUNT_OFFSET, -1);
+        byte[] bytes = buildProgressBatch(new WriterKey(1L, 2L), 3L);
+        putInt(bytes, ProgressKvRecordBatch.RECORDS_COUNT_OFFSET, -1);
         updateCrc(bytes, bytes.length);
 
         assertReaderRejects(ByteBuffer.wrap(bytes), "negative record count -1");
@@ -206,12 +206,15 @@ class FencedKvRecordBatchTest {
 
     @Test
     void testRecordCannotConsumeBytesBeyondDeclaredBatchEnd() throws Exception {
-        byte[] validRecordBatch = buildV1BatchWithKeys(new byte[] {42});
+        byte[] validRecordBatch = buildProgressBatchWithKeys(new byte[] {42});
         int declaredSize = validRecordBatch.length - 1;
         byte[] bytesWithSentinel = Arrays.copyOf(validRecordBatch, validRecordBatch.length + 4);
         Arrays.fill(
                 bytesWithSentinel, validRecordBatch.length, bytesWithSentinel.length, (byte) 99);
-        putInt(bytesWithSentinel, FencedKvRecordBatch.LENGTH_OFFSET, declaredSize - Integer.BYTES);
+        putInt(
+                bytesWithSentinel,
+                ProgressKvRecordBatch.LENGTH_OFFSET,
+                declaredSize - Integer.BYTES);
         updateCrc(bytesWithSentinel, declaredSize);
         KvRecordBatch batch =
                 KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytesWithSentinel));
@@ -226,8 +229,8 @@ class FencedKvRecordBatchTest {
 
     @Test
     void testRecordCountMustConsumeEntireDeclaredPayload() throws Exception {
-        byte[] bytes = buildV1BatchWithKeys(new byte[] {1}, new byte[] {2});
-        putInt(bytes, FencedKvRecordBatch.RECORDS_COUNT_OFFSET, 1);
+        byte[] bytes = buildProgressBatchWithKeys(new byte[] {1}, new byte[] {2});
+        putInt(bytes, ProgressKvRecordBatch.RECORDS_COUNT_OFFSET, 1);
         updateCrc(bytes, bytes.length);
         KvRecordBatch batch = KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
         batch.ensureValid();
@@ -241,7 +244,7 @@ class FencedKvRecordBatchTest {
 
     @Test
     void testSetWriterStateAfterBuildRebuildsHeader() throws Exception {
-        FencedKvRecordBatchBuilder builder = newBuilder();
+        ProgressKvRecordBatchBuilder builder = newBuilder();
         builder.setWriterState(new WriterKey(1L, 2L), 3L);
         BytesView firstBuild = builder.build();
 
@@ -251,15 +254,15 @@ class FencedKvRecordBatchTest {
                 KvRecordBatchReader.pointToByteBuffer(secondBuild.getByteBuf().nioBuffer());
 
         assertThat(secondBuild).isNotSameAs(firstBuild);
-        assertThat(batch.fencedWriterKey()).isEqualTo(new WriterKey(4L, 5L));
-        assertThat(batch.fencedSequence()).isEqualTo(6L);
+        assertThat(batch.writerKey()).isEqualTo(new WriterKey(4L, 5L));
+        assertThat(batch.writerProgress()).isEqualTo(6L);
         batch.ensureValid();
         builder.close();
     }
 
-    private static byte[] buildV1Batch(WriterKey writerKey, long sequence) throws Exception {
-        FencedKvRecordBatchBuilder builder = newBuilder();
-        builder.setWriterState(writerKey, sequence);
+    private static byte[] buildProgressBatch(WriterKey writerKey, long progress) throws Exception {
+        ProgressKvRecordBatchBuilder builder = newBuilder();
+        builder.setWriterState(writerKey, progress);
         ByteBuffer buffer = builder.build().getByteBuf().nioBuffer();
         byte[] bytes = new byte[buffer.remaining()];
         buffer.get(bytes);
@@ -267,8 +270,8 @@ class FencedKvRecordBatchTest {
         return bytes;
     }
 
-    private static byte[] buildV1BatchWithKeys(byte[]... keys) throws Exception {
-        FencedKvRecordBatchBuilder builder = newBuilder();
+    private static byte[] buildProgressBatchWithKeys(byte[]... keys) throws Exception {
+        ProgressKvRecordBatchBuilder builder = newBuilder();
         builder.setWriterState(new WriterKey(1L, 2L), 3L);
         for (byte[] key : keys) {
             builder.append(key, null);
@@ -280,8 +283,8 @@ class FencedKvRecordBatchTest {
         return bytes;
     }
 
-    private static FencedKvRecordBatchBuilder newBuilder() {
-        return FencedKvRecordBatchBuilder.builder(
+    private static ProgressKvRecordBatchBuilder newBuilder() {
+        return ProgressKvRecordBatchBuilder.builder(
                 1, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), KvFormat.COMPACTED);
     }
 
@@ -308,9 +311,9 @@ class FencedKvRecordBatchTest {
         long crc =
                 Crc32C.compute(
                         bytes,
-                        FencedKvRecordBatch.SCHEMA_ID_OFFSET,
-                        declaredSize - FencedKvRecordBatch.SCHEMA_ID_OFFSET);
-        putInt(bytes, FencedKvRecordBatch.CRC_OFFSET, (int) crc);
+                        ProgressKvRecordBatch.SCHEMA_ID_OFFSET,
+                        declaredSize - ProgressKvRecordBatch.SCHEMA_ID_OFFSET);
+        putInt(bytes, ProgressKvRecordBatch.CRC_OFFSET, (int) crc);
     }
 
     private static byte[] minimumBatchWithMagic(byte magic) {

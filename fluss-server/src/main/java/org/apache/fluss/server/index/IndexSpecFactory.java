@@ -147,7 +147,7 @@ public final class IndexSpecFactory {
             valueFieldTypes[storedColCount] = DataTypes.BIGINT().copy(false);
         }
 
-        KvFormat indexKvFormat = partitioned ? KvFormat.ALIGNED : KvFormat.COMPACTED;
+        KvFormat indexKvFormat = KvFormat.COMPACTED;
         RowEncoder valueRowEncoder = RowEncoder.create(indexKvFormat, valueFieldTypes);
         int[] physicalPkIndices = new int[totalColCount];
         for (int i = 0; i < totalColCount; i++) {
@@ -250,16 +250,13 @@ public final class IndexSpecFactory {
         if (!indexTableInfo.isIndexTable()) {
             throw invalidMetadata(path, "a table that is not an Index Table");
         }
-        if (!indexTableInfo.getMainTableId().isPresent()
-                || indexTableInfo.getMainTableId().getAsLong() != mainTableInfo.getTableId()) {
+        if (indexTableInfo.getMainTableId().getAsLong() != mainTableInfo.getTableId()) {
             throw invalidMetadata(
                     path,
                     "an Index Table owned by main table "
                             + mainTableInfo.getTableId()
                             + " but found owner "
-                            + (indexTableInfo.getMainTableId().isPresent()
-                                    ? indexTableInfo.getMainTableId().getAsLong()
-                                    : "none"));
+                            + indexTableInfo.getMainTableId().getAsLong());
         }
 
         TableDescriptor expected =
@@ -326,8 +323,9 @@ public final class IndexSpecFactory {
                             + " but found "
                             + actualKvFormatVersion);
         }
-        if (indexTableInfo.getKvIdempotenceProtocol() != KvIdempotenceProtocol.V1_FENCED) {
-            throw invalidMetadata(path, "an unfenced KV idempotence protocol");
+        if (indexTableInfo.getKvIdempotenceProtocol()
+                != KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
+            throw invalidMetadata(path, "the cumulative progress protocol");
         }
     }
 

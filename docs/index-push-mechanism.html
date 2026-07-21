@@ -615,7 +615,7 @@
       <div class="view-head">
         <div>
           <h1>Committed WAL to durable index progress</h1>
-          <p>Each source bucket and index has one active IndexWindow. Every target batch is admitted as one unit, and source progress advances only after all target batches are durably acknowledged.</p>
+          <p>Each main-table bucket and index has one active IndexWindow. Every Index Bucket batch is admitted as one unit, and main-table WAL progress advances only after all Index Bucket batches are durably acknowledged.</p>
         </div>
         <div class="controls">
           <div class="segment" aria-label="Replication scenario">
@@ -629,7 +629,7 @@
             <button data-pipe-stage="1">2 Window</button>
             <button data-pipe-stage="2">3 Admit</button>
             <button data-pipe-stage="3">4 Send</button>
-            <button data-pipe-stage="4">5 Target HW</button>
+            <button data-pipe-stage="4">5 Index Table HW</button>
             <button data-pipe-stage="5">6 Progress</button>
           </div>
         </div>
@@ -639,21 +639,21 @@
         <div class="canvas">
           <svg class="diagram" id="pipelineDiagram" viewBox="0 0 1400 760" role="img" aria-labelledby="pipeTitle pipeDesc">
             <title id="pipeTitle">Global secondary index V2 push replication pipeline</title>
-            <desc id="pipeDesc">A single IndexWindow is built from committed source WAL, admitted atomically, sent to multiple Index Buckets through PutKv V1, and completed only after every target commits.</desc>
+            <desc id="pipeDesc">A single IndexWindow is built from committed main-table WAL, admitted atomically, sent to multiple Index Buckets through cumulative-progress PutKv, and completed only after every Index Bucket commits.</desc>
             <rect class="band" x="24" y="24" width="1352" height="112"></rect>
-            <text class="band-label" x="42" y="48">SOURCE COMMIT</text>
+            <text class="band-label" x="42" y="48">MAIN TABLE COMMIT</text>
             <rect class="band" x="24" y="154" width="1352" height="138"></rect>
-            <text class="band-label" x="42" y="178">ONE WINDOW PER SOURCE BUCKET / INDEX</text>
+            <text class="band-label" x="42" y="178">ONE WINDOW PER MAIN-TABLE BUCKET / INDEX</text>
             <rect class="band" x="24" y="310" width="1352" height="134"></rect>
             <text class="band-label" x="42" y="334">WHOLE-WINDOW ADMISSION</text>
             <rect class="band" x="24" y="462" width="1352" height="166"></rect>
-            <text class="band-label" x="42" y="486">V1 TARGET APPLY</text>
+            <text class="band-label" x="42" y="486">CUMULATIVE PROGRESS INDEX TABLE APPLY</text>
             <rect class="band" x="24" y="646" width="1352" height="88"></rect>
-            <text class="band-label" x="42" y="670">SOURCE PROGRESS</text>
+            <text class="band-label" x="42" y="670">MAIN TABLE PROGRESS</text>
 
             <g class="phase current" data-pipe-phase="0">
               <rect class="box source" x="90" y="62" width="210" height="58"></rect>
-              <text class="node-title" x="108" y="86">Source Data Bucket</text>
+              <text class="node-title" x="108" y="86">Main Table Bucket</text>
               <text class="node-sub mono" x="108" y="106">KV + WAL, HW = 120</text>
               <path class="arrow-source" d="M300 91 H360"></path>
               <rect class="wal-cell committed" x="365" y="68" width="94" height="42"></rect>
@@ -673,14 +673,14 @@
               <path class="arrow-source" d="M515 124 V188"></path>
               <rect class="box teal" x="330" y="190" width="370" height="82"></rect>
               <text class="node-title" x="350" y="216">IndexReplicator / IndexWindow</text>
-              <text class="node-sub mono" id="pipeWindow" x="350" y="239">source range [100,120), sequence = 120</text>
+              <text class="node-sub mono" id="pipeWindow" x="350" y="239">main-table WAL range [100,120), writer progress = 120</text>
               <text class="node-sub mono" id="pipeWriterKey" x="350" y="258">WriterKey = (high=0, low=3)</text>
               <path class="arrow-control" d="M700 231 H774"></path>
               <rect class="batch-cell" x="780" y="190" width="164" height="34"></rect>
               <rect class="batch-cell" x="780" y="232" width="164" height="34"></rect>
               <text class="node-sub mono" id="pipeMutationA" x="794" y="212">B0  UPSERT</text>
               <text class="node-sub mono" id="pipeMutationB" x="794" y="254">B2  UPSERT</text>
-              <text class="node-sub" x="972" y="214">each target at most one batch</text>
+              <text class="node-sub" x="972" y="214">each Index Bucket at most one batch</text>
               <text class="node-sub" x="972" y="244">physical OVERWRITE / DELETE</text>
             </g>
 
@@ -700,7 +700,7 @@
               <rect class="box control" x="90" y="512" width="190" height="82"></rect>
               <text class="node-title" x="108" y="538">IndexSender</text>
               <text class="node-sub mono" x="108" y="558">PutKv API v2</text>
-              <text class="node-sub mono" x="108" y="576">V1_FENCED, acks=-1</text>
+              <text class="node-sub mono" x="108" y="576">cumulative progress, acks=-1</text>
               <path class="arrow-control" d="M280 553 H342"></path>
               <path class="arrow-control" d="M332 553 C430 474, 686 474, 804 500"></path>
               <circle class="token" cx="316" cy="553" r="16"></circle>
@@ -712,18 +712,18 @@
               <text class="node-title" x="368" y="528">Index Bucket B0</text>
               <text class="node-sub mono" id="pipeTarget0State" x="368" y="550">fresh: E=120 &gt; last=96</text>
               <text class="node-sub" x="368" y="570">KV effect + WriterState in one WAL batch</text>
-              <text class="node-sub mono" id="pipeTarget0Ack" x="368" y="590">ACK after target HW</text>
+              <text class="node-sub mono" id="pipeTarget0Ack" x="368" y="590">ACK after Index Table HW</text>
               <rect class="box index" id="pipeTarget2" x="666" y="502" width="276" height="104"></rect>
               <text class="node-title" x="684" y="528">Index Bucket B2</text>
               <text class="node-sub mono" id="pipeTarget2State" x="684" y="550">fresh: E=120 &gt; last=96</text>
-              <text class="node-sub" id="pipeTarget2Effect" x="684" y="570">physical mutation + durable fence</text>
-              <text class="node-sub mono" id="pipeTarget2Ack" x="684" y="590">ACK after target HW</text>
+              <text class="node-sub" id="pipeTarget2Effect" x="684" y="570">physical mutation + durable WriterState</text>
+              <text class="node-sub mono" id="pipeTarget2Ack" x="684" y="590">ACK after Index Table HW</text>
               <path class="arrow-index" d="M488 606 V620 H980 V578 H1004"></path>
               <path class="arrow-index" d="M942 554 H1004"></path>
               <rect class="box teal" x="1010" y="514" width="278" height="80"></rect>
               <text class="node-title" x="1028" y="540">IndexWindow completion</text>
               <text class="node-sub mono" id="pipeCompletion" x="1028" y="562">pendingBatchCount: 2 → 0</text>
-              <text class="node-sub" x="1028" y="580">all non-empty target batches committed</text>
+              <text class="node-sub" x="1028" y="580">all non-empty Index Bucket batches committed</text>
             </g>
 
             <g class="phase" data-pipe-phase="5">
@@ -740,18 +740,18 @@
           </svg>
         </div>
         <div class="legend">
-          <span><i class="swatch" style="background:var(--source-soft);border-color:var(--source)"></i>source committed state</span>
+          <span><i class="swatch" style="background:var(--source-soft);border-color:var(--source)"></i>main-table committed state</span>
           <span><i class="swatch" style="background:var(--control-soft);border-color:var(--control)"></i>bounded transient state</span>
-          <span><i class="swatch" style="background:var(--index-soft);border-color:var(--index)"></i>target durable state</span>
+          <span><i class="swatch" style="background:var(--index-soft);border-color:var(--index)"></i>Index Table durable state</span>
           <span><i class="swatch" style="background:var(--danger-soft);border-color:var(--danger)"></i>retry or fail-closed path</span>
         </div>
       </div>
 
       <div class="contract-strip">
-        <div class="contract"><strong>ONE_WINDOW</strong><span>No next window is built for the same source bucket and index until the current window completes.</span></div>
-        <div class="contract"><strong>ALL_OR_NONE_ADMISSION</strong><span>The sender cannot observe any staged target batch before the whole-window admission commits.</span></div>
-        <div class="contract"><strong>DURABLE_ACK</strong><span>Fresh, stale, and tombstone no-op responses all have explicit target-HW semantics.</span></div>
-        <div class="contract"><strong>SNAPSHOT_RETENTION</strong><span>Only committed snapshot.indexPushedOffset may release raw source WAL.</span></div>
+        <div class="contract"><strong>ONE_WINDOW</strong><span>No next window is built for the same main-table bucket and index until the current window completes.</span></div>
+        <div class="contract"><strong>ALL_OR_NONE_ADMISSION</strong><span>The sender cannot observe any staged Index Bucket batch before the whole-window admission commits.</span></div>
+        <div class="contract"><strong>DURABLE_ACK</strong><span>Fresh, stale, and tombstone no-op responses all wait for the relevant Index Table HW.</span></div>
+        <div class="contract"><strong>SNAPSHOT_RETENTION</strong><span>Only committed snapshot.indexPushedOffset may release raw main-table WAL.</span></div>
       </div>
     </section>
 
@@ -759,79 +759,79 @@
       <div class="view-head">
         <div>
           <h1>Target ordering across different window boundaries</h1>
-          <p>The long sequence for a WriterKey is an absolute exclusive source-WAL end offset. Old and new leaders may form different windows, while the target persists only the larger source prefix.</p>
+          <p>Writer progress is the exclusive end offset of a main-table WAL range. Old and new leaders may form different windows, while the Index Bucket keeps the greatest committed progress for each WriterKey.</p>
         </div>
         <div class="controls">
           <div class="segment" aria-label="Arrival order">
-            <button class="active" data-fence-order="new-first">New Leader First</button>
-            <button data-fence-order="old-first">Old Leader First</button>
+            <button class="active" data-progress-order="new-first">New Leader First</button>
+            <button data-progress-order="old-first">Old Leader First</button>
           </div>
         </div>
       </div>
 
       <div class="diagram-shell">
         <div class="canvas">
-          <svg class="diagram" viewBox="0 0 1400 650" role="img" aria-labelledby="fenceTitle fenceDesc">
-            <title id="fenceTitle">Old and new source leader ordering through V1 WriterState</title>
-            <desc id="fenceDesc">The old leader's sequence 120 and the new leader's sequence 160 arrive out of order; target WriterState accepts only an increasing sequence.</desc>
+          <svg class="diagram" viewBox="0 0 1400 650" role="img" aria-labelledby="progressTitle progressDesc">
+            <title id="progressTitle">Old and new main-table bucket leader ordering through cumulative writer progress</title>
+            <desc id="progressDesc">The old leader's progress 120 and the new leader's progress 160 arrive out of order; Index Bucket WriterState keeps only increasing progress.</desc>
             <rect class="band" x="24" y="24" width="420" height="600"></rect>
-            <text class="band-label" x="44" y="50">SOURCE LEADERS</text>
+            <text class="band-label" x="44" y="50">MAIN-TABLE BUCKET LEADERS</text>
             <rect class="band" x="466" y="24" width="410" height="600"></rect>
             <text class="band-label" x="486" y="50">NETWORK REORDERING</text>
             <rect class="band" x="898" y="24" width="478" height="600"></rect>
-            <text class="band-label" x="918" y="50">INDEX BUCKET / V1 WRITERSTATE</text>
+            <text class="band-label" x="918" y="50">INDEX BUCKET / CUMULATIVE PROGRESS WRITERSTATE</text>
 
             <rect class="box source" x="76" y="100" width="310" height="104"></rect>
-            <text class="node-title" x="98" y="128">Old source leader L1</text>
+            <text class="node-title" x="98" y="128">Old main-table leader L1</text>
             <text class="node-sub mono" x="98" y="152">WriterKey = (0,3)</text>
-            <text class="node-sub mono" x="98" y="174">window [80,120), sequence = 120</text>
+            <text class="node-sub mono" x="98" y="174">window [80,120), writer progress = 120</text>
             <text class="node-sub" x="98" y="192">request remains in flight across failover</text>
 
             <rect class="box teal" x="76" y="276" width="310" height="126"></rect>
-            <text class="node-title" x="98" y="304">New source leader L2</text>
+            <text class="node-title" x="98" y="304">New main-table leader L2</text>
             <text class="node-sub mono" x="98" y="328">restore snapshot progress = 80</text>
-            <text class="node-sub mono" x="98" y="350">window [80,160), sequence = 160</text>
-            <text class="node-sub" x="98" y="374">replays a larger committed source prefix</text>
-            <text class="node-sub" x="98" y="392">without querying target state</text>
+            <text class="node-sub mono" x="98" y="350">window [80,160), writer progress = 160</text>
+            <text class="node-sub" x="98" y="374">replays a longer committed WAL range</text>
+            <text class="node-sub" x="98" y="392">without querying Index Bucket state</text>
 
             <path class="arrow-danger" d="M386 152 C560 152, 704 202, 930 202"></path>
             <path class="arrow-index" d="M386 338 C566 338, 706 286, 930 286"></path>
-            <circle class="token" id="fenceOldOrderCircle" cx="608" cy="170" r="17"></circle>
-            <text class="token-label" id="fenceOldOrder" x="608" y="170">2</text>
-            <circle class="token" id="fenceNewOrderCircle" cx="608" cy="320" r="17"></circle>
-            <text class="token-label" id="fenceNewOrder" x="608" y="320">1</text>
-            <text class="node-sub" id="fenceNetworkText" x="520" y="438">arrival order: 160, then 120</text>
+            <circle class="token" id="progressOldOrderCircle" cx="608" cy="170" r="17"></circle>
+            <text class="token-label" id="progressOldOrder" x="608" y="170">2</text>
+            <circle class="token" id="progressNewOrderCircle" cx="608" cy="320" r="17"></circle>
+            <text class="token-label" id="progressNewOrder" x="608" y="320">1</text>
+            <text class="node-sub" id="progressNetworkText" x="520" y="438">arrival order: 160, then 120</text>
 
             <rect class="box metadata" x="940" y="92" width="382" height="74"></rect>
             <text class="node-title" x="962" y="120">Immutable table protocol</text>
-            <text class="node-sub mono" x="962" y="143">V1_FENCED + WriterKey (128 bit) + int64 sequence</text>
+            <text class="node-sub mono" x="962" y="143">cumulative progress + WriterKey (128 bit) + int64 progress</text>
 
-            <rect class="box index" id="fenceFirstDecisionBox" x="940" y="188" width="382" height="88"></rect>
-            <text class="node-title" id="fenceFirstDecisionTitle" x="962" y="216">receive E=160: FRESH</text>
-            <text class="node-sub mono" id="fenceFirstDecisionBody" x="962" y="240">160 &gt; unknown → apply KV + persist last=160</text>
-            <text class="node-sub" id="fenceFirstDecisionFoot" x="962" y="260">target WAL offset T160 gates response</text>
+            <rect class="box index" id="progressFirstDecisionBox" x="940" y="188" width="382" height="88"></rect>
+            <text class="node-title" id="progressFirstDecisionTitle" x="962" y="216">receive E=160: FRESH</text>
+            <text class="node-sub mono" id="progressFirstDecisionBody" x="962" y="240">160 &gt; unknown → apply KV + persist progress=160</text>
+            <text class="node-sub" id="progressFirstDecisionFoot" x="962" y="260">Index Table WAL offset T160 gates response</text>
 
-            <rect class="box danger" id="fenceSecondDecisionBox" x="940" y="296" width="382" height="88"></rect>
-            <text class="node-title" id="fenceSecondDecisionTitle" x="962" y="324">receive E=120: STALE</text>
-            <text class="node-sub mono" id="fenceSecondDecisionBody" x="962" y="348">120 ≤ 160 → no decode / KV / WAL append</text>
-            <text class="node-sub" id="fenceSecondDecisionFoot" x="962" y="368">success waits until target HW &gt; T160</text>
+            <rect class="box danger" id="progressSecondDecisionBox" x="940" y="296" width="382" height="88"></rect>
+            <text class="node-title" id="progressSecondDecisionTitle" x="962" y="324">receive E=120: STALE</text>
+            <text class="node-sub mono" id="progressSecondDecisionBody" x="962" y="348">120 ≤ 160 → no decode / KV / WAL append</text>
+            <text class="node-sub" id="progressSecondDecisionFoot" x="962" y="368">success waits until Index Table HW &gt; T160</text>
 
             <rect class="box teal" x="940" y="426" width="382" height="84"></rect>
             <text class="node-title" x="962" y="454">Durable final state</text>
-            <text class="node-sub mono" id="fenceFinalState" x="962" y="478">WriterState: unknown → 160</text>
-            <text class="node-sub" x="962" y="498">KV equals the committed source prefix ending at 160</text>
+            <text class="node-sub mono" id="progressFinalState" x="962" y="478">WriterState: unknown → 160</text>
+            <text class="node-sub" x="962" y="498">KV reflects the committed WAL range ending at 160</text>
 
             <path class="arrow-index" d="M1132 510 V558"></path>
             <rect class="box index" x="940" y="558" width="382" height="42"></rect>
-            <text class="node-title" x="962" y="584">Both arrival orders converge to sequence 160</text>
+            <text class="node-title" x="962" y="584">Both arrival orders converge to progress 160</text>
           </svg>
         </div>
       </div>
 
       <div class="contract-strip">
-        <div class="contract"><strong>SEQUENCE_IS_OFFSET</strong><span>The sequence is neither an artificial contiguous counter nor the live logEndOffset.</span></div>
-        <div class="contract"><strong>SAME_WRITER_DOMAIN</strong><span>A stable WriterKey places requests from one source TableBucket in the same comparison domain.</span></div>
-        <div class="contract"><strong>STALE_NO_OP</strong><span>A batch whose sequence is no greater than last stops before row decoding.</span></div>
+        <div class="contract"><strong>PROGRESS_IS_WINDOW_END</strong><span>Writer progress is the processed WAL range end, not the live logEndOffset.</span></div>
+        <div class="contract"><strong>SAME_WRITER_DOMAIN</strong><span>A stable WriterKey lets the Index Bucket compare requests from one main-table TableBucket.</span></div>
+        <div class="contract"><strong>STALE_NO_OP</strong><span>A batch whose progress is no greater than the saved value stops before row decoding.</span></div>
         <div class="contract"><strong>NO_ROW_METADATA</strong><span>Index rows require neither __source_offset nor __index_deleted.</span></div>
       </div>
     </section>
@@ -839,15 +839,15 @@
     <section class="view-panel" id="panel-recovery" role="tabpanel" hidden>
       <div class="view-head">
         <div>
-          <h1>Independent source and target recovery proofs</h1>
-          <p>Source recovery requires committed indexPushedOffset and continuous raw WAL. Target recovery requires a KV snapshot, a full V1 WriterState snapshot, and continuous target WAL. Any coverage gap refuses leadership.</p>
+          <h1>Independent main-table and Index Table recovery</h1>
+          <p>Main-table recovery requires committed indexPushedOffset and continuous raw WAL. Index Table recovery requires a KV snapshot, a complete cumulative-progress WriterState snapshot, and continuous Index Table WAL. A missing required range refuses leadership.</p>
         </div>
         <div class="controls">
           <div class="segment" aria-label="Recovery scenario">
-            <button class="active" data-recovery="normal">Continuous Coverage</button>
-            <button data-recovery="missing-progress">Missing Source Progress</button>
-            <button data-recovery="source-gap">source WAL gap</button>
-            <button data-recovery="target-gap">target coverage gap</button>
+            <button class="active" data-recovery="normal">Continuous WAL</button>
+            <button data-recovery="missing-progress">Missing Replication Progress</button>
+            <button data-recovery="source-gap">main-table WAL gap</button>
+            <button data-recovery="target-gap">Index Table WAL Gap</button>
           </div>
         </div>
       </div>
@@ -855,17 +855,17 @@
       <div class="diagram-shell">
         <div class="canvas">
           <svg class="diagram" viewBox="0 0 1400 670" role="img" aria-labelledby="recoveryTitle recoveryDesc">
-            <title id="recoveryTitle">Source and target recovery coverage</title>
-            <desc id="recoveryDesc">The source recovers from snapshot progress plus remote and local WAL; the target jointly recovers KV and WriterState and fails closed when coverage is missing.</desc>
+            <title id="recoveryTitle">Main-table and Index Table recovery</title>
+            <desc id="recoveryDesc">The main table recovers from snapshot progress plus remote and local WAL. The Index Table recovers KV and WriterState together, and a missing required range fails closed.</desc>
             <rect class="band" x="24" y="24" width="662" height="620"></rect>
-            <text class="band-label" x="44" y="50">SOURCE DATA BUCKET RECOVERY</text>
+            <text class="band-label" x="44" y="50">MAIN TABLE BUCKET RECOVERY</text>
             <rect class="band" x="714" y="24" width="662" height="620"></rect>
             <text class="band-label" x="734" y="50">INDEX BUCKET RECOVERY</text>
 
             <rect class="box source" id="sourceSnapshotBox" x="70" y="86" width="276" height="94"></rect>
             <text class="node-title" x="90" y="116">Committed KV snapshot</text>
             <text class="node-sub mono" id="sourceSnapshotText" x="90" y="142">indexPushedOffset = 80</text>
-            <text class="node-sub" x="90" y="163">exclusive next source WAL offset</text>
+            <text class="node-sub" x="90" y="163">next main-table WAL offset</text>
             <path class="arrow-source" d="M346 132 H396"></path>
             <rect class="box teal" id="sourceProgressGate" x="404" y="98" width="220" height="70"></rect>
             <text class="node-title" id="sourceProgressGateText" x="424" y="127">progress valid</text>
@@ -880,16 +880,16 @@
             <rect class="box source" id="localWalBox" x="380" y="226" width="244" height="86"></rect>
             <text class="node-title" x="400" y="254">Local committed WAL</text>
             <text class="node-sub mono" x="400" y="278">[128, HW=176)</text>
-            <text class="node-sub" x="400" y="298">exact remote/local handoff</text>
+            <text class="node-sub" x="400" y="298">no logical offset gap</text>
 
             <path class="arrow-source" d="M348 312 V370"></path>
             <rect class="box teal" id="sourceCoverageBox" x="178" y="374" width="340" height="84"></rect>
-            <text class="node-title" id="sourceCoverageTitle" x="200" y="404">continuous source coverage</text>
+            <text class="node-title" id="sourceCoverageTitle" x="200" y="404">main-table WAL range complete</text>
             <text class="node-sub mono" id="sourceCoverageText" x="200" y="428">[80,176) proven</text>
-            <text class="node-sub" x="200" y="448">re-extract + push; target fence deduplicates</text>
+            <text class="node-sub" x="200" y="448">re-extract + push; WriterState deduplicates</text>
             <path class="arrow-source" d="M348 458 V516"></path>
             <rect class="box index status-ok" id="sourceResultBox" x="178" y="520" width="340" height="70"></rect>
-            <text class="node-title" id="sourceResultTitle" x="200" y="550">SOURCE LEADER READY</text>
+            <text class="node-title" id="sourceResultTitle" x="200" y="550">MAIN-TABLE LEADER READY</text>
             <text class="node-sub" id="sourceResultText" x="200" y="572">replay starts exactly at 80</text>
 
             <rect class="box index" x="756" y="86" width="250" height="94"></rect>
@@ -897,36 +897,36 @@
             <text class="node-sub mono" x="776" y="142">replay offset K = 420</text>
             <text class="node-sub" x="776" y="163">materialized index state</text>
             <rect class="box metadata" x="1080" y="86" width="250" height="94"></rect>
-            <text class="node-title" x="1100" y="116">Full V1 state snapshot</text>
+            <text class="node-title" x="1100" y="116">Complete cumulative-progress state snapshot</text>
             <text class="node-sub mono" x="1100" y="142">state offset R = 396</text>
-            <text class="node-sub" x="1100" y="163">latest sequence + target WAL offset</text>
+            <text class="node-sub" x="1100" y="163">latest progress + Index Table WAL offset</text>
 
             <path class="arrow-index" d="M882 180 V230"></path>
             <path class="arrow-metadata" d="M1206 180 V230"></path>
             <rect class="box teal" id="targetWalBox" x="812" y="232" width="462" height="92"></rect>
-            <text class="node-title" x="834" y="260">Continuous target WAL to recovery end = 512</text>
-            <text class="node-sub mono" id="targetWalText" x="834" y="285">KV coverage [420,512) + state coverage [396,512)</text>
-            <text class="node-sub" x="834" y="306">each fresh V1 batch carries KV effect and WriterState together</text>
+            <text class="node-title" x="834" y="260">Index Table WAL is continuous through offset 512</text>
+            <text class="node-sub mono" id="targetWalText" x="834" y="285">KV [420,512) + WriterState [396,512)</text>
+            <text class="node-sub" x="834" y="306">each fresh cumulative-progress batch carries KV effect and WriterState together</text>
 
             <path class="arrow-index" d="M1044 324 V374"></path>
             <rect class="box index" id="targetCoverageBox" x="812" y="378" width="462" height="82"></rect>
-            <text class="node-title" id="targetCoverageTitle" x="834" y="408">joint coverage proven</text>
-            <text class="node-sub" id="targetCoverageText" x="834" y="432">replay KV and WriterState to the same target frontier</text>
+            <text class="node-title" id="targetCoverageTitle" x="834" y="408">required WAL ranges complete</text>
+            <text class="node-sub" id="targetCoverageText" x="834" y="432">replay KV and WriterState to the same Index Table WAL end offset</text>
             <text class="node-sub" x="834" y="450">truncate and fallback must preserve both</text>
 
             <path class="arrow-index" d="M1044 460 V516"></path>
             <rect class="box index status-ok" id="targetResultBox" x="874" y="520" width="340" height="70"></rect>
             <text class="node-title" id="targetResultTitle" x="896" y="550">INDEX LEADER READY</text>
-            <text class="node-sub" id="targetResultText" x="896" y="572">KV and fence state end at 512</text>
+            <text class="node-sub" id="targetResultText" x="896" y="572">KV and WriterState end at 512</text>
           </svg>
         </div>
       </div>
 
       <div class="contract-strip">
-        <div class="contract"><strong>NO_SNAPSHOT</strong><span>Without a source KV snapshot, replication starts at offset 0.</span></div>
-        <div class="contract"><strong>MISSING_PROGRESS</strong><span>An indexed snapshot with a missing field refuses recovery instead of guessing logStartOffset.</span></div>
-        <div class="contract"><strong>EXACT_HANDOFF</strong><span>Remote and local raw WAL must be contiguous, with no gap or overlap.</span></div>
-        <div class="contract"><strong>JOINT_TARGET_STATE</strong><span>KV effects and WriterState cannot recover to different target frontiers.</span></div>
+        <div class="contract"><strong>NO_SNAPSHOT</strong><span>Without a main-table KV snapshot, replication starts at offset 0.</span></div>
+        <div class="contract"><strong>MISSING_PROGRESS</strong><span>A main-table snapshot missing indexPushedOffset refuses recovery instead of guessing logStartOffset.</span></div>
+        <div class="contract"><strong>CONTINUOUS_OFFSETS</strong><span>Remote batches may overlap; every required logical offset must be present.</span></div>
+        <div class="contract"><strong>JOINT_TARGET_STATE</strong><span>KV effects and WriterState must recover to the same Index Table WAL end offset.</span></div>
       </div>
     </section>
 
@@ -961,7 +961,7 @@
             <text class="band-label" x="44" y="580">READ CORRECTNESS FALLBACK</text>
 
             <rect class="box metadata" x="110" y="72" width="372" height="62"></rect>
-            <text class="node-title" x="132" y="98">Coordinator / source table znode</text>
+            <text class="node-title" x="132" y="98">Coordinator / main-table znode</text>
             <text class="node-sub mono" x="132" y="120">format=1, version=19, floor=30, explicit={42,57}</text>
             <path class="arrow-metadata" d="M482 103 H574"></path>
             <rect class="box metadata" x="582" y="72" width="304" height="62"></rect>
@@ -969,7 +969,7 @@
             <text class="node-sub" x="604" y="120">authoritative empty/non-empty baseline</text>
             <path class="arrow-metadata" d="M886 103 H978"></path>
             <rect class="box metadata" x="986" y="72" width="304" height="62"></rect>
-            <text class="node-title" x="1008" y="98">Retry reads fresh source state</text>
+            <text class="node-title" x="1008" y="98">Retry resolves current metadata</text>
             <text class="node-sub" x="1008" y="120">broadcast failures coalesce and reschedule</text>
 
             <path class="arrow-metadata" d="M734 134 V220"></path>
@@ -1033,7 +1033,7 @@
         <div class="canvas">
           <svg class="diagram" viewBox="0 0 1400 610" role="img" aria-labelledby="lookupTitle lookupDesc">
             <title id="lookupTitle">Two-Hop lookup with logical primary-key deduplication and recheck</title>
-            <desc id="lookupDesc">An Index Bucket prefix scan returns physical candidates; the client deduplicates logical primary keys, point-gets the source table, and validates the current index value.</desc>
+            <desc id="lookupDesc">An Index Bucket prefix scan returns physical candidates; the client deduplicates main-table primary keys, point-gets the main table, and validates the current index value.</desc>
             <rect class="band" x="24" y="24" width="1352" height="560"></rect>
             <text class="band-label" x="44" y="50">LOOKUP KEY → PHYSICAL CANDIDATES → LOGICAL KEYS → CURRENT ROWS</text>
 
@@ -1053,7 +1053,7 @@
 
             <rect class="box teal" x="636" y="88" width="280" height="136"></rect>
             <text class="node-title" x="658" y="116">Logical-PK dedup</text>
-            <text class="node-sub" x="658" y="140">complete base PK, including partition columns</text>
+            <text class="node-sub" x="658" y="140">complete main-table PK, including partition columns</text>
             <text class="node-sub" x="658" y="160">exclude physical __partition_id</text>
             <text class="node-sub mono" id="lookupDedupSet" x="658" y="188">{PK7, PK9}</text>
             <text class="node-sub mono" id="lookupHop2Count" x="658" y="210">2 distinct keys → 2 Hop 2 calls</text>
@@ -1091,24 +1091,24 @@
     <section class="view-panel" id="panel-format" role="tabpanel" hidden>
       <div class="view-head">
         <div>
-          <h1>V2 format boundaries and V0 isolation</h1>
-          <p>V1 is a complete idempotence protocol explicitly selected by Index Tables. Ordinary KV tables remain on V0, and Log Tables plus ProduceLog remain outside V1. Partitioned indexes add only physical pid isolation and the v3 value tag.</p>
+          <h1>Index storage and idempotence formats</h1>
+          <p>Index Tables explicitly select cumulative progress mode. Ordinary KV tables keep contiguous batch sequences, while Log Tables and ProduceLog do not use this KV setting. An Index Table created for a partitioned main table remains non-partitioned, but adds physical partitionId isolation and the v3 value tag.</p>
         </div>
       </div>
 
       <div class="diagram-shell">
         <div class="canvas">
           <svg class="diagram" viewBox="0 0 1400 720" role="img" aria-labelledby="formatTitle formatDesc">
-            <title id="formatTitle">Global secondary index V2 binary layouts and compatibility boundaries</title>
-            <desc id="formatDesc">Physical layouts for partitioned index keys and values, V1 PutKv, target WAL, and WriterState snapshots, with an explicit boundary from ordinary V0 tables.</desc>
+            <title id="formatTitle">Secondary index binary layouts and compatibility boundaries</title>
+            <desc id="formatDesc">Physical layouts for partitioned Index Table keys and values, cumulative-progress PutKv, Index Table WAL, and WriterState snapshots, separated from ordinary contiguous-sequence KV tables.</desc>
             <rect class="band" x="24" y="24" width="1352" height="130"></rect>
-            <text class="band-label" x="44" y="50">PARTITIONED INDEX TABLE ROW</text>
+            <text class="band-label" x="44" y="50">INDEX ROW FOR A PARTITIONED MAIN TABLE</text>
             <text class="node-title" x="70" y="82">Physical key</text>
             <rect class="byte byte-source" x="190" y="62" width="206" height="42"></rect>
             <rect class="byte byte-index" x="396" y="62" width="206" height="42"></rect>
             <rect class="byte byte-control" x="602" y="62" width="214" height="42"></rect>
             <text class="byte-label" x="293" y="83">index columns</text>
-            <text class="byte-label" x="499" y="83">base primary key</text>
+            <text class="byte-label" x="499" y="83">main-table primary key</text>
             <text class="byte-label" x="709" y="83">__partition_id</text>
             <text class="node-title" x="70" y="130">Value v3</text>
             <rect class="byte byte-neutral" x="190" y="110" width="132" height="32"></rect>
@@ -1116,12 +1116,12 @@
             <rect class="byte byte-index" x="702" y="110" width="320" height="32"></rect>
             <text class="byte-label" x="256" y="126">schemaId 2B</text>
             <text class="byte-label" x="512" y="126">value tag / partitionId, int64 big-endian</text>
-            <text class="byte-label" x="862" y="126">BinaryRow</text>
-            <text class="node-sub" x="1050" y="126">10 bytes are sufficient to decode tag</text>
+            <text class="byte-label" x="862" y="126">CompactedRow</text>
+            <text class="node-sub" x="1050" y="126">10 bytes are sufficient to read the tag</text>
 
             <rect class="band" x="24" y="172" width="1352" height="154"></rect>
             <text class="band-label" x="44" y="198">PUTKV RECORDS PAYLOAD</text>
-            <text class="node-title" x="70" y="234">V1 Index Table</text>
+            <text class="node-title" x="70" y="234">Cumulative-progress Index Table</text>
             <rect class="byte byte-control" x="220" y="214" width="96" height="42"></rect>
             <rect class="byte byte-metadata" x="316" y="214" width="214" height="42"></rect>
             <rect class="byte byte-metadata" x="530" y="214" width="214" height="42"></rect>
@@ -1130,49 +1130,49 @@
             <text class="byte-label" x="268" y="235">magic 1</text>
             <text class="byte-label" x="423" y="235">WriterKey high</text>
             <text class="byte-label" x="637" y="235">WriterKey low</text>
-            <text class="byte-label" x="851" y="235">sequence int64</text>
+            <text class="byte-label" x="851" y="235">writer progress int64</text>
             <text class="byte-label" x="1108" y="235">KV records</text>
-            <text class="node-title" x="70" y="294">V0 ordinary KV</text>
+            <text class="node-title" x="70" y="294">Contiguous batch sequence mode</text>
             <rect class="byte byte-neutral" x="220" y="274" width="96" height="34"></rect>
             <rect class="byte byte-neutral" x="316" y="274" width="280" height="34"></rect>
             <rect class="byte byte-neutral" x="596" y="274" width="280" height="34"></rect>
             <rect class="byte byte-neutral" x="876" y="274" width="382" height="34"></rect>
             <text class="byte-label" x="268" y="291">magic 0</text>
             <text class="byte-label" x="456" y="291">writerId int64</text>
-            <text class="byte-label" x="736" y="291">sequence int32</text>
+            <text class="byte-label" x="736" y="291">batch sequence int32</text>
             <text class="byte-label" x="1067" y="291">existing records</text>
 
             <rect class="band" x="24" y="344" width="1352" height="150"></rect>
-            <text class="band-label" x="44" y="370">TARGET WAL + WRITERSTATE</text>
-            <text class="node-title" x="70" y="406">Target WAL magic 3</text>
+            <text class="band-label" x="44" y="370">INDEX TABLE WAL + WRITERSTATE</text>
+            <text class="node-title" x="70" y="406">Index Table WAL magic 3</text>
             <rect class="byte byte-control" x="250" y="386" width="110" height="42"></rect>
             <rect class="byte byte-metadata" x="360" y="386" width="280" height="42"></rect>
             <rect class="byte byte-source" x="640" y="386" width="230" height="42"></rect>
             <rect class="byte byte-index" x="870" y="386" width="388" height="42"></rect>
             <text class="byte-label" x="305" y="407">magic 3</text>
             <text class="byte-label" x="500" y="407">full WriterKey</text>
-            <text class="byte-label" x="755" y="407">sequence int64</text>
+            <text class="byte-label" x="755" y="407">writer progress int64</text>
             <text class="byte-label" x="1064" y="407">KV effect in same batch</text>
-            <text class="node-title" x="70" y="470">Full V1 snapshot</text>
+            <text class="node-title" x="70" y="470">Complete cumulative-progress snapshot</text>
             <rect class="byte byte-control" x="250" y="448" width="180" height="32"></rect>
             <rect class="byte byte-metadata" x="430" y="448" width="360" height="32"></rect>
             <rect class="byte byte-source" x="790" y="448" width="260" height="32"></rect>
             <rect class="byte byte-index" x="1050" y="448" width="208" height="32"></rect>
             <text class="byte-label" x="340" y="464">protocol version</text>
             <text class="byte-label" x="610" y="464">WriterKey</text>
-            <text class="byte-label" x="920" y="464">latest sequence</text>
-            <text class="byte-label" x="1154" y="464">target offset</text>
+            <text class="byte-label" x="920" y="464">latest progress</text>
+            <text class="byte-label" x="1154" y="464">WAL offset</text>
 
             <rect class="band" x="24" y="512" width="1352" height="180"></rect>
             <text class="band-label" x="44" y="538">COMPATIBILITY BOUNDARY</text>
             <rect class="box source" x="74" y="566" width="270" height="84"></rect>
             <text class="node-title" x="96" y="594">Ordinary KV table</text>
-            <text class="node-sub mono" x="96" y="618">property absent → V0_COMPACT</text>
+            <text class="node-sub mono" x="96" y="618">property absent → contiguous batch sequence</text>
             <text class="node-sub" x="96" y="638">existing bytes and behavior unchanged</text>
             <rect class="box index" x="398" y="566" width="270" height="84"></rect>
             <text class="node-title" x="420" y="594">Internal Index Table</text>
-            <text class="node-sub mono" x="420" y="618">property = 1 → V1_FENCED</text>
-            <text class="node-sub" x="420" y="638">no runtime inference from table.type</text>
+            <text class="node-sub mono" x="420" y="618">property = 1 → cumulative progress</text>
+            <text class="node-sub" x="420" y="638">not inferred from index identity</text>
             <rect class="box metadata" x="722" y="566" width="270" height="84"></rect>
             <text class="node-title" x="744" y="594">Log Table</text>
             <text class="node-sub mono" x="744" y="618">KV property rejected</text>
@@ -1181,16 +1181,16 @@
             <text class="node-title" x="1068" y="594">Not present in final V2</text>
             <text class="node-sub mono crossed" x="1068" y="618">__source_offset</text>
             <text class="node-sub mono crossed" x="1182" y="618">__index_deleted</text>
-            <text class="node-sub" x="1068" y="638">physical DELETE + WriterState fence</text>
+            <text class="node-sub" x="1068" y="638">physical DELETE + WriterState update</text>
           </svg>
         </div>
       </div>
 
       <div class="contract-strip">
-        <div class="contract"><strong>TABLE_BOUND_PROTOCOL</strong><span>A missing property resolves strictly to V0; only system-derived Index Tables explicitly write version 1.</span></div>
-        <div class="contract"><strong>API_IS_TRANSPORT</strong><span>PutKv API v2 transports V1 bytes and never selects or downgrades the table protocol.</span></div>
+        <div class="contract"><strong>TABLE_BOUND_MODE</strong><span>A missing property selects contiguous batch sequences; system-derived Index Tables explicitly set value 1.</span></div>
+        <div class="contract"><strong>API_IS_TRANSPORT</strong><span>PutKv API v2 transports cumulative-progress batches and never selects or downgrades the table mode.</span></div>
         <div class="contract"><strong>SHORT_VALUE_GUARD</strong><span>Java and native filters require at least 10 bytes before reading the 8-byte tag.</span></div>
-        <div class="contract"><strong>NO_DOWNGRADE_AFTER_V1</strong><span>Once V1 state exists, binaries that cannot read the new formats cannot be used.</span></div>
+        <div class="contract"><strong>NO_FORMAT_DOWNGRADE</strong><span>Once cumulative-progress state exists, binaries that cannot read its formats cannot be used.</span></div>
       </div>
     </section>
 
@@ -1198,7 +1198,7 @@
       <span><code>IndexReplicator</code> window/progress</span>
       <span><code>IndexAccumulator</code> admission/accounting</span>
       <span><code>IndexSender</code> routing/retry</span>
-      <span><code>KvTablet + WriterStateManager</code> target fence</span>
+      <span><code>KvTablet + WriterStateManager</code> Index Table WriterState</span>
       <span><code>IndexSourceReader</code> remote/local handoff</span>
       <span><code>PartitionTombstone</code> metadata/filtering</span>
       <span><code>SecondaryIndexLookuper</code> dedup/recheck</span>
@@ -1223,7 +1223,7 @@
 
     const pipelineScenarios = {
       normal: {
-        window: "source range [100,120), sequence = 120",
+        window: "main-table WAL range [100,120), writer progress = 120",
         writerKey: "WriterKey = (high=0, low=3)",
         mutationA: "B0  UPSERT",
         mutationB: "B2  UPSERT",
@@ -1232,8 +1232,8 @@
         pendingWidth: 62,
         target0: "fresh: E=120 > last=96",
         target2: "fresh: E=120 > last=96",
-        target2Effect: "physical mutation + durable fence",
-        target2Ack: "ACK after target HW",
+        target2Effect: "physical mutation + durable WriterState",
+        target2Ack: "ACK after Index Table HW",
         completion: "pendingBatchCount: 2 → 0",
         progress: "pushedOffset[index] = 120",
         watermark: "sync/all watermarks = 120",
@@ -1242,7 +1242,7 @@
         targetState: "ok"
       },
       update: {
-        window: "source range [120,148), sequence = 148",
+        window: "main-table WAL range [120,148), writer progress = 148",
         writerKey: "WriterKey = (high=0, low=3)",
         mutationA: "B0  DELETE old A",
         mutationB: "B2  UPSERT new B",
@@ -1251,8 +1251,8 @@
         pendingWidth: 82,
         target0: "fresh physical DELETE(A, PK)",
         target2: "fresh physical UPSERT(B, PK)",
-        target2Effect: "same WriterKey and sequence = 148",
-        target2Ack: "both effects wait for target HW",
+        target2Effect: "same WriterKey and writer progress = 148",
+        target2Ack: "both effects wait for Index Table HW",
         completion: "pendingBatchCount: 2 → 0",
         progress: "pushedOffset[index] = 148",
         watermark: "sync/all watermarks = 148",
@@ -1261,7 +1261,7 @@
         targetState: "ok"
       },
       reject: {
-        window: "source range [100,120), sequence = 120",
+        window: "main-table WAL range [100,120), writer progress = 120",
         writerKey: "WriterKey = (high=0, low=3)",
         mutationA: "B0  UPSERT staged",
         mutationB: "B2  UPSERT staged",
@@ -1271,7 +1271,7 @@
         target0: "not visible to sender",
         target2: "not visible to sender",
         target2Effect: "window retired and rebuilt after backoff",
-        target2Ack: "no RPC / no target side effect",
+        target2Ack: "no RPC / no Index Table write",
         completion: "pendingBatchCount never published",
         progress: "pushedOffset[index] remains 100",
         watermark: "sync/all watermarks remain 100",
@@ -1280,14 +1280,14 @@
         targetState: "muted"
       },
       retry: {
-        window: "source range [100,120), sequence = 120",
+        window: "main-table WAL range [100,120), writer progress = 120",
         writerKey: "WriterKey = (high=0, low=3)",
         mutationA: "B0  UPSERT",
         mutationB: "B2  UPSERT retained",
         admission: "ADMITTED: payload retained through retry",
         pending: "44 KB retained until terminal ack",
         pendingWidth: 62,
-        target0: "committed at target HW",
+        target0: "committed at Index Table HW",
         target2: "leader moved / timeout → retry",
         target2Effect: "rediscover leader; same records bytes",
         target2Ack: "no progress until deterministic response",
@@ -1370,27 +1370,27 @@
       });
     });
 
-    function renderFencing(order) {
-      document.querySelectorAll("[data-fence-order]").forEach((button) => {
-        button.classList.toggle("active", button.dataset.fenceOrder === order);
+    function renderProgressOrder(order) {
+      document.querySelectorAll("[data-progress-order]").forEach((button) => {
+        button.classList.toggle("active", button.dataset.progressOrder === order);
       });
       const newFirst = order === "new-first";
-      setText("fenceOldOrder", newFirst ? "2" : "1");
-      setText("fenceNewOrder", newFirst ? "1" : "2");
-      setText("fenceNetworkText", newFirst ? "arrival order: 160, then 120" : "arrival order: 120, then 160");
-      setText("fenceFirstDecisionTitle", newFirst ? "receive E=160: FRESH" : "receive E=120: FRESH");
-      setText("fenceFirstDecisionBody", newFirst ? "160 > unknown → apply KV + persist last=160" : "120 > unknown → apply prefix and persist last=120");
-      setText("fenceFirstDecisionFoot", newFirst ? "target WAL offset T160 gates response" : "target WAL offset T120 gates response");
-      setText("fenceSecondDecisionTitle", newFirst ? "receive E=120: STALE" : "receive E=160: FRESH");
-      setText("fenceSecondDecisionBody", newFirst ? "120 ≤ 160 → no decode / KV / WAL append" : "160 > 120 → apply larger prefix and persist last=160");
-      setText("fenceSecondDecisionFoot", newFirst ? "success waits until target HW > T160" : "target WAL offset T160 supersedes T120");
-      setText("fenceFinalState", newFirst ? "WriterState: unknown → 160" : "WriterState: unknown → 120 → 160");
-      setBoxState(document.getElementById("fenceFirstDecisionBox"), "ok");
-      setBoxState(document.getElementById("fenceSecondDecisionBox"), newFirst ? "error" : "ok");
+      setText("progressOldOrder", newFirst ? "2" : "1");
+      setText("progressNewOrder", newFirst ? "1" : "2");
+      setText("progressNetworkText", newFirst ? "arrival order: 160, then 120" : "arrival order: 120, then 160");
+      setText("progressFirstDecisionTitle", newFirst ? "receive E=160: FRESH" : "receive E=120: FRESH");
+      setText("progressFirstDecisionBody", newFirst ? "160 > unknown → apply KV + persist progress=160" : "120 > unknown → apply prefix and persist progress=120");
+      setText("progressFirstDecisionFoot", newFirst ? "Index Table WAL offset T160 gates response" : "Index Table WAL offset T120 gates response");
+      setText("progressSecondDecisionTitle", newFirst ? "receive E=120: STALE" : "receive E=160: FRESH");
+      setText("progressSecondDecisionBody", newFirst ? "120 ≤ 160 → no decode / KV / WAL append" : "160 > 120 → apply larger prefix and persist progress=160");
+      setText("progressSecondDecisionFoot", newFirst ? "success waits until Index Table HW > T160" : "Index Table WAL offset T160 replaces T120");
+      setText("progressFinalState", newFirst ? "WriterState: unknown → 160" : "WriterState: unknown → 120 → 160");
+      setBoxState(document.getElementById("progressFirstDecisionBox"), "ok");
+      setBoxState(document.getElementById("progressSecondDecisionBox"), newFirst ? "error" : "ok");
     }
 
-    document.querySelectorAll("[data-fence-order]").forEach((button) => {
-      button.addEventListener("click", () => renderFencing(button.dataset.fenceOrder));
+    document.querySelectorAll("[data-progress-order]").forEach((button) => {
+      button.addEventListener("click", () => renderProgressOrder(button.dataset.progressOrder));
     });
 
     function renderRecovery(mode) {
@@ -1403,17 +1403,17 @@
       const targetGap = mode === "target-gap";
       setText("sourceSnapshotText", missingProgress ? "indexPushedOffset = MISSING" : "indexPushedOffset = 80");
       setText("sourceProgressGateText", missingProgress ? "progress invalid" : "progress valid");
-      setText("sourceProgressGateSub", missingProgress ? "indexed snapshot cannot prove start" : "non-negative and present");
+      setText("sourceProgressGateSub", missingProgress ? "snapshot is missing indexPushedOffset" : "non-negative and present");
       setText("remoteWalText", sourceGap ? "[80,119) then GAP" : "[80,128)");
-      setText("sourceCoverageTitle", missingProgress || sourceGap ? "source coverage not proven" : "continuous source coverage");
+      setText("sourceCoverageTitle", missingProgress || sourceGap ? "main-table WAL range incomplete" : "main-table WAL range complete");
       setText("sourceCoverageText", missingProgress ? "no trustworthy replay start" : sourceGap ? "required [119,128) missing" : "[80,176) proven");
-      setText("sourceResultTitle", missingProgress || sourceGap ? "SOURCE LEADERSHIP REFUSED" : "SOURCE LEADER READY");
+      setText("sourceResultTitle", missingProgress || sourceGap ? "MAIN-TABLE LEADERSHIP REFUSED" : "MAIN-TABLE LEADER READY");
       setText("sourceResultText", missingProgress ? "never substitute local logStartOffset" : sourceGap ? "never skip to local offset 128" : "replay starts exactly at 80");
-      setText("targetWalText", targetGap ? "KV [420,512), state [396,477) then GAP" : "KV coverage [420,512) + state coverage [396,512)");
-      setText("targetCoverageTitle", targetGap ? "joint coverage not proven" : "joint coverage proven");
-      setText("targetCoverageText", targetGap ? "WriterState cannot reach recovery end" : "replay KV and WriterState to the same target frontier");
+      setText("targetWalText", targetGap ? "KV [420,512), WriterState [396,477) then GAP" : "KV [420,512) + WriterState [396,512)");
+      setText("targetCoverageTitle", targetGap ? "required WAL ranges incomplete" : "required WAL ranges complete");
+      setText("targetCoverageText", targetGap ? "WriterState WAL stops before offset 512" : "replay KV and WriterState to the same Index Table WAL end offset");
       setText("targetResultTitle", targetGap ? "INDEX LEADERSHIP REFUSED" : "INDEX LEADER READY");
-      setText("targetResultText", targetGap ? "no log-and-continue fallback" : "KV and fence state end at 512");
+      setText("targetResultText", targetGap ? "no log-and-continue fallback" : "KV and WriterState end at 512");
 
       setBoxState(document.getElementById("sourceSnapshotBox"), missingProgress ? "error" : "ok");
       setBoxState(document.getElementById("sourceProgressGate"), missingProgress ? "error" : "ok");
@@ -1450,7 +1450,7 @@
         cacheText: "authoritative floor/set is empty",
         cacheState: "ok",
         writeDecision: "fresh request → apply",
-        writeEffect: "KV effect + WriterState enter target WAL",
+        writeEffect: "KV effect + WriterState enter Index Table WAL",
         writeState: "ok",
         queryDecision: "emit scanned candidates",
         queryEffect: "no partition is known deleted",
@@ -1590,7 +1590,7 @@
     });
 
     renderPipeline();
-    renderFencing("new-first");
+    renderProgressOrder("new-first");
     renderRecovery("normal");
     renderTombstone("uninitialized");
     renderLookup("duplicate");

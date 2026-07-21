@@ -46,8 +46,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test for {@link DefaultLogRecordBatch}. */
 public class DefaultLogRecordBatchTest extends LogTestBase {
 
-    private static final WriterKey FENCED_WRITER_KEY = new WriterKey(17L, Long.MIN_VALUE | 3L);
-    private static final long FENCED_SEQUENCE = (long) Integer.MAX_VALUE + 17L;
+    private static final WriterKey PROGRESS_WRITER_KEY = new WriterKey(17L, Long.MIN_VALUE | 3L);
+    private static final long WRITER_PROGRESS = (long) Integer.MAX_VALUE + 17L;
 
     @ParameterizedTest
     @ValueSource(bytes = {LOG_MAGIC_VALUE_V0, LOG_MAGIC_VALUE_V1, LOG_MAGIC_VALUE_V2})
@@ -56,9 +56,8 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
         assertThat(batch.writerId()).isEqualTo(7L);
         assertThat(batch.batchSequence()).isEqualTo(Integer.MAX_VALUE);
         assertThat(batch.idempotenceProtocolVersion()).isZero();
-        assertThatThrownBy(batch::fencedWriterKey)
-                .isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(batch::fencedSequence).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::writerKey).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(batch::writerProgress).isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
@@ -74,64 +73,64 @@ public class DefaultLogRecordBatchTest extends LogTestBase {
     }
 
     @Test
-    void testV3WriterKeyAndLongSequenceSurviveMemoryRoundTrip() throws Exception {
+    void testV3WriterKeyAndLongProgressSurviveMemoryRoundTrip() throws Exception {
         MemoryLogRecordsIndexedBuilder builder =
-                MemoryLogRecordsIndexedBuilder.fencedBuilder(
+                MemoryLogRecordsIndexedBuilder.progressBuilder(
                         schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
-        builder.setFencedWriterState(FENCED_WRITER_KEY, FENCED_SEQUENCE);
+        builder.setWriterProgress(PROGRESS_WRITER_KEY, WRITER_PROGRESS);
 
         LogRecordBatch batch =
                 MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
         assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
         assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
-        assertThat(batch.fencedWriterKey()).isEqualTo(FENCED_WRITER_KEY);
-        assertThat(batch.fencedSequence()).isEqualTo(FENCED_SEQUENCE);
+        assertThat(batch.writerKey()).isEqualTo(PROGRESS_WRITER_KEY);
+        assertThat(batch.writerProgress()).isEqualTo(WRITER_PROGRESS);
         assertThatThrownBy(batch::writerId).isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(batch::batchSequence).isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
-    void testRowBuilderRewritesBuiltHeaderAfterFencedStateChanges() throws Exception {
+    void testRowBuilderRewritesBuiltHeaderAfterProgressChanges() throws Exception {
         MemoryLogRecordsIndexedBuilder builder =
-                MemoryLogRecordsIndexedBuilder.fencedBuilder(
+                MemoryLogRecordsIndexedBuilder.progressBuilder(
                         schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
-        builder.setFencedWriterState(FENCED_WRITER_KEY, FENCED_SEQUENCE);
+        builder.setWriterProgress(PROGRESS_WRITER_KEY, WRITER_PROGRESS);
         LogRecordBatch first =
                 MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
         long firstChecksum = first.checksum();
 
         WriterKey replacementKey = new WriterKey(-9L, 27L);
-        long replacementSequence = Long.MAX_VALUE;
-        builder.setFencedWriterState(replacementKey, replacementSequence);
+        long replacementProgress = Long.MAX_VALUE;
+        builder.setWriterProgress(replacementKey, replacementProgress);
         LogRecordBatch rebuilt =
                 MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
 
-        assertThat(rebuilt.fencedWriterKey()).isEqualTo(replacementKey);
-        assertThat(rebuilt.fencedSequence()).isEqualTo(replacementSequence);
+        assertThat(rebuilt.writerKey()).isEqualTo(replacementKey);
+        assertThat(rebuilt.writerProgress()).isEqualTo(replacementProgress);
         assertThat(rebuilt.checksum()).isNotEqualTo(firstChecksum);
         rebuilt.ensureValid();
     }
 
     @Test
-    void testV3RequiresWriterKeyAndAcceptsLongMaxSequence() throws Exception {
+    void testV3RequiresWriterKeyAndAcceptsLongMaxProgress() throws Exception {
         MemoryLogRecordsCompactedBuilder missingKeyBuilder =
-                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                MemoryLogRecordsCompactedBuilder.progressBuilder(
                         schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
         assertThatThrownBy(missingKeyBuilder::build)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("writer key");
 
-        MemoryLogRecordsCompactedBuilder maxSequenceBuilder =
-                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+        MemoryLogRecordsCompactedBuilder maxProgressBuilder =
+                MemoryLogRecordsCompactedBuilder.progressBuilder(
                         schemaId, Integer.MAX_VALUE, new UnmanagedPagedOutputView(100), false);
-        maxSequenceBuilder.setFencedWriterState(FENCED_WRITER_KEY, Long.MAX_VALUE);
+        maxProgressBuilder.setWriterProgress(PROGRESS_WRITER_KEY, Long.MAX_VALUE);
         LogRecordBatch batch =
-                MemoryLogRecords.pointToBytesView(maxSequenceBuilder.build())
+                MemoryLogRecords.pointToBytesView(maxProgressBuilder.build())
                         .batches()
                         .iterator()
                         .next();
-        assertThat(batch.fencedSequence()).isEqualTo(Long.MAX_VALUE);
-        assertThatThrownBy(() -> maxSequenceBuilder.setFencedWriterState(FENCED_WRITER_KEY, -1L))
+        assertThat(batch.writerProgress()).isEqualTo(Long.MAX_VALUE);
+        assertThatThrownBy(() -> maxProgressBuilder.setWriterProgress(PROGRESS_WRITER_KEY, -1L))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 

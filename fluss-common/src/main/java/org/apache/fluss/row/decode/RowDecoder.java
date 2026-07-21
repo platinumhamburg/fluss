@@ -40,8 +40,6 @@ public interface RowDecoder {
             return new CompactedRowDecoder(fieldDataTypes);
         } else if (kvFormat == KvFormat.INDEXED) {
             return new IndexedRowDecoder(fieldDataTypes);
-        } else if (kvFormat == KvFormat.ALIGNED) {
-            return new AlignedRowDecoder(fieldDataTypes);
         } else {
             throw new IllegalArgumentException("Unsupported kv format: " + kvFormat);
         }

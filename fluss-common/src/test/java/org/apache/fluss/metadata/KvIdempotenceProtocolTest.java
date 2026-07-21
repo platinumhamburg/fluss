@@ -27,8 +27,10 @@ class KvIdempotenceProtocolTest {
 
     @Test
     void testSupportedVersionsResolveExactly() {
-        assertThat(KvIdempotenceProtocol.forVersion(0)).isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
-        assertThat(KvIdempotenceProtocol.forVersion(1)).isEqualTo(KvIdempotenceProtocol.V1_FENCED);
+        assertThat(KvIdempotenceProtocol.forVersion(0))
+                .isEqualTo(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
+        assertThat(KvIdempotenceProtocol.forVersion(1))
+                .isEqualTo(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
     }
 
     @Test

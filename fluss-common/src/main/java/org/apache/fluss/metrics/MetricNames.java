@@ -142,8 +142,8 @@ public class MetricNames {
     public static final String INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS = "indexPushOldestInFlightAgeMs";
     public static final String INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT =
             "indexReplicationFailedSourceBucketCount";
-    public static final String INDEX_PUSH_STALE_V1_BATCHES_RATE =
-            "indexPushStaleV1BatchesPerSecond";
+    public static final String INDEX_PUSH_STALE_PROGRESS_BATCHES_RATE =
+            "indexPushStaleProgressBatchesPerSecond";
     public static final String INDEX_WRITER_STATE_ENTRIES = "indexWriterStateEntries";
     public static final String INDEX_WRITER_STATE_SNAPSHOT_BYTES = "indexWriterStateSnapshotBytes";
     public static final String INDEX_SOURCE_REMOTE_READ_BYTES_RATE =

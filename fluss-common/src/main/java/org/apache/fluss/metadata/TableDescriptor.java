@@ -181,13 +181,9 @@ public final class TableDescriptor implements Serializable {
                 : ChangelogImage.fromString(v);
     }
 
-    /**
-     * Returns {@code true} when this descriptor is for a system-managed Index Table (i.e. {@link
-     * ConfigOptions#TABLE_TYPE} is {@link TableType#INDEX_TABLE}).
-     */
+    /** Returns {@code true} when this descriptor carries the main-table link of an Index Table. */
     public boolean isIndexTable() {
-        String v = properties.get(ConfigOptions.TABLE_TYPE.key());
-        return v != null && TableType.INDEX_TABLE.name().equals(v.toUpperCase());
+        return properties.containsKey(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID.key());
     }
 
     /** Returns the bucket key of the table, empty if no bucket key is set. */

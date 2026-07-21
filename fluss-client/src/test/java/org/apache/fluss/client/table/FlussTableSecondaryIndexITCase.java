@@ -64,8 +64,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Integration tests for secondary index lookup on {@link FlussTable}, covering non-partitioned and
- * partitioned scenarios. Migrated from V1 secondary index tests to V2 API patterns.
+ * Integration tests for secondary index lookup, covering non-partitioned and partitioned tables.
  */
 class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
 
@@ -168,8 +167,8 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             upsertWriter.upsert(row(5, "Eve", "eve@example.com"));
             upsertWriter.flush();
 
-            Lookuper nameLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
-            Lookuper emailLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_email");
+            Lookuper nameLookuper = table.getSecondaryIndexLookuper("idx_name");
+            Lookuper emailLookuper = table.getSecondaryIndexLookuper("idx_email");
 
             // Wait until name index for "Alice" is visible.
             waitUntil(
@@ -277,8 +276,8 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             upsertWriter.upsert(row(4, "Diana", "diana@example.com", "2024"));
             upsertWriter.flush();
 
-            Lookuper nameLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
-            Lookuper emailLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_email");
+            Lookuper nameLookuper = table.getSecondaryIndexLookuper("idx_name");
+            Lookuper emailLookuper = table.getSecondaryIndexLookuper("idx_email");
 
             // Wait for name index to become visible.
             waitUntil(
@@ -401,8 +400,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                 Table table = recreatedConnection.getTable(tablePath);
                 Table indexTable = recreatedConnection.getTable(indexTablePath)) {
             Lookuper rawIndexLookuper = indexTable.newLookup().lookupBy("name").createLookuper();
-            Lookuper secondaryIndexLookuper =
-                    ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
+            Lookuper secondaryIndexLookuper = table.getSecondaryIndexLookuper("idx_name");
 
             UpsertWriter recreatedPartitionWriter = table.newUpsert().createWriter();
             recreatedPartitionWriter.upsert(row(1, "Alice", "2024", "new"));
@@ -496,8 +494,8 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             upsertWriter.upsert(row(3, "Hank", "hank@example.com"));
             upsertWriter.flush();
 
-            Lookuper nameLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
-            Lookuper emailLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_email");
+            Lookuper nameLookuper = table.getSecondaryIndexLookuper("idx_name");
+            Lookuper emailLookuper = table.getSecondaryIndexLookuper("idx_email");
 
             // Wait for name index to become visible.
             waitUntil(
@@ -587,8 +585,8 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                 upsertWriter.flush();
             }
 
-            Lookuper nameLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
-            Lookuper emailLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_email");
+            Lookuper nameLookuper = table.getSecondaryIndexLookuper("idx_name");
+            Lookuper emailLookuper = table.getSecondaryIndexLookuper("idx_email");
 
             // generateRandomTestData yields a unique id, name and email for every row, so each
             // secondary-index lookup must resolve to exactly one row. Verifying *all* rows (not a
@@ -671,8 +669,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             }
             upsertWriter.flush();
 
-            Lookuper indexLookuper =
-                    ((FlussTable) table).getSecondaryIndexLookuper("idx_product_id");
+            Lookuper indexLookuper = table.getSecondaryIndexLookuper("idx_product_id");
 
             // Wait for all entries to become visible
             for (int i = 1; i <= 15; i++) {
@@ -719,7 +716,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             writer.upsert(row(1, orderId, 100));
             writer.flush();
 
-            Lookuper indexLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_order_id");
+            Lookuper indexLookuper = table.getSecondaryIndexLookuper("idx_order_id");
             waitUntil(
                     () -> !indexLookuper.lookup(row(orderId)).get().getRowList().isEmpty(),
                     INDEX_VISIBILITY_TIMEOUT,
@@ -761,7 +758,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             writer.upsert(row(1, price, 100));
             writer.flush();
 
-            Lookuper indexLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_price");
+            Lookuper indexLookuper = table.getSecondaryIndexLookuper("idx_price");
             waitUntil(
                     () ->
                             !indexLookuper
@@ -809,8 +806,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             writer.upsert(row(1, eventTime, 100));
             writer.flush();
 
-            Lookuper indexLookuper =
-                    ((FlussTable) table).getSecondaryIndexLookuper("idx_event_time");
+            Lookuper indexLookuper = table.getSecondaryIndexLookuper("idx_event_time");
             waitUntil(
                     () -> !indexLookuper.lookup(row(eventTime)).get().getRowList().isEmpty(),
                     INDEX_VISIBILITY_TIMEOUT,
@@ -852,7 +848,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             writer.upsert(row(3, true, 300));
             writer.flush();
 
-            Lookuper indexLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_active");
+            Lookuper indexLookuper = table.getSecondaryIndexLookuper("idx_active");
             // A boolean index is low-cardinality: lookup(true) must return both true rows.
             waitUntil(
                     () -> indexLookuper.lookup(row(true)).get().getRowList().size() == 2,
@@ -898,7 +894,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             assertThatThrownBy(() -> table.newUpsert().partialUpdate("id", "note").createWriter())
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining(
-                            "Partial Update requires all columns except primary key to be nullable")
+                            "Partial Update requires all columns except primary key and auto-increment columns to be nullable")
                     .hasMessageContaining("user_id");
         }
     }
@@ -968,8 +964,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             }
 
             // Verify secondary index lookup
-            Lookuper indexLookuper =
-                    ((FlussTable) table).getSecondaryIndexLookuper("idx_product_id");
+            Lookuper indexLookuper = table.getSecondaryIndexLookuper("idx_product_id");
 
             for (int i = 1; i <= 15; i++) {
                 final int pid = i;
@@ -1032,7 +1027,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             assertThat(pkLookuper.lookup(row(3)).get().getRowList()).hasSize(1);
 
             // Verify the valid row IS indexed
-            Lookuper nameLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
+            Lookuper nameLookuper = table.getSecondaryIndexLookuper("idx_name");
             waitUntil(
                     () -> !nameLookuper.lookup(row("ValidName")).get().getRowList().isEmpty(),
                     INDEX_VISIBILITY_TIMEOUT,
@@ -1069,7 +1064,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             upsertWriter.upsert(row(1, writtenPayload));
             upsertWriter.flush();
 
-            Lookuper lookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_payload");
+            Lookuper lookuper = table.getSecondaryIndexLookuper("idx_payload");
             waitUntil(
                     () -> !lookuper.lookup(row(lookupPayload)).get().getRowList().isEmpty(),
                     INDEX_VISIBILITY_TIMEOUT,
@@ -1113,7 +1108,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
             upsertWriter.upsert(row(1, "Alice", "alice@example.com"));
             upsertWriter.flush();
 
-            Lookuper nameLookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
+            Lookuper nameLookuper = table.getSecondaryIndexLookuper("idx_name");
 
             // Verify index lookup works
             waitUntil(

@@ -162,13 +162,13 @@ class ArrowWalBuilderTest {
     }
 
     @Test
-    void testFencedWriterStateRoundTripsThroughEveryWalBuilder() throws Exception {
+    void testWriterProgressRoundTripsThroughEveryWalBuilder() throws Exception {
         WriterKey writerKey = new WriterKey(17L, Long.MIN_VALUE | 3L);
-        long sequence = (long) Integer.MAX_VALUE + 17L;
+        long progress = (long) Integer.MAX_VALUE + 17L;
         TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
 
         WalBuilder arrowBuilder =
-                ArrowWalBuilder.fencedBuilder(
+                ArrowWalBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID,
                         arrowWriterProvider.getOrCreateWriter(
                                 tableBucket.getTableId(),
@@ -177,39 +177,39 @@ class ArrowWalBuilderTest {
                                 DATA1_ROW_TYPE,
                                 DEFAULT_COMPRESSION),
                         new TestingMemorySegmentPool(1024));
-        assertFencedBatch(arrowBuilder, writerKey, sequence);
+        assertProgressBatch(arrowBuilder, writerKey, progress);
 
         WalBuilder compactedBuilder =
-                CompactedWalBuilder.fencedBuilder(
+                CompactedWalBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID, DATA1_ROW_TYPE, new TestingMemorySegmentPool(1024));
-        assertFencedBatch(compactedBuilder, writerKey, sequence);
+        assertProgressBatch(compactedBuilder, writerKey, progress);
 
         WalBuilder indexBuilder =
-                IndexWalBuilder.fencedBuilder(
+                IndexWalBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID, new TestingMemorySegmentPool(1024));
-        assertFencedBatch(indexBuilder, writerKey, sequence);
+        assertProgressBatch(indexBuilder, writerKey, progress);
     }
 
     @Test
-    void testRowWalBuildersRewriteBuiltHeaderAfterFencedStateChanges() throws Exception {
+    void testRowWalBuildersRewriteBuiltHeaderAfterProgressChanges() throws Exception {
         List<WalBuilder> builders =
                 List.of(
-                        CompactedWalBuilder.fencedBuilder(
+                        CompactedWalBuilder.progressBuilder(
                                 DEFAULT_SCHEMA_ID,
                                 DATA1_ROW_TYPE,
                                 new TestingMemorySegmentPool(1024)),
-                        IndexWalBuilder.fencedBuilder(
+                        IndexWalBuilder.progressBuilder(
                                 DEFAULT_SCHEMA_ID, new TestingMemorySegmentPool(1024)));
         for (WalBuilder builder : builders) {
-            builder.setFencedWriterState(new WriterKey(1L, 2L), 3L);
+            builder.setWriterProgress(new WriterKey(1L, 2L), 3L);
             long originalChecksum = builder.build().batches().iterator().next().checksum();
 
             WriterKey replacementKey = new WriterKey(4L, 5L);
-            builder.setFencedWriterState(replacementKey, Long.MAX_VALUE);
+            builder.setWriterProgress(replacementKey, Long.MAX_VALUE);
             LogRecordBatch rebuilt = builder.build().batches().iterator().next();
 
-            assertThat(rebuilt.fencedWriterKey()).isEqualTo(replacementKey);
-            assertThat(rebuilt.fencedSequence()).isEqualTo(Long.MAX_VALUE);
+            assertThat(rebuilt.writerKey()).isEqualTo(replacementKey);
+            assertThat(rebuilt.writerProgress()).isEqualTo(Long.MAX_VALUE);
             assertThat(rebuilt.checksum()).isNotEqualTo(originalChecksum);
             rebuilt.ensureValid();
             builder.deallocate();
@@ -217,13 +217,13 @@ class ArrowWalBuilderTest {
     }
 
     @Test
-    void testNonEmptyFencedBatchesRoundTripThroughEveryWalBuilder() throws Exception {
+    void testNonEmptyProgressBatchesRoundTripThroughEveryWalBuilder() throws Exception {
         WriterKey writerKey = new WriterKey(31L, Long.MIN_VALUE | 9L);
-        long sequence = (long) Integer.MAX_VALUE + 31L;
+        long progress = (long) Integer.MAX_VALUE + 31L;
         TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
 
         WalBuilder arrowBuilder =
-                ArrowWalBuilder.fencedBuilder(
+                ArrowWalBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID,
                         arrowWriterProvider.getOrCreateWriter(
                                 tableBucket.getTableId(),
@@ -233,7 +233,7 @@ class ArrowWalBuilderTest {
                                 DEFAULT_COMPRESSION),
                         new TestingMemorySegmentPool(1024));
         arrowBuilder.append(ChangeType.INSERT, row(1, "arrow"));
-        MemoryLogRecords arrowRecords = buildFenced(arrowBuilder, writerKey, sequence);
+        MemoryLogRecords arrowRecords = buildProgress(arrowBuilder, writerKey, progress);
         assertLogRecordsEqualsWithRowKind(
                 DATA1_ROW_TYPE,
                 arrowRecords,
@@ -241,10 +241,10 @@ class ArrowWalBuilderTest {
         arrowBuilder.deallocate();
 
         WalBuilder compactedBuilder =
-                CompactedWalBuilder.fencedBuilder(
+                CompactedWalBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID, DATA1_ROW_TYPE, new TestingMemorySegmentPool(1024));
         compactedBuilder.append(ChangeType.UPDATE_AFTER, row(2, "compacted"));
-        MemoryLogRecords compactedRecords = buildFenced(compactedBuilder, writerKey, sequence);
+        MemoryLogRecords compactedRecords = buildProgress(compactedBuilder, writerKey, progress);
         try (LogRecordReadContext context =
                         LogRecordReadContext.createCompactedRowReadContext(
                                 DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID);
@@ -255,11 +255,11 @@ class ArrowWalBuilderTest {
         compactedBuilder.deallocate();
 
         WalBuilder indexBuilder =
-                IndexWalBuilder.fencedBuilder(
+                IndexWalBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID, new TestingMemorySegmentPool(1024));
         IndexedRow indexedRow = indexedRow(DATA1_ROW_TYPE, new Object[] {3, "indexed"});
         indexBuilder.append(ChangeType.DELETE, indexedRow);
-        MemoryLogRecords indexedRecords = buildFenced(indexBuilder, writerKey, sequence);
+        MemoryLogRecords indexedRecords = buildProgress(indexBuilder, writerKey, progress);
         try (LogRecordReadContext context =
                         LogRecordReadContext.createIndexedReadContext(
                                 DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER);
@@ -270,15 +270,15 @@ class ArrowWalBuilderTest {
         indexBuilder.deallocate();
     }
 
-    private static MemoryLogRecords buildFenced(
-            WalBuilder builder, WriterKey writerKey, long sequence) throws Exception {
-        builder.setFencedWriterState(writerKey, sequence);
+    private static MemoryLogRecords buildProgress(
+            WalBuilder builder, WriterKey writerKey, long progress) throws Exception {
+        builder.setWriterProgress(writerKey, progress);
         MemoryLogRecords records = builder.build();
         LogRecordBatch batch = records.batches().iterator().next();
         assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
         assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
-        assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
-        assertThat(batch.fencedSequence()).isEqualTo(sequence);
+        assertThat(batch.writerKey()).isEqualTo(writerKey);
+        assertThat(batch.writerProgress()).isEqualTo(progress);
         assertThat(batch.getRecordCount()).isEqualTo(1);
         batch.ensureValid();
         return records;
@@ -298,14 +298,14 @@ class ArrowWalBuilderTest {
         assertThat(records.hasNext()).isFalse();
     }
 
-    private static void assertFencedBatch(WalBuilder builder, WriterKey writerKey, long sequence)
+    private static void assertProgressBatch(WalBuilder builder, WriterKey writerKey, long progress)
             throws Exception {
-        builder.setFencedWriterState(writerKey, sequence);
+        builder.setWriterProgress(writerKey, progress);
         LogRecordBatch batch = builder.build().batches().iterator().next();
         assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
         assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
-        assertThat(batch.fencedWriterKey()).isEqualTo(writerKey);
-        assertThat(batch.fencedSequence()).isEqualTo(sequence);
+        assertThat(batch.writerKey()).isEqualTo(writerKey);
+        assertThat(batch.writerProgress()).isEqualTo(progress);
         builder.deallocate();
     }
 

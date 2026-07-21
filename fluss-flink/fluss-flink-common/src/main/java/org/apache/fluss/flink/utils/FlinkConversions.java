@@ -731,7 +731,7 @@ public class FlinkConversions {
     private static void parseSecondaryIndexes(Configuration options, Schema.Builder schemaBuilder) {
         if (options.containsKey(TABLE_LEVEL_INDEX_VISIBILITY)) {
             throw new CatalogException(
-                    "'index.visibility' is no longer supported. Use "
+                    "'index.visibility' is not a valid table property. Use "
                             + "'secondary-index.<index-name>.visibility' so each index stores its own visibility.");
         }
         Map<String, SecondaryIndexOptions> byName = new TreeMap<>();

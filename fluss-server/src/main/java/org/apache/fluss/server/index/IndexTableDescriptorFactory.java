@@ -24,7 +24,6 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
-import org.apache.fluss.metadata.TableType;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.IndexTableUtils;
@@ -106,10 +105,9 @@ public final class IndexTableDescriptorFactory {
         TableDescriptor.Builder b =
                 TableDescriptor.builder()
                         .schema(derivedSchema)
-                        .kvFormat(partitioned ? KvFormat.ALIGNED : KvFormat.COMPACTED)
+                        .kvFormat(KvFormat.COMPACTED)
                         .logFormat(LogFormat.COMPACTED)
                         .changelogImage(ChangelogImage.WAL)
-                        .property(ConfigOptions.TABLE_TYPE, TableType.INDEX_TABLE)
                         .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, mainTableId)
                         .property(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION, 1)
                         .property(

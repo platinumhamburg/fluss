@@ -33,9 +33,10 @@ import java.util.List;
  * index buckets. Only when every one of those batches has been acknowledged does the window advance
  * that index's pushed offset to {@link #windowEndOffset}.
  *
- * <p>Window boundaries may differ after failover. Correctness relies on the target WriterState
- * fence, whose sequence is this window's exclusive end offset, rather than on reproducing an
- * identical source-side trajectory.
+ * <p>Window boundaries may differ after failover. The source advances progress only after every
+ * batch in a window completes and replays from its persisted progress after recovery. Together with
+ * the target rejecting requests behind its stored writer progress, this makes different source-side
+ * window boundaries safe.
  */
 @Internal
 final class IndexWindow {

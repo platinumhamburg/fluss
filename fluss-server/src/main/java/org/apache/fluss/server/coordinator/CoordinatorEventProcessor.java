@@ -723,7 +723,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
             // Atomic table creation can surface main/index watcher events in either order.
             // Publishing from the main-table event makes initialization order-independent.
             mainTable = createdTable;
-        } else if (createdTable.isIndexTable() && createdTable.getMainTableId().isPresent()) {
+        } else if (createdTable.isIndexTable()) {
             mainTable =
                     coordinatorContext.getTableInfoById(createdTable.getMainTableId().getAsLong());
         } else {

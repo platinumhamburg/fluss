@@ -32,7 +32,7 @@ public interface KvRecordBatch {
     /** The "magic" values. */
     byte KV_MAGIC_VALUE_V0 = 0;
 
-    /** The fenced idempotence protocol magic value. */
+    /** The cumulative-progress idempotence protocol magic value. */
     byte KV_MAGIC_VALUE_V1 = 1;
 
     /** The current "magic" value. */
@@ -91,14 +91,14 @@ public interface KvRecordBatch {
         return 0;
     }
 
-    /** Returns the opaque V1 writer key. */
-    default WriterKey fencedWriterKey() {
-        throw new UnsupportedOperationException("V0 batch has no fenced WriterKey");
+    /** Returns the cumulative-progress writer key. */
+    default WriterKey writerKey() {
+        throw new UnsupportedOperationException("Contiguous-sequence batch has no WriterKey");
     }
 
-    /** Returns the V1 fenced sequence. */
-    default long fencedSequence() {
-        throw new UnsupportedOperationException("V0 batch has no fenced sequence");
+    /** Returns the cumulative writer progress. */
+    default long writerProgress() {
+        throw new UnsupportedOperationException("Contiguous-sequence batch has no writer progress");
     }
 
     /**

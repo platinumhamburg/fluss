@@ -315,7 +315,7 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
-    void adjacentUpdatePairInOneSourceBatchProducesOneFencedTargetBatch() throws Exception {
+    void adjacentUpdatePairInOneSourceBatchProducesOneProgressBatch() throws Exception {
         PollFixture fixture =
                 pollFixture(
                         5L,
@@ -331,8 +331,8 @@ public class IndexReplicatorAppendTest {
         assertThat(targetBatch).isNotNull();
         assertThat(targetBatch.window().windowEndOffset()).isEqualTo(7L);
         KvRecordBatch decoded = decode(targetBatch);
-        assertThat(decoded.fencedWriterKey()).isEqualTo(IndexWriterKey.encode(SOURCE_BUCKET));
-        assertThat(decoded.fencedSequence()).isEqualTo(7L);
+        assertThat(decoded.writerKey()).isEqualTo(IndexWriterKey.encode(SOURCE_BUCKET));
+        assertThat(decoded.writerProgress()).isEqualTo(7L);
         assertThat(decoded.getRecordCount()).isEqualTo(2);
     }
 
@@ -402,7 +402,7 @@ public class IndexReplicatorAppendTest {
         IndexBatch targetBatch = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         KvRecordBatch decoded = decode(targetBatch);
         assertThat(decoded.getRecordCount()).isEqualTo(1);
-        assertThat(decoded.fencedSequence()).isEqualTo(7L);
+        assertThat(decoded.writerProgress()).isEqualTo(7L);
         assertThat(fixture.sourceWal.readOffsets).containsExactly(6L);
     }
 
@@ -562,8 +562,8 @@ public class IndexReplicatorAppendTest {
         IndexBatch upsert = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 1));
         assertThat(delete.window()).isSameAs(upsert.window());
         assertThat(delete.window().windowEndOffset()).isEqualTo(8L);
-        assertThat(decode(delete).fencedSequence()).isEqualTo(8L);
-        assertThat(decode(upsert).fencedSequence()).isEqualTo(8L);
+        assertThat(decode(delete).writerProgress()).isEqualTo(8L);
+        assertThat(decode(upsert).writerProgress()).isEqualTo(8L);
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(6L);
         acknowledge(fixture.accumulator, delete);
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(6L);
@@ -588,9 +588,9 @@ public class IndexReplicatorAppendTest {
                 decode(smaller.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
         KvRecordBatch largerBatch =
                 decode(larger.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
-        assertThat(smallerBatch.fencedWriterKey()).isEqualTo(largerBatch.fencedWriterKey());
-        assertThat(smallerBatch.fencedSequence()).isEqualTo(6L);
-        assertThat(largerBatch.fencedSequence()).isEqualTo(7L);
+        assertThat(smallerBatch.writerKey()).isEqualTo(largerBatch.writerKey());
+        assertThat(smallerBatch.writerProgress()).isEqualTo(6L);
+        assertThat(largerBatch.writerProgress()).isEqualTo(7L);
         assertThat(largerBatch.getRecordCount()).isEqualTo(2);
     }
 

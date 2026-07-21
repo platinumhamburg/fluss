@@ -32,16 +32,16 @@ import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.DefaultLogRecordBatch;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.MemoryLogRecordsCompactedBuilder;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.aligned.AlignedRow;
-import org.apache.fluss.row.aligned.AlignedRowWriter;
+import org.apache.fluss.row.compacted.CompactedRow;
+import org.apache.fluss.row.compacted.CompactedRowWriter;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
@@ -51,16 +51,17 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
-import org.apache.fluss.server.log.FencedWriterAppendInfo;
-import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.WriterProgressAppendInfo;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestBase;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
@@ -100,9 +101,9 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     private static final long INDEX_TABLE_ID = 9200L;
     private static final long PARTITION_ID = 10L;
     private static final short SCHEMA_ID = 1;
-    private static final int FENCED_KV_CRC_OFFSET = 5;
-    private static final int FENCED_KV_SCHEMA_ID_OFFSET = 9;
-    private static final int FENCED_KV_SEQUENCE_OFFSET = 28;
+    private static final int PROGRESS_KV_CRC_OFFSET = 5;
+    private static final int PROGRESS_KV_SCHEMA_ID_OFFSET = 9;
+    private static final int PROGRESS_KV_WRITER_PROGRESS_OFFSET = 28;
 
     @Test
     void testUninitializedPartitionedIndexRejectsBeforePrewrite() throws Exception {
@@ -138,7 +139,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                                 .readValueTag(MemorySegment.wrap(encodedValue)))
                 .isEqualTo(PARTITION_ID);
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
 
         fixture.log.writerStateManager().updateMapEndOffset(1L);
         fixture.log.writerStateManager().takeSnapshot();
@@ -161,7 +162,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         byte[] key = physicalKey(physicalRow(PARTITION_ID));
         fixture.put(mutation(writerKey, 200L, physicalRow(PARTITION_ID), key));
         long staleBefore =
-                replicaManager.getServerMetricGroup().indexPushStaleV1Batches().getCount();
+                replicaManager.getServerMetricGroup().indexPushStaleProgressBatches().getCount();
         long walEndBefore = fixture.log.localLogEndOffset();
         KvPreWriteBuffer.Value valueBefore = fixture.kv.getKvPreWriteBuffer().get(Key.of(key));
 
@@ -171,7 +172,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(result.lastOffset()).isZero();
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(walEndBefore);
         assertThat(fixture.kv.getKvPreWriteBuffer().get(Key.of(key))).isEqualTo(valueBefore);
-        assertThat(replicaManager.getServerMetricGroup().indexPushStaleV1Batches().getCount())
+        assertThat(replicaManager.getServerMetricGroup().indexPushStaleProgressBatches().getCount())
                 .isEqualTo(staleBefore + 1L);
     }
 
@@ -228,8 +229,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(
                         fixture.log
                                 .writerStateManager()
-                                .lastFencedEntry(writerKey)
-                                .map(FencedWriterStateEntry::lastSequence))
+                                .lastProgressEntry(writerKey)
+                                .map(WriterProgressStateEntry::lastProgress))
                 .contains(100L);
     }
 
@@ -253,18 +254,18 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
     @Test
     void testTombstonedNegativeSequenceIsRejectedBeforeNoAppend() throws Exception {
-        Fixture fixture = createFixture("negative_sequence");
+        Fixture fixture = createFixture("negative_progress");
         publishDirect(tombstone(PARTITION_ID));
         WriterKey writerKey = writerKey(PARTITION_ID);
         KvRecordBatch invalid =
-                crcValidNegativeSequenceMutation(
+                crcValidNegativeProgressMutation(
                         writerKey, physicalRow(PARTITION_ID), PARTITION_ID);
 
-        assertThat(invalid.fencedSequence()).isEqualTo(-1L);
+        assertThat(invalid.writerProgress()).isEqualTo(-1L);
         assertThat(invalid.isValid()).isTrue();
         assertThatThrownBy(() -> fixture.put(invalid))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("sequence must be non-negative");
+                .hasMessage("writer progress must be non-negative");
 
         assertNoMutation(fixture, writerKey, 0L);
     }
@@ -298,15 +299,15 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     }
 
     @Test
-    void testMetadataUpdateRetiresFencedWriter() throws Exception {
+    void testMetadataUpdateRetiresProgressWriter() throws Exception {
         Fixture fixture = createInitializedFixture("retirement");
         WriterKey writerKey = writerKey(PARTITION_ID);
         fixture.put(mutation(writerKey, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
 
         publishThroughReplicaManager(tombstone(PARTITION_ID));
 
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
     }
 
     @Test
@@ -317,10 +318,10 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
         assertThat(fixture.replica.getKvTablet()).isNull();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
 
         publishThroughReplicaManager(tombstone(PARTITION_ID));
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
 
         // Model a follower replay that wins after publication. Promotion must catch it up against
         // the already-published authoritative baseline before accepting leader writes.
@@ -328,7 +329,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         makeLeader(fixture, INITIAL_LEADER_EPOCH + 2);
 
         assertThat(fixture.replica.getKvTablet()).isNotNull();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
     }
 
     @Test
@@ -343,7 +344,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         assertThat(fixture.replica.getKvTablet()).isNull();
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
     }
 
     @Test
@@ -356,7 +357,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         fixture.replica.appendRecordsToFollower(followerWal(liveWriter, 100L, 0L));
 
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(liveWriter)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(liveWriter)).isPresent();
     }
 
     @Test
@@ -368,7 +369,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         fixture.replica.appendRecordsToFollower(followerWal(writerKey, 100L, 0L));
 
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
     }
 
     @Test
@@ -383,8 +384,8 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         fixture.replica.appendRecordsToFollower(followerWal(malformed, 100L, 1L));
 
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(2L);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(unpartitioned)).isPresent();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(malformed)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(unpartitioned)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(malformed)).isPresent();
     }
 
     @Test
@@ -403,9 +404,9 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         assertThat(fixture.replica.getKvTablet()).isNull();
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(2L);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isEmpty();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(truncated)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(tombstoned)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(live)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(truncated)).isEmpty();
     }
 
     @Test
@@ -419,14 +420,14 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         fixture.log.writerStateManager().truncateFullyAndStartAt(0L);
         fixture.log.loadWriterSnapshot(2L);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isPresent();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(tombstoned)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(live)).isPresent();
 
         makeFollower(fixture, INITIAL_LEADER_EPOCH + 1);
 
         assertThat(fixture.replica.getKvTablet()).isNull();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isEmpty();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(tombstoned)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(live)).isPresent();
     }
 
     @ParameterizedTest
@@ -449,11 +450,12 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         assertThat(serverMetadataCache.getPartitionTombstone(MAIN_TABLE_ID))
                 .isEqualTo(tombstone(PARTITION_ID));
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(tombstoned)).isEmpty();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(live)).isPresent();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(unpartitioned)).isPresent();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(reserved)).isPresent();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(negativePartition)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(tombstoned)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(live)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(unpartitioned)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(reserved)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(negativePartition))
+                .isPresent();
     }
 
     private static Stream<Arguments> retirementKeyOrders() {
@@ -477,7 +479,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         publishThroughReplicaManager(
                 new PartitionTombstone(tombstone.getFloor(), tombstone.getExplicitSet(), 2L));
 
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
     }
 
     @Test
@@ -491,7 +493,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         assertThat(serverMetadataCache.getInitializedPartitionTombstone(MAIN_TABLE_ID))
                 .contains(PartitionTombstone.EMPTY);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isPresent();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
     }
 
     @Test
@@ -508,8 +510,9 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
 
         publishThroughReplicaManager(tombstone(PARTITION_ID));
 
-        assertThat(matching.log.writerStateManager().lastFencedEntry(matchingWriter)).isEmpty();
-        assertThat(unrelated.log.writerStateManager().lastFencedEntry(unrelatedWriter)).isPresent();
+        assertThat(matching.log.writerStateManager().lastProgressEntry(matchingWriter)).isEmpty();
+        assertThat(unrelated.log.writerStateManager().lastProgressEntry(unrelatedWriter))
+                .isPresent();
     }
 
     @Test
@@ -521,7 +524,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         CountDownLatch releaseApply = new CountDownLatch(1);
         setKvHook(
                 fixture.kv,
-                "setAfterFencedPrecheck",
+                "setAfterProgressPrecheck",
                 () -> {
                     applyHasLock.countDown();
                     awaitUnchecked(releaseApply);
@@ -547,13 +550,13 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
             retirement.get(10, TimeUnit.SECONDS);
         } finally {
             releaseApply.countDown();
-            setKvHook(fixture.kv, "setAfterFencedPrecheck", null);
+            setKvHook(fixture.kv, "setAfterProgressPrecheck", null);
             executor.shutdownNow();
         }
 
         fixture.kv.flush(Long.MAX_VALUE, ignored -> {});
         assertThat(fixture.replica.prefixLookup(key)).isEmpty();
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
     }
 
     @Test
@@ -665,15 +668,15 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         return IndexWriterKey.encode(new TableBucket(mainTableId, partitionId, 0));
     }
 
-    private static AlignedRow physicalRow(long partitionId) {
-        AlignedRow row = new AlignedRow(4);
-        AlignedRowWriter writer = new AlignedRowWriter(row);
-        writer.reset();
-        writer.writeLong(0, 7L);
-        writer.writeLong(1, 42L);
-        writer.writeString(2, fromString("2026-07-12"));
-        writer.writeLong(3, partitionId);
-        writer.complete();
+    private static CompactedRow physicalRow(long partitionId) {
+        RowType rowType = indexRowType();
+        CompactedRow row = new CompactedRow(rowType.getChildren().toArray(new DataType[0]));
+        CompactedRowWriter writer = new CompactedRowWriter(rowType.getFieldCount());
+        writer.writeLong(7L);
+        writer.writeLong(42L);
+        writer.writeString(fromString("2026-07-12"));
+        writer.writeLong(partitionId);
+        row.pointTo(writer.segment(), 0, writer.position());
         return row;
     }
 
@@ -690,48 +693,48 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     }
 
     private static KvRecordBatch mutation(
-            WriterKey writerKey, long sequence, BinaryRow row, long keyPartitionId)
+            WriterKey writerKey, long progress, BinaryRow row, long keyPartitionId)
             throws Exception {
-        return mutation(writerKey, sequence, row, physicalKey(physicalRow(keyPartitionId)));
+        return mutation(writerKey, progress, row, physicalKey(physicalRow(keyPartitionId)));
     }
 
     private static KvRecordBatch mutation(
-            WriterKey writerKey, long sequence, BinaryRow row, byte[] key) throws Exception {
-        FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
-                        SCHEMA_ID, 1024, new UnmanagedPagedOutputView(256), KvFormat.ALIGNED);
+            WriterKey writerKey, long progress, BinaryRow row, byte[] key) throws Exception {
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        SCHEMA_ID, 1024, new UnmanagedPagedOutputView(256), KvFormat.COMPACTED);
         builder.append(key, row);
-        builder.setWriterState(writerKey, sequence);
+        builder.setWriterState(writerKey, progress);
         return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
-    private static KvRecordBatch crcValidNegativeSequenceMutation(
+    private static KvRecordBatch crcValidNegativeProgressMutation(
             WriterKey writerKey, BinaryRow row, long keyPartitionId) throws Exception {
-        FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
-                        SCHEMA_ID, 1024, new UnmanagedPagedOutputView(256), KvFormat.ALIGNED);
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        SCHEMA_ID, 1024, new UnmanagedPagedOutputView(256), KvFormat.COMPACTED);
         builder.append(physicalKey(physicalRow(keyPartitionId)), row);
         builder.setWriterState(writerKey, 0L);
         ByteBuffer source = builder.build().getByteBuf().nioBuffer();
         byte[] bytes = new byte[source.remaining()];
         source.get(bytes);
         ByteBuffer littleEndian = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
-        littleEndian.putLong(FENCED_KV_SEQUENCE_OFFSET, -1L);
+        littleEndian.putLong(PROGRESS_KV_WRITER_PROGRESS_OFFSET, -1L);
         long crc =
                 Crc32C.compute(
                         bytes,
-                        FENCED_KV_SCHEMA_ID_OFFSET,
-                        bytes.length - FENCED_KV_SCHEMA_ID_OFFSET);
-        littleEndian.putInt(FENCED_KV_CRC_OFFSET, (int) crc);
+                        PROGRESS_KV_SCHEMA_ID_OFFSET,
+                        bytes.length - PROGRESS_KV_SCHEMA_ID_OFFSET);
+        littleEndian.putInt(PROGRESS_KV_CRC_OFFSET, (int) crc);
         return KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
     }
 
-    private static MemoryLogRecords followerWal(WriterKey writerKey, long sequence, long baseOffset)
+    private static MemoryLogRecords followerWal(WriterKey writerKey, long progress, long baseOffset)
             throws Exception {
         MemoryLogRecordsCompactedBuilder builder =
-                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                MemoryLogRecordsCompactedBuilder.progressBuilder(
                         SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
-        builder.setFencedWriterState(writerKey, sequence);
+        builder.setWriterProgress(writerKey, progress);
         builder.close();
         MemoryLogRecords records =
                 MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
@@ -744,11 +747,11 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         return records;
     }
 
-    private static void putWriterState(LogTablet logTablet, WriterKey writerKey, long sequence) {
-        FencedWriterAppendInfo update =
-                logTablet.writerStateManager().prepareFencedUpdate(writerKey);
-        update.append(sequence, sequence, sequence);
-        logTablet.writerStateManager().updateFenced(update);
+    private static void putWriterState(LogTablet logTablet, WriterKey writerKey, long progress) {
+        WriterProgressAppendInfo update =
+                logTablet.writerStateManager().prepareProgressUpdate(writerKey);
+        update.append(progress, progress, progress);
+        logTablet.writerStateManager().updateProgress(update);
     }
 
     private static void makeFollower(Fixture fixture, int leaderEpoch) {
@@ -803,7 +806,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
     private static void assertNoMutation(Fixture fixture, WriterKey writerKey, long logEndOffset) {
         assertThat(fixture.kv.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(logEndOffset);
-        assertThat(fixture.log.writerStateManager().lastFencedEntry(writerKey)).isEmpty();
+        assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
     }
 
     private static <T> T metricValue(TabletServerMetricGroup metrics, String name, Class<T> type) {

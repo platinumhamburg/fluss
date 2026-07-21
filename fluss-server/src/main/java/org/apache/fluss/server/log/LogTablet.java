@@ -91,7 +91,7 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 public final class LogTablet {
 
     private static final Logger LOG = LoggerFactory.getLogger(LogTablet.class);
-    private static final Predicate<WriterKey> RETAIN_ALL_FENCED_WRITERS = ignored -> true;
+    private static final Predicate<WriterKey> RETAIN_ALL_PROGRESS_WRITERS = ignored -> true;
 
     // Configured local storage root that owns this tablet, for example /data-0.
     private final File dataDir;
@@ -323,18 +323,18 @@ public final class LogTablet {
         return writerStateManager;
     }
 
-    /** Finds a committed V1 fence that dominates the supplied sequence. */
-    public Optional<FencedWriterStateEntry> findStaleFencedBatch(
-            WriterKey writerKey, long sequence) {
+    /** Finds committed WriterState which makes the supplied progress stale. */
+    public Optional<WriterProgressStateEntry> findStaleProgressBatch(
+            WriterKey writerKey, long progress) {
         synchronized (lock) {
-            return writerStateManager.findStaleFencedBatch(writerKey, sequence);
+            return writerStateManager.findStaleProgressBatch(writerKey, progress);
         }
     }
 
-    /** Retires V1 writer state while preserving the LogTablet lock boundary. */
-    public void removeFencedWriters(Predicate<WriterKey> predicate) {
+    /** Retires cumulative-progress WriterState while preserving the LogTablet lock boundary. */
+    public void removeProgressWriters(Predicate<WriterKey> predicate) {
         synchronized (lock) {
-            writerStateManager.removeFencedWriters(predicate);
+            writerStateManager.removeProgressWriters(predicate);
         }
     }
 
@@ -365,7 +365,7 @@ public final class LogTablet {
                 isChangelog,
                 clock,
                 isCleanShutdown,
-                KvIdempotenceProtocol.V0_COMPACT);
+                KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
     }
 
     public static LogTablet create(
@@ -472,22 +472,21 @@ public final class LogTablet {
      * Leader Epochs.
      */
     public LogAppendInfo appendAsLeader(MemoryLogRecords records) throws Exception {
-        return append(records, true, RETAIN_ALL_FENCED_WRITERS);
+        return append(records, true, RETAIN_ALL_PROGRESS_WRITERS);
     }
 
     /** Append this message set to the active segment of the local log without assigning offsets. */
     public LogAppendInfo appendAsFollower(MemoryLogRecords records) throws Exception {
-        return appendAsFollower(records, RETAIN_ALL_FENCED_WRITERS);
+        return appendAsFollower(records, RETAIN_ALL_PROGRESS_WRITERS);
     }
 
     /**
-     * Append this message set as a follower and retain matching V1 WriterState after the WAL
+     * Append this message set as a follower and retain matching progress WriterState after the WAL
      * append.
      */
     public LogAppendInfo appendAsFollower(
-            MemoryLogRecords records, Predicate<WriterKey> retainFencedWriterState)
-            throws Exception {
-        return append(records, false, Objects.requireNonNull(retainFencedWriterState));
+            MemoryLogRecords records, Predicate<WriterKey> retainWriterProgress) throws Exception {
+        return append(records, false, Objects.requireNonNull(retainWriterProgress));
     }
 
     /** Read messages from the local log without projection or filter. */
@@ -787,7 +786,7 @@ public final class LogTablet {
     private LogAppendInfo append(
             MemoryLogRecords records,
             boolean appendAsLeader,
-            Predicate<WriterKey> retainFencedWriterState)
+            Predicate<WriterKey> retainWriterProgress)
             throws Exception {
         LogAppendInfo appendInfo = analyzeAndValidateRecords(records);
 
@@ -821,8 +820,8 @@ public final class LogTablet {
             }
 
             Collection<WriterAppendInfo> updatedWriters = Collections.emptyList();
-            Collection<FencedWriterAppendInfo> updatedFencedWriters = Collections.emptyList();
-            if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT) {
+            Collection<WriterProgressAppendInfo> updatedProgressWriters = Collections.emptyList();
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
                 // Preserve the compact protocol's existing roll-before-duplicate-check behavior.
                 maybeRoll(validRecords.sizeInBytes(), appendInfo);
                 Either<WriterStateEntry.BatchMetadata, Collection<WriterAppendInfo>>
@@ -855,21 +854,21 @@ public final class LogTablet {
                     return appendInfo;
                 }
             } else {
-                FencedValidationResult validateResult =
-                        analyzeAndValidateFencedWriterState(validRecords);
+                ProgressValidationResult validateResult =
+                        analyzeAndValidateWriterProgress(validRecords);
                 if (validateResult.allStale()) {
                     if (appendAsLeader) {
                         return LogAppendInfo.duplicatedAt(
-                                validateResult.dominatingTargetWalOffset(),
-                                validateResult.dominatingTimestamp());
+                                validateResult.requiredWalOffset(),
+                                validateResult.requiredTimestamp());
                     }
                     throw new DuplicateSequenceException(
                             String.format(
-                                    "Found all-stale fenced append for table bucket %s, dominating offset %s",
-                                    getTableBucket(), validateResult.dominatingTargetWalOffset()));
+                                    "Found an all-stale writer progress append for table bucket %s; required WAL offset is %s",
+                                    getTableBucket(), validateResult.requiredWalOffset()));
                 }
-                updatedFencedWriters = validateResult.updates();
-                // A stale V1 batch returned above without rolling or otherwise mutating the WAL.
+                updatedProgressWriters = validateResult.updates();
+                // A stale progress batch returned above without rolling or mutating the WAL.
                 maybeRoll(validRecords.sizeInBytes(), appendInfo);
             }
 
@@ -883,10 +882,10 @@ public final class LogTablet {
             appendFaultInjector.inject(AppendPhase.AFTER_LOCAL_APPEND);
             updateHighWatermarkWithLogEndOffset();
             updatedWriters.forEach(writerStateManager::update);
-            updatedFencedWriters.stream()
-                    .filter(update -> retainFencedWriterState.test(update.writerKey()))
-                    .forEach(writerStateManager::updateFenced);
-            if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
+            updatedProgressWriters.stream()
+                    .filter(update -> retainWriterProgress.test(update.writerKey()))
+                    .forEach(writerStateManager::updateProgress);
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
                 appendFaultInjector.inject(AppendPhase.AFTER_WRITER_STATE_UPDATE);
             }
             writerStateManager.updateMapEndOffset(appendInfo.lastOffset() + 1);
@@ -1254,7 +1253,7 @@ public final class LogTablet {
         Map<Long, WriterAppendInfo> updatedWriters = new HashMap<>();
 
         for (LogRecordBatch batch : records.batches()) {
-            validateWalProtocol(batch, KvIdempotenceProtocol.V0_COMPACT);
+            validateWalProtocol(batch, KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
             if (batch.hasWriterId()) {
                 // if this is a write request, there will be up to 5 batches which could
                 // have been duplicated. If we find a duplicate, we return the metadata of the
@@ -1275,109 +1274,113 @@ public final class LogTablet {
         return Either.right(updatedWriters.values());
     }
 
-    private FencedValidationResult analyzeAndValidateFencedWriterState(MemoryLogRecords records) {
-        List<FencedWriterAppendInfo> updates = new ArrayList<>();
-        Map<WriterKey, FencedWriterStateEntry> staged = new HashMap<>();
+    private ProgressValidationResult analyzeAndValidateWriterProgress(MemoryLogRecords records) {
+        List<WriterProgressAppendInfo> updates = new ArrayList<>();
+        Map<WriterKey, WriterProgressStateEntry> staged = new HashMap<>();
         boolean sawFresh = false;
         boolean sawCommittedStale = false;
-        long dominatingOffset = -1L;
-        long dominatingTimestamp = -1L;
+        long requiredWalOffset = -1L;
+        long requiredTimestamp = -1L;
         for (LogRecordBatch batch : records.batches()) {
-            validateWalProtocol(batch, KvIdempotenceProtocol.V1_FENCED);
-            WriterKey writerKey = batch.fencedWriterKey();
-            FencedWriterStateEntry committed =
-                    writerStateManager.lastFencedEntry(writerKey).orElse(null);
-            FencedWriterStateEntry stagedCurrent = staged.get(writerKey);
-            if (stagedCurrent != null && batch.fencedSequence() <= stagedCurrent.lastSequence()) {
-                throw fencedOrderingError(
-                        writerKey, batch.fencedSequence(), stagedCurrent.lastSequence(), "staged");
+            validateWalProtocol(batch, KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+            WriterKey writerKey = batch.writerKey();
+            WriterProgressStateEntry committed =
+                    writerStateManager.lastProgressEntry(writerKey).orElse(null);
+            WriterProgressStateEntry stagedCurrent = staged.get(writerKey);
+            if (stagedCurrent != null && batch.writerProgress() <= stagedCurrent.lastProgress()) {
+                throw progressOrderingError(
+                        writerKey, batch.writerProgress(), stagedCurrent.lastProgress(), "staged");
             }
-            if (committed != null && batch.fencedSequence() <= committed.lastSequence()) {
+            if (committed != null && batch.writerProgress() <= committed.lastProgress()) {
                 if (sawFresh) {
-                    throw mixedFencedAppendError();
+                    throw mixedProgressAppendError();
                 }
                 sawCommittedStale = true;
-                if (committed.dominatingTargetWalOffset() > dominatingOffset) {
-                    dominatingOffset = committed.dominatingTargetWalOffset();
-                    dominatingTimestamp = committed.lastTimestamp();
+                if (committed.progressWalOffset() > requiredWalOffset) {
+                    requiredWalOffset = committed.progressWalOffset();
+                    requiredTimestamp = committed.lastTimestamp();
                 }
                 continue;
             }
             if (sawCommittedStale) {
-                throw mixedFencedAppendError();
+                throw mixedProgressAppendError();
             }
             sawFresh = true;
-            FencedWriterStateEntry current = stagedCurrent != null ? stagedCurrent : committed;
-            FencedWriterAppendInfo update =
-                    new FencedWriterAppendInfo(writerKey, getTableBucket(), current);
-            update.append(batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
+            WriterProgressStateEntry current = stagedCurrent != null ? stagedCurrent : committed;
+            WriterProgressAppendInfo update =
+                    new WriterProgressAppendInfo(writerKey, getTableBucket(), current);
+            update.append(batch.writerProgress(), batch.lastLogOffset(), batch.commitTimestamp());
             updates.add(update);
             staged.put(writerKey, update.updatedEntry());
         }
         return sawCommittedStale
-                ? FencedValidationResult.allStale(dominatingOffset, dominatingTimestamp)
-                : FencedValidationResult.allFresh(updates);
+                ? ProgressValidationResult.allStale(requiredWalOffset, requiredTimestamp)
+                : ProgressValidationResult.allFresh(updates);
     }
 
     private void validateWalProtocol(LogRecordBatch batch, KvIdempotenceProtocol expectedProtocol) {
         if (batch.idempotenceProtocolVersion() != expectedProtocol.version()) {
             throw new CorruptRecordException(
                     String.format(
-                            "Target WAL magic v%s does not match table protocol V%s for %s",
-                            batch.magic(), expectedProtocol.version(), getTableBucket()));
+                            "Target WAL magic %s does not match table mode %s (value %s) for %s",
+                            batch.magic(),
+                            expectedProtocol,
+                            expectedProtocol.version(),
+                            getTableBucket()));
         }
     }
 
-    private OutOfOrderSequenceException fencedOrderingError(
+    private OutOfOrderSequenceException progressOrderingError(
             WriterKey writerKey, long incoming, long current, String stateKind) {
         return new OutOfOrderSequenceException(
                 String.format(
-                        "Out-of-order fenced sequence %s for writer %s in %s; %s state is %s",
+                        "Non-increasing progress %s for writer %s in %s; %s progress is %s",
                         incoming, writerKey, getTableBucket(), stateKind, current));
     }
 
-    private OutOfOrderSequenceException mixedFencedAppendError() {
+    private OutOfOrderSequenceException mixedProgressAppendError() {
         return new OutOfOrderSequenceException(
-                "A fenced WAL append cannot mix committed-stale and fresh batches for "
+                "A cumulative-progress WAL append cannot mix committed-stale and fresh batches for "
                         + getTableBucket());
     }
 
-    private static final class FencedValidationResult {
-        private final Collection<FencedWriterAppendInfo> updates;
-        private final long dominatingTargetWalOffset;
-        private final long dominatingTimestamp;
+    private static final class ProgressValidationResult {
+        private final Collection<WriterProgressAppendInfo> updates;
+        private final long requiredWalOffset;
+        private final long requiredTimestamp;
 
-        private FencedValidationResult(
-                Collection<FencedWriterAppendInfo> updates,
-                long dominatingTargetWalOffset,
-                long dominatingTimestamp) {
+        private ProgressValidationResult(
+                Collection<WriterProgressAppendInfo> updates,
+                long requiredWalOffset,
+                long requiredTimestamp) {
             this.updates = updates;
-            this.dominatingTargetWalOffset = dominatingTargetWalOffset;
-            this.dominatingTimestamp = dominatingTimestamp;
+            this.requiredWalOffset = requiredWalOffset;
+            this.requiredTimestamp = requiredTimestamp;
         }
 
-        private static FencedValidationResult allFresh(Collection<FencedWriterAppendInfo> updates) {
-            return new FencedValidationResult(updates, -1L, -1L);
+        private static ProgressValidationResult allFresh(
+                Collection<WriterProgressAppendInfo> updates) {
+            return new ProgressValidationResult(updates, -1L, -1L);
         }
 
-        private static FencedValidationResult allStale(long offset, long timestamp) {
-            return new FencedValidationResult(Collections.emptyList(), offset, timestamp);
+        private static ProgressValidationResult allStale(long offset, long timestamp) {
+            return new ProgressValidationResult(Collections.emptyList(), offset, timestamp);
         }
 
         private boolean allStale() {
-            return dominatingTargetWalOffset >= 0L;
+            return requiredWalOffset >= 0L;
         }
 
-        private Collection<FencedWriterAppendInfo> updates() {
+        private Collection<WriterProgressAppendInfo> updates() {
             return updates;
         }
 
-        private long dominatingTargetWalOffset() {
-            return dominatingTargetWalOffset;
+        private long requiredWalOffset() {
+            return requiredWalOffset;
         }
 
-        private long dominatingTimestamp() {
-            return dominatingTimestamp;
+        private long requiredTimestamp() {
+            return requiredTimestamp;
         }
     }
 
@@ -1397,7 +1400,7 @@ public final class LogTablet {
         synchronized (lock) {
             localLog.checkIfMemoryMappedBufferClosed();
             long retainedLogStartOffset =
-                    writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED
+                    writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
                             ? localLog.getSegments()
                                     .firstSegment()
                                     .map(LogSegment::getBaseOffset)
@@ -1551,7 +1554,7 @@ public final class LogTablet {
         // snapshot at the log end offset (see below). The next time the log is reloaded, we will
         // load writer state using this snapshot (or later snapshots). Otherwise, if there is
         // no snapshot file, then we have to rebuild writer state from the first segment.
-        if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT
+        if (writerStateManager.protocol() == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE
                 && !writerStateManager.latestSnapshotOffset().isPresent()
                 && reloadFromCleanShutdown) {
             // To avoid an expensive scan through all the segments, we take empty snapshots from
@@ -1571,9 +1574,9 @@ public final class LogTablet {
             boolean isEmptyBeforeTruncation =
                     writerStateManager.isEmpty() && writerStateManager.mapEndOffset() >= lastOffset;
             long writerStateLoadStart = System.currentTimeMillis();
-            if (writerStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
                 try {
-                    rebuildFencedWriterState(
+                    rebuildWriterProgressState(
                             writerStateManager,
                             segments,
                             logStartOffset,
@@ -1595,8 +1598,8 @@ public final class LogTablet {
             writerStateManager.truncateAndReload(
                     logStartOffset, lastOffset, System.currentTimeMillis());
             long segmentRecoveryStart = System.currentTimeMillis();
-            // This optimization applies only to the legacy writer map. V1 recovery always scans
-            // the complete candidate range so that coverage is proved before publication.
+            // Cumulative-progress recovery always scans the complete candidate range before
+            // publishing it. The contiguous-sequence writer map retains the existing shortcut.
             if (lastOffset > writerStateManager.mapEndOffset() && !isEmptyBeforeTruncation) {
                 reloadWriterStateFromLog(
                         writerStateManager,
@@ -1617,7 +1620,7 @@ public final class LogTablet {
         }
     }
 
-    private static void rebuildFencedWriterState(
+    private static void rebuildWriterProgressState(
             WriterStateManager writerStateManager,
             LogSegments segments,
             long logStartOffset,
@@ -1626,11 +1629,11 @@ public final class LogTablet {
             throws IOException {
         RuntimeException latestSemanticFailure = null;
         for (Optional<Long> snapshotOffset :
-                writerStateManager.fencedRecoveryCandidateOffsets(
+                writerStateManager.progressRecoveryCandidateOffsets(
                         logStartOffset, recoveryEndOffset)) {
             try {
                 WriterStateManager candidate =
-                        writerStateManager.fencedRecoveryCandidate(
+                        writerStateManager.progressRecoveryCandidate(
                                 logStartOffset, recoveryEndOffset, snapshotOffset);
                 reloadWriterStateFromLog(
                         candidate,
@@ -1640,12 +1643,12 @@ public final class LogTablet {
                         Collections.emptyList(),
                         recoveryFaultInjector);
                 candidate.validateRecoveryCoverage(logStartOffset, recoveryEndOffset);
-                writerStateManager.publishFencedRecovery(candidate, recoveryEndOffset);
+                writerStateManager.publishProgressRecovery(candidate, recoveryEndOffset);
                 return;
             } catch (CorruptSnapshotException | CorruptRecordException semanticFailure) {
                 latestSemanticFailure = semanticFailure;
                 LOG.warn(
-                        "Ignoring invalid V1 writer recovery candidate {} for bucket {}",
+                        "Ignoring invalid writer progress recovery candidate {} for bucket {}",
                         snapshotOffset,
                         segments.getTableBucket(),
                         semanticFailure);
@@ -1657,7 +1660,7 @@ public final class LogTablet {
                         : latestSemanticFailure.getMessage();
         throw new CorruptSnapshotException(
                 String.format(
-                        "No V1 writer snapshot and retained WAL provide continuous recovery over [%d,%d): %s",
+                        "No writer progress snapshot and retained WAL provide continuous recovery over [%d,%d): %s",
                         logStartOffset, recoveryEndOffset, failureDetail),
                 latestSemanticFailure);
     }
@@ -1682,7 +1685,7 @@ public final class LogTablet {
                     Math.max(
                             Math.max(segment.getBaseOffset(), recoveryStateManager.mapEndOffset()),
                             logStartOffset);
-            if (recoveryStateManager.protocol() == KvIdempotenceProtocol.V1_FENCED) {
+            if (recoveryStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
                 if (startOffset > recoveryStateManager.mapEndOffset()) {
                     throw recoveryGap(recoveryStateManager, startOffset, recoveryEndOffset);
                 }
@@ -1716,12 +1719,12 @@ public final class LogTablet {
             LogRecords records,
             AppendFaultInjector recoveryFaultInjector)
             throws IOException {
-        if (writerStateManager.protocol() == KvIdempotenceProtocol.V0_COMPACT) {
+        if (writerStateManager.protocol() == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
             Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
             for (LogRecordBatch batch : records.batches()) {
                 if (batch.idempotenceProtocolVersion() != 0) {
                     throw new CorruptRecordException(
-                            "Fenced target WAL found while recovering a V0 table");
+                            "Cumulative-progress target WAL found while recovering a contiguous-sequence table");
                 }
                 if (batch.hasWriterId()) {
                     updateWriterAppendInfo(writerStateManager, batch, loadedWriters, false);
@@ -1741,27 +1744,28 @@ public final class LogTablet {
                 }
                 if (batch.idempotenceProtocolVersion() != 1) {
                     throw new CorruptRecordException(
-                            "Compact target WAL found while recovering a V1 table");
+                            "Contiguous-sequence target WAL found while recovering a cumulative-progress table");
                 }
-                Optional<FencedWriterStateEntry> stale =
-                        writerStateManager.findStaleFencedBatch(
-                                batch.fencedWriterKey(), batch.fencedSequence());
+                Optional<WriterProgressStateEntry> stale =
+                        writerStateManager.findStaleProgressBatch(
+                                batch.writerKey(), batch.writerProgress());
                 if (stale.isPresent()) {
                     throw new CorruptRecordException(
-                            "Non-increasing fenced sequence found while recovering target WAL");
+                            "Non-increasing writer progress found while recovering target WAL");
                 }
-                FencedWriterAppendInfo update =
-                        writerStateManager.prepareFencedUpdate(batch.fencedWriterKey());
+                WriterProgressAppendInfo update =
+                        writerStateManager.prepareProgressUpdate(batch.writerKey());
                 update.append(
-                        batch.fencedSequence(), batch.lastLogOffset(), batch.commitTimestamp());
-                writerStateManager.updateFenced(update);
+                        batch.writerProgress(), batch.lastLogOffset(), batch.commitTimestamp());
+                writerStateManager.updateProgress(update);
                 writerStateManager.updateMapEndOffset(batch.nextLogOffset());
                 try {
                     recoveryFaultInjector.inject(AppendPhase.DURING_WRITER_RECOVERY);
                 } catch (Error error) {
                     throw error;
                 } catch (Exception failure) {
-                    throw new IOException("Injected V1 WriterState recovery failure", failure);
+                    throw new IOException(
+                            "Injected cumulative-progress WriterState recovery failure", failure);
                 }
             }
         }
@@ -1771,7 +1775,7 @@ public final class LogTablet {
             WriterStateManager writerStateManager, long nextOffset, long recoveryEnd) {
         return new CorruptSnapshotException(
                 String.format(
-                        "V1 WriterState recovery has a WAL gap [%d,%d) before recovery end %d",
+                        "Writer progress recovery has a WAL gap [%d,%d) before recovery end %d",
                         writerStateManager.mapEndOffset(), nextOffset, recoveryEnd));
     }
 

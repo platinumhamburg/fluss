@@ -501,31 +501,31 @@ final class LogTabletTest extends LogTestBase {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void testFencedMultiBatchRejectsDescendingStagedSequenceAtomically(boolean follower)
+    void testProgressMultiBatchRejectsDescendingStagedProgressAtomically(boolean follower)
             throws Exception {
-        LogTablet log = createFencedLogTablet();
+        LogTablet log = createProgressLogTablet();
         WriterKey key = new WriterKey(1L, 1L);
-        MemoryLogRecords records = fencedRecords(key, 101L, key, 100L);
+        MemoryLogRecords records = progressRecords(key, 101L, key, 100L);
         prepareAppend(records, follower, 0L);
 
         assertThatThrownBy(() -> append(log, records, follower))
                 .isInstanceOf(OutOfOrderSequenceException.class);
         assertThat(log.localLogEndOffset()).isZero();
-        assertThat(log.writerStateManager().lastFencedEntry(key)).isEmpty();
+        assertThat(log.writerStateManager().lastProgressEntry(key)).isEmpty();
     }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void testFencedMultiBatchRejectsMixedCommittedStaleAndFreshAtomically(boolean follower)
+    void testProgressMultiBatchRejectsMixedCommittedStaleAndFreshAtomically(boolean follower)
             throws Exception {
-        LogTablet log = createFencedLogTablet();
+        LogTablet log = createProgressLogTablet();
         WriterKey committedKey = new WriterKey(2L, 1L);
         WriterKey freshKey = new WriterKey(2L, 2L);
-        MemoryLogRecords seed = fencedRecords(committedKey, 100L);
+        MemoryLogRecords seed = progressRecords(committedKey, 100L);
         prepareAppend(seed, follower, 0L);
         append(log, seed, follower);
 
-        MemoryLogRecords mixed = fencedRecords(committedKey, 90L, freshKey, 1L);
+        MemoryLogRecords mixed = progressRecords(committedKey, 90L, freshKey, 1L);
         prepareAppend(mixed, follower, 1L);
         assertThatThrownBy(() -> append(log, mixed, follower))
                 .isInstanceOf(OutOfOrderSequenceException.class);
@@ -533,25 +533,25 @@ final class LogTabletTest extends LogTestBase {
         assertThat(log.localLogEndOffset()).isEqualTo(1L);
         assertThat(
                         log.writerStateManager()
-                                .lastFencedEntry(committedKey)
+                                .lastProgressEntry(committedKey)
                                 .orElseThrow(AssertionError::new)
-                                .lastSequence())
+                                .lastProgress())
                 .isEqualTo(100L);
-        assertThat(log.writerStateManager().lastFencedEntry(freshKey)).isEmpty();
+        assertThat(log.writerStateManager().lastProgressEntry(freshKey)).isEmpty();
     }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void testFencedMultiBatchClassifiesAllCommittedStaleAtomically(boolean follower)
+    void testProgressMultiBatchClassifiesAllCommittedStaleAtomically(boolean follower)
             throws Exception {
-        LogTablet log = createFencedLogTablet();
+        LogTablet log = createProgressLogTablet();
         WriterKey first = new WriterKey(3L, 1L);
         WriterKey second = new WriterKey(3L, 2L);
-        MemoryLogRecords seed = fencedRecords(first, 100L, second, 100L);
+        MemoryLogRecords seed = progressRecords(first, 100L, second, 100L);
         prepareAppend(seed, follower, 0L);
         append(log, seed, follower);
 
-        MemoryLogRecords stale = fencedRecords(first, 90L, second, 90L);
+        MemoryLogRecords stale = progressRecords(first, 90L, second, 90L);
         prepareAppend(stale, follower, 2L);
         if (follower) {
             assertThatThrownBy(() -> append(log, stale, true))
@@ -565,42 +565,46 @@ final class LogTabletTest extends LogTestBase {
         assertThat(log.localLogEndOffset()).isEqualTo(2L);
         assertThat(
                         log.writerStateManager()
-                                .lastFencedEntry(first)
+                                .lastProgressEntry(first)
                                 .orElseThrow(AssertionError::new)
-                                .lastSequence())
+                                .lastProgress())
                 .isEqualTo(100L);
         assertThat(
                         log.writerStateManager()
-                                .lastFencedEntry(second)
+                                .lastProgressEntry(second)
                                 .orElseThrow(AssertionError::new)
-                                .lastSequence())
+                                .lastProgress())
                 .isEqualTo(100L);
     }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void testFencedMultiBatchAcceptsAllFreshAtomically(boolean follower) throws Exception {
-        LogTablet log = createFencedLogTablet();
+    void testProgressMultiBatchAcceptsAllFreshAtomically(boolean follower) throws Exception {
+        LogTablet log = createProgressLogTablet();
         WriterKey key = new WriterKey(4L, 1L);
-        MemoryLogRecords fresh = fencedRecords(key, 100L, key, 101L);
+        MemoryLogRecords fresh = progressRecords(key, 100L, key, 101L);
         prepareAppend(fresh, follower, 0L);
 
         append(log, fresh, follower);
 
         assertThat(log.localLogEndOffset()).isEqualTo(2L);
-        FencedWriterStateEntry state =
-                log.writerStateManager().lastFencedEntry(key).orElseThrow(AssertionError::new);
-        assertThat(state.lastSequence()).isEqualTo(101L);
-        assertThat(state.dominatingTargetWalOffset()).isEqualTo(1L);
+        WriterProgressStateEntry state =
+                log.writerStateManager().lastProgressEntry(key).orElseThrow(AssertionError::new);
+        assertThat(state.lastProgress()).isEqualTo(101L);
+        assertThat(state.progressWalOffset()).isEqualTo(1L);
     }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void testFollowerRejectsWalProtocolMismatch(boolean fencedTable) throws Exception {
+    void testFollowerRejectsWalProtocolMismatch(boolean progressTable) throws Exception {
         KvIdempotenceProtocol tableProtocol =
-                fencedTable ? KvIdempotenceProtocol.V1_FENCED : KvIdempotenceProtocol.V0_COMPACT;
+                progressTable
+                        ? KvIdempotenceProtocol.CUMULATIVE_PROGRESS
+                        : KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE;
         KvIdempotenceProtocol incomingProtocol =
-                fencedTable ? KvIdempotenceProtocol.V0_COMPACT : KvIdempotenceProtocol.V1_FENCED;
+                progressTable
+                        ? KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE
+                        : KvIdempotenceProtocol.CUMULATIVE_PROGRESS;
         LogTablet log = createProtocolLogTablet(tableProtocol);
         MemoryLogRecords mismatched = protocolRecords(incomingProtocol);
         prepareAppend(mismatched, true, 0L);
@@ -613,7 +617,7 @@ final class LogTabletTest extends LogTestBase {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void testRecoveryRejectsPersistedWalProtocolMismatch(boolean fencedWal) throws Exception {
+    void testRecoveryRejectsPersistedWalProtocolMismatch(boolean progressWal) throws Exception {
         File recoveryDir =
                 LogTestUtils.makeRandomLogTabletDir(
                         tempDir,
@@ -621,9 +625,13 @@ final class LogTabletTest extends LogTestBase {
                         DATA1_TABLE_ID,
                         DATA1_TABLE_PATH.getTableName());
         KvIdempotenceProtocol walProtocol =
-                fencedWal ? KvIdempotenceProtocol.V1_FENCED : KvIdempotenceProtocol.V0_COMPACT;
+                progressWal
+                        ? KvIdempotenceProtocol.CUMULATIVE_PROGRESS
+                        : KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE;
         KvIdempotenceProtocol recoveryProtocol =
-                fencedWal ? KvIdempotenceProtocol.V0_COMPACT : KvIdempotenceProtocol.V1_FENCED;
+                progressWal
+                        ? KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE
+                        : KvIdempotenceProtocol.CUMULATIVE_PROGRESS;
         LogTablet source = createProtocolLogTablet(recoveryDir, walProtocol);
         source.appendAsLeader(protocolRecords(walProtocol));
         source.close();
@@ -643,8 +651,9 @@ final class LogTabletTest extends LogTestBase {
                         DATA1_TABLE_ID,
                         DATA1_TABLE_PATH.getTableName());
         LogTablet source =
-                createProtocolLogTablet(recoveryDir, KvIdempotenceProtocol.V0_COMPACT, true);
-        source.appendAsLeader(protocolRecords(KvIdempotenceProtocol.V0_COMPACT));
+                createProtocolLogTablet(
+                        recoveryDir, KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE, true);
+        source.appendAsLeader(protocolRecords(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE));
         source.writerStateManager().takeSnapshot();
         source.close();
 
@@ -658,15 +667,17 @@ final class LogTabletTest extends LogTestBase {
         assertThatThrownBy(
                         () ->
                                 createProtocolLogTablet(
-                                        recoveryDir, KvIdempotenceProtocol.V1_FENCED, false))
+                                        recoveryDir,
+                                        KvIdempotenceProtocol.CUMULATIVE_PROGRESS,
+                                        false))
                 .isInstanceOf(CorruptRecordException.class)
                 .hasMessageContaining("Target WAL magic")
-                .hasMessageContaining("table protocol V1");
+                .hasMessageContaining("table mode CUMULATIVE_PROGRESS");
         assertThat(snapshotContents(recoveryDir)).isEqualTo(snapshotsBeforeRecovery);
     }
 
-    private LogTablet createFencedLogTablet() throws Exception {
-        File fencedDir =
+    private LogTablet createProgressLogTablet() throws Exception {
+        File progressDir =
                 LogTestUtils.makeRandomLogTabletDir(
                         tempDir,
                         DATA1_TABLE_PATH.getDatabaseName(),
@@ -675,7 +686,7 @@ final class LogTabletTest extends LogTestBase {
         return LogTablet.create(
                 tempDir,
                 PhysicalTablePath.of(DATA1_TABLE_PATH),
-                fencedDir,
+                progressDir,
                 conf,
                 TestingMetricGroups.TABLET_SERVER_METRICS,
                 0,
@@ -685,7 +696,7 @@ final class LogTabletTest extends LogTestBase {
                 true,
                 SystemClock.getInstance(),
                 true,
-                KvIdempotenceProtocol.V1_FENCED);
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
     }
 
     private LogTablet createProtocolLogTablet(KvIdempotenceProtocol protocol) throws Exception {
@@ -740,13 +751,13 @@ final class LogTabletTest extends LogTestBase {
     private static MemoryLogRecords protocolRecords(KvIdempotenceProtocol protocol)
             throws Exception {
         MemoryLogRecordsCompactedBuilder builder =
-                protocol == KvIdempotenceProtocol.V1_FENCED
-                        ? MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                protocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
+                        ? MemoryLogRecordsCompactedBuilder.progressBuilder(
                                 DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false)
                         : MemoryLogRecordsCompactedBuilder.builder(
                                 DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
-        if (protocol == KvIdempotenceProtocol.V1_FENCED) {
-            builder.setFencedWriterState(new WriterKey(7L, 8L), 100L);
+        if (protocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
+            builder.setWriterProgress(new WriterKey(7L, 8L), 100L);
         } else {
             builder.setWriterState(7L, 0);
         }
@@ -773,16 +784,17 @@ final class LogTabletTest extends LogTestBase {
         }
     }
 
-    private static MemoryLogRecords fencedRecords(Object... writerAndSequences) throws Exception {
+    private static MemoryLogRecords progressRecords(Object... writerAndProgressValues)
+            throws Exception {
         List<byte[]> batches = new ArrayList<>();
         int totalSize = 0;
-        for (int i = 0; i < writerAndSequences.length; i += 2) {
-            WriterKey writerKey = (WriterKey) writerAndSequences[i];
-            long sequence = (Long) writerAndSequences[i + 1];
+        for (int i = 0; i < writerAndProgressValues.length; i += 2) {
+            WriterKey writerKey = (WriterKey) writerAndProgressValues[i];
+            long progress = (Long) writerAndProgressValues[i + 1];
             MemoryLogRecordsCompactedBuilder builder =
-                    MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                    MemoryLogRecordsCompactedBuilder.progressBuilder(
                             DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
-            builder.setFencedWriterState(writerKey, sequence);
+            builder.setWriterProgress(writerKey, progress);
             builder.close();
             BytesView bytes = builder.build();
             byte[] batch = new byte[bytes.getBytesLength()];

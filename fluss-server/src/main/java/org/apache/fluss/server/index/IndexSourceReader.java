@@ -706,13 +706,13 @@ public final class IndexSourceReader implements AutoCloseable {
         }
 
         @Override
-        public WriterKey fencedWriterKey() {
-            return delegate.fencedWriterKey();
+        public WriterKey writerKey() {
+            return delegate.writerKey();
         }
 
         @Override
-        public long fencedSequence() {
-            return delegate.fencedSequence();
+        public long writerProgress() {
+            return delegate.writerProgress();
         }
 
         @Override

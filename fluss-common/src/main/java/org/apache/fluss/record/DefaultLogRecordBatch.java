@@ -55,7 +55,6 @@ import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.batchSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
-import static org.apache.fluss.record.LogRecordBatchFormat.fencedSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.lastOffsetDeltaOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.leaderEpochOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
@@ -66,6 +65,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.statisticsLengthOffse
 import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyHighOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyLowOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerProgressOffset;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
@@ -154,9 +154,9 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
     }
 
     @Override
-    public WriterKey fencedWriterKey() {
+    public WriterKey writerKey() {
         if (magic != LOG_MAGIC_VALUE_V3) {
-            return LogRecordBatch.super.fencedWriterKey();
+            return LogRecordBatch.super.writerKey();
         }
         return new WriterKey(
                 segment.getLong(position + writerKeyHighOffset(magic)),
@@ -164,11 +164,11 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
     }
 
     @Override
-    public long fencedSequence() {
+    public long writerProgress() {
         if (magic != LOG_MAGIC_VALUE_V3) {
-            return LogRecordBatch.super.fencedSequence();
+            return LogRecordBatch.super.writerProgress();
         }
-        return segment.getLong(position + fencedSequenceOffset(magic));
+        return segment.getLong(position + writerProgressOffset(magic));
     }
 
     @Override

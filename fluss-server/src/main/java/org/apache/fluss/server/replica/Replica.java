@@ -441,14 +441,14 @@ public final class Replica {
         return logTablet.getWriterIdCount();
     }
 
-    public long fencedWriterStateEntryCount() {
-        return logTablet.getWriterStateProtocol() == KvIdempotenceProtocol.V1_FENCED
+    public long writerProgressStateEntryCount() {
+        return logTablet.getWriterStateProtocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
                 ? logTablet.getWriterIdCount()
                 : 0L;
     }
 
-    public long fencedWriterStateSnapshotBytes() {
-        return logTablet.getWriterStateProtocol() == KvIdempotenceProtocol.V1_FENCED
+    public long writerProgressStateSnapshotBytes() {
+        return logTablet.getWriterStateProtocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
                 ? logTablet.getWriterStateSnapshotBytes()
                 : 0L;
     }
@@ -463,9 +463,7 @@ public final class Replica {
 
     /** Retires writers for a tombstoned source partition under the applicable tablet lock. */
     public void retireTombstonedIndexWriters(long mainTableId) {
-        if (!tableInfo.isIndexTable()
-                || !tableInfo.getMainTableId().isPresent()
-                || tableInfo.getMainTableId().getAsLong() != mainTableId) {
+        if (!tableInfo.isIndexTable() || tableInfo.getMainTableId().getAsLong() != mainTableId) {
             return;
         }
         Runnable retirement =
@@ -489,7 +487,7 @@ public final class Replica {
 
     private void removeTombstonedIndexWriters(PartitionTombstone tombstone) {
         int[] skipped = {0};
-        logTablet.removeFencedWriters(
+        logTablet.removeProgressWriters(
                 writerKey -> {
                     try {
                         OptionalLong partitionId =
@@ -506,7 +504,7 @@ public final class Replica {
                 });
         if (skipped[0] > 0) {
             LOG.warn(
-                    "Skipped {} unattributable V1 writer keys while retiring tombstoned writers for {}",
+                    "Skipped {} unattributable cumulative-progress writer keys while retiring tombstoned writers for {}",
                     skipped[0],
                     tableBucket);
         }
@@ -1429,11 +1427,11 @@ public final class Replica {
 
     public LogAppendInfo appendRecordsToFollower(MemoryLogRecords memoryLogRecords)
             throws Exception {
-        return logTablet.appendAsFollower(memoryLogRecords, this::retainFollowerFencedWriterState);
+        return logTablet.appendAsFollower(memoryLogRecords, this::retainFollowerWriterProgress);
     }
 
-    private boolean retainFollowerFencedWriterState(WriterKey writerKey) {
-        if (!tableInfo.isIndexTable() || !tableInfo.getMainTableId().isPresent()) {
+    private boolean retainFollowerWriterProgress(WriterKey writerKey) {
+        if (!tableInfo.isIndexTable()) {
             return true;
         }
         Optional<PartitionTombstone> tombstone =
@@ -1474,18 +1472,18 @@ public final class Replica {
                     if (kvRecords.idempotenceProtocolVersion() != tableProtocol.version()) {
                         throw new UnsupportedVersionException(
                                 String.format(
-                                        "KV batch protocol V%s does not match table protocol V%s",
+                                        "KV batch protocol value %s does not match table mode %s (value %s)",
                                         kvRecords.idempotenceProtocolVersion(),
+                                        tableProtocol,
                                         tableProtocol.version()));
                     }
-                    if (tableProtocol == KvIdempotenceProtocol.V1_FENCED) {
+                    if (tableProtocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
                         if (mergeMode != MergeMode.OVERWRITE) {
                             throw new InvalidTableException(
-                                    "KV idempotence protocol V1 requires OVERWRITE merge mode");
+                                    "CUMULATIVE_PROGRESS requires OVERWRITE merge mode");
                         }
                         if (requiredAcks != -1) {
-                            throw new InvalidTableException(
-                                    "KV idempotence protocol V1 requires acks=-1");
+                            throw new InvalidTableException("CUMULATIVE_PROGRESS requires acks=-1");
                         }
                     }
                     validateInSyncReplicaSize(requiredAcks);
@@ -1505,7 +1503,7 @@ public final class Replica {
                         throw new KvStorageException(
                                 "Error while putting records to " + tableBucket, e);
                     } catch (Error error) {
-                        if (tableProtocol == KvIdempotenceProtocol.V1_FENCED) {
+                        if (tableProtocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
                             failStop(error);
                         }
                         throw error;
@@ -2633,11 +2631,11 @@ public final class Replica {
     }
 
     private void failIndexFollowerRecovery(Throwable failure) {
-        if (tableInfo.getKvIdempotenceProtocol() == KvIdempotenceProtocol.V1_FENCED
+        if (tableInfo.getKvIdempotenceProtocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
                 && online.compareAndSet(true, false)) {
             leaderReplicaIdOpt.set(null);
             LOG.error(
-                    "Failing V1 target replica {} after remote WriterState recovery failure",
+                    "Failing cumulative-progress target replica {} after remote WriterState recovery failure",
                     tableBucket,
                     failure);
         }
@@ -2650,7 +2648,7 @@ public final class Replica {
         if (failure instanceof RuntimeException) {
             throw (RuntimeException) failure;
         }
-        throw new StorageException("V1 WriterState recovery failed", failure);
+        throw new StorageException("Cumulative-progress WriterState recovery failed", failure);
     }
 
     @VisibleForTesting
@@ -2719,7 +2717,7 @@ public final class Replica {
                         isKvTable(),
                         isKvTable()
                                 ? tableInfo.getKvIdempotenceProtocol()
-                                : KvIdempotenceProtocol.V0_COMPACT);
+                                : KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
         // update high watermark.
         Optional<Long> watermarkOpt = lazyHighWatermarkCheckpoint.fetch(tableBucket);
         long watermark =

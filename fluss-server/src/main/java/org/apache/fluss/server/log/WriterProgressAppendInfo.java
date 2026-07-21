@@ -25,18 +25,18 @@ import javax.annotation.Nullable;
 import java.util.Objects;
 import java.util.Optional;
 
-/** Prepared, one-shot V1 WriterState update published after its target WAL append succeeds. */
-public final class FencedWriterAppendInfo {
+/** Prepared WriterState progress update published after its target WAL append succeeds. */
+public final class WriterProgressAppendInfo {
     private final WriterKey writerKey;
     private final TableBucket tableBucket;
-    @Nullable private final FencedWriterStateEntry currentEntry;
-    @Nullable private FencedWriterStateEntry updatedEntry;
+    @Nullable private final WriterProgressStateEntry currentEntry;
+    @Nullable private WriterProgressStateEntry updatedEntry;
     private boolean published;
 
-    FencedWriterAppendInfo(
+    WriterProgressAppendInfo(
             WriterKey writerKey,
             TableBucket tableBucket,
-            @Nullable FencedWriterStateEntry currentEntry) {
+            @Nullable WriterProgressStateEntry currentEntry) {
         this.writerKey = Objects.requireNonNull(writerKey, "writerKey");
         this.tableBucket = Objects.requireNonNull(tableBucket, "tableBucket");
         this.currentEntry = currentEntry;
@@ -46,29 +46,30 @@ public final class FencedWriterAppendInfo {
         return writerKey;
     }
 
-    public void append(long sequence, long targetWalOffset, long timestamp) {
+    public void append(long progress, long targetWalOffset, long timestamp) {
         if (updatedEntry != null) {
-            throw new IllegalStateException("A fenced writer update accepts exactly one append");
+            throw new IllegalStateException("A writer progress update accepts exactly one append");
         }
-        if (sequence < 0L) {
-            throw new IllegalArgumentException("sequence must be non-negative");
+        if (progress < 0L) {
+            throw new IllegalArgumentException("writer progress must be non-negative");
         }
-        if (currentEntry != null && sequence <= currentEntry.lastSequence()) {
+        if (currentEntry != null && progress <= currentEntry.lastProgress()) {
             throw new IllegalArgumentException(
                     String.format(
-                            "Stale fenced sequence %s for writer %s; current sequence is %s",
-                            sequence, writerKey, currentEntry.lastSequence()));
+                            "Stale progress %s for writer %s; current progress is %s",
+                            progress, writerKey, currentEntry.lastProgress()));
         }
-        updatedEntry = new FencedWriterStateEntry(writerKey, sequence, targetWalOffset, timestamp);
+        updatedEntry =
+                new WriterProgressStateEntry(writerKey, progress, targetWalOffset, timestamp);
     }
 
-    public Optional<FencedWriterStateEntry> currentEntry() {
+    public Optional<WriterProgressStateEntry> currentEntry() {
         return Optional.ofNullable(currentEntry);
     }
 
-    public FencedWriterStateEntry updatedEntry() {
+    public WriterProgressStateEntry updatedEntry() {
         if (updatedEntry == null) {
-            throw new IllegalStateException("No fenced writer update has been appended");
+            throw new IllegalStateException("No writer progress update has been appended");
         }
         return updatedEntry;
     }
@@ -77,11 +78,11 @@ public final class FencedWriterAppendInfo {
         return tableBucket;
     }
 
-    FencedWriterStateEntry takeUpdatedEntryForPublish() {
+    WriterProgressStateEntry takeUpdatedEntryForPublish() {
         if (published) {
-            throw new IllegalStateException("Fenced writer update has already been published");
+            throw new IllegalStateException("Writer progress update has already been published");
         }
-        FencedWriterStateEntry entry = updatedEntry();
+        WriterProgressStateEntry entry = updatedEntry();
         published = true;
         return entry;
     }

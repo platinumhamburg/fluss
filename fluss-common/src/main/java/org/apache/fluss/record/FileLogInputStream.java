@@ -186,13 +186,13 @@ public class FileLogInputStream
         }
 
         @Override
-        public WriterKey fencedWriterKey() {
-            return loadBatchHeader().fencedWriterKey();
+        public WriterKey writerKey() {
+            return loadBatchHeader().writerKey();
         }
 
         @Override
-        public long fencedSequence() {
-            return loadBatchHeader().fencedSequence();
+        public long writerProgress() {
+            return loadBatchHeader().writerProgress();
         }
 
         @Override

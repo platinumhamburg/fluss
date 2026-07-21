@@ -37,7 +37,6 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.DefaultValueRecordBatch;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
@@ -47,6 +46,7 @@ import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.InternalRow;
@@ -214,10 +214,10 @@ class ReplicaManagerTest extends ReplicaTestBase {
         return result;
     }
 
-    private static KvRecordBatch fencedBatch(
-            WriterKey writerKey, long sequence, int key, String value) throws Exception {
-        try (FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+    private static KvRecordBatch progressBatch(
+            WriterKey writerKey, long progress, int key, String value) throws Exception {
+        try (ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         DEFAULT_SCHEMA_ID,
                         1024,
                         new UnmanagedPagedOutputView(128),
@@ -225,7 +225,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
             builder.append(
                     new byte[] {(byte) key},
                     compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {key, value}));
-            builder.setWriterState(writerKey, sequence);
+            builder.setWriterState(writerKey, progress);
             return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
         }
     }
@@ -242,7 +242,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 Collections.singletonList("a"),
                 Collections.singletonMap(
                         ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(),
-                        String.valueOf(KvIdempotenceProtocol.V1_FENCED.version())));
+                        String.valueOf(KvIdempotenceProtocol.CUMULATIVE_PROGRESS.version())));
 
         CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> leaderResult =
                 notifyLeader(tablePath, tableBucket, TABLET_SERVER_ID, 0);
@@ -251,11 +251,14 @@ class ReplicaManagerTest extends ReplicaTestBase {
         Replica replica = replicaManager.getReplicaOrException(tableBucket);
         WriterKey writerKey = new WriterKey(41L, 17L);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 100L, 1, "before-snapshot"), null, MergeMode.OVERWRITE, -1);
+                progressBatch(writerKey, 100L, 1, "before-snapshot"),
+                null,
+                MergeMode.OVERWRITE,
+                -1);
         replica.getKvSnapshotManager().triggerSnapshot();
         snapshotReporter.waitUntilSnapshotComplete(tableBucket, 0);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 500L, 2, "after-snapshot"), null, MergeMode.OVERWRITE, -1);
+                progressBatch(writerKey, 500L, 2, "after-snapshot"), null, MergeMode.OVERWRITE, -1);
 
         assertThat(notifyLeader(tablePath, tableBucket, 2, 1).get())
                 .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
@@ -282,7 +285,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         assertThatThrownBy(
                         () ->
                                 replica.putRecordsToLeader(
-                                        fencedBatch(writerKey, 100L, 3, "stale"),
+                                        progressBatch(writerKey, 100L, 3, "stale"),
                                         null,
                                         MergeMode.OVERWRITE,
                                         -1))

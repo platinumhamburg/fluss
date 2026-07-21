@@ -25,9 +25,9 @@ import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
@@ -362,10 +362,10 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
         return result;
     }
 
-    private static KvRecordBatch fencedBatch(
-            WriterKey writerKey, long sequence, int key, String value) throws Exception {
-        try (FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+    private static KvRecordBatch progressBatch(
+            WriterKey writerKey, long progress, int key, String value) throws Exception {
+        try (ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         DEFAULT_SCHEMA_ID,
                         1024,
                         new UnmanagedPagedOutputView(128),
@@ -373,7 +373,7 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
             builder.append(
                     new byte[] {(byte) key},
                     compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {key, value}));
-            builder.setWriterState(writerKey, sequence);
+            builder.setWriterState(writerKey, progress);
             return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
         }
     }
@@ -389,17 +389,20 @@ class ReplicaLeaderTransitionTest extends ReplicaTestBase {
                 Collections.singletonList("a"),
                 Collections.singletonMap(
                         ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(),
-                        String.valueOf(KvIdempotenceProtocol.V1_FENCED.version())));
+                        String.valueOf(KvIdempotenceProtocol.CUMULATIVE_PROGRESS.version())));
         assertThat(notifyLeader(tablePath, tableBucket, TABLET_SERVER_ID, 0).get())
                 .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
         Replica replica = replicaManager.getReplicaOrException(tableBucket);
         WriterKey writerKey = new WriterKey(41L, 17L);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 100L, 1, "before-snapshot"), null, MergeMode.OVERWRITE, -1);
+                progressBatch(writerKey, 100L, 1, "before-snapshot"),
+                null,
+                MergeMode.OVERWRITE,
+                -1);
         replica.getKvSnapshotManager().triggerSnapshot();
         snapshotReporter.waitUntilSnapshotComplete(tableBucket, 0);
         replica.putRecordsToLeader(
-                fencedBatch(writerKey, 500L, 2, "after-snapshot"), null, MergeMode.OVERWRITE, -1);
+                progressBatch(writerKey, 500L, 2, "after-snapshot"), null, MergeMode.OVERWRITE, -1);
         return new ReplayRecoveryFixture(tablePath, tableBucket, replica);
     }
 

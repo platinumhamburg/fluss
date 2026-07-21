@@ -83,7 +83,7 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter indexPushErrors;
     private final Histogram indexPushLatencyHistogram;
     private final Counter partitionTombstoneApplyDrops;
-    private final Counter indexPushStaleV1Batches;
+    private final Counter indexPushStaleProgressBatches;
     private final Counter indexSourceRemoteReadBytes;
     private final Counter indexSourceRemoteReadFailures;
     private final Counter indexPushRecordTooLargeFailures;
@@ -164,8 +164,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(
                 MetricNames.PARTITION_TOMBSTONE_APPLY_DROPS_RATE,
                 new MeterView(partitionTombstoneApplyDrops));
-        indexPushStaleV1Batches = new ThreadSafeSimpleCounter();
-        meter(MetricNames.INDEX_PUSH_STALE_V1_BATCHES_RATE, new MeterView(indexPushStaleV1Batches));
+        indexPushStaleProgressBatches = new ThreadSafeSimpleCounter();
+        meter(
+                MetricNames.INDEX_PUSH_STALE_PROGRESS_BATCHES_RATE,
+                new MeterView(indexPushStaleProgressBatches));
         indexSourceRemoteReadBytes = new ThreadSafeSimpleCounter();
         meter(
                 MetricNames.INDEX_SOURCE_REMOTE_READ_BYTES_RATE,
@@ -326,8 +328,8 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         return partitionTombstoneApplyDrops;
     }
 
-    public Counter indexPushStaleV1Batches() {
-        return indexPushStaleV1Batches;
+    public Counter indexPushStaleProgressBatches() {
+        return indexPushStaleProgressBatches;
     }
 
     public Counter indexSourceRemoteReadBytes() {

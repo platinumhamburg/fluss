@@ -134,7 +134,7 @@ class IndexSourceRemoteRecoveryITCase {
             LOG.info(
                     "Remote index recovery evidence: sourceLeader={}, recoveryFollower={}, "
                             + "offlineFollower={}, targetOnly={}, targetBucket={}; baseline={}, "
-                            + "committedEnd={}, followerLocalStart={}, replaySequence={}, "
+                            + "committedEnd={}, followerLocalStart={}, replayProgress={}, "
                             + "remoteBytes={}->{}, continuationEnd={}",
                     recovery.sourceLeader,
                     recovery.recoveryFollower,
@@ -144,7 +144,7 @@ class IndexSourceRemoteRecoveryITCase {
                     baselinePushedOffset,
                     committedSourceEnd,
                     recovered.followerLocalStart,
-                    recovery.replayGate().admittedSequence(),
+                    recovery.replayGate().admittedProgress(),
                     recovered.remoteBytesBefore,
                     recovered.remoteBytesWhileAckHeld,
                     continuationEnd);
@@ -196,7 +196,7 @@ class IndexSourceRemoteRecoveryITCase {
         assertThat(CLUSTER.waitAndGetLeader(gatedTargetBucket)).isEqualTo(roles.targetOnlyServer);
 
         LOG.info(
-                "Task 7 topology: source={} assignment={}, sourceLeader={}, recoveryFollower={}, "
+                "Remote-recovery topology: source={} assignment={}, sourceLeader={}, recoveryFollower={}, "
                         + "offlineFollower={}, targetOnly={}, targetBucket={}, values=[{}, {}]",
                 indexedSourceTable.sourceTableBucket,
                 roles.sourceReplicas,
@@ -292,15 +292,12 @@ class IndexSourceRemoteRecoveryITCase {
                 .containsExactlyInAnyOrderElementsOf(
                         Arrays.stream(liveServerIds).boxed().collect(Collectors.toList()));
         return new RecoveryRoles(
-                sourceReplicas,
-                sourceLeader,
-                recoveryFollower,
-                offlineFollower,
-                targetOnlyServer);
+                sourceReplicas, sourceLeader, recoveryFollower, offlineFollower, targetOnlyServer);
     }
 
     private static TableBucket findTargetBucketLedBy(
-            long indexTableId, int targetOnlyServer, List<Integer> sourceReplicas) throws Exception {
+            long indexTableId, int targetOnlyServer, List<Integer> sourceReplicas)
+            throws Exception {
         int targetBucket = -1;
         int[] indexLeaders = new int[INDEX_BUCKET_COUNT];
         for (int bucket = 0; bucket < INDEX_BUCKET_COUNT; bucket++) {
@@ -460,10 +457,7 @@ class IndexSourceRemoteRecoveryITCase {
                 .as("raw remote source bytes must be consumed before target progress advances")
                 .isGreaterThan(remoteBytesBefore);
         return new RecoveredSource(
-                newSourceReplica,
-                followerLocalStart,
-                remoteBytesBefore,
-                remoteBytesWhileAckHeld);
+                newSourceReplica, followerLocalStart, remoteBytesBefore, remoteBytesWhileAckHeld);
     }
 
     private static void verifyRecoveredProjection(
@@ -481,10 +475,7 @@ class IndexSourceRemoteRecoveryITCase {
         assertExactIndexProjection(recovery, expectedRows);
         assertIndexKeyAbsent(recovery, recovery.firstIndexValue, 0, "known stale pre-update key");
         assertIndexKeyAbsent(
-                recovery,
-                recovery.secondIndexValue,
-                NEVER_WRITTEN_KEY,
-                "never-written index key");
+                recovery, recovery.secondIndexValue, NEVER_WRITTEN_KEY, "never-written index key");
     }
 
     private static long verifyLocalContinuation(
@@ -547,7 +538,7 @@ class IndexSourceRemoteRecoveryITCase {
                 sourceTabletServer(recovery.sourceLeader).getReplicaManager().getRemoteLogManager();
         RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(recovery.sourceTableBucket);
         LOG.info(
-                "Task 7 initial remote coverage state: {}",
+                "Initial remote coverage state: {}",
                 safeRemoteCoverageState(
                         sourceReplica, remoteLog, baselinePushedOffset, committedSourceEnd));
 
@@ -570,7 +561,7 @@ class IndexSourceRemoteRecoveryITCase {
         String finalState =
                 safeRemoteCoverageState(
                         sourceReplica, remoteLog, baselinePushedOffset, committedSourceEnd);
-        LOG.info("Task 7 raw remote replay range covered: {}", finalState);
+        LOG.info("Raw remote replay range covered: {}", finalState);
         assertThat(sourceLog.canFetchFromRemoteLog(baselinePushedOffset))
                 .as("raw remote source WAL must cover the replay start")
                 .isTrue();
@@ -739,7 +730,8 @@ class IndexSourceRemoteRecoveryITCase {
             RemoteRecoveryFixture recovery, String indexedValue, int primaryKey, String description)
             throws Exception {
         PhysicalIndexRow physical =
-                physicalIndexRow(primaryKey, indexedValue, liveIndexTableInfo(recovery).getSchemaId());
+                physicalIndexRow(
+                        primaryKey, indexedValue, liveIndexTableInfo(recovery).getSchemaId());
         TableBucket target = new TableBucket(recovery.indexTableId, indexBucket(indexedValue));
         assertThat(
                         CLUSTER.waitAndGetLeaderReplica(target)
@@ -868,37 +860,37 @@ class IndexSourceRemoteRecoveryITCase {
 
     private static final class ReplayGate implements AutoCloseable {
         private final WriterKey writerKey;
-        private final long baselineSequence;
-        private final AtomicLong admittedSequence = new AtomicLong(-1L);
+        private final long baselineProgress;
+        private final AtomicLong admittedProgress = new AtomicLong(-1L);
         private final CountDownLatch replayAdmitted = new CountDownLatch(1);
         private final CountDownLatch releaseReplay = new CountDownLatch(1);
         private final AutoCloseable registration;
 
-        private ReplayGate(Replica targetReplica, WriterKey writerKey, long baselineSequence) {
+        private ReplayGate(Replica targetReplica, WriterKey writerKey, long baselineProgress) {
             this.writerKey = writerKey;
-            this.baselineSequence = baselineSequence;
+            this.baselineProgress = baselineProgress;
             this.registration =
                     ReplicaTestHooks.installAfterPutAdmissionHook(
                             targetReplica, this::afterAdmission);
         }
 
         private void afterAdmission(KvRecordBatch batch) {
-            if (!writerKey.equals(batch.fencedWriterKey())
-                    || batch.fencedSequence() <= baselineSequence) {
+            if (!writerKey.equals(batch.writerKey())
+                    || batch.writerProgress() <= baselineProgress) {
                 return;
             }
-            admittedSequence.accumulateAndGet(batch.fencedSequence(), Math::max);
+            admittedProgress.accumulateAndGet(batch.writerProgress(), Math::max);
             replayAdmitted.countDown();
             await(releaseReplay, "wait to release remote source replay ACK");
         }
 
         private void awaitAdmission() {
             await(replayAdmitted, "wait for canonical remote source replay admission");
-            assertThat(admittedSequence.get()).isGreaterThan(baselineSequence);
+            assertThat(admittedProgress.get()).isGreaterThan(baselineProgress);
         }
 
-        private long admittedSequence() {
-            return admittedSequence.get();
+        private long admittedProgress() {
+            return admittedProgress.get();
         }
 
         private void release() {
@@ -1022,9 +1014,9 @@ class IndexSourceRemoteRecoveryITCase {
         }
 
         private ReplayGate installReplayGate(
-                Replica targetReplica, WriterKey writerKey, long baselineSequence) {
+                Replica targetReplica, WriterKey writerKey, long baselineProgress) {
             assertThat(replayGate).as("a replay gate may be installed only once").isNull();
-            replayGate = new ReplayGate(targetReplica, writerKey, baselineSequence);
+            replayGate = new ReplayGate(targetReplica, writerKey, baselineProgress);
             return replayGate;
         }
 

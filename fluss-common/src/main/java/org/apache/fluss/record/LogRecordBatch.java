@@ -158,16 +158,16 @@ public interface LogRecordBatch {
      */
     int batchSequence();
 
-    /** Get the opaque writer key for a protocol V1 target WAL batch. */
-    default WriterKey fencedWriterKey() {
+    /** Get the writer key for a cumulative-progress target WAL batch. */
+    default WriterKey writerKey() {
         throw new UnsupportedOperationException(
-                "Fenced writer key is not supported for magic v" + magic());
+                "Writer key is not supported for magic v" + magic());
     }
 
-    /** Get the 64-bit sequence fence for a protocol V1 target WAL batch. */
-    default long fencedSequence() {
+    /** Get the cumulative writer progress for a target WAL batch. */
+    default long writerProgress() {
         throw new UnsupportedOperationException(
-                "Fenced sequence is not supported for magic v" + magic());
+                "Writer progress is not supported for magic v" + magic());
     }
 
     /**

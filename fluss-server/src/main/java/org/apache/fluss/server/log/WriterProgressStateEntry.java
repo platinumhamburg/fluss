@@ -21,24 +21,21 @@ import org.apache.fluss.record.WriterKey;
 
 import java.util.Objects;
 
-/** Latest accepted fence for an opaque V1 writer key. */
-public final class FencedWriterStateEntry {
+/** Latest cumulative progress accepted for a writer key. */
+public final class WriterProgressStateEntry {
     private final WriterKey writerKey;
-    private final long lastSequence;
-    private final long dominatingTargetWalOffset;
+    private final long lastProgress;
+    private final long progressWalOffset;
     private final long lastTimestamp;
 
-    public FencedWriterStateEntry(
-            WriterKey writerKey,
-            long lastSequence,
-            long dominatingTargetWalOffset,
-            long lastTimestamp) {
-        if (lastSequence < 0L) {
-            throw new IllegalArgumentException("lastSequence must be non-negative");
+    public WriterProgressStateEntry(
+            WriterKey writerKey, long lastProgress, long progressWalOffset, long lastTimestamp) {
+        if (lastProgress < 0L) {
+            throw new IllegalArgumentException("lastProgress must be non-negative");
         }
         this.writerKey = Objects.requireNonNull(writerKey, "writerKey");
-        this.lastSequence = lastSequence;
-        this.dominatingTargetWalOffset = dominatingTargetWalOffset;
+        this.lastProgress = lastProgress;
+        this.progressWalOffset = progressWalOffset;
         this.lastTimestamp = lastTimestamp;
     }
 
@@ -46,12 +43,12 @@ public final class FencedWriterStateEntry {
         return writerKey;
     }
 
-    public long lastSequence() {
-        return lastSequence;
+    public long lastProgress() {
+        return lastProgress;
     }
 
-    public long dominatingTargetWalOffset() {
-        return dominatingTargetWalOffset;
+    public long progressWalOffset() {
+        return progressWalOffset;
     }
 
     public long lastTimestamp() {
@@ -63,30 +60,30 @@ public final class FencedWriterStateEntry {
         if (this == other) {
             return true;
         }
-        if (!(other instanceof FencedWriterStateEntry)) {
+        if (!(other instanceof WriterProgressStateEntry)) {
             return false;
         }
-        FencedWriterStateEntry that = (FencedWriterStateEntry) other;
-        return lastSequence == that.lastSequence
-                && dominatingTargetWalOffset == that.dominatingTargetWalOffset
+        WriterProgressStateEntry that = (WriterProgressStateEntry) other;
+        return lastProgress == that.lastProgress
+                && progressWalOffset == that.progressWalOffset
                 && lastTimestamp == that.lastTimestamp
                 && writerKey.equals(that.writerKey);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(writerKey, lastSequence, dominatingTargetWalOffset, lastTimestamp);
+        return Objects.hash(writerKey, lastProgress, progressWalOffset, lastTimestamp);
     }
 
     @Override
     public String toString() {
-        return "FencedWriterStateEntry{"
+        return "WriterProgressStateEntry{"
                 + "writerKey="
                 + writerKey
-                + ", lastSequence="
-                + lastSequence
-                + ", dominatingTargetWalOffset="
-                + dominatingTargetWalOffset
+                + ", lastProgress="
+                + lastProgress
+                + ", progressWalOffset="
+                + progressWalOffset
                 + ", lastTimestamp="
                 + lastTimestamp
                 + '}';

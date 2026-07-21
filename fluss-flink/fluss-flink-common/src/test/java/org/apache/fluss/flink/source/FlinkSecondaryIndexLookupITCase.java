@@ -21,7 +21,6 @@ import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
-import org.apache.fluss.client.table.FlussTable;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
@@ -70,7 +69,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * Integration tests for Flink lookup join through secondary indexes.
  *
  * <p>Validates the full path: DDL with secondary-index config -> LookupNormalizer routing ->
- * FlinkLookupFunction/FlinkAsyncLookupFunction -> FlussTable.getSecondaryIndexLookuper -> results.
+ * FlinkLookupFunction/FlinkAsyncLookupFunction -> Table.getSecondaryIndexLookuper -> results.
  */
 abstract class FlinkSecondaryIndexLookupITCase extends AbstractTestBase {
 
@@ -496,7 +495,7 @@ abstract class FlinkSecondaryIndexLookupITCase extends AbstractTestBase {
             writer.flush();
             waitForSecondaryIndex(table, "idx_name", row("alice"), row("bob"));
 
-            Lookuper lookuper = ((FlussTable) table).getSecondaryIndexLookuper("idx_name");
+            Lookuper lookuper = table.getSecondaryIndexLookuper("idx_name");
 
             // Per-call FlinkAsFlussRow (matches fixed FlinkAsyncLookupFunction pattern)
             GenericRowData key1 = new GenericRowData(1);
@@ -538,12 +537,12 @@ abstract class FlinkSecondaryIndexLookupITCase extends AbstractTestBase {
     }
 
     /**
-     * Polls the secondary index via {@link FlussTable#getSecondaryIndexLookuper} until all expected
+     * Polls the secondary index via {@link Table#getSecondaryIndexLookuper} until all expected
      * lookup keys return non-empty results.
      */
     private static void waitForSecondaryIndex(
             Table table, String indexName, org.apache.fluss.row.InternalRow... expectedKeys) {
-        Lookuper lookuper = ((FlussTable) table).getSecondaryIndexLookuper(indexName);
+        Lookuper lookuper = table.getSecondaryIndexLookuper(indexName);
         for (org.apache.fluss.row.InternalRow key : expectedKeys) {
             waitUntil(
                     () -> !lookuper.lookup(key).get().getRowList().isEmpty(),

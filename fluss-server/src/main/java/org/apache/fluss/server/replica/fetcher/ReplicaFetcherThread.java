@@ -630,16 +630,16 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                     "Failed to truncate and restore writer snapshot for {} while log hash been moved to remote",
                     tb,
                     e);
-            boolean fencedTarget =
+            boolean progressTarget =
                     replica.getTableInfo().getKvIdempotenceProtocol()
-                            == KvIdempotenceProtocol.V1_FENCED;
-            if (fencedTarget) {
+                            == KvIdempotenceProtocol.CUMULATIVE_PROGRESS;
+            if (progressTarget) {
                 replicaManager.markReplicaOffline(tb, replica);
             }
             if (e instanceof Error) {
                 throw (Error) e;
             }
-            if (fencedTarget) {
+            if (progressTarget) {
                 throw new StorageException(
                         "Remote WriterState recovery failed for V1 target bucket " + tb, e);
             }

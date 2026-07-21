@@ -515,23 +515,23 @@ final class LogLoaderTest extends LogTestBase {
     @Test
     void testV1RecoveryFallsBackFromCorruptLatestWithContinuousWal() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
-        LogTablet log = createFencedLogTablet(true);
-        appendFenced(log, writerKey, 100L);
+        LogTablet log = createProgressLogTablet(true);
+        appendProgress(log, writerKey, 100L);
         log.roll(Optional.empty());
-        appendFenced(log, writerKey, 500L);
+        appendProgress(log, writerKey, 500L);
         log.roll(Optional.empty());
-        appendFenced(log, writerKey, 900L);
+        appendProgress(log, writerKey, 900L);
         long recoveryEnd = log.localLogEndOffset();
         log.close();
 
         File corruptLatest = FlussPaths.writerSnapshotFile(logDir, recoveryEnd);
         Files.write(corruptLatest.toPath(), "{\"version\":2}".getBytes());
 
-        LogTablet recovered = createFencedLogTablet(false);
+        LogTablet recovered = createProgressLogTablet(false);
 
-        assertThat(recovered.writerStateManager().lastFencedEntry(writerKey))
+        assertThat(recovered.writerStateManager().lastProgressEntry(writerKey))
                 .get()
-                .extracting(FencedWriterStateEntry::lastSequence)
+                .extracting(WriterProgressStateEntry::lastProgress)
                 .isEqualTo(900L);
         assertThat(recovered.writerStateManager().mapEndOffset()).isEqualTo(recoveryEnd);
         recovered.close();
@@ -540,12 +540,12 @@ final class LogLoaderTest extends LogTestBase {
     @Test
     void testV1RecoveryFallsBackFromEntryValidNewestWithIncompatibleSequence() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
-        LogTablet log = createFencedLogTablet(true);
-        appendFenced(log, writerKey, 100L);
+        LogTablet log = createProgressLogTablet(true);
+        appendProgress(log, writerKey, 100L);
         log.roll(Optional.empty());
-        appendFenced(log, writerKey, 500L);
+        appendProgress(log, writerKey, 500L);
         long recoveryEnd = log.localLogEndOffset();
-        writeFencedSnapshot(1L, writerKey, 900L, 0L);
+        writeProgressSnapshot(1L, writerKey, 900L, 0L);
         log.writerStateManager().reloadSnapshots();
         LogSegments recoverySegments = new LogSegments(log.getTableBucket());
         log.logSegments().forEach(recoverySegments::add);
@@ -557,9 +557,9 @@ final class LogLoaderTest extends LogTestBase {
                 recoveryEnd,
                 false);
 
-        assertThat(log.writerStateManager().lastFencedEntry(writerKey))
+        assertThat(log.writerStateManager().lastProgressEntry(writerKey))
                 .get()
-                .extracting(FencedWriterStateEntry::lastSequence)
+                .extracting(WriterProgressStateEntry::lastProgress)
                 .isEqualTo(500L);
         assertThat(log.writerStateManager().mapEndOffset()).isEqualTo(recoveryEnd);
         assertThat(FlussPaths.writerSnapshotFile(logDir, 1L)).exists();
@@ -569,10 +569,10 @@ final class LogLoaderTest extends LogTestBase {
     @Test
     void testV1RecoveryFallsBackWhenNewestStartsInsideWalBatch() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
-        LogTablet log = createFencedLogTablet(true);
-        appendFencedBatch(log, writerKey, 100L, 3);
+        LogTablet log = createProgressLogTablet(true);
+        appendProgressBatch(log, writerKey, 100L, 3);
         long recoveryEnd = log.localLogEndOffset();
-        writeFencedSnapshot(1L, writerKey, 100L, 0L);
+        writeProgressSnapshot(1L, writerKey, 100L, 0L);
         log.writerStateManager().reloadSnapshots();
         LogSegments recoverySegments = new LogSegments(log.getTableBucket());
         log.logSegments().forEach(recoverySegments::add);
@@ -584,9 +584,9 @@ final class LogLoaderTest extends LogTestBase {
                 recoveryEnd,
                 false);
 
-        assertThat(log.writerStateManager().lastFencedEntry(writerKey))
+        assertThat(log.writerStateManager().lastProgressEntry(writerKey))
                 .get()
-                .extracting(FencedWriterStateEntry::lastSequence)
+                .extracting(WriterProgressStateEntry::lastProgress)
                 .isEqualTo(100L);
         assertThat(log.writerStateManager().mapEndOffset()).isEqualTo(recoveryEnd);
         assertThat(FlussPaths.writerSnapshotFile(logDir, 1L)).exists();
@@ -596,10 +596,10 @@ final class LogLoaderTest extends LogTestBase {
     @Test
     void testV1CleanShutdownWithoutSnapshotFailsWhenRetainedWalStartsAfterZero() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
-        LogTablet log = createFencedLogTablet(true);
-        appendFenced(log, writerKey, 100L);
+        LogTablet log = createProgressLogTablet(true);
+        appendProgress(log, writerKey, 100L);
         log.roll(Optional.empty());
-        appendFenced(log, writerKey, 500L);
+        appendProgress(log, writerKey, 500L);
         LogSegment deletedPrefix = log.getSegments().get(0);
         log.close();
 
@@ -612,7 +612,7 @@ final class LogLoaderTest extends LogTestBase {
                 TestingMetricGroups.TABLET_SERVER_METRICS
                         .indexWriterStateRecoveryCoverageFailures()
                         .getCount();
-        assertThatThrownBy(() -> createFencedLogTablet(true))
+        assertThatThrownBy(() -> createProgressLogTablet(true))
                 .isInstanceOf(CorruptSnapshotException.class)
                 .hasMessageContaining("retained WAL starts at 1");
         assertThat(
@@ -625,8 +625,8 @@ final class LogLoaderTest extends LogTestBase {
     @Test
     void testV1CleanShutdownRejectsCorruptWalWhileRebuildingWriterState() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
-        LogTablet log = createFencedLogTablet(true);
-        appendFenced(log, writerKey, 100L);
+        LogTablet log = createProgressLogTablet(true);
+        appendProgress(log, writerKey, 100L);
         File walFile = log.getSegments().get(0).getFileLogRecords().file();
         log.close();
         for (SnapshotFile snapshot : WriterStateManager.listSnapshotFiles(logDir)) {
@@ -640,7 +640,7 @@ final class LogLoaderTest extends LogTestBase {
             file.write(value ^ 1);
         }
 
-        assertThatThrownBy(() -> createFencedLogTablet(true))
+        assertThatThrownBy(() -> createProgressLogTablet(true))
                 .isInstanceOf(CorruptMessageException.class)
                 .hasMessageContaining("crc");
     }
@@ -648,12 +648,12 @@ final class LogLoaderTest extends LogTestBase {
     @Test
     void testV1CorruptFallbackFailsWhenRetainedWalHasGap() throws Exception {
         WriterKey writerKey = new WriterKey(7L, 8L);
-        LogTablet log = createFencedLogTablet(true);
-        appendFenced(log, writerKey, 100L);
+        LogTablet log = createProgressLogTablet(true);
+        appendProgress(log, writerKey, 100L);
         log.roll(Optional.empty());
-        appendFenced(log, writerKey, 500L);
+        appendProgress(log, writerKey, 500L);
         log.roll(Optional.empty());
-        appendFenced(log, writerKey, 900L);
+        appendProgress(log, writerKey, 900L);
         long recoveryEnd = log.localLogEndOffset();
         LogSegment missingMiddle = log.getSegments().get(1);
         log.close();
@@ -664,7 +664,7 @@ final class LogLoaderTest extends LogTestBase {
         FlussPaths.writerSnapshotFile(logDir, 2L).delete();
         missingMiddle.deleteIfExists();
 
-        assertThatThrownBy(() -> createFencedLogTablet(false))
+        assertThatThrownBy(() -> createProgressLogTablet(false))
                 .isInstanceOf(CorruptSnapshotException.class)
                 .hasMessageContaining("gap")
                 .hasMessageContaining("1")
@@ -828,7 +828,7 @@ final class LogLoaderTest extends LogTestBase {
                 isCleanShutdown);
     }
 
-    private LogTablet createFencedLogTablet(boolean isCleanShutdown) throws Exception {
+    private LogTablet createProgressLogTablet(boolean isCleanShutdown) throws Exception {
         return LogTablet.create(
                 tempDir,
                 PhysicalTablePath.of(DATA1_TABLE_PATH),
@@ -842,32 +842,33 @@ final class LogLoaderTest extends LogTestBase {
                 true,
                 SystemClock.getInstance(),
                 isCleanShutdown,
-                KvIdempotenceProtocol.V1_FENCED);
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
     }
 
-    private static void appendFenced(LogTablet log, WriterKey writerKey, long sequence)
+    private static void appendProgress(LogTablet log, WriterKey writerKey, long progress)
             throws Exception {
-        appendFencedBatch(log, writerKey, sequence, 1);
+        appendProgressBatch(log, writerKey, progress, 1);
     }
 
-    private static void appendFencedBatch(
-            LogTablet log, WriterKey writerKey, long sequence, int recordCount) throws Exception {
+    private static void appendProgressBatch(
+            LogTablet log, WriterKey writerKey, long progress, int recordCount) throws Exception {
         MemoryLogRecordsCompactedBuilder builder =
-                MemoryLogRecordsCompactedBuilder.fencedBuilder(
+                MemoryLogRecordsCompactedBuilder.progressBuilder(
                         DEFAULT_SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), false);
-        builder.setFencedWriterState(writerKey, sequence);
+        builder.setWriterProgress(writerKey, progress);
         for (int recordIndex = 0; recordIndex < recordCount; recordIndex++) {
             builder.append(
                     ChangeType.INSERT,
-                    compactedRow(DATA1_ROW_TYPE, new Object[] {recordIndex, "fenced-" + sequence}));
+                    compactedRow(
+                            DATA1_ROW_TYPE, new Object[] {recordIndex, "progress-" + progress}));
         }
         builder.close();
         log.appendAsLeader(
                 MemoryLogRecords.pointToByteBuffer(builder.build().getByteBuf().nioBuffer()));
     }
 
-    private void writeFencedSnapshot(
-            long snapshotOffset, WriterKey writerKey, long sequence, long dominatingTargetWalOffset)
+    private void writeProgressSnapshot(
+            long snapshotOffset, WriterKey writerKey, long progress, long progressWalOffset)
             throws Exception {
         FlussPaths.writerSnapshotFile(logDir, snapshotOffset).delete();
         WriterStateManager snapshotWriter =
@@ -875,10 +876,10 @@ final class LogLoaderTest extends LogTestBase {
                         new TableBucket(DATA1_TABLE_ID, 0),
                         logDir,
                         (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis(),
-                        KvIdempotenceProtocol.V1_FENCED);
-        FencedWriterAppendInfo appendInfo = snapshotWriter.prepareFencedUpdate(writerKey);
-        appendInfo.append(sequence, dominatingTargetWalOffset, 1L);
-        snapshotWriter.updateFenced(appendInfo);
+                        KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        WriterProgressAppendInfo appendInfo = snapshotWriter.prepareProgressUpdate(writerKey);
+        appendInfo.append(progress, progressWalOffset, 1L);
+        snapshotWriter.updateProgress(appendInfo);
         snapshotWriter.updateMapEndOffset(snapshotOffset);
         snapshotWriter.takeSnapshot();
     }

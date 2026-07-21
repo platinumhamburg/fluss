@@ -40,7 +40,6 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatchReader;
@@ -48,6 +47,7 @@ import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
@@ -61,12 +61,12 @@ import org.apache.fluss.server.kv.UncertainWalAppendException;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
-import org.apache.fluss.server.log.FencedWriterStateEntry;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTabletTestHelper;
 import org.apache.fluss.server.log.LogTabletTestHelper.FaultPhase;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.metadata.BucketMetadata;
 import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.TableMetadata;
@@ -160,10 +160,11 @@ final class ReplicaTest extends ReplicaTestBase {
         KvRecordTestUtils.KvRecordBatchFactory v0Factory =
                 KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
         KvRecordBatch compact = v0Factory.ofRecords(Collections.emptyList(), 11L, 0);
-        KvRecordBatch fenced = emptyFencedBatch(new WriterKey(9L, 3L), 1L);
+        KvRecordBatch progressBatch = emptyProgressBatch(new WriterKey(9L, 3L), 1L);
 
         v0.putRecordsToLeader(compact, null, MergeMode.DEFAULT, 0);
-        assertThatThrownBy(() -> v0.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1))
+        assertThatThrownBy(
+                        () -> v0.putRecordsToLeader(progressBatch, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
 
         TablePath v1Path = TablePath.of("test_db", "protocol_v1");
@@ -194,17 +195,17 @@ final class ReplicaTest extends ReplicaTestBase {
 
         assertThatThrownBy(() -> v1.putRecordsToLeader(compact, null, MergeMode.OVERWRITE, -1))
                 .isInstanceOf(UnsupportedVersionException.class);
-        assertThatThrownBy(() -> v1.putRecordsToLeader(fenced, null, MergeMode.DEFAULT, -1))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(progressBatch, null, MergeMode.DEFAULT, -1))
                 .isInstanceOf(InvalidTableException.class);
-        assertThatThrownBy(() -> v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, 0))
+        assertThatThrownBy(() -> v1.putRecordsToLeader(progressBatch, null, MergeMode.OVERWRITE, 0))
                 .isInstanceOf(InvalidTableException.class);
-        v1.putRecordsToLeader(fenced, null, MergeMode.OVERWRITE, -1);
+        v1.putRecordsToLeader(progressBatch, null, MergeMode.OVERWRITE, -1);
 
         conf.set(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER, 2);
         assertThatThrownBy(
                         () ->
                                 v0.putRecordsToLeader(
-                                        emptyFencedBatch(new WriterKey(9L, 4L), 2L),
+                                        emptyProgressBatch(new WriterKey(9L, 4L), 2L),
                                         null,
                                         MergeMode.OVERWRITE,
                                         -1))
@@ -214,7 +215,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThatThrownBy(
                         () ->
                                 v1.putRecordsToLeader(
-                                        emptyFencedBatch(new WriterKey(9L, 5L), 2L),
+                                        emptyProgressBatch(new WriterKey(9L, 5L), 2L),
                                         null,
                                         MergeMode.DEFAULT,
                                         -1))
@@ -224,22 +225,23 @@ final class ReplicaTest extends ReplicaTestBase {
     @Test
     void testAfterPutAdmissionHookHasScopedOwnership() throws Exception {
         TableBucket tableBucket = new TableBucket(998L, 0);
-        Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 998L, tableBucket);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 998L, tableBucket);
         WriterKey writerKey = new WriterKey(17L, 9L);
         AtomicInteger hookCalls = new AtomicInteger();
 
         AutoCloseable first =
                 replica.installAfterPutAdmissionHook(
                         records -> {
-                            assertThat(records.fencedWriterKey()).isEqualTo(writerKey);
-                            assertThat(records.fencedSequence()).isEqualTo(100L);
+                            assertThat(records.writerKey()).isEqualTo(writerKey);
+                            assertThat(records.writerProgress()).isEqualTo(100L);
                             hookCalls.incrementAndGet();
                         });
         assertThatThrownBy(() -> replica.installAfterPutAdmissionHook(ignored -> {}))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("already installed");
         replica.putRecordsToLeader(
-                emptyFencedBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
+                emptyProgressBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
         first.close();
 
         try (AutoCloseable replacement =
@@ -247,10 +249,10 @@ final class ReplicaTest extends ReplicaTestBase {
             // A stale owner must not clear the replacement registration.
             first.close();
             replica.putRecordsToLeader(
-                    emptyFencedBatch(writerKey, 101L), null, MergeMode.OVERWRITE, -1);
+                    emptyProgressBatch(writerKey, 101L), null, MergeMode.OVERWRITE, -1);
         }
         replica.putRecordsToLeader(
-                emptyFencedBatch(writerKey, 102L), null, MergeMode.OVERWRITE, -1);
+                emptyProgressBatch(writerKey, 102L), null, MergeMode.OVERWRITE, -1);
 
         assertThat(hookCalls).hasValue(2);
     }
@@ -258,7 +260,8 @@ final class ReplicaTest extends ReplicaTestBase {
     @Test
     void testUncertainV1AppendFailStopsExactlyOnce() throws Exception {
         TableBucket tableBucket = new TableBucket(994L, 0);
-        Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 994L, tableBucket);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 994L, tableBucket);
         AtomicInteger fatalErrors = installCountingFatalHandler(replica);
         LogTabletTestHelper.failOnceAt(
                 replica.getLogTablet(),
@@ -268,7 +271,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThatThrownBy(
                         () ->
                                 replica.putRecordsToLeader(
-                                        emptyFencedBatch(new WriterKey(7L, 3L), 100L),
+                                        emptyProgressBatch(new WriterKey(7L, 3L), 100L),
                                         null,
                                         MergeMode.OVERWRITE,
                                         -1))
@@ -278,7 +281,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThatThrownBy(
                         () ->
                                 replica.putRecordsToLeader(
-                                        emptyFencedBatch(new WriterKey(7L, 3L), 101L),
+                                        emptyProgressBatch(new WriterKey(7L, 3L), 101L),
                                         null,
                                         MergeMode.OVERWRITE,
                                         -1))
@@ -289,7 +292,8 @@ final class ReplicaTest extends ReplicaTestBase {
     @Test
     void testUncertainV1ErrorFailStopsAndRethrowsSameError() throws Exception {
         TableBucket tableBucket = new TableBucket(995L, 0);
-        Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 995L, tableBucket);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 995L, tableBucket);
         AtomicInteger fatalErrors = installCountingFatalHandler(replica);
         AssertionError injected = new AssertionError("injected fatal append error");
         LogTabletTestHelper.failOnceAt(
@@ -298,7 +302,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThatThrownBy(
                         () ->
                                 replica.putRecordsToLeader(
-                                        emptyFencedBatch(new WriterKey(8L, 4L), 100L),
+                                        emptyProgressBatch(new WriterKey(8L, 4L), 100L),
                                         null,
                                         MergeMode.OVERWRITE,
                                         -1))
@@ -314,18 +318,19 @@ final class ReplicaTest extends ReplicaTestBase {
         TableBucket tableBucket = new TableBucket(tableId, 0);
         TablePath tablePath = TablePath.of("test_db", "matrix_1");
         Replica replica =
-                makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, tableId, tableBucket);
+                makeProtocolReplica(
+                        KvIdempotenceProtocol.CUMULATIVE_PROGRESS, tableId, tableBucket);
         WriterKey writerKey = new WriterKey(8L, 5L);
         replica.putRecordsToLeader(
-                emptyFencedBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
+                emptyProgressBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
         replica.putRecordsToLeader(
-                emptyFencedBatch(writerKey, 500L), null, MergeMode.OVERWRITE, -1);
+                emptyProgressBatch(writerKey, 500L), null, MergeMode.OVERWRITE, -1);
         replica.putRecordsToLeader(
-                emptyFencedBatch(writerKey, 900L), null, MergeMode.OVERWRITE, -1);
-        FencedWriterStateEntry stateBefore =
+                emptyProgressBatch(writerKey, 900L), null, MergeMode.OVERWRITE, -1);
+        WriterProgressStateEntry stateBefore =
                 replica.getLogTablet()
                         .writerStateManager()
-                        .lastFencedEntry(writerKey)
+                        .lastProgressEntry(writerKey)
                         .orElseThrow(AssertionError::new);
 
         replica.makeFollower(
@@ -348,7 +353,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThatThrownBy(() -> replica.truncateTo(2L)).isInstanceOf(StorageException.class);
 
         assertThat(replica.isOnline()).isFalse();
-        assertThat(replica.getLogTablet().writerStateManager().lastFencedEntry(writerKey))
+        assertThat(replica.getLogTablet().writerStateManager().lastProgressEntry(writerKey))
                 .contains(stateBefore);
         assertThatThrownBy(
                         () ->
@@ -374,7 +379,8 @@ final class ReplicaTest extends ReplicaTestBase {
     @Test
     void testAdmittedPutQueuedBehindUncertainAppendIsRejected() throws Exception {
         TableBucket tableBucket = new TableBucket(996L, 0);
-        Replica replica = makeProtocolReplica(KvIdempotenceProtocol.V1_FENCED, 996L, tableBucket);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 996L, tableBucket);
         AtomicInteger fatalErrors = installCountingFatalHandler(replica);
         CountDownLatch firstPutInAppend = new CountDownLatch(1);
         CountDownLatch failFirstPut = new CountDownLatch(1);
@@ -395,7 +401,7 @@ final class ReplicaTest extends ReplicaTestBase {
         try {
             CompletableFuture<Throwable> first =
                     capturePutFailure(
-                            executor, replica, emptyFencedBatch(new WriterKey(7L, 3L), 100L));
+                            executor, replica, emptyProgressBatch(new WriterKey(7L, 3L), 100L));
             assertThat(firstPutInAppend.await(10, TimeUnit.SECONDS)).isTrue();
 
             admissionHook =
@@ -404,7 +410,7 @@ final class ReplicaTest extends ReplicaTestBase {
             setPutLockContentionHook(replica.getKvTablet(), secondPutContendedOnKvLock::countDown);
             CompletableFuture<Throwable> second =
                     capturePutFailure(
-                            executor, replica, emptyFencedBatch(new WriterKey(7L, 3L), 101L));
+                            executor, replica, emptyProgressBatch(new WriterKey(7L, 3L), 101L));
 
             assertThat(secondPutAdmitted.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(secondPutContendedOnKvLock.await(10, TimeUnit.SECONDS)).isTrue();
@@ -458,15 +464,15 @@ final class ReplicaTest extends ReplicaTestBase {
         return fatalErrors;
     }
 
-    private static KvRecordBatch emptyFencedBatch(WriterKey writerKey, long sequence)
+    private static KvRecordBatch emptyProgressBatch(WriterKey writerKey, long progress)
             throws Exception {
-        FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         DEFAULT_SCHEMA_ID,
                         1024,
                         new UnmanagedPagedOutputView(128),
                         KvFormat.COMPACTED);
-        builder.setWriterState(writerKey, sequence);
+        builder.setWriterState(writerKey, progress);
         return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
@@ -492,13 +498,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(kvReplica.getKvTablet()).isNotNull();
     }
 
-    /**
-     * P2T9 regression: the empty-indexes leader-promotion path must NOT construct an {@link
-     * org.apache.fluss.server.index.IndexReplicator}. {@code DATA1_TABLE_INFO_PK} (the KV table
-     * fixture this test base uses) declares no secondary indexes, so the scheduler field must
-     * remain {@code null} after {@code makeLeader} and after a subsequent demote-via-follower
-     * cycle.
-     */
+    /** A table without secondary indexes must not create an index replicator. */
     @Test
     void testIndexReplicatorNotConstructedForTableWithoutIndexes() throws Exception {
         Replica kvReplica =
@@ -516,48 +516,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(kvReplica.getIndexReplicator()).isNull();
     }
 
-    /**
-     * P2T11 regression: leader promotion must invoke the WAL-replay recovery hook AFTER the index
-     * push scheduler field is assigned (so that re-submitted records land on a live pipeline). For
-     * a non-indexed table (this fixture), the hook is unreachable because the scheduler is never
-     * built — verify the leader path still completes cleanly, the scheduler stays {@code null}, and
-     * a seeded index pushed offset is preserved across the promotion (i.e. the recovery code path
-     * produced no side effect on the watermark).
-     */
-    @Test
-    void testRecoverIndexPushFromWalIsInvokedAfterSchedulerStarts() throws Exception {
-        Replica kvReplica =
-                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
-
-        // Seed a non-trivial index pushed offset to simulate a checkpoint-loaded value. The
-        // recovery hook (if it were active) would compare this against HW; for a non-indexed
-        // table the hook is never reached, so the seed must survive the promotion verbatim.
-        kvReplica.seedIndexPushedOffsetOnLoad(5L);
-        assertThat(kvReplica.getSyncIndexPushedOffset()).isEqualTo(5L);
-
-        makeKvReplicaAsLeader(kvReplica);
-
-        assertThat(kvReplica.getIndexReplicator())
-                .as("Non-indexed table must not construct an IndexReplicator.")
-                .isNull();
-        assertThat(kvReplica.getSyncIndexPushedOffset())
-                .as("Recovery hook must not mutate the seeded sync index pushed offset.")
-                .isEqualTo(5L);
-
-        // Demote → re-promote: recovery hook must still be safe to invoke on each promotion.
-        makeKvReplicaAsFollower(kvReplica, INITIAL_LEADER_EPOCH + 1);
-        makeKvReplicaAsLeader(kvReplica, INITIAL_LEADER_EPOCH + 2);
-        assertThat(kvReplica.getIndexReplicator()).isNull();
-        assertThat(kvReplica.getSyncIndexPushedOffset()).isEqualTo(5L);
-    }
-
-    /**
-     * P3T14 regression: when {@link Replica#maybeStartIndexReplicator()} runs on leader promotion
-     * but the auto-derived Index Table is not yet visible in the local {@link
-     * org.apache.fluss.server.metadata.TabletServerMetadataCache}, the scheduler must NOT crash
-     * with {@code IllegalStateException}. Instead it must defer initialization (set the deferred
-     * flag) so the next cluster-metadata update can retry it.
-     */
+    /** Index replication initialization waits until the Index Table metadata is locally visible. */
     @Test
     void testIndexReplicatorInitDefersWhenIndexTableNotYetInCache() throws Exception {
         IndexedFixture f = setupIndexedMainTableReplica();
@@ -739,11 +698,7 @@ final class ReplicaTest extends ReplicaTestBase {
                 .isTrue();
     }
 
-    /**
-     * P3T14 retry path: after the auto-derived Index Table propagates into the cache, the next
-     * cluster-metadata update (or an explicit {@code retryMaybeStartIndexReplicator()} call) must
-     * wire the scheduler and clear the deferred flag.
-     */
+    /** A metadata update retries deferred index replication initialization. */
     @Test
     void testIndexReplicatorInitRetriesAfterMetadataUpdate() throws Exception {
         IndexedFixture f = setupIndexedMainTableReplica();
@@ -1614,7 +1569,7 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Helpers for the P3T14 deferred / retry tests.
+    // Helpers for deferred index-replicator initialization tests.
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -1808,7 +1763,8 @@ final class ReplicaTest extends ReplicaTestBase {
             byte batchMagic,
             boolean accepted)
             throws Exception {
-        long tableId = tableProtocol == KvIdempotenceProtocol.V0_COMPACT ? 992L : 993L;
+        long tableId =
+                tableProtocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE ? 992L : 993L;
         TableBucket tableBucket = new TableBucket(tableId, 0);
         Replica replica = makeProtocolReplica(tableProtocol, tableId, tableBucket);
         BytesView encoded = encodedKvBatch(batchMagic);
@@ -1839,12 +1795,18 @@ final class ReplicaTest extends ReplicaTestBase {
 
     private static Stream<Arguments> putKvProtocolMatrix() {
         return Stream.of(
-                Arguments.of(KvIdempotenceProtocol.V0_COMPACT, (short) 1, (byte) 0, true),
-                Arguments.of(KvIdempotenceProtocol.V0_COMPACT, (short) 2, (byte) 0, true),
-                Arguments.of(KvIdempotenceProtocol.V0_COMPACT, (short) 2, (byte) 1, false),
-                Arguments.of(KvIdempotenceProtocol.V1_FENCED, (short) 1, (byte) 1, false),
-                Arguments.of(KvIdempotenceProtocol.V1_FENCED, (short) 2, (byte) 0, false),
-                Arguments.of(KvIdempotenceProtocol.V1_FENCED, (short) 2, (byte) 1, true));
+                Arguments.of(
+                        KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE, (short) 1, (byte) 0, true),
+                Arguments.of(
+                        KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE, (short) 2, (byte) 0, true),
+                Arguments.of(
+                        KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE,
+                        (short) 2,
+                        (byte) 1,
+                        false),
+                Arguments.of(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, (short) 1, (byte) 1, false),
+                Arguments.of(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, (short) 2, (byte) 0, false),
+                Arguments.of(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, (short) 2, (byte) 1, true));
     }
 
     private Replica makeProtocolReplica(
@@ -1891,8 +1853,8 @@ final class ReplicaTest extends ReplicaTestBase {
             builder.setWriterState(11L, 0);
             return builder.build();
         }
-        FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         DEFAULT_SCHEMA_ID,
                         1024,
                         new UnmanagedPagedOutputView(128),

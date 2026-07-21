@@ -36,7 +36,7 @@ class TableInfoIndexTableTest {
         TableInfo tableInfo = createPrimaryKeyTableInfo(Collections.emptyMap());
 
         assertThat(tableInfo.getKvIdempotenceProtocol())
-                .isEqualTo(KvIdempotenceProtocol.V0_COMPACT);
+                .isEqualTo(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
     }
 
     @Test
@@ -46,7 +46,8 @@ class TableInfoIndexTableTest {
                         Collections.singletonMap(
                                 ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(), "1"));
 
-        assertThat(tableInfo.getKvIdempotenceProtocol()).isEqualTo(KvIdempotenceProtocol.V1_FENCED);
+        assertThat(tableInfo.getKvIdempotenceProtocol())
+                .isEqualTo(KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
     }
 
     @Test
@@ -61,7 +62,6 @@ class TableInfoIndexTableTest {
                 TableDescriptor.builder()
                         .schema(indexSchema)
                         .distributedBy(4, "u")
-                        .property(ConfigOptions.TABLE_TYPE, TableType.INDEX_TABLE)
                         .property(ConfigOptions.TABLE_INDEX_META_MAIN_TABLE_ID, 7L)
                         .build();
 
@@ -77,6 +77,7 @@ class TableInfoIndexTableTest {
                         now);
 
         assertThat(info.isIndexTable()).isTrue();
+        assertThat(idxD.isIndexTable()).isTrue();
         assertThat(info.getMainTableId()).isEqualTo(OptionalLong.of(7L));
     }
 
@@ -89,6 +90,7 @@ class TableInfoIndexTableTest {
         TableInfo info = TableInfo.of(TablePath.of("db", "t"), 1L, 1, d, null, now, now);
 
         assertThat(info.isIndexTable()).isFalse();
+        assertThat(d.isIndexTable()).isFalse();
         assertThat(info.getMainTableId()).isEmpty();
     }
 

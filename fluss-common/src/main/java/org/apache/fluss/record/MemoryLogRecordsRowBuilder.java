@@ -58,7 +58,7 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
     private long writerId;
     private int batchSequence;
     private WriterKey writerKey;
-    private long fencedSequence;
+    private long writerProgress;
     private int currentRecordNumber;
     private int sizeInBytes;
     private volatile boolean isClosed;
@@ -83,7 +83,7 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
         this.firstSegment = pagedOutputView.getCurrentSegment();
         this.writerId = NO_WRITER_ID;
         this.batchSequence = NO_BATCH_SEQUENCE;
-        this.fencedSequence = -1L;
+        this.writerProgress = -1L;
         this.currentRecordNumber = 0;
         this.isClosed = false;
 
@@ -154,12 +154,12 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
         this.batchSequence = batchBaseSequence;
     }
 
-    public void setFencedWriterState(WriterKey writerKey, long sequence) {
-        checkState(magic == LOG_MAGIC_VALUE_V3, "Fenced writer state requires WAL magic v3");
-        checkArgument(sequence >= 0L, "fenced sequence must be non-negative");
+    public void setWriterProgress(WriterKey writerKey, long progress) {
+        checkState(magic == LOG_MAGIC_VALUE_V3, "Cumulative writer progress requires WAL magic v3");
+        checkArgument(progress >= 0L, "writer progress must be non-negative");
         this.builtBuffer = null;
         this.writerKey = checkNotNull(writerKey);
-        this.fencedSequence = sequence;
+        this.writerProgress = progress;
     }
 
     public void resetWriterState(long writerId, int batchSequence) {
@@ -239,7 +239,7 @@ public abstract class MemoryLogRecordsRowBuilder<T> implements AutoCloseable {
         if (magic == LOG_MAGIC_VALUE_V3) {
             outputView.writeLong(writerKey.high());
             outputView.writeLong(writerKey.low());
-            outputView.writeLong(fencedSequence);
+            outputView.writeLong(writerProgress);
         } else {
             outputView.writeLong(writerId);
             outputView.writeInt(batchSequence);

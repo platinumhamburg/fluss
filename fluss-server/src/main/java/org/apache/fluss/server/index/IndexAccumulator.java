@@ -105,7 +105,7 @@ public final class IndexAccumulator {
         this(Long.MAX_VALUE, Long.MAX_VALUE);
     }
 
-    /** Creates an accumulator using the same legacy bound per producer and in total. */
+    /** Creates an accumulator using the same bound per producer and in total. */
     public IndexAccumulator(long maxPendingBytes) {
         this(maxPendingBytes, maxPendingBytes);
     }

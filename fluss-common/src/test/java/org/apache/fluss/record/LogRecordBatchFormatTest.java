@@ -27,7 +27,6 @@ import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.batchSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.crcOffset;
-import static org.apache.fluss.record.LogRecordBatchFormat.fencedSequenceOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.lastOffsetDeltaOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.leaderEpochOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize;
@@ -38,6 +37,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.statisticsLengthOffse
 import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyHighOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyLowOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerProgressOffset;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -118,7 +118,7 @@ public class LogRecordBatchFormatTest {
         assertThat(lastOffsetDeltaOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(32);
         assertThat(writerKeyHighOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(36);
         assertThat(writerKeyLowOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(44);
-        assertThat(fencedSequenceOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(52);
+        assertThat(writerProgressOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(52);
         assertThat(recordsCountOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(60);
         assertThat(statisticsLengthOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(64);
         assertThat(statisticsDataOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(68);

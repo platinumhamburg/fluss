@@ -21,9 +21,9 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.TestData;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.WriterKey;
@@ -157,16 +157,16 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                 Arguments.of(FaultPhase.AFTER_WRITER_STATE_UPDATE, WalOutcome.LOST));
     }
 
-    private static void assertWriterState(LogTablet logTablet, long sequence) {
+    private static void assertWriterState(LogTablet logTablet, long progress) {
         assertThat(
                         logTablet
                                 .writerStateManager()
-                                .lastFencedEntry(WRITER_KEY)
+                                .lastProgressEntry(WRITER_KEY)
                                 .orElseThrow(AssertionError::new))
                 .satisfies(
                         state -> {
-                            assertThat(state.lastSequence()).isEqualTo(sequence);
-                            assertThat(state.dominatingTargetWalOffset()).isZero();
+                            assertThat(state.lastProgress()).isEqualTo(progress);
+                            assertThat(state.progressWalOffset()).isZero();
                         });
     }
 
@@ -237,7 +237,7 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                 true,
                 SystemClock.getInstance(),
                 false,
-                KvIdempotenceProtocol.V1_FENCED);
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
     }
 
     private KvTablet createReplacementKv(Fixture fixture) throws Exception {
@@ -328,10 +328,10 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                 ValueEncoder.encodeValue(SCHEMA_ID, expectedRow));
     }
 
-    private static KvRecordBatch mutation(WriterKey key, long sequence, String value)
+    private static KvRecordBatch mutation(WriterKey key, long progress, String value)
             throws Exception {
-        FencedKvRecordBatchBuilder builder =
-                FencedKvRecordBatchBuilder.builder(
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
                         SCHEMA_ID, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
         BinaryRow row =
                 compactedRow(TestData.DATA1_SCHEMA_PK.getRowType(), new Object[] {1, value});
@@ -339,7 +339,7 @@ class IndexWalAppendFailureTest extends ReplicaTestBase {
                 new CompactedKeyEncoder(TestData.DATA1_SCHEMA_PK.getRowType(), new int[] {0})
                         .encodeKey(row),
                 row);
-        builder.setWriterState(key, sequence);
+        builder.setWriterState(key, progress);
         return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 

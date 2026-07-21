@@ -42,20 +42,20 @@ public class IndexWalBuilder implements WalBuilder {
         this(schemaId, memorySegmentPool, false);
     }
 
-    private IndexWalBuilder(int schemaId, MemorySegmentPool memorySegmentPool, boolean fenced)
+    private IndexWalBuilder(int schemaId, MemorySegmentPool memorySegmentPool, boolean progressMode)
             throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         // unlimited write size as we don't know the WAL size in advance
         this.recordsBuilder =
-                fenced
-                        ? MemoryLogRecordsIndexedBuilder.fencedBuilder(
+                progressMode
+                        ? MemoryLogRecordsIndexedBuilder.progressBuilder(
                                 schemaId, Integer.MAX_VALUE, outputView, false)
                         : MemoryLogRecordsIndexedBuilder.builder(
                                 schemaId, Integer.MAX_VALUE, outputView, false);
     }
 
-    public static IndexWalBuilder fencedBuilder(int schemaId, MemorySegmentPool memorySegmentPool)
+    public static IndexWalBuilder progressBuilder(int schemaId, MemorySegmentPool memorySegmentPool)
             throws IOException {
         return new IndexWalBuilder(schemaId, memorySegmentPool, true);
     }
@@ -84,8 +84,8 @@ public class IndexWalBuilder implements WalBuilder {
     }
 
     @Override
-    public void setFencedWriterState(WriterKey writerKey, long sequence) {
-        recordsBuilder.setFencedWriterState(writerKey, sequence);
+    public void setWriterProgress(WriterKey writerKey, long progress) {
+        recordsBuilder.setWriterProgress(writerKey, progress);
     }
 
     @Override

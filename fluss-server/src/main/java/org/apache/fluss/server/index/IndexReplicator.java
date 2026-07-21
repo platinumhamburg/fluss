@@ -25,11 +25,11 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.DefaultKvRecord;
-import org.apache.fluss.record.FencedKvRecordBatch;
-import org.apache.fluss.record.FencedKvRecordBatchBuilder;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
+import org.apache.fluss.record.ProgressKvRecordBatch;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.BinaryRow;
@@ -62,12 +62,13 @@ import java.util.function.BiConsumer;
  * WAL-driven index replicator that reads committed WAL entries, derives index mutations, and stages
  * them as pre-encoded {@link IndexBatch}es in the server-global {@link IndexAccumulator}. No
  * intermediate heap objects ({@code IndexMutation}) are created — derivation writes directly to
- * per-target-bucket {@link FencedKvRecordBatchBuilder}s.
+ * per-target-bucket {@link ProgressKvRecordBatchBuilder}s.
  *
  * <p>Each secondary index has its own pushed offset and at most one {@link IndexWindow} in flight.
  * {@link #poll()} reads the next valid window for every index that is currently ready. Window ends
- * may differ after failover because they depend on the fetched input and derived output size; the
- * target-side WriterState fence provides idempotence across those valid trajectories.
+ * may differ after failover because they depend on the fetched input and derived output size. The
+ * source advances only completed windows and replays from persisted progress after recovery; the
+ * target rejects requests behind its stored writer progress.
  *
  * <p>Driven by {@link #poll()} calls from an {@code IndexReplicatorPool} read worker.
  */
@@ -1079,7 +1080,7 @@ public final class IndexReplicator implements AutoCloseable {
             for (Mutation operation : operations) {
                 if (!builders.containsKey(operation.targetBucket)
                         && !operation.targetBucket.equals(firstNewBucket)) {
-                    delta += FencedKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
+                    delta += ProgressKvRecordBatch.RECORD_BATCH_HEADER_SIZE;
                     firstNewBucket = operation.targetBucket;
                 }
                 delta += operation.recordSize;
@@ -1123,12 +1124,12 @@ public final class IndexReplicator implements AutoCloseable {
     /** Per-target-bucket builder that directly encodes KV records. */
     static final class BucketBatchBuilder {
         private final UnmanagedPagedOutputView output;
-        final FencedKvRecordBatchBuilder builder;
+        final ProgressKvRecordBatchBuilder builder;
 
         BucketBatchBuilder(short schemaId, KvFormat kvFormat) {
             this.output = new UnmanagedPagedOutputView(PAGE_SIZE);
             this.builder =
-                    FencedKvRecordBatchBuilder.builder(
+                    ProgressKvRecordBatchBuilder.builder(
                             schemaId, Integer.MAX_VALUE, output, kvFormat);
         }
 

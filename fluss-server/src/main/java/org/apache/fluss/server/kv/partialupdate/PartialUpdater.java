@@ -72,13 +72,10 @@ public class PartialUpdater {
      *   <li>Every primary-key column is present in {@code targetColumns} — so PK values always come
      *       from {@code partialValue} at merge time, never from {@code oldValue} or the "missing
      *       old field" null fallback.
-     *   <li>Every non-PK column is {@link DataType#isNullable() nullable} — note this is stricter
-     *       than the historical comment suggests: the check is on {@code !pkColumnSet.get(i)}, so
-     *       it applies to ALL non-PK columns regardless of whether they appear in {@code
-     *       targetColumns}. This forbids the configuration that would let {@link
-     *       #updateRow(BinaryValue, BinaryValue)} legitimately produce a NOT NULL column whose
-     *       value is null (either because it is absent from the partial-update target set, or
-     *       because the old row from an evolved schema lacked it).
+     *   <li>Every column other than primary-key and auto-increment columns is {@link
+     *       DataType#isNullable() nullable}. This applies whether or not the column appears in
+     *       {@code targetColumns}. Auto-increment columns are filled by the server for inserts and
+     *       preserved from the stored row for updates.
      * </ol>
      *
      * <p>Because both invariants are enforced at construction time, no per-row runtime guard for
@@ -87,6 +84,7 @@ public class PartialUpdater {
      */
     private void sanityCheck(Schema schema, int[] targetColumns) {
         BitSet pkColumnSet = new BitSet();
+        BitSet autoIncrementColumnSet = new BitSet();
         // check the target columns contains the primary key
         for (int pkIndex : schema.getPrimaryKeyIndexes()) {
             if (!partialUpdateCols.get(pkIndex)) {
@@ -99,17 +97,18 @@ public class PartialUpdater {
             pkColumnSet.set(pkIndex);
         }
 
-        // every non-PK column must be nullable so that:
-        //   (a) non-target non-PK columns can be safely left as null in updateRow / set to null
-        //       in deleteRow, and
-        //   (b) when oldValue is from an evolved-schema row with fewer fields, the missing-field
-        //       null fallback in updateRow is type-safe.
+        for (String columnName : schema.getAutoIncrementColumnNames()) {
+            autoIncrementColumnSet.set(schema.getColumnNames().indexOf(columnName));
+        }
+
+        // Every ordinary non-PK column must be nullable so that omitted fields and fields missing
+        // from an older row can safely be represented as null during a partial merge.
         for (int i = 0; i < fieldDataTypes.length; i++) {
-            if (!pkColumnSet.get(i)) {
+            if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i)) {
                 if (!fieldDataTypes[i].isNullable()) {
                     throw new InvalidTargetColumnException(
                             String.format(
-                                    "Partial Update requires all columns except primary key to be nullable, but column %s is NOT NULL.",
+                                    "Partial Update requires all columns except primary key and auto-increment columns to be nullable, but column %s is NOT NULL.",
                                     schema.getRowType().getFieldNames().get(i)));
                 }
             }
@@ -122,9 +121,9 @@ public class PartialUpdater {
      * set to null.
      *
      * <p>No runtime "NOT NULL column ended up null" guard is needed here: the constructor-time
-     * {@link #sanityCheck(Schema, int[])} establishes that every non-PK column is nullable and
-     * every PK column is in the target set. Together those invariants make every {@code null}
-     * written by the loop below type-safe — see the sanityCheck javadoc for the full rationale.
+     * {@link #sanityCheck(Schema, int[])} establishes that every ordinary non-PK column is nullable
+     * and every PK column is in the target set. Auto-increment columns are populated after an
+     * insert merge and preserved from the old row during an update.
      *
      * @param oldValue the old value to be updated
      * @param partialValue the new value to be updated.
