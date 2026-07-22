@@ -60,6 +60,19 @@ class ScanAndCleanFunctionTest {
     }
 
     @Test
+    void splitsRemoteFsRateEvenlyAcrossScanSubtasks() {
+        assertThat(ScanAndCleanFunction.perSubtaskRate(100L, 16)).isEqualTo(6.25d);
+    }
+
+    @Test
+    void keepsJobLimitWhenParallelismExceedsRate() {
+        double perSubtask = ScanAndCleanFunction.perSubtaskRate(3L, 8);
+
+        assertThat(perSubtask).isEqualTo(0.375d);
+        assertThat(perSubtask * 8).isEqualTo(3.0d);
+    }
+
+    @Test
     void forwardsScopeSummaryWithoutOpeningFilesystemState() throws Exception {
         ScopePlanStats plan = new ScopePlanStats();
         ScopeSummaryTask marker = ScopeSummaryTask.from(plan);
