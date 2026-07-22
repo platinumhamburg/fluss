@@ -99,6 +99,11 @@ public final class FlussConnection implements Connection {
     }
 
     @Override
+    public Admin createAdmin() {
+        return new FlussAdmin(rpcClient, metadataUpdater);
+    }
+
+    @Override
     public Table getTable(TablePath tablePath) {
         // force to update the table info from server to avoid stale data in cache.
         metadataUpdater.updateTableOrPartitionMetadata(tablePath, null);

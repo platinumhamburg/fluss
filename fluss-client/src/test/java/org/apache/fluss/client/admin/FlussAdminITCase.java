@@ -158,12 +158,21 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
     void testMultiClient() throws Exception {
         Admin admin1 = conn.getAdmin();
         Admin admin2 = conn.getAdmin();
-        assertThat(admin1).isEqualTo(admin2);
+        assertThat(admin1).isSameAs(admin2);
 
         TableInfo t1 = admin1.getTableInfo(DEFAULT_TABLE_PATH).get();
         TableInfo t2 = admin2.getTableInfo(DEFAULT_TABLE_PATH).get();
         assertThat(t1).isEqualTo(t2);
 
+        try (Admin ownedAdmin1 = conn.createAdmin();
+                Admin ownedAdmin2 = conn.createAdmin()) {
+            assertThat(ownedAdmin1).isNotSameAs(admin1).isNotSameAs(ownedAdmin2);
+            assertThat(ownedAdmin2).isNotSameAs(admin1);
+
+            TableInfo t3 = ownedAdmin1.getTableInfo(DEFAULT_TABLE_PATH).get();
+            TableInfo t4 = ownedAdmin2.getTableInfo(DEFAULT_TABLE_PATH).get();
+            assertThat(t1).isEqualTo(t3).isEqualTo(t4);
+        }
         admin1.close();
         admin2.close();
     }
