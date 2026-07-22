@@ -34,10 +34,6 @@ import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
-import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
-import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
-import org.apache.fluss.flink.action.orphan.build.KvSharedSstFetchResult;
-import org.apache.fluss.flink.action.orphan.build.LogActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.MaxKnownIdsTracker;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.rule.OrphanDirDetector;
@@ -64,7 +60,6 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -76,11 +71,9 @@ import java.util.function.Predicate;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.enumerateBuckets;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.fetchClusterConfigMap;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.normalizeRoot;
-import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.physicalPath;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.remoteSubDir;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.resolveClusterRemoteDataDir;
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.resolveClusterRemoteDataDirs;
-import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.resolveRemoteDataDir;
 
 /**
  * Stage 1 of the orphan files cleanup job. Runs at parallelism=1 and concentrates all coordinator
@@ -131,7 +124,18 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             throws Exception {
         Throwable processingFailure = null;
         try {
-            Configuration flussConfig = createFlussClientConfiguration(config);
+            if (!config.extraConfigs().isEmpty()) {
+                FileSystem.initialize(Configuration.fromMap(config.extraConfigs()), null);
+            }
+
+            Configuration flussConfig = new Configuration();
+            flussConfig.setString(ConfigOptions.BOOTSTRAP_SERVERS.key(), config.bootstrapServer());
+            // Pass through client-related extra configs (e.g. security/auth).
+            for (Map.Entry<String, String> entry : config.extraConfigs().entrySet()) {
+                if (entry.getKey().startsWith("client.")) {
+                    flussConfig.setString(entry.getKey(), entry.getValue());
+                }
+            }
 
             try (Connection connection = ConnectionFactory.createConnection(flussConfig);
                     Admin admin = connection.getAdmin()) {
@@ -148,7 +152,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
                 RateLimiter remoteFsOpRateLimiter =
                         RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
-                ActiveRefsFetcher fetcher = new ActiveRefsFetcher(admin, 3, remoteFsOpRateLimiter);
+                ScopeTargetEnumeration.Worker targetWorker =
+                        ScopeTargetEnumeration.worker(admin, remoteFsOpRateLimiter);
                 MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
                 Map<String, String> clusterConfigMap;
                 String clusterRemoteDataDir;
@@ -177,8 +182,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 } finally {
                     endScopePhase(audit, "metadata_inventory", phaseStartMillis, phaseComplete);
                 }
-                Set<Long> activeTableIds = collectActiveTableIds(dbStates);
-                Set<Long> activePartitionIds = collectActivePartitionIds(dbStates);
 
                 phaseStartMillis = startScopePhase(audit, "live_target_planning");
                 phaseComplete = false;
@@ -187,7 +190,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                         for (LiveTableScope liveTable : dbState.liveTables) {
                             emitBucketTasks(
                                     liveTable,
-                                    fetcher,
+                                    targetWorker,
                                     audit,
                                     clusterRemoteDataDir,
                                     clusterRoots,
@@ -214,29 +217,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     phaseComplete = true;
                 } finally {
                     endScopePhase(audit, "live_target_planning", phaseStartMillis, phaseComplete);
-                }
-                phaseStartMillis = startScopePhase(audit, "unknown_database_directory_discovery");
-                phaseComplete = false;
-                try {
-                    emitOrphanDirTasksUnderUnknownDatabases(
-                            dbStates.keySet(),
-                            activeTableIds,
-                            activeTableIdsComplete(dbStates),
-                            activePartitionIds,
-                            activePartitionIdsComplete(dbStates),
-                            tracker,
-                            clusterRoots,
-                            audit,
-                            remoteFsOpRateLimiter,
-                            planStats,
-                            out);
-                    phaseComplete = true;
-                } finally {
-                    endScopePhase(
-                            audit,
-                            "unknown_database_directory_discovery",
-                            phaseStartMillis,
-                            phaseComplete);
                 }
                 audit.logScopePlan(planStats);
                 out.collect(ScopeSummaryTask.from(planStats));
@@ -302,38 +282,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             AuditLogger audit, String phase, long startMillis, boolean complete) {
         audit.logScopePhaseEnd(
                 phase, Math.max(0L, System.currentTimeMillis() - startMillis), complete);
-    }
-
-    static Configuration createFlussClientConfiguration(OrphanCleanConfig config) {
-        Configuration flussConfig = new Configuration();
-        flussConfig.setString(ConfigOptions.BOOTSTRAP_SERVERS.key(), config.bootstrapServer());
-
-        // Preserve explicit client options such as security and authentication settings.
-        for (Map.Entry<String, String> entry : config.extraConfigs().entrySet()) {
-            if (entry.getKey().startsWith("client.")) {
-                flussConfig.setString(entry.getKey(), entry.getValue());
-            }
-        }
-
-        // FlussConnection initializes FileSystem exclusively from client.fs.* options.
-        for (Map.Entry<String, String> entry : config.extraConfigs().entrySet()) {
-            if (!entry.getKey().startsWith("fs.")) {
-                continue;
-            }
-
-            String clientKey = "client." + entry.getKey();
-            String explicitClientValue = config.extraConfigs().get(clientKey);
-            if (explicitClientValue != null && !explicitClientValue.equals(entry.getValue())) {
-                throw new IllegalArgumentException(
-                        "Conflicting filesystem configurations for '"
-                                + entry.getKey()
-                                + "' and '"
-                                + clientKey
-                                + "'.");
-            }
-            flussConfig.setString(clientKey, entry.getValue());
-        }
-        return flussConfig;
     }
 
     /** Normalizes each root in the list and returns a deduplicated ordered list. */
@@ -558,12 +506,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
     private void emitBucketTasks(
             LiveTableScope liveTable,
-            ActiveRefsFetcher fetcher,
+            ScopeTargetEnumeration.Worker worker,
             AuditLogger audit,
             @Nullable String clusterRemoteDataDir,
             List<String> clusterRoots,
             ScopePlanStats planStats,
-            Collector<CleanTask> out) {
+            Collector<CleanTask> out)
+            throws Exception {
         if (liveTable.partitioned && !liveTable.partitionInfosComplete) {
             return;
         }
@@ -575,7 +524,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             emitBucketTasksForTarget(
                     liveTable,
                     partitionInfo,
-                    fetcher,
+                    worker,
                     audit,
                     clusterRemoteDataDir,
                     clusterRoots,
@@ -587,228 +536,47 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     private void emitBucketTasksForTarget(
             LiveTableScope liveTable,
             @Nullable PartitionInfo partitionInfo,
-            ActiveRefsFetcher fetcher,
+            ScopeTargetEnumeration.Worker worker,
             AuditLogger audit,
             @Nullable String clusterRemoteDataDir,
             List<String> clusterRoots,
             ScopePlanStats planStats,
-            Collector<CleanTask> out) {
-        Long partitionId = partitionInfo == null ? null : partitionInfo.getPartitionId();
-        ScopeIdentity targetScope =
-                ScopeIdentity.table(liveTable.dbName, liveTable.tableName, liveTable.tableId)
-                        .withPartitionAndBucket(partitionId, null);
+            Collector<CleanTask> out)
+            throws Exception {
         List<TableBucket> buckets = enumerateBuckets(liveTable.tableInfo, partitionInfo);
-        ScopeTargetStats targetStats =
-                new ScopeTargetStats(
-                        targetScope, buckets.size(), liveTable.tableInfo.hasPrimaryKey());
-        planStats.discoveredBuckets(buckets.size());
-        long targetStartMillis = System.currentTimeMillis();
-        boolean targetComplete = false;
-
-        try {
-            emitBucketTasksForTarget(
-                    liveTable,
-                    partitionInfo,
-                    fetcher,
-                    audit,
-                    clusterRemoteDataDir,
-                    clusterRoots,
-                    planStats,
-                    out,
-                    buckets,
-                    targetStats);
-            targetComplete =
-                    targetStats.logCoverageConsistent()
-                            && targetStats.kvCoverageConsistent()
-                            && !targetStats.hasCoverageFailure();
-        } finally {
-            long durationMillis = Math.max(0L, System.currentTimeMillis() - targetStartMillis);
-            if (targetComplete) {
-                targetStats.complete(durationMillis);
-            } else {
-                targetStats.incomplete(durationMillis);
-            }
-            planStats.target(targetStats);
-            audit.logScopeTargetSummary(targetStats);
-        }
+        ScopeTargetEnumeration.Input input =
+                new ScopeTargetEnumeration.Input(
+                        liveTable.dbName,
+                        liveTable.tableName,
+                        liveTable.tableId,
+                        liveTable.tablePath,
+                        liveTable.tableInfo,
+                        partitionInfo,
+                        buckets,
+                        clusterRemoteDataDir,
+                        clusterRoots,
+                        config.olderThanMillis(),
+                        config.dryRun(),
+                        config.allowDeleteManifest());
+        enumerateTarget(worker, input, audit, planStats, out::collect);
     }
 
-    private void emitBucketTasksForTarget(
-            LiveTableScope liveTable,
-            @Nullable PartitionInfo partitionInfo,
-            ActiveRefsFetcher fetcher,
+    static void enumerateTarget(
+            ScopeTargetEnumeration.Worker worker,
+            ScopeTargetEnumeration.Input input,
             AuditLogger audit,
-            @Nullable String clusterRemoteDataDir,
-            List<String> clusterRoots,
             ScopePlanStats planStats,
-            Collector<CleanTask> out,
-            List<TableBucket> buckets,
-            ScopeTargetStats targetStats) {
-        Long partitionId = partitionInfo == null ? null : partitionInfo.getPartitionId();
-        ScopeIdentity targetScope = targetStats.scope();
-
-        String remoteDataDir =
-                resolveRemoteDataDir(liveTable.tableInfo, partitionInfo, clusterRemoteDataDir);
-
-        // Scope guard: skip this target if its metadata-resolved root is not part of the
-        // cluster's configured remote data directories.
-        if (!clusterRoots.contains(normalizeRoot(remoteDataDir))) {
-            targetStats.outOfScope();
-            audit.logSkipBucketOutOfScope(liveTable.tableId, partitionId, remoteDataDir);
-            planStats.skippedOutOfScopeRoot();
-            return;
-        }
-
-        LogActiveRefsFetchResult logResult =
-                fetcher.fetchLogActiveRefsByBucket(liveTable.tableId, partitionId);
-        if (!logResult.listOk()) {
-            targetStats.logRpcFailed();
-            audit.logRpcFailure(
-                    AuditStage.SCOPE,
-                    targetScope,
-                    CleanupObjectType.LOG_MANIFEST,
-                    logResult.listFailureDetail());
-            planStats.metadataFailure();
-        }
-
-        Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
-        boolean kvTargetOk = false;
-        if (liveTable.tableInfo.hasPrimaryKey()) {
-            KvActiveRefsFetchResult kvResult =
-                    fetcher.fetchKvActiveSnapDirs(liveTable.tableId, partitionId);
-            if (kvResult.listOk()) {
-                kvActiveByBucket = new HashMap<>(kvResult.activeSnapDirsByBucket());
-                kvTargetOk = true;
-            } else {
-                targetStats.kvRpcFailed();
-                audit.logRpcFailure(
-                        AuditStage.SCOPE,
-                        targetScope,
-                        CleanupObjectType.KV_SNAPSHOT_FILE,
-                        kvResult.listFailureDetail());
-                planStats.metadataFailure();
+            Consumer<CleanTask> collector)
+            throws Exception {
+        try {
+            worker.enumerate(input).replay(audit, planStats, collector);
+        } catch (ScopeTargetEnumeration.EnumerationException enumerationFailure) {
+            try {
+                enumerationFailure.partialResult().replay(audit, planStats, collector);
+            } catch (Throwable replayFailure) {
+                enumerationFailure.originalFailure().addSuppressed(replayFailure);
             }
-        }
-
-        FsPath remoteLogDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_LOG_DIR_NAME);
-        FsPath remoteKvDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_KV_DIR_NAME);
-
-        for (TableBucket tableBucket : buckets) {
-            int bucketId = tableBucket.getBucket();
-
-            String logTabletDir = null;
-
-            Set<String> logSegmentRelativePaths = Collections.emptySet();
-            Set<String> logActiveManifestPaths = Collections.emptySet();
-
-            if (logResult.listOk()) {
-                switch (logResult.statusFor(bucketId)) {
-                    case RESOLVED:
-                        targetStats.logResolvedBucket();
-                        logTabletDir =
-                                FlussPaths.remoteLogTabletDir(
-                                                remoteLogDir,
-                                                physicalPath(liveTable.tablePath, partitionInfo),
-                                                tableBucket)
-                                        .toString();
-                        logSegmentRelativePaths =
-                                logResult.activeRefsOf(bucketId).logSegmentRelativePaths();
-                        logActiveManifestPaths =
-                                logResult.activeRefsOf(bucketId).logActiveManifestPaths();
-                        break;
-                    case READ_FAILED:
-                        targetStats.logReadFailedBucket();
-                        audit.logMetadataFailure(
-                                AuditStage.SCOPE,
-                                targetScope.withPartitionAndBucket(partitionId, bucketId),
-                                CleanupObjectType.LOG_MANIFEST,
-                                logResult.readFailureDetail(bucketId));
-                        planStats.metadataFailure();
-                        break;
-                    case NOT_LISTED:
-                        targetStats.logNoManifestBucket();
-                        // No committed manifest proves that there are no active remote log
-                        // references, not that the physical bucket directory is empty. Scan it
-                        // with an empty active set so partial uploads from a failed first tiering
-                        // attempt can be reclaimed after the cutoff.
-                        logTabletDir =
-                                FlussPaths.remoteLogTabletDir(
-                                                remoteLogDir,
-                                                physicalPath(liveTable.tablePath, partitionInfo),
-                                                tableBucket)
-                                        .toString();
-                        audit.logScanLogBucketWithoutManifest(
-                                liveTable.tableId, partitionId, bucketId);
-                        break;
-                    default:
-                        break;
-                }
-            }
-
-            String kvTabletDir = null;
-            Set<String> kvActiveSnaps = Collections.emptySet();
-            Set<String> kvSharedSstFileNames = Collections.emptySet();
-            boolean kvSharedSstRefsComplete = false;
-            if (kvTargetOk) {
-                kvTabletDir =
-                        FlussPaths.remoteKvTabletDir(
-                                        remoteKvDir,
-                                        physicalPath(liveTable.tablePath, partitionInfo),
-                                        tableBucket)
-                                .toString();
-                kvActiveSnaps = kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
-                KvSharedSstFetchResult sstResult =
-                        fetcher.fetchKvSharedSstFileNamesWithRefresh(
-                                liveTable.tableId,
-                                partitionId,
-                                bucketId,
-                                new FsPath(kvTabletDir),
-                                kvActiveByBucket);
-                kvActiveSnaps = kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
-                if (kvActiveSnaps.isEmpty()) {
-                    targetStats.kvEmptyBucket();
-                    audit.logScanKvBucketWithoutActiveSnapshots(
-                            liveTable.tableId, partitionId, bucketId);
-                } else {
-                    targetStats.kvActiveBucket();
-                }
-                if (sstResult.allMetadataReadOk()) {
-                    kvSharedSstFileNames = sstResult.sharedSstFileNames();
-                    kvSharedSstRefsComplete = true;
-                } else {
-                    targetStats.metadataFailure();
-                    audit.logMetadataFailure(
-                            AuditStage.SCOPE,
-                            targetScope.withPartitionAndBucket(partitionId, bucketId),
-                            CleanupObjectType.KV_SHARED_SST,
-                            sstResult.failureDetail());
-                    planStats.metadataFailure();
-                }
-            }
-
-            if (logTabletDir == null && kvTabletDir == null) {
-                continue;
-            }
-
-            out.collect(
-                    new BucketCleanTask(
-                            ScopeIdentity.table(
-                                            liveTable.dbName,
-                                            liveTable.tableName,
-                                            liveTable.tableId)
-                                    .withPartitionAndBucket(partitionId, bucketId),
-                            logTabletDir,
-                            kvTabletDir,
-                            logSegmentRelativePaths,
-                            logActiveManifestPaths,
-                            kvActiveSnaps,
-                            kvSharedSstFileNames,
-                            kvSharedSstRefsComplete,
-                            config.olderThanMillis(),
-                            config.dryRun(),
-                            config.allowDeleteManifest()));
-            planStats.bucketTask();
-            targetStats.taskEmitted();
+            enumerationFailure.rethrowOriginal();
         }
     }
 
@@ -935,226 +703,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         }
     }
 
-    private void emitOrphanDirTasksUnderUnknownDatabases(
-            Set<String> activeDbNames,
-            Set<Long> activeTableIds,
-            boolean activeTableIdsComplete,
-            Set<Long> activePartitionIds,
-            boolean activePartitionIdsComplete,
-            MaxKnownIdsTracker tracker,
-            List<String> clusterRoots,
-            AuditLogger audit,
-            RateLimiter remoteFsOpRateLimiter,
-            ScopePlanStats planStats,
-            Collector<CleanTask> out)
-            throws IOException {
-        if (config.table().isPresent()) {
-            return;
-        }
-        if (!activeTableIdsComplete) {
-            audit.logSkipOrphanTableScan("*", "tableInfos-incomplete");
-            return;
-        }
-        if (config.allDatabases()) {
-            emitOrphanDirTasksUnderAllUnknownDatabases(
-                    activeDbNames,
-                    activeTableIds,
-                    activePartitionIds,
-                    activePartitionIdsComplete,
-                    tracker,
-                    clusterRoots,
-                    audit,
-                    remoteFsOpRateLimiter,
-                    planStats,
-                    out);
-            return;
-        }
-
-        String databaseName = config.database().get();
-        if (activeDbNames.contains(databaseName)) {
-            return;
-        }
-        for (String root : clusterRoots) {
-            for (String topLevel : TOP_LEVEL_DIRS) {
-                FsPath dbDir = remoteSubDir(root, topLevel + "/" + databaseName);
-                emitOrphanDirTasksUnderUnknownDatabase(
-                        dbDir,
-                        activeTableIds,
-                        activePartitionIds,
-                        activePartitionIdsComplete,
-                        tracker,
-                        audit,
-                        remoteFsOpRateLimiter,
-                        planStats,
-                        out);
-            }
-        }
-    }
-
-    private void emitOrphanDirTasksUnderAllUnknownDatabases(
-            Set<String> activeDbNames,
-            Set<Long> activeTableIds,
-            Set<Long> activePartitionIds,
-            boolean activePartitionIdsComplete,
-            MaxKnownIdsTracker tracker,
-            List<String> clusterRoots,
-            AuditLogger audit,
-            RateLimiter remoteFsOpRateLimiter,
-            ScopePlanStats planStats,
-            Collector<CleanTask> out)
-            throws IOException {
-        for (String root : clusterRoots) {
-            for (String topLevel : TOP_LEVEL_DIRS) {
-                FsPath topLevelDir = remoteSubDir(root, topLevel);
-                ScopeIdentity scope = ScopeIdentity.global();
-                FileSystem fs;
-                try {
-                    fs = getFileSystemIfExists(topLevelDir, remoteFsOpRateLimiter);
-                } catch (IOException failure) {
-                    audit.logFilesystemFailure(
-                            AuditStage.SCOPE,
-                            scope,
-                            CleanupObjectType.DIRECTORY,
-                            filesystemFailure("exists", "io_error", topLevelDir, failure));
-                    planStats.metadataFailure();
-                    throw failure;
-                }
-                if (fs == null) {
-                    continue;
-                }
-                FileStatus[] entries =
-                        listStatuses(fs, topLevelDir, remoteFsOpRateLimiter, audit, scope);
-                if (entries == null) {
-                    planStats.metadataFailure();
-                    continue;
-                }
-                for (FileStatus entry : entries) {
-                    if (!entry.isDir()) {
-                        continue;
-                    }
-                    String dbName = entry.getPath().getName();
-                    if (activeDbNames.contains(dbName)) {
-                        continue;
-                    }
-                    emitOrphanDirTasksUnderUnknownDatabase(
-                            entry.getPath(),
-                            activeTableIds,
-                            activePartitionIds,
-                            activePartitionIdsComplete,
-                            tracker,
-                            audit,
-                            remoteFsOpRateLimiter,
-                            planStats,
-                            out);
-                }
-            }
-        }
-    }
-
-    private void emitOrphanDirTasksUnderUnknownDatabase(
-            FsPath dbDir,
-            Set<Long> activeTableIds,
-            Set<Long> activePartitionIds,
-            boolean activePartitionIdsComplete,
-            MaxKnownIdsTracker tracker,
-            AuditLogger audit,
-            RateLimiter remoteFsOpRateLimiter,
-            ScopePlanStats planStats,
-            Collector<CleanTask> out)
-            throws IOException {
-        ScopeIdentity scope = ScopeIdentity.database(dbDir.getName());
-        FileSystem fs;
-        try {
-            fs = getFileSystemIfExists(dbDir, remoteFsOpRateLimiter);
-        } catch (IOException failure) {
-            audit.logFilesystemFailure(
-                    AuditStage.SCOPE,
-                    scope,
-                    CleanupObjectType.DIRECTORY,
-                    filesystemFailure("exists", "io_error", dbDir, failure));
-            planStats.metadataFailure();
-            throw failure;
-        }
-        if (fs == null) {
-            return;
-        }
-        FileStatus[] entries = listStatuses(fs, dbDir, remoteFsOpRateLimiter, audit, scope);
-        if (entries == null) {
-            planStats.metadataFailure();
-            return;
-        }
-        long maxKnownTableId = tracker.maxKnownTableId();
-        for (FileStatus entry : entries) {
-            if (!entry.isDir()) {
-                continue;
-            }
-            FsPath tableDir = entry.getPath();
-            if (!OrphanDirDetector.isOrphanTable(
-                    tableDir.getName(), activeTableIds, maxKnownTableId)) {
-                continue;
-            }
-            ScopeIdentity orphanScope =
-                    ScopeIdentity.orphanTable(dbDir.getName(), tableDir.getName(), null);
-            if (config.allowCleanOrphanTables()) {
-                out.collect(orphanDirCleanTask(orphanScope, tableDir));
-                planStats.orphanDirTask();
-            } else {
-                audit.logSkipOrphanTable(tableDir, "default-conservative");
-                emitOrphanPartitionDirTasksUnderUnknownTable(
-                        tableDir,
-                        activePartitionIds,
-                        activePartitionIdsComplete,
-                        tracker,
-                        audit,
-                        remoteFsOpRateLimiter,
-                        planStats,
-                        out);
-            }
-        }
-    }
-
-    private void emitOrphanPartitionDirTasksUnderUnknownTable(
-            FsPath tableDir,
-            Set<Long> activePartitionIds,
-            boolean activePartitionIdsComplete,
-            MaxKnownIdsTracker tracker,
-            AuditLogger audit,
-            RateLimiter remoteFsOpRateLimiter,
-            ScopePlanStats planStats,
-            Collector<CleanTask> out)
-            throws IOException {
-        if (!config.allowCleanOrphanPartitions() || !activePartitionIdsComplete) {
-            return;
-        }
-        long maxKnownPartitionId = tracker.maxKnownPartitionId();
-        forEachOrphanDirUnderParent(
-                tableDir,
-                dirName ->
-                        OrphanDirDetector.isOrphanPartition(
-                                dirName, activePartitionIds, maxKnownPartitionId),
-                remoteFsOpRateLimiter,
-                dir -> {
-                    ScopeIdentity orphanScope =
-                            ScopeIdentity.orphanTable(
-                                    tableDir.getParent().getName(), tableDir.getName(), null);
-                    out.collect(orphanDirCleanTask(orphanScope, dir));
-                    planStats.orphanDirTask();
-                },
-                planStats,
-                audit,
-                ScopeIdentity.orphanTable(
-                        tableDir.getParent().getName(), tableDir.getName(), null));
-    }
-
-    private OrphanDirCleanTask orphanDirCleanTask(ScopeIdentity scope, FsPath dir) {
-        return new OrphanDirCleanTask(
-                scope,
-                dir.toString(),
-                config.olderThanMillis(),
-                config.dryRun(),
-                config.allowDeleteManifest());
-    }
-
     private void forEachOrphanDirUnderParent(
             FsPath parentDir,
             Predicate<String> isOrphan,
@@ -1198,44 +746,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
-
-    private static Set<Long> collectActiveTableIds(Map<String, DbScanState> dbStates) {
-        Set<Long> ids = new LinkedHashSet<Long>();
-        for (DbScanState dbState : dbStates.values()) {
-            ids.addAll(dbState.activeTableIds);
-        }
-        return ids;
-    }
-
-    private static Set<Long> collectActivePartitionIds(Map<String, DbScanState> dbStates) {
-        Set<Long> ids = new LinkedHashSet<Long>();
-        for (DbScanState dbState : dbStates.values()) {
-            for (LiveTableScope liveTable : dbState.liveTables) {
-                ids.addAll(liveTable.activePartitionIds);
-            }
-        }
-        return ids;
-    }
-
-    private static boolean activeTableIdsComplete(Map<String, DbScanState> dbStates) {
-        for (DbScanState dbState : dbStates.values()) {
-            if (!dbState.tableInfosComplete) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean activePartitionIdsComplete(Map<String, DbScanState> dbStates) {
-        for (DbScanState dbState : dbStates.values()) {
-            for (LiveTableScope liveTable : dbState.liveTables) {
-                if (liveTable.partitioned && !liveTable.partitionInfosComplete) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
 
     private static AuditFailureDetail rpcFailure(String operation, Throwable failure) {
         Throwable cause = ExceptionUtils.stripExecutionException(failure);
