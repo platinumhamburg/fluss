@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -138,45 +139,36 @@ class ScopeTargetExecutorTest {
     }
 
     @Test
-    void neverRunsMoreThanConfiguredTargets() throws Exception {
+    void overlapsConfiguredTargetsAndReplaysEveryResultOnce() throws Exception {
+        List<ScopeTargetEnumeration.Result> expected =
+                Arrays.asList(emptyResult(), emptyResult(), emptyResult(), emptyResult());
+        AtomicInteger nextResult = new AtomicInteger();
         AtomicInteger running = new AtomicInteger();
         AtomicInteger maximum = new AtomicInteger();
-        CountDownLatch twoStarted = new CountDownLatch(2);
-        CountDownLatch release = new CountDownLatch(1);
+        CyclicBarrier twoWorkers = new CyclicBarrier(2);
 
         ScopeTargetEnumeration.Worker worker =
                 input -> {
+                    ScopeTargetEnumeration.Result result =
+                            expected.get(nextResult.getAndIncrement());
                     int active = running.incrementAndGet();
                     maximum.accumulateAndGet(active, Math::max);
-                    twoStarted.countDown();
                     try {
-                        release.await(10, TimeUnit.SECONDS);
-                        return emptyResult();
+                        twoWorkers.await(10, TimeUnit.SECONDS);
+                        return result;
                     } finally {
                         running.decrementAndGet();
                     }
                 };
+        List<ScopeTargetEnumeration.Result> completed =
+                new ArrayList<ScopeTargetEnumeration.Result>();
 
-        ExecutorService caller = Executors.newSingleThreadExecutor();
         try (ScopeTargetExecutor executor = ScopeTargetExecutor.testing(2, () -> worker)) {
-            Future<List<ScopeTargetEnumeration.Result>> future =
-                    caller.submit(
-                            () -> {
-                                List<ScopeTargetEnumeration.Result> results =
-                                        new ArrayList<ScopeTargetEnumeration.Result>();
-                                executor.forEachCompleted(nullInputs(5), results::add);
-                                return results;
-                            });
-
-            assertThat(twoStarted.await(10, TimeUnit.SECONDS)).isTrue();
-            assertThat(maximum.get()).isEqualTo(2);
-            release.countDown();
-            assertThat(future.get(10, TimeUnit.SECONDS)).hasSize(5);
-            assertThat(maximum.get()).isEqualTo(2);
-        } finally {
-            release.countDown();
-            caller.shutdownNow();
+            executor.forEachCompleted(nullInputs(4), completed::add);
         }
+
+        assertThat(completed).containsExactlyInAnyOrderElementsOf(expected);
+        assertThat(maximum.get()).isEqualTo(2);
     }
 
     @Test
