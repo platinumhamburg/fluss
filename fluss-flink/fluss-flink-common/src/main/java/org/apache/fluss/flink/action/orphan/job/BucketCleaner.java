@@ -248,7 +248,7 @@ public final class BucketCleaner {
                 }
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.recordScanned(objectType);
-                progress.recordScannedFile();
+                progress.recordScannedFile(meta.size());
                 stats.recordRuleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
                 switch (decision) {
                     case DELETE:

@@ -247,7 +247,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             phaseStartMillis,
                             planStats.scopeTargets() - targetsCompletedBefore,
                             planStats.incompleteTargets() - targetsFailedBefore,
-                            phaseComplete);
+                            phaseComplete,
+                            config.scopeEnumerationConcurrency());
                 }
                 audit.logScopePlan(planStats);
                 out.collect(ScopeSummaryTask.from(planStats));
@@ -336,6 +337,23 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 targetsCompleted,
                 targetsFailed,
                 complete);
+    }
+
+    private static void endScopePhase(
+            AuditLogger audit,
+            String phase,
+            long startMillis,
+            long targetsCompleted,
+            long targetsFailed,
+            boolean complete,
+            int scopeEnumerationConcurrency) {
+        audit.logScopePhaseEnd(
+                phase,
+                Math.max(0L, System.currentTimeMillis() - startMillis),
+                targetsCompleted,
+                targetsFailed,
+                complete,
+                Integer.valueOf(scopeEnumerationConcurrency));
     }
 
     /** Normalizes each root in the list and returns a deduplicated ordered list. */

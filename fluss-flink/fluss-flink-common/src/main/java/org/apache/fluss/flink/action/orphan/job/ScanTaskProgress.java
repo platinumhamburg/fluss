@@ -23,6 +23,7 @@ import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 final class ScanTaskProgress implements SafeDeleter.DeletionProgressListener {
 
     private long scannedFiles;
+    private long scannedBytes;
     private long plannedFiles;
     private long plannedDirs;
     private long plannedBytes;
@@ -31,8 +32,9 @@ final class ScanTaskProgress implements SafeDeleter.DeletionProgressListener {
     private long deleteFailures;
     private long bytesReclaimed;
 
-    void recordScannedFile() {
+    void recordScannedFile(long bytes) {
         scannedFiles++;
+        scannedBytes += bytes;
     }
 
     void recordPlannedFile(long bytes) {
@@ -75,5 +77,9 @@ final class ScanTaskProgress implements SafeDeleter.DeletionProgressListener {
                 emptyDirsRemoved,
                 deleteFailures,
                 bytesReclaimed);
+    }
+
+    long scannedBytes() {
+        return scannedBytes;
     }
 }
