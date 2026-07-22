@@ -50,8 +50,15 @@ public interface Connection extends AutoCloseable {
     /** Retrieve the configuration used to create this connection. */
     Configuration getConfiguration();
 
-    /** Retrieve a new Admin client to administer a Fluss cluster. */
+    /** Retrieve the shared Admin client associated with this connection. */
     Admin getAdmin();
+
+    /**
+     * Create a new Admin client that shares this connection's lower-level resources.
+     *
+     * <p>The returned client is owned by the caller and must be closed when it is no longer needed.
+     */
+    Admin createAdmin();
 
     /** Retrieve a new Table client to operate data in table. */
     Table getTable(TablePath tablePath);

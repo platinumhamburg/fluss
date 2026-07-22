@@ -42,7 +42,6 @@ import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.PartitionInfo;
-import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
@@ -152,8 +151,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
                 RateLimiter remoteFsOpRateLimiter =
                         RateLimiter.create((double) config.remoteFsOpRateLimitPerSecond());
-                ScopeTargetEnumeration.Worker targetWorker =
-                        ScopeTargetEnumeration.worker(admin, remoteFsOpRateLimiter);
                 MaxKnownIdsTracker tracker = new MaxKnownIdsTracker();
                 Map<String, String> clusterConfigMap;
                 String clusterRemoteDataDir;
@@ -186,16 +183,19 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 phaseStartMillis = startScopePhase(audit, "live_target_planning");
                 phaseComplete = false;
                 try {
+                    List<ScopeTargetEnumeration.Input> targetInputs =
+                            buildTargetInputs(dbStates, clusterRemoteDataDir, clusterRoots);
+                    try (ScopeTargetExecutor executor =
+                            ScopeTargetExecutor.create(
+                                    connection,
+                                    config.scopeEnumerationConcurrency(),
+                                    remoteFsOpRateLimiter)) {
+                        executor.forEachCompleted(
+                                targetInputs,
+                                result -> result.replay(audit, planStats, out::collect));
+                    }
                     for (DbScanState dbState : dbStates.values()) {
                         for (LiveTableScope liveTable : dbState.liveTables) {
-                            emitBucketTasks(
-                                    liveTable,
-                                    targetWorker,
-                                    audit,
-                                    clusterRemoteDataDir,
-                                    clusterRoots,
-                                    planStats,
-                                    out);
                             emitOrphanPartitionDirTasks(
                                     liveTable,
                                     tracker,
@@ -501,64 +501,42 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     }
 
     // -------------------------------------------------------------------------
-    // Emit BucketCleanTasks (per-target RPC + per-bucket task emission)
+    // Build live target inputs (worker execution is handled separately)
     // -------------------------------------------------------------------------
 
-    private void emitBucketTasks(
-            LiveTableScope liveTable,
-            ScopeTargetEnumeration.Worker worker,
-            AuditLogger audit,
+    private List<ScopeTargetEnumeration.Input> buildTargetInputs(
+            Map<String, DbScanState> dbStates,
             @Nullable String clusterRemoteDataDir,
-            List<String> clusterRoots,
-            ScopePlanStats planStats,
-            Collector<CleanTask> out)
-            throws Exception {
-        if (liveTable.partitioned && !liveTable.partitionInfosComplete) {
-            return;
+            List<String> clusterRoots) {
+        List<ScopeTargetEnumeration.Input> inputs = new ArrayList<ScopeTargetEnumeration.Input>();
+        for (DbScanState dbState : dbStates.values()) {
+            for (LiveTableScope liveTable : dbState.liveTables) {
+                if (liveTable.partitioned && !liveTable.partitionInfosComplete) {
+                    continue;
+                }
+                List<PartitionInfo> partitionTargets =
+                        liveTable.partitioned
+                                ? liveTable.partitions
+                                : Collections.<PartitionInfo>singletonList(null);
+                for (PartitionInfo partitionInfo : partitionTargets) {
+                    inputs.add(
+                            new ScopeTargetEnumeration.Input(
+                                    liveTable.dbName,
+                                    liveTable.tableName,
+                                    liveTable.tableId,
+                                    liveTable.tablePath,
+                                    liveTable.tableInfo,
+                                    partitionInfo,
+                                    enumerateBuckets(liveTable.tableInfo, partitionInfo),
+                                    clusterRemoteDataDir,
+                                    clusterRoots,
+                                    config.olderThanMillis(),
+                                    config.dryRun(),
+                                    config.allowDeleteManifest()));
+                }
+            }
         }
-        List<PartitionInfo> partitionTargets =
-                liveTable.partitioned
-                        ? liveTable.partitions
-                        : Collections.<PartitionInfo>singletonList(null);
-        for (PartitionInfo partitionInfo : partitionTargets) {
-            emitBucketTasksForTarget(
-                    liveTable,
-                    partitionInfo,
-                    worker,
-                    audit,
-                    clusterRemoteDataDir,
-                    clusterRoots,
-                    planStats,
-                    out);
-        }
-    }
-
-    private void emitBucketTasksForTarget(
-            LiveTableScope liveTable,
-            @Nullable PartitionInfo partitionInfo,
-            ScopeTargetEnumeration.Worker worker,
-            AuditLogger audit,
-            @Nullable String clusterRemoteDataDir,
-            List<String> clusterRoots,
-            ScopePlanStats planStats,
-            Collector<CleanTask> out)
-            throws Exception {
-        List<TableBucket> buckets = enumerateBuckets(liveTable.tableInfo, partitionInfo);
-        ScopeTargetEnumeration.Input input =
-                new ScopeTargetEnumeration.Input(
-                        liveTable.dbName,
-                        liveTable.tableName,
-                        liveTable.tableId,
-                        liveTable.tablePath,
-                        liveTable.tableInfo,
-                        partitionInfo,
-                        buckets,
-                        clusterRemoteDataDir,
-                        clusterRoots,
-                        config.olderThanMillis(),
-                        config.dryRun(),
-                        config.allowDeleteManifest());
-        enumerateTarget(worker, input, audit, planStats, out::collect);
+        return inputs;
     }
 
     static void enumerateTarget(
