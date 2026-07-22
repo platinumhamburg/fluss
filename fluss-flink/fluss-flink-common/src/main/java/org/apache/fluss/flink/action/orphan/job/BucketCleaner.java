@@ -65,6 +65,7 @@ public final class BucketCleaner {
     private final RateLimiter remoteFsOpRateLimiter;
     private final boolean dryRun;
     private final ScopeIdentity scope;
+    private final ScanTaskProgress progress;
 
     public BucketCleaner(
             RuleDispatcher dispatcher,
@@ -80,7 +81,8 @@ public final class BucketCleaner {
                 cutoffMillis,
                 remoteFsOpRateLimiter,
                 dryRun,
-                ScopeIdentity.global());
+                ScopeIdentity.global(),
+                new ScanTaskProgress());
     }
 
     public BucketCleaner(
@@ -91,6 +93,26 @@ public final class BucketCleaner {
             RateLimiter remoteFsOpRateLimiter,
             boolean dryRun,
             ScopeIdentity scope) {
+        this(
+                dispatcher,
+                safeDeleter,
+                audit,
+                cutoffMillis,
+                remoteFsOpRateLimiter,
+                dryRun,
+                scope,
+                new ScanTaskProgress());
+    }
+
+    BucketCleaner(
+            RuleDispatcher dispatcher,
+            SafeDeleter safeDeleter,
+            AuditLogger audit,
+            long cutoffMillis,
+            RateLimiter remoteFsOpRateLimiter,
+            boolean dryRun,
+            ScopeIdentity scope,
+            ScanTaskProgress progress) {
         this.dispatcher = dispatcher;
         this.safeDeleter = safeDeleter;
         this.audit = audit;
@@ -98,6 +120,7 @@ public final class BucketCleaner {
         this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
         this.dryRun = dryRun;
         this.scope = scope;
+        this.progress = progress;
     }
 
     /** Cleans one bucket's log/kv subtrees using the caller-supplied active reference set. */
@@ -127,6 +150,7 @@ public final class BucketCleaner {
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
                     stats.recordPlannedDirectory();
+                    progress.recordPlannedDirectory();
                     SafeDeleter.DirectoryDeleteResult result =
                             safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
                     switch (result) {
@@ -224,12 +248,14 @@ public final class BucketCleaner {
                 }
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.recordScanned(objectType);
+                progress.recordScannedFile();
                 stats.recordRuleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
                 switch (decision) {
                     case DELETE:
                         stats.recordRuleDecision(
                                 objectType, RuleDecisionCounters.candidate(meta.size()));
                         stats.recordPlanned(objectType, meta.size());
+                        progress.recordPlannedFile(meta.size());
                         if (safeDeleter.deleteFile(meta, decision, rule.id(), cutoffMillis)) {
                             if (!dryRun) {
                                 stats.recordDeleted(objectType, meta.size());

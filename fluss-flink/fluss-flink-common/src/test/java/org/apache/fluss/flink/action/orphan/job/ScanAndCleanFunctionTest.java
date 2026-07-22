@@ -99,6 +99,55 @@ class ScanAndCleanFunctionTest {
     }
 
     @Test
+    void emitsOneBoundedLifecyclePairPerScanSubtaskAttempt() throws Exception {
+        ScopeIdentity firstScope =
+                ScopeIdentity.table("db", "first", 1L).withPartitionAndBucket(null, 0);
+        ScopeIdentity secondScope =
+                ScopeIdentity.table("db", "second", 2L).withPartitionAndBucket(null, 1);
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        try (OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness =
+                scanHarness(function)) {
+            harness.open();
+            harness.processElement(new StreamRecord<CleanTask>(emptyBucketTask(firstScope)));
+            harness.processElement(
+                    new StreamRecord<CleanTask>(ScopeSummaryTask.from(new ScopePlanStats())));
+            harness.processElement(new StreamRecord<CleanTask>(emptyBucketTask(secondScope)));
+        }
+
+        assertThat(TestingAuditReporterFactory.events("testing"))
+                .filteredOn(event -> event.getAction().equals("scan_start"))
+                .singleElement()
+                .satisfies(
+                        event -> {
+                            assertThat(event.getDimensions())
+                                    .containsEntry("scan_parallelism", "3")
+                                    .containsEntry(
+                                            "effective_remote_fs_rate_limit_per_second",
+                                            Double.toString(100.0d / 3.0d));
+                            assertThat(event.getMetrics())
+                                    .containsEntry("remote_fs_rate_limit", 100L);
+                        });
+        assertThat(TestingAuditReporterFactory.events("testing"))
+                .filteredOn(event -> event.getAction().equals("scan_subtask_summary"))
+                .singleElement()
+                .satisfies(
+                        event -> {
+                            assertThat(event.getMetrics())
+                                    .containsEntry("tasks_completed", 2L)
+                                    .containsKey("elapsed_ms")
+                                    .containsEntry("scanned_files", 0L)
+                                    .containsEntry("planned_files", 0L)
+                                    .containsEntry("planned_dirs", 0L)
+                                    .containsEntry("planned_bytes", 0L)
+                                    .containsEntry("deleted_files", 0L)
+                                    .containsEntry("empty_dirs_removed", 0L)
+                                    .containsEntry("delete_failures", 0L)
+                                    .containsEntry("bytes_reclaimed", 0L);
+                            assertThat(event.getPath()).isNull();
+                        });
+    }
+
+    @Test
     void requiredReporterOpenFailureFailsScanHarnessOpen() throws Exception {
         TestingAuditReporterFactory.fail("testing", "open", "injected-open-failure");
         ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
@@ -130,6 +179,8 @@ class ScanAndCleanFunctionTest {
                         "testing:validate",
                         "testing:create",
                         "testing:open",
+                        "testing:report",
+                        "testing:report",
                         "testing:flush",
                         "testing:close");
         assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
@@ -173,7 +224,6 @@ class ScanAndCleanFunctionTest {
     void scanProcessingFailureRemainsPrimaryWhenReporterTeardownFails(@TempDir Path tempDir)
             throws Exception {
         Files.write(tempDir.resolve("unknown.bin"), new byte[] {1});
-        TestingAuditReporterFactory.fail("testing", "report", "injected-report-failure");
         TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
         TestingAuditReporterFactory.fail("testing", "close", "injected-close-failure");
         ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
@@ -181,6 +231,7 @@ class ScanAndCleanFunctionTest {
 
         try {
             harness.open();
+            TestingAuditReporterFactory.fail("testing", "report", "injected-report-failure");
             Throwable processingFailure =
                     catchThrowable(
                             () ->
@@ -208,11 +259,18 @@ class ScanAndCleanFunctionTest {
                             suppressed -> {
                                 assertThat(suppressed)
                                         .hasMessageContaining("testing")
-                                        .hasMessageContaining("flush")
-                                        .hasMessageNotContaining("injected-flush-failure");
+                                        .hasMessageContaining("report")
+                                        .hasMessageNotContaining("injected-report-failure");
                                 assertThat(suppressed.getSuppressed())
-                                        .singleElement()
-                                        .satisfies(
+                                        .hasSize(2)
+                                        .anySatisfy(
+                                                flushFailure ->
+                                                        assertThat(flushFailure)
+                                                                .hasMessageContaining("testing")
+                                                                .hasMessageContaining("flush")
+                                                                .hasMessageNotContaining(
+                                                                        "injected-flush-failure"))
+                                        .anySatisfy(
                                                 closeFailure ->
                                                         assertThat(closeFailure)
                                                                 .hasMessageContaining("testing")
@@ -220,6 +278,69 @@ class ScanAndCleanFunctionTest {
                                                                 .hasMessageNotContaining(
                                                                         "injected-close-failure"));
                             });
+        } finally {
+            TestingAuditReporterFactory.reset();
+            try {
+                function.close();
+            } finally {
+                harness.close();
+            }
+        }
+    }
+
+    @Test
+    void terminalSummaryRetainsPartialProgressWhenDeleteAuditFails(@TempDir Path tempDir)
+            throws Exception {
+        long cutoff = System.currentTimeMillis() + 10_000L;
+        Path deletedFile = createLogFile(tempDir, 1, ".log", cutoff - 1_000L);
+        ScopeIdentity scope = ScopeIdentity.table("db", "table", 42L).withPartitionAndBucket(7L, 3);
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), false);
+        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness = scanHarness(function);
+
+        try {
+            harness.open();
+            TestingAuditReporterFactory.fail("testing", "report", "injected-report-failure");
+
+            Throwable processingFailure =
+                    catchThrowable(
+                            () ->
+                                    harness.processElement(
+                                            new StreamRecord<CleanTask>(
+                                                    new BucketCleanTask(
+                                                            scope,
+                                                            tempDir.toUri().toString(),
+                                                            null,
+                                                            Collections.<String>emptySet(),
+                                                            Collections.<String>emptySet(),
+                                                            Collections.<String>emptySet(),
+                                                            cutoff,
+                                                            false,
+                                                            false))));
+
+            assertThat(processingFailure)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("report");
+            assertThat(deletedFile).doesNotExist();
+            assertThat(harness.extractOutputValues()).isEmpty();
+
+            function.close();
+
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("scan_subtask_summary"))
+                    .singleElement()
+                    .satisfies(
+                            event ->
+                                    assertThat(event.getMetrics())
+                                            .containsEntry("tasks_completed", 0L)
+                                            .containsEntry("scanned_files", 1L)
+                                            .containsEntry("planned_files", 1L)
+                                            .containsEntry("planned_dirs", 0L)
+                                            .containsEntry("planned_bytes", 1L)
+                                            .containsEntry("deleted_files", 1L)
+                                            .containsEntry("empty_dirs_removed", 0L)
+                                            .containsEntry("delete_failures", 0L)
+                                            .containsEntry("bytes_reclaimed", 1L));
         } finally {
             TestingAuditReporterFactory.reset();
             try {
@@ -328,6 +449,16 @@ class ScanAndCleanFunctionTest {
                                     .containsEntry("mtime_minus_cutoff_ms", -2_000L);
                             assertThat(event.getFlags()).containsEntry("dry_run", true);
                         });
+        assertThat(events)
+                .filteredOn(event -> event.getAction().equals("scan_subtask_summary"))
+                .singleElement()
+                .satisfies(
+                        event ->
+                                assertThat(event.getMetrics())
+                                        .containsEntry("tasks_completed", 1L)
+                                        .containsEntry("scanned_files", 7L)
+                                        .containsEntry("planned_files", 1L)
+                                        .containsEntry("planned_bytes", 1L));
     }
 
     private static OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> scanHarness(
@@ -358,6 +489,19 @@ class ScanAndCleanFunctionTest {
                 Collections.singletonList(
                         new ReporterSpec(
                                 "testing", required, Collections.<String, String>emptyMap())));
+    }
+
+    private static BucketCleanTask emptyBucketTask(ScopeIdentity scope) {
+        return new BucketCleanTask(
+                scope,
+                null,
+                null,
+                Collections.<String>emptySet(),
+                Collections.<String>emptySet(),
+                Collections.<String>emptySet(),
+                0L,
+                true,
+                false);
     }
 
     private static ScanAndCleanFunction newScanFunction(

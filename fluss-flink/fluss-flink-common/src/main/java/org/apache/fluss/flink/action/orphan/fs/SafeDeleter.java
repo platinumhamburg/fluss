@@ -62,10 +62,17 @@ public final class SafeDeleter {
     private final AuditLogger audit;
     private final RateLimiter remoteFsOpRateLimiter;
     private final ScopeIdentity scope;
+    private final DeletionProgressListener progressListener;
 
     public SafeDeleter(
             FileSystem fs, boolean dryRun, AuditLogger audit, RateLimiter remoteFsOpRateLimiter) {
-        this(fs, dryRun, audit, remoteFsOpRateLimiter, ScopeIdentity.global());
+        this(
+                fs,
+                dryRun,
+                audit,
+                remoteFsOpRateLimiter,
+                ScopeIdentity.global(),
+                DeletionProgressListener.NO_OP);
     }
 
     public SafeDeleter(
@@ -74,11 +81,22 @@ public final class SafeDeleter {
             AuditLogger audit,
             RateLimiter remoteFsOpRateLimiter,
             ScopeIdentity scope) {
+        this(fs, dryRun, audit, remoteFsOpRateLimiter, scope, DeletionProgressListener.NO_OP);
+    }
+
+    public SafeDeleter(
+            FileSystem fs,
+            boolean dryRun,
+            AuditLogger audit,
+            RateLimiter remoteFsOpRateLimiter,
+            ScopeIdentity scope,
+            DeletionProgressListener progressListener) {
         this.fs = fs;
         this.dryRun = dryRun;
         this.audit = audit;
         this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
         this.scope = scope;
+        this.progressListener = progressListener;
     }
 
     /**
@@ -119,17 +137,20 @@ public final class SafeDeleter {
         try {
             boolean ok = fs.delete(file.path(), false);
             if (ok) {
+                progressListener.fileDeleted(file.size());
                 if (cutoffMillis == null) {
                     audit.logDeleted(file, ruleId, scope);
                 } else {
                     audit.logDeleted(file, ruleId, scope, cutoffMillis);
                 }
             } else {
+                progressListener.fileDeleteFailed();
                 logDeleteFailed(file, ruleId, "filesystem_returned_false", cutoffMillis);
             }
             return ok;
         } catch (IOException e) {
             LOG.warn("Failed to delete file: {}", file.path(), e);
+            progressListener.fileDeleteFailed();
             logDeleteFailed(file, ruleId, "io_error", cutoffMillis);
             return false;
         }
@@ -180,14 +201,17 @@ public final class SafeDeleter {
         try {
             boolean ok = fs.delete(dir, false);
             if (ok) {
+                progressListener.directoryDeleted();
                 audit.logDeletedDirectory(dir, modificationTime, scope, false);
                 return DirectoryDeleteResult.SUCCESS;
             }
+            progressListener.directoryDeleteFailed();
             audit.logDirectoryDeleteFailed(
                     dir, modificationTime, scope, "filesystem_returned_false", false, true);
             return DirectoryDeleteResult.DELETE_FAILED;
         } catch (IOException e) {
             LOG.warn("Failed to delete empty directory: {}", dir, e);
+            progressListener.directoryDeleteFailed();
             audit.logDirectoryDeleteFailed(dir, modificationTime, scope, "io_error", false, true);
             return DirectoryDeleteResult.DELETE_FAILED;
         }
@@ -203,6 +227,37 @@ public final class SafeDeleter {
         public boolean successful() {
             return this == SUCCESS;
         }
+    }
+
+    /** Receives actual filesystem deletion outcomes before their audit event is reported. */
+    public interface DeletionProgressListener {
+
+        DeletionProgressListener NO_OP =
+                new DeletionProgressListener() {
+                    @Override
+                    public void fileDeleted(long bytes) {}
+
+                    @Override
+                    public void fileDeleteFailed() {}
+
+                    @Override
+                    public void directoryDeleted() {}
+
+                    @Override
+                    public void directoryDeleteFailed() {}
+                };
+
+        /** Records one successfully deleted file and its reclaimed bytes. */
+        void fileDeleted(long bytes);
+
+        /** Records one failed file deletion. */
+        void fileDeleteFailed();
+
+        /** Records one successfully deleted empty directory. */
+        void directoryDeleted();
+
+        /** Records one failed empty-directory deletion. */
+        void directoryDeleteFailed();
     }
 
     private FileStatus[] listChildrenSilently(FsPath dir) {

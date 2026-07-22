@@ -86,6 +86,9 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
     private transient Throwable processingFailure;
+    private transient long scanStartMillis;
+    private transient long tasksCompleted;
+    private transient CleanupCounters subtaskCounters;
 
     public ScanAndCleanFunction(
             long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
@@ -106,6 +109,9 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     @Override
     protected void doOpen() throws Exception {
         processingFailure = null;
+        scanStartMillis = System.currentTimeMillis();
+        tasksCompleted = 0L;
+        subtaskCounters = CleanupCounters.empty();
         if (!extraConfigs.isEmpty()) {
             FileSystem.initialize(Configuration.fromMap(extraConfigs), null);
         }
@@ -116,20 +122,23 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                 RateLimiter.create(perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism));
         if (auditReporterSpec == null) {
             audit = new AuditLogger();
-            return;
+        } else {
+            AuditReporterContext reporterContext =
+                    new AuditReporterContext(
+                            auditReporterSpec.runId(),
+                            dryRun,
+                            AuditStage.SCAN,
+                            "ScanAndClean",
+                            subtaskIndex,
+                            RuntimeContextAdapter.getAttemptNumber(runtimeContext),
+                            getRuntimeContext().getUserCodeClassLoader());
+            auditRuntime = AuditReporterRuntime.open(auditReporterSpec, reporterContext);
+            audit = new AuditLogger(auditRuntime, reporterContext);
         }
-
-        AuditReporterContext reporterContext =
-                new AuditReporterContext(
-                        auditReporterSpec.runId(),
-                        dryRun,
-                        AuditStage.SCAN,
-                        "ScanAndClean",
-                        subtaskIndex,
-                        RuntimeContextAdapter.getAttemptNumber(runtimeContext),
-                        getRuntimeContext().getUserCodeClassLoader());
-        auditRuntime = AuditReporterRuntime.open(auditReporterSpec, reporterContext);
-        audit = new AuditLogger(auditRuntime, reporterContext);
+        audit.logScanStart(
+                remoteFsOpRateLimitPerSecond,
+                parallelism,
+                perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism));
     }
 
     @Override
@@ -149,15 +158,30 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     @Override
     public void processElement(CleanTask task, Context ctx, Collector<CleanupStats> out)
             throws Exception {
+        ScanTaskProgress taskProgress = null;
+        boolean progressMerged = false;
         try {
             if (task instanceof ScopeSummaryTask) {
                 out.collect(((ScopeSummaryTask) task).stats());
             } else if (task instanceof BucketCleanTask) {
-                out.collect(processBucketTask((BucketCleanTask) task));
+                taskProgress = new ScanTaskProgress();
+                CleanupStats stats = processBucketTask((BucketCleanTask) task, taskProgress);
+                mergeTaskProgress(taskProgress);
+                progressMerged = true;
+                out.collect(stats);
+                tasksCompleted++;
             } else if (task instanceof OrphanDirCleanTask) {
-                out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
+                taskProgress = new ScanTaskProgress();
+                CleanupStats stats = processOrphanDirTask((OrphanDirCleanTask) task, taskProgress);
+                mergeTaskProgress(taskProgress);
+                progressMerged = true;
+                out.collect(stats);
+                tasksCompleted++;
             }
         } catch (Exception | Error failure) {
+            if (taskProgress != null && !progressMerged) {
+                mergeTaskProgress(taskProgress);
+            }
             if (processingFailure == null) {
                 processingFailure = failure;
             }
@@ -169,7 +193,8 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     // BucketCleanTask processing
     // -------------------------------------------------------------------------
 
-    private CleanupStats processBucketTask(BucketCleanTask task) throws IOException {
+    private CleanupStats processBucketTask(BucketCleanTask task, ScanTaskProgress progress)
+            throws IOException {
         FsPath logDir = task.logTabletDir() != null ? new FsPath(task.logTabletDir()) : null;
         FsPath kvDir = task.kvTabletDir() != null ? new FsPath(task.kvTabletDir()) : null;
 
@@ -187,7 +212,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                         task.kvSharedSstRefsComplete());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
         SafeDeleter safeDeleter =
-                createSafeDeleter(anyDir.getFileSystem(), task.dryRun(), task.scope());
+                createSafeDeleter(anyDir.getFileSystem(), task.dryRun(), task.scope(), progress);
         BucketCleaner cleaner =
                 new BucketCleaner(
                         dispatcher,
@@ -196,7 +221,8 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                         task.cutoffMillis(),
                         remoteFsOpRateLimiter,
                         task.dryRun(),
-                        task.scope());
+                        task.scope(),
+                        progress);
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
@@ -220,7 +246,8 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     // OrphanDirCleanTask processing
     // -------------------------------------------------------------------------
 
-    private CleanupStats processOrphanDirTask(OrphanDirCleanTask task) throws IOException {
+    private CleanupStats processOrphanDirTask(OrphanDirCleanTask task, ScanTaskProgress progress)
+            throws IOException {
         FsPath dirPath = new FsPath(task.dirPath());
         FileSystem fs = dirPath.getFileSystem();
         remoteFsOpRateLimiter.acquire();
@@ -228,7 +255,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
             return CleanupStats.emptyScan(task.scope());
         }
 
-        SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun(), task.scope());
+        SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun(), task.scope(), progress);
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest(), true);
 
         CleanupStats.Builder stats = CleanupStats.scanBuilder(task.scope());
@@ -263,6 +290,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
                     stats.plannedDirectory(1L);
+                    progress.recordPlannedDirectory();
                     SafeDeleter.DirectoryDeleteResult result =
                             safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
                     switch (result) {
@@ -352,6 +380,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                 FileRule rule = dispatcher.dispatch(meta);
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.scanned(objectType, 1L);
+                progress.recordScannedFile();
                 stats.ruleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
                 RuleEvaluation evaluation =
                         rule.evaluateDetailed(
@@ -365,6 +394,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                     case DELETE:
                         stats.ruleDecision(objectType, RuleDecisionCounters.candidate(meta.size()));
                         stats.planned(objectType, 1L, meta.size());
+                        progress.recordPlannedFile(meta.size());
                         if (safeDeleter.deleteFile(
                                 meta, decision, rule.id(), task.cutoffMillis())) {
                             if (!task.dryRun()) {
@@ -441,8 +471,13 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     // Helpers
     // -------------------------------------------------------------------------
 
-    private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun, ScopeIdentity scope) {
-        return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter, scope);
+    private SafeDeleter createSafeDeleter(
+            FileSystem fs, boolean dryRun, ScopeIdentity scope, ScanTaskProgress progress) {
+        return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter, scope, progress);
+    }
+
+    private void mergeTaskProgress(ScanTaskProgress progress) {
+        subtaskCounters = subtaskCounters.add(progress.snapshot());
     }
 
     static double perSubtaskRate(long totalRate, int parallelism) {
@@ -458,10 +493,24 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
         RuntimeException failure = null;
         try {
             if (logger != null) {
+                logger.logScanSubtaskSummary(
+                        Math.max(0L, System.currentTimeMillis() - scanStartMillis),
+                        tasksCompleted,
+                        subtaskCounters);
+            }
+        } catch (RuntimeException summaryFailure) {
+            failure = summaryFailure;
+        }
+        try {
+            if (logger != null) {
                 logger.flushDiagnosticSamplingSummaries();
             }
         } catch (RuntimeException samplingFailure) {
-            failure = samplingFailure;
+            if (failure == null) {
+                failure = samplingFailure;
+            } else {
+                failure.addSuppressed(samplingFailure);
+            }
         }
         if (runtime != null) {
             try {

@@ -133,6 +133,7 @@ class AuditLoggerTest {
                                             + " cutoff_source=explicit cutoff_age_ms="
                                             + (EVENT_TIME_MILLIS + 1L - CUTOFF_MILLIS)
                                             + " cutoff_in_future=false dry_run=true parallelism=3"
+                                            + " scope_enumeration_concurrency=1 scan_parallelism=3"
                                             + " remote_fs_rate_limit=17 allow_delete_manifest=true"
                                             + " allow_clean_orphan_tables=true"
                                             + " allow_clean_orphan_partitions=true",
@@ -141,6 +142,8 @@ class AuditLoggerTest {
                                     "run_start")
                             .dimension("scope", "db.orders")
                             .dimension("parallelism", "3")
+                            .dimension("scope_enumeration_concurrency", "1")
+                            .dimension("scan_parallelism", "3")
                             .dimension("cutoff_source", "explicit")
                             .metric("older_than_ms", CUTOFF_MILLIS)
                             .metric("cutoff_age_ms", EVENT_TIME_MILLIS + 1L - CUTOFF_MILLIS)
@@ -859,19 +862,38 @@ class AuditLoggerTest {
             target.complete(41L);
 
             logger.logScopePhaseStart("metadata_inventory");
-            logger.logScopePhaseEnd("metadata_inventory", 37L, true);
+            logger.logScopePhaseEnd("metadata_inventory", 10_000L, 40L, 2L, true);
+            logger.logScopePhaseEnd("empty", 0L, 0L, 0L, true);
             logger.logScopeTargetSummary(target);
 
             assertThat(TestingAuditReporterFactory.events("testing"))
                     .filteredOn(event -> event.getAction().equals("scope_phase_end"))
+                    .filteredOn(
+                            event ->
+                                    event.getDimensions().get("phase").equals("metadata_inventory"))
                     .singleElement()
                     .satisfies(
                             event -> {
                                 assertThat(event.getDimensions())
                                         .containsEntry("phase", "metadata_inventory");
-                                assertThat(event.getMetrics()).containsEntry("duration_ms", 37L);
+                                assertThat(event.getMetrics())
+                                        .containsEntry("duration_ms", 10_000L)
+                                        .containsEntry("targets_completed", 40L)
+                                        .containsEntry("targets_failed", 2L)
+                                        .containsEntry("targets_per_second_millis", 4_000L);
                                 assertThat(event.getFlags()).containsEntry("complete", true);
                             });
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("scope_phase_end"))
+                    .filteredOn(event -> event.getDimensions().get("phase").equals("empty"))
+                    .singleElement()
+                    .satisfies(
+                            event ->
+                                    assertThat(event.getMetrics())
+                                            .containsEntry("duration_ms", 0L)
+                                            .containsEntry("targets_completed", 0L)
+                                            .containsEntry("targets_failed", 0L)
+                                            .containsEntry("targets_per_second_millis", 0L));
             assertThat(TestingAuditReporterFactory.events("testing"))
                     .filteredOn(event -> event.getAction().equals("scope_target_summary"))
                     .singleElement()
@@ -891,6 +913,39 @@ class AuditLoggerTest {
                                         .containsEntry("complete", true)
                                         .containsEntry("log_coverage_consistent", true)
                                         .containsEntry("kv_coverage_consistent", true);
+                            });
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
+    void emitsEffectiveThroughputConfigurationAtRunStart() {
+        AuditReporterContext context =
+                new AuditReporterContext(
+                        RUN_ID,
+                        true,
+                        AuditStage.RUN,
+                        "ScopeEnumerator",
+                        0,
+                        0,
+                        AuditLoggerTest.class.getClassLoader());
+        AuditReporterRuntime runtime = openTestingRuntime(context);
+        try {
+            AuditLogger logger = new AuditLogger(runtime, context);
+
+            logger.logRunStart(throughputConfig());
+
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("run_start"))
+                    .singleElement()
+                    .satisfies(
+                            event -> {
+                                assertThat(event.getDimensions())
+                                        .containsEntry("scope_enumeration_concurrency", "8")
+                                        .containsEntry("scan_parallelism", "32");
+                                assertThat(event.getMetrics())
+                                        .containsEntry("remote_fs_rate_limit", 400L);
                             });
         } finally {
             runtime.close();
@@ -1322,7 +1377,9 @@ class AuditLoggerTest {
                         "logRunStart(OrphanCleanConfig)",
                         "logScopePlan(ScopePlanStats)",
                         "logScopePhaseStart(String)",
-                        "logScopePhaseEnd(String,long,boolean)",
+                        "logScopePhaseEnd(String,long,long,long,boolean)",
+                        "logScanStart(long,int,double)",
+                        "logScanSubtaskSummary(long,long,CleanupCounters)",
                         "logScopeTargetSummary(ScopeTargetStats)",
                         "logDeleted(FsPath,RuleId,boolean)",
                         "logWouldDelete(FsPath,RuleId)",
@@ -1364,7 +1421,7 @@ class AuditLoggerTest {
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",
                         "logAuditIntegrity(CleanupSummary)");
-        assertThat(actual).hasSize(46);
+        assertThat(actual).hasSize(48);
         assertThat(actual)
                 .noneMatch(
                         method ->
@@ -1394,6 +1451,23 @@ class AuditLoggerTest {
                             "--allow-delete-manifest",
                             "--allow-clean-orphan-tables",
                             "--allow-clean-orphan-partitions"
+                        }));
+    }
+
+    private static OrphanCleanConfig throughputConfig() {
+        return OrphanCleanConfig.fromParams(
+                MultipleParameterToolAdapter.fromArgs(
+                        new String[] {
+                            "--bootstrap-server",
+                            "localhost:9123",
+                            "--database",
+                            "db",
+                            "--scope-enumeration-concurrency",
+                            "8",
+                            "--parallelism",
+                            "32",
+                            "--remote-fs-op-rate-limit-per-second",
+                            "400"
                         }));
     }
 
