@@ -21,6 +21,9 @@ import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.io.IOException;
@@ -47,31 +50,38 @@ import static org.apache.fluss.utils.Preconditions.checkState;
 /** Bounded concurrent execution of live Scope targets with caller-thread result replay. */
 final class ScopeTargetExecutor implements AutoCloseable {
 
-    private static final long CLOSE_TIMEOUT_SECONDS = 10L;
+    private static final Logger LOG = LoggerFactory.getLogger(ScopeTargetExecutor.class);
+    private static final long CLOSE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10L);
 
     private final int concurrency;
     private final ExecutorService executor;
     private final ExecutorCompletionService<ScopeTargetEnumeration.Result> completion;
     private final Set<Future<ScopeTargetEnumeration.Result>> inFlight =
             new HashSet<Future<ScopeTargetEnumeration.Result>>();
-    private final Queue<WorkerContext> contexts = new ConcurrentLinkedQueue<WorkerContext>();
-    private final ThreadLocal<WorkerContext> workerContext;
+    private final Queue<Throwable> workerCloseFailures = new ConcurrentLinkedQueue<Throwable>();
+    private final ThreadLocal<WorkerContext> workerContext = new ThreadLocal<WorkerContext>();
+    private final Supplier<WorkerContext> contextFactory;
+    @Nullable private final Connection ownedConnection;
+    private final long closeTimeoutMillis;
+    private final Object workerExitMonitor = new Object();
+    private int liveWorkerThreads;
 
     private boolean processingFailed;
     private boolean closed;
 
-    private ScopeTargetExecutor(int concurrency, Supplier<WorkerContext> contextFactory) {
+    private ScopeTargetExecutor(
+            int concurrency,
+            Supplier<WorkerContext> contextFactory,
+            @Nullable Connection ownedConnection,
+            long closeTimeoutMillis) {
         checkArgument(concurrency > 0, "concurrency must be greater than 0");
+        checkArgument(closeTimeoutMillis > 0, "close timeout must be greater than 0");
         this.concurrency = concurrency;
+        this.contextFactory = contextFactory;
+        this.ownedConnection = ownedConnection;
+        this.closeTimeoutMillis = closeTimeoutMillis;
         this.executor = Executors.newFixedThreadPool(concurrency, new ScopeTargetThreadFactory());
         this.completion = new ExecutorCompletionService<ScopeTargetEnumeration.Result>(executor);
-        this.workerContext =
-                ThreadLocal.withInitial(
-                        () -> {
-                            WorkerContext context = contextFactory.get();
-                            contexts.add(context);
-                            return context;
-                        });
     }
 
     static ScopeTargetExecutor create(
@@ -82,10 +92,19 @@ final class ScopeTargetExecutor implements AutoCloseable {
                 admin -> ScopeTargetEnumeration.worker(admin, remoteFsOpRateLimiter));
     }
 
+    /** Creates an executor that assumes ownership of {@code connection}. */
     static ScopeTargetExecutor create(
             Connection connection,
             int concurrency,
             Function<Admin, ScopeTargetEnumeration.Worker> workerFactory) {
+        return create(connection, concurrency, workerFactory, CLOSE_TIMEOUT_MILLIS);
+    }
+
+    static ScopeTargetExecutor create(
+            Connection connection,
+            int concurrency,
+            Function<Admin, ScopeTargetEnumeration.Worker> workerFactory,
+            long closeTimeoutMillis) {
         return new ScopeTargetExecutor(
                 concurrency,
                 () -> {
@@ -100,18 +119,23 @@ final class ScopeTargetExecutor implements AutoCloseable {
                         }
                         throw failure;
                     }
-                });
+                },
+                connection,
+                closeTimeoutMillis);
     }
 
     static ScopeTargetExecutor testing(
             int concurrency, Supplier<ScopeTargetEnumeration.Worker> workerFactory) {
         return new ScopeTargetExecutor(
-                concurrency, () -> new WorkerContext(null, workerFactory.get()));
+                concurrency,
+                () -> new WorkerContext(null, workerFactory.get()),
+                null,
+                CLOSE_TIMEOUT_MILLIS);
     }
 
     static ScopeTargetExecutor testingContexts(
             int concurrency, Supplier<WorkerContext> contextFactory) {
-        return new ScopeTargetExecutor(concurrency, contextFactory);
+        return new ScopeTargetExecutor(concurrency, contextFactory, null, CLOSE_TIMEOUT_MILLIS);
     }
 
     void forEachCompleted(
@@ -155,21 +179,24 @@ final class ScopeTargetExecutor implements AutoCloseable {
         executor.shutdownNow();
 
         Throwable closeFailure = null;
+        boolean resourcesSafeToClose = false;
         try {
-            if (!executor.awaitTermination(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            if (!executor.awaitTermination(closeTimeoutMillis, TimeUnit.MILLISECONDS)) {
                 closeFailure = new IOException("Timed out closing Scope target executor");
+            } else {
+                awaitWorkerThreadExit();
+                resourcesSafeToClose = true;
             }
         } catch (InterruptedException failure) {
             Thread.currentThread().interrupt();
             closeFailure = failure;
         }
 
-        for (WorkerContext context : contexts) {
-            try {
-                context.close();
-            } catch (Exception | Error failure) {
-                closeFailure = addSuppressed(closeFailure, failure);
-            }
+        closeFailure = drainWorkerCloseFailures(closeFailure);
+        if (resourcesSafeToClose) {
+            closeFailure = closeOwnedConnection(closeFailure);
+        } else {
+            startDeferredConnectionCleanup();
         }
         if (closeFailure != null) {
             rethrow(closeFailure);
@@ -177,7 +204,115 @@ final class ScopeTargetExecutor implements AutoCloseable {
     }
 
     private void submit(ScopeTargetEnumeration.Input input) {
-        inFlight.add(completion.submit(() -> workerContext.get().worker().enumerate(input)));
+        inFlight.add(completion.submit(() -> getOrCreateWorkerContext().worker().enumerate(input)));
+    }
+
+    private WorkerContext getOrCreateWorkerContext() {
+        WorkerContext context = workerContext.get();
+        if (context == null) {
+            context = contextFactory.get();
+            workerContext.set(context);
+        }
+        return context;
+    }
+
+    private void closeCurrentWorkerContext() {
+        WorkerContext context = workerContext.get();
+        workerContext.remove();
+        if (context != null) {
+            try {
+                context.close();
+            } catch (Exception | Error failure) {
+                workerCloseFailures.add(failure);
+            }
+        }
+    }
+
+    private void workerThreadStarted() {
+        synchronized (workerExitMonitor) {
+            liveWorkerThreads++;
+        }
+    }
+
+    private void workerThreadExited() {
+        synchronized (workerExitMonitor) {
+            liveWorkerThreads--;
+            workerExitMonitor.notifyAll();
+        }
+    }
+
+    private void awaitWorkerThreadExit() throws InterruptedException {
+        synchronized (workerExitMonitor) {
+            while (liveWorkerThreads > 0) {
+                workerExitMonitor.wait();
+            }
+        }
+    }
+
+    private void awaitWorkerThreadExitUninterruptibly() {
+        boolean interrupted = false;
+        synchronized (workerExitMonitor) {
+            while (liveWorkerThreads > 0) {
+                try {
+                    workerExitMonitor.wait();
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private Throwable drainWorkerCloseFailures(@Nullable Throwable primary) {
+        Throwable failure = primary;
+        Throwable workerCloseFailure;
+        while ((workerCloseFailure = workerCloseFailures.poll()) != null) {
+            failure = addSuppressed(failure, workerCloseFailure);
+        }
+        return failure;
+    }
+
+    private Throwable closeOwnedConnection(@Nullable Throwable primary) {
+        Throwable failure = primary;
+        if (ownedConnection != null) {
+            try {
+                ownedConnection.close();
+            } catch (Exception | Error connectionCloseFailure) {
+                failure = addSuppressed(failure, connectionCloseFailure);
+            }
+        }
+        return failure;
+    }
+
+    private void startDeferredConnectionCleanup() {
+        Thread cleanupThread =
+                new Thread(
+                        () -> {
+                            boolean interrupted = false;
+                            while (!executor.isTerminated()) {
+                                try {
+                                    executor.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+                                } catch (InterruptedException ignored) {
+                                    interrupted = true;
+                                }
+                            }
+                            awaitWorkerThreadExitUninterruptibly();
+                            Throwable deferredFailure = drainWorkerCloseFailures(null);
+                            deferredFailure = closeOwnedConnection(deferredFailure);
+                            if (deferredFailure != null) {
+                                LOG.warn(
+                                        "Failed to release deferred Scope target executor resources",
+                                        deferredFailure);
+                            }
+                            if (interrupted) {
+                                Thread.currentThread().interrupt();
+                            }
+                        },
+                        "fluss-orphan-scope-target-cleanup");
+        cleanupThread.setDaemon(true);
+        cleanupThread.start();
     }
 
     private void rethrowWorkerFailure(
@@ -244,14 +379,26 @@ final class ScopeTargetExecutor implements AutoCloseable {
         }
     }
 
-    private static final class ScopeTargetThreadFactory implements ThreadFactory {
+    private final class ScopeTargetThreadFactory implements ThreadFactory {
         private final AtomicInteger threadIndex = new AtomicInteger();
 
         @Override
         public Thread newThread(Runnable runnable) {
             Thread thread =
                     new Thread(
-                            runnable, "fluss-orphan-scope-target-" + threadIndex.incrementAndGet());
+                            () -> {
+                                workerThreadStarted();
+                                try {
+                                    runnable.run();
+                                } finally {
+                                    try {
+                                        closeCurrentWorkerContext();
+                                    } finally {
+                                        workerThreadExited();
+                                    }
+                                }
+                            },
+                            "fluss-orphan-scope-target-" + threadIndex.incrementAndGet());
             thread.setDaemon(true);
             return thread;
         }

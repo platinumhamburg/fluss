@@ -65,6 +65,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 import static org.apache.fluss.flink.action.orphan.OrphanCleanUtils.enumerateBuckets;
@@ -136,15 +137,10 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 }
             }
 
-            try (Connection connection = ConnectionFactory.createConnection(flussConfig);
-                    Admin admin = connection.getAdmin()) {
-                // Fail fast on incompatible servers: the action jar may be deployed against an
-                // older cluster that does not implement ListRemoteLogManifests / ListKvSnapshots.
-                // Without this guard, every per-target fetch would degrade to skip_log_target /
-                // skip_kv_target audit events and the job would exit "successfully" with
-                // deleted=0, masking the incompatibility.
-                verifyServerSupportsRequiredApis(admin);
-
+            Connection connection = ConnectionFactory.createConnection(flussConfig);
+            boolean connectionTransferred = false;
+            Throwable connectionOwnerFailure = null;
+            try {
                 ScopePlanStats planStats = new ScopePlanStats();
                 audit.logRunStart(config);
                 audit.logCutoff(config.olderThanMillis());
@@ -155,69 +151,93 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 Map<String, String> clusterConfigMap;
                 String clusterRemoteDataDir;
                 List<String> clusterRoots;
-                long phaseStartMillis = startScopePhase(audit, "cluster_configuration_resolution");
-                boolean phaseComplete = false;
-                try {
-                    clusterConfigMap = fetchClusterConfigMap(admin);
-                    clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
-                    clusterRoots = normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
-                    phaseComplete = true;
-                } finally {
-                    endScopePhase(
-                            audit,
-                            "cluster_configuration_resolution",
-                            phaseStartMillis,
-                            0L,
-                            0L,
-                            phaseComplete);
-                }
-
                 Map<String, DbScanState> dbStates;
-                phaseStartMillis = startScopePhase(audit, "metadata_inventory");
-                phaseComplete = false;
-                try {
-                    dbStates = enumerateActiveScope(admin, audit, tracker, planStats);
-                    phaseComplete = true;
-                } finally {
-                    endScopePhase(
-                            audit, "metadata_inventory", phaseStartMillis, 0L, 0L, phaseComplete);
+                try (Admin admin = connection.getAdmin()) {
+                    // Fail fast on incompatible servers: the action jar may be deployed against an
+                    // older cluster that does not implement ListRemoteLogManifests /
+                    // ListKvSnapshots. Without this guard, every per-target fetch would degrade to
+                    // skip_log_target / skip_kv_target audit events and the job would exit
+                    // "successfully" with deleted=0, masking the incompatibility.
+                    verifyServerSupportsRequiredApis(admin);
+
+                    long phaseStartMillis =
+                            startScopePhase(audit, "cluster_configuration_resolution");
+                    boolean phaseComplete = false;
+                    try {
+                        clusterConfigMap = fetchClusterConfigMap(admin);
+                        clusterRemoteDataDir = resolveClusterRemoteDataDir(clusterConfigMap);
+                        clusterRoots =
+                                normalizeRoots(resolveClusterRemoteDataDirs(clusterConfigMap));
+                        phaseComplete = true;
+                    } finally {
+                        endScopePhase(
+                                audit,
+                                "cluster_configuration_resolution",
+                                phaseStartMillis,
+                                0L,
+                                0L,
+                                phaseComplete);
+                    }
+
+                    phaseStartMillis = startScopePhase(audit, "metadata_inventory");
+                    phaseComplete = false;
+                    try {
+                        dbStates = enumerateActiveScope(admin, audit, tracker, planStats);
+                        phaseComplete = true;
+                    } finally {
+                        endScopePhase(
+                                audit,
+                                "metadata_inventory",
+                                phaseStartMillis,
+                                0L,
+                                0L,
+                                phaseComplete);
+                    }
                 }
 
-                phaseStartMillis = startScopePhase(audit, "live_target_planning");
+                long phaseStartMillis = startScopePhase(audit, "live_target_planning");
                 long targetsCompletedBefore = planStats.scopeTargets();
                 long targetsFailedBefore = planStats.incompleteTargets();
-                phaseComplete = false;
+                boolean phaseComplete = false;
                 try {
-                    List<ScopeTargetEnumeration.Input> targetInputs =
-                            buildTargetInputs(dbStates, clusterRemoteDataDir, clusterRoots);
-                    try (ScopeTargetExecutor executor =
+                    ScopeTargetExecutor executor =
                             ScopeTargetExecutor.create(
                                     connection,
                                     config.scopeEnumerationConcurrency(),
-                                    remoteFsOpRateLimiter)) {
-                        executor.forEachCompleted(
-                                targetInputs,
-                                result -> result.replay(audit, planStats, out::collect));
-                    }
-                    for (DbScanState dbState : dbStates.values()) {
-                        for (LiveTableScope liveTable : dbState.liveTables) {
-                            emitOrphanPartitionDirTasks(
-                                    liveTable,
-                                    tracker,
-                                    clusterRoots,
-                                    audit,
-                                    remoteFsOpRateLimiter,
-                                    planStats,
-                                    out);
-                        }
-                        emitOrphanTableDirTasks(
-                                dbState,
-                                tracker,
-                                clusterRoots,
-                                audit,
-                                remoteFsOpRateLimiter,
-                                planStats,
-                                out);
+                                    remoteFsOpRateLimiter);
+                    connectionTransferred = true;
+                    try (ScopeTargetExecutor ownedExecutor = executor) {
+                        planTargetsAndOrphans(
+                                config.scopeEnumerationConcurrency(),
+                                new ArrayList<DbScanState>(dbStates.values()),
+                                dbState -> dbState.liveTables,
+                                liveTables ->
+                                        ownedExecutor.forEachCompleted(
+                                                buildTargetInputs(
+                                                        liveTables,
+                                                        clusterRemoteDataDir,
+                                                        clusterRoots),
+                                                result ->
+                                                        result.replay(
+                                                                audit, planStats, out::collect)),
+                                liveTable ->
+                                        emitOrphanPartitionDirTasks(
+                                                liveTable,
+                                                tracker,
+                                                clusterRoots,
+                                                audit,
+                                                remoteFsOpRateLimiter,
+                                                planStats,
+                                                out),
+                                dbState ->
+                                        emitOrphanTableDirTasks(
+                                                dbState,
+                                                tracker,
+                                                clusterRoots,
+                                                audit,
+                                                remoteFsOpRateLimiter,
+                                                planStats,
+                                                out));
                     }
                     phaseComplete = true;
                 } finally {
@@ -231,6 +251,20 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                 }
                 audit.logScopePlan(planStats);
                 out.collect(ScopeSummaryTask.from(planStats));
+            } catch (Exception | Error failure) {
+                connectionOwnerFailure = failure;
+                throw failure;
+            } finally {
+                if (!connectionTransferred) {
+                    try {
+                        connection.close();
+                    } catch (Exception | Error closeFailure) {
+                        if (connectionOwnerFailure == null) {
+                            throw closeFailure;
+                        }
+                        connectionOwnerFailure.addSuppressed(closeFailure);
+                    }
+                }
             }
         } catch (Exception | Error failure) {
             processingFailure = failure;
@@ -525,38 +559,73 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     // -------------------------------------------------------------------------
 
     private List<ScopeTargetEnumeration.Input> buildTargetInputs(
-            Map<String, DbScanState> dbStates,
+            List<LiveTableScope> liveTables,
             @Nullable String clusterRemoteDataDir,
             List<String> clusterRoots) {
         List<ScopeTargetEnumeration.Input> inputs = new ArrayList<ScopeTargetEnumeration.Input>();
-        for (DbScanState dbState : dbStates.values()) {
-            for (LiveTableScope liveTable : dbState.liveTables) {
-                if (liveTable.partitioned && !liveTable.partitionInfosComplete) {
-                    continue;
-                }
-                List<PartitionInfo> partitionTargets =
-                        liveTable.partitioned
-                                ? liveTable.partitions
-                                : Collections.<PartitionInfo>singletonList(null);
-                for (PartitionInfo partitionInfo : partitionTargets) {
-                    inputs.add(
-                            new ScopeTargetEnumeration.Input(
-                                    liveTable.dbName,
-                                    liveTable.tableName,
-                                    liveTable.tableId,
-                                    liveTable.tablePath,
-                                    liveTable.tableInfo,
-                                    partitionInfo,
-                                    enumerateBuckets(liveTable.tableInfo, partitionInfo),
-                                    clusterRemoteDataDir,
-                                    clusterRoots,
-                                    config.olderThanMillis(),
-                                    config.dryRun(),
-                                    config.allowDeleteManifest()));
-                }
+        for (LiveTableScope liveTable : liveTables) {
+            if (liveTable.partitioned && !liveTable.partitionInfosComplete) {
+                continue;
+            }
+            List<PartitionInfo> partitionTargets =
+                    liveTable.partitioned
+                            ? liveTable.partitions
+                            : Collections.<PartitionInfo>singletonList(null);
+            for (PartitionInfo partitionInfo : partitionTargets) {
+                inputs.add(
+                        new ScopeTargetEnumeration.Input(
+                                liveTable.dbName,
+                                liveTable.tableName,
+                                liveTable.tableId,
+                                liveTable.tablePath,
+                                liveTable.tableInfo,
+                                partitionInfo,
+                                enumerateBuckets(liveTable.tableInfo, partitionInfo),
+                                clusterRemoteDataDir,
+                                clusterRoots,
+                                config.olderThanMillis(),
+                                config.dryRun(),
+                                config.allowDeleteManifest()));
             }
         }
         return inputs;
+    }
+
+    static <D, T> void planTargetsAndOrphans(
+            int concurrency,
+            List<D> databases,
+            Function<D, List<T>> liveTables,
+            ThrowingConsumer<List<T>> targetPlanner,
+            ThrowingConsumer<T> orphanPartitionPlanner,
+            ThrowingConsumer<D> orphanTablePlanner)
+            throws Exception {
+        if (concurrency == 1) {
+            for (D database : databases) {
+                for (T table : liveTables.apply(database)) {
+                    targetPlanner.accept(Collections.singletonList(table));
+                    orphanPartitionPlanner.accept(table);
+                }
+                orphanTablePlanner.accept(database);
+            }
+            return;
+        }
+
+        List<T> targets = new ArrayList<T>();
+        for (D database : databases) {
+            targets.addAll(liveTables.apply(database));
+        }
+        targetPlanner.accept(targets);
+        for (D database : databases) {
+            for (T table : liveTables.apply(database)) {
+                orphanPartitionPlanner.accept(table);
+            }
+            orphanTablePlanner.accept(database);
+        }
+    }
+
+    @FunctionalInterface
+    interface ThrowingConsumer<T> {
+        void accept(T value) throws Exception;
     }
 
     static void enumerateTarget(

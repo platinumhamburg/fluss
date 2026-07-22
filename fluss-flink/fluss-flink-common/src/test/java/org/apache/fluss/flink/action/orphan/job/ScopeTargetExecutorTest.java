@@ -36,9 +36,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -47,6 +49,205 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ScopeTargetExecutorTest {
+
+    @Test
+    void doesNotCloseResourcesBeforeInterruptIgnoringWorkerExits() throws Exception {
+        Connection connection = mock(Connection.class);
+        Admin inventoryAdmin = mock(Admin.class);
+        Admin workerAdmin0 = mock(Admin.class);
+        Admin workerAdmin1 = mock(Admin.class);
+        when(connection.getAdmin()).thenReturn(inventoryAdmin);
+        AtomicInteger adminIndex = new AtomicInteger();
+        when(connection.createAdmin())
+                .thenAnswer(
+                        ignored -> adminIndex.getAndIncrement() == 0 ? workerAdmin0 : workerAdmin1);
+
+        IOException primary = new IOException("primary");
+        AtomicInteger invocation = new AtomicInteger();
+        AtomicReference<Admin> stubbornAdmin = new AtomicReference<Admin>();
+        CountDownLatch stubbornStarted = new CountDownLatch(1);
+        CountDownLatch releaseStubborn = new CountDownLatch(1);
+        CountDownLatch stubbornExited = new CountDownLatch(1);
+        CountDownLatch stubbornAdminClosed = new CountDownLatch(1);
+        CountDownLatch connectionClosed = new CountDownLatch(1);
+        doAnswer(
+                        invocationOnMock -> {
+                            if (invocationOnMock.getMock() == stubbornAdmin.get()) {
+                                stubbornAdminClosed.countDown();
+                            }
+                            return null;
+                        })
+                .when(workerAdmin0)
+                .close();
+        doAnswer(
+                        invocationOnMock -> {
+                            if (invocationOnMock.getMock() == stubbornAdmin.get()) {
+                                stubbornAdminClosed.countDown();
+                            }
+                            return null;
+                        })
+                .when(workerAdmin1)
+                .close();
+        doAnswer(
+                        ignored -> {
+                            connectionClosed.countDown();
+                            return null;
+                        })
+                .when(connection)
+                .close();
+
+        Admin retainedInventoryAdmin = connection.getAdmin();
+        Throwable failure;
+        try {
+            failure =
+                    catchThrowable(
+                            () -> {
+                                try (ScopeTargetExecutor executor =
+                                        ScopeTargetExecutor.create(
+                                                connection,
+                                                2,
+                                                admin ->
+                                                        input -> {
+                                                            if (invocation.getAndIncrement() == 0) {
+                                                                stubbornStarted.await(
+                                                                        10, TimeUnit.SECONDS);
+                                                                throw primary;
+                                                            }
+                                                            stubbornAdmin.set(admin);
+                                                            stubbornStarted.countDown();
+                                                            try {
+                                                                while (true) {
+                                                                    try {
+                                                                        if (releaseStubborn.await(
+                                                                                10,
+                                                                                TimeUnit
+                                                                                        .MILLISECONDS)) {
+                                                                            return emptyResult();
+                                                                        }
+                                                                    } catch (
+                                                                            InterruptedException
+                                                                                    ignored) {
+                                                                        // Deliberately ignore
+                                                                        // cancellation.
+                                                                    }
+                                                                }
+                                                            } finally {
+                                                                stubbornExited.countDown();
+                                                            }
+                                                        },
+                                                25L)) {
+                                    executor.forEachCompleted(nullInputs(2), ignored -> {});
+                                }
+                            });
+
+            assertThat(failure).isSameAs(primary);
+            assertThat(failure.getSuppressed())
+                    .singleElement()
+                    .isInstanceOfSatisfying(
+                            IOException.class,
+                            timeout ->
+                                    assertThat(timeout)
+                                            .hasMessageContaining(
+                                                    "Timed out closing Scope target executor"));
+            assertThat(stubbornExited.getCount()).isEqualTo(1L);
+            verify(stubbornAdmin.get(), never()).close();
+            verify(connection, never()).close();
+        } finally {
+            releaseStubborn.countDown();
+        }
+
+        assertThat(stubbornExited.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(stubbornAdminClosed.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(connectionClosed.await(10, TimeUnit.SECONDS)).isTrue();
+        verify(stubbornAdmin.get(), times(1)).close();
+        verify(workerAdmin0, times(1)).close();
+        verify(workerAdmin1, times(1)).close();
+        verify(connection, times(1)).close();
+        verify(inventoryAdmin, never()).close();
+        assertThat(retainedInventoryAdmin).isSameAs(inventoryAdmin);
+    }
+
+    @Test
+    void interruptedCloseDefersResourcesUntilWorkerExit() throws Exception {
+        Connection connection = mock(Connection.class);
+        Admin inventoryAdmin = mock(Admin.class);
+        Admin workerAdmin = mock(Admin.class);
+        when(connection.getAdmin()).thenReturn(inventoryAdmin);
+        when(connection.createAdmin()).thenReturn(workerAdmin);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        CountDownLatch workerExited = new CountDownLatch(1);
+        CountDownLatch adminClosed = new CountDownLatch(1);
+        CountDownLatch connectionClosed = new CountDownLatch(1);
+        doAnswer(
+                        ignored -> {
+                            adminClosed.countDown();
+                            return null;
+                        })
+                .when(workerAdmin)
+                .close();
+        doAnswer(
+                        ignored -> {
+                            connectionClosed.countDown();
+                            return null;
+                        })
+                .when(connection)
+                .close();
+        ScopeTargetEnumeration.Worker worker =
+                input -> {
+                    workerStarted.countDown();
+                    try {
+                        while (true) {
+                            try {
+                                if (releaseWorker.await(10, TimeUnit.MILLISECONDS)) {
+                                    return emptyResult();
+                                }
+                            } catch (InterruptedException ignored) {
+                                // Deliberately ignore cancellation.
+                            }
+                        }
+                    } finally {
+                        workerExited.countDown();
+                    }
+                };
+
+        Admin retainedInventoryAdmin = connection.getAdmin();
+        ScopeTargetExecutor executor =
+                ScopeTargetExecutor.create(connection, 1, ignored -> worker, 25L);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        Future<?> enumeration =
+                caller.submit(
+                        () -> {
+                            executor.forEachCompleted(nullInputs(1), ignored -> {});
+                            return null;
+                        });
+        try {
+            assertThat(workerStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            Thread.currentThread().interrupt();
+            Throwable closeFailure = catchThrowable(executor::close);
+            boolean interruptRestored = Thread.currentThread().isInterrupted();
+            Thread.interrupted();
+
+            assertThat(closeFailure).isInstanceOf(InterruptedException.class);
+            assertThat(interruptRestored).isTrue();
+            assertThat(workerExited.getCount()).isEqualTo(1L);
+            verify(workerAdmin, never()).close();
+            verify(connection, never()).close();
+        } finally {
+            Thread.interrupted();
+            releaseWorker.countDown();
+            caller.shutdown();
+        }
+
+        assertThat(workerExited.await(10, TimeUnit.SECONDS)).isTrue();
+        enumeration.get(10, TimeUnit.SECONDS);
+        assertThat(adminClosed.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(connectionClosed.await(10, TimeUnit.SECONDS)).isTrue();
+        verify(workerAdmin, times(1)).close();
+        verify(connection, times(1)).close();
+        verify(inventoryAdmin, never()).close();
+        assertThat(retainedInventoryAdmin).isSameAs(inventoryAdmin);
+    }
 
     @Test
     void productionFactoryOwnsOneDistinctAdminPerWorkerThread() throws Exception {
@@ -98,7 +299,7 @@ class ScopeTargetExecutorTest {
         verify(inventoryAdmin, never()).close();
         verify(connection, times(2)).createAdmin();
         verify(connection, times(1)).getAdmin();
-        verify(connection, never()).close();
+        verify(connection, times(1)).close();
     }
 
     @Test
@@ -135,7 +336,7 @@ class ScopeTargetExecutorTest {
         verify(inventoryAdmin, never()).close();
         verify(connection, times(1)).createAdmin();
         verify(connection, times(1)).getAdmin();
-        verify(connection, never()).close();
+        verify(connection, times(1)).close();
     }
 
     @Test
