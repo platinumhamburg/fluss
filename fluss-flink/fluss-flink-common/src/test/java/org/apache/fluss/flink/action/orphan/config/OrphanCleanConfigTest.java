@@ -64,6 +64,7 @@ class OrphanCleanConfigTest {
         assertThat(config.olderThanConfigured()).isFalse();
         assertThat(config.dryRun()).isFalse();
         assertThat(config.remoteFsOpRateLimitPerSecond()).isEqualTo(100L);
+        assertThat(config.scopeEnumerationConcurrency()).isEqualTo(1);
         assertThat(config.allowDeleteManifest()).isFalse();
         assertThat(config.allowCleanOrphanTables()).isFalse();
         assertThat(config.allowCleanOrphanPartitions()).isFalse();
@@ -99,6 +100,39 @@ class OrphanCleanConfigTest {
                                                 })))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("--remote-fs-op-rate-limit-per-second must be positive");
+    }
+
+    @Test
+    void scopeEnumerationConcurrencyParsed() {
+        OrphanCleanConfig config =
+                OrphanCleanConfig.fromParams(
+                        MultipleParameterToolAdapter.fromArgs(
+                                new String[] {
+                                    "--bootstrap-server",
+                                    "h:9123",
+                                    "--all-databases",
+                                    "--scope-enumeration-concurrency",
+                                    "8"
+                                }));
+
+        assertThat(config.scopeEnumerationConcurrency()).isEqualTo(8);
+    }
+
+    @Test
+    void scopeEnumerationConcurrencyMustBePositive() {
+        assertThatThrownBy(
+                        () ->
+                                OrphanCleanConfig.fromParams(
+                                        MultipleParameterToolAdapter.fromArgs(
+                                                new String[] {
+                                                    "--bootstrap-server",
+                                                    "h:9123",
+                                                    "--all-databases",
+                                                    "--scope-enumeration-concurrency",
+                                                    "0"
+                                                })))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--scope-enumeration-concurrency must be positive");
     }
 
     @Test

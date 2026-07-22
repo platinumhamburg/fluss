@@ -64,6 +64,8 @@ public final class OrphanCleanConfig implements Serializable {
 
     private static final long DEFAULT_REMOTE_FS_OP_RATE_LIMIT_PER_SECOND = 100L;
 
+    private static final int DEFAULT_SCOPE_ENUMERATION_CONCURRENCY = 1;
+
     private static final String AUDIT_RUN_ID = "audit.run-id";
     private static final String AUDIT_REPORTERS = "audit.reporters";
     private static final String AUDIT_REPORTER_PREFIX = "audit.reporter.";
@@ -77,6 +79,7 @@ public final class OrphanCleanConfig implements Serializable {
     private final boolean olderThanConfigured;
     private final boolean dryRun;
     private final long remoteFsOpRateLimitPerSecond;
+    private final int scopeEnumerationConcurrency;
     private final @Nullable Integer parallelism;
     private final boolean allowDeleteManifest;
     private final boolean allowCleanOrphanTables;
@@ -93,6 +96,7 @@ public final class OrphanCleanConfig implements Serializable {
             boolean olderThanConfigured,
             boolean dryRun,
             long remoteFsOpRateLimitPerSecond,
+            int scopeEnumerationConcurrency,
             @Nullable Integer parallelism,
             boolean allowDeleteManifest,
             boolean allowCleanOrphanTables,
@@ -107,6 +111,7 @@ public final class OrphanCleanConfig implements Serializable {
         this.olderThanConfigured = olderThanConfigured;
         this.dryRun = dryRun;
         this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
+        this.scopeEnumerationConcurrency = scopeEnumerationConcurrency;
         this.parallelism = parallelism;
         this.allowDeleteManifest = allowDeleteManifest;
         this.allowCleanOrphanTables = allowCleanOrphanTables;
@@ -145,6 +150,11 @@ public final class OrphanCleanConfig implements Serializable {
                         "--remote-fs-op-rate-limit-per-second",
                         params.get("remote-fs-op-rate-limit-per-second"),
                         DEFAULT_REMOTE_FS_OP_RATE_LIMIT_PER_SECOND);
+        int scopeEnumerationConcurrency =
+                parsePositiveInt(
+                        "--scope-enumeration-concurrency",
+                        params.get("scope-enumeration-concurrency"),
+                        DEFAULT_SCOPE_ENUMERATION_CONCURRENCY);
         Integer parallelism = parseParallelism(params.get("parallelism"));
         boolean allowDeleteManifest = params.has("allow-delete-manifest");
         boolean allowCleanOrphanTables = params.has("allow-clean-orphan-tables");
@@ -161,6 +171,7 @@ public final class OrphanCleanConfig implements Serializable {
                 !StringUtils.isNullOrWhitespaceOnly(olderThan),
                 params.has("dry-run"),
                 remoteFsOpRateLimitPerSecond,
+                scopeEnumerationConcurrency,
                 parallelism,
                 allowDeleteManifest,
                 allowCleanOrphanTables,
@@ -216,6 +227,17 @@ public final class OrphanCleanConfig implements Serializable {
             throw new IllegalArgumentException(flag + " must be positive");
         }
         return rate;
+    }
+
+    private static int parsePositiveInt(String flag, @Nullable String value, int defaultValue) {
+        if (StringUtils.isNullOrWhitespaceOnly(value)) {
+            return defaultValue;
+        }
+        int parsed = Integer.parseInt(value);
+        if (parsed <= 0) {
+            throw new IllegalArgumentException(flag + " must be positive");
+        }
+        return parsed;
     }
 
     @Nullable
@@ -425,6 +447,11 @@ public final class OrphanCleanConfig implements Serializable {
      */
     public long remoteFsOpRateLimitPerSecond() {
         return remoteFsOpRateLimitPerSecond;
+    }
+
+    /** Returns the target-level scope enumeration concurrency. */
+    public int scopeEnumerationConcurrency() {
+        return scopeEnumerationConcurrency;
     }
 
     /** Returns the optional parallelism for the ScanAndClean stage. */
