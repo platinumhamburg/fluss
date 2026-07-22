@@ -49,6 +49,28 @@ public final class ScopeTargetStats {
         this.kvApplicable = kvApplicable;
     }
 
+    private ScopeTargetStats(ScopeTargetStats source) {
+        this.scope = source.scope;
+        this.expectedBuckets = source.expectedBuckets;
+        this.kvApplicable = source.kvApplicable;
+        this.logResolvedBuckets = source.logResolvedBuckets;
+        this.logNoManifestBuckets = source.logNoManifestBuckets;
+        this.logReadFailedBuckets = source.logReadFailedBuckets;
+        this.logUnavailableBuckets = source.logUnavailableBuckets;
+        this.outOfScopeBuckets = source.outOfScopeBuckets;
+        this.kvActiveBuckets = source.kvActiveBuckets;
+        this.kvEmptyBuckets = source.kvEmptyBuckets;
+        this.kvUnavailableBuckets = source.kvUnavailableBuckets;
+        this.tasksEmitted = source.tasksEmitted;
+        this.durationMillis = source.durationMillis;
+        this.complete = source.complete;
+        this.coverageFailure = source.coverageFailure;
+    }
+
+    ScopeTargetStats snapshot() {
+        return new ScopeTargetStats(this);
+    }
+
     public void logResolvedBucket() {
         logResolvedBuckets++;
     }

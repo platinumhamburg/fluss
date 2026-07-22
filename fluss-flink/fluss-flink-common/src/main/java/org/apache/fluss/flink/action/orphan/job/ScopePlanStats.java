@@ -116,6 +116,32 @@ public final class ScopePlanStats {
         }
     }
 
+    void mergeFrom(ScopePlanStats delta) {
+        databases += delta.databases;
+        tables += delta.tables;
+        partitions += delta.partitions;
+        discoveredBuckets += delta.discoveredBuckets;
+        bucketTasks += delta.bucketTasks;
+        orphanDirTasks += delta.orphanDirTasks;
+        skippedNoRemoteManifest += delta.skippedNoRemoteManifest;
+        skippedEmptyKvActiveSet += delta.skippedEmptyKvActiveSet;
+        skippedOutOfScopeRoot += delta.skippedOutOfScopeRoot;
+        metadataFailures += delta.metadataFailures;
+        scopeTargets += delta.scopeTargets;
+        targetBuckets += delta.targetBuckets;
+        kvTargetBuckets += delta.kvTargetBuckets;
+        logResolvedBuckets += delta.logResolvedBuckets;
+        logNoManifestBuckets += delta.logNoManifestBuckets;
+        logReadFailedBuckets += delta.logReadFailedBuckets;
+        logUnavailableBuckets += delta.logUnavailableBuckets;
+        outOfScopeBuckets += delta.outOfScopeBuckets;
+        kvOutOfScopeBuckets += delta.kvOutOfScopeBuckets;
+        kvActiveBuckets += delta.kvActiveBuckets;
+        kvEmptyBuckets += delta.kvEmptyBuckets;
+        kvUnavailableBuckets += delta.kvUnavailableBuckets;
+        incompleteTargets += delta.incompleteTargets;
+    }
+
     public long databases() {
         return databases;
     }
