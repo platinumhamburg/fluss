@@ -112,13 +112,8 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
         StreamingRuntimeContext runtimeContext = (StreamingRuntimeContext) getRuntimeContext();
         int parallelism = RuntimeContextAdapter.getNumberOfParallelSubtasks(runtimeContext);
         int subtaskIndex = RuntimeContextAdapter.getIndexOfThisSubtask(runtimeContext);
-        // Distribute the configured rate as base + 1 extra for the first `remainder` subtasks.
-        // Flink does not provide a cross-JVM limiter here, so this is a best-effort job-level
-        // target. Each subtask gets at least 1/s; if parallelism exceeds the configured rate, the
-        // effective aggregate can exceed the target by that floor.
         remoteFsOpRateLimiter =
-                RateLimiter.create(
-                        perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism, subtaskIndex));
+                RateLimiter.create(perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism));
         if (auditReporterSpec == null) {
             audit = new AuditLogger();
             return;
@@ -450,11 +445,8 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
         return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter, scope);
     }
 
-    private static double perSubtaskRate(long totalRate, int parallelism, int subtaskIndex) {
-        long base = totalRate / parallelism;
-        long remainder = totalRate % parallelism;
-        long quota = base + (subtaskIndex < remainder ? 1L : 0L);
-        return Math.max(1.0, (double) quota);
+    static double perSubtaskRate(long totalRate, int parallelism) {
+        return ((double) totalRate) / parallelism;
     }
 
     private void closeAuditRuntime() {
