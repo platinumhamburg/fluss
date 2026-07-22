@@ -123,6 +123,10 @@ public final class AuditLogger {
                 newEvent(AuditSeverity.INFO, AuditStage.RUN, "run_start", eventTimeMillis)
                         .dimension("scope", scope)
                         .dimension("parallelism", parallelism.toString())
+                        .dimension(
+                                "scope_enumeration_concurrency",
+                                Integer.toString(config.scopeEnumerationConcurrency()))
+                        .dimension("scan_parallelism", parallelism.toString())
                         .dimension("cutoff_source", cutoffSource)
                         .metric("older_than_ms", config.olderThanMillis())
                         .metric("cutoff_age_ms", cutoffAgeMillis)
@@ -134,6 +138,7 @@ public final class AuditLogger {
                         .flag("allow_clean_orphan_partitions", config.allowCleanOrphanPartitions()),
                 "action=run_start scope={} older_than_ms={} cutoff_source={} cutoff_age_ms={}"
                         + " cutoff_in_future={} dry_run={} parallelism={}"
+                        + " scope_enumeration_concurrency={} scan_parallelism={}"
                         + " remote_fs_rate_limit={} allow_delete_manifest={}"
                         + " allow_clean_orphan_tables={} allow_clean_orphan_partitions={}",
                 scope,
@@ -142,6 +147,8 @@ public final class AuditLogger {
                 cutoffAgeMillis,
                 cutoffAgeMillis < 0L,
                 config.dryRun(),
+                parallelism,
+                config.scopeEnumerationConcurrency(),
                 parallelism,
                 config.remoteFsOpRateLimitPerSecond(),
                 config.allowDeleteManifest(),
@@ -225,19 +232,81 @@ public final class AuditLogger {
                 phase);
     }
 
-    public void logScopePhaseEnd(String phase, long durationMillis, boolean complete) {
+    public void logScopePhaseEnd(
+            String phase,
+            long durationMillis,
+            long targetsCompleted,
+            long targetsFailed,
+            boolean complete) {
+        long targetsPerSecondMillis =
+                durationMillis == 0L ? 0L : targetsCompleted * 1_000_000L / durationMillis;
         emit(
                 newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scope_phase_end")
                         .dimension("phase", phase)
                         .metric("duration_ms", durationMillis)
+                        .metric("targets_completed", targetsCompleted)
+                        .metric("targets_failed", targetsFailed)
+                        .metric("targets_per_second_millis", targetsPerSecondMillis)
                         .flag("complete", complete)
                         .flag("action_required", !complete),
                 "audit_version=1 stage=scope action=scope_phase_end phase={} duration_ms={}"
-                        + " complete={} action_required={}",
+                        + " targets_completed={} targets_failed={}"
+                        + " targets_per_second_millis={} complete={} action_required={}",
                 phase,
                 durationMillis,
+                targetsCompleted,
+                targetsFailed,
+                targetsPerSecondMillis,
                 complete,
                 !complete);
+    }
+
+    /** One-shot effective Scan execution configuration for this subtask attempt. */
+    public void logScanStart(
+            long remoteFsRateLimit, int scanParallelism, double effectiveRatePerSecond) {
+        String effectiveRate = Double.toString(effectiveRatePerSecond);
+        emit(
+                newEvent(AuditSeverity.INFO, AuditStage.SCAN, "scan_start")
+                        .dimension("scan_parallelism", Integer.toString(scanParallelism))
+                        .dimension("effective_remote_fs_rate_limit_per_second", effectiveRate)
+                        .metric("remote_fs_rate_limit", remoteFsRateLimit),
+                "audit_version=1 stage=scan action=scan_start scan_parallelism={}"
+                        + " remote_fs_rate_limit={}"
+                        + " effective_remote_fs_rate_limit_per_second={}",
+                scanParallelism,
+                remoteFsRateLimit,
+                effectiveRate);
+    }
+
+    /** One-shot bounded scalar summary for this Scan subtask attempt. */
+    public void logScanSubtaskSummary(
+            long elapsedMillis, long tasksCompleted, CleanupCounters counters) {
+        emit(
+                newEvent(AuditSeverity.INFO, AuditStage.SCAN, "scan_subtask_summary")
+                        .metric("elapsed_ms", elapsedMillis)
+                        .metric("tasks_completed", tasksCompleted)
+                        .metric("scanned_files", counters.scannedFiles())
+                        .metric("planned_files", counters.plannedFiles())
+                        .metric("planned_dirs", counters.plannedDirs())
+                        .metric("planned_bytes", counters.plannedBytes())
+                        .metric("deleted_files", counters.deletedFiles())
+                        .metric("empty_dirs_removed", counters.emptyDirsRemoved())
+                        .metric("delete_failures", counters.deleteFailures())
+                        .metric("bytes_reclaimed", counters.bytesReclaimed()),
+                "audit_version=1 stage=scan action=scan_subtask_summary elapsed_ms={}"
+                        + " tasks_completed={} scanned_files={} planned_files={} planned_dirs={}"
+                        + " planned_bytes={} deleted_files={} empty_dirs_removed={}"
+                        + " delete_failures={} bytes_reclaimed={}",
+                elapsedMillis,
+                tasksCompleted,
+                counters.scannedFiles(),
+                counters.plannedFiles(),
+                counters.plannedDirs(),
+                counters.plannedBytes(),
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed());
     }
 
     public void logScopeTargetSummary(ScopeTargetStats stats) {

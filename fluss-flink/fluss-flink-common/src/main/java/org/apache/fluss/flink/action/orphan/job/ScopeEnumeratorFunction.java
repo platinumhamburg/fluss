@@ -167,6 +167,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                             audit,
                             "cluster_configuration_resolution",
                             phaseStartMillis,
+                            0L,
+                            0L,
                             phaseComplete);
                 }
 
@@ -177,10 +179,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     dbStates = enumerateActiveScope(admin, audit, tracker, planStats);
                     phaseComplete = true;
                 } finally {
-                    endScopePhase(audit, "metadata_inventory", phaseStartMillis, phaseComplete);
+                    endScopePhase(
+                            audit, "metadata_inventory", phaseStartMillis, 0L, 0L, phaseComplete);
                 }
 
                 phaseStartMillis = startScopePhase(audit, "live_target_planning");
+                long targetsCompletedBefore = planStats.scopeTargets();
+                long targetsFailedBefore = planStats.incompleteTargets();
                 phaseComplete = false;
                 try {
                     List<ScopeTargetEnumeration.Input> targetInputs =
@@ -216,7 +221,13 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                     }
                     phaseComplete = true;
                 } finally {
-                    endScopePhase(audit, "live_target_planning", phaseStartMillis, phaseComplete);
+                    endScopePhase(
+                            audit,
+                            "live_target_planning",
+                            phaseStartMillis,
+                            planStats.scopeTargets() - targetsCompletedBefore,
+                            planStats.incompleteTargets() - targetsFailedBefore,
+                            phaseComplete);
                 }
                 audit.logScopePlan(planStats);
                 out.collect(ScopeSummaryTask.from(planStats));
@@ -279,9 +290,18 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     }
 
     private static void endScopePhase(
-            AuditLogger audit, String phase, long startMillis, boolean complete) {
+            AuditLogger audit,
+            String phase,
+            long startMillis,
+            long targetsCompleted,
+            long targetsFailed,
+            boolean complete) {
         audit.logScopePhaseEnd(
-                phase, Math.max(0L, System.currentTimeMillis() - startMillis), complete);
+                phase,
+                Math.max(0L, System.currentTimeMillis() - startMillis),
+                targetsCompleted,
+                targetsFailed,
+                complete);
     }
 
     /** Normalizes each root in the list and returns a deduplicated ordered list. */
