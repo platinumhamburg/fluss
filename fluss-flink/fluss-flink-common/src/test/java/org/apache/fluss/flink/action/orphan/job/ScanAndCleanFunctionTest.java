@@ -120,6 +120,10 @@ class ScanAndCleanFunctionTest {
                 .satisfies(
                         event -> {
                             assertThat(event.getDimensions())
+                                    .containsEntry("parallelism", "3")
+                                    .containsEntry(
+                                            "assigned_remote_fs_rate",
+                                            Double.toString(100.0d / 3.0d))
                                     .containsEntry("scan_parallelism", "3")
                                     .containsEntry(
                                             "effective_remote_fs_rate_limit_per_second",
@@ -136,6 +140,8 @@ class ScanAndCleanFunctionTest {
                                     .containsEntry("tasks_completed", 2L)
                                     .containsKey("elapsed_ms")
                                     .containsEntry("scanned_files", 0L)
+                                    .containsEntry("scanned_bytes", 0L)
+                                    .containsEntry("files_per_second_millis", 0L)
                                     .containsEntry("planned_files", 0L)
                                     .containsEntry("planned_dirs", 0L)
                                     .containsEntry("planned_bytes", 0L)
@@ -143,6 +149,8 @@ class ScanAndCleanFunctionTest {
                                     .containsEntry("empty_dirs_removed", 0L)
                                     .containsEntry("delete_failures", 0L)
                                     .containsEntry("bytes_reclaimed", 0L);
+                            assertThat(event.getDimensions())
+                                    .containsEntry("files_per_second", "0.000");
                             assertThat(event.getPath()).isNull();
                         });
     }
@@ -158,6 +166,63 @@ class ScanAndCleanFunctionTest {
                     .hasMessageContaining("testing")
                     .hasMessageContaining("open")
                     .hasMessageNotContaining("injected-open-failure");
+        }
+    }
+
+    @Test
+    void scanStartReportFailureOwnsRuntimeCleanup() throws Exception {
+        TestingAuditReporterFactory.fail("testing", "report", "injected-report-failure");
+        TestingAuditReporterFactory.fail("testing", "flush", "injected-flush-failure");
+        TestingAuditReporterFactory.fail("testing", "close", "injected-close-failure");
+        ScanAndCleanFunction function = newScanFunction(reportingSpec(true), true);
+        OneInputStreamOperatorTestHarness<CleanTask, CleanupStats> harness = scanHarness(function);
+
+        try {
+            Throwable openFailure = catchThrowable(harness::open);
+            Throwable hardCloseFailure = catchThrowable(harness::close);
+
+            assertThat(openFailure)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageContaining("testing")
+                    .hasMessageContaining("report")
+                    .hasMessageNotContaining("injected-report-failure")
+                    .satisfies(
+                            failure ->
+                                    assertThat(failure.getSuppressed())
+                                            .singleElement()
+                                            .satisfies(
+                                                    cleanupFailure -> {
+                                                        assertThat(cleanupFailure)
+                                                                .hasMessageContaining("testing")
+                                                                .hasMessageContaining("flush")
+                                                                .hasMessageNotContaining(
+                                                                        "injected-flush-failure");
+                                                        assertThat(cleanupFailure.getSuppressed())
+                                                                .singleElement()
+                                                                .satisfies(
+                                                                        closeFailure ->
+                                                                                assertThat(
+                                                                                                closeFailure)
+                                                                                        .hasMessageContaining(
+                                                                                                "testing")
+                                                                                        .hasMessageContaining(
+                                                                                                "close")
+                                                                                        .hasMessageNotContaining(
+                                                                                                "injected-close-failure"));
+                                                    }));
+            assertThat(hardCloseFailure).isNull();
+            assertThat(TestingAuditReporterFactory.callCount("testing:flush")).isEqualTo(1);
+            assertThat(TestingAuditReporterFactory.callCount("testing:close")).isEqualTo(1);
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .extracting(event -> event.getAction())
+                    .containsExactly("scan_start");
+        } finally {
+            TestingAuditReporterFactory.reset();
+            try {
+                function.close();
+            } finally {
+                harness.close();
+            }
         }
     }
 
@@ -334,6 +399,8 @@ class ScanAndCleanFunctionTest {
                                     assertThat(event.getMetrics())
                                             .containsEntry("tasks_completed", 0L)
                                             .containsEntry("scanned_files", 1L)
+                                            .containsEntry("scanned_bytes", 1L)
+                                            .containsKey("files_per_second_millis")
                                             .containsEntry("planned_files", 1L)
                                             .containsEntry("planned_dirs", 0L)
                                             .containsEntry("planned_bytes", 1L)
@@ -341,6 +408,13 @@ class ScanAndCleanFunctionTest {
                                             .containsEntry("empty_dirs_removed", 0L)
                                             .containsEntry("delete_failures", 0L)
                                             .containsEntry("bytes_reclaimed", 1L));
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("scan_subtask_summary"))
+                    .singleElement()
+                    .satisfies(
+                            event ->
+                                    assertThat(event.getDimensions().get("files_per_second"))
+                                            .matches("[0-9]+\\.[0-9]{3}"));
         } finally {
             TestingAuditReporterFactory.reset();
             try {
@@ -457,6 +531,8 @@ class ScanAndCleanFunctionTest {
                                 assertThat(event.getMetrics())
                                         .containsEntry("tasks_completed", 1L)
                                         .containsEntry("scanned_files", 7L)
+                                        .containsEntry("scanned_bytes", 7L)
+                                        .containsKey("files_per_second_millis")
                                         .containsEntry("planned_files", 1L)
                                         .containsEntry("planned_bytes", 1L));
     }

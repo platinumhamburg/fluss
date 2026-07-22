@@ -89,6 +89,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     private transient long scanStartMillis;
     private transient long tasksCompleted;
     private transient CleanupCounters subtaskCounters;
+    private transient long subtaskScannedBytes;
 
     public ScanAndCleanFunction(
             long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
@@ -112,6 +113,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
         scanStartMillis = System.currentTimeMillis();
         tasksCompleted = 0L;
         subtaskCounters = CleanupCounters.empty();
+        subtaskScannedBytes = 0L;
         if (!extraConfigs.isEmpty()) {
             FileSystem.initialize(Configuration.fromMap(extraConfigs), null);
         }
@@ -135,10 +137,19 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
             auditRuntime = AuditReporterRuntime.open(auditReporterSpec, reporterContext);
             audit = new AuditLogger(auditRuntime, reporterContext);
         }
-        audit.logScanStart(
-                remoteFsOpRateLimitPerSecond,
-                parallelism,
-                perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism));
+        try {
+            audit.logScanStart(
+                    remoteFsOpRateLimitPerSecond,
+                    parallelism,
+                    perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism));
+        } catch (Exception | Error openFailure) {
+            try {
+                closeAuditRuntime(false);
+            } catch (RuntimeException | Error cleanupFailure) {
+                openFailure.addSuppressed(cleanupFailure);
+            }
+            throw openFailure;
+        }
     }
 
     @Override
@@ -380,7 +391,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                 FileRule rule = dispatcher.dispatch(meta);
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.scanned(objectType, 1L);
-                progress.recordScannedFile();
+                progress.recordScannedFile(meta.size());
                 stats.ruleDecision(objectType, RuleDecisionCounters.scanned(meta.size()));
                 RuleEvaluation evaluation;
                 Decision decision;
@@ -490,6 +501,7 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
 
     private void mergeTaskProgress(ScanTaskProgress progress) {
         subtaskCounters = subtaskCounters.add(progress.snapshot());
+        subtaskScannedBytes += progress.scannedBytes();
     }
 
     static double perSubtaskRate(long totalRate, int parallelism) {
@@ -497,6 +509,10 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
     }
 
     private void closeAuditRuntime() {
+        closeAuditRuntime(true);
+    }
+
+    private void closeAuditRuntime(boolean emitSummary) {
         AuditReporterRuntime runtime = auditRuntime;
         AuditLogger logger = audit;
         auditRuntime = null;
@@ -504,11 +520,12 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
 
         RuntimeException failure = null;
         try {
-            if (logger != null) {
+            if (logger != null && emitSummary) {
                 logger.logScanSubtaskSummary(
                         Math.max(0L, System.currentTimeMillis() - scanStartMillis),
                         tasksCompleted,
-                        subtaskCounters);
+                        subtaskCounters,
+                        subtaskScannedBytes);
             }
         } catch (RuntimeException summaryFailure) {
             failure = summaryFailure;

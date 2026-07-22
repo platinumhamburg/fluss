@@ -857,6 +857,8 @@ class AuditLoggerTest {
             logger.logScopePhaseStart("metadata_inventory");
             logger.logScopePhaseEnd("metadata_inventory", 10_000L, 40L, 2L, true);
             logger.logScopePhaseEnd("empty", 0L, 0L, 0L, true);
+            logScopePhaseEnd(
+                    logger, "live_target_planning", 2_000L, 12L, 1L, true, Integer.valueOf(8));
             logger.logScopeTargetSummary(target);
 
             assertThat(TestingAuditReporterFactory.events("testing"))
@@ -888,6 +890,23 @@ class AuditLoggerTest {
                                             .containsEntry("targets_failed", 0L)
                                             .containsEntry("targets_per_second_millis", 0L));
             assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("scope_phase_end"))
+                    .filteredOn(
+                            event ->
+                                    event.getDimensions()
+                                            .get("phase")
+                                            .equals("live_target_planning"))
+                    .singleElement()
+                    .satisfies(
+                            event -> {
+                                assertThat(event.getDimensions())
+                                        .containsEntry("scope_enumeration_concurrency", "8");
+                                assertThat(event.getMetrics())
+                                        .containsEntry("targets_completed", 12L)
+                                        .containsEntry("targets_failed", 1L)
+                                        .containsEntry("targets_per_second_millis", 6_000L);
+                            });
+            assertThat(TestingAuditReporterFactory.events("testing"))
                     .filteredOn(event -> event.getAction().equals("scope_target_summary"))
                     .singleElement()
                     .satisfies(
@@ -906,6 +925,55 @@ class AuditLoggerTest {
                                         .containsEntry("complete", true)
                                         .containsEntry("log_coverage_consistent", true)
                                         .containsEntry("kv_coverage_consistent", true);
+                            });
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
+    void emitsExactOverflowSafeScanThroughput() {
+        AuditReporterContext context =
+                new AuditReporterContext(
+                        RUN_ID,
+                        true,
+                        AuditStage.SCAN,
+                        "ScanAndClean",
+                        0,
+                        0,
+                        AuditLoggerTest.class.getClassLoader());
+        AuditReporterRuntime runtime = openTestingRuntime(context);
+        try {
+            AuditLogger logger = new AuditLogger(runtime, context);
+            CleanupCounters threeFiles = new CleanupCounters(3L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+            CleanupCounters maximumFiles =
+                    new CleanupCounters(Long.MAX_VALUE, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+
+            logScanSubtaskSummary(logger, 2_000L, 1L, threeFiles, 30L);
+            logScanSubtaskSummary(logger, 0L, 0L, threeFiles, 30L);
+            logScanSubtaskSummary(logger, 1L, 1L, maximumFiles, Long.MAX_VALUE);
+
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("scan_subtask_summary"))
+                    .satisfiesExactly(
+                            event -> {
+                                assertThat(event.getMetrics())
+                                        .containsEntry("scanned_bytes", 30L)
+                                        .containsEntry("files_per_second_millis", 1_500L);
+                                assertThat(event.getDimensions())
+                                        .containsEntry("files_per_second", "1.500");
+                            },
+                            event -> {
+                                assertThat(event.getMetrics())
+                                        .containsEntry("files_per_second_millis", 0L);
+                                assertThat(event.getDimensions())
+                                        .containsEntry("files_per_second", "0.000");
+                            },
+                            event -> {
+                                assertThat(event.getMetrics())
+                                        .containsEntry("files_per_second_millis", Long.MAX_VALUE);
+                                assertThat(event.getDimensions())
+                                        .containsEntry("files_per_second", "9223372036854775.807");
                             });
         } finally {
             runtime.close();
@@ -1371,8 +1439,10 @@ class AuditLoggerTest {
                         "logScopePlan(ScopePlanStats)",
                         "logScopePhaseStart(String)",
                         "logScopePhaseEnd(String,long,long,long,boolean)",
+                        "logScopePhaseEnd(String,long,long,long,boolean,Integer)",
                         "logScanStart(long,int,double)",
                         "logScanSubtaskSummary(long,long,CleanupCounters)",
+                        "logScanSubtaskSummary(long,long,CleanupCounters,long)",
                         "logScopeTargetSummary(ScopeTargetStats)",
                         "logDeleted(FsPath,RuleId,boolean)",
                         "logWouldDelete(FsPath,RuleId)",
@@ -1414,7 +1484,7 @@ class AuditLoggerTest {
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",
                         "logAuditIntegrity(CleanupSummary)");
-        assertThat(actual).hasSize(48);
+        assertThat(actual).hasSize(50);
         assertThat(actual)
                 .noneMatch(
                         method ->
@@ -1699,6 +1769,76 @@ class AuditLoggerTest {
         ReporterSpec reporter = new ReporterSpec("testing", true, Collections.emptyMap());
         return AuditReporterRuntime.open(
                 new AuditReporterSpec(RUN_ID, Collections.singletonList(reporter)), context);
+    }
+
+    private static void logScopePhaseEnd(
+            AuditLogger logger,
+            String phase,
+            long durationMillis,
+            long targetsCompleted,
+            long targetsFailed,
+            boolean complete,
+            Integer scopeEnumerationConcurrency) {
+        try {
+            Method method =
+                    AuditLogger.class.getDeclaredMethod(
+                            "logScopePhaseEnd",
+                            String.class,
+                            long.class,
+                            long.class,
+                            long.class,
+                            boolean.class,
+                            Integer.class);
+            method.invoke(
+                    logger,
+                    phase,
+                    durationMillis,
+                    targetsCompleted,
+                    targetsFailed,
+                    complete,
+                    scopeEnumerationConcurrency);
+        } catch (NoSuchMethodException e) {
+            throw new AssertionError("Task 5 requires effective Scope concurrency evidence", e);
+        } catch (IllegalAccessException e) {
+            throw new AssertionError("Scope phase audit method is inaccessible", e);
+        } catch (InvocationTargetException e) {
+            throw propagateReflectionFailure(e);
+        }
+    }
+
+    private static void logScanSubtaskSummary(
+            AuditLogger logger,
+            long elapsedMillis,
+            long tasksCompleted,
+            CleanupCounters counters,
+            long scannedBytes) {
+        try {
+            Method method =
+                    AuditLogger.class.getDeclaredMethod(
+                            "logScanSubtaskSummary",
+                            long.class,
+                            long.class,
+                            CleanupCounters.class,
+                            long.class);
+            method.invoke(logger, elapsedMillis, tasksCompleted, counters, scannedBytes);
+        } catch (NoSuchMethodException e) {
+            throw new AssertionError("Task 5 requires Scan byte and throughput evidence", e);
+        } catch (IllegalAccessException e) {
+            throw new AssertionError("Scan subtask audit method is inaccessible", e);
+        } catch (InvocationTargetException e) {
+            throw propagateReflectionFailure(e);
+        }
+    }
+
+    private static RuntimeException propagateReflectionFailure(InvocationTargetException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof RuntimeException) {
+            return (RuntimeException) cause;
+        }
+        if (cause instanceof Error) {
+            throw (Error) cause;
+        }
+        return new RuntimeException(cause);
     }
 
     private static AuditLogger newDeterministicLogger(

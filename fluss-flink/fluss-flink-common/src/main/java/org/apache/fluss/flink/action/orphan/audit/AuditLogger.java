@@ -34,6 +34,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.math.BigInteger;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
@@ -238,9 +239,19 @@ public final class AuditLogger {
             long targetsCompleted,
             long targetsFailed,
             boolean complete) {
+        logScopePhaseEnd(phase, durationMillis, targetsCompleted, targetsFailed, complete, null);
+    }
+
+    public void logScopePhaseEnd(
+            String phase,
+            long durationMillis,
+            long targetsCompleted,
+            long targetsFailed,
+            boolean complete,
+            @Nullable Integer scopeEnumerationConcurrency) {
         long targetsPerSecondMillis =
                 durationMillis == 0L ? 0L : targetsCompleted * 1_000_000L / durationMillis;
-        emit(
+        EventDraft event =
                 newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scope_phase_end")
                         .dimension("phase", phase)
                         .metric("duration_ms", durationMillis)
@@ -248,15 +259,36 @@ public final class AuditLogger {
                         .metric("targets_failed", targetsFailed)
                         .metric("targets_per_second_millis", targetsPerSecondMillis)
                         .flag("complete", complete)
-                        .flag("action_required", !complete),
+                        .flag("action_required", !complete);
+        if (scopeEnumerationConcurrency == null) {
+            emit(
+                    event,
+                    "audit_version=1 stage=scope action=scope_phase_end phase={} duration_ms={}"
+                            + " targets_completed={} targets_failed={}"
+                            + " targets_per_second_millis={} complete={} action_required={}",
+                    phase,
+                    durationMillis,
+                    targetsCompleted,
+                    targetsFailed,
+                    targetsPerSecondMillis,
+                    complete,
+                    !complete);
+            return;
+        }
+        event.dimension(
+                "scope_enumeration_concurrency", Integer.toString(scopeEnumerationConcurrency));
+        emit(
+                event,
                 "audit_version=1 stage=scope action=scope_phase_end phase={} duration_ms={}"
                         + " targets_completed={} targets_failed={}"
-                        + " targets_per_second_millis={} complete={} action_required={}",
+                        + " targets_per_second_millis={} scope_enumeration_concurrency={}"
+                        + " complete={} action_required={}",
                 phase,
                 durationMillis,
                 targetsCompleted,
                 targetsFailed,
                 targetsPerSecondMillis,
+                scopeEnumerationConcurrency,
                 complete,
                 !complete);
     }
@@ -267,12 +299,17 @@ public final class AuditLogger {
         String effectiveRate = Double.toString(effectiveRatePerSecond);
         emit(
                 newEvent(AuditSeverity.INFO, AuditStage.SCAN, "scan_start")
+                        .dimension("parallelism", Integer.toString(scanParallelism))
+                        .dimension("assigned_remote_fs_rate", effectiveRate)
                         .dimension("scan_parallelism", Integer.toString(scanParallelism))
                         .dimension("effective_remote_fs_rate_limit_per_second", effectiveRate)
                         .metric("remote_fs_rate_limit", remoteFsRateLimit),
-                "audit_version=1 stage=scan action=scan_start scan_parallelism={}"
+                "audit_version=1 stage=scan action=scan_start parallelism={}"
+                        + " assigned_remote_fs_rate={} scan_parallelism={}"
                         + " remote_fs_rate_limit={}"
                         + " effective_remote_fs_rate_limit_per_second={}",
+                scanParallelism,
+                effectiveRate,
                 scanParallelism,
                 remoteFsRateLimit,
                 effectiveRate);
@@ -281,11 +318,22 @@ public final class AuditLogger {
     /** One-shot bounded scalar summary for this Scan subtask attempt. */
     public void logScanSubtaskSummary(
             long elapsedMillis, long tasksCompleted, CleanupCounters counters) {
+        logScanSubtaskSummary(elapsedMillis, tasksCompleted, counters, 0L);
+    }
+
+    public void logScanSubtaskSummary(
+            long elapsedMillis, long tasksCompleted, CleanupCounters counters, long scannedBytes) {
+        long filesPerSecondMillis =
+                fixedPointRate(counters.scannedFiles(), elapsedMillis, 1_000_000L);
+        String filesPerSecond = fixedPointDecimal(filesPerSecondMillis);
         emit(
                 newEvent(AuditSeverity.INFO, AuditStage.SCAN, "scan_subtask_summary")
+                        .dimension("files_per_second", filesPerSecond)
                         .metric("elapsed_ms", elapsedMillis)
                         .metric("tasks_completed", tasksCompleted)
                         .metric("scanned_files", counters.scannedFiles())
+                        .metric("scanned_bytes", scannedBytes)
+                        .metric("files_per_second_millis", filesPerSecondMillis)
                         .metric("planned_files", counters.plannedFiles())
                         .metric("planned_dirs", counters.plannedDirs())
                         .metric("planned_bytes", counters.plannedBytes())
@@ -294,12 +342,17 @@ public final class AuditLogger {
                         .metric("delete_failures", counters.deleteFailures())
                         .metric("bytes_reclaimed", counters.bytesReclaimed()),
                 "audit_version=1 stage=scan action=scan_subtask_summary elapsed_ms={}"
-                        + " tasks_completed={} scanned_files={} planned_files={} planned_dirs={}"
+                        + " tasks_completed={} scanned_files={} scanned_bytes={}"
+                        + " files_per_second_millis={} files_per_second={}"
+                        + " planned_files={} planned_dirs={}"
                         + " planned_bytes={} deleted_files={} empty_dirs_removed={}"
                         + " delete_failures={} bytes_reclaimed={}",
                 elapsedMillis,
                 tasksCompleted,
                 counters.scannedFiles(),
+                scannedBytes,
+                filesPerSecondMillis,
+                filesPerSecond,
                 counters.plannedFiles(),
                 counters.plannedDirs(),
                 counters.plannedBytes(),
@@ -307,6 +360,30 @@ public final class AuditLogger {
                 counters.emptyDirsRemoved(),
                 counters.deleteFailures(),
                 counters.bytesReclaimed());
+    }
+
+    private static long fixedPointRate(long count, long durationMillis, long scale) {
+        if (count <= 0L || durationMillis <= 0L) {
+            return 0L;
+        }
+        BigInteger rate =
+                BigInteger.valueOf(count)
+                        .multiply(BigInteger.valueOf(scale))
+                        .divide(BigInteger.valueOf(durationMillis));
+        BigInteger maximum = BigInteger.valueOf(Long.MAX_VALUE);
+        return rate.compareTo(maximum) > 0 ? Long.MAX_VALUE : rate.longValue();
+    }
+
+    private static String fixedPointDecimal(long filesPerSecondMillis) {
+        long whole = filesPerSecondMillis / 1_000L;
+        long fraction = filesPerSecondMillis % 1_000L;
+        if (fraction < 10L) {
+            return whole + ".00" + fraction;
+        }
+        if (fraction < 100L) {
+            return whole + ".0" + fraction;
+        }
+        return whole + "." + fraction;
     }
 
     public void logScopeTargetSummary(ScopeTargetStats stats) {
