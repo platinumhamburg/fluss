@@ -378,6 +378,8 @@ class ScanAndCleanFunctionTest {
                                                             Collections.<String>emptySet(),
                                                             Collections.<String>emptySet(),
                                                             Collections.<String>emptySet(),
+                                                            Collections.<String>emptySet(),
+                                                            false,
                                                             cutoff,
                                                             false,
                                                             false))));
@@ -575,6 +577,8 @@ class ScanAndCleanFunctionTest {
                 Collections.<String>emptySet(),
                 Collections.<String>emptySet(),
                 Collections.<String>emptySet(),
+                Collections.<String>emptySet(),
+                false,
                 0L,
                 true,
                 false);
