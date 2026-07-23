@@ -67,8 +67,11 @@ public final class OrphanCleanConfig implements Serializable {
     private static final int DEFAULT_SCOPE_ENUMERATION_CONCURRENCY = 1;
 
     private static final String AUDIT_RUN_ID = "audit.run-id";
+    private static final String AUDIT_CLUSTER_ID = "audit.cluster-id";
     private static final String AUDIT_REPORTERS = "audit.reporters";
     private static final String AUDIT_REPORTER_PREFIX = "audit.reporter.";
+    private static final Pattern CLUSTER_ID_PATTERN =
+            Pattern.compile("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}");
     private static final Pattern REPORTER_IDENTIFIER_PATTERN = Pattern.compile("[a-z][a-z0-9_-]*");
 
     private final String bootstrapServer;
@@ -277,6 +280,7 @@ public final class OrphanCleanConfig implements Serializable {
 
     private static AuditReporterSpec parseAuditReporterSpec(LinkedHashMap<String, String> configs) {
         String runId = parseRunId(configs.get(AUDIT_RUN_ID));
+        String clusterId = parseClusterId(configs.get(AUDIT_CLUSTER_ID));
         List<String> identifiers = parseReporterIdentifiers(configs.get(AUDIT_REPORTERS));
         LinkedHashMap<String, ReporterOptions> optionsByIdentifier = new LinkedHashMap<>();
         for (String identifier : identifiers) {
@@ -287,6 +291,7 @@ public final class OrphanCleanConfig implements Serializable {
             String key = entry.getKey();
             if (!key.startsWith("audit.")
                     || AUDIT_RUN_ID.equals(key)
+                    || AUDIT_CLUSTER_ID.equals(key)
                     || AUDIT_REPORTERS.equals(key)) {
                 continue;
             }
@@ -319,7 +324,7 @@ public final class OrphanCleanConfig implements Serializable {
             ReporterOptions options = entry.getValue();
             reporterSpecs.add(new ReporterSpec(entry.getKey(), options.required, options.options));
         }
-        return new AuditReporterSpec(runId, reporterSpecs);
+        return new AuditReporterSpec(runId, clusterId, reporterSpecs);
     }
 
     private static String parseRunId(@Nullable String configuredRunId) {
@@ -336,6 +341,17 @@ public final class OrphanCleanConfig implements Serializable {
             throw auditConfigError(AUDIT_RUN_ID);
         }
         return configuredRunId;
+    }
+
+    @Nullable
+    private static String parseClusterId(@Nullable String configuredClusterId) {
+        if (configuredClusterId == null) {
+            return null;
+        }
+        if (!CLUSTER_ID_PATTERN.matcher(configuredClusterId).matches()) {
+            throw auditConfigError(AUDIT_CLUSTER_ID);
+        }
+        return configuredClusterId;
     }
 
     private static List<String> parseReporterIdentifiers(@Nullable String configuredReporters) {

@@ -104,6 +104,7 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<Cleanup
         AuditReporterContext reporterContext =
                 new AuditReporterContext(
                         auditReporterSpec.runId(),
+                        auditReporterSpec.clusterId(),
                         dryRun,
                         AuditStage.SUMMARY,
                         "StatsAggregate",

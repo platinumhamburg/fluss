@@ -36,6 +36,7 @@ class AuditEventTest {
 
     private static final String EVENT_ID = "43c08df6-8b20-4902-8ff4-205cb8b59fe1";
     private static final String RUN_ID = "3b5939f1-9837-49d8-8a02-945273a0d7e2";
+    private static final String CLUSTER_ID = "fluss-zjk-log";
     private static final String UPPERCASE_EVENT_ID = "43C08DF6-8B20-4902-8FF4-205CB8B59FE1";
     private static final String UPPERCASE_RUN_ID = "3B5939F1-9837-49D8-8A02-945273A0D7E2";
     private static final String NON_CANONICAL_UUID = "1-1-1-1-1";
@@ -280,9 +281,17 @@ class AuditEventTest {
         ClassLoader classLoader = getClass().getClassLoader();
         AuditReporterContext context =
                 new AuditReporterContext(
-                        RUN_ID, true, AuditStage.SUMMARY, "StatsAggregate", 0, 4, classLoader);
+                        RUN_ID,
+                        CLUSTER_ID,
+                        true,
+                        AuditStage.SUMMARY,
+                        "StatsAggregate",
+                        0,
+                        4,
+                        classLoader);
 
         assertThat(context.getRunId()).isEqualTo(RUN_ID);
+        assertThat(context.getClusterId()).isEqualTo(CLUSTER_ID);
         assertThat(context.isDryRun()).isTrue();
         assertThat(context.getStage()).isEqualTo(AuditStage.SUMMARY);
         assertThat(context.getOperatorName()).isEqualTo("StatsAggregate");

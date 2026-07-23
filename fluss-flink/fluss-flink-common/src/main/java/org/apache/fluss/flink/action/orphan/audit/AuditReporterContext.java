@@ -22,12 +22,17 @@ import org.apache.fluss.annotation.PublicUnstable;
 import javax.annotation.Nullable;
 
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 /** Runtime identity supplied when an orphan cleanup audit reporter is opened. */
 @PublicUnstable
 public final class AuditReporterContext {
 
+    private static final Pattern CLUSTER_ID_PATTERN =
+            Pattern.compile("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}");
+
     private final String runId;
+    private final @Nullable String clusterId;
     private final boolean dryRun;
     private final AuditStage stage;
     private final @Nullable String operatorName;
@@ -43,7 +48,28 @@ public final class AuditReporterContext {
             @Nullable Integer subtaskIndex,
             @Nullable Integer attemptNumber,
             ClassLoader userCodeClassLoader) {
+        this(
+                runId,
+                null,
+                dryRun,
+                stage,
+                operatorName,
+                subtaskIndex,
+                attemptNumber,
+                userCodeClassLoader);
+    }
+
+    public AuditReporterContext(
+            String runId,
+            @Nullable String clusterId,
+            boolean dryRun,
+            AuditStage stage,
+            @Nullable String operatorName,
+            @Nullable Integer subtaskIndex,
+            @Nullable Integer attemptNumber,
+            ClassLoader userCodeClassLoader) {
         this.runId = validateRunId(runId);
+        this.clusterId = validateClusterId(clusterId);
         if (stage == null) {
             throw new IllegalArgumentException("stage");
         }
@@ -60,6 +86,11 @@ public final class AuditReporterContext {
 
     public String getRunId() {
         return runId;
+    }
+
+    @Nullable
+    public String getClusterId() {
+        return clusterId;
     }
 
     public boolean isDryRun() {
@@ -103,5 +134,13 @@ public final class AuditReporterContext {
             throw new IllegalArgumentException("runId");
         }
         return runId;
+    }
+
+    @Nullable
+    private static String validateClusterId(@Nullable String clusterId) {
+        if (clusterId != null && !CLUSTER_ID_PATTERN.matcher(clusterId).matches()) {
+            throw new IllegalArgumentException("clusterId");
+        }
+        return clusterId;
     }
 }
