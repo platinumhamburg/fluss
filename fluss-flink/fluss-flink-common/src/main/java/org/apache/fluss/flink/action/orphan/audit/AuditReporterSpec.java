@@ -19,6 +19,8 @@ package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
 
+import javax.annotation.Nullable;
+
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -34,12 +36,21 @@ import java.util.regex.Pattern;
 public final class AuditReporterSpec implements Serializable {
 
     private static final long serialVersionUID = 1L;
+    private static final Pattern CLUSTER_ID_PATTERN =
+            Pattern.compile("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}");
 
     private final String runId;
+    private final @Nullable String clusterId;
     private final List<ReporterSpec> reporters;
 
     public AuditReporterSpec(String runId, List<ReporterSpec> reporters) {
+        this(runId, null, reporters);
+    }
+
+    public AuditReporterSpec(
+            String runId, @Nullable String clusterId, List<ReporterSpec> reporters) {
         this.runId = validateRunId(Objects.requireNonNull(runId, "runId"));
+        this.clusterId = validateClusterId(clusterId);
         this.reporters =
                 Collections.unmodifiableList(
                         new ArrayList<>(Objects.requireNonNull(reporters, "reporters")));
@@ -47,6 +58,11 @@ public final class AuditReporterSpec implements Serializable {
 
     public String runId() {
         return runId;
+    }
+
+    @Nullable
+    public String clusterId() {
+        return clusterId;
     }
 
     public List<ReporterSpec> reporters() {
@@ -64,6 +80,14 @@ public final class AuditReporterSpec implements Serializable {
             throw new IllegalArgumentException("runId");
         }
         return runId;
+    }
+
+    @Nullable
+    private static String validateClusterId(@Nullable String clusterId) {
+        if (clusterId != null && !CLUSTER_ID_PATTERN.matcher(clusterId).matches()) {
+            throw new IllegalArgumentException("clusterId");
+        }
+        return clusterId;
     }
 
     /** Immutable configuration for one reporter factory. */

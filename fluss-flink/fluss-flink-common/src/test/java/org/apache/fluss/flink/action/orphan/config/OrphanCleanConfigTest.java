@@ -41,6 +41,7 @@ import static org.assertj.core.api.Assertions.entry;
 class OrphanCleanConfigTest {
 
     private static final String RUN_ID = "3b5939f1-9837-49d8-8a02-945273a0d7e2";
+    private static final String CLUSTER_ID = "fluss-zjk-log";
     private static final String UPPERCASE_RUN_ID = "3B5939F1-9837-49D8-8A02-945273A0D7E2";
     private static final String NON_CANONICAL_UUID = "1-1-1-1-1";
 
@@ -318,7 +319,42 @@ class OrphanCleanConfigTest {
         OrphanCleanConfig config = fromConfs("audit.run-id=" + RUN_ID);
 
         assertThat(config.auditReporterSpec().runId()).isEqualTo(RUN_ID);
+        assertThat(config.auditReporterSpec().clusterId()).isNull();
         assertThat(config.extraConfigs()).isEmpty();
+    }
+
+    @Test
+    void explicitClusterIdIsPreservedAsCommonAuditContext() {
+        OrphanCleanConfig config =
+                fromConfs(
+                        "audit.run-id=" + RUN_ID,
+                        "audit.cluster-id=" + CLUSTER_ID,
+                        "audit.reporters=jdbc",
+                        "audit.reporter.jdbc.url=jdbc:postgresql://audit-db:5432/fluss");
+
+        assertThat(config.auditReporterSpec().clusterId()).isEqualTo(CLUSTER_ID);
+        assertThat(config.auditReporterSpec().reporters()).hasSize(1);
+        assertThat(config.extraConfigs()).isEmpty();
+    }
+
+    @Test
+    void rejectsInvalidClusterIdsWithoutEchoingValues() {
+        assertThatThrownBy(() -> fromConfs("audit.cluster-id="))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("audit.cluster-id");
+
+        for (String invalid :
+                Arrays.asList(
+                        "-cluster",
+                        "cluster id",
+                        "cluster/id",
+                        String.join("", Collections.nCopies(129, "a")))) {
+            assertThatThrownBy(() -> fromConfs("audit.cluster-id=" + invalid))
+                    .as("invalid cluster id")
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("audit.cluster-id")
+                    .hasMessageNotContaining(invalid);
+        }
     }
 
     @Test

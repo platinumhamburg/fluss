@@ -45,6 +45,7 @@ import static org.assertj.core.api.Assertions.entry;
 class AuditReporterSpecTest {
 
     private static final String RUN_ID = "3b5939f1-9837-49d8-8a02-945273a0d7e2";
+    private static final String CLUSTER_ID = "fluss-zjk-log";
     private static final String UPPERCASE_RUN_ID = "3B5939F1-9837-49D8-8A02-945273A0D7E2";
     private static final String NON_CANONICAL_UUID = "1-1-1-1-1";
 
@@ -59,6 +60,10 @@ class AuditReporterSpecTest {
         assertThatThrownBy(() -> new AuditReporterSpec(RUN_ID, null))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessage("reporters");
+        assertThatThrownBy(() -> new AuditReporterSpec(RUN_ID, "-cluster", Collections.emptyList()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("clusterId")
+                .hasMessageNotContaining("-cluster");
         assertThatThrownBy(() -> new ReporterSpec(null, true, Collections.emptyMap()))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessage("identifier");
@@ -126,6 +131,7 @@ class AuditReporterSpecTest {
         AuditReporterSpec original =
                 new AuditReporterSpec(
                         RUN_ID,
+                        CLUSTER_ID,
                         Collections.singletonList(new ReporterSpec("jdbc", false, options)));
 
         byte[] serialized;
@@ -151,6 +157,7 @@ class AuditReporterSpecTest {
         }
 
         assertThat(restored.runId()).isEqualTo(RUN_ID);
+        assertThat(restored.clusterId()).isEqualTo(CLUSTER_ID);
         assertThat(restored.reporters()).hasSize(1);
         ReporterSpec restoredJdbc = restored.reporters().get(0);
         assertThat(restoredJdbc.identifier()).isEqualTo("jdbc");

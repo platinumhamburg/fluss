@@ -1503,7 +1503,11 @@ public final class AuditLogger {
                         .operatorName(reporterContext.getOperatorName())
                         .subtaskIndex(reporterContext.getSubtaskIndex())
                         .attemptNumber(reporterContext.getAttemptNumber());
-        return new EventDraft(severity, eventTimeMillis, builder);
+        EventDraft draft = new EventDraft(severity, eventTimeMillis, builder);
+        if (reporterContext.getClusterId() != null) {
+            draft.dimension("cluster_id", reporterContext.getClusterId());
+        }
+        return draft;
     }
 
     private void emit(EventDraft draft, String legacyTemplate, Object... legacyArgs) {
