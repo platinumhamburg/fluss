@@ -70,6 +70,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class AuditLoggerTest {
 
     private static final String RUN_ID = "123e4567-e89b-12d3-a456-426614174000";
+    private static final String CLUSTER_ID = "fluss-zjk-log";
     private static final long EVENT_TIME_MILLIS = 1_723_456_789_012L;
     private static final long CUTOFF_MILLIS = 1_704_067_200_000L;
     private static final String OPERATOR_NAME = "ScanAndClean";
@@ -84,6 +85,36 @@ class AuditLoggerTest {
     @BeforeEach
     void resetTestingReporter() {
         TestingAuditReporterFactory.reset();
+    }
+
+    @Test
+    void injectsConfiguredClusterIdIntoEveryStructuredEvent() {
+        AuditReporterContext context =
+                new AuditReporterContext(
+                        RUN_ID,
+                        CLUSTER_ID,
+                        true,
+                        AuditStage.RUN,
+                        OPERATOR_NAME,
+                        SUBTASK_INDEX,
+                        ATTEMPT_NUMBER,
+                        AuditLoggerTest.class.getClassLoader());
+        AuditReporterRuntime runtime = openTestingRuntime(context);
+        try {
+            AuditLogger logger = new AuditLogger(runtime, context);
+
+            logger.logCutoff(CUTOFF_MILLIS);
+            logger.logScopePhaseStart("metadata_inventory");
+
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .hasSize(2)
+                    .allSatisfy(
+                            event ->
+                                    assertThat(event.getDimensions())
+                                            .containsEntry("cluster_id", CLUSTER_ID));
+        } finally {
+            runtime.close();
+        }
     }
 
     @Test

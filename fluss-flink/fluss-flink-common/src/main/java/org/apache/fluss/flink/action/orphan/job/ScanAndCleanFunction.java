@@ -131,6 +131,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         AuditReporterContext reporterContext =
                 new AuditReporterContext(
                         auditReporterSpec.runId(),
+                        auditReporterSpec.clusterId(),
                         dryRun,
                         AuditStage.SCAN,
                         "ScanAndClean",

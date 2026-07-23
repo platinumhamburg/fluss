@@ -114,6 +114,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         AuditReporterContext reporterContext =
                 new AuditReporterContext(
                         config.auditReporterSpec().runId(),
+                        config.auditReporterSpec().clusterId(),
                         config.dryRun(),
                         AuditStage.SCOPE,
                         "ScopeEnumerator",
