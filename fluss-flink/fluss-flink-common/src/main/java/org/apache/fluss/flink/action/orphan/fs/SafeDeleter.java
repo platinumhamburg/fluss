@@ -35,6 +35,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Optional;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
@@ -161,12 +162,31 @@ public final class SafeDeleter {
     }
 
     public DirectoryDeleteResult deleteEmptyDirDetailed(FsPath dir, long modificationTime) {
-        FileStatus[] children = listChildrenSilently(dir);
-        if (children == null) {
+        Optional<FileStatus[]> listing;
+        try {
+            listing = FileSystemProbe.listStatus(fs, dir, remoteFsOpRateLimiter);
+        } catch (IOException e) {
+            audit.logFilesystemFailure(
+                    AuditStage.SCAN,
+                    scope,
+                    CleanupObjectType.DIRECTORY,
+                    AuditFailureDetail.builder("list_directory", "directory_list_failed")
+                            .targetPath(dir)
+                            .exceptionClass(e.getClass())
+                            .retryable(true)
+                            .actionRequired(true)
+                            .consistencyRacePossible(true)
+                            .build());
             audit.logSkippedDirectory(
                     dir, modificationTime, scope, "directory_list_failed", dryRun, true, true);
             return DirectoryDeleteResult.LIST_FAILED;
         }
+        if (!listing.isPresent()) {
+            audit.logSkippedDirectory(
+                    dir, modificationTime, scope, "directory_not_found", dryRun, false, false);
+            return DirectoryDeleteResult.NOT_FOUND;
+        }
+        FileStatus[] children = listing.get();
         if (children.length > 0) {
             audit.logSkippedDirectory(
                     dir, modificationTime, scope, "directory_not_empty", dryRun, false, false);
@@ -196,32 +216,13 @@ public final class SafeDeleter {
     /** Result of the final empty-directory recheck and non-recursive delete attempt. */
     public enum DirectoryDeleteResult {
         SUCCESS,
+        NOT_FOUND,
         NOT_EMPTY,
         LIST_FAILED,
         DELETE_FAILED;
 
         public boolean successful() {
             return this == SUCCESS;
-        }
-    }
-
-    private FileStatus[] listChildrenSilently(FsPath dir) {
-        try {
-            remoteFsOpRateLimiter.acquire();
-            return fs.listStatus(dir);
-        } catch (IOException e) {
-            audit.logFilesystemFailure(
-                    AuditStage.SCAN,
-                    scope,
-                    CleanupObjectType.DIRECTORY,
-                    AuditFailureDetail.builder("list_directory", "directory_list_failed")
-                            .targetPath(dir)
-                            .exceptionClass(e.getClass())
-                            .retryable(true)
-                            .actionRequired(true)
-                            .consistencyRacePossible(true)
-                            .build());
-            return null;
         }
     }
 }

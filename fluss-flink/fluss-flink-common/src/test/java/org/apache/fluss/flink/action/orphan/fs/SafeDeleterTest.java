@@ -35,6 +35,7 @@ import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLim
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -144,6 +145,59 @@ class SafeDeleterTest {
                                         .containsEntry("action_required", true)
                                         .containsEntry("consistency_race_possible", true);
                             });
+        } finally {
+            runtime.close();
+            TestingAuditReporterFactory.reset();
+        }
+    }
+
+    @Test
+    void repeatedNotFoundIsReportedAsAlreadyAbsent() throws IOException {
+        TestingAuditReporterFactory.reset();
+        FileSystem fs = mock(FileSystem.class);
+        FsPath dir = new FsPath("file:/table-1/partition-2/bucket-3/snap-4");
+        when(fs.listStatus(dir)).thenThrow(new FileNotFoundException("already gone"));
+        AuditReporterSpec spec =
+                new AuditReporterSpec(
+                        "00000000-0000-0000-0000-000000000007",
+                        Collections.singletonList(
+                                new ReporterSpec(
+                                        "testing", true, Collections.<String, String>emptyMap())));
+        AuditReporterContext context =
+                new AuditReporterContext(
+                        spec.runId(),
+                        true,
+                        AuditStage.SCAN,
+                        "ScanAndClean",
+                        0,
+                        0,
+                        SafeDeleterTest.class.getClassLoader());
+        AuditReporterRuntime runtime = AuditReporterRuntime.open(spec, context);
+        try {
+            SafeDeleter deleter =
+                    new SafeDeleter(
+                            fs,
+                            true,
+                            new AuditLogger(runtime, context),
+                            RateLimiter.create(1000.0),
+                            ScopeIdentity.table("db", "table", 1L).withPartitionAndBucket(2L, 3));
+
+            assertThat(deleter.deleteEmptyDirDetailed(dir, 123L))
+                    .isEqualTo(SafeDeleter.DirectoryDeleteResult.NOT_FOUND);
+
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .filteredOn(event -> event.getAction().equals("skip_directory"))
+                    .singleElement()
+                    .satisfies(
+                            event -> {
+                                assertThat(event.getReasonCode()).isEqualTo("directory_not_found");
+                                assertThat(event.getFlags())
+                                        .containsEntry("retryable", false)
+                                        .containsEntry("action_required", false)
+                                        .containsEntry("consistency_race_possible", true);
+                            });
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .noneMatch(event -> event.getAction().equals("filesystem_failure"));
         } finally {
             runtime.close();
             TestingAuditReporterFactory.reset();

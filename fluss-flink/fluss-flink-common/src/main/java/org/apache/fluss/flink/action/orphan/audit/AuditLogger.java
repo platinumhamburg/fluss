@@ -707,7 +707,7 @@ public final class AuditLogger {
             boolean dryRun,
             boolean retryable,
             boolean actionRequired) {
-        emit(
+        EventDraft event =
                 newEvent(AuditSeverity.INFO, AuditStage.SCAN, action)
                         .scope(scope)
                         .objectType("directory")
@@ -719,7 +719,33 @@ public final class AuditLogger {
                         .result(result)
                         .flag("dry_run", dryRun)
                         .flag("retryable", retryable)
-                        .flag("action_required", actionRequired),
+                        .flag("action_required", actionRequired);
+        if ("directory_not_found".equals(reasonCode)) {
+            event.flag("consistency_race_possible", true);
+            emit(
+                    event,
+                    "audit_version=1 stage=scan action={} object_type=directory path={}"
+                            + " size_bytes=0 mtime_ms={} rule=empty-directory reason_code={} result={}"
+                            + " database={} table={} table_id={} partition_id={} bucket_id={}"
+                            + " dry_run={} retryable={} action_required={}"
+                            + " consistency_race_possible=true",
+                    action,
+                    dir,
+                    modificationTime,
+                    reasonCode,
+                    result,
+                    scope.database(),
+                    scope.table(),
+                    nullable(scope.tableId()),
+                    nullable(scope.partitionId()),
+                    nullable(scope.bucketId()),
+                    dryRun,
+                    retryable,
+                    actionRequired);
+            return;
+        }
+        emit(
+                event,
                 "audit_version=1 stage=scan action={} object_type=directory path={}"
                         + " size_bytes=0 mtime_ms={} rule=empty-directory reason_code={} result={}"
                         + " database={} table={} table_id={} partition_id={} bucket_id={}"

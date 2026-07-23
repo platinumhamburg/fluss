@@ -24,6 +24,7 @@ import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
+import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
@@ -46,6 +47,7 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Per-bucket orphan cleanup for live buckets: walks the provided bucket directories and dispatches
@@ -116,10 +118,6 @@ public final class BucketCleaner {
     private void walkAndCleanDir(FsPath root, BucketActiveRefs activeRefs, BucketCleanStats stats)
             throws IOException {
         FileSystem fs = root.getFileSystem();
-        remoteFsOpRateLimiter.acquire();
-        if (!fs.exists(root)) {
-            return;
-        }
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
         stack.push(new DirVisit(root, false, false, -1L, null, true));
         while (!stack.isEmpty()) {
@@ -127,14 +125,21 @@ public final class BucketCleaner {
             if (visit.postOrder) {
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
-                    stats.recordPlannedDirectory();
+                    if (dryRun) {
+                        stats.recordPlannedDirectory();
+                        audit.logWouldDeleteDirectory(
+                                visit.dir, visit.modificationTime, scope, true);
+                        continue;
+                    }
                     SafeDeleter.DirectoryDeleteResult result =
                             safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
                     switch (result) {
                         case SUCCESS:
-                            if (!dryRun) {
-                                stats.recordRemovedDirectory();
-                            }
+                            stats.recordPlannedDirectory();
+                            stats.recordRemovedDirectory();
+                            break;
+                        case NOT_FOUND:
+                            stats.recordSkip(SkipReasonCode.DIRECTORY_NOT_FOUND);
                             break;
                         case NOT_EMPTY:
                             stats.recordSkip(SkipReasonCode.DIRECTORY_NOT_EMPTY);
@@ -157,10 +162,9 @@ public final class BucketCleaner {
                 }
                 continue;
             }
-            FileStatus[] children;
+            Optional<FileStatus[]> listing;
             try {
-                remoteFsOpRateLimiter.acquire();
-                children = fs.listStatus(visit.dir);
+                listing = FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
                 audit.logFilesystemFailure(
@@ -179,12 +183,19 @@ public final class BucketCleaner {
                 }
                 continue;
             }
-            if (children == null) {
-                if (visit.parent != null) {
-                    visit.parent.hasRemainingChild = true;
-                }
+            if (!listing.isPresent()) {
+                audit.logSkippedDirectory(
+                        visit.dir,
+                        visit.modificationTime,
+                        scope,
+                        "directory_not_found",
+                        dryRun,
+                        false,
+                        false);
+                stats.recordSkip(SkipReasonCode.DIRECTORY_NOT_FOUND);
                 continue;
             }
+            FileStatus[] children = listing.get();
             if (!visit.root) {
                 visit.postOrder = true;
                 stack.push(visit);
