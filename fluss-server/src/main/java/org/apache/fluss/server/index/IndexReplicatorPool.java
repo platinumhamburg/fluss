@@ -32,6 +32,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /**
@@ -61,15 +62,18 @@ public final class IndexReplicatorPool implements AutoCloseable {
 
     public IndexReplicatorPool(
             int numWorkers, int maxWindowBytes, long preferredMaxRequestBytes, long backoffMs) {
+        checkArgument(numWorkers > 0, "numWorkers must be positive");
+        checkArgument(maxWindowBytes > 0, "maxWindowBytes must be positive");
+        checkArgument(preferredMaxRequestBytes > 0, "preferredMaxRequestBytes must be positive");
+        checkArgument(backoffMs > 0, "backoffMs must be positive");
         this.maxWindowBytes = maxWindowBytes;
         this.preferredMaxRequestBytes = preferredMaxRequestBytes;
-        int workerCount = Math.max(1, numWorkers);
-        this.workers = new ReplicatorWorker[workerCount];
-        for (int i = 0; i < workerCount; i++) {
+        this.workers = new ReplicatorWorker[numWorkers];
+        for (int i = 0; i < numWorkers; i++) {
             this.workers[i] = new ReplicatorWorker("index-replicator-pool-" + i, backoffMs);
             this.workers[i].start();
         }
-        LOG.info("IndexReplicatorPool started with {} workers", workerCount);
+        LOG.info("IndexReplicatorPool started with {} workers", numWorkers);
     }
 
     /** Maximum number of WAL bytes a replicator reads per window. */

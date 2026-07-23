@@ -80,8 +80,8 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     // aggregated index push metrics
     private final Counter indexPushRequests;
-    private final Counter indexPushErrors;
-    private final Histogram indexPushLatencyHistogram;
+    private final Counter indexPushBatchRetries;
+    private final Histogram indexPushRequestLatencyHistogram;
     private final Counter partitionTombstoneApplyDrops;
     private final Counter indexPushStaleProgressBatches;
     private final Counter indexSourceRemoteReadBytes;
@@ -156,10 +156,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         // index push metrics
         indexPushRequests = new ThreadSafeSimpleCounter();
         meter(MetricNames.INDEX_PUSH_REQUESTS_RATE, new MeterView(indexPushRequests));
-        indexPushErrors = new ThreadSafeSimpleCounter();
-        meter(MetricNames.INDEX_PUSH_ERRORS_RATE, new MeterView(indexPushErrors));
-        indexPushLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
-        histogram(MetricNames.INDEX_PUSH_LATENCY_MS, indexPushLatencyHistogram);
+        indexPushBatchRetries = new ThreadSafeSimpleCounter();
+        meter(MetricNames.INDEX_PUSH_BATCH_RETRIES_RATE, new MeterView(indexPushBatchRetries));
+        indexPushRequestLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.INDEX_PUSH_REQUEST_LATENCY_MS, indexPushRequestLatencyHistogram);
         partitionTombstoneApplyDrops = new ThreadSafeSimpleCounter();
         meter(
                 MetricNames.PARTITION_TOMBSTONE_APPLY_DROPS_RATE,
@@ -198,14 +198,14 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
                 MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS,
                 () -> indexPushGaugeSource.get().oldestInFlightAgeMsSupplier.getAsLong());
         gauge(
+                MetricNames.INDEX_REPLICATION_MAX_NO_PROGRESS_TIME_MS,
+                () -> indexPushGaugeSource.get().maxNoProgressTimeMsSupplier.getAsLong());
+        gauge(
                 MetricNames.INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT,
                 () -> indexPushGaugeSource.get().failedSourceBucketCountSupplier.getAsLong());
         gauge(
                 MetricNames.INDEX_WRITER_STATE_ENTRIES,
                 () -> indexWriterStateGaugeSource.get().entryCountSupplier.getAsLong());
-        gauge(
-                MetricNames.INDEX_WRITER_STATE_SNAPSHOT_BYTES,
-                () -> indexWriterStateGaugeSource.get().snapshotBytesSupplier.getAsLong());
 
         // Register server-level RocksDB aggregated metrics
         registerServerRocksDBMetrics();
@@ -316,12 +316,12 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         return indexPushRequests;
     }
 
-    public Counter indexPushErrors() {
-        return indexPushErrors;
+    public Counter indexPushBatchRetries() {
+        return indexPushBatchRetries;
     }
 
-    public Histogram indexPushLatencyHistogram() {
-        return indexPushLatencyHistogram;
+    public Histogram indexPushRequestLatencyHistogram() {
+        return indexPushRequestLatencyHistogram;
     }
 
     public Counter partitionTombstoneApplyDrops() {
@@ -356,21 +356,21 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
             LongSupplier pendingBytesSupplier,
             IntSupplier inFlightRequestsSupplier,
             LongSupplier oldestInFlightAgeMsSupplier,
+            LongSupplier maxNoProgressTimeMsSupplier,
             LongSupplier failedSourceBucketCountSupplier) {
         IndexPushGaugeSource source =
                 new IndexPushGaugeSource(
                         pendingBytesSupplier,
                         inFlightRequestsSupplier,
                         oldestInFlightAgeMsSupplier,
+                        maxNoProgressTimeMsSupplier,
                         failedSourceBucketCountSupplier);
         indexPushGaugeSource.set(source);
         return () -> indexPushGaugeSource.compareAndSet(source, IndexPushGaugeSource.EMPTY);
     }
 
-    public GaugeRegistration registerIndexWriterStateGauges(
-            LongSupplier entryCountSupplier, LongSupplier snapshotBytesSupplier) {
-        IndexWriterStateGaugeSource source =
-                new IndexWriterStateGaugeSource(entryCountSupplier, snapshotBytesSupplier);
+    public GaugeRegistration registerIndexWriterStateGauge(LongSupplier entryCountSupplier) {
+        IndexWriterStateGaugeSource source = new IndexWriterStateGaugeSource(entryCountSupplier);
         indexWriterStateGaugeSource.set(source);
         return () ->
                 indexWriterStateGaugeSource.compareAndSet(
@@ -386,36 +386,36 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     private static final class IndexPushGaugeSource {
         private static final IndexPushGaugeSource EMPTY =
-                new IndexPushGaugeSource(() -> 0L, () -> 0, () -> 0L, () -> 0L);
+                new IndexPushGaugeSource(() -> 0L, () -> 0, () -> 0L, () -> 0L, () -> 0L);
 
         private final LongSupplier pendingBytesSupplier;
         private final IntSupplier inFlightRequestsSupplier;
         private final LongSupplier oldestInFlightAgeMsSupplier;
+        private final LongSupplier maxNoProgressTimeMsSupplier;
         private final LongSupplier failedSourceBucketCountSupplier;
 
         private IndexPushGaugeSource(
                 LongSupplier pendingBytesSupplier,
                 IntSupplier inFlightRequestsSupplier,
                 LongSupplier oldestInFlightAgeMsSupplier,
+                LongSupplier maxNoProgressTimeMsSupplier,
                 LongSupplier failedSourceBucketCountSupplier) {
             this.pendingBytesSupplier = pendingBytesSupplier;
             this.inFlightRequestsSupplier = inFlightRequestsSupplier;
             this.oldestInFlightAgeMsSupplier = oldestInFlightAgeMsSupplier;
+            this.maxNoProgressTimeMsSupplier = maxNoProgressTimeMsSupplier;
             this.failedSourceBucketCountSupplier = failedSourceBucketCountSupplier;
         }
     }
 
     private static final class IndexWriterStateGaugeSource {
         private static final IndexWriterStateGaugeSource EMPTY =
-                new IndexWriterStateGaugeSource(() -> 0L, () -> 0L);
+                new IndexWriterStateGaugeSource(() -> 0L);
 
         private final LongSupplier entryCountSupplier;
-        private final LongSupplier snapshotBytesSupplier;
 
-        private IndexWriterStateGaugeSource(
-                LongSupplier entryCountSupplier, LongSupplier snapshotBytesSupplier) {
+        private IndexWriterStateGaugeSource(LongSupplier entryCountSupplier) {
             this.entryCountSupplier = entryCountSupplier;
-            this.snapshotBytesSupplier = snapshotBytesSupplier;
         }
     }
 

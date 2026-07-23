@@ -62,6 +62,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
 import static org.apache.fluss.rpc.protocol.MessageCodec.REQUEST_HEADER_LENGTH;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /**
@@ -309,6 +310,15 @@ public final class IndexSender implements AutoCloseable {
             long maxTransportRequestBytes,
             long requestTimeoutMs,
             LifecycleHooks lifecycleHooks) {
+        checkArgument(numWorkers > 0, "numWorkers must be positive");
+        checkArgument(backoffMs > 0, "backoffMs must be positive");
+        checkArgument(retryBackoffMs > 0, "retryBackoffMs must be positive");
+        checkArgument(
+                retryMaxBackoffMs >= retryBackoffMs,
+                "retryMaxBackoffMs must be greater than or equal to retryBackoffMs");
+        checkArgument(maxRequestBytes > 0, "maxRequestBytes must be positive");
+        checkArgument(maxTransportRequestBytes > 0, "maxTransportRequestBytes must be positive");
+        checkArgument(requestTimeoutMs > 0, "requestTimeoutMs must be positive");
         this.accumulator = accumulator;
         this.leaderResolver = leaderResolver;
         this.gatewayFactory = gatewayFactory;
@@ -319,9 +329,8 @@ public final class IndexSender implements AutoCloseable {
         this.maxTransportRequestBytes = maxTransportRequestBytes;
         this.requestTimeoutMs = requestTimeoutMs;
         this.lifecycleHooks = lifecycleHooks;
-        int workerCount = Math.max(1, numWorkers);
-        this.workers = new SenderWorker[workerCount];
-        for (int i = 0; i < workerCount; i++) {
+        this.workers = new SenderWorker[numWorkers];
+        for (int i = 0; i < numWorkers; i++) {
             this.workers[i] = new SenderWorker("index-sender-" + i, i, backoffMs);
         }
         accumulator.setAppendListener(this::enqueueReadyBucket);
@@ -332,7 +341,7 @@ public final class IndexSender implements AutoCloseable {
         for (SenderWorker worker : workers) {
             worker.start();
         }
-        LOG.info("IndexSender started with {} workers", workerCount);
+        LOG.info("IndexSender started with {} workers", numWorkers);
     }
 
     /**
@@ -751,7 +760,6 @@ public final class IndexSender implements AutoCloseable {
                 lifecycleLock.unlock();
             }
             if (failure != null) {
-                metrics.indexPushErrors().inc();
                 LOG.warn("Failed to get gateway for server {}, re-enqueuing", serverId, failure);
             }
             runAccounting(actions);
@@ -797,7 +805,6 @@ public final class IndexSender implements AutoCloseable {
                         addRetryOrReleaseActionsLocked(actions, batches);
                     } else if (error != null) {
                         invalidateTargetLocked(target);
-                        metrics.indexPushErrors().inc();
                         LOG.warn(
                                 "Failed to query PutKv capability for server {}",
                                 target.serverId,
@@ -814,7 +821,6 @@ public final class IndexSender implements AutoCloseable {
                         target.retryAtMs =
                                 System.currentTimeMillis()
                                         + retryDelayMs(batches.get(0).attempts() + 1);
-                        metrics.indexPushErrors().inc();
                         LOG.warn(
                                 "Target server {} does not currently advertise PutKv API v2",
                                 target.serverId);
@@ -899,6 +905,7 @@ public final class IndexSender implements AutoCloseable {
             inFlightRequests.add(inFlightRequest);
             CompletableFuture<PutKvResponse> future;
             try {
+                metrics.indexPushRequests().inc();
                 future = target.gateway.putKv(request);
                 FutureUtils.orTimeout(
                                 future,
@@ -968,18 +975,16 @@ public final class IndexSender implements AutoCloseable {
                     addRetryOrReleaseActionsLocked(actions, chunk);
                 } else if (error != null) {
                     invalidateTargetLocked(target);
-                    metrics.indexPushErrors().inc();
                     LOG.warn("PutKv failed for tableId={}", tableId, error);
                     addRetryOrReleaseActionsLocked(actions, chunk);
                 } else {
-                    metrics.indexPushRequests().inc();
                     addResponseActionsLocked(actions, chunk, response);
                 }
                 beginAccountingLocked(actions);
             } finally {
                 lifecycleLock.unlock();
             }
-            metrics.indexPushLatencyHistogram()
+            metrics.indexPushRequestLatencyHistogram()
                     .update((System.nanoTime() - inFlightRequest.startNs) / 1_000_000L);
             try {
                 runAccountingAndCallbacks(actions);
@@ -1279,7 +1284,6 @@ public final class IndexSender implements AutoCloseable {
             PbPutKvRespForBucket bucketResp = respByBucket.get(bucketId);
             boolean failed = bucketResp == null || bucketResp.hasErrorCode();
             if (failed) {
-                metrics.indexPushErrors().inc();
                 if (bucketResp == null) {
                     LOG.warn("PutKv response missing bucket {}, re-enqueuing", bucketId);
                 } else {
@@ -1306,7 +1310,6 @@ public final class IndexSender implements AutoCloseable {
         if (siblings == null) {
             return;
         }
-        metrics.indexPushErrors().inc();
         metrics.indexPushRecordTooLargeFailures().inc();
         releaseWindowBatches(siblings);
     }
@@ -1474,7 +1477,9 @@ public final class IndexSender implements AutoCloseable {
                     long readyAtMs =
                             System.currentTimeMillis() + retryDelayMs(batch.attempts() + 1);
                     lifecycleHooks.beforeRetryPublication();
-                    if (!accumulator.reEnqueueIfActive(batch, readyAtMs)) {
+                    if (accumulator.reEnqueueIfActive(batch, readyAtMs)) {
+                        metrics.indexPushBatchRetries().inc();
+                    } else {
                         releaseRejectedRetry(batch);
                     }
                 } else {

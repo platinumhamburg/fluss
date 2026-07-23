@@ -133,11 +133,8 @@ class IndexPushOrderingITCase {
         Configuration conf = new Configuration();
         conf.setInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR, REPLICATION_FACTOR);
         conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofHours(1));
-        conf.set(ConfigOptions.INDEX_REPLICATION_BACKOFF_INTERVAL, Duration.ofMillis(5));
         conf.set(ConfigOptions.INDEX_REPLICATION_RETRY_BACKOFF, Duration.ofMillis(5));
-        conf.set(ConfigOptions.INDEX_REPLICATION_RETRY_MAX_BACKOFF, Duration.ofMillis(20));
-        conf.set(ConfigOptions.INDEX_REPLICATION_MAX_WINDOW_BYTES, MemorySize.parse("1mb"));
-        conf.set(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES, MemorySize.parse("1mb"));
+        conf.set(ConfigOptions.INDEX_REPLICATION_REQUEST_TARGET_BYTES, MemorySize.parse("1mb"));
         return conf;
     }
 

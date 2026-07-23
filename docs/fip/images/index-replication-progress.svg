@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Replication progress for one main-table bucket</title>
+  <desc id="desc">Main-table high watermark and per-index pushed offsets on one shared WAL offset axis.</desc>
+  <defs>
+    <pattern id="inflight" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#FFFAEB"/>
+      <line x1="0" y1="0" x2="0" y2="10" stroke="#FEC84B" stroke-width="3"/>
+    </pattern>
+    <style>
+      text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { font-size: 24px; font-weight: 600; fill: #101828; }
+      .subtitle { font-size: 13px; fill: #667085; }
+      .lane { font-size: 15px; font-weight: 600; fill: #344054; }
+      .tick { font-size: 11px; fill: #667085; }
+      .marker { font-size: 12px; font-weight: 600; fill: #344054; }
+      .result-title { font-size: 15px; font-weight: 600; fill: #101828; }
+      .result { font-size: 13px; fill: #475467; }
+      .small { font-size: 11px; fill: #667085; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="520" fill="#FFFFFF"/>
+  <text class="title" x="40" y="42">Replication progress for one main-table bucket</text>
+  <text class="subtitle" x="40" y="65">Every value is the next main-table WAL offset to read.</text>
+
+  <line x1="250" y1="97" x2="1150" y2="97" stroke="#EAECF0"/>
+  <text class="tick" x="250" y="88" text-anchor="middle">0</text>
+  <text class="tick" x="475" y="88" text-anchor="middle">50</text>
+  <text class="tick" x="700" y="88" text-anchor="middle">100</text>
+  <text class="tick" x="925" y="88" text-anchor="middle">150</text>
+  <text class="tick" x="1060" y="88" text-anchor="middle">180</text>
+  <text class="tick" x="1150" y="88" text-anchor="middle">200</text>
+
+  <text class="lane" x="40" y="142">Main-table WAL</text>
+  <rect x="250" y="116" width="900" height="42" rx="6" fill="#F2F4F7"/>
+  <rect x="250" y="116" width="810" height="42" rx="6" fill="#D1E9FF"/>
+  <text class="small" x="655" y="141" text-anchor="middle">committed</text>
+  <line x1="1060" y1="108" x2="1060" y2="170" stroke="#2563EB" stroke-width="2"/>
+  <text class="marker" x="1060" y="104" text-anchor="middle">HW = 180</text>
+
+  <text class="lane" x="40" y="237">SYNC index A</text>
+  <rect x="250" y="211" width="810" height="42" rx="6" fill="#F2F4F7"/>
+  <rect x="250" y="211" width="675" height="42" rx="6" fill="#D1FADF"/>
+  <rect x="925" y="211" width="135" height="42" rx="6" fill="url(#inflight)" stroke="#F79009" stroke-width="1.5"/>
+  <text class="small" x="992.5" y="237" text-anchor="middle">window [150, 180)</text>
+  <line x1="925" y1="199" x2="925" y2="265" stroke="#0F766E" stroke-width="2"/>
+  <text class="marker" x="915" y="194" text-anchor="end">pushedOffset = 150</text>
+
+  <text class="lane" x="40" y="332">ASYNC index B</text>
+  <rect x="250" y="306" width="810" height="42" rx="6" fill="#F2F4F7"/>
+  <rect x="250" y="306" width="540" height="42" rx="6" fill="#D1FADF"/>
+  <line x1="790" y1="294" x2="790" y2="360" stroke="#0F766E" stroke-width="2"/>
+  <text class="marker" x="800" y="289">pushedOffset = 120</text>
+
+  <line x1="880" y1="104" x2="880" y2="370" stroke="#98A2B3" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <rect x="842" y="365" width="76" height="25" rx="4" fill="#EFF6FF" stroke="#84ADFF"/>
+  <text class="small" x="880" y="382" text-anchor="middle">write @ 140</text>
+
+  <line x1="40" y1="412" x2="1160" y2="412" stroke="#EAECF0"/>
+  <text class="result-title" x="60" y="445">Write visibility</text>
+  <text class="result" x="60" y="472">syncIndexPushedOffset = min(SYNC indexes) = 150</text>
+  <text class="small" x="60" y="494">Write offset 140 can complete: HW and sync progress are both beyond 140.</text>
+
+  <line x1="610" y1="430" x2="610" y2="500" stroke="#EAECF0"/>
+  <text class="result-title" x="650" y="445">Snapshot and WAL retention</text>
+  <text class="result" x="650" y="472">allIndexPushedOffset = min(all indexes) = 120</text>
+  <text class="small" x="650" y="494">A committed snapshot records 120; WAL retention cannot advance past it.</text>
+</svg>

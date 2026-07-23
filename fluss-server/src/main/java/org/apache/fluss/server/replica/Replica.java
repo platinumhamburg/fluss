@@ -447,12 +447,6 @@ public final class Replica {
                 : 0L;
     }
 
-    public long writerProgressStateSnapshotBytes() {
-        return logTablet.getWriterStateProtocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
-                ? logTablet.getWriterStateSnapshotBytes()
-                : 0L;
-    }
-
     public Path getTabletParentDir() {
         return logManager.getTabletParentDir(logTablet.getDataDir(), physicalPath, tableBucket);
     }

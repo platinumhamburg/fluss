@@ -133,19 +133,20 @@ public class MetricNames {
 
     // for index push
     public static final String INDEX_PUSH_REQUESTS_RATE = "indexPushRequestsPerSecond";
-    public static final String INDEX_PUSH_ERRORS_RATE = "indexPushErrorsPerSecond";
-    public static final String INDEX_PUSH_LATENCY_MS = "indexPushLatencyMs";
+    public static final String INDEX_PUSH_BATCH_RETRIES_RATE = "indexPushBatchRetriesPerSecond";
+    public static final String INDEX_PUSH_REQUEST_LATENCY_MS = "indexPushRequestLatencyMs";
     public static final String PARTITION_TOMBSTONE_APPLY_DROPS_RATE =
             "partitionTombstoneApplyDropsPerSecond";
     public static final String INDEX_PUSH_PENDING_BYTES = "indexPushPendingBytes";
     public static final String INDEX_PUSH_IN_FLIGHT_REQUESTS = "indexPushInFlightRequests";
     public static final String INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS = "indexPushOldestInFlightAgeMs";
+    public static final String INDEX_REPLICATION_MAX_NO_PROGRESS_TIME_MS =
+            "indexReplicationMaxNoProgressTimeMs";
     public static final String INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT =
             "indexReplicationFailedSourceBucketCount";
     public static final String INDEX_PUSH_STALE_PROGRESS_BATCHES_RATE =
             "indexPushStaleProgressBatchesPerSecond";
     public static final String INDEX_WRITER_STATE_ENTRIES = "indexWriterStateEntries";
-    public static final String INDEX_WRITER_STATE_SNAPSHOT_BYTES = "indexWriterStateSnapshotBytes";
     public static final String INDEX_SOURCE_REMOTE_READ_BYTES_RATE =
             "indexSourceRemoteReadBytesPerSecond";
     public static final String INDEX_SOURCE_REMOTE_READ_FAILURES_RATE =

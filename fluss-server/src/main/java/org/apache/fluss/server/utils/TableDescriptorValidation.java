@@ -73,7 +73,6 @@ import static org.apache.fluss.utils.PartitionUtils.PARTITION_KEY_SUPPORTED_TYPE
 /** Validator of {@link TableDescriptor}. */
 public class TableDescriptorValidation {
 
-    private static final String TABLE_LEVEL_INDEX_VISIBILITY = "index.visibility";
     private static final String SECONDARY_INDEX_PROPERTY_PREFIX = "secondary-index.";
 
     private static final Set<String> SYSTEM_COLUMNS =
@@ -102,13 +101,6 @@ public class TableDescriptorValidation {
         // check properties should only contain table.* options,
         // and this cluster know it, and value is valid
         for (String key : tableConf.keySet()) {
-
-            if (key.equals(TABLE_LEVEL_INDEX_VISIBILITY)) {
-                throw new InvalidConfigException(
-                        "'index.visibility' is not a valid table property. Use "
-                                + "'secondary-index.<index-name>.visibility' in DDL so visibility is stored "
-                                + "inside Schema.Index metadata.");
-            }
 
             if (key.startsWith(SECONDARY_INDEX_PROPERTY_PREFIX)) {
                 throw new InvalidConfigException(

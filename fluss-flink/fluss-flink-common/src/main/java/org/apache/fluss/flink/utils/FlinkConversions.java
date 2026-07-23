@@ -100,7 +100,6 @@ public class FlinkConversions {
     private static final String SECONDARY_INDEX_COLUMNS_SUFFIX = ".columns";
     private static final String SECONDARY_INDEX_VISIBILITY_SUFFIX = ".visibility";
     private static final String SECONDARY_INDEX_BUCKET_NUM_SUFFIX = ".bucket.num";
-    private static final String TABLE_LEVEL_INDEX_VISIBILITY = "index.visibility";
     private static final Pattern SECONDARY_INDEX_OPTION_PATTERN =
             Pattern.compile(
                     "secondary-index\\.([A-Za-z0-9_]+)(\\.columns|\\.visibility|\\.bucket\\.num)");
@@ -729,11 +728,6 @@ public class FlinkConversions {
      * declarations.
      */
     private static void parseSecondaryIndexes(Configuration options, Schema.Builder schemaBuilder) {
-        if (options.containsKey(TABLE_LEVEL_INDEX_VISIBILITY)) {
-            throw new CatalogException(
-                    "'index.visibility' is not a valid table property. Use "
-                            + "'secondary-index.<index-name>.visibility' so each index stores its own visibility.");
-        }
         Map<String, SecondaryIndexOptions> byName = new TreeMap<>();
         for (Map.Entry<String, String> entry : options.toMap().entrySet()) {
             if (!entry.getKey().startsWith(SECONDARY_INDEX_PREFIX)) {
@@ -826,12 +820,7 @@ public class FlinkConversions {
         // properties.
         customProperties.remove(BUCKET_KEY.key());
         customProperties.remove(BUCKET_NUMBER.key());
-        customProperties
-                .keySet()
-                .removeIf(
-                        key ->
-                                key.equals(TABLE_LEVEL_INDEX_VISIBILITY)
-                                        || key.startsWith(SECONDARY_INDEX_PREFIX));
+        customProperties.keySet().removeIf(key -> key.startsWith(SECONDARY_INDEX_PREFIX));
         return customProperties;
     }
 }

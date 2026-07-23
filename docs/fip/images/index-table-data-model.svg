@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 500" role="img" aria-labelledby="title desc">
+  <title id="title">Index Table data model</title>
+  <desc id="desc">How a partitioned main-table row becomes an Index Table primary key.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
+    </marker>
+    <style>
+      text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { font-size: 24px; font-weight: 600; fill: #101828; }
+      .subtitle { font-size: 13px; fill: #667085; }
+      .panel-title { font-size: 17px; font-weight: 600; fill: #101828; }
+      .label { font-size: 12px; font-weight: 600; fill: #475467; }
+      .body { font-size: 13px; fill: #344054; }
+      .muted { font-size: 12px; fill: #667085; }
+      .key-title { font-size: 13px; font-weight: 600; fill: #101828; }
+      .key-note { font-size: 11px; fill: #475467; }
+      .divider { stroke: #EAECF0; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1100" height="500" fill="#FFFFFF"/>
+  <text class="title" x="40" y="42">Index Table data model</text>
+  <text class="subtitle" x="40" y="65">Example: orders partitioned by dt, with a secondary index on user_id.</text>
+
+  <rect x="40" y="90" width="400" height="330" rx="6" fill="#FFFFFF" stroke="#D0D5DD" stroke-width="1.5"/>
+  <rect x="40" y="90" width="5" height="330" rx="2.5" fill="#2563EB"/>
+  <text class="panel-title" x="70" y="124">Main table row</text>
+  <text class="label" x="70" y="157">COLUMN</text>
+  <text class="label" x="245" y="157">ROLE</text>
+  <line class="divider" x1="70" y1="170" x2="410" y2="170"/>
+
+  <text class="body" x="70" y="199">dt</text>
+  <text class="body" x="245" y="199">partition key, primary key</text>
+  <line class="divider" x1="70" y1="213" x2="410" y2="213"/>
+
+  <text class="body" x="70" y="242">order_id</text>
+  <text class="body" x="245" y="242">primary key</text>
+  <line class="divider" x1="70" y1="256" x2="410" y2="256"/>
+
+  <rect x="60" y="266" width="360" height="42" rx="4" fill="#FFFAEB"/>
+  <rect x="60" y="266" width="4" height="42" rx="2" fill="#F79009"/>
+  <text class="body" x="70" y="292" font-weight="600">user_id</text>
+  <text class="body" x="245" y="292">secondary index</text>
+
+  <line class="divider" x1="70" y1="318" x2="410" y2="318"/>
+  <text class="body" x="70" y="347">amount</text>
+  <text class="body" x="245" y="347">stored value</text>
+  <line class="divider" x1="70" y1="367" x2="410" y2="367"/>
+  <text class="muted" x="70" y="394">Primary key</text>
+  <text class="body" x="155" y="394">(dt, order_id)</text>
+
+  <line x1="465" y1="245" x2="535" y2="245" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text class="muted" x="500" y="228" text-anchor="middle">derive</text>
+
+  <rect x="560" y="90" width="500" height="330" rx="6" fill="#FFFFFF" stroke="#D0D5DD" stroke-width="1.5"/>
+  <rect x="560" y="90" width="5" height="330" rx="2.5" fill="#0F766E"/>
+  <text class="panel-title" x="590" y="124">Index Table row</text>
+  <text class="label" x="590" y="154">PHYSICAL PRIMARY KEY</text>
+
+  <rect x="590" y="170" width="115" height="72" rx="6" fill="#FFFAEB" stroke="#FEC84B" stroke-width="1.5"/>
+  <text class="key-title" x="647.5" y="199" text-anchor="middle">user_id</text>
+  <text class="key-note" x="647.5" y="220" text-anchor="middle">index prefix</text>
+
+  <rect x="705" y="170" width="205" height="72" fill="#EFF6FF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="key-title" x="807.5" y="199" text-anchor="middle">dt, order_id</text>
+  <text class="key-note" x="807.5" y="220" text-anchor="middle">main-table primary key</text>
+
+  <rect x="910" y="170" width="120" height="72" rx="6" fill="#ECFDF3" stroke="#6CE9A6" stroke-width="1.5"/>
+  <text class="key-title" x="970" y="199" text-anchor="middle">__partition_id</text>
+  <text class="key-note" x="970" y="220" text-anchor="middle">partition identity</text>
+
+  <text class="muted" x="590" y="283">Bucket key</text>
+  <text class="body" x="720" y="283" font-weight="600">user_id</text>
+  <line class="divider" x1="590" y1="301" x2="1030" y2="301"/>
+
+  <text class="muted" x="590" y="329">Prefix lookup</text>
+  <text class="body" x="720" y="329">uses user_id only</text>
+  <line class="divider" x1="590" y1="347" x2="1030" y2="347"/>
+
+  <text class="muted" x="590" y="375">Stored columns</text>
+  <text class="body" x="720" y="375">key columns only</text>
+  <text class="muted" x="590" y="399">Non-partitioned tables omit __partition_id.</text>
+
+  <line class="divider" x1="40" y1="451" x2="1060" y2="451"/>
+  <circle cx="55" cy="474" r="4" fill="#0F766E"/>
+  <text class="body" x="70" y="478">The partition id keeps rows from dropped and recreated partitions physically distinct.</text>
+</svg>

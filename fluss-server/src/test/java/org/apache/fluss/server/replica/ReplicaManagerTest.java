@@ -170,21 +170,6 @@ class ReplicaManagerTest extends ReplicaTestBase {
     private static final short PREFIX_LOOKUP_KV_VERSION = 1;
 
     @Test
-    void testIndexWindowBytesMustFitPositiveInt() {
-        assertThat(ReplicaManager.checkedIndexWindowBytes(Integer.MAX_VALUE))
-                .isEqualTo(Integer.MAX_VALUE);
-        assertThatThrownBy(() -> ReplicaManager.checkedIndexWindowBytes(0L))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("index.replication.max-window-bytes")
-                .hasMessageContaining("positive 32-bit");
-        assertThatThrownBy(
-                        () -> ReplicaManager.checkedIndexWindowBytes((long) Integer.MAX_VALUE + 1L))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("index.replication.max-window-bytes")
-                .hasMessageContaining("positive 32-bit");
-    }
-
-    @Test
     void testMissingReplicaUsesConservativeSyncIndexGate() {
         assertThat(
                         replicaManager.requiresSyncIndexVisibility(

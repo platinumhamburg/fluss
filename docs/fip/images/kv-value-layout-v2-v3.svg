@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 320" role="img" aria-labelledby="title desc">
+  <title id="title">KV value layouts</title>
+  <desc id="desc">Comparison of KV format v2 and v3 value headers.</desc>
+  <defs>
+    <style>
+      text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { font-size: 24px; font-weight: 600; fill: #101828; }
+      .subtitle { font-size: 13px; fill: #667085; }
+      .row-title { font-size: 16px; font-weight: 600; fill: #344054; }
+      .row-note { font-size: 12px; fill: #667085; }
+      .segment-title { font-size: 14px; font-weight: 600; fill: #101828; }
+      .segment-note { font-size: 11px; fill: #475467; }
+      .offset { font-size: 11px; fill: #667085; }
+      .rule { stroke: #D0D5DD; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1000" height="320" fill="#FFFFFF"/>
+  <text class="title" x="40" y="42">KV value layouts</text>
+  <text class="subtitle" x="40" y="65">v3 adds one fixed valueTag; key encoding and row encoding stay unchanged.</text>
+
+  <text class="row-title" x="40" y="118">Format v2</text>
+  <text class="row-note" x="40" y="139">Default for PK tables</text>
+
+  <rect x="220" y="88" width="150" height="64" rx="6" fill="#EFF6FF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="segment-title" x="295" y="115" text-anchor="middle">schemaId</text>
+  <text class="segment-note" x="295" y="135" text-anchor="middle">2 B, little-endian</text>
+
+  <rect x="370" y="88" width="570" height="64" rx="6" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5"/>
+  <text class="segment-title" x="655" y="115" text-anchor="middle">Row payload</text>
+  <text class="segment-note" x="655" y="135" text-anchor="middle">encoding selected by table.kv.format</text>
+  <text class="offset" x="220" y="170">offset 0</text>
+  <text class="offset" x="370" y="170">offset 2</text>
+
+  <line class="rule" x1="40" y1="184" x2="940" y2="184"/>
+
+  <text class="row-title" x="40" y="230">Format v3</text>
+  <text class="row-note" x="40" y="251">Partitioned main-table indexes</text>
+
+  <rect x="220" y="200" width="150" height="64" rx="6" fill="#EFF6FF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="segment-title" x="295" y="227" text-anchor="middle">schemaId</text>
+  <text class="segment-note" x="295" y="247" text-anchor="middle">2 B, little-endian</text>
+
+  <rect x="370" y="200" width="250" height="64" fill="#ECFDF3" stroke="#6CE9A6" stroke-width="1.5"/>
+  <text class="segment-title" x="495" y="227" text-anchor="middle">valueTag</text>
+  <text class="segment-note" x="495" y="247" text-anchor="middle">8 B, big-endian</text>
+
+  <rect x="620" y="200" width="320" height="64" rx="6" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5"/>
+  <text class="segment-title" x="780" y="227" text-anchor="middle">CompactedRow</text>
+  <text class="segment-note" x="780" y="247" text-anchor="middle">same row encoding as v2</text>
+  <text class="offset" x="220" y="283">offset 0</text>
+  <text class="offset" x="370" y="283">offset 2</text>
+  <text class="offset" x="620" y="283">offset 10</text>
+
+  <text class="subtitle" x="940" y="304" text-anchor="end">For partitioned indexes: valueTag = main-table partitionId</text>
+</svg>

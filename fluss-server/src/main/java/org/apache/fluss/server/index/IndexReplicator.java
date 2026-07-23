@@ -96,6 +96,7 @@ public final class IndexReplicator implements AutoCloseable {
     private final LogRecordReadContext readContext;
     private final IndexProgressListener onProgress;
     private final BiConsumer<IndexReplicator, Throwable> onTerminalFailure;
+    private final IndexReplicationNoProgressTracker noProgressTracker;
     private final int maxWindowBytes;
     private final long preferredMaxRequestBytes;
 
@@ -234,6 +235,8 @@ public final class IndexReplicator implements AutoCloseable {
         this.lifecycleLock = new ReentrantLock();
         this.onProgress = onProgress;
         this.onTerminalFailure = onTerminalFailure;
+        this.noProgressTracker =
+                new IndexReplicationNoProgressTracker(initialOffset, initialOffset);
     }
 
     @VisibleForTesting
@@ -832,6 +835,21 @@ public final class IndexReplicator implements AutoCloseable {
         return min;
     }
 
+    void onHighWatermarkAdvanced() {
+        if (indexStates.isEmpty() || closed.get() || terminalFailure.get() != null) {
+            return;
+        }
+        noProgressTracker.update(getAllIndexPushedOffset(), sourceReader.highWatermark());
+    }
+
+    public long noProgressTimeMs() {
+        if (indexStates.isEmpty() || closed.get() || terminalFailure.get() != null) {
+            return 0L;
+        }
+        return noProgressTracker.noProgressTimeMs(
+                getAllIndexPushedOffset(), sourceReader.highWatermark());
+    }
+
     private boolean advanceIndexState(IndexProgressState state, long newOffset) {
         if (newOffset > state.pushedOffset) {
             state.pushedOffset = newOffset;
@@ -841,6 +859,9 @@ public final class IndexReplicator implements AutoCloseable {
     }
 
     private void notifyProgress() {
+        if (!indexStates.isEmpty()) {
+            noProgressTracker.update(getAllIndexPushedOffset(), sourceReader.highWatermark());
+        }
         onProgress.onProgress(getSyncIndexPushedOffset(), getAllIndexPushedOffset());
     }
 

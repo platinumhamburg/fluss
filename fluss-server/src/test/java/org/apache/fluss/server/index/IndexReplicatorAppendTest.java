@@ -213,6 +213,57 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
+    void activeWindowBlocksReadingAndBuildingItsSuccessor() throws Exception {
+        PollFixture fixture =
+                pollFixture(
+                        0L,
+                        1,
+                        Collections.singletonList(
+                                Arrays.asList(
+                                        record(
+                                                0L,
+                                                ChangeType.INSERT,
+                                                row(1L, 10L, 100L)),
+                                        record(
+                                                1L,
+                                                ChangeType.INSERT,
+                                                row(2L, 12L, 100L)))));
+
+        assertThat(fixture.replicator.poll()).isTrue();
+        IndexWindow firstWindow = fixture.replicator.inFlightWindow("idx");
+        IndexBatch firstBatch =
+                fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        assertThat(firstWindow).isNotNull();
+        assertThat(firstBatch).isNotNull();
+        assertThat(firstBatch.window()).isSameAs(firstWindow);
+        assertThat(firstWindow.windowEndOffset()).isEqualTo(1L);
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
+
+        assertThat(fixture.replicator.poll()).isFalse();
+        assertThat(fixture.replicator.inFlightWindow("idx")).isSameAs(firstWindow);
+        assertThat(fixture.sourceWal.readOffsets)
+                .as("an active window must prevent reading its successor")
+                .containsExactly(0L);
+        assertThat(fixture.accumulator.hasUnsent()).isFalse();
+
+        acknowledge(fixture.accumulator, firstBatch);
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(1L);
+        assertThat(fixture.replicator.poll()).isTrue();
+
+        IndexWindow secondWindow = fixture.replicator.inFlightWindow("idx");
+        IndexBatch secondBatch =
+                fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        assertThat(secondWindow).isNotNull().isNotSameAs(firstWindow);
+        assertThat(secondBatch).isNotNull();
+        assertThat(secondBatch.window()).isSameAs(secondWindow);
+        assertThat(secondWindow.windowEndOffset()).isEqualTo(2L);
+        assertThat(fixture.sourceWal.readOffsets).containsExactly(0L, 1L);
+
+        acknowledge(fixture.accumulator, secondBatch);
+        assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(2L);
+    }
+
+    @Test
     void nonIndexColumnUpdateSkipsRedundantUpsert() {
         IndexReplicator replicator = newReplicator();
         Map<TableBucket, IndexReplicator.BucketBatchBuilder> builders = new HashMap<>();

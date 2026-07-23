@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 840" role="img" aria-labelledby="title desc">
+  <title id="title">Index replication write flow</title>
+  <desc id="desc">A sequence diagram showing a committed main-table write becoming index batches, the Index Bucket decision, acknowledgement, and replication progress.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
+    </marker>
+    <marker id="ack-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0F766E"/>
+    </marker>
+    <marker id="retry-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#D97706"/>
+    </marker>
+    <style>
+      text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { font-size: 24px; font-weight: 600; fill: #101828; }
+      .subtitle { font-size: 13px; fill: #667085; }
+      .lane-title { font-size: 13px; font-weight: 600; fill: #101828; }
+      .lane-subtitle { font-size: 10px; fill: #667085; }
+      .message { font-size: 11px; font-weight: 600; fill: #475467; }
+      .body { font-size: 11px; fill: #475467; }
+      .small { font-size: 10px; fill: #667085; }
+      .panel-title { font-size: 12px; font-weight: 600; fill: #101828; }
+      .condition { font-size: 10px; font-weight: 600; fill: #344054; }
+      .result { font-size: 10px; fill: #475467; }
+      .retry { font-size: 10px; font-weight: 600; fill: #B54708; }
+      .success { font-size: 10px; font-weight: 600; fill: #067647; }
+      .progress { font-size: 15px; font-weight: 600; fill: #065F46; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="840" fill="#FFFFFF"/>
+  <text class="title" x="40" y="42">Index replication write flow</text>
+  <text class="subtitle" x="40" y="65">Index replication starts only after the main-table write is committed.</text>
+
+  <rect x="40" y="92" width="120" height="54" rx="6" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5"/>
+  <text class="lane-title" x="100" y="116" text-anchor="middle">Client</text>
+  <text class="lane-subtitle" x="100" y="134" text-anchor="middle">table writer</text>
+
+  <rect x="205" y="92" width="220" height="54" rx="6" fill="#EFF6FF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="lane-title" x="315" y="116" text-anchor="middle">Main Table Bucket Leader</text>
+  <text class="lane-subtitle" x="315" y="134" text-anchor="middle">KV, WAL, and HW</text>
+
+  <rect x="450" y="92" width="180" height="54" rx="6" fill="#FFFFFF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="lane-title" x="540" y="116" text-anchor="middle">IndexReplicator</text>
+  <text class="lane-subtitle" x="540" y="134" text-anchor="middle">one window per index</text>
+
+  <rect x="665" y="92" width="210" height="54" rx="6" fill="#FFFAEB" stroke="#FEC84B" stroke-width="1.5"/>
+  <text class="lane-title" x="770" y="116" text-anchor="middle">Accumulator / Sender</text>
+  <text class="lane-subtitle" x="770" y="134" text-anchor="middle">admission, queueing, and retry</text>
+
+  <rect x="920" y="92" width="240" height="54" rx="6" fill="#F0FDFA" stroke="#5FE9D0" stroke-width="1.5"/>
+  <text class="lane-title" x="1040" y="116" text-anchor="middle">Index Bucket Leader</text>
+  <text class="lane-subtitle" x="1040" y="134" text-anchor="middle">KV, WriterState, WAL, and HW</text>
+
+  <line x1="100" y1="146" x2="100" y2="750" stroke="#D0D5DD" stroke-width="1.25" stroke-dasharray="4 5"/>
+  <line x1="315" y1="146" x2="315" y2="750" stroke="#84ADFF" stroke-width="1.25" stroke-dasharray="4 5"/>
+  <line x1="540" y1="146" x2="540" y2="750" stroke="#84ADFF" stroke-width="1.25" stroke-dasharray="4 5"/>
+  <line x1="770" y1="146" x2="770" y2="750" stroke="#FEC84B" stroke-width="1.25" stroke-dasharray="4 5"/>
+  <line x1="1040" y1="146" x2="1040" y2="750" stroke="#5FE9D0" stroke-width="1.25" stroke-dasharray="4 5"/>
+
+  <text class="small" x="40" y="178">01  MAIN-TABLE WRITE</text>
+  <line x1="100" y1="194" x2="315" y2="194" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text class="message" x="207" y="185" text-anchor="middle">PutKv</text>
+  <rect x="308" y="194" width="14" height="100" rx="3" fill="#D1E9FF" stroke="#84ADFF"/>
+  <rect x="340" y="213" width="175" height="64" rx="6" fill="#EFF6FF" stroke="#B2CCFF"/>
+  <text class="body" x="355" y="237">Append WAL and apply KV</text>
+  <text class="body" x="355" y="258">Replicate and wait for HW</text>
+
+  <text class="small" x="40" y="322">02  BUILD AND SEND</text>
+  <line x1="315" y1="338" x2="540" y2="338" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text class="message" x="427" y="329" text-anchor="middle">Read committed range [P, H)</text>
+  <rect x="533" y="338" width="14" height="124" rx="3" fill="#D1E9FF" stroke="#84ADFF"/>
+  <rect x="557" y="357" width="180" height="70" rx="6" fill="#FFFFFF" stroke="#B2CCFF"/>
+  <text class="body" x="572" y="381">Build [P, E) for each index</text>
+  <text class="body" x="572" y="403">Writer progress = E</text>
+  <line x1="540" y1="446" x2="770" y2="446" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text class="message" x="655" y="437" text-anchor="middle">Admit the whole window and queue batches</text>
+  <rect x="763" y="446" width="14" height="292" rx="3" fill="#FEF0C7" stroke="#FEC84B"/>
+  <line x1="770" y1="482" x2="1040" y2="482" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text class="message" x="905" y="473" text-anchor="middle">PutKv with writer key and progress E</text>
+  <rect x="1033" y="482" width="14" height="205" rx="3" fill="#CCFBEF" stroke="#5FE9D0"/>
+
+  <text class="small" x="40" y="511">03  INDEX BUCKET DECISION</text>
+  <rect x="845" y="507" width="315" height="158" rx="6" fill="#FFFFFF" stroke="#98A2B3" stroke-width="1.25"/>
+  <text class="panel-title" x="862" y="531">Index Bucket processing</text>
+  <text class="small" x="1143" y="531" text-anchor="end">* partitioned source only</text>
+  <line x1="862" y1="541" x2="1143" y2="541" stroke="#EAECF0"/>
+
+  <text class="small" x="862" y="558">PARTITION CHECK*</text>
+  <text class="small" x="1004" y="558">CUMULATIVE PROGRESS</text>
+  <line x1="998" y1="550" x2="998" y2="655" stroke="#EAECF0"/>
+
+  <rect x="862" y="567" width="130" height="34" rx="4" fill="#FFFAEB"/>
+  <text class="condition" x="872" y="581">Tombstone unavailable</text>
+  <text class="retry" x="872" y="594">Retry</text>
+
+  <rect x="862" y="607" width="130" height="34" rx="4" fill="#F2F4F7"/>
+  <text class="condition" x="872" y="621">Partition dropped</text>
+  <text class="success" x="872" y="634">No-op success</text>
+
+  <rect x="1004" y="567" width="139" height="34" rx="4" fill="#F2F4F7"/>
+  <text class="condition" x="1014" y="581">E &lt;= saved progress</text>
+  <text class="success" x="1014" y="594">No-op success</text>
+
+  <rect x="1004" y="607" width="139" height="48" rx="4" fill="#ECFDF3"/>
+  <text class="condition" x="1014" y="621">E &gt; saved progress</text>
+  <text class="result" x="1014" y="635">KV + state in WAL</text>
+  <text class="result" x="1014" y="648">Ack after HW</text>
+
+  <path d="M 1040 687 L 1040 700 L 770 700" fill="none" stroke="#D97706" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#retry-arrow)"/>
+  <text class="retry" x="905" y="692" text-anchor="middle">Retry while tombstone is unavailable</text>
+  <path d="M 1040 716 L 770 716" fill="none" stroke="#0F766E" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#ack-arrow)"/>
+  <text class="success" x="905" y="710" text-anchor="middle">Success after no-op or Index HW</text>
+  <path d="M 770 738 L 540 738" fill="none" stroke="#0F766E" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#ack-arrow)"/>
+  <text class="message" x="655" y="731" text-anchor="middle">All target batches acknowledged</text>
+
+  <text class="small" x="40" y="780">04  ADVANCE REPLICATION PROGRESS</text>
+  <rect x="450" y="760" width="410" height="58" rx="6" fill="#ECFDF3" stroke="#6CE9A6" stroke-width="1.5"/>
+  <text class="progress" x="655" y="786" text-anchor="middle">pushedOffset[index] = E</text>
+  <text class="small" x="655" y="806" text-anchor="middle">Recompute syncIndexPushedOffset and allIndexPushedOffset</text>
+</svg>

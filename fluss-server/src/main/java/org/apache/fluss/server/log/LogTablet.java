@@ -298,10 +298,6 @@ public final class LogTablet {
         return writerStateManager.protocol();
     }
 
-    public long getWriterStateSnapshotBytes() {
-        return writerStateManager.latestSnapshotBytes();
-    }
-
     public Map<Long, WriterStateEntry> activeWriters() {
         return writerStateManager.activeWriters();
     }

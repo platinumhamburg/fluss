@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Secondary index lookup</title>
+  <desc id="desc">Index candidates are deduplicated, looked up in the main table, and rechecked before being returned.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
+    </marker>
+    <marker id="yes-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0F766E"/>
+    </marker>
+    <marker id="no-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#D92D20"/>
+    </marker>
+    <style>
+      text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { font-size: 24px; font-weight: 600; fill: #101828; }
+      .subtitle { font-size: 13px; fill: #667085; }
+      .step { font-size: 11px; font-weight: 600; fill: #667085; }
+      .node-title { font-size: 15px; font-weight: 600; fill: #101828; }
+      .body { font-size: 12px; fill: #475467; }
+      .small { font-size: 11px; fill: #667085; }
+      .yes { font-size: 13px; font-weight: 600; fill: #065F46; }
+      .no { font-size: 13px; font-weight: 600; fill: #B42318; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="520" fill="#FFFFFF"/>
+  <text class="title" x="40" y="42">Secondary index lookup</text>
+  <text class="subtitle" x="40" y="65">Index entries provide candidates; the current main-table row determines the result.</text>
+
+  <rect x="40" y="120" width="150" height="122" rx="6" fill="#EFF6FF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="step" x="58" y="145">01</text>
+  <text class="node-title" x="58" y="174">Lookup key</text>
+  <text class="body" x="58" y="203">user_id = 42</text>
+
+  <rect x="230" y="120" width="190" height="122" rx="6" fill="#F0FDFA" stroke="#5FE9D0" stroke-width="1.5"/>
+  <text class="step" x="248" y="145">02</text>
+  <text class="node-title" x="248" y="174">Index prefix scan</text>
+  <text class="body" x="248" y="201">prefixLookup(user_id)</text>
+  <text class="small" x="248" y="222">read candidate index rows</text>
+
+  <rect x="460" y="120" width="170" height="122" rx="6" fill="#FFFAEB" stroke="#FEC84B" stroke-width="1.5"/>
+  <text class="step" x="478" y="145">03</text>
+  <text class="node-title" x="478" y="174">Candidate keys</text>
+  <text class="body" x="478" y="201">PK-A, PK-B, PK-A</text>
+  <text class="small" x="478" y="222">may be stale or repeated</text>
+
+  <rect x="670" y="120" width="170" height="122" rx="6" fill="#FFFFFF" stroke="#D0D5DD" stroke-width="1.5"/>
+  <text class="step" x="688" y="145">04</text>
+  <text class="node-title" x="688" y="174">Deduplicate</text>
+  <text class="body" x="688" y="201">PK-A, PK-B</text>
+  <text class="small" x="688" y="222">by complete primary key</text>
+
+  <rect x="880" y="120" width="280" height="122" rx="6" fill="#EFF6FF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="step" x="898" y="145">05</text>
+  <text class="node-title" x="898" y="174">Main-table point lookups</text>
+  <text class="body" x="898" y="201">one request per distinct primary key</text>
+  <text class="small" x="898" y="222">discard rows that no longer exist</text>
+
+  <line x1="190" y1="181" x2="230" y2="181" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="420" y1="181" x2="460" y2="181" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="630" y1="181" x2="670" y2="181" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="840" y1="181" x2="880" y2="181" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <path d="M 1020 242 L 1020 282 L 600 282 L 600 310" fill="none" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="420" y="310" width="360" height="82" rx="6" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5"/>
+  <text class="node-title" x="600" y="340" text-anchor="middle">Recheck the current row</text>
+  <text class="body" x="600" y="365" text-anchor="middle">Do the current index columns still match user_id = 42?</text>
+  <text class="small" x="600" y="383" text-anchor="middle">type-aware, content-based comparison</text>
+
+  <path d="M 510 392 L 510 418 L 430 451" fill="none" stroke="#D92D20" stroke-width="1.5" marker-end="url(#no-arrow)"/>
+  <path d="M 690 392 L 690 418 L 770 451" fill="none" stroke="#0F766E" stroke-width="1.5" marker-end="url(#yes-arrow)"/>
+  <text class="no" x="470" y="421" text-anchor="middle">NO</text>
+  <text class="yes" x="730" y="421" text-anchor="middle">YES</text>
+
+  <rect x="180" y="438" width="250" height="58" rx="6" fill="#FEF3F2" stroke="#FDA29B" stroke-width="1.5"/>
+  <text class="no" x="305" y="463" text-anchor="middle">Discard</text>
+  <text class="small" x="305" y="482" text-anchor="middle">row missing or index columns changed</text>
+
+  <rect x="770" y="438" width="250" height="58" rx="6" fill="#ECFDF3" stroke="#6CE9A6" stroke-width="1.5"/>
+  <text class="yes" x="895" y="463" text-anchor="middle">Emit once</text>
+  <text class="small" x="895" y="482" text-anchor="middle">current row still matches the lookup key</text>
+</svg>

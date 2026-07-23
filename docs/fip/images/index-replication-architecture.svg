@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">Index replication pipeline</title>
+  <desc id="desc">Committed main-table WAL records flow through IndexReplicator, IndexAccumulator, and IndexSender to Index Bucket leaders.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
+    </marker>
+    <marker id="ack-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0F766E"/>
+    </marker>
+    <style>
+      text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { font-size: 24px; font-weight: 600; fill: #101828; }
+      .subtitle { font-size: 13px; fill: #667085; }
+      .lane { font-size: 12px; font-weight: 600; letter-spacing: 0.7px; fill: #475467; }
+      .step { font-size: 12px; font-weight: 600; fill: #667085; }
+      .node-title { font-size: 16px; font-weight: 600; fill: #101828; }
+      .body { font-size: 12px; fill: #475467; }
+      .small { font-size: 11px; fill: #667085; }
+      .bucket-title { font-size: 13px; font-weight: 600; fill: #065F46; }
+      .progress { font-size: 15px; font-weight: 600; fill: #065F46; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="620" fill="#FFFFFF"/>
+  <text class="title" x="40" y="42">Index replication pipeline</text>
+  <text class="subtitle" x="40" y="65">Only committed main-table WAL records are transformed and pushed to Index Bucket leaders.</text>
+
+  <rect x="40" y="92" width="1120" height="54" rx="6" fill="#F8FAFC" stroke="#D0D5DD" stroke-width="1.5"/>
+  <text class="node-title" x="65" y="116">Coordinator</text>
+  <text class="body" x="65" y="135">Schema, assignments, Index Table metadata, and PartitionTombstone</text>
+  <path d="M 225 146 L 160 190" fill="none" stroke="#98A2B3" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <path d="M 990 146 L 1050 190" fill="none" stroke="#98A2B3" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <text class="small" x="172" y="167">metadata</text>
+  <text class="small" x="1018" y="167">metadata</text>
+
+  <text class="lane" x="40" y="196">MAIN TABLE BUCKET LEADER</text>
+  <text class="lane" x="925" y="196">INDEX TABLE</text>
+
+  <rect x="40" y="215" width="185" height="138" rx="6" fill="#EFF6FF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="step" x="60" y="242">01</text>
+  <text class="node-title" x="60" y="270">Committed WAL</text>
+  <text class="body" x="60" y="298">Read offsets below HW</text>
+  <text class="body" x="60" y="320">Range [P, E)</text>
+  <line x1="60" y1="334" x2="205" y2="334" stroke="#B2CCFF"/>
+  <text class="small" x="60" y="347">Main-table KV is already applied</text>
+
+  <rect x="265" y="215" width="185" height="138" rx="6" fill="#FFFFFF" stroke="#84ADFF" stroke-width="1.5"/>
+  <text class="step" x="285" y="242">02</text>
+  <text class="node-title" x="285" y="270">IndexReplicator</text>
+  <text class="body" x="285" y="298">Build one window</text>
+  <text class="body" x="285" y="320">for each index</text>
+  <text class="small" x="285" y="344">writer progress = E</text>
+
+  <rect x="490" y="215" width="185" height="138" rx="6" fill="#FFFFFF" stroke="#D0D5DD" stroke-width="1.5"/>
+  <text class="step" x="510" y="242">03</text>
+  <text class="node-title" x="510" y="270">IndexAccumulator</text>
+  <text class="body" x="510" y="298">Admit the whole window</text>
+  <text class="body" x="510" y="320">or reject it as a unit</text>
+  <text class="small" x="510" y="344">account retained bytes once</text>
+
+  <rect x="715" y="215" width="170" height="138" rx="6" fill="#FFFAEB" stroke="#FEC84B" stroke-width="1.5"/>
+  <text class="step" x="735" y="242">04</text>
+  <text class="node-title" x="735" y="270">IndexSender</text>
+  <text class="body" x="735" y="298">Queue by target bucket</text>
+  <text class="body" x="735" y="320">Retry without reordering</text>
+  <text class="small" x="735" y="344">resolve the current leader</text>
+
+  <rect x="925" y="215" width="235" height="250" rx="6" fill="#F0FDFA" stroke="#5FE9D0" stroke-width="1.5"/>
+  <text class="step" x="945" y="242">05</text>
+  <text class="node-title" x="945" y="270">Index Bucket leaders</text>
+  <text class="small" x="945" y="292">PutKv with writer key + progress</text>
+
+  <rect x="945" y="309" width="58" height="118" rx="5" fill="#FFFFFF" stroke="#A6F4E4"/>
+  <rect x="1013" y="309" width="58" height="118" rx="5" fill="#FFFFFF" stroke="#A6F4E4"/>
+  <rect x="1081" y="309" width="58" height="118" rx="5" fill="#FFFFFF" stroke="#A6F4E4"/>
+  <text class="bucket-title" x="974" y="334" text-anchor="middle">B0</text>
+  <text class="bucket-title" x="1042" y="334" text-anchor="middle">B1</text>
+  <text class="bucket-title" x="1110" y="334" text-anchor="middle">Bn</text>
+  <text class="small" x="974" y="359" text-anchor="middle">KV</text>
+  <text class="small" x="974" y="378" text-anchor="middle">State</text>
+  <text class="small" x="974" y="397" text-anchor="middle">WAL</text>
+  <text class="small" x="1042" y="359" text-anchor="middle">KV</text>
+  <text class="small" x="1042" y="378" text-anchor="middle">State</text>
+  <text class="small" x="1042" y="397" text-anchor="middle">WAL</text>
+  <text class="small" x="1110" y="359" text-anchor="middle">KV</text>
+  <text class="small" x="1110" y="378" text-anchor="middle">State</text>
+  <text class="small" x="1110" y="397" text-anchor="middle">WAL</text>
+  <text class="small" x="1042.5" y="448" text-anchor="middle">ack after Index HW</text>
+
+  <line x1="225" y1="284" x2="265" y2="284" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="450" y1="284" x2="490" y2="284" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="675" y1="284" x2="715" y2="284" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="885" y1="284" x2="925" y2="284" stroke="#667085" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <path d="M 1042 465 L 1042 492 L 357 492 L 357 365" fill="none" stroke="#0F766E" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#ack-arrow)"/>
+  <text class="body" x="700" y="484" text-anchor="middle">all target batches acknowledged</text>
+
+  <rect x="265" y="520" width="620" height="58" rx="6" fill="#ECFDF3" stroke="#6CE9A6" stroke-width="1.5"/>
+  <text class="progress" x="575" y="545" text-anchor="middle">pushedOffset[index] = E</text>
+  <text class="small" x="575" y="565" text-anchor="middle">then recompute syncIndexPushedOffset and allIndexPushedOffset</text>
+</svg>

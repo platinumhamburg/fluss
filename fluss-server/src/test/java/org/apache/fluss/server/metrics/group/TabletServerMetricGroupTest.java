@@ -21,57 +21,59 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TabletServerMetricGroupTest {
 
     @Test
-    void testWriterStateGaugeOwnershipCanBeReplacedAndCleared() {
+    void testIndexGaugeOwnershipCanBeReplacedAndCleared() {
         TabletServerMetricGroup metrics =
                 new TabletServerMetricGroup(
                         NOPMetricRegistry.INSTANCE, "gauge-owner", "rack", "host", 1);
         AtomicLong firstEntries = new AtomicLong(11L);
-        AtomicLong firstBytes = new AtomicLong(101L);
         AtomicLong secondEntries = new AtomicLong(22L);
-        AtomicLong secondBytes = new AtomicLong(202L);
         AtomicLong firstPending = new AtomicLong(33L);
         AtomicInteger firstInFlight = new AtomicInteger(3);
         AtomicLong firstAge = new AtomicLong(303L);
+        AtomicLong firstNoProgress = new AtomicLong(304L);
         AtomicLong firstFailedSources = new AtomicLong(30L);
         AtomicLong secondPending = new AtomicLong(44L);
         AtomicInteger secondInFlight = new AtomicInteger(4);
         AtomicLong secondAge = new AtomicLong(404L);
+        AtomicLong secondNoProgress = new AtomicLong(405L);
         AtomicLong secondFailedSources = new AtomicLong(40L);
 
         TabletServerMetricGroup.GaugeRegistration firstWriterState =
-                metrics.registerIndexWriterStateGauges(firstEntries::get, firstBytes::get);
+                metrics.registerIndexWriterStateGauge(firstEntries::get);
         TabletServerMetricGroup.GaugeRegistration firstPush =
                 metrics.registerIndexPushGauges(
                         firstPending::get,
                         firstInFlight::get,
                         firstAge::get,
+                        firstNoProgress::get,
                         firstFailedSources::get);
-        assertWriterStateGauges(metrics, 11L, 101L);
-        assertPushGauges(metrics, 33L, 3L, 303L, 30L);
+        assertWriterStateGauge(metrics, 11L);
+        assertPushGauges(metrics, 33L, 3L, 303L, 304L, 30L);
 
         TabletServerMetricGroup.GaugeRegistration secondWriterState =
-                metrics.registerIndexWriterStateGauges(secondEntries::get, secondBytes::get);
+                metrics.registerIndexWriterStateGauge(secondEntries::get);
         TabletServerMetricGroup.GaugeRegistration secondPush =
                 metrics.registerIndexPushGauges(
                         secondPending::get,
                         secondInFlight::get,
                         secondAge::get,
+                        secondNoProgress::get,
                         secondFailedSources::get);
-        assertWriterStateGauges(metrics, 22L, 202L);
-        assertPushGauges(metrics, 44L, 4L, 404L, 40L);
+        assertWriterStateGauge(metrics, 22L);
+        assertPushGauges(metrics, 44L, 4L, 404L, 405L, 40L);
         assertThat(metrics.getMetrics().keySet())
-                .filteredOn("indexReplicationFailedSourceBucketCount"::equals)
+                .filteredOn(MetricNames.INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT::equals)
                 .hasSize(1);
 
         firstWriterState.close();
         firstPush.close();
-        assertWriterStateGauges(metrics, 22L, 202L);
-        assertPushGauges(metrics, 44L, 4L, 404L, 40L);
+        assertWriterStateGauge(metrics, 22L);
+        assertPushGauges(metrics, 44L, 4L, 404L, 405L, 40L);
 
         secondWriterState.close();
         secondPush.close();
-        assertWriterStateGauges(metrics, 0L, 0L);
-        assertPushGauges(metrics, 0L, 0L, 0L, 0L);
+        assertWriterStateGauge(metrics, 0L);
+        assertPushGauges(metrics, 0L, 0L, 0L, 0L, 0L);
     }
 
     private static void assertPushGauges(
@@ -79,6 +81,7 @@ class TabletServerMetricGroupTest {
             long expectedPending,
             long expectedInFlight,
             long expectedAge,
+            long expectedNoProgress,
             long expectedFailedSources) {
         assertThat(metricValue(metrics, MetricNames.INDEX_PUSH_PENDING_BYTES))
                 .isEqualTo(expectedPending);
@@ -86,16 +89,16 @@ class TabletServerMetricGroupTest {
                 .isEqualTo(expectedInFlight);
         assertThat(metricValue(metrics, MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS))
                 .isEqualTo(expectedAge);
+        assertThat(metricValue(metrics, MetricNames.INDEX_REPLICATION_MAX_NO_PROGRESS_TIME_MS))
+                .isEqualTo(expectedNoProgress);
         assertThat(metricValue(metrics, MetricNames.INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT))
                 .isEqualTo(expectedFailedSources);
     }
 
-    private static void assertWriterStateGauges(
-            TabletServerMetricGroup metrics, long expectedEntries, long expectedBytes) {
+    private static void assertWriterStateGauge(
+            TabletServerMetricGroup metrics, long expectedEntries) {
         assertThat(metricValue(metrics, MetricNames.INDEX_WRITER_STATE_ENTRIES))
                 .isEqualTo(expectedEntries);
-        assertThat(metricValue(metrics, MetricNames.INDEX_WRITER_STATE_SNAPSHOT_BYTES))
-                .isEqualTo(expectedBytes);
     }
 
     private static long metricValue(TabletServerMetricGroup metrics, String name) {

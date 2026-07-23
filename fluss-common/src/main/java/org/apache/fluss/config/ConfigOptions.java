@@ -839,75 +839,54 @@ public class ConfigOptions {
                     .withDescription("The amount of time to sleep when fetch bucket error occurs.")
                     .withFallbackKeys("log.replica.fetch-backoff-interval");
 
-    public static final ConfigOption<Integer> INDEX_REPLICATION_READER_NUMBER =
-            key("index.replication.reader-number")
+    public static final ConfigOption<Integer> INDEX_REPLICATION_READER_THREADS =
+            key("index.replication.reader.threads")
                     .intType()
                     .defaultValue(1)
                     .withDescription(
                             "Number of reader worker threads in the server-global index replicator "
                                     + "pool. Each leader-side index replicator is assigned to a "
                                     + "worker by bucket hash; increasing this value raises the "
-                                    + "degree of parallelism for WAL reading and index derivation.");
+                                    + "degree of parallelism for WAL reading and index derivation. "
+                                    + "The value must be positive.");
 
-    public static final ConfigOption<Integer> INDEX_REPLICATION_SENDER_NUMBER =
-            key("index.replication.sender-number")
+    public static final ConfigOption<Integer> INDEX_REPLICATION_SENDER_THREADS =
+            key("index.replication.sender.threads")
                     .intType()
                     .defaultValue(1)
                     .withDescription(
                             "Number of sender worker threads that dispatch derived index batches to "
                                     + "target Index Table leaders. Within one TabletServer, each "
                                     + "target index bucket is owned by one sender worker so a later "
-                                    + "local batch cannot overtake an in-flight batch.");
-
-    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_WINDOW_BYTES =
-            key("index.replication.max-window-bytes")
-                    .memoryType()
-                    .defaultValue(MemorySize.parse("256kb"))
-                    .withDescription(
-                            "Maximum number of WAL bytes requested by an index replicator per read. "
-                                    + "A window ends only at a complete source mutation boundary and "
-                                    + "may end inside a WAL record batch based on derived output size.");
-
-    public static final ConfigOption<Duration> INDEX_REPLICATION_BACKOFF_INTERVAL =
-            key("index.replication.backoff-interval")
-                    .durationType()
-                    .defaultValue(Duration.ofMillis(50))
-                    .withDescription(
-                            "The amount of time an idle index replication worker (reader or sender) "
-                                    + "sleeps before re-checking for work when none is available.");
+                                    + "local batch cannot overtake an in-flight batch. The value "
+                                    + "must be positive.");
 
     public static final ConfigOption<Duration> INDEX_REPLICATION_RETRY_BACKOFF =
-            key("index.replication.retry-backoff")
+            key("index.replication.retry.backoff")
                     .durationType()
                     .defaultValue(Duration.ofMillis(100))
                     .withDescription(
                             "The base backoff applied before retrying a failed index batch send. "
                                     + "The effective delay grows exponentially with the number of "
-                                    + "attempts, capped by 'index.replication.retry-max-backoff'. A "
-                                    + "failed batch is not eligible for re-send until this delay "
-                                    + "elapses, preventing busy-retry against an unhealthy target.");
+                                    + "attempts, capped at 10 seconds. A failed batch is not eligible "
+                                    + "for re-send until this delay elapses, preventing busy-retry "
+                                    + "against an unhealthy target. The value must be positive and "
+                                    + "must not exceed 10 seconds.");
 
-    public static final ConfigOption<Duration> INDEX_REPLICATION_RETRY_MAX_BACKOFF =
-            key("index.replication.retry-max-backoff")
-                    .durationType()
-                    .defaultValue(Duration.ofSeconds(10))
-                    .withDescription(
-                            "The upper bound on the exponential retry backoff for a failed index "
-                                    + "batch send.");
-
-    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_PENDING_BYTES =
-            key("index.replication.max-pending-bytes")
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAIN_BUCKET_BUFFER_MAX_BYTES =
+            key("index.replication.buffer.max-bytes-per-main-bucket")
                     .memoryType()
                     .defaultValue(MemorySize.parse("64mb"))
                     .withDescription(
                             "Maximum retained payload bytes of pending (un-acknowledged) index "
-                                    + "batches buffered per leader-side index replicator. One "
+                                    + "batches buffered per leader main-table bucket. One "
                                     + "indivisible admitted window may cross this soft threshold; "
                                     + "the read layer then stops polling new WAL windows for that "
-                                    + "replicator without blocking unrelated main-table buckets.");
+                                    + "bucket without blocking unrelated main-table buckets. The "
+                                    + "value must be positive.");
 
-    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_TOTAL_PENDING_BYTES =
-            key("index.replication.max-total-pending-bytes")
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_BUFFER_MAX_BYTES =
+            key("index.replication.buffer.max-bytes")
                     .memoryType()
                     .defaultValue(MemorySize.parse("256mb"))
                     .withDescription(
@@ -915,16 +894,18 @@ public class ConfigOptions {
                                     + "batches across one TabletServer. The value includes queued, "
                                     + "in-flight, and retry-retained page buffers. It is a hard "
                                     + "post-admission bound for accumulator payload pages, not an "
-                                    + "exact bound on total JVM heap usage.");
+                                    + "exact bound on total JVM heap usage. The value must be positive.");
 
-    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAX_REQUEST_BYTES =
-            key("index.replication.max-request-bytes")
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_REQUEST_TARGET_BYTES =
+            key("index.replication.request.target-bytes")
                     .memoryType()
                     .defaultValue(MemorySize.parse("1mb"))
                     .withDescription(
-                            "Preferred aggregate encoded payload bound for one index replication "
-                                    + "window and for PutKv request consolidation. A complete source "
-                                    + "mutation group and an individual target batch are never split.");
+                            "Preferred encoded payload size for one index replication window and "
+                                    + "for PutKv request consolidation. A complete source mutation "
+                                    + "group and an individual target batch are never split, so an "
+                                    + "individual window or request may exceed this target. The value "
+                                    + "must be positive.");
 
     public static final ConfigOption<MemorySize> LOG_REPLICA_FETCH_MAX_BYTES =
             key("log.replica.fetch.max-bytes")

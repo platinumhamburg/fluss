@@ -782,18 +782,6 @@ public class FlinkConversionsTest {
     }
 
     @Test
-    void testRejectsTableLevelIndexVisibility() {
-        Map<String, String> options = new HashMap<>();
-        options.put("secondary-index.idx_email.columns", "email");
-        options.put("index.visibility", "async");
-
-        assertThatThrownBy(() -> FlinkConversions.toFlussTable(resolvedIndexTable(options)))
-                .isInstanceOf(CatalogException.class)
-                .hasMessageContaining("index.visibility")
-                .hasMessageContaining("secondary-index.<index-name>.visibility");
-    }
-
-    @Test
     void testRejectsMalformedOrIncompleteSecondaryIndexOptions() {
         for (Map<String, String> invalidOptions :
                 Arrays.asList(

@@ -45,20 +45,6 @@ class TableDescriptorValidationTest {
     private static final String INDEX_NAME = "idx_user";
 
     @Test
-    void testRejectsTableLevelIndexVisibility() {
-        TableDescriptor descriptor =
-                baseDescriptorBuilder().property("index.visibility", "async").build();
-
-        assertThatThrownBy(
-                        () ->
-                                TableDescriptorValidation.validateTableDescriptor(
-                                        descriptor, MAX_BUCKET_NUM, null))
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("index.visibility")
-                .hasMessageContaining("secondary-index.<index-name>.visibility");
-    }
-
-    @Test
     void testRejectsLegacySecondaryIndexProperties() {
         TableDescriptor descriptor =
                 baseDescriptorBuilder()
@@ -157,7 +143,7 @@ class TableDescriptorValidationTest {
                                         dataTable, MAX_BUCKET_NUM, null))
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessageContaining(
-                        "protocol version 1 is reserved for system-managed Index Tables");
+                        "cumulative-progress KV idempotence protocol is reserved for system-managed Index Tables");
     }
 
     @Test

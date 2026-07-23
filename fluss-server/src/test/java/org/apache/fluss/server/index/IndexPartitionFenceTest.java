@@ -141,18 +141,12 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
         assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
 
-        fixture.log.writerStateManager().updateMapEndOffset(1L);
-        fixture.log.writerStateManager().takeSnapshot();
         TabletServerMetricGroup metrics =
                 new TabletServerMetricGroup(
                         NOPMetricRegistry.INSTANCE, "gauge-test", "rack", "host", 1);
-        metrics.registerIndexWriterStateGauges(
-                fixture.log.writerStateManager()::writerIdCount,
-                fixture.log.writerStateManager()::latestSnapshotBytes);
+        metrics.registerIndexWriterStateGauge(fixture.log.writerStateManager()::writerIdCount);
         assertThat(metricValue(metrics, MetricNames.INDEX_WRITER_STATE_ENTRIES, Long.class))
                 .isEqualTo(1L);
-        assertThat(metricValue(metrics, MetricNames.INDEX_WRITER_STATE_SNAPSHOT_BYTES, Long.class))
-                .isGreaterThan(0L);
     }
 
     @Test

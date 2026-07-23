@@ -220,7 +220,11 @@ public final class ReplicaIndexController {
      * it polls the newly committed WAL window. No-op when no replicator is active.
      */
     public void onHighWatermarkAdvanced() {
-        if (indexReplicator != null && replicatorPool != null) {
+        IndexReplicator replicator = indexReplicator;
+        if (replicator != null) {
+            replicator.onHighWatermarkAdvanced();
+        }
+        if (replicator != null && replicatorPool != null) {
             replicatorPool.signal(tableBucket);
         }
     }
@@ -241,6 +245,12 @@ public final class ReplicaIndexController {
     public long getAllIndexPushedOffset() {
         IndexReplicator r = this.indexReplicator;
         return r != null ? r.getAllIndexPushedOffset() : -1L;
+    }
+
+    /** Returns how long the active replicator has been behind without advancing. */
+    public long noProgressTimeMs() {
+        IndexReplicator r = this.indexReplicator;
+        return state.get() == State.RUNNING && r != null ? r.noProgressTimeMs() : 0L;
     }
 
     // ------------------------------------------------------------------------------------
@@ -423,6 +433,7 @@ public final class ReplicaIndexController {
         // Register with the read pool; the pool worker will catch up on any WAL entries already
         // committed before this replicator was created.
         installIndexReplicator(replicator);
+        replicator.onHighWatermarkAdvanced();
         LOG.info("IndexReplicator (WAL-driven) registered for {}", tableBucket);
     }
 

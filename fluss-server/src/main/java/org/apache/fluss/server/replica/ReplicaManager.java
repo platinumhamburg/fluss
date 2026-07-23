@@ -162,6 +162,10 @@ public class ReplicaManager implements ServerReconfigurable {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicaManager.class);
 
     public static final String HIGH_WATERMARK_CHECKPOINT_FILE_NAME = "high-watermark-checkpoint";
+    private static final int INDEX_REPLICATION_MAX_WINDOW_BYTES = 256 * 1024;
+    private static final long INDEX_REPLICATION_WORKER_BACKOFF_MS = 50L;
+    private static final long INDEX_REPLICATION_RETRY_MAX_BACKOFF_MS = 10_000L;
+
     private final Configuration conf;
     private final Scheduler scheduler;
     private final LogManager logManager;
@@ -306,28 +310,26 @@ public class ReplicaManager implements ServerReconfigurable {
         this.rpcClient = rpcClient;
         this.indexAccumulator =
                 new IndexAccumulator(
-                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_PENDING_BYTES).getBytes(),
-                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_TOTAL_PENDING_BYTES)
-                                .getBytes());
+                        conf.get(ConfigOptions.INDEX_REPLICATION_MAIN_BUCKET_BUFFER_MAX_BYTES)
+                                .getBytes(),
+                        conf.get(ConfigOptions.INDEX_REPLICATION_BUFFER_MAX_BYTES).getBytes());
         this.indexReplicatorPool =
                 new IndexReplicatorPool(
-                        conf.getInt(ConfigOptions.INDEX_REPLICATION_READER_NUMBER),
-                        checkedIndexWindowBytes(
-                                conf.get(ConfigOptions.INDEX_REPLICATION_MAX_WINDOW_BYTES)
-                                        .getBytes()),
-                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES).getBytes(),
-                        conf.get(ConfigOptions.INDEX_REPLICATION_BACKOFF_INTERVAL).toMillis());
+                        conf.getInt(ConfigOptions.INDEX_REPLICATION_READER_THREADS),
+                        INDEX_REPLICATION_MAX_WINDOW_BYTES,
+                        conf.get(ConfigOptions.INDEX_REPLICATION_REQUEST_TARGET_BYTES).getBytes(),
+                        INDEX_REPLICATION_WORKER_BACKOFF_MS);
         this.indexSender =
                 new IndexSender(
                         indexAccumulator,
                         metadataCache::getBucketLeader,
                         this::indexPushGatewayFor,
                         serverMetricGroup,
-                        conf.getInt(ConfigOptions.INDEX_REPLICATION_SENDER_NUMBER),
-                        conf.get(ConfigOptions.INDEX_REPLICATION_BACKOFF_INTERVAL).toMillis(),
+                        conf.getInt(ConfigOptions.INDEX_REPLICATION_SENDER_THREADS),
+                        INDEX_REPLICATION_WORKER_BACKOFF_MS,
                         conf.get(ConfigOptions.INDEX_REPLICATION_RETRY_BACKOFF).toMillis(),
-                        conf.get(ConfigOptions.INDEX_REPLICATION_RETRY_MAX_BACKOFF).toMillis(),
-                        conf.get(ConfigOptions.INDEX_REPLICATION_MAX_REQUEST_BYTES).getBytes(),
+                        INDEX_REPLICATION_RETRY_MAX_BACKOFF_MS,
+                        conf.get(ConfigOptions.INDEX_REPLICATION_REQUEST_TARGET_BYTES).getBytes(),
                         conf.get(ConfigOptions.NETTY_SERVER_MAX_REQUEST_SIZE).getBytes(),
                         30_000L);
         this.indexPushGaugeRegistration =
@@ -335,11 +337,11 @@ public class ReplicaManager implements ServerReconfigurable {
                         indexAccumulator::pendingBytes,
                         indexSender::inFlightRequestCount,
                         indexSender::oldestInFlightAgeMs,
+                        this::maxIndexReplicationNoProgressTimeMs,
                         this::failedIndexReplicationSourceBucketCount);
         this.indexWriterStateGaugeRegistration =
-                serverMetricGroup.registerIndexWriterStateGauges(
-                        this::writerProgressStateEntryCount,
-                        this::writerProgressStateSnapshotBytes);
+                serverMetricGroup.registerIndexWriterStateGauge(
+                        this::writerProgressStateEntryCount);
 
         this.highWatermarkCheckpoints = new HashMap<>();
         for (File dataDir : localDiskManager.dataDirs()) {
@@ -509,6 +511,14 @@ public class ReplicaManager implements ServerReconfigurable {
                 .count();
     }
 
+    private long maxIndexReplicationNoProgressTimeMs() {
+        return onlineReplicas()
+                .filter(Replica::isLeader)
+                .mapToLong(replica -> replica.getIndexManager().noProgressTimeMs())
+                .max()
+                .orElse(0L);
+    }
+
     @VisibleForTesting
     public long leaderCount() {
         return onlineReplicas().filter(Replica::isLeader).count();
@@ -520,10 +530,6 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private long writerProgressStateEntryCount() {
         return onlineReplicas().mapToLong(Replica::writerProgressStateEntryCount).sum();
-    }
-
-    private long writerProgressStateSnapshotBytes() {
-        return onlineReplicas().mapToLong(Replica::writerProgressStateSnapshotBytes).sum();
     }
 
     private long logicalStorageLogSize() {
@@ -1831,17 +1837,6 @@ public class ReplicaManager implements ServerReconfigurable {
                     e);
             return true;
         }
-    }
-
-    static int checkedIndexWindowBytes(long bytes) {
-        if (bytes <= 0L || bytes > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException(
-                    ConfigOptions.INDEX_REPLICATION_MAX_WINDOW_BYTES.key()
-                            + " must fit in a positive 32-bit integer, but was "
-                            + bytes
-                            + " bytes");
-        }
-        return (int) bytes;
     }
 
     private void maybeAddDelayedFetchLog(
