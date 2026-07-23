@@ -28,6 +28,7 @@ import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
 import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
+import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
@@ -52,6 +53,7 @@ import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Stage 2 of the orphan files cleanup job. Runs at user-configured parallelism (N) and performs
@@ -261,18 +263,41 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
             throws IOException {
         FsPath dirPath = new FsPath(task.dirPath());
         FileSystem fs = dirPath.getFileSystem();
-        remoteFsOpRateLimiter.acquire();
-        if (!fs.exists(dirPath)) {
-            return CleanupStats.emptyScan(task.scope());
-        }
-
         SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun(), task.scope(), progress);
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest(), true);
 
         CleanupStats.Builder stats = CleanupStats.scanBuilder(task.scope());
 
-        remoteFsOpRateLimiter.acquire();
-        FileStatus rootStatus = fs.getFileStatus(dirPath);
+        Optional<FileStatus> rootStatusResult;
+        try {
+            rootStatusResult = FileSystemProbe.getFileStatus(fs, dirPath, remoteFsOpRateLimiter);
+        } catch (IOException e) {
+            audit.logFilesystemFailure(
+                    AuditStage.SCAN,
+                    task.scope(),
+                    CleanupObjectType.DIRECTORY,
+                    AuditFailureDetail.builder("get_file_status", "directory_list_failed")
+                            .targetPath(dirPath)
+                            .exceptionClass(e.getClass())
+                            .retryable(true)
+                            .actionRequired(true)
+                            .build());
+            stats.skipped(SkipReasonCode.DIRECTORY_LIST_FAILED, 1L);
+            return stats.build();
+        }
+        if (!rootStatusResult.isPresent()) {
+            audit.logSkippedDirectory(
+                    dirPath,
+                    Long.MAX_VALUE,
+                    task.scope(),
+                    "directory_not_found",
+                    task.dryRun(),
+                    false,
+                    false);
+            stats.skipped(SkipReasonCode.DIRECTORY_NOT_FOUND, 1L);
+            return stats.build();
+        }
+        FileStatus rootStatus = rootStatusResult.get();
         long rootModificationTime = rootStatus.getModificationTime();
         if (MtimePolicy.isUnavailable(rootModificationTime)) {
             stats.skipped(SkipReasonCode.MTIME_UNAVAILABLE, 1L);
@@ -300,15 +325,23 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
             if (visit.postOrder) {
                 boolean plannedRemoval = visit.oldEnough && !visit.hasRemainingChild;
                 if (plannedRemoval) {
-                    stats.plannedDirectory(1L);
-                    progress.recordPlannedDirectory();
+                    if (task.dryRun()) {
+                        stats.plannedDirectory(1L);
+                        progress.recordPlannedDirectory();
+                        audit.logWouldDeleteDirectory(
+                                visit.dir, visit.modificationTime, task.scope(), true);
+                        continue;
+                    }
                     SafeDeleter.DirectoryDeleteResult result =
                             safeDeleter.deleteEmptyDirDetailed(visit.dir, visit.modificationTime);
                     switch (result) {
                         case SUCCESS:
-                            if (!task.dryRun()) {
-                                stats.removedDirectory(1L);
-                            }
+                            stats.plannedDirectory(1L);
+                            progress.recordPlannedDirectory();
+                            stats.removedDirectory(1L);
+                            break;
+                        case NOT_FOUND:
+                            stats.skipped(SkipReasonCode.DIRECTORY_NOT_FOUND, 1L);
                             break;
                         case NOT_EMPTY:
                             stats.skipped(SkipReasonCode.DIRECTORY_NOT_EMPTY, 1L);
@@ -331,10 +364,9 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                 }
                 continue;
             }
-            FileStatus[] children;
+            Optional<FileStatus[]> listing;
             try {
-                remoteFsOpRateLimiter.acquire();
-                children = fs.listStatus(visit.dir);
+                listing = FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
                 audit.logFilesystemFailure(
@@ -353,12 +385,19 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                 }
                 continue;
             }
-            if (children == null) {
-                if (visit.parent != null) {
-                    visit.parent.hasRemainingChild = true;
-                }
+            if (!listing.isPresent()) {
+                audit.logSkippedDirectory(
+                        visit.dir,
+                        visit.modificationTime,
+                        task.scope(),
+                        "directory_not_found",
+                        task.dryRun(),
+                        false,
+                        false);
+                stats.skipped(SkipReasonCode.DIRECTORY_NOT_FOUND, 1L);
                 continue;
             }
+            FileStatus[] children = listing.get();
             visit.postOrder = true;
             stack.push(visit);
             for (FileStatus child : children) {
