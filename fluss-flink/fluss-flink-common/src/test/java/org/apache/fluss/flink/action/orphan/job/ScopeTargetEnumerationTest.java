@@ -26,6 +26,7 @@ import org.apache.fluss.flink.action.orphan.audit.AuditReporterSpec.ReporterSpec
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.audit.TestingAuditReporterFactory;
 
 import org.junit.jupiter.api.Test;
@@ -220,6 +221,59 @@ class ScopeTargetEnumerationTest {
                                 assertThat(event.getDimensions())
                                         .containsEntry("operation", "list_remote_log_manifests")
                                         .containsEntry("failure_category", "timeout");
+                            });
+        } finally {
+            runtime.close();
+            TestingAuditReporterFactory.reset();
+        }
+    }
+
+    @Test
+    void resultReplaysDisappearedTargetAsCompleteScopeChange() {
+        TestingAuditReporterFactory.reset();
+        AuditReporterSpec spec = testingReporterSpec();
+        AuditReporterContext context = testingContext(spec);
+        AuditReporterRuntime runtime = AuditReporterRuntime.open(spec, context);
+        AuditLogger audit = new AuditLogger(runtime, context);
+        ScopeIdentity scope =
+                ScopeIdentity.table("db", "table", 7L).withPartitionAndBucket(9L, null);
+        ScopeTargetStats targetStats = new ScopeTargetStats(scope, 2L, true);
+        targetStats.targetDisappeared(SkipReasonCode.PARTITION_NOT_EXIST);
+        AuditFailureDetail failure =
+                AuditFailureDetail.builder("list_remote_log_manifests", "partition_not_exist")
+                        .exceptionClass("org.apache.fluss.exception.PartitionNotExistException")
+                        .attempts(1)
+                        .retryable(false)
+                        .actionRequired(false)
+                        .consistencyRacePossible(true)
+                        .build();
+        ScopeTargetEnumeration.Result result =
+                ScopeTargetEnumeration.Result.builder(targetStats)
+                        .discoveredBuckets(2L)
+                        .targetDisappeared(scope, CleanupObjectType.LOG_MANIFEST, 2L, failure)
+                        .targetTiming(100L, true)
+                        .build();
+        ScopePlanStats total = new ScopePlanStats();
+
+        try {
+            result.replay(audit, total, ignored -> {}, () -> 107L);
+
+            assertThat(total.metadataFailures()).isZero();
+            assertThat(total.incompleteTargets()).isZero();
+            assertThat(total.disappearedTargets()).isEqualTo(1L);
+            assertThat(total.disappearedBuckets()).isEqualTo(2L);
+            assertThat(total.kvDisappearedBuckets()).isEqualTo(2L);
+            assertThat(total.coverageComplete()).isTrue();
+            assertThat(TestingAuditReporterFactory.events("testing"))
+                    .extracting(event -> event.getAction())
+                    .containsExactly("scope_target_disappeared", "scope_target_summary");
+            assertThat(TestingAuditReporterFactory.events("testing").get(0))
+                    .satisfies(
+                            event -> {
+                                assertThat(event.getReasonCode()).isEqualTo("partition_not_exist");
+                                assertThat(event.getFlags())
+                                        .containsEntry("action_required", false)
+                                        .containsEntry("consistency_race_possible", true);
                             });
         } finally {
             runtime.close();

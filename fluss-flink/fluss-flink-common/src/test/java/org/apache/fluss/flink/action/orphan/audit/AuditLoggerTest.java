@@ -198,7 +198,9 @@ class AuditLoggerTest {
                                             + " log_read_failed_buckets=0 log_unavailable_buckets=0"
                                             + " out_of_scope_buckets=0 kv_target_buckets=0"
                                             + " kv_active_buckets=0 kv_empty_buckets=0"
-                                            + " kv_unavailable_buckets=0 incomplete_targets=0"
+                                            + " kv_unavailable_buckets=0 disappeared_targets=0"
+                                            + " disappeared_buckets=0 kv_disappeared_buckets=0"
+                                            + " incomplete_targets=0"
                                             + " kv_out_of_scope_buckets=0 coverage_complete=false"
                                             + " counters_consistent=false action_required=true",
                                     AuditSeverity.INFO,
@@ -225,6 +227,9 @@ class AuditLoggerTest {
                             .metric("kv_active_buckets", 0L)
                             .metric("kv_empty_buckets", 0L)
                             .metric("kv_unavailable_buckets", 0L)
+                            .metric("disappeared_targets", 0L)
+                            .metric("disappeared_buckets", 0L)
+                            .metric("kv_disappeared_buckets", 0L)
                             .metric("kv_out_of_scope_buckets", 0L)
                             .metric("incomplete_targets", 0L)
                             .flag("coverage_complete", false)
@@ -789,7 +794,8 @@ class AuditLoggerTest {
                                             + " empty_active_set_targets=3"
                                             + " metadata_read_failed_targets=4"
                                             + " directory_list_failed_targets=5"
-                                            + " rpc_failed_targets=7 mtime_unavailable_files=6"
+                                            + " rpc_failed_targets=7 disappeared_targets=0"
+                                            + " mtime_unavailable_files=6"
                                             + " mtime_unavailable_bytes=60"
                                             + " mtime_unavailable_dirs=8 complete=false"
                                             + " physical_scan_complete=false"
@@ -802,6 +808,7 @@ class AuditLoggerTest {
                             .metric("metadata_read_failed_targets", 4L)
                             .metric("directory_list_failed_targets", 5L)
                             .metric("rpc_failed_targets", 7L)
+                            .metric("disappeared_targets", 0L)
                             .metric("mtime_unavailable_files", 6L)
                             .metric("mtime_unavailable_bytes", 60L)
                             .metric("mtime_unavailable_dirs", 8L)
@@ -1048,6 +1055,55 @@ class AuditLoggerTest {
                             });
         } finally {
             runtime.close();
+        }
+    }
+
+    @Test
+    void emitsExpectedScopeTargetDisappearance() {
+        ScopeIdentity scope =
+                ScopeIdentity.table("db", "table", 7L).withPartitionAndBucket(9L, null);
+        AuditFailureDetail detail =
+                AuditFailureDetail.builder("list_remote_log_manifests", "partition_not_exist")
+                        .exceptionClass("org.apache.fluss.exception.PartitionNotExistException")
+                        .attempts(1)
+                        .retryable(false)
+                        .actionRequired(false)
+                        .consistencyRacePossible(true)
+                        .build();
+
+        try (ParityHarness harness = new ParityHarness(AuditStage.SCOPE, "ScopeEnumerator", 0, 0)) {
+            harness.logger()
+                    .logScopeTargetDisappeared(scope, CleanupObjectType.LOG_MANIFEST, 3L, detail);
+
+            AuditEvent event = TestingAuditReporterFactory.events("testing").get(0);
+            assertThat(event.getAction()).isEqualTo("scope_target_disappeared");
+            assertThat(event.getTableId()).isEqualTo(7L);
+            assertThat(event.getPartitionId()).isEqualTo(9L);
+            assertThat(event.getObjectType()).isEqualTo("log_manifest");
+            assertThat(event.getReasonCode()).isEqualTo("partition_not_exist");
+            assertThat(event.getDimensions())
+                    .containsEntry("operation", "list_remote_log_manifests")
+                    .containsEntry(
+                            "exception_class",
+                            "org.apache.fluss.exception.PartitionNotExistException");
+            assertThat(event.getMetrics())
+                    .containsEntry("expected_buckets", 3L)
+                    .containsEntry("attempts", 1L);
+            assertThat(event.getFlags())
+                    .containsEntry("retryable", false)
+                    .containsEntry("action_required", false)
+                    .containsEntry("consistency_race_possible", true);
+            assertThat(harness.logs())
+                    .singleElement()
+                    .satisfies(
+                            log -> {
+                                assertThat(log.level).isEqualTo(Level.INFO);
+                                assertThat(log.message)
+                                        .contains("action=scope_target_disappeared")
+                                        .contains("reason=partition_not_exist")
+                                        .contains("expected_buckets=3")
+                                        .contains("action_required=false");
+                            });
         }
     }
 
@@ -1482,6 +1538,7 @@ class AuditLoggerTest {
                         "logScanSubtaskSummary(long,long,CleanupCounters)",
                         "logScanSubtaskSummary(long,long,CleanupCounters,long)",
                         "logScopeTargetSummary(ScopeTargetStats)",
+                        "logScopeTargetDisappeared(ScopeIdentity,CleanupObjectType,long,AuditFailureDetail)",
                         "logDeleted(FsPath,RuleId,boolean)",
                         "logWouldDelete(FsPath,RuleId)",
                         "logWouldDelete(FileMeta,RuleId,ScopeIdentity)",
@@ -1522,7 +1579,7 @@ class AuditLoggerTest {
                         "logGlobalRuleSummary(CleanupObjectType,RuleDecisionCounters,boolean)",
                         "logCoverageSummary(Map,long,long,long,long,boolean,boolean)",
                         "logAuditIntegrity(CleanupSummary)");
-        assertThat(actual).hasSize(50);
+        assertThat(actual).hasSize(51);
         assertThat(actual)
                 .noneMatch(
                         method ->

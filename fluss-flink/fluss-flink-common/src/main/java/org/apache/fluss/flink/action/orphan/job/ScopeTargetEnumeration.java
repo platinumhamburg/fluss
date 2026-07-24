@@ -23,6 +23,7 @@ import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
 import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.KvSharedSstFetchResult;
@@ -244,6 +245,17 @@ final class ScopeTargetEnumeration {
                 return this;
             }
 
+            Builder targetDisappeared(
+                    ScopeIdentity scope,
+                    CleanupObjectType objectType,
+                    long expectedBuckets,
+                    AuditFailureDetail failure) {
+                diagnostics.add(
+                        new TargetDisappearedDiagnostic(
+                                scope, objectType, expectedBuckets, failure));
+                return this;
+            }
+
             Builder metadataFailure() {
                 planDelta.metadataFailure();
                 return this;
@@ -333,6 +345,29 @@ final class ScopeTargetEnumeration {
         @Override
         public void emit(AuditLogger audit) {
             audit.logMetadataFailure(AuditStage.SCOPE, scope, objectType, failure);
+        }
+    }
+
+    private static final class TargetDisappearedDiagnostic implements Diagnostic {
+        private final ScopeIdentity scope;
+        private final CleanupObjectType objectType;
+        private final long expectedBuckets;
+        private final AuditFailureDetail failure;
+
+        private TargetDisappearedDiagnostic(
+                ScopeIdentity scope,
+                CleanupObjectType objectType,
+                long expectedBuckets,
+                AuditFailureDetail failure) {
+            this.scope = scope;
+            this.objectType = objectType;
+            this.expectedBuckets = expectedBuckets;
+            this.failure = failure;
+        }
+
+        @Override
+        public void emit(AuditLogger audit) {
+            audit.logScopeTargetDisappeared(scope, objectType, expectedBuckets, failure);
         }
     }
 
@@ -438,6 +473,30 @@ final class ScopeTargetEnumeration {
 
             LogActiveRefsFetchResult logResult =
                     fetcher.fetchLogActiveRefsByBucket(input.tableId, partitionId);
+            if (!logResult.listOk()
+                    && recordTargetDisappearance(
+                            logResult.listFailureDetail(),
+                            CleanupObjectType.LOG_MANIFEST,
+                            targetStats,
+                            result)) {
+                return;
+            }
+
+            Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
+            boolean kvTargetOk = false;
+            KvActiveRefsFetchResult kvResult = null;
+            if (input.tableInfo.hasPrimaryKey()) {
+                kvResult = fetcher.fetchKvActiveSnapDirs(input.tableId, partitionId);
+                if (!kvResult.listOk()
+                        && recordTargetDisappearance(
+                                kvResult.listFailureDetail(),
+                                CleanupObjectType.KV_SNAPSHOT_FILE,
+                                targetStats,
+                                result)) {
+                    return;
+                }
+            }
+
             if (!logResult.listOk()) {
                 targetStats.logRpcFailed();
                 result.rpcFailure(
@@ -447,11 +506,7 @@ final class ScopeTargetEnumeration {
                         .metadataFailure();
             }
 
-            Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
-            boolean kvTargetOk = false;
-            if (input.tableInfo.hasPrimaryKey()) {
-                KvActiveRefsFetchResult kvResult =
-                        fetcher.fetchKvActiveSnapDirs(input.tableId, partitionId);
+            if (kvResult != null) {
                 if (kvResult.listOk()) {
                     kvActiveByBucket = new HashMap<>(kvResult.activeSnapDirsByBucket());
                     kvTargetOk = true;
@@ -483,6 +538,34 @@ final class ScopeTargetEnumeration {
                         remoteKvDir,
                         tableBucket);
             }
+        }
+
+        private static boolean recordTargetDisappearance(
+                AuditFailureDetail detail,
+                CleanupObjectType objectType,
+                ScopeTargetStats targetStats,
+                Result.Builder result) {
+            SkipReasonCode reason = targetDisappearanceReason(detail);
+            if (reason == null) {
+                return false;
+            }
+            targetStats.targetDisappeared(reason);
+            result.targetDisappeared(
+                    targetStats.scope(), objectType, targetStats.expectedBuckets(), detail);
+            return true;
+        }
+
+        @Nullable
+        private static SkipReasonCode targetDisappearanceReason(AuditFailureDetail detail) {
+            if (SkipReasonCode.PARTITION_NOT_EXIST
+                    .name()
+                    .equalsIgnoreCase(detail.failureCategory())) {
+                return SkipReasonCode.PARTITION_NOT_EXIST;
+            }
+            if (SkipReasonCode.TABLE_NOT_EXIST.name().equalsIgnoreCase(detail.failureCategory())) {
+                return SkipReasonCode.TABLE_NOT_EXIST;
+            }
+            return null;
         }
 
         private void enumerateBucket(

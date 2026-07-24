@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 
 /** Compact counters describing the cleanup scope and the tasks emitted by stage 1. */
 @Internal
@@ -45,6 +46,11 @@ public final class ScopePlanStats {
     private long kvActiveBuckets;
     private long kvEmptyBuckets;
     private long kvUnavailableBuckets;
+    private long disappearedTargets;
+    private long disappearedBuckets;
+    private long kvDisappearedBuckets;
+    private long disappearedPartitionTargets;
+    private long disappearedTableTargets;
     private long incompleteTargets;
 
     public void database() {
@@ -109,6 +115,16 @@ public final class ScopePlanStats {
         kvActiveBuckets += target.kvActiveBuckets();
         kvEmptyBuckets += target.kvEmptyBuckets();
         kvUnavailableBuckets += target.kvUnavailableBuckets();
+        if (target.disappeared()) {
+            disappearedTargets++;
+            disappearedBuckets += target.disappearedBuckets();
+            kvDisappearedBuckets += target.kvDisappearedBuckets();
+            if (target.disappearanceReason() == SkipReasonCode.PARTITION_NOT_EXIST) {
+                disappearedPartitionTargets++;
+            } else if (target.disappearanceReason() == SkipReasonCode.TABLE_NOT_EXIST) {
+                disappearedTableTargets++;
+            }
+        }
         if (!target.complete()
                 || !target.logCoverageConsistent()
                 || !target.kvCoverageConsistent()) {
@@ -139,6 +155,11 @@ public final class ScopePlanStats {
         kvActiveBuckets += delta.kvActiveBuckets;
         kvEmptyBuckets += delta.kvEmptyBuckets;
         kvUnavailableBuckets += delta.kvUnavailableBuckets;
+        disappearedTargets += delta.disappearedTargets;
+        disappearedBuckets += delta.disappearedBuckets;
+        kvDisappearedBuckets += delta.kvDisappearedBuckets;
+        disappearedPartitionTargets += delta.disappearedPartitionTargets;
+        disappearedTableTargets += delta.disappearedTableTargets;
         incompleteTargets += delta.incompleteTargets;
     }
 
@@ -230,6 +251,26 @@ public final class ScopePlanStats {
         return kvUnavailableBuckets;
     }
 
+    public long disappearedTargets() {
+        return disappearedTargets;
+    }
+
+    public long disappearedBuckets() {
+        return disappearedBuckets;
+    }
+
+    public long kvDisappearedBuckets() {
+        return kvDisappearedBuckets;
+    }
+
+    public long disappearedPartitionTargets() {
+        return disappearedPartitionTargets;
+    }
+
+    public long disappearedTableTargets() {
+        return disappearedTableTargets;
+    }
+
     public long incompleteTargets() {
         return incompleteTargets;
     }
@@ -241,11 +282,13 @@ public final class ScopePlanStats {
                                 + logNoManifestBuckets
                                 + logReadFailedBuckets
                                 + logUnavailableBuckets
+                                + disappearedBuckets
                                 + outOfScopeBuckets
                 && kvTargetBuckets
                         == kvActiveBuckets
                                 + kvEmptyBuckets
                                 + kvUnavailableBuckets
+                                + kvDisappearedBuckets
                                 + kvOutOfScopeBuckets;
     }
 

@@ -19,6 +19,9 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
+
+import javax.annotation.Nullable;
 
 /** Fixed-size coverage counters for one table or partition target attempted by Scope. */
 @Internal
@@ -35,10 +38,12 @@ public final class ScopeTargetStats {
     private long kvActiveBuckets;
     private long kvEmptyBuckets;
     private long kvUnavailableBuckets;
+    private long disappearedBuckets;
     private long tasksEmitted;
     private long durationMillis;
     private boolean complete;
     private boolean coverageFailure;
+    @Nullable private SkipReasonCode disappearanceReason;
 
     public ScopeTargetStats(ScopeIdentity scope, long expectedBuckets, boolean kvApplicable) {
         if (expectedBuckets < 0L) {
@@ -61,10 +66,12 @@ public final class ScopeTargetStats {
         this.kvActiveBuckets = source.kvActiveBuckets;
         this.kvEmptyBuckets = source.kvEmptyBuckets;
         this.kvUnavailableBuckets = source.kvUnavailableBuckets;
+        this.disappearedBuckets = source.disappearedBuckets;
         this.tasksEmitted = source.tasksEmitted;
         this.durationMillis = source.durationMillis;
         this.complete = source.complete;
         this.coverageFailure = source.coverageFailure;
+        this.disappearanceReason = source.disappearanceReason;
     }
 
     ScopeTargetStats snapshot() {
@@ -112,6 +119,15 @@ public final class ScopeTargetStats {
     /** Marks target coverage incomplete without changing bucket classification counters. */
     public void metadataFailure() {
         coverageFailure = true;
+    }
+
+    public void targetDisappeared(SkipReasonCode reason) {
+        if (reason != SkipReasonCode.PARTITION_NOT_EXIST
+                && reason != SkipReasonCode.TABLE_NOT_EXIST) {
+            throw new IllegalArgumentException("reason");
+        }
+        disappearanceReason = reason;
+        disappearedBuckets = expectedBuckets;
     }
 
     public void taskEmitted() {
@@ -182,6 +198,23 @@ public final class ScopeTargetStats {
         return kvUnavailableBuckets;
     }
 
+    public boolean disappeared() {
+        return disappearanceReason != null;
+    }
+
+    @Nullable
+    public SkipReasonCode disappearanceReason() {
+        return disappearanceReason;
+    }
+
+    public long disappearedBuckets() {
+        return disappearedBuckets;
+    }
+
+    public long kvDisappearedBuckets() {
+        return kvApplicable ? disappearedBuckets : 0L;
+    }
+
     public long tasksEmitted() {
         return tasksEmitted;
     }
@@ -204,6 +237,7 @@ public final class ScopeTargetStats {
                         + logNoManifestBuckets
                         + logReadFailedBuckets
                         + logUnavailableBuckets
+                        + disappearedBuckets
                         + outOfScopeBuckets;
     }
 
@@ -212,6 +246,10 @@ public final class ScopeTargetStats {
             return kvActiveBuckets == 0L && kvEmptyBuckets == 0L && kvUnavailableBuckets == 0L;
         }
         return expectedBuckets
-                == kvActiveBuckets + kvEmptyBuckets + kvUnavailableBuckets + outOfScopeBuckets;
+                == kvActiveBuckets
+                        + kvEmptyBuckets
+                        + kvUnavailableBuckets
+                        + disappearedBuckets
+                        + outOfScopeBuckets;
     }
 }

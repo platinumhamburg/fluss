@@ -183,6 +183,9 @@ public final class AuditLogger {
                         .metric("kv_active_buckets", stats.kvActiveBuckets())
                         .metric("kv_empty_buckets", stats.kvEmptyBuckets())
                         .metric("kv_unavailable_buckets", stats.kvUnavailableBuckets())
+                        .metric("disappeared_targets", stats.disappearedTargets())
+                        .metric("disappeared_buckets", stats.disappearedBuckets())
+                        .metric("kv_disappeared_buckets", stats.kvDisappearedBuckets())
                         .metric("kv_out_of_scope_buckets", stats.kvOutOfScopeBuckets())
                         .metric("incomplete_targets", stats.incompleteTargets())
                         .flag("coverage_complete", stats.coverageComplete())
@@ -195,8 +198,9 @@ public final class AuditLogger {
                         + " log_resolved_buckets={} log_no_manifest_buckets={}"
                         + " log_read_failed_buckets={} log_unavailable_buckets={}"
                         + " out_of_scope_buckets={} kv_target_buckets={} kv_active_buckets={}"
-                        + " kv_empty_buckets={} kv_unavailable_buckets={} incomplete_targets={}"
-                        + " kv_out_of_scope_buckets={}"
+                        + " kv_empty_buckets={} kv_unavailable_buckets={} disappeared_targets={}"
+                        + " disappeared_buckets={} kv_disappeared_buckets={}"
+                        + " incomplete_targets={} kv_out_of_scope_buckets={}"
                         + " coverage_complete={} counters_consistent={} action_required={}",
                 stats.databases(),
                 stats.tables(),
@@ -219,6 +223,9 @@ public final class AuditLogger {
                 stats.kvActiveBuckets(),
                 stats.kvEmptyBuckets(),
                 stats.kvUnavailableBuckets(),
+                stats.disappearedTargets(),
+                stats.disappearedBuckets(),
+                stats.kvDisappearedBuckets(),
                 stats.incompleteTargets(),
                 stats.kvOutOfScopeBuckets(),
                 stats.coverageComplete(),
@@ -400,9 +407,11 @@ public final class AuditLogger {
                         .metric("kv_active_buckets", stats.kvActiveBuckets())
                         .metric("kv_empty_buckets", stats.kvEmptyBuckets())
                         .metric("kv_unavailable_buckets", stats.kvUnavailableBuckets())
+                        .metric("disappeared_buckets", stats.disappearedBuckets())
                         .metric("tasks_emitted", stats.tasksEmitted())
                         .metric("duration_ms", stats.durationMillis())
                         .flag("kv_applicable", stats.kvApplicable())
+                        .flag("scope_changed", stats.disappeared())
                         .flag("complete", stats.complete())
                         .flag("log_coverage_consistent", stats.logCoverageConsistent())
                         .flag("kv_coverage_consistent", stats.kvCoverageConsistent())
@@ -417,7 +426,8 @@ public final class AuditLogger {
                         + " log_read_failed_buckets={} log_unavailable_buckets={}"
                         + " out_of_scope_buckets={}"
                         + " kv_active_buckets={} kv_empty_buckets={} kv_unavailable_buckets={}"
-                        + " tasks_emitted={} duration_ms={} kv_applicable={} complete={}"
+                        + " disappeared_buckets={} tasks_emitted={} duration_ms={}"
+                        + " kv_applicable={} scope_changed={} complete={}"
                         + " log_coverage_consistent={} kv_coverage_consistent={}"
                         + " action_required={}",
                 stats.scope().database(),
@@ -433,15 +443,53 @@ public final class AuditLogger {
                 stats.kvActiveBuckets(),
                 stats.kvEmptyBuckets(),
                 stats.kvUnavailableBuckets(),
+                stats.disappearedBuckets(),
                 stats.tasksEmitted(),
                 stats.durationMillis(),
                 stats.kvApplicable(),
+                stats.disappeared(),
                 stats.complete(),
                 stats.logCoverageConsistent(),
                 stats.kvCoverageConsistent(),
                 !stats.complete()
                         || !stats.logCoverageConsistent()
                         || !stats.kvCoverageConsistent());
+    }
+
+    public void logScopeTargetDisappeared(
+            ScopeIdentity scope,
+            CleanupObjectType objectType,
+            long expectedBuckets,
+            AuditFailureDetail detail) {
+        emit(
+                newEvent(AuditSeverity.INFO, AuditStage.SCOPE, "scope_target_disappeared")
+                        .scope(scope)
+                        .objectType(lower(objectType.name()))
+                        .reasonCode(detail.failureCategory())
+                        .dimension("operation", detail.operation())
+                        .dimension("exception_class", detail.exceptionClass())
+                        .metric("expected_buckets", expectedBuckets)
+                        .metric("attempts", detail.attempts())
+                        .flag("retryable", detail.retryable())
+                        .flag("action_required", detail.actionRequired())
+                        .flag("consistency_race_possible", detail.consistencyRacePossible()),
+                "audit_version=1 stage=scope action=scope_target_disappeared database={} table={}"
+                        + " table_id={} partition_id={} object_type={} operation={} reason={}"
+                        + " exception_class={} expected_buckets={} attempts={} retryable={}"
+                        + " action_required={} consistency_race_possible={}",
+                scope.database(),
+                scope.table(),
+                nullable(scope.tableId()),
+                nullable(scope.partitionId()),
+                lower(objectType.name()),
+                detail.operation(),
+                detail.failureCategory(),
+                detail.exceptionClass(),
+                expectedBuckets,
+                detail.attempts(),
+                detail.retryable(),
+                detail.actionRequired(),
+                detail.consistencyRacePossible());
     }
 
     public void logDeleted(FsPath path, RuleId ruleId, boolean ok) {
@@ -1278,6 +1326,9 @@ public final class AuditLogger {
         long directoryListFailedTargets =
                 skipped.getOrDefault(SkipReasonCode.DIRECTORY_LIST_FAILED, 0L);
         long rpcFailedTargets = skipped.getOrDefault(SkipReasonCode.RPC_ERROR, 0L);
+        long disappearedTargets =
+                skipped.getOrDefault(SkipReasonCode.PARTITION_NOT_EXIST, 0L)
+                        + skipped.getOrDefault(SkipReasonCode.TABLE_NOT_EXIST, 0L);
         boolean physicalScanComplete =
                 coverageComplete && noRemoteManifestTargets == 0L && emptyActiveSetTargets == 0L;
         emit(
@@ -1287,6 +1338,7 @@ public final class AuditLogger {
                         .metric("metadata_read_failed_targets", metadataFailures)
                         .metric("directory_list_failed_targets", directoryListFailedTargets)
                         .metric("rpc_failed_targets", rpcFailedTargets)
+                        .metric("disappeared_targets", disappearedTargets)
                         .metric("mtime_unavailable_files", mtimeUnavailableFiles)
                         .metric("mtime_unavailable_bytes", mtimeUnavailableBytes)
                         .metric("mtime_unavailable_dirs", mtimeUnavailableDirs)
@@ -1297,6 +1349,7 @@ public final class AuditLogger {
                 "action=coverage_summary no_remote_manifest_targets={}"
                         + " empty_active_set_targets={} metadata_read_failed_targets={}"
                         + " directory_list_failed_targets={} rpc_failed_targets={}"
+                        + " disappeared_targets={}"
                         + " mtime_unavailable_files={} mtime_unavailable_bytes={}"
                         + " mtime_unavailable_dirs={} complete={} physical_scan_complete={}"
                         + " action_required={} dry_run={}",
@@ -1305,6 +1358,7 @@ public final class AuditLogger {
                 metadataFailures,
                 directoryListFailedTargets,
                 rpcFailedTargets,
+                disappearedTargets,
                 mtimeUnavailableFiles,
                 mtimeUnavailableBytes,
                 mtimeUnavailableDirs,
