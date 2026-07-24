@@ -633,6 +633,10 @@ public final class AuditLogger {
                         .flag("dry_run", dryRun)
                         .flag("retryable", retryable)
                         .flag("action_required", actionRequired);
+        long creationTime = file.creationTime();
+        if (creationTime > 0L && creationTime != Long.MAX_VALUE) {
+            draft.metric("file_creation_time_ms", creationTime);
+        }
         if (cutoffMillis != null) {
             draft.metric("cutoff_ms", cutoffMillis)
                     .metric(

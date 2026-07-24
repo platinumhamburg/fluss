@@ -522,7 +522,8 @@ class ScanAndCleanFunctionTest {
                             assertThat(event.getPath()).isEqualTo(auditPath(candidateFile));
                             assertThat(event.getMetrics())
                                     .containsEntry("cutoff_ms", cutoff)
-                                    .containsEntry("mtime_minus_cutoff_ms", -2_000L);
+                                    .containsEntry("mtime_minus_cutoff_ms", -2_000L)
+                                    .doesNotContainKey("file_creation_time_ms");
                             assertThat(event.getFlags()).containsEntry("dry_run", true);
                         });
         assertThat(events)
