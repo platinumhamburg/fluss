@@ -50,5 +50,6 @@ class FileStatusTest {
                 };
 
         assertThat(status.getModificationTime()).isEqualTo(Long.MAX_VALUE);
+        assertThat(status.getCreationTime()).isEqualTo(Long.MAX_VALUE);
     }
 }

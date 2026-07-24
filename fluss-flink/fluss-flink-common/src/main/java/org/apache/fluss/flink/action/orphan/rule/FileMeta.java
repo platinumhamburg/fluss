@@ -27,11 +27,17 @@ public final class FileMeta {
     private final FsPath path;
     private final long size;
     private final long modificationTime;
+    private final long creationTime;
 
     public FileMeta(FsPath path, long size, long modificationTime) {
+        this(path, size, modificationTime, Long.MAX_VALUE);
+    }
+
+    public FileMeta(FsPath path, long size, long modificationTime, long creationTime) {
         this.path = path;
         this.size = size;
         this.modificationTime = modificationTime;
+        this.creationTime = creationTime;
     }
 
     public FsPath path() {
@@ -44,5 +50,9 @@ public final class FileMeta {
 
     public long modificationTime() {
         return modificationTime;
+    }
+
+    public long creationTime() {
+        return creationTime;
     }
 }
