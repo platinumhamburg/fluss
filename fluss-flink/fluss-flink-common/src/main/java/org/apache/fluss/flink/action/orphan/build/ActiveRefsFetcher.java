@@ -22,14 +22,18 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.ActiveKvSnapshots;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.exception.PartitionNotExistException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditFailureDetail;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.remote.RemoteLogManifest;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.RetryUtils;
@@ -44,6 +48,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -231,15 +236,32 @@ public final class ActiveRefsFetcher {
     }
 
     private AuditFailureDetail rpcFailure(String operation, IOException failure) {
-        Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+        Throwable cause =
+                failure.getCause() == null
+                        ? failure
+                        : ExceptionUtils.stripExecutionException(failure.getCause());
         RpcErrorClassifier.Category category = RpcErrorClassifier.classify(cause);
-        return AuditFailureDetail.builder(operation, category.name().toLowerCase())
+        return AuditFailureDetail.builder(operation, failureCategory(category, cause))
                 .exceptionClass(cause.getClass())
                 .attempts(category == RpcErrorClassifier.Category.NOT_FOUND ? 1 : maxRetries)
                 .retryable(category == RpcErrorClassifier.Category.TRANSIENT)
-                .actionRequired(true)
+                .actionRequired(category != RpcErrorClassifier.Category.NOT_FOUND)
                 .consistencyRacePossible(category == RpcErrorClassifier.Category.NOT_FOUND)
                 .build();
+    }
+
+    private static String failureCategory(RpcErrorClassifier.Category category, Throwable cause) {
+        if (cause instanceof PartitionNotExistException) {
+            return lower(SkipReasonCode.PARTITION_NOT_EXIST);
+        }
+        if (cause instanceof TableNotExistException) {
+            return lower(SkipReasonCode.TABLE_NOT_EXIST);
+        }
+        return category.name().toLowerCase(Locale.ROOT);
+    }
+
+    private static String lower(SkipReasonCode reasonCode) {
+        return reasonCode.name().toLowerCase(Locale.ROOT);
     }
 
     private BucketActiveRefs buildBucketActiveRefs(List<RemoteLogManifestInfo> entries)

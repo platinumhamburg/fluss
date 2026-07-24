@@ -119,11 +119,13 @@ public final class CleanupStats implements Serializable {
                         + plan.logNoManifestBuckets()
                         + plan.logReadFailedBuckets()
                         + plan.logUnavailableBuckets()
+                        + plan.disappearedBuckets()
                         + plan.outOfScopeBuckets(),
                 plan.kvTargetBuckets(),
                 plan.kvActiveBuckets()
                         + plan.kvEmptyBuckets()
                         + plan.kvUnavailableBuckets()
+                        + plan.kvDisappearedBuckets()
                         + plan.kvOutOfScopeBuckets(),
                 plan.incompleteTargets(),
                 skipped,

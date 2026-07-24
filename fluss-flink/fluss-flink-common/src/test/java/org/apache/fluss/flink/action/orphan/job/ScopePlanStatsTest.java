@@ -118,6 +118,56 @@ class ScopePlanStatsTest {
     }
 
     @Test
+    void countsDisappearedPartitionAsCompleteScopeChange() {
+        ScopePlanStats stats = new ScopePlanStats();
+        stats.discoveredBuckets(3L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(
+                        ScopeIdentity.table("db", "table", 7L).withPartitionAndBucket(9L, null),
+                        3L,
+                        true);
+        target.targetDisappeared(SkipReasonCode.PARTITION_NOT_EXIST);
+        target.complete(50L);
+
+        stats.target(target);
+
+        assertThat(target.disappeared()).isTrue();
+        assertThat(target.disappearanceReason()).isEqualTo(SkipReasonCode.PARTITION_NOT_EXIST);
+        assertThat(target.disappearedBuckets()).isEqualTo(3L);
+        assertThat(target.hasCoverageFailure()).isFalse();
+        assertThat(target.logCoverageConsistent()).isTrue();
+        assertThat(target.kvCoverageConsistent()).isTrue();
+        assertThat(stats.disappearedTargets()).isEqualTo(1L);
+        assertThat(stats.disappearedBuckets()).isEqualTo(3L);
+        assertThat(stats.disappearedPartitionTargets()).isEqualTo(1L);
+        assertThat(stats.incompleteTargets()).isZero();
+        assertThat(stats.metadataFailures()).isZero();
+        assertThat(stats.countersConsistent()).isTrue();
+        assertThat(stats.coverageComplete()).isTrue();
+        assertThat(ScopeSummaryTask.from(stats).stats().skipped())
+                .containsEntry(SkipReasonCode.PARTITION_NOT_EXIST, 1L);
+    }
+
+    @Test
+    void doesNotInventKvCoverageForDisappearedLogOnlyTarget() {
+        ScopePlanStats stats = new ScopePlanStats();
+        stats.discoveredBuckets(2L);
+        ScopeTargetStats target =
+                new ScopeTargetStats(ScopeIdentity.table("db", "log_table", 8L), 2L, false);
+        target.targetDisappeared(SkipReasonCode.TABLE_NOT_EXIST);
+        target.complete(7L);
+
+        stats.target(target);
+
+        assertThat(target.logCoverageConsistent()).isTrue();
+        assertThat(target.kvCoverageConsistent()).isTrue();
+        assertThat(stats.kvTargetBuckets()).isZero();
+        assertThat(stats.kvDisappearedBuckets()).isZero();
+        assertThat(stats.countersConsistent()).isTrue();
+        assertThat(stats.coverageComplete()).isTrue();
+    }
+
+    @Test
     void classifiesOutOfScopeBucketsWithoutInventingKvCoverageForLogOnlyTable() {
         ScopePlanStats stats = new ScopePlanStats();
         stats.discoveredBuckets(2L);

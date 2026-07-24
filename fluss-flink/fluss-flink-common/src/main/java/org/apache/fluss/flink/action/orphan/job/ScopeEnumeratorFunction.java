@@ -34,6 +34,7 @@ import org.apache.fluss.flink.action.orphan.audit.AuditReporterRuntime;
 import org.apache.fluss.flink.action.orphan.audit.AuditStage;
 import org.apache.fluss.flink.action.orphan.audit.CleanupObjectType;
 import org.apache.fluss.flink.action.orphan.audit.ScopeIdentity;
+import org.apache.fluss.flink.action.orphan.audit.SkipReasonCode;
 import org.apache.fluss.flink.action.orphan.build.ActiveRefsFetcher;
 import org.apache.fluss.flink.action.orphan.build.KvActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.LogActiveRefsFetchResult;
@@ -614,6 +615,30 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
         LogActiveRefsFetchResult logResult =
                 fetcher.fetchLogActiveRefsByBucket(liveTable.tableId, partitionId);
+        if (!logResult.listOk()
+                && recordTargetDisappearance(
+                        logResult.listFailureDetail(),
+                        CleanupObjectType.LOG_MANIFEST,
+                        targetStats,
+                        audit)) {
+            return;
+        }
+
+        Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
+        boolean kvTargetOk = false;
+        KvActiveRefsFetchResult kvResult = null;
+        if (liveTable.tableInfo.hasPrimaryKey()) {
+            kvResult = fetcher.fetchKvActiveSnapDirs(liveTable.tableId, partitionId);
+            if (!kvResult.listOk()
+                    && recordTargetDisappearance(
+                            kvResult.listFailureDetail(),
+                            CleanupObjectType.KV_SNAPSHOT_FILE,
+                            targetStats,
+                            audit)) {
+                return;
+            }
+        }
+
         if (!logResult.listOk()) {
             targetStats.logRpcFailed();
             audit.logRpcFailure(
@@ -624,11 +649,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             planStats.metadataFailure();
         }
 
-        Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
-        boolean kvTargetOk = false;
-        if (liveTable.tableInfo.hasPrimaryKey()) {
-            KvActiveRefsFetchResult kvResult =
-                    fetcher.fetchKvActiveSnapDirs(liveTable.tableId, partitionId);
+        if (kvResult != null) {
             if (kvResult.listOk()) {
                 kvActiveByBucket = kvResult.activeSnapDirsByBucket();
                 kvTargetOk = true;
@@ -739,6 +760,32 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             planStats.bucketTask();
             targetStats.taskEmitted();
         }
+    }
+
+    private static boolean recordTargetDisappearance(
+            AuditFailureDetail detail,
+            CleanupObjectType objectType,
+            ScopeTargetStats targetStats,
+            AuditLogger audit) {
+        SkipReasonCode reason = targetDisappearanceReason(detail);
+        if (reason == null) {
+            return false;
+        }
+        targetStats.targetDisappeared(reason);
+        audit.logScopeTargetDisappeared(
+                targetStats.scope(), objectType, targetStats.expectedBuckets(), detail);
+        return true;
+    }
+
+    @Nullable
+    private static SkipReasonCode targetDisappearanceReason(AuditFailureDetail detail) {
+        if (SkipReasonCode.PARTITION_NOT_EXIST.name().equalsIgnoreCase(detail.failureCategory())) {
+            return SkipReasonCode.PARTITION_NOT_EXIST;
+        }
+        if (SkipReasonCode.TABLE_NOT_EXIST.name().equalsIgnoreCase(detail.failureCategory())) {
+            return SkipReasonCode.TABLE_NOT_EXIST;
+        }
+        return null;
     }
 
     // -------------------------------------------------------------------------

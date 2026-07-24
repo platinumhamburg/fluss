@@ -43,6 +43,9 @@ public final class ScopeSummaryTask implements CleanTask {
         putPositive(
                 skipped, SkipReasonCode.EMPTY_KV_ACTIVE_SET, plan.skippedEmptyKvActiveSetCount());
         putPositive(skipped, SkipReasonCode.OUT_OF_SCOPE_ROOT, plan.skippedOutOfScopeRootCount());
+        putPositive(
+                skipped, SkipReasonCode.PARTITION_NOT_EXIST, plan.disappearedPartitionTargets());
+        putPositive(skipped, SkipReasonCode.TABLE_NOT_EXIST, plan.disappearedTableTargets());
         return new ScopeSummaryTask(CleanupStats.scope(plan, skipped));
     }
 

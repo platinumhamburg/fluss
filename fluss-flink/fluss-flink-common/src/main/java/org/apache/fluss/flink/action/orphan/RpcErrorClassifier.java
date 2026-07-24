@@ -35,7 +35,8 @@ import java.util.concurrent.TimeoutException;
  *
  * <ul>
  *   <li>{@link Category#NOT_FOUND} — legitimate "object does not exist"; the enumerator treats it
- *       as the target having disappeared concurrently and silently skips it without alarm.
+ *       as the target having disappeared concurrently, emits an expected scope-change event, and
+ *       does not mark metadata coverage incomplete.
  *   <li>{@link Category#TRANSIENT} — IO / timeout / ZK connection loss; the target is skipped this
  *       round and naturally retried in the next cleanup round.
  *   <li>{@link Category#SERVER_ERROR} — server-side failure; same skip, but audited at higher
