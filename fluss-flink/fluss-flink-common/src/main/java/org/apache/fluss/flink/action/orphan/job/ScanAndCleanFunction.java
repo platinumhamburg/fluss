@@ -427,7 +427,11 @@ public final class ScanAndCleanFunction extends ProcessFunctionAdapter<CleanTask
                     continue;
                 }
                 FileMeta meta =
-                        new FileMeta(childPath, child.getLen(), child.getModificationTime());
+                        new FileMeta(
+                                childPath,
+                                child.getLen(),
+                                child.getModificationTime(),
+                                child.getCreationTime());
                 FileRule rule = dispatcher.dispatch(meta);
                 CleanupObjectType objectType = rule.id().objectType();
                 stats.scanned(objectType, 1L);
