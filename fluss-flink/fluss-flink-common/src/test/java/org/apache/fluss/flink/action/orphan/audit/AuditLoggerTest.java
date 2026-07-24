@@ -73,6 +73,7 @@ class AuditLoggerTest {
     private static final String CLUSTER_ID = "fluss-zjk-log";
     private static final long EVENT_TIME_MILLIS = 1_723_456_789_012L;
     private static final long CUTOFF_MILLIS = 1_704_067_200_000L;
+    private static final long FILE_CREATION_TIME_MILLIS = 1_699_999_000_000L;
     private static final String OPERATOR_NAME = "ScanAndClean";
     private static final int SUBTASK_INDEX = 3;
     private static final int ATTEMPT_NUMBER = 2;
@@ -125,7 +126,8 @@ class AuditLoggerTest {
         ScopeIdentity bucketScope = tableScope.withPartitionAndBucket(11L, 4);
         FsPath simpleFile = new FsPath("oss://audit-bucket/root/simple.log");
         FsPath structuredPath = new FsPath("oss://audit-bucket/root/segment-1.log");
-        FileMeta structuredFile = new FileMeta(structuredPath, 4096L, 1_700_000_000_123L);
+        FileMeta structuredFile =
+                new FileMeta(structuredPath, 4096L, 1_700_000_000_123L, FILE_CREATION_TIME_MILLIS);
         FsPath directory = new FsPath("oss://audit-bucket/root/empty-dir");
         long directoryMtime = 1_700_000_000_456L;
         RuleDecisionCounters counters = completeRuleCounters();
@@ -281,6 +283,7 @@ class AuditLoggerTest {
                             .stable("rule", "log-segment")
                             .stable("reason_code", "older_than_cutoff")
                             .stable("result", "planned")
+                            .metric("file_creation_time_ms", FILE_CREATION_TIME_MILLIS)
                             .flag("dry_run", true)
                             .flag("retryable", false)
                             .flag("action_required", false),
@@ -308,6 +311,7 @@ class AuditLoggerTest {
                             .stable("rule", "log-segment")
                             .stable("reason_code", "older_than_cutoff")
                             .stable("result", "success")
+                            .metric("file_creation_time_ms", FILE_CREATION_TIME_MILLIS)
                             .flag("dry_run", false)
                             .flag("retryable", false)
                             .flag("action_required", false),
@@ -335,6 +339,7 @@ class AuditLoggerTest {
                             .stable("rule", "log-segment")
                             .stable("reason_code", "rpc_error")
                             .stable("result", "failed")
+                            .metric("file_creation_time_ms", FILE_CREATION_TIME_MILLIS)
                             .flag("dry_run", false)
                             .flag("retryable", true)
                             .flag("action_required", true),
