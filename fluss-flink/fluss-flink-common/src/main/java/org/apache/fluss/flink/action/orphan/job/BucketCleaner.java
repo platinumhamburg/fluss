@@ -229,7 +229,11 @@ public final class BucketCleaner {
                     continue;
                 }
                 FileMeta meta =
-                        new FileMeta(childPath, child.getLen(), child.getModificationTime());
+                        new FileMeta(
+                                childPath,
+                                child.getLen(),
+                                child.getModificationTime(),
+                                child.getCreationTime());
                 FileRule rule = dispatcher.dispatch(meta);
                 RuleEvaluation evaluation = rule.evaluateDetailed(meta, activeRefs, cutoffMillis);
                 Decision decision =

@@ -60,4 +60,13 @@ public interface FileStatus {
     default long getModificationTime() {
         return Long.MAX_VALUE;
     }
+
+    /**
+     * Returns the creation time of the file in milliseconds since the epoch.
+     *
+     * @return the creation time in epoch millis, or {@link Long#MAX_VALUE} when unavailable
+     */
+    default long getCreationTime() {
+        return Long.MAX_VALUE;
+    }
 }
