@@ -493,7 +493,7 @@ Verify the RC images are present:
 - https://hub.docker.com/r/apache/fluss/tags
 - https://hub.docker.com/r/apache/fluss-quickstart-flink/tags
 
-Then, update the `dockerVersion` field for the current release RC version in the `website/fluss-versions.json` file on the `main` branch to the value of `${RELEASE_VERSION}_RC${RC_NUM}` (which includes the RC suffix, e.g., `0.8.0-rc1`). This update should be committed and pushed to the `main` branch.
+Then, update the `dockerVersion` field for the current release RC version in the `website/fluss-versions.json` file on the `main` branch to the value of `${RELEASE_VERSION}_rc${RC_NUM}` (which includes the RC suffix, e.g., `0.8.0-rc1`). This update should be committed and pushed to the `main` branch.
 
 This ensures that the **Quickstart guide** in the documentation references the correct Docker image for the release candidate. This will help developers to easily test the new release candidate using the Quickstart guide.
 
