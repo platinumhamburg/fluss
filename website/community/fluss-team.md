@@ -8,29 +8,31 @@ We'd like to thank the following members and committers to the Apache Fluss proj
 
 ### Members
 
+*Members are grouped by role in the order of PMC Chair, PMC Member, and Committer, and sorted alphabetically by public name within each group.*
+
 | Public Name          | Company       | GitHub Username                                            | Apache ID                                                                     | Role(s)               |
 |----------------------|---------------|------------------------------------------------------------|-------------------------------------------------------------------------------|-----------------------|
-| Yu Li                | Alibaba Cloud | [@carp84](https://github.com/carp84)                       | [liyu](https://people.apache.org/committer-index.html#liyu)                   | PMC Member            |
+| Jark Wu              | Alibaba Cloud | [@wuchong](https://github.com/wuchong)                     | [jark](https://people.apache.org/committer-index.html#jark)                   | PMC Chair             |
+| Anton Borisov        | Fresha        | [@fresh-borzoni](https://github.com/fresh-borzoni)         | [aborisov](https://people.apache.org/committer-index.html#aborisov)           | PMC Member            |
 | Becket Qin           | LinkedIn      | [@becketqin](https://github.com/becketqin)                 | [jqin](https://people.apache.org/committer-index.html#jqin)                   | PMC Member            |
+| Giannis Polyzos      | Ververica     | [@polyzos](https://github.com/polyzos)                     | [ipolyzos](https://people.apache.org/committer-index.html#ipolyzos)           | PMC Member            |
 | Jean-Baptiste Onofré | Dremio        | [@jbonofre](https://github.com/jbonofre)                   | [jbonofre](https://people.apache.org/committer-index.html#jbonofre)           | PMC Member            |
 | Jingsong Lee         | Alibaba Cloud | [@JingsongLi](https://github.com/JingsongLi)               | [lzljs3620320](https://people.apache.org/committer-index.html#lzljs3620320)   | PMC Member            |
-| Zili Chen            | ScopeDB       | [@tisonkun](https://github.com/tisonkun)                   | [tison](https://people.apache.org/committer-index.html#tison)                 | PMC Member            |
-| Jark Wu              | Alibaba Cloud | [@wuchong](https://github.com/wuchong)                     | [jark](https://people.apache.org/committer-index.html#jark)                   | PMC Member, PMC Chair |
-| Giannis Polyzos      | Ververica     | [@polyzos](https://github.com/polyzos)                     | [ipolyzos](https://people.apache.org/committer-index.html#ipolyzos)           | PMC Member            |
-| Yuxia Luo            | Alibaba Cloud | [@luoyuxia](https://github.com/luoyuxia)                   | [yuxia](https://people.apache.org/committer-index.html#yuxia)                 | PMC Member            |
+| Keith Lee            | Confluent     | [@leekeiabstraction](https://github.com/leekeiabstraction) | [leekei](https://people.apache.org/committer-index.html#leekei)               | PMC Member            |
 | Mehul Batra          | DigitalOcean  | [@MehulBatra](https://github.com/MehulBatra)               | [mehulbatra](https://people.apache.org/committer-index.html#mehulbatra)       | PMC Member            |
-| Yunhong Zheng        | Alibaba Cloud | [@swuferhong](https://github.com/swuferhong)               | [yunhong](https://people.apache.org/committer-index.html#yunhong)             | PMC Member            |
 | Michael Koepf        | Dynatrace     | [@michaelkoepf](https://github.com/michaelkoepf)           | [michaelkoepf](https://people.apache.org/committer-index.html#michaelkoepf)   | PMC Member            |
 | Nicholas Jiang       | AntGroup      | [@SteNicholas](https://github.com/SteNicholas)             | [nicholasjiang](https://people.apache.org/committer-index.html#nicholasjiang) | PMC Member            |
-| Anton Borisov        | Fresha        | [@fresh-borzoni](https://github.com/fresh-borzoni)         | [aborisov](https://people.apache.org/committer-index.html#aborisov)           | PMC Member            |
-| Keith Lee            | Confluent     | [@leekeiabstraction](https://github.com/leekeiabstraction) | [leekei](https://people.apache.org/committer-index.html#leekei)               | PMC Member            |
-| Feng Wang            | Alibaba Cloud | [@wangfengpro](https://github.com/wangfengpro)             | [fengwang](https://people.apache.org/committer-index.html#fengwang)           | Committer             |
+| Yu Li                | Alibaba Cloud | [@carp84](https://github.com/carp84)                       | [liyu](https://people.apache.org/committer-index.html#liyu)                   | PMC Member            |
+| Yunhong Zheng        | Alibaba Cloud | [@swuferhong](https://github.com/swuferhong)               | [yunhong](https://people.apache.org/committer-index.html#yunhong)             | PMC Member            |
+| Yuxia Luo            | Alibaba Cloud | [@luoyuxia](https://github.com/luoyuxia)                   | [yuxia](https://people.apache.org/committer-index.html#yuxia)                 | PMC Member            |
+| Zili Chen            | ScopeDB       | [@tisonkun](https://github.com/tisonkun)                   | [tison](https://people.apache.org/committer-index.html#tison)                 | PMC Member            |
 | Benchao Li           | ByteDance     | [@libenchao](https://github.com/libenchao)                 | [libenchao](https://people.apache.org/committer-index.html#libenchao)         | Committer             |
-| Hongshun Wang        | Alibaba Cloud | [@loserwang1024](https://github.com/loserwang1024)         | [hongshun](https://people.apache.org/committer-index.html#hongshun)           | Committer             |
 | Cheng Wang           | Tencent       | [@xx789633](https://github.com/xx789633)                   | [chengwang](https://people.apache.org/committer-index.html#chengwang)         | Committer             |
+| Cheng Zhou           | Taobao        | [@zcoo](https://github.com/zcoo)                           | [zcoo](https://people.apache.org/committer-index.html#zcoo)                   | Committer             |
+| Feng Wang            | Alibaba Cloud | [@wangfengpro](https://github.com/wangfengpro)             | [fengwang](https://people.apache.org/committer-index.html#fengwang)           | Committer             |
+| Hongshun Wang        | Alibaba Cloud | [@loserwang1024](https://github.com/loserwang1024)         | [hongshun](https://people.apache.org/committer-index.html#hongshun)           | Committer             |
 | Leonard Xu           | Alibaba Cloud | [@leonardBang](https://github.com/leonardBang)             | [leonard](https://people.apache.org/committer-index.html#leonard)             | Committer             |
 | Liebing Yu           | Taobao        | [@LiebingYu](https://github.com/LiebingYu)                 | [liebing](https://people.apache.org/committer-index.html#liebing)             | Committer             |
-| Cheng Zhou           | Taobao        | [@zcoo](https://github.com/zcoo)                           | [zcoo](https://people.apache.org/committer-index.html#zcoo)                   | Committer             |
 
 The Apache Fluss project recognizes the following roles, each representing a distinct type of contribution to the project’s development:
 
