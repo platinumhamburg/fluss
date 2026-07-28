@@ -17,6 +17,7 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.types.RowType;
@@ -65,7 +66,9 @@ public class FileLogInputStream
     @Override
     public FileChannelLogRecordBatch nextBatch() throws IOException {
         FileChannel channel = fileRecords.channel();
-        if (position >= end - HEADER_SIZE_UP_TO_MAGIC) {
+        long availableEnd = Math.min((long) end, channel.size());
+        long availableBytes = availableEnd - position;
+        if (availableBytes < HEADER_SIZE_UP_TO_MAGIC) {
             return null;
         }
 
@@ -75,16 +78,39 @@ public class FileLogInputStream
         logHeaderBuffer.rewind();
         long offset = logHeaderBuffer.getLong(BASE_OFFSET_OFFSET);
         int length = logHeaderBuffer.getInt(LENGTH_OFFSET);
+        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
 
-        if (position > end - LOG_OVERHEAD - length) {
+        final int minimumHeaderSize;
+        try {
+            minimumHeaderSize = recordBatchHeaderSize(magic);
+        } catch (IllegalArgumentException e) {
+            throw new CorruptMessageException(
+                    "Unsupported log magic " + Byte.toUnsignedInt(magic), e);
+        }
+        if (length < 0) {
+            throw new CorruptMessageException(
+                    "Record batch has negative declared length " + length);
+        }
+        long batchSize = (long) LOG_OVERHEAD + length;
+        if (batchSize > Integer.MAX_VALUE) {
+            throw new CorruptMessageException("Record batch declared size overflow: " + batchSize);
+        }
+        if (batchSize < minimumHeaderSize) {
+            throw new CorruptMessageException(
+                    "Record batch magic v"
+                            + magic
+                            + " declared size "
+                            + batchSize
+                            + " is smaller than fixed header "
+                            + minimumHeaderSize);
+        }
+        if (availableBytes < minimumHeaderSize || availableBytes < batchSize) {
             return null;
         }
-
-        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
         FileChannelLogRecordBatch batch =
                 new FileChannelLogRecordBatch(offset, magic, fileRecords, position, length);
 
-        position += batch.sizeInBytes();
+        position += (int) batchSize;
         return batch;
     }
 
@@ -157,6 +183,16 @@ public class FileLogInputStream
         @Override
         public int batchSequence() {
             return loadBatchHeader().batchSequence();
+        }
+
+        @Override
+        public WriterKey writerKey() {
+            return loadBatchHeader().writerKey();
+        }
+
+        @Override
+        public long writerProgress() {
+            return loadBatchHeader().writerProgress();
         }
 
         @Override

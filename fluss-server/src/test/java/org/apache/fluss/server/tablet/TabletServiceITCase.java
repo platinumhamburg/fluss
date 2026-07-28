@@ -20,6 +20,8 @@ package org.apache.fluss.server.tablet;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
+import org.apache.fluss.exception.UnsupportedVersionException;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -31,6 +33,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.ValueDecoder;
@@ -50,6 +53,7 @@ import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrReqForBucket;
 import org.apache.fluss.rpc.messages.PbPrefixLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
+import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.messages.ScanKvRequest;
 import org.apache.fluss.rpc.messages.ScanKvResponse;
@@ -128,6 +132,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** ITCase for {@link TabletService}. */
 public class TabletServiceITCase {
+
+    @Test
+    void testApiV1RejectsTruncatedV1BatchBeforeHeaderDecode() {
+        byte[] prefix = {0, 0, 0, 0, 1};
+        PutKvRequest request = new PutKvRequest().setTableId(1L).setAcks(-1).setTimeoutMs(1000);
+        request.addBucketsReq()
+                .setBucketId(0)
+                .setRecordsBytesView(
+                        new MemorySegmentBytesView(MemorySegment.wrap(prefix), 0, prefix.length));
+
+        assertThatThrownBy(() -> ServerRpcMessageUtils.getPutKvData(request, (short) 1))
+                .isInstanceOf(UnsupportedVersionException.class);
+    }
+
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
             FlussClusterExtension.builder().setNumOfTabletServers(3).build();

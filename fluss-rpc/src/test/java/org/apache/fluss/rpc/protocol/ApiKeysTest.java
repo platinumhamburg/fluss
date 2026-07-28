@@ -38,4 +38,10 @@ class ApiKeysTest {
             assertThat(api.highestSupportedVersion).isGreaterThanOrEqualTo((short) 0);
         }
     }
+
+    @Test
+    void testPutKvVersionRangeIncludesProgressBatches() {
+        assertThat(ApiKeys.PUT_KV.lowestSupportedVersion).isZero();
+        assertThat(ApiKeys.PUT_KV.highestSupportedVersion).isEqualTo((short) 2);
+    }
 }

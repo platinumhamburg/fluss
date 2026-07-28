@@ -26,6 +26,7 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.SchemaNotExistException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -304,6 +305,27 @@ public final class LogManager extends TabletManagerBase {
             long logTtlMs,
             boolean isChangelog)
             throws Exception {
+        return getOrCreateLog(
+                dataDir,
+                tablePath,
+                tableBucket,
+                logFormat,
+                tieredLogLocalSegments,
+                logTtlMs,
+                isChangelog,
+                KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
+    }
+
+    public LogTablet getOrCreateLog(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            long logTtlMs,
+            boolean isChangelog,
+            KvIdempotenceProtocol protocol)
+            throws Exception {
         return inLock(
                 logCreationOrDeletionLock,
                 () -> {
@@ -327,7 +349,8 @@ public final class LogManager extends TabletManagerBase {
                                     logTtlMs,
                                     isChangelog,
                                     clock,
-                                    true);
+                                    true,
+                                    protocol);
                     currentLogs.put(tableBucket, logTablet);
 
                     LOG.info(
@@ -424,6 +447,15 @@ public final class LogManager extends TabletManagerBase {
         }
     }
 
+    /** Truncate local WAL while deferring WriterState rebuild for remote snapshot restore. */
+    public void prepareRemoteWriterStateRecovery(TableBucket tableBucket, long newOffset) {
+        LogTablet logTablet = currentLogs.get(tableBucket);
+        if (logTablet != null) {
+            logTablet.prepareRemoteWriterStateRecovery(newOffset);
+            checkpointRecoveryOffsets(logTablet.getDataDir());
+        }
+    }
+
     private LogTablet loadLog(
             File dataDir,
             File tabletDir,
@@ -458,6 +490,10 @@ public final class LogManager extends TabletManagerBase {
             }
         }
 
+        KvIdempotenceProtocol protocol =
+                tableInfo.hasPrimaryKey()
+                        ? tableInfo.getKvIdempotenceProtocol()
+                        : KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE;
         LogTablet logTablet =
                 LogTablet.create(
                         dataDir,
@@ -472,7 +508,8 @@ public final class LogManager extends TabletManagerBase {
                         tableInfo.getTableConfig().getLogTTLMs(),
                         tableInfo.hasPrimaryKey(),
                         clock,
-                        isCleanShutdown);
+                        isCleanShutdown,
+                        protocol);
         logTablet.updateIsDataLakeEnabled(tableInfo.getTableConfig().isDataLakeEnabled());
 
         if (currentLogs.containsKey(tableBucket)) {

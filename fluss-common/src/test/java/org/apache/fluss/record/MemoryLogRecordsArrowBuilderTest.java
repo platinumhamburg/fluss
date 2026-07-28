@@ -60,6 +60,7 @@ import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchStatisticsTestUtils.createAllColumnsStatsMapping;
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
@@ -653,6 +654,48 @@ public class MemoryLogRecordsArrowBuilderTest {
                 new ArrowCompressionInfo(ArrowCompressionType.LZ4_FRAME, -1),
                 new ArrowCompressionInfo(ArrowCompressionType.ZSTD, 3),
                 new ArrowCompressionInfo(ArrowCompressionType.ZSTD, 9));
+    }
+
+    @Test
+    void testNonEmptyProgressBatchWithStatistics() throws Exception {
+        ArrowWriter writer =
+                provider.getOrCreateWriter(
+                        1L, DEFAULT_SCHEMA_ID, 1024, DATA1_ROW_TYPE, DEFAULT_COMPRESSION);
+        LogRecordBatchStatisticsCollector statisticsCollector =
+                new LogRecordBatchStatisticsCollector(
+                        writer.getSchema(), createAllColumnsStatsMapping(writer.getSchema()));
+        MemoryLogRecordsArrowBuilder builder =
+                MemoryLogRecordsArrowBuilder.progressBuilder(
+                        DEFAULT_SCHEMA_ID,
+                        writer,
+                        new ManagedPagedOutputView(new TestingMemorySegmentPool(1024)),
+                        false,
+                        statisticsCollector);
+        WriterKey writerKey = new WriterKey(71L, Long.MIN_VALUE | 5L);
+        long progress = (long) Integer.MAX_VALUE + 71L;
+        builder.append(ChangeType.INSERT, row(4, "statistics"));
+        builder.setWriterProgress(writerKey, progress);
+        builder.close();
+
+        LogRecordBatch batch =
+                MemoryLogRecords.pointToBytesView(builder.build()).batches().iterator().next();
+        assertThat(batch.magic()).isEqualTo(LOG_MAGIC_VALUE_V3);
+        assertThat(batch.writerKey()).isEqualTo(writerKey);
+        assertThat(batch.writerProgress()).isEqualTo(progress);
+        assertThat(batch.getRecordCount()).isEqualTo(1);
+        batch.ensureValid();
+
+        try (LogRecordReadContext context =
+                        LogRecordReadContext.createArrowReadContext(
+                                DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, TEST_SCHEMA_GETTER);
+                CloseableIterator<LogRecord> records = batch.records(context)) {
+            LogRecordBatchStatistics statistics = batch.getStatistics(context).orElseThrow();
+            assertThat(statistics.getMinValues().getInt(0)).isEqualTo(4);
+            assertThat(statistics.getMaxValues().getInt(0)).isEqualTo(4);
+            assertThat(statistics.getNullCounts()).containsExactly(0, 0);
+            assertThat(records.next().getRow().getString(1).toString()).isEqualTo("statistics");
+            assertThat(records.hasNext()).isFalse();
+        }
     }
 
     private static Collection<Arguments> magicAndExpectedBatchSize() {

@@ -55,8 +55,10 @@ import static org.apache.fluss.config.ConfigOptions.NoKeyAssigner.STICKY;
 public class ConfigOptions {
     public static final String DEFAULT_LISTENER_NAME = "FLUSS";
 
+    public static final int KV_FORMAT_VERSION_1 = 1;
     public static final int KV_FORMAT_VERSION_2 = 2;
-    public static final int CURRENT_KV_FORMAT_VERSION = KV_FORMAT_VERSION_2;
+    public static final int KV_FORMAT_VERSION_3 = 3;
+    public static final int CURRENT_KV_FORMAT_VERSION = KV_FORMAT_VERSION_3;
 
     @Internal
     public static final String[] PARENT_FIRST_LOGGING_PATTERNS =
@@ -1009,6 +1011,74 @@ public class ConfigOptions {
                     .withDescription("The amount of time to sleep when fetch bucket error occurs.")
                     .withFallbackKeys("log.replica.fetch-backoff-interval");
 
+    public static final ConfigOption<Integer> INDEX_REPLICATION_READER_THREADS =
+            key("index.replication.reader.threads")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "Number of reader worker threads in the server-global index replicator "
+                                    + "pool. Each leader-side index replicator is assigned to a "
+                                    + "worker by bucket hash; increasing this value raises the "
+                                    + "degree of parallelism for WAL reading and index derivation. "
+                                    + "The value must be positive.");
+
+    public static final ConfigOption<Integer> INDEX_REPLICATION_SENDER_THREADS =
+            key("index.replication.sender.threads")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "Number of sender worker threads that dispatch derived index batches to "
+                                    + "target Index Table leaders. Within one TabletServer, each "
+                                    + "target index bucket is owned by one sender worker so a later "
+                                    + "local batch cannot overtake an in-flight batch. The value "
+                                    + "must be positive.");
+
+    public static final ConfigOption<Duration> INDEX_REPLICATION_RETRY_BACKOFF =
+            key("index.replication.retry.backoff")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(100))
+                    .withDescription(
+                            "The base backoff applied before retrying a failed index batch send. "
+                                    + "The effective delay grows exponentially with the number of "
+                                    + "attempts, capped at 10 seconds. A failed batch is not eligible "
+                                    + "for re-send until this delay elapses, preventing busy-retry "
+                                    + "against an unhealthy target. The value must be positive and "
+                                    + "must not exceed 10 seconds.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_MAIN_BUCKET_BUFFER_MAX_BYTES =
+            key("index.replication.buffer.max-bytes-per-main-bucket")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("64mb"))
+                    .withDescription(
+                            "Maximum retained payload bytes of pending (un-acknowledged) index "
+                                    + "batches buffered per leader main-table bucket. One "
+                                    + "indivisible admitted window may cross this soft threshold; "
+                                    + "the read layer then stops polling new WAL windows for that "
+                                    + "bucket without blocking unrelated main-table buckets. The "
+                                    + "value must be positive.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_BUFFER_MAX_BYTES =
+            key("index.replication.buffer.max-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("256mb"))
+                    .withDescription(
+                            "Maximum retained payload bytes of admitted, unacknowledged index "
+                                    + "batches across one TabletServer. The value includes queued, "
+                                    + "in-flight, and retry-retained page buffers. It is a hard "
+                                    + "post-admission bound for accumulator payload pages, not an "
+                                    + "exact bound on total JVM heap usage. The value must be positive.");
+
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_REQUEST_TARGET_BYTES =
+            key("index.replication.request.target-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("1mb"))
+                    .withDescription(
+                            "Preferred encoded payload size for one index replication window and "
+                                    + "for PutKv request consolidation. A complete source mutation "
+                                    + "group and an individual target batch are never split, so an "
+                                    + "individual window or request may exceed this target. The value "
+                                    + "must be positive.");
+
     public static final ConfigOption<MemorySize> LOG_REPLICA_FETCH_MAX_BYTES =
             key("log.replica.fetch.max-bytes")
                     .memoryType()
@@ -1658,15 +1728,27 @@ public class ConfigOptions {
                                     + "Note: The datalake encoding and bucketing strategy mentioned below only takes effect "
                                     + "when 'datalake.format' is configured at cluster level. "
                                     + "Version Behaviors: "
-                                    + "(1) Version 1: Tables created before 'table.kv.format-version' was introduced are treated as version 1. "
-                                    + "Uses datalake's encoder (e.g., Paimon/Iceberg) for both primary key and bucket key encoding. "
+                                    + "(1) Version 1: Legacy tables with an explicit version 1 or missing version metadata use datalake's encoder "
+                                    + "(e.g., Paimon/Iceberg) for both primary key and bucket key encoding. "
                                     + "This may not support prefix lookup properly because some datalake encoders (like Paimon) "
                                     + "don't guarantee that encoded bucket key bytes are a prefix of encoded primary key bytes. "
-                                    + "(2) Version 2 (current): New tables use Fluss's default encoder for primary key encoding "
+                                    + "(2) Version 2: Ordinary primary-key tables use Fluss's default encoder for primary key encoding "
                                     + "when bucket key differs from primary key, which ensures proper prefix lookup support. "
                                     + "When bucket key equals primary key (default bucket key), it still uses datalake's encoder "
                                     + "for optimization (encoded bytes can be reused for bucket calculation). "
-                                    + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation.");
+                                    + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation. "
+                                    + "(3) Version 3: Uses the same v2-compatible key encoding and adds a tagged value layout. "
+                                    + "It is reserved for system-managed partitioned secondary index tables.");
+
+    public static final ConfigOption<Integer> TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION =
+            key("table.kv.idempotence-protocol-version")
+                    .intType()
+                    .defaultValue(0)
+                    .withDescription(
+                            "The immutable KV idempotence protocol. Version 0 uses contiguous "
+                                    + "batch sequences and is the default. Version 1 uses a 128-bit "
+                                    + "WriterKey with cumulative 64-bit writer progress and is "
+                                    + "reserved for system-managed Index Tables.");
 
     public static final ConfigOption<Boolean> TABLE_KV_STANDBY_REPLICA_ENABLED =
             key("table.kv.standby-replica.enabled")
@@ -1901,6 +1983,21 @@ public class ConfigOptions {
                                     + "Note: enabling column statistics requires the V1 batch format. "
                                     + "Downstream consumers must be upgraded to Fluss v1.0+ before enabling this option, "
                                     + "as older versions cannot parse the extended batch format.");
+
+    // ------------------------------------------------------------------------
+    //  Index Table Metadata Configs
+    //  (index table metadata: table.index-meta.*)
+    // ------------------------------------------------------------------------
+
+    public static final ConfigOption<Long> TABLE_INDEX_META_MAIN_TABLE_ID =
+            key("table.index-meta.main-table-id")
+                    .longType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The table id of the main table that this index table belongs to. "
+                                    + "Set automatically by the system when creating index tables; "
+                                    + "users must not modify it. Its presence identifies an internal "
+                                    + "Index Table, and its value links that table to the main table.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv

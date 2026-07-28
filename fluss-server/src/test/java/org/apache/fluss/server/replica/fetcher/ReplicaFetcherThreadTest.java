@@ -21,21 +21,35 @@ import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.StorageException;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.remote.RemoteLogFetchInfo;
+import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.RpcClient;
+import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.ProduceLogResultForBucket;
+import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
+import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.LogManager;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.log.remote.RemoteLogStorage;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
@@ -49,6 +63,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
+import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
@@ -60,14 +75,20 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -82,12 +103,16 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.metrics.group.TestingMetricGroups.USER_METRICS;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getFetchLogData;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_BUCKET_EPOCH;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Test for {@link ReplicaFetcherThread}. */
 public class ReplicaFetcherThreadTest {
@@ -468,6 +493,272 @@ public class ReplicaFetcherThreadTest {
         }
     }
 
+    @Test
+    void testFailedRemoteRecoveryDoesNotAdvanceNonIndexFetchOffset() throws Exception {
+        long initialOffset = 7L;
+        long remoteEndOffset = 50L;
+        ScriptedRemoteLeaderEndpoint endpoint =
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
+        endpoint.addResponse(tb, remoteFetchResult(tb, DATA1_TABLE_PATH, remoteEndOffset));
+        ReplicaFetcherThread fetcher =
+                new ReplicaFetcherThread("non-index-remote-failure", followerRM, endpoint, 1000);
+        fetcher.addBuckets(
+                Collections.singletonMap(
+                        tb,
+                        new InitialFetchStatus(
+                                DATA1_TABLE_ID, DATA1_TABLE_PATH, leader.id(), initialOffset)));
+
+        fetcher.doWork();
+
+        assertThat(fetcher.fetchStatus(tb)).isPresent();
+        assertThat(fetcher.fetchStatus(tb).get().fetchOffset()).isEqualTo(initialOffset);
+        assertThat(endpoint.requestsFor(tb)).isEqualTo(1);
+    }
+
+    @Test
+    void testFailedIndexRemoteRecoveryFailsOnlyThatBucketAndCannotResume() throws Exception {
+        long initialOffset = 7L;
+        long remoteEndOffset = 50L;
+        TablePath indexPath = TablePath.of("test_db", "remote_failure_index");
+        TableBucket indexBucket = registerIndexTableFollower(indexPath, 9901L);
+        Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
+        ScriptedRemoteLeaderEndpoint endpoint =
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
+        endpoint.addResponse(
+                indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
+        ReplicaFetcherThread fetcher =
+                new ReplicaFetcherThread("index-remote-failure", followerRM, endpoint, 1000);
+        Map<TableBucket, InitialFetchStatus> initialStatuses = new HashMap<>();
+        initialStatuses.put(
+                indexBucket, new InitialFetchStatus(9901L, indexPath, leader.id(), initialOffset));
+        initialStatuses.put(
+                tb, new InitialFetchStatus(DATA1_TABLE_ID, DATA1_TABLE_PATH, leader.id(), 0L));
+        fetcher.addBuckets(initialStatuses);
+
+        fetcher.doWork();
+
+        assertThat(fetcher.fetchStatus(indexBucket)).isEmpty();
+        assertThat(fetcher.fetchStatus(tb)).isPresent();
+        assertThatThrownBy(() -> followerRM.getReplicaOrException(indexBucket))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+        assertThatThrownBy(
+                        () ->
+                                failedReplica.makeLeader(
+                                        new NotifyLeaderAndIsrData(
+                                                PhysicalTablePath.of(indexPath),
+                                                indexBucket,
+                                                Arrays.asList(leaderServerId, followerServerId),
+                                                new LeaderAndIsr(
+                                                        followerServerId,
+                                                        INITIAL_LEADER_EPOCH + 1,
+                                                        Arrays.asList(
+                                                                leaderServerId, followerServerId),
+                                                        Collections.emptyList(),
+                                                        INITIAL_COORDINATOR_EPOCH,
+                                                        INITIAL_BUCKET_EPOCH + 1))))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+
+        fetcher.doWork();
+        assertThat(endpoint.requestsFor(indexBucket)).isEqualTo(1);
+        assertThat(fetcher.fetchStatus(tb).get().fetchOffset()).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"download", "parse", "reload", "coverage"})
+    void testV1RemoteWriterSnapshotFailureSchedulesDoNotAdvanceOrPermitPromotion(
+            String failureStage) throws Exception {
+        long initialOffset = 7L;
+        long remoteEndOffset = 50L;
+        long tableId = 9910L + Math.abs(failureStage.hashCode() % 100);
+        TablePath indexPath = TablePath.of("test_db", "remote_" + failureStage + "_index");
+        TableBucket indexBucket = registerIndexTableFollower(indexPath, tableId);
+        Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
+        ScriptedRemoteLeaderEndpoint endpoint =
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
+        endpoint.addResponse(
+                indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
+        ReplicaFetcherThread fetcher =
+                new ReplicaFetcherThread(
+                        "index-remote-" + failureStage, followerRM, endpoint, 1000);
+        fetcher.setRemoteWriterStateRecovery(
+                (ignoredReplica, ignoredFetchInfo, ignoredOffset) -> {
+                    if ("parse".equals(failureStage) || "coverage".equals(failureStage)) {
+                        throw new CorruptSnapshotException(failureStage + " failure");
+                    }
+                    throw new IOException(failureStage + " failure");
+                });
+        fetcher.addBuckets(
+                Collections.singletonMap(
+                        indexBucket,
+                        new InitialFetchStatus(tableId, indexPath, leader.id(), initialOffset)));
+
+        fetcher.doWork();
+
+        assertThat(fetcher.fetchStatus(indexBucket)).isEmpty();
+        assertThat(endpoint.requestsFor(indexBucket)).isEqualTo(1);
+        assertThatThrownBy(() -> followerRM.getReplicaOrException(indexBucket))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+        assertThatThrownBy(
+                        () ->
+                                failedReplica.makeLeader(
+                                        new NotifyLeaderAndIsrData(
+                                                PhysicalTablePath.of(indexPath),
+                                                indexBucket,
+                                                Arrays.asList(leaderServerId, followerServerId),
+                                                new LeaderAndIsr(
+                                                        followerServerId,
+                                                        INITIAL_LEADER_EPOCH + 1,
+                                                        Arrays.asList(
+                                                                leaderServerId, followerServerId),
+                                                        Collections.emptyList(),
+                                                        INITIAL_COORDINATOR_EPOCH,
+                                                        INITIAL_BUCKET_EPOCH + 1))))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+    }
+
+    @Test
+    void testIndexRemoteRecoveryRethrowsOriginalJvmError() throws Exception {
+        long initialOffset = 7L;
+        long remoteEndOffset = 50L;
+        TablePath indexPath = TablePath.of("test_db", "remote_error_index");
+        TableBucket indexBucket = registerIndexTableFollower(indexPath, 9902L);
+        Replica failedReplica = followerRM.getReplicaOrException(indexBucket);
+        ScriptedRemoteLeaderEndpoint endpoint =
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
+        endpoint.addResponse(
+                indexBucket, remoteFetchResult(indexBucket, indexPath, remoteEndOffset));
+        ReplicaFetcherThread fetcher =
+                new ReplicaFetcherThread("index-remote-error", followerRM, endpoint, 1000);
+        AssertionError injectedError = new AssertionError("injected remote recovery error");
+        fetcher.setRemoteWriterStateRecovery(
+                (ignoredReplica, ignoredFetchInfo, ignoredOffset) -> {
+                    throw injectedError;
+                });
+        fetcher.addBuckets(
+                Collections.singletonMap(
+                        indexBucket,
+                        new InitialFetchStatus(9902L, indexPath, leader.id(), initialOffset)));
+
+        assertThatThrownBy(fetcher::doWork)
+                .isSameAs(injectedError)
+                .isExactlyInstanceOf(AssertionError.class);
+
+        assertThat(fetcher.fetchStatus(indexBucket)).isPresent();
+        assertThat(fetcher.fetchStatus(indexBucket).get().fetchOffset()).isEqualTo(initialOffset);
+        assertThat(fetcher.fetchStatus(indexBucket).get().fetchOffset())
+                .isNotEqualTo(remoteEndOffset);
+        assertThatThrownBy(() -> followerRM.getReplicaOrException(indexBucket))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+        assertThatThrownBy(
+                        () ->
+                                failedReplica.makeLeader(
+                                        new NotifyLeaderAndIsrData(
+                                                PhysicalTablePath.of(indexPath),
+                                                indexBucket,
+                                                Arrays.asList(leaderServerId, followerServerId),
+                                                new LeaderAndIsr(
+                                                        followerServerId,
+                                                        INITIAL_LEADER_EPOCH + 1,
+                                                        Arrays.asList(
+                                                                leaderServerId, followerServerId),
+                                                        Collections.emptyList(),
+                                                        INITIAL_COORDINATOR_EPOCH,
+                                                        INITIAL_BUCKET_EPOCH + 1))))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+    }
+
+    @Test
+    void testSuccessfulRemoteRecoveryAdvancesExactlyToRemoteEndOffset() throws Exception {
+        long initialOffset = 7L;
+        long remoteEndOffset = 50L;
+        ScriptedRemoteLeaderEndpoint endpoint =
+                new ScriptedRemoteLeaderEndpoint(new Configuration(), leaderRM, followerServerId);
+        endpoint.addResponse(tb, remoteFetchResult(tb, DATA1_TABLE_PATH, remoteEndOffset));
+        ReplicaFetcherThread fetcher =
+                new ReplicaFetcherThread("remote-recovery-success", followerRM, endpoint, 1000);
+        fetcher.setRemoteWriterStateRecovery(
+                (replica, ignored, recoveredOffset) -> {
+                    assertThat(recoveredOffset).isEqualTo(remoteEndOffset);
+                    replica.truncateFullyAndStartAt(recoveredOffset);
+                });
+        fetcher.addBuckets(
+                Collections.singletonMap(
+                        tb,
+                        new InitialFetchStatus(
+                                DATA1_TABLE_ID, DATA1_TABLE_PATH, leader.id(), initialOffset)));
+
+        fetcher.doWork();
+
+        assertThat(fetcher.fetchStatus(tb).get().fetchOffset()).isEqualTo(remoteEndOffset);
+        assertThat(endpoint.requestsFor(tb)).isEqualTo(1);
+    }
+
+    @Test
+    void testWriterSnapshotCopyFailureClosesStreamAndRemovesTempFile() throws Exception {
+        File snapshotFile = new File(tempDir, "copy-failure.snapshot");
+        RemoteLogSegment segment =
+                remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
+                        .remoteLogFetchInfo()
+                        .remoteLogSegmentList()
+                        .get(0);
+        TrackingInputStream input = new TrackingInputStream(true);
+        RemoteLogManager remoteLogManager = remoteLogManagerReturning(segment, input);
+
+        assertThatThrownBy(
+                        () ->
+                                followerFetcher.buildWriterIdSnapshotFile(
+                                        snapshotFile, segment, remoteLogManager))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("copy failure");
+
+        assertThat(input.closed).isTrue();
+        assertThat(snapshotFile).doesNotExist();
+        assertThat(new File(snapshotFile.getAbsolutePath() + ".tmp")).doesNotExist();
+    }
+
+    @Test
+    void testWriterSnapshotMoveFailureClosesStreamAndRemovesTempFile() throws Exception {
+        File snapshotFile = new File(tempDir, "move-failure.snapshot");
+        RemoteLogSegment segment =
+                remoteFetchResult(tb, DATA1_TABLE_PATH, 1L)
+                        .remoteLogFetchInfo()
+                        .remoteLogSegmentList()
+                        .get(0);
+        TrackingInputStream input = new TrackingInputStream(false);
+        RemoteLogManager remoteLogManager = remoteLogManagerReturning(segment, input);
+        followerFetcher.setSnapshotFileMover(
+                (source, target) -> {
+                    throw new IOException("move failure");
+                });
+
+        assertThatThrownBy(
+                        () ->
+                                followerFetcher.buildWriterIdSnapshotFile(
+                                        snapshotFile, segment, remoteLogManager))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("move failure");
+
+        assertThat(input.closed).isTrue();
+        assertThat(snapshotFile).doesNotExist();
+        assertThat(new File(snapshotFile.getAbsolutePath() + ".tmp")).doesNotExist();
+    }
+
+    private RemoteLogManager remoteLogManagerReturning(RemoteLogSegment segment, InputStream input)
+            throws Exception {
+        RemoteLogStorage storage = mock(RemoteLogStorage.class);
+        when(storage.fetchIndex(segment, RemoteLogStorage.IndexType.WRITER_ID_SNAPSHOT))
+                .thenReturn(input);
+        RemoteLogManager remoteLogManager = mock(RemoteLogManager.class);
+        when(remoteLogManager.getRemoteLogStorage()).thenReturn(storage);
+        return remoteLogManager;
+    }
+
     private void registerTableInZkClient() throws Exception {
         ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupRoot();
         zkClient.registerTable(
@@ -475,6 +766,92 @@ public class ReplicaFetcherThreadTest {
                 TableRegistration.newTable(
                         DATA1_TABLE_ID, DEFAULT_REMOTE_DATA_DIR, DATA1_TABLE_DESCRIPTOR));
         zkClient.registerFirstSchema(DATA1_TABLE_PATH, DATA1_SCHEMA);
+    }
+
+    private TableBucket registerIndexTableFollower(TablePath indexPath, long indexTableId)
+            throws Exception {
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("indexed", DataTypes.BIGINT())
+                        .primaryKey("id")
+                        .index(
+                                "idx",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("indexed"),
+                                IndexVisibility.SYNC,
+                                1)
+                        .build();
+        TableDescriptor mainDescriptor =
+                TableDescriptor.builder().schema(mainSchema).distributedBy(1, "id").build();
+        TableDescriptor indexDescriptor =
+                IndexTableDescriptorFactory.derive(
+                        mainDescriptor, DATA1_TABLE_ID, DATA1_TABLE_PATH.toString(), "idx");
+        zkClient.registerTable(
+                indexPath,
+                TableRegistration.newTable(indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
+        zkClient.registerFirstSchema(indexPath, indexDescriptor.getSchema());
+        TableBucket indexBucket = new TableBucket(indexTableId, 0);
+        followerRM.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(indexPath),
+                                indexBucket,
+                                Arrays.asList(leaderServerId, followerServerId),
+                                new LeaderAndIsr(
+                                        leaderServerId,
+                                        INITIAL_LEADER_EPOCH,
+                                        Arrays.asList(leaderServerId, followerServerId),
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        INITIAL_BUCKET_EPOCH))),
+                ignored -> {});
+        assertThat(followerRM.getReplicaOrException(indexBucket).getTableInfo().isIndexTable())
+                .isTrue();
+        return indexBucket;
+    }
+
+    private static FetchLogResultForBucket remoteFetchResult(
+            TableBucket tableBucket, TablePath tablePath, long remoteEndOffset) {
+        RemoteLogSegment segment =
+                RemoteLogSegment.Builder.builder()
+                        .physicalTablePath(PhysicalTablePath.of(tablePath))
+                        .tableBucket(tableBucket)
+                        .remoteLogSegmentId(UUID.randomUUID())
+                        .remoteLogStartOffset(0L)
+                        .remoteLogEndOffset(remoteEndOffset)
+                        .maxTimestamp(0L)
+                        .segmentSizeInBytes(1)
+                        .build();
+        return new FetchLogResultForBucket(
+                tableBucket,
+                new RemoteLogFetchInfo(
+                        "missing-remote-tablet", null, Collections.singletonList(segment), 0),
+                remoteEndOffset);
+    }
+
+    private static final class TrackingInputStream extends InputStream {
+        private final boolean failRead;
+        private int nextByte;
+        private boolean closed;
+
+        private TrackingInputStream(boolean failRead) {
+            this.failRead = failRead;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (failRead) {
+                throw new IOException("copy failure");
+            }
+            return nextByte++ == 0 ? 1 : -1;
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
     }
 
     private void makeLeaderAndFollower() {
@@ -617,6 +994,48 @@ public class ReplicaFetcherThreadTest {
                     }
                 }
             }
+        }
+    }
+
+    private static final class ScriptedRemoteLeaderEndpoint extends TestingLeaderEndpoint {
+        private final Map<TableBucket, FetchLogResultForBucket> responses = new HashMap<>();
+        private final Map<TableBucket, Integer> requestCounts = new HashMap<>();
+
+        private ScriptedRemoteLeaderEndpoint(
+                Configuration conf, ReplicaManager replicaManager, int followerServerId) {
+            super(
+                    conf,
+                    replicaManager,
+                    new ServerNode(
+                            followerServerId,
+                            "localhost",
+                            10001,
+                            ServerType.TABLET_SERVER,
+                            "rack2"));
+        }
+
+        private void addResponse(TableBucket tableBucket, FetchLogResultForBucket response) {
+            responses.put(tableBucket, response);
+        }
+
+        private int requestsFor(TableBucket tableBucket) {
+            return requestCounts.getOrDefault(tableBucket, 0);
+        }
+
+        @Override
+        public CompletableFuture<LeaderEndpoint.FetchData> fetchLog(
+                FetchLogContext fetchLogContext) {
+            Map<TableBucket, FetchLogResultForBucket> requestedResponses = new HashMap<>();
+            for (TableBucket requested :
+                    getFetchLogData(fetchLogContext.getFetchLogRequest()).keySet()) {
+                requestCounts.merge(requested, 1, Integer::sum);
+                FetchLogResultForBucket response = responses.get(requested);
+                if (response != null) {
+                    requestedResponses.put(requested, response);
+                }
+            }
+            return CompletableFuture.completedFuture(
+                    new LeaderEndpoint.FetchData(new FetchLogResponse(), requestedResponses));
         }
     }
 }

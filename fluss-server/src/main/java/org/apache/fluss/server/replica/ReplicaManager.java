@@ -18,6 +18,7 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
@@ -36,6 +37,7 @@ import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -49,6 +51,7 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
+import org.apache.fluss.rpc.GatewayClientProxy;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
@@ -60,6 +63,7 @@ import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.entity.TableStatsResultForBucket;
 import org.apache.fluss.rpc.entity.WriteResultForBucket;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
@@ -78,6 +82,9 @@ import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
+import org.apache.fluss.server.index.IndexAccumulator;
+import org.apache.fluss.server.index.IndexReplicatorPool;
+import org.apache.fluss.server.index.IndexSender;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.scan.ScannerManager;
@@ -159,6 +166,10 @@ public class ReplicaManager implements ServerReconfigurable {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicaManager.class);
 
     public static final String HIGH_WATERMARK_CHECKPOINT_FILE_NAME = "high-watermark-checkpoint";
+    private static final int INDEX_REPLICATION_MAX_WINDOW_BYTES = 256 * 1024;
+    private static final long INDEX_REPLICATION_WORKER_BACKOFF_MS = 50L;
+    private static final long INDEX_REPLICATION_RETRY_MAX_BACKOFF_MS = 10_000L;
+
     private final Configuration conf;
     private final Scheduler scheduler;
     private final LogManager logManager;
@@ -173,6 +184,12 @@ public class ReplicaManager implements ServerReconfigurable {
     private final Map<TableBucket, HostedReplica> allReplicas = new ConcurrentHashMap<>();
 
     private final TabletServerMetadataCache metadataCache;
+    private final RpcClient rpcClient;
+    private final IndexAccumulator indexAccumulator;
+    private final IndexReplicatorPool indexReplicatorPool;
+    private final IndexSender indexSender;
+    private final TabletServerMetricGroup.GaugeRegistration indexPushGaugeRegistration;
+    private final TabletServerMetricGroup.GaugeRegistration indexWriterStateGaugeRegistration;
     private final ExecutorService ioExecutor;
     private final ProjectionPushdownCache projectionsCache = new ProjectionPushdownCache();
     private final Lock replicaStateChangeLock = new ReentrantLock();
@@ -294,6 +311,41 @@ public class ReplicaManager implements ServerReconfigurable {
         this.kvManager = kvManager;
         this.serverId = serverId;
         this.metadataCache = metadataCache;
+        this.rpcClient = rpcClient;
+        this.indexAccumulator =
+                new IndexAccumulator(
+                        conf.get(ConfigOptions.INDEX_REPLICATION_MAIN_BUCKET_BUFFER_MAX_BYTES)
+                                .getBytes(),
+                        conf.get(ConfigOptions.INDEX_REPLICATION_BUFFER_MAX_BYTES).getBytes());
+        this.indexReplicatorPool =
+                new IndexReplicatorPool(
+                        conf.getInt(ConfigOptions.INDEX_REPLICATION_READER_THREADS),
+                        INDEX_REPLICATION_MAX_WINDOW_BYTES,
+                        conf.get(ConfigOptions.INDEX_REPLICATION_REQUEST_TARGET_BYTES).getBytes(),
+                        INDEX_REPLICATION_WORKER_BACKOFF_MS);
+        this.indexSender =
+                new IndexSender(
+                        indexAccumulator,
+                        metadataCache::getBucketLeader,
+                        this::indexPushGatewayFor,
+                        serverMetricGroup,
+                        conf.getInt(ConfigOptions.INDEX_REPLICATION_SENDER_THREADS),
+                        INDEX_REPLICATION_WORKER_BACKOFF_MS,
+                        conf.get(ConfigOptions.INDEX_REPLICATION_RETRY_BACKOFF).toMillis(),
+                        INDEX_REPLICATION_RETRY_MAX_BACKOFF_MS,
+                        conf.get(ConfigOptions.INDEX_REPLICATION_REQUEST_TARGET_BYTES).getBytes(),
+                        conf.get(ConfigOptions.NETTY_SERVER_MAX_REQUEST_SIZE).getBytes(),
+                        30_000L);
+        this.indexPushGaugeRegistration =
+                serverMetricGroup.registerIndexPushGauges(
+                        indexAccumulator::pendingBytes,
+                        indexSender::inFlightRequestCount,
+                        indexSender::oldestInFlightAgeMs,
+                        this::maxIndexReplicationNoProgressTimeMs,
+                        this::failedIndexReplicationSourceBucketCount);
+        this.indexWriterStateGaugeRegistration =
+                serverMetricGroup.registerIndexWriterStateGauge(
+                        this::writerProgressStateEntryCount);
 
         this.highWatermarkCheckpoints = new HashMap<>();
         for (File dataDir : localDiskManager.dataDirs()) {
@@ -465,6 +517,21 @@ public class ReplicaManager implements ServerReconfigurable {
         return onlineReplicas().filter(Replica::isAtMinIsr).count();
     }
 
+    private long failedIndexReplicationSourceBucketCount() {
+        return onlineReplicas()
+                .filter(Replica::isLeader)
+                .filter(replica -> replica.getIndexManager().isFailed())
+                .count();
+    }
+
+    private long maxIndexReplicationNoProgressTimeMs() {
+        return onlineReplicas()
+                .filter(Replica::isLeader)
+                .mapToLong(replica -> replica.getIndexManager().noProgressTimeMs())
+                .max()
+                .orElse(0L);
+    }
+
     @VisibleForTesting
     public long leaderCount() {
         return onlineReplicas().filter(Replica::isLeader).count();
@@ -472,6 +539,10 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private int writerIdCount() {
         return onlineReplicas().map(Replica::writerIdCount).reduce(0, Integer::sum);
+    }
+
+    private long writerProgressStateEntryCount() {
+        return onlineReplicas().mapToLong(Replica::writerProgressStateEntryCount).sum();
     }
 
     private long logicalStorageLogSize() {
@@ -557,9 +628,74 @@ public class ReplicaManager implements ServerReconfigurable {
                 () -> {
                     // check or apply coordinator epoch.
                     validateAndApplyCoordinatorEpoch(coordinatorEpoch, "updateMetadataCache");
+                    Map<Long, Optional<PartitionTombstone>> previousTombstones =
+                            capturePreviousTombstones(clusterMetadata.getPartitionTombstones());
                     metadataCache.updateClusterMetadata(clusterMetadata);
+                    retireTombstonedIndexWriters(
+                            advancedTombstones(
+                                    clusterMetadata.getPartitionTombstones(), previousTombstones));
                     updateReplicaTableConfig(clusterMetadata);
+                    retryDeferredIndexReplicators();
                 });
+    }
+
+    private Map<Long, Optional<PartitionTombstone>> capturePreviousTombstones(
+            Map<Long, PartitionTombstone> incoming) {
+        if (incoming == null || incoming.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<Long, Optional<PartitionTombstone>> previous = new HashMap<>();
+        for (long mainTableId : incoming.keySet()) {
+            previous.put(mainTableId, metadataCache.getInitializedPartitionTombstone(mainTableId));
+        }
+        return previous;
+    }
+
+    private Map<Long, PartitionTombstone> advancedTombstones(
+            Map<Long, PartitionTombstone> incoming,
+            Map<Long, Optional<PartitionTombstone>> previousTombstones) {
+        if (incoming == null || incoming.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<Long, PartitionTombstone> advanced = new HashMap<>();
+        for (long mainTableId : incoming.keySet()) {
+            Optional<PartitionTombstone> current =
+                    metadataCache.getInitializedPartitionTombstone(mainTableId);
+            if (!current.isPresent()) {
+                continue;
+            }
+            PartitionTombstone previous =
+                    previousTombstones
+                            .getOrDefault(mainTableId, Optional.empty())
+                            .orElse(PartitionTombstone.EMPTY);
+            if (hasNewlyTombstonedPartition(previous, current.get())) {
+                advanced.put(mainTableId, current.get());
+            }
+        }
+        return advanced;
+    }
+
+    private static boolean hasNewlyTombstonedPartition(
+            PartitionTombstone previous, PartitionTombstone current) {
+        if (current.getFloor() > previous.getFloor()) {
+            return true;
+        }
+        return current.getExplicitSet().stream().anyMatch(pid -> !previous.isTombstoned(pid));
+    }
+
+    private void retireTombstonedIndexWriters(Map<Long, PartitionTombstone> tombstones) {
+        if (tombstones == null || tombstones.isEmpty()) {
+            return;
+        }
+        for (Replica replica : getOnlineReplicaList()) {
+            if (!replica.getTableInfo().isIndexTable()) {
+                continue;
+            }
+            long mainTableId = replica.getTableInfo().getMainTableId().getAsLong();
+            if (tombstones.containsKey(mainTableId)) {
+                replica.retireTombstonedIndexWriters(mainTableId);
+            }
+        }
     }
 
     private void updateReplicaTableConfig(ClusterMetadata clusterMetadata) {
@@ -1157,6 +1293,9 @@ public class ReplicaManager implements ServerReconfigurable {
             TableBucket tb = data.getTableBucket();
             try {
                 Replica replica = getReplicaOrException(tb);
+                // Revoke any task owned by the previous local-leader incarnation before role
+                // recovery. It is restarted only after makeLeader publishes a ready leader.
+                remoteLogManager.stopLogTiering(replica);
                 // register replica to remote log manager first.
                 remoteLogManager.registerReplica(replica);
 
@@ -1359,7 +1498,9 @@ public class ReplicaManager implements ServerReconfigurable {
                         appendInfo.firstOffset(),
                         appendInfo.lastOffset());
                 putResultForBucketMap.put(
-                        tb, new PutKvResultForBucket(tb, appendInfo.lastOffset() + 1));
+                        tb,
+                        new PutKvResultForBucket(
+                                tb, appendInfo.hasNoAppend() ? -1L : appendInfo.lastOffset() + 1));
 
                 // metric for kv
                 tableMetrics.incKvMessageIn(entry.getValue().getRecordCount());
@@ -1632,7 +1773,7 @@ public class ReplicaManager implements ServerReconfigurable {
 
     /** Flushes the high watermark value for all buckets to the high watermark checkpoint file. */
     @VisibleForTesting
-    void checkpointHighWatermarks() {
+    public void checkpointHighWatermarks() {
         List<Replica> onlineReplicasList = getOnlineReplicaList();
         if (onlineReplicasList.isEmpty()) {
             return;
@@ -1674,14 +1815,31 @@ public class ReplicaManager implements ServerReconfigurable {
             int requestBucketSize,
             Map<TableBucket, T> writeResults,
             Consumer<List<T>> responseCallback) {
-        if (delayedWriteRequired(requiredAcks, requestBucketSize, writeResults)) {
-            Map<TableBucket, DelayedWrite.DelayedBucketStatus<T>> bucketStatusMap = new HashMap<>();
-            writeResults.forEach(
-                    (tb, result) ->
-                            bucketStatusMap.put(
-                                    tb,
-                                    new DelayedWrite.DelayedBucketStatus<>(
-                                            result.getWriteLogEndOffset(), result)));
+        // Build the per-bucket status first so we can decide whether any bucket needs the PutKv ack
+        // gated on its sync index-pushed-offset. A SYNC index forces a delayed
+        // write even when requiredAcks != -1, because its ack must wait for the index push, not
+        // just
+        // for ISR replication.
+        Map<TableBucket, DelayedWrite.DelayedBucketStatus<T>> bucketStatusMap = new HashMap<>();
+        boolean anySyncIndex = false;
+        for (Map.Entry<TableBucket, T> entry : writeResults.entrySet()) {
+            TableBucket tb = entry.getKey();
+            T result = entry.getValue();
+            long requiredIndexOffset = DelayedWrite.DelayedBucketStatus.NO_INDEX_OFFSET_REQUIRED;
+            if (result.succeeded() && requiresSyncIndexVisibility(tb)) {
+                requiredIndexOffset = result.getWriteLogEndOffset();
+                anySyncIndex = true;
+            }
+            bucketStatusMap.put(
+                    tb,
+                    new DelayedWrite.DelayedBucketStatus<>(
+                            result.getWriteLogEndOffset(),
+                            requiredIndexOffset,
+                            requiredAcks == -1,
+                            result));
+        }
+
+        if (delayedWriteRequired(requiredAcks, requestBucketSize, writeResults) || anySyncIndex) {
             DelayedWrite<T> delayedWrite =
                     new DelayedWrite<>(
                             timeoutMs,
@@ -1700,6 +1858,24 @@ public class ReplicaManager implements ServerReconfigurable {
                             .collect(Collectors.toList()));
         } else {
             responseCallback.accept(new ArrayList<>(writeResults.values()));
+        }
+    }
+
+    /**
+     * Returns {@code true} when the bucket's leader replica requires SYNC index visibility (its
+     * PutKv ack must wait for secondary-index mutations to be applied). If the local replica
+     * disappears during acknowledgement, conservatively retains the gate so delayed completion
+     * re-resolves the replica and reports the leadership error instead of acknowledging early.
+     */
+    boolean requiresSyncIndexVisibility(TableBucket tableBucket) {
+        try {
+            return getReplicaOrException(tableBucket).requiresSyncIndexVisibility();
+        } catch (Exception e) {
+            LOG.warn(
+                    "Replica {} disappeared before write acknowledgement; applying conservative index visibility gating",
+                    tableBucket,
+                    e);
+            return true;
         }
     }
 
@@ -2107,7 +2283,10 @@ public class ReplicaManager implements ServerReconfigurable {
                                 tableInfo,
                                 clock,
                                 remoteLogManager,
-                                scannerManager);
+                                scannerManager,
+                                indexReplicatorPool,
+                                indexAccumulator,
+                                serverMetricGroup);
                 if (!existingLogTabletOpt.isPresent()) {
                     localDiskManager.recordReplicaLoad(dataDir, isKvTable);
                 }
@@ -2143,6 +2322,18 @@ public class ReplicaManager implements ServerReconfigurable {
         return allReplicas.getOrDefault(tableBucket, new NoneReplica());
     }
 
+    /** Marks only the expected failed replica offline without taking the lifecycle lock. */
+    public void markReplicaOffline(TableBucket tableBucket, Replica expectedReplica) {
+        allReplicas.computeIfPresent(
+                tableBucket,
+                (ignored, hostedReplica) ->
+                        hostedReplica instanceof OnlineReplica
+                                        && ((OnlineReplica) hostedReplica).getReplica()
+                                                == expectedReplica
+                                ? new OfflineReplica()
+                                : hostedReplica);
+    }
+
     private boolean isRequiredAcksInvalid(int requiredAcks) {
         return requiredAcks != 0 && requiredAcks != 1 && requiredAcks != -1;
     }
@@ -2169,6 +2360,45 @@ public class ReplicaManager implements ServerReconfigurable {
 
     public TabletServerMetricGroup getServerMetricGroup() {
         return serverMetricGroup;
+    }
+
+    private void retryDeferredIndexReplicators() {
+        for (Map.Entry<TableBucket, HostedReplica> entry : allReplicas.entrySet()) {
+            if (entry.getValue() instanceof OnlineReplica) {
+                Replica replica = ((OnlineReplica) entry.getValue()).getReplica();
+                replica.getIndexManager()
+                        .retryStart(
+                                replica.getLogTablet(),
+                                replica.getSchemaGetter(),
+                                replica::advanceIndexProgress,
+                                replica.getAllIndexPushedOffset());
+            }
+        }
+    }
+
+    /** Returns the server-global index replicator pool (read layer). */
+    public IndexReplicatorPool getIndexReplicatorPool() {
+        return indexReplicatorPool;
+    }
+
+    /** Returns the server-global index accumulator (staging area). */
+    public IndexAccumulator getIndexAccumulator() {
+        return indexAccumulator;
+    }
+
+    private TabletServerGateway indexPushGatewayFor(int serverId) {
+        String listenerName = conf.get(ConfigOptions.INTERNAL_LISTENER_NAME);
+        ServerNode node =
+                metadataCache
+                        .getTabletServer(serverId, listenerName)
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "TabletServer "
+                                                        + serverId
+                                                        + " not found in cache"));
+        return GatewayClientProxy.createGatewayProxy(
+                () -> node, rpcClient, TabletServerGateway.class);
     }
 
     /**
@@ -2198,9 +2428,13 @@ public class ReplicaManager implements ServerReconfigurable {
     public static final class OfflineReplica implements HostedReplica {}
 
     public void shutdown() throws InterruptedException {
+        indexWriterStateGaugeRegistration.close();
+        indexPushGaugeRegistration.close();
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
         replicaFetcherManager.shutdown();
+        indexSender.close();
+        indexReplicatorPool.close();
         delayedWriteManager.shutdown();
         delayedFetchLogManager.shutdown();
 

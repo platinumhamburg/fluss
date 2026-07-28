@@ -20,12 +20,17 @@ package org.apache.fluss.server.kv;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.CorruptMessageException;
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -33,10 +38,12 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -44,11 +51,15 @@ import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.record.TestData;
 import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.BinaryRow;
+import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
@@ -60,10 +71,13 @@ import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
 import org.apache.fluss.server.kv.snapshot.TabletState;
+import org.apache.fluss.server.kv.wal.CompactedWalBuilder;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.LogTestUtils;
+import org.apache.fluss.server.log.WriterProgressAppendInfo;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
@@ -84,20 +98,25 @@ import org.junit.jupiter.params.provider.ValueSource;
 import javax.annotation.Nullable;
 
 import java.io.File;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
@@ -112,6 +131,12 @@ import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Fail.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** Test for {@link KvTablet}. */
 class KvTabletTest {
@@ -138,7 +163,15 @@ class KvTabletTest {
     }
 
     @AfterEach
-    void afterEach() {
+    void afterEach() throws Exception {
+        if (kvTablet != null) {
+            kvTablet.close();
+            kvTablet = null;
+        }
+        if (logTablet != null) {
+            logTablet.close();
+            logTablet = null;
+        }
         if (executor != null) {
             executor.shutdown();
         }
@@ -151,9 +184,19 @@ class KvTabletTest {
 
     private void initLogTabletAndKvTablet(
             TablePath tablePath, Schema schema, Map<String, String> tableConfig) throws Exception {
+        initLogTabletAndKvTablet(
+                tablePath, schema, tableConfig, KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
+    }
+
+    private void initLogTabletAndKvTablet(
+            TablePath tablePath,
+            Schema schema,
+            Map<String, String> tableConfig,
+            KvIdempotenceProtocol protocol)
+            throws Exception {
         PhysicalTablePath physicalTablePath = PhysicalTablePath.of(tablePath);
         schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
-        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath, protocol);
         TableBucket tableBucket = logTablet.getTableBucket();
         kvTablet =
                 createKvTablet(
@@ -166,6 +209,16 @@ class KvTabletTest {
     }
 
     private LogTablet createLogTablet(File tempLogDir, long tableId, PhysicalTablePath tablePath)
+            throws Exception {
+        return createLogTablet(
+                tempLogDir, tableId, tablePath, KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
+    }
+
+    private LogTablet createLogTablet(
+            File tempLogDir,
+            long tableId,
+            PhysicalTablePath tablePath,
+            KvIdempotenceProtocol protocol)
             throws Exception {
         File logTabletDir =
                 LogTestUtils.makeRandomLogTabletDir(
@@ -182,7 +235,8 @@ class KvTabletTest {
                 1,
                 true,
                 SystemClock.getInstance(),
-                true);
+                true,
+                protocol);
     }
 
     private KvTablet createKvTablet(
@@ -193,13 +247,26 @@ class KvTabletTest {
             SchemaGetter schemaGetter,
             Map<String, String> tableConfig)
             throws Exception {
+        return createKvTablet(
+                tablePath, tableBucket, logTablet, tmpKvDir, schemaGetter, tableConfig, null);
+    }
+
+    private KvTablet createKvTablet(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File tmpKvDir,
+            SchemaGetter schemaGetter,
+            Map<String, String> tableConfig,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor)
+            throws Exception {
         TableConfig tableConf = new TableConfig(Configuration.fromMap(tableConfig));
         RowMerger rowMerger = RowMerger.create(tableConf, KvFormat.COMPACTED, schemaGetter);
         AutoIncrementManager autoIncrementManager =
                 new AutoIncrementManager(
                         schemaGetter,
                         tablePath.getTablePath(),
-                        new TableConfig(new Configuration()),
+                        tableConf,
                         new TestingSequenceGeneratorFactory());
 
         return KvTablet.create(
@@ -216,8 +283,115 @@ class KvTabletTest {
                 DEFAULT_COMPRESSION,
                 schemaGetter,
                 tableConf.getChangelogImage(),
+                tableConf.getKvFormatVersion().orElse(KV_FORMAT_VERSION_2),
                 KvManager.getDefaultRateLimiter(),
-                autoIncrementManager);
+                autoIncrementManager,
+                null,
+                tagExtractor);
+    }
+
+    @Test
+    void testKvFormatVersionThreeRequiresTagExtractor() throws Exception {
+        Schema schema = DATA1_SCHEMA_PK;
+        PhysicalTablePath tablePath = PhysicalTablePath.of(TablePath.of("testDb", "v3_no_tag"));
+        File invalidKvTabletDir = new File(tmpKvDir, "v3-no-tag");
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, tablePath);
+        Map<String, String> tableConfig = new HashMap<>();
+        tableConfig.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_3));
+
+        assertThat(invalidKvTabletDir).doesNotExist();
+        assertThatThrownBy(
+                        () ->
+                                createKvTablet(
+                                        tablePath,
+                                        logTablet.getTableBucket(),
+                                        logTablet,
+                                        invalidKvTabletDir,
+                                        schemaGetter,
+                                        tableConfig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tagExtractor");
+        assertThat(invalidKvTabletDir).doesNotExist();
+    }
+
+    @Test
+    void testKvFormatVersionTwoRejectsTagExtractor() throws Exception {
+        Schema schema = DATA1_SCHEMA_PK;
+        PhysicalTablePath tablePath = PhysicalTablePath.of(TablePath.of("testDb", "v2_with_tag"));
+        File invalidKvTabletDir = new File(tmpKvDir, "v2-with-tag");
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, tablePath);
+        Map<String, String> tableConfig = new HashMap<>();
+        tableConfig.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_2));
+
+        assertThat(invalidKvTabletDir).doesNotExist();
+        assertThatThrownBy(
+                        () ->
+                                createKvTablet(
+                                        tablePath,
+                                        logTablet.getTableBucket(),
+                                        logTablet,
+                                        invalidKvTabletDir,
+                                        schemaGetter,
+                                        tableConfig,
+                                        row -> 1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tagExtractor");
+        assertThat(invalidKvTabletDir).doesNotExist();
+    }
+
+    @Test
+    void testVersionThreeTagIsExtractedFromFinalMergedRow() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.STRING())
+                        .column("partition_id", DataTypes.BIGINT())
+                        .primaryKey("id")
+                        .build();
+        PhysicalTablePath tablePath =
+                PhysicalTablePath.of(TablePath.of("testDb", "v3_final_row_tag"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(schema, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, tablePath);
+        Map<String, String> tableConfig = new HashMap<>();
+        tableConfig.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), String.valueOf(KV_FORMAT_VERSION_3));
+        kvTablet =
+                createKvTablet(
+                        tablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        tableConfig,
+                        row -> row.getLong(2));
+        KvRecordTestUtils.KvRecordFactory records =
+                KvRecordTestUtils.KvRecordFactory.of(schema.getRowType());
+
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        records.ofRecord("k1".getBytes(), new Object[] {1, "before", 41L})),
+                new int[] {0, 1, 2});
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        records.ofRecord("k1".getBytes(), new Object[] {1, "after", null})),
+                new int[] {0, 1});
+
+        Value storedValue = kvTablet.getKvPreWriteBuffer().get(Key.of("k1".getBytes()));
+        assertThat(storedValue).isNotNull();
+        byte[] stored = storedValue.get();
+        assertThat(stored).isNotNull();
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_3);
+        assertThat(layout.readValueTag(MemorySegment.wrap(stored))).isEqualTo(41L);
+
+        BinaryValue decoded =
+                new ValueDecoder(schemaGetter, KvFormat.COMPACTED, layout).decodeValue(stored);
+        assertThat(decoded.row.getInt(0)).isEqualTo(1);
+        assertThat(decoded.row.getString(1).toString()).isEqualTo("after");
+        assertThat(decoded.row.getLong(2)).isEqualTo(41L);
     }
 
     @Test
@@ -259,11 +433,11 @@ class KvTabletTest {
         assertThatThrownBy(() -> kvTablet.putAsLeader(kvRecordBatch, new int[] {0, 1}))
                 .isInstanceOf(InvalidTargetColumnException.class)
                 .hasMessage(
-                        "Partial Update requires all columns except primary key to be nullable, but column c is NOT NULL.");
+                        "Partial Update requires all columns except primary key and auto-increment columns to be nullable, but column c is NOT NULL.");
         assertThatThrownBy(() -> kvTablet.putAsLeader(kvRecordBatch, new int[] {0, 2}))
                 .isInstanceOf(InvalidTargetColumnException.class)
                 .hasMessage(
-                        "Partial Update requires all columns except primary key to be nullable, but column c is NOT NULL.");
+                        "Partial Update requires all columns except primary key and auto-increment columns to be nullable, but column c is NOT NULL.");
     }
 
     @Test
@@ -1291,6 +1465,182 @@ class KvTabletTest {
         KvRecordBatch kvRecordBatch2 = kvRecordBatchFactory.ofRecords(kvData1, writeId, 1);
         kvTablet.putAsLeader(kvRecordBatch2, null);
         assertThat(kvTablet.getKvPreWriteBuffer().getMaxLSN()).isEqualTo(9);
+    }
+
+    @Test
+    void testStaleProgressBatchDoesNotDecodeOrAppend() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "stale_v1"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        WriterKey writerKey = new WriterKey(9L, Long.MIN_VALUE | 3L);
+        WriterProgressAppendInfo accepted =
+                logTablet.writerStateManager().prepareProgressUpdate(writerKey);
+        accepted.append(500L, 17L, 1234L);
+        logTablet.writerStateManager().updateProgress(accepted);
+        long logEndOffset = logTablet.localLogEndOffset();
+
+        KvRecordBatch malformed = mock(KvRecordBatch.class);
+        when(malformed.idempotenceProtocolVersion()).thenReturn(1);
+        when(malformed.schemaId()).thenReturn(schemaId);
+        when(malformed.writerKey()).thenReturn(writerKey);
+        when(malformed.writerProgress()).thenReturn(100L);
+        doThrow(new AssertionError("stale payload must not be decoded"))
+                .when(malformed)
+                .records(any());
+
+        LogAppendInfo result =
+                kvTablet.putAsLeader(
+                        malformed, null, org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
+
+        assertThat(result.duplicated()).isTrue();
+        assertThat(result.lastOffset()).isEqualTo(17L);
+        assertThat(result.maxTimestamp()).isEqualTo(1234L);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(logEndOffset);
+        verify(malformed, never()).records(any());
+    }
+
+    @Test
+    void testLogLockRevalidationTurnsFreshProgressPrecheckStale() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "race_v1"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        WriterKey writerKey = new WriterKey(9L, 3L);
+        byte[] key = "race-key".getBytes();
+        BinaryRow olderRow = compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "old"});
+        BinaryRow newerRow = compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "new"});
+        byte[] newerValue = ValueEncoder.encodeValue(schemaId, newerRow);
+        KvRecordBatch older = progressBatch(writerKey, 100L, key, olderRow);
+        CompactedWalBuilder newerBuilder =
+                CompactedWalBuilder.progressBuilder(
+                        schemaId, DATA1_SCHEMA_PK.getRowType(), new TestingMemorySegmentPool(1024));
+        newerBuilder.setWriterProgress(writerKey, 200L);
+        newerBuilder.append(ChangeType.INSERT, newerRow);
+        kvTablet.setAfterProgressPrecheck(
+                () -> {
+                    try {
+                        kvTablet.putToPreWriteBuffer(ChangeType.INSERT, key, newerValue, 0L);
+                        logTablet.appendAsLeader(newerBuilder.build());
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+        LogAppendInfo result =
+                kvTablet.putAsLeader(
+                        older, null, org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE);
+        newerBuilder.deallocate();
+
+        assertThat(result.duplicated()).isTrue();
+        assertThat(result.lastOffset()).isZero();
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(1L);
+        WriterProgressStateEntry state =
+                logTablet
+                        .writerStateManager()
+                        .lastProgressEntry(writerKey)
+                        .orElseThrow(AssertionError::new);
+        assertThat(state.lastProgress()).isEqualTo(200L);
+        assertThat(state.progressWalOffset()).isZero();
+        assertThat(kvTablet.getKvPreWriteBuffer().get(Key.of(key))).isEqualTo(Value.of(newerValue));
+        assertThat(kvTablet.getKvPreWriteBuffer().getAllKvEntries()).hasSize(1);
+        assertThat(kvTablet.getKvPreWriteBuffer().getTruncateAsDuplicatedCount().getCount())
+                .isEqualTo(1L);
+        assertThat(kvTablet.getKvPreWriteBuffer().getTruncateAsErrorCount().getCount()).isZero();
+
+        Iterator<LogRecordBatch> batches = readLogRecords().batches().iterator();
+        LogRecordBatch batch = batches.next();
+        assertThat(batch.idempotenceProtocolVersion()).isEqualTo(1);
+        assertThat(batch.baseLogOffset()).isZero();
+        assertThat(batch.lastLogOffset()).isZero();
+        assertThat(batch.getRecordCount()).isEqualTo(1);
+        assertThat(batch.writerKey()).isEqualTo(writerKey);
+        assertThat(batch.writerProgress()).isEqualTo(200L);
+        assertThat(batches.hasNext()).isFalse();
+
+        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        assertThat(kvTablet.multiGet(Collections.singletonList(key))).containsExactly(newerValue);
+    }
+
+    @Test
+    void testCorruptProgressBatchIsRejectedBeforeWriterStateAdmission() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "corrupt_v1"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        WriterKey writerKey = new WriterKey(10L, 20L);
+        BinaryRow row = compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "value"});
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        schemaId, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
+        builder.append("key".getBytes(), row);
+        builder.setWriterState(writerKey, 100L);
+        ByteBuffer buffer = builder.build().getByteBuf().nioBuffer();
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+        builder.close();
+        bytes[bytes.length - 1] ^= 1;
+        KvRecordBatch corrupt = KvRecordBatchReader.pointToByteBuffer(ByteBuffer.wrap(bytes));
+
+        assertThatThrownBy(
+                        () ->
+                                kvTablet.putAsLeader(
+                                        corrupt,
+                                        null,
+                                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE))
+                .isInstanceOf(CorruptMessageException.class);
+        assertThat(logTablet.localLogEndOffset()).isZero();
+        assertThat(logTablet.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
+        assertThat(kvTablet.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
+    }
+
+    @Test
+    void testProgressTableRejectsContiguousSequenceBatchMagic() throws Exception {
+        initLogTabletAndKvTablet(
+                TablePath.of("testDb", "v1_magic_downgrade"),
+                DATA1_SCHEMA_PK,
+                new HashMap<>(),
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+        KvRecordBatch downgraded = mock(KvRecordBatch.class);
+        when(downgraded.idempotenceProtocolVersion()).thenReturn(0);
+        when(downgraded.schemaId()).thenReturn(schemaId);
+        doThrow(new AssertionError("a protocol-mismatched payload must not be decoded"))
+                .when(downgraded)
+                .records(any());
+
+        assertThatThrownBy(
+                        () ->
+                                kvTablet.putAsLeader(
+                                        downgraded,
+                                        null,
+                                        org.apache.fluss.rpc.protocol.MergeMode.OVERWRITE))
+                .isInstanceOf(CorruptRecordException.class)
+                .hasMessageContaining("table mode CUMULATIVE_PROGRESS");
+        assertThat(logTablet.localLogEndOffset()).isZero();
+        assertThat(kvTablet.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
+        verify(downgraded, never()).records(any());
+    }
+
+    private static KvRecordBatch progressBatch(
+            WriterKey writerKey, long progress, byte[] key, BinaryRow row) throws Exception {
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        schemaId, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
+        builder.append(key, row);
+        builder.setWriterState(writerKey, progress);
+        return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
+    }
+
+    private static KvRecordBatch emptyProgressBatch(WriterKey writerKey, long progress)
+            throws Exception {
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        schemaId, 1024, new UnmanagedPagedOutputView(128), KvFormat.COMPACTED);
+        builder.setWriterState(writerKey, progress);
+        return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
     }
 
     @Test

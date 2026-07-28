@@ -22,6 +22,22 @@ package org.apache.fluss.server.log;
  */
 public final class LogAppendInfo {
 
+    /** Creates a successful no-op result dominated by an already appended inclusive WAL offset. */
+    public static LogAppendInfo duplicatedAt(long targetWalOffset, long timestamp) {
+        LogAppendInfo info =
+                new LogAppendInfo(
+                        targetWalOffset, targetWalOffset, timestamp, targetWalOffset, 0, 0, true);
+        info.setDuplicated(true);
+        return info;
+    }
+
+    /** Creates a successful result for a write intentionally dropped before any append. */
+    public static LogAppendInfo noAppend() {
+        LogAppendInfo info = new LogAppendInfo(-1L, -1L, -1L, -1L, 0, 0, true);
+        info.noAppend = true;
+        return info;
+    }
+
     /** The number of validated records. */
     private final int shallowCount;
 
@@ -39,6 +55,8 @@ public final class LogAppendInfo {
 
     /** Whether the appended log data is duplicated. */
     private boolean duplicated;
+
+    private boolean noAppend;
 
     /** Creates an instance with the given params. */
     public LogAppendInfo(
@@ -79,6 +97,7 @@ public final class LogAppendInfo {
         this.offsetsMonotonic = offsetsMonotonic;
         this.errorMessage = errorMessage;
         this.duplicated = false;
+        this.noAppend = false;
     }
 
     public long firstOffset() {
@@ -130,6 +149,10 @@ public final class LogAppendInfo {
         this.duplicated = duplicated;
     }
 
+    public boolean hasNoAppend() {
+        return noAppend;
+    }
+
     public boolean offsetsMonotonic() {
         return offsetsMonotonic;
     }
@@ -165,6 +188,8 @@ public final class LogAppendInfo {
                 + offsetsMonotonic
                 + ", duplicated="
                 + duplicated
+                + ", noAppend="
+                + noAppend
                 + ", recordErrors="
                 + errorMessage
                 + ')';

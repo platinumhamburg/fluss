@@ -28,6 +28,9 @@ import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableBucketReplica;
@@ -55,6 +58,7 @@ import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
 import org.apache.fluss.server.coordinator.event.CoordinatorEventManager;
 import org.apache.fluss.server.coordinator.event.NotifyLeaderAndIsrResponseReceivedEvent;
+import org.apache.fluss.server.coordinator.event.RefreshPartitionTombstonesEvent;
 import org.apache.fluss.server.coordinator.event.RetryOfflineLeaderEvent;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
@@ -65,6 +69,7 @@ import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.entity.TablePropertyChanges;
+import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.metadata.BucketMetadata;
@@ -91,6 +96,7 @@ import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
@@ -225,7 +231,8 @@ class CoordinatorEventProcessorTest {
                         metadataManager,
                         new RemoteDirDynamicLoader(conf),
                         conf,
-                        replicaCapacityController);
+                        replicaCapacityController,
+                        zkEpoch.getCoordinatorEpochZkVersion());
         kvSnapshotLeaseManager =
                 new KvSnapshotLeaseManager(
                         Duration.ofMinutes(10).toMillis(),
@@ -470,6 +477,88 @@ class CoordinatorEventProcessorTest {
         assertThat(tableBucketReplicas).isEmpty();
         assertThat(fromCtx(CoordinatorContext::getKvBucketCount)).isZero();
         assertThat(replicaCapacityController.getKvLeaderReplicaCount()).isZero();
+    }
+
+    @Test
+    void testIndexedMainCreatePublishesTombstoneBaselineBeforeIndexEvent() throws Exception {
+        initCoordinatorChannel();
+        TablePath mainPath = TablePath.of(defaultDatabase, "baseline_main");
+        TableDescriptor mainDescriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("region", DataTypes.STRING())
+                                        .primaryKey("id", "region")
+                                        .index(
+                                                "idx_id",
+                                                IndexType.SECONDARY,
+                                                Collections.singletonList("id"),
+                                                IndexVisibility.SYNC,
+                                                1)
+                                        .build())
+                        .partitionedBy("region")
+                        .distributedBy(1, "id")
+                        .build()
+                        .withReplicationFactor(1);
+        long mainTableId =
+                metadataManager.createTable(mainPath, remoteDataDir, mainDescriptor, null, false);
+        retryVerifyContext(
+                ctx -> assertThat(ctx.getTablePathById(mainTableId)).isEqualTo(mainPath));
+
+        assertThat(lastTombstoneUpdate(0))
+                .containsExactlyEntriesOf(
+                        Collections.singletonMap(mainTableId, PartitionTombstone.EMPTY));
+
+        TableDescriptor indexDescriptor =
+                IndexTableDescriptorFactory.derive(
+                                mainDescriptor,
+                                mainTableId,
+                                defaultDatabase + ".baseline_main",
+                                "idx_id")
+                        .withReplicationFactor(1);
+        TablePath indexPath =
+                TablePath.of(
+                        defaultDatabase, IndexTableUtils.indexTableName("baseline_main", "idx_id"));
+        TableAssignment indexAssignment =
+                generateAssignment(
+                        1,
+                        1,
+                        new TabletServerInfo[] {
+                            new TabletServerInfo(0, "rack0"),
+                            new TabletServerInfo(1, "rack1"),
+                            new TabletServerInfo(2, "rack2")
+                        });
+        long indexTableId =
+                metadataManager.createTable(
+                        indexPath, remoteDataDir, indexDescriptor, indexAssignment, false);
+        retryVerifyContext(
+                ctx -> assertThat(ctx.getTablePathById(indexTableId)).isEqualTo(indexPath));
+
+        assertThat(lastTombstoneUpdate(0))
+                .containsExactlyEntriesOf(
+                        Collections.singletonMap(mainTableId, PartitionTombstone.EMPTY));
+
+        TablePath unrelatedPath = TablePath.of(defaultDatabase, "baseline_unrelated");
+        long unrelatedId =
+                metadataManager.createTable(
+                        unrelatedPath, remoteDataDir, TEST_TABLE, indexAssignment, false);
+        retryVerifyContext(
+                ctx -> assertThat(ctx.getTablePathById(unrelatedId)).isEqualTo(unrelatedPath));
+
+        assertThat(lastTombstoneUpdate(0)).isEmpty();
+
+        PartitionTombstone refreshedTombstone =
+                new PartitionTombstone(17L, Collections.singleton(23L), 2L);
+        zookeeperClient.setOrCreatePartitionTombstone(mainPath, refreshedTombstone);
+        eventProcessor.getCoordinatorEventManager().put(new RefreshPartitionTombstonesEvent());
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(lastTombstoneUpdate(0))
+                                .containsExactlyEntriesOf(
+                                        Collections.singletonMap(mainTableId, refreshedTombstone)));
     }
 
     @Test
@@ -840,7 +929,12 @@ class CoordinatorEventProcessorTest {
         assertThat(completedSnapshotStoreManager.getBucketCompletedSnapshotStores()).isNotEmpty();
 
         // drop the partition
-        zookeeperClient.deletePartition(tablePath, partition1Name);
+        zookeeperClient.deletePartition(
+                tablePath,
+                partition1Name,
+                tableId,
+                partition1Id,
+                zkEpoch.getCoordinatorEpochZkVersion());
         verifyPartitionDropped(tableId, partition1Id);
 
         // verify CompleteSnapshotStore has been removed when the table partition1 is dropped
@@ -903,7 +997,12 @@ class CoordinatorEventProcessorTest {
         // now, drop partition2 and restart the coordinator event processor,
         // the partition2 should be dropped
         eventProcessor.shutdown();
-        zookeeperClient.deletePartition(tablePath, partition2Name);
+        zookeeperClient.deletePartition(
+                tablePath,
+                partition2Name,
+                tableId,
+                partition2Id,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // start the coordinator
         eventProcessor = buildCoordinatorEventProcessor();
@@ -961,7 +1060,12 @@ class CoordinatorEventProcessorTest {
                 replicationFactor);
 
         // Drop partition1 via ZK (simulates the watcher path).
-        zookeeperClient.deletePartition(tablePath, partition1Name);
+        zookeeperClient.deletePartition(
+                tablePath,
+                partition1Name,
+                tableId,
+                partition1Id,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // Verify the drop entered the lifecycle throttler and partition is fully deleted.
         TableLifecycleThrottler throttler = eventProcessor.getLifecycleThrottler();
@@ -1119,7 +1223,12 @@ class CoordinatorEventProcessorTest {
 
         // Shutdown the event processor, then delete partition2 in ZK while it's down.
         eventProcessor.shutdown();
-        zookeeperClient.deletePartition(tablePath, partition2Name);
+        zookeeperClient.deletePartition(
+                tablePath,
+                partition2Name,
+                tableId,
+                partition2Id,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // Restart the event processor. During startup, the stale partition2 should be
         // detected and routed through the cleanup manager.
@@ -1598,7 +1707,12 @@ class CoordinatorEventProcessorTest {
         builder.setCustomProperty("custom.key", "custom.value");
         TablePropertyChanges tablePropertyChanges = builder.build();
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), tablePropertyChanges, false, null);
+                t1,
+                Collections.emptyList(),
+                tablePropertyChanges,
+                false,
+                null,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // get updated table info and verify metadata update request is sent
         TableInfo updatedTableInfo = metadataManager.getTable(t1);
@@ -1659,7 +1773,12 @@ class CoordinatorEventProcessorTest {
         disableBuilder.setTableProperty(
                 ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "false");
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), disableBuilder.build(), false, null);
+                t1,
+                Collections.emptyList(),
+                disableBuilder.build(),
+                false,
+                null,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // verify standby replicas are removed after re-election
         retryVerifyContext(
@@ -1727,7 +1846,12 @@ class CoordinatorEventProcessorTest {
         enableBuilder.setTableProperty(
                 ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "true");
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), enableBuilder.build(), false, null);
+                t1,
+                Collections.emptyList(),
+                enableBuilder.build(),
+                false,
+                null,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // Verify re-election happened: standby assigned and leaderEpoch incremented
         retryVerifyContext(
@@ -1788,7 +1912,8 @@ class CoordinatorEventProcessorTest {
                                         Collections.emptyList(),
                                         enableBuilder.build(),
                                         false,
-                                        null))
+                                        null,
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
                 .isInstanceOf(InvalidAlterTableException.class)
                 .hasMessageContaining("can only be altered on primary key tables");
 
@@ -1803,7 +1928,8 @@ class CoordinatorEventProcessorTest {
                                         Collections.emptyList(),
                                         disableBuilder.build(),
                                         false,
-                                        null))
+                                        null,
+                                        zkEpoch.getCoordinatorEpochZkVersion()))
                 .isInstanceOf(InvalidAlterTableException.class)
                 .hasMessageContaining("can only be altered on primary key tables");
     }
@@ -2129,6 +2255,7 @@ class CoordinatorEventProcessorTest {
                                             ConfigOptions.REMOTE_DATA_DIR.key(), remoteDataDir))),
                     new Configuration(),
                     replicaCapacityController,
+                    zkEpoch.getCoordinatorEpochZkVersion(),
                     SystemClock.getInstance(),
                     new ManuallyTriggeredScheduledExecutorService());
             this.metadataCache = metadataCache;
@@ -2201,14 +2328,16 @@ class CoordinatorEventProcessorTest {
                 partitionAssignment,
                 remoteDataDir,
                 tablePath,
-                tableId);
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
         zookeeperClient.registerPartitionAssignmentAndMetadata(
                 partition2Id,
                 partition2Name,
                 partitionAssignment,
                 remoteDataDir,
                 tablePath,
-                tableId);
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         return Tuple2.of(
                 new PartitionIdName(partition1Id, partition1Name),
@@ -2450,6 +2579,16 @@ class CoordinatorEventProcessorTest {
         }
     }
 
+    private Map<Long, PartitionTombstone> lastTombstoneUpdate(int serverId) {
+        TestTabletServerGateway gateway =
+                (TestTabletServerGateway)
+                        testCoordinatorChannelManager.getTabletServerGateway(serverId).get();
+        ApiMessage request = gateway.getRequest(gateway.pendingRequestSize() - 1);
+        assertThat(request).isInstanceOf(UpdateMetadataRequest.class);
+        return getUpdateMetadataRequestData((UpdateMetadataRequest) request)
+                .getPartitionTombstones();
+    }
+
     private void retryVerifyContext(Consumer<CoordinatorContext> verifyFunction) {
         retry(
                 Duration.ofMinutes(1),
@@ -2487,7 +2626,8 @@ class CoordinatorEventProcessorTest {
     }
 
     private void alterTable(TablePath tablePath, List<TableChange> schemaChanges) {
-        metadataManager.alterTableSchema(tablePath, schemaChanges, true, null);
+        metadataManager.alterTableSchema(
+                tablePath, schemaChanges, true, null, zkEpoch.getCoordinatorEpochZkVersion());
     }
 
     private TableDescriptor getPartitionedTable() {

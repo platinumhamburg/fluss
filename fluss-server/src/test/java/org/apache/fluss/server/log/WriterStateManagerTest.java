@@ -19,19 +19,26 @@ package org.apache.fluss.server.log;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -54,6 +61,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test for {@link WriterStateManager}. */
 public class WriterStateManagerTest {
 
+    private static final byte[] CONTIGUOUS_SEQUENCE_SNAPSHOT_FIXTURE =
+            ("{\"version\":1,\"writer_id_entries\":[{\"writer_id\":5,"
+                            + "\"last_batch_sequence\":0,\"last_batch_base_offset\":8,"
+                            + "\"offset_delta\":0,\"last_batch_timestamp\":9}]}")
+                    .getBytes(StandardCharsets.UTF_8);
+
     private @TempDir File tempDir;
     private final long writerId = 1L;
     private File logDir;
@@ -72,6 +85,404 @@ public class WriterStateManagerTest {
                         tableBucket,
                         logDir,
                         (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis());
+    }
+
+    @Test
+    void testThreeArgumentConstructorDefaultsToContiguousBatchSequence() {
+        append(stateManager, 5L, 0, 8L, false, 9L);
+
+        assertThat(stateManager.protocol())
+                .isEqualTo(KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
+        assertThat(stateManager.activeWriters()).containsOnlyKeys(5L);
+        assertThat(stateManager.writerIdCount()).isEqualTo(1);
+    }
+
+    @Test
+    void testSnapshotWriteDrainsShortWritingChannel() throws Exception {
+        ByteBuffer source = ByteBuffer.wrap("complete-snapshot".getBytes(StandardCharsets.UTF_8));
+        ByteBuffer sink = ByteBuffer.allocate(source.remaining());
+        WritableByteChannel shortWriter =
+                new WritableByteChannel() {
+                    private boolean open = true;
+
+                    @Override
+                    public int write(ByteBuffer input) {
+                        int bytes = Math.min(3, input.remaining());
+                        for (int i = 0; i < bytes; i++) {
+                            sink.put(input.get());
+                        }
+                        return bytes;
+                    }
+
+                    @Override
+                    public boolean isOpen() {
+                        return open;
+                    }
+
+                    @Override
+                    public void close() {
+                        open = false;
+                    }
+                };
+
+        WriterStateManager.writeFully(shortWriter, source);
+
+        assertThat(source.hasRemaining()).isFalse();
+        assertThat(new String(sink.array(), StandardCharsets.UTF_8)).isEqualTo("complete-snapshot");
+    }
+
+    @Test
+    void testContiguousSequenceSnapshotMatchesLiteralFixture() throws Exception {
+        append(stateManager, 5L, 0, 8L, false, 9L);
+        stateManager.takeSnapshot();
+
+        assertThat(Files.readAllBytes(writerSnapshotFile(logDir, 9L).toPath()))
+                .isEqualTo(CONTIGUOUS_SEQUENCE_SNAPSHOT_FIXTURE);
+    }
+
+    @Test
+    void testCumulativeProgressKeepsLatestValueAcrossGaps() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey key = new WriterKey(4L, 5L);
+
+        appendProgress(manager, key, 100L, 10L, 1L);
+        appendProgress(manager, key, 500L, 20L, 2L);
+        appendProgress(manager, key, (long) Integer.MAX_VALUE + 1L, 30L, 3L);
+
+        WriterProgressStateEntry entry =
+                manager.lastProgressEntry(key).orElseThrow(AssertionError::new);
+        assertThat(entry.lastProgress()).isEqualTo((long) Integer.MAX_VALUE + 1L);
+        assertThat(entry.progressWalOffset()).isEqualTo(30L);
+        assertThat(manager.findStaleProgressBatch(key, 500L)).contains(entry);
+        assertThat(manager.findStaleProgressBatch(key, entry.lastProgress())).contains(entry);
+        assertThat(manager.findStaleProgressBatch(key, entry.lastProgress() + 1L)).isEmpty();
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+    }
+
+    @Test
+    void testProgressUpdateIsOneShotAndPublishesOnlyOnUpdate() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey key = new WriterKey(4L, 5L);
+        WriterProgressAppendInfo appendInfo = manager.prepareProgressUpdate(key);
+        WriterProgressAppendInfo superseded = manager.prepareProgressUpdate(key);
+
+        appendInfo.append(100L, 10L, 1L);
+        superseded.append(101L, 11L, 2L);
+        assertThat(manager.lastProgressEntry(key)).isEmpty();
+        assertThatThrownBy(() -> appendInfo.append(101L, 11L, 2L))
+                .isInstanceOf(IllegalStateException.class);
+
+        manager.updateProgress(appendInfo);
+        assertThat(manager.lastProgressEntry(key)).contains(appendInfo.updatedEntry());
+        assertThatThrownBy(() -> manager.updateProgress(superseded))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> manager.updateProgress(manager.prepareProgressUpdate(key)))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void testProgressRejectsEqualLowerAndNegativeFreshUpdates() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey key = new WriterKey(4L, 5L);
+        appendProgress(manager, key, 100L, 10L, 1L);
+
+        assertThatThrownBy(() -> manager.prepareProgressUpdate(key).append(100L, 11L, 2L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> manager.prepareProgressUpdate(key).append(99L, 11L, 2L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(
+                        () ->
+                                manager.prepareProgressUpdate(new WriterKey(6L, 7L))
+                                        .append(-1L, 11L, 2L))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testProgressWriterDoesNotExpireAndCanBeExplicitlyRetired() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey retained = new WriterKey(4L, 5L);
+        WriterKey retired = new WriterKey(6L, 7L);
+        appendProgress(manager, retained, 100L, 10L, 1L);
+        appendProgress(manager, retired, 200L, 20L, 2L);
+
+        manager.removeExpiredWriters(Long.MAX_VALUE);
+        assertThat(manager.writerIdCount()).isEqualTo(2);
+
+        manager.removeProgressWriters(retired::equals);
+        assertThat(manager.lastProgressEntry(retained)).isPresent();
+        assertThat(manager.lastProgressEntry(retired)).isEmpty();
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+        assertThat(manager.isEmpty()).isFalse();
+        manager.removeProgressWriters(key -> true);
+        assertThat(manager.isEmpty()).isTrue();
+    }
+
+    @Test
+    void testProtocolSpecificApisFailFastAcrossProtocols() throws Exception {
+        WriterStateManager progress = progressManager();
+        WriterKey key = new WriterKey(4L, 5L);
+
+        assertThatThrownBy(() -> stateManager.lastProgressEntry(key))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.findStaleProgressBatch(key, 0L))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.prepareProgressUpdate(key))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.removeProgressWriters(ignored -> true))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> stateManager.updateProgress(progress.prepareProgressUpdate(key)))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThatThrownBy(() -> progress.lastEntry(1L)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(progress::activeWriters).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> progress.prepareUpdate(1L))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> progress.update(stateManager.prepareUpdate(1L)))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> progress.loadWriterEntry(WriterStateEntry.empty(1L)))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void testProgressSnapshotRoundTripPreservesFullKeyAndLongValues() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey key = new WriterKey(Long.MAX_VALUE, Long.MIN_VALUE | 3L);
+        appendProgress(manager, key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L);
+        manager.updateMapEndOffset(Long.MAX_VALUE);
+        manager.takeSnapshot();
+
+        WriterStateManager recovered = progressManager();
+        recovered.truncateAndReload(0L, Long.MAX_VALUE, Long.MAX_VALUE);
+
+        assertThat(recovered.lastProgressEntry(key))
+                .contains(
+                        new WriterProgressStateEntry(
+                                key, (long) Integer.MAX_VALUE + 1L, Long.MAX_VALUE - 1L, 42L));
+    }
+
+    @Test
+    void testSnapshotReplacesStaleTemporaryFileAndPublishesCompleteContents() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey key = new WriterKey(4L, 5L);
+        appendProgress(manager, key, 100L, 10L, 1L);
+        manager.updateMapEndOffset(11L);
+        Path snapshot = writerSnapshotFile(logDir, 11L).toPath();
+        Path temporary = snapshot.resolveSibling(snapshot.getFileName() + ".tmp");
+        Files.write(temporary, "stale-partial-snapshot".getBytes(StandardCharsets.UTF_8));
+
+        manager.takeSnapshot();
+
+        assertThat(temporary).doesNotExist();
+        assertThat(Files.readAllBytes(snapshot)).isEqualTo(v2SnapshotBytes(100L, 10L));
+        WriterStateManager recovered = progressManager();
+        recovered.truncateAndReload(0L, 11L, Long.MAX_VALUE);
+        assertThat(recovered.lastProgressEntry(key))
+                .contains(new WriterProgressStateEntry(key, 100L, 10L, 1L));
+    }
+
+    @Test
+    void testProtocolSnapshotMismatchIsRejected() throws Exception {
+        Files.write(writerSnapshotFile(logDir, 1L).toPath(), v2SnapshotBytes());
+        stateManager.reloadSnapshots();
+        stateManager.truncateAndReload(0L, 1L, Long.MAX_VALUE);
+        assertThat(writerSnapshotFile(logDir, 1L)).doesNotExist();
+
+        Files.write(writerSnapshotFile(logDir, 2L).toPath(), CONTIGUOUS_SEQUENCE_SNAPSHOT_FIXTURE);
+        WriterStateManager progress = progressManager();
+        assertThatThrownBy(() -> progress.truncateAndReload(1L, 2L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class);
+        assertThat(writerSnapshotFile(logDir, 2L)).exists();
+    }
+
+    @Test
+    void testProgressCorruptSnapshotIsPropagatedWithoutFallback() throws Exception {
+        File snapshot = writerSnapshotFile(logDir, 1L);
+        Files.write(snapshot.toPath(), "{\"version\":2}".getBytes(StandardCharsets.UTF_8));
+        WriterStateManager progress = progressManager();
+
+        assertThatThrownBy(() -> progress.truncateAndReload(1L, 1L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class);
+        assertThat(snapshot).exists();
+    }
+
+    @Test
+    void testProgressRecoveryCoverageUsesHalfOpenOffsets() throws Exception {
+        WriterStateManager empty = progressManager();
+
+        assertThatThrownBy(() -> empty.validateRecoveryCoverage(1L, 1L))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("retained WAL starts at 1");
+        empty.validateRecoveryCoverage(0L, 0L);
+        empty.updateMapEndOffset(5L);
+        empty.validateRecoveryCoverage(0L, 5L);
+
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, new WriterKey(4L, 5L), 100L, 4L, 1L);
+        snapshotWriter.updateMapEndOffset(5L);
+        snapshotWriter.takeSnapshot();
+
+        WriterStateManager exactEnd = progressManager();
+        exactEnd.truncateAndReload(5L, 5L, Long.MAX_VALUE);
+        exactEnd.validateRecoveryCoverage(5L, 5L);
+
+        assertThatThrownBy(() -> exactEnd.validateRecoveryCoverage(0L, 6L))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("ends at 5")
+                .hasMessageContaining("recovery end 6");
+    }
+
+    @Test
+    void testProgressFallsBackToOlderValidSnapshotWithoutDeletingCorruptLatest() throws Exception {
+        WriterKey olderKey = new WriterKey(4L, 5L);
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, olderKey, 100L, 4L, 1L);
+        snapshotWriter.updateMapEndOffset(5L);
+        snapshotWriter.takeSnapshot();
+
+        File corruptLatest = writerSnapshotFile(logDir, 10L);
+        byte[] corruptBytes = "{\"version\":2}".getBytes(StandardCharsets.UTF_8);
+        Files.write(corruptLatest.toPath(), corruptBytes);
+
+        WriterStateManager recovered = progressManager();
+        recovered.truncateAndReload(5L, 10L, Long.MAX_VALUE);
+
+        assertThat(recovered.lastProgressEntry(olderKey)).isPresent();
+        assertThat(recovered.mapEndOffset()).isEqualTo(5L);
+        assertThat(recovered.fetchSnapshot(10L)).contains(corruptLatest);
+        assertThat(Files.readAllBytes(corruptLatest.toPath())).isEqualTo(corruptBytes);
+    }
+
+    @Test
+    void testProgressRejectsFallbackWhoseReplayRangeStartsBeforeRetainedWal() throws Exception {
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, new WriterKey(4L, 5L), 100L, 3L, 1L);
+        snapshotWriter.updateMapEndOffset(4L);
+        snapshotWriter.takeSnapshot();
+
+        File corruptLatest = writerSnapshotFile(logDir, 10L);
+        Files.write(corruptLatest.toPath(), "{\"version\":2}".getBytes(StandardCharsets.UTF_8));
+
+        WriterStateManager recovered = progressManager();
+        assertThatThrownBy(() -> recovered.truncateAndReload(5L, 10L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("continuous WriterState recovery");
+        assertThat(corruptLatest).exists();
+        assertThat(writerSnapshotFile(logDir, 4L)).exists();
+    }
+
+    @Test
+    void testProgressRejectsSnapshotAfterTruncationTarget() throws Exception {
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, new WriterKey(4L, 5L), 100L, 9L, 1L);
+        snapshotWriter.updateMapEndOffset(10L);
+        snapshotWriter.takeSnapshot();
+
+        WriterStateManager recovered = progressManager();
+        assertThatThrownBy(() -> recovered.truncateAndReload(5L, 8L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class)
+                .hasMessageContaining("recovery end 8");
+        assertThat(writerSnapshotFile(logDir, 10L)).exists();
+    }
+
+    @Test
+    void testProgressFailedReloadPreservesLiveStateAndSnapshotMetadata() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey liveKey = new WriterKey(4L, 5L);
+        appendProgress(manager, liveKey, 100L, 10L, 1L);
+        manager.updateMapEndOffset(20L);
+
+        File corruptSnapshot = writerSnapshotFile(logDir, 15L);
+        byte[] corruptBytes = "{\"version\":2}".getBytes(StandardCharsets.UTF_8);
+        Files.write(corruptSnapshot.toPath(), corruptBytes);
+        File outOfRangeSnapshot = writerSnapshotFile(logDir, 25L);
+        byte[] outOfRangeBytes = v2SnapshotBytes();
+        Files.write(outOfRangeSnapshot.toPath(), outOfRangeBytes);
+        manager.reloadSnapshots();
+
+        Optional<WriterProgressStateEntry> liveEntry = manager.lastProgressEntry(liveKey);
+        Optional<Long> latestSnapshotOffset = manager.latestSnapshotOffset();
+        Optional<Long> oldestSnapshotOffset = manager.oldestSnapshotOffset();
+
+        assertThatThrownBy(() -> manager.truncateAndReload(1L, 15L, Long.MAX_VALUE))
+                .isInstanceOf(CorruptSnapshotException.class);
+
+        assertThat(manager.lastProgressEntry(liveKey)).isEqualTo(liveEntry);
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+        assertThat(manager.mapEndOffset()).isEqualTo(20L);
+        assertThat(manager.latestSnapshotOffset()).isEqualTo(latestSnapshotOffset);
+        assertThat(manager.oldestSnapshotOffset()).isEqualTo(oldestSnapshotOffset);
+        assertThat(manager.fetchSnapshot(15L)).contains(corruptSnapshot);
+        assertThat(Files.readAllBytes(corruptSnapshot.toPath())).isEqualTo(corruptBytes);
+        assertThat(manager.fetchSnapshot(25L)).contains(outOfRangeSnapshot);
+        assertThat(Files.readAllBytes(outOfRangeSnapshot.toPath())).isEqualTo(outOfRangeBytes);
+    }
+
+    @Test
+    void testProgressRecoveryCandidateFailureDoesNotPublishSelectedSnapshot() throws Exception {
+        WriterKey writerKey = new WriterKey(4L, 5L);
+        WriterStateManager manager = progressManager();
+        appendProgress(manager, writerKey, 100L, 4L, 1L);
+        manager.updateMapEndOffset(5L);
+        manager.takeSnapshot();
+        appendProgress(manager, writerKey, 900L, 9L, 2L);
+        manager.updateMapEndOffset(10L);
+
+        WriterStateManager candidate = manager.progressRecoveryCandidate(5L, 10L);
+        assertThatThrownBy(() -> candidate.validateRecoveryCoverage(5L, 10L))
+                .isInstanceOf(CorruptSnapshotException.class);
+
+        assertThat(manager.mapEndOffset()).isEqualTo(10L);
+        assertThat(manager.lastProgressEntry(writerKey))
+                .get()
+                .extracting(WriterProgressStateEntry::lastProgress)
+                .isEqualTo(900L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {-1L, 5L})
+    void testProgressCandidateRejectsInvalidTargetWalOffsetAndKeepsOlderEligible(
+            long invalidTargetOffset) throws Exception {
+        WriterKey writerKey = new WriterKey(4L, 5L);
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, writerKey, 100L, 0L, 1L);
+        snapshotWriter.updateMapEndOffset(2L);
+        snapshotWriter.takeSnapshot();
+        File invalidSnapshot = writerSnapshotFile(logDir, 5L);
+        byte[] invalidBytes = v2SnapshotBytes(900L, invalidTargetOffset);
+        Files.write(invalidSnapshot.toPath(), invalidBytes);
+
+        WriterStateManager manager = progressManager();
+        WriterStateManager candidate = manager.progressRecoveryCandidate(0L, 5L);
+
+        assertThat(candidate.mapEndOffset()).isEqualTo(2L);
+        assertThat(candidate.lastProgressEntry(writerKey))
+                .get()
+                .extracting(WriterProgressStateEntry::lastProgress)
+                .isEqualTo(100L);
+        assertThat(Files.readAllBytes(invalidSnapshot.toPath())).isEqualTo(invalidBytes);
+    }
+
+    @Test
+    void testProgressSuccessfulReloadAtomicallyReplacesLiveState() throws Exception {
+        WriterStateManager manager = progressManager();
+        WriterKey oldKey = new WriterKey(4L, 5L);
+        WriterKey snapshotKey = new WriterKey(6L, 7L);
+        appendProgress(manager, oldKey, 100L, 10L, 1L);
+        manager.updateMapEndOffset(20L);
+
+        WriterStateManager snapshotWriter = progressManager();
+        appendProgress(snapshotWriter, snapshotKey, 200L, 14L, 2L);
+        snapshotWriter.updateMapEndOffset(15L);
+        snapshotWriter.takeSnapshot();
+        manager.reloadSnapshots();
+
+        manager.truncateAndReload(0L, 15L, Long.MAX_VALUE);
+
+        assertThat(manager.lastProgressEntry(oldKey)).isEmpty();
+        assertThat(manager.lastProgressEntry(snapshotKey))
+                .contains(new WriterProgressStateEntry(snapshotKey, 200L, 14L, 2L));
+        assertThat(manager.writerIdCount()).isEqualTo(1);
+        assertThat(manager.mapEndOffset()).isEqualTo(15L);
     }
 
     @Test
@@ -525,6 +936,39 @@ public class WriterStateManagerTest {
                 lastTimestamp);
         stateManager.update(appendInfo);
         stateManager.updateMapEndOffset(offset + 1);
+    }
+
+    private WriterStateManager progressManager() throws IOException {
+        return new WriterStateManager(
+                tableBucket,
+                logDir,
+                (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis(),
+                KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+    }
+
+    private static void appendProgress(
+            WriterStateManager manager,
+            WriterKey writerKey,
+            long progress,
+            long targetWalOffset,
+            long timestamp) {
+        WriterProgressAppendInfo appendInfo = manager.prepareProgressUpdate(writerKey);
+        appendInfo.append(progress, targetWalOffset, timestamp);
+        manager.updateProgress(appendInfo);
+    }
+
+    private static byte[] v2SnapshotBytes() {
+        return v2SnapshotBytes(100L, 10L);
+    }
+
+    private static byte[] v2SnapshotBytes(long progress, long targetOffset) {
+        return ("{\"version\":2,\"kv_idempotence_protocol_version\":1,\"writer_entries\":[{"
+                        + "\"writer_key_high\":4,\"writer_key_low\":5,\"last_sequence\":"
+                        + progress
+                        + ",\"last_target_wal_offset\":"
+                        + targetOffset
+                        + ",\"last_timestamp\":1}]}")
+                .getBytes(StandardCharsets.UTF_8);
     }
 
     private Set<Long> currentSnapshotOffsets() {

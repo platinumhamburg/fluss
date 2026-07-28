@@ -33,10 +33,7 @@ public class BinaryValue {
         this.row = row;
     }
 
-    /**
-     * Encode the value (consisted of {@code row} with a {@code schemaId}) to a byte array value to
-     * be expected persisted to kv store.
-     */
+    /** Encodes this logical value using the version 2 physical layout. */
     public byte[] encodeValue() {
         return ValueEncoder.encodeValue(schemaId, row);
     }

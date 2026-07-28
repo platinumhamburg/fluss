@@ -224,6 +224,7 @@ class CoordinatorServiceOrphanRpcsITCase {
                 new KvSnapshotHandle(Collections.emptyList(), Collections.emptyList(), 0L),
                 snapshotId,
                 null,
+                null,
                 null);
     }
 

@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.kv.snapshot;
 
+import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.local.LocalFileSystem;
@@ -86,6 +87,24 @@ class SnapshotLocationTest {
     @Test
     void testFlushAboveThreshold() throws IOException {
         flushAndVerify(10, 11, false);
+    }
+
+    @Test
+    void testCloseAndGetHandleCreatesEmptyFileHandle() throws IOException {
+        try (FsSnapshotOutputStream stream =
+                createSnapshotLocation(LocalFileSystem.getSharedInstance(), 10)
+                        .createSnapshotOutputStream(SnapshotFileScope.EXCLUSIVE)) {
+            KvFileHandle handle = stream.closeAndGetHandle();
+
+            assertThat(handle).isNotNull();
+            assertThat(handle.getSize()).isEqualTo(0L);
+
+            FsPath handlePath = new FsPath(handle.getFilePath());
+            assertThat(handlePath.getFileSystem().exists(handlePath)).isTrue();
+            try (FSDataInputStream inputStream = handlePath.getFileSystem().open(handlePath)) {
+                assertThat(inputStream.read()).isEqualTo(-1);
+            }
+        }
     }
 
     private void flushAndVerify(int minFileSize, int bytesToFlush, boolean expectEmpty)

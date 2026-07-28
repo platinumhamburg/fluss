@@ -26,8 +26,10 @@ import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -39,13 +41,16 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.TestingSchemaGetter;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.ValueDecoder;
@@ -114,6 +119,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.record.LogRecordReadContext.createArrowReadContext;
@@ -166,6 +172,115 @@ class ReplicaManagerTest extends ReplicaTestBase {
     private static final short PUT_KV_VERSION = 1;
     private static final short LOOKUP_KV_VERSION = 1;
     private static final short PREFIX_LOOKUP_KV_VERSION = 1;
+
+    @Test
+    void testMissingReplicaUsesConservativeSyncIndexGate() {
+        assertThat(
+                        replicaManager.requiresSyncIndexVisibility(
+                                new TableBucket(Long.MAX_VALUE, Integer.MAX_VALUE)))
+                .isTrue();
+    }
+
+    private CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> notifyLeader(
+            TablePath tablePath, TableBucket tableBucket, int leaderId, int leaderEpoch) {
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> result =
+                new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(tablePath),
+                                tableBucket,
+                                Arrays.asList(TABLET_SERVER_ID, 2),
+                                new LeaderAndIsr(
+                                        leaderId,
+                                        leaderEpoch,
+                                        Collections.singletonList(leaderId),
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        INITIAL_BUCKET_EPOCH + leaderEpoch))),
+                result::complete);
+        return result;
+    }
+
+    private static KvRecordBatch progressBatch(
+            WriterKey writerKey, long progress, int key, String value) throws Exception {
+        try (ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        DEFAULT_SCHEMA_ID,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED)) {
+            builder.append(
+                    new byte[] {(byte) key},
+                    compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {key, value}));
+            builder.setWriterState(writerKey, progress);
+            return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
+        }
+    }
+
+    @Test
+    void testFailedKvReplayCleansEveryAttemptAndPreventsLeaderPublication() throws Exception {
+        long tableId = 150101L;
+        TablePath tablePath = TablePath.of("test_db_1", "failed_replay_v1");
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        registerTableInZkClient(
+                tablePath,
+                DATA1_SCHEMA_PK,
+                tableId,
+                Collections.singletonList("a"),
+                Collections.singletonMap(
+                        ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key(),
+                        String.valueOf(KvIdempotenceProtocol.CUMULATIVE_PROGRESS.version())));
+
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> leaderResult =
+                notifyLeader(tablePath, tableBucket, TABLET_SERVER_ID, 0);
+        assertThat(leaderResult.get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+        Replica replica = replicaManager.getReplicaOrException(tableBucket);
+        WriterKey writerKey = new WriterKey(41L, 17L);
+        replica.putRecordsToLeader(
+                progressBatch(writerKey, 100L, 1, "before-snapshot"),
+                null,
+                MergeMode.OVERWRITE,
+                -1);
+        replica.getKvSnapshotManager().triggerSnapshot();
+        snapshotReporter.waitUntilSnapshotComplete(tableBucket, 0);
+        replica.putRecordsToLeader(
+                progressBatch(writerKey, 500L, 2, "after-snapshot"), null, MergeMode.OVERWRITE, -1);
+
+        assertThat(notifyLeader(tablePath, tableBucket, 2, 1).get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+        assertThat(replica.isLeader()).isFalse();
+
+        AtomicInteger replayAttempts = new AtomicInteger();
+        replica.setKvRecoveryFaultInjector(
+                nextOffset -> {
+                    replayAttempts.incrementAndGet();
+                    throw new IOException("injected replay failure at " + nextOffset);
+                });
+        long walEndBeforePromotion = replica.getLogTablet().localLogEndOffset();
+
+        List<NotifyLeaderAndIsrResultForBucket> failedPromotion =
+                notifyLeader(tablePath, tableBucket, TABLET_SERVER_ID, 2).get();
+
+        assertThat(failedPromotion).hasSize(1);
+        assertThat(failedPromotion.get(0).getErrorMessage()).contains("Fail to init kv tablet");
+        assertThat(replayAttempts).hasValue(5);
+        assertThat(replica.isLeader()).isFalse();
+        assertThat(replica.getKvTablet()).isNull();
+        assertThat(kvManager.getKv(tableBucket)).isEmpty();
+        assertThat(replica.getKvSnapshotManager()).isNull();
+        assertThatThrownBy(
+                        () ->
+                                replica.putRecordsToLeader(
+                                        progressBatch(writerKey, 100L, 3, "stale"),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isInstanceOf(NotLeaderOrFollowerException.class);
+        assertThat(replica.getLogTablet().localLogEndOffset()).isEqualTo(walEndBeforePromotion);
+    }
 
     @Test
     void testProduceLog() throws Exception {

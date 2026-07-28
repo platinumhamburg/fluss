@@ -50,6 +50,10 @@ public class TestingRemoteLogStorage extends DefaultRemoteLogStorage {
 
     private final AtomicInteger copySegmentCount = new AtomicInteger(0);
 
+    public int copiedSegmentCount() {
+        return copySegmentCount.get();
+    }
+
     /**
      * When set to a positive value, each call to {@link #fetchLogData} will sleep for the given
      * number of milliseconds before delegating to the real implementation. Used by integration

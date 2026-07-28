@@ -18,12 +18,26 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.exception.KvStorageException;
+import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.exception.StorageException;
+import org.apache.fluss.exception.UnsupportedVersionException;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.MetricNames;
@@ -31,32 +45,58 @@ import org.apache.fluss.metrics.groups.AbstractMetricGroup;
 import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordBatchBuilder;
+import org.apache.fluss.record.KvRecordBatchReader;
 import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.ProjectionPushdownCache;
+import org.apache.fluss.record.WriterKey;
+import org.apache.fluss.record.bytesview.BytesView;
+import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.index.IndexReplicator;
+import org.apache.fluss.server.index.IndexTableDescriptorFactory;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.UncertainWalAppendException;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
+import org.apache.fluss.server.log.LogTabletTestHelper;
+import org.apache.fluss.server.log.LogTabletTestHelper.FaultPhase;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
+import org.apache.fluss.server.metadata.BucketMetadata;
+import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.testutils.KvTestUtils;
+import org.apache.fluss.server.utils.FatalErrorHandler;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
+import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
+import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -64,8 +104,15 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
@@ -75,6 +122,7 @@ import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
@@ -82,10 +130,12 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA2;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
+import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.apache.fluss.testutils.DataTestUtils.assertLogRecordsEquals;
+import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
@@ -96,12 +146,339 @@ import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 /** Test for {@link Replica}. */
 final class ReplicaTest extends ReplicaTestBase {
     // TODO add more tests refer to kafka's PartitionTest.
     // TODO add more tests to cover partition table
+
+    @Test
+    void testPutKvTableProtocolContract() throws Exception {
+        Replica v0 =
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
+        makeKvReplicaAsLeader(v0);
+        KvRecordTestUtils.KvRecordBatchFactory v0Factory =
+                KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
+        KvRecordBatch compact = v0Factory.ofRecords(Collections.emptyList(), 11L, 0);
+        KvRecordBatch progressBatch = emptyProgressBatch(new WriterKey(9L, 3L), 1L);
+
+        v0.putRecordsToLeader(compact, null, MergeMode.DEFAULT, 0);
+        assertThatThrownBy(
+                        () -> v0.putRecordsToLeader(progressBatch, null, MergeMode.OVERWRITE, -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+
+        TablePath v1Path = TablePath.of("test_db", "protocol_v1");
+        long v1TableId = 991L;
+        TableDescriptor v1Descriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(3)
+                        .property(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION, 1)
+                        .build();
+        zkClient.registerTable(
+                v1Path,
+                TableRegistration.newTable(v1TableId, DEFAULT_REMOTE_DATA_DIR, v1Descriptor));
+        zkClient.registerFirstSchema(v1Path, DATA1_SCHEMA_PK);
+        long now = System.currentTimeMillis();
+        TableInfo v1Info =
+                TableInfo.of(
+                        v1Path,
+                        v1TableId,
+                        DEFAULT_SCHEMA_ID,
+                        v1Descriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+        TableBucket v1Bucket = new TableBucket(v1TableId, 0);
+        Replica v1 = makeKvReplica(PhysicalTablePath.of(v1Path), v1Bucket, v1Info);
+        makeLeaderReplica(v1, v1Path, v1Bucket, INITIAL_LEADER_EPOCH);
+
+        assertThatThrownBy(() -> v1.putRecordsToLeader(compact, null, MergeMode.OVERWRITE, -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThatThrownBy(() -> v1.putRecordsToLeader(progressBatch, null, MergeMode.DEFAULT, -1))
+                .isInstanceOf(InvalidTableException.class);
+        assertThatThrownBy(() -> v1.putRecordsToLeader(progressBatch, null, MergeMode.OVERWRITE, 0))
+                .isInstanceOf(InvalidTableException.class);
+        v1.putRecordsToLeader(progressBatch, null, MergeMode.OVERWRITE, -1);
+
+        conf.set(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER, 2);
+        assertThatThrownBy(
+                        () ->
+                                v0.putRecordsToLeader(
+                                        emptyProgressBatch(new WriterKey(9L, 4L), 2L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThatThrownBy(() -> v1.putRecordsToLeader(compact, null, MergeMode.OVERWRITE, -1))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThatThrownBy(
+                        () ->
+                                v1.putRecordsToLeader(
+                                        emptyProgressBatch(new WriterKey(9L, 5L), 2L),
+                                        null,
+                                        MergeMode.DEFAULT,
+                                        -1))
+                .isInstanceOf(InvalidTableException.class);
+    }
+
+    @Test
+    void testAfterPutAdmissionHookHasScopedOwnership() throws Exception {
+        TableBucket tableBucket = new TableBucket(998L, 0);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 998L, tableBucket);
+        WriterKey writerKey = new WriterKey(17L, 9L);
+        AtomicInteger hookCalls = new AtomicInteger();
+
+        AutoCloseable first =
+                replica.installAfterPutAdmissionHook(
+                        records -> {
+                            assertThat(records.writerKey()).isEqualTo(writerKey);
+                            assertThat(records.writerProgress()).isEqualTo(100L);
+                            hookCalls.incrementAndGet();
+                        });
+        assertThatThrownBy(() -> replica.installAfterPutAdmissionHook(ignored -> {}))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("already installed");
+        replica.putRecordsToLeader(
+                emptyProgressBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
+        first.close();
+
+        try (AutoCloseable replacement =
+                replica.installAfterPutAdmissionHook(ignored -> hookCalls.incrementAndGet())) {
+            // A stale owner must not clear the replacement registration.
+            first.close();
+            replica.putRecordsToLeader(
+                    emptyProgressBatch(writerKey, 101L), null, MergeMode.OVERWRITE, -1);
+        }
+        replica.putRecordsToLeader(
+                emptyProgressBatch(writerKey, 102L), null, MergeMode.OVERWRITE, -1);
+
+        assertThat(hookCalls).hasValue(2);
+    }
+
+    @Test
+    void testUncertainV1AppendFailStopsExactlyOnce() throws Exception {
+        TableBucket tableBucket = new TableBucket(994L, 0);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 994L, tableBucket);
+        AtomicInteger fatalErrors = installCountingFatalHandler(replica);
+        LogTabletTestHelper.failOnceAt(
+                replica.getLogTablet(),
+                FaultPhase.AFTER_LOCAL_APPEND,
+                new IOException("injected append failure"));
+
+        assertThatThrownBy(
+                        () ->
+                                replica.putRecordsToLeader(
+                                        emptyProgressBatch(new WriterKey(7L, 3L), 100L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isInstanceOf(UncertainWalAppendException.class);
+        assertThat(fatalErrors).hasValue(1);
+        assertThat(replica.isOnline()).isFalse();
+        assertThatThrownBy(
+                        () ->
+                                replica.putRecordsToLeader(
+                                        emptyProgressBatch(new WriterKey(7L, 3L), 101L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isInstanceOf(NotLeaderOrFollowerException.class);
+        assertThat(fatalErrors).hasValue(1);
+    }
+
+    @Test
+    void testUncertainV1ErrorFailStopsAndRethrowsSameError() throws Exception {
+        TableBucket tableBucket = new TableBucket(995L, 0);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 995L, tableBucket);
+        AtomicInteger fatalErrors = installCountingFatalHandler(replica);
+        AssertionError injected = new AssertionError("injected fatal append error");
+        LogTabletTestHelper.failOnceAt(
+                replica.getLogTablet(), FaultPhase.BEFORE_LOCAL_APPEND, injected);
+
+        assertThatThrownBy(
+                        () ->
+                                replica.putRecordsToLeader(
+                                        emptyProgressBatch(new WriterKey(8L, 4L), 100L),
+                                        null,
+                                        MergeMode.OVERWRITE,
+                                        -1))
+                .isSameAs(injected);
+        assertThat(fatalErrors).hasValue(1);
+        assertThat(replica.isOnline()).isFalse();
+    }
+
+    @Test
+    void testFailedDestructiveV1RecoveryPublishesNoPartialStateAndPreventsPromotion()
+            throws Exception {
+        long tableId = 997L;
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        TablePath tablePath = TablePath.of("test_db", "matrix_1");
+        Replica replica =
+                makeProtocolReplica(
+                        KvIdempotenceProtocol.CUMULATIVE_PROGRESS, tableId, tableBucket);
+        WriterKey writerKey = new WriterKey(8L, 5L);
+        replica.putRecordsToLeader(
+                emptyProgressBatch(writerKey, 100L), null, MergeMode.OVERWRITE, -1);
+        replica.putRecordsToLeader(
+                emptyProgressBatch(writerKey, 500L), null, MergeMode.OVERWRITE, -1);
+        replica.putRecordsToLeader(
+                emptyProgressBatch(writerKey, 900L), null, MergeMode.OVERWRITE, -1);
+        WriterProgressStateEntry stateBefore =
+                replica.getLogTablet()
+                        .writerStateManager()
+                        .lastProgressEntry(writerKey)
+                        .orElseThrow(AssertionError::new);
+
+        replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket,
+                        Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID + 1,
+                                INITIAL_LEADER_EPOCH + 1,
+                                Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                INITIAL_LEADER_EPOCH + 1)));
+        LogTabletTestHelper.failOnceAt(
+                replica.getLogTablet(),
+                FaultPhase.DURING_WRITER_RECOVERY,
+                new IOException("injected recovery failure"));
+
+        assertThatThrownBy(() -> replica.truncateTo(2L)).isInstanceOf(StorageException.class);
+
+        assertThat(replica.isOnline()).isFalse();
+        assertThat(replica.getLogTablet().writerStateManager().lastProgressEntry(writerKey))
+                .contains(stateBefore);
+        assertThatThrownBy(
+                        () ->
+                                replica.makeLeader(
+                                        new NotifyLeaderAndIsrData(
+                                                PhysicalTablePath.of(tablePath),
+                                                tableBucket,
+                                                Arrays.asList(
+                                                        TABLET_SERVER_ID, TABLET_SERVER_ID + 1),
+                                                new LeaderAndIsr(
+                                                        TABLET_SERVER_ID,
+                                                        INITIAL_LEADER_EPOCH + 2,
+                                                        Arrays.asList(
+                                                                TABLET_SERVER_ID,
+                                                                TABLET_SERVER_ID + 1),
+                                                        Collections.emptyList(),
+                                                        INITIAL_COORDINATOR_EPOCH,
+                                                        INITIAL_LEADER_EPOCH + 2))))
+                .isInstanceOf(StorageException.class)
+                .hasMessageContaining("offline");
+    }
+
+    @Test
+    void testAdmittedPutQueuedBehindUncertainAppendIsRejected() throws Exception {
+        TableBucket tableBucket = new TableBucket(996L, 0);
+        Replica replica =
+                makeProtocolReplica(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, 996L, tableBucket);
+        AtomicInteger fatalErrors = installCountingFatalHandler(replica);
+        CountDownLatch firstPutInAppend = new CountDownLatch(1);
+        CountDownLatch failFirstPut = new CountDownLatch(1);
+        CountDownLatch secondPutAdmitted = new CountDownLatch(1);
+        CountDownLatch secondPutContendedOnKvLock = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        AutoCloseable admissionHook = null;
+
+        LogTabletTestHelper.runOnceAt(
+                replica.getLogTablet(),
+                FaultPhase.AFTER_LOCAL_APPEND,
+                () -> {
+                    firstPutInAppend.countDown();
+                    assertThat(failFirstPut.await(10, TimeUnit.SECONDS)).isTrue();
+                    throw new IOException("injected append failure");
+                });
+
+        try {
+            CompletableFuture<Throwable> first =
+                    capturePutFailure(
+                            executor, replica, emptyProgressBatch(new WriterKey(7L, 3L), 100L));
+            assertThat(firstPutInAppend.await(10, TimeUnit.SECONDS)).isTrue();
+
+            admissionHook =
+                    replica.installAfterPutAdmissionHook(
+                            ignoredRecords -> secondPutAdmitted.countDown());
+            setPutLockContentionHook(replica.getKvTablet(), secondPutContendedOnKvLock::countDown);
+            CompletableFuture<Throwable> second =
+                    capturePutFailure(
+                            executor, replica, emptyProgressBatch(new WriterKey(7L, 3L), 101L));
+
+            assertThat(secondPutAdmitted.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(secondPutContendedOnKvLock.await(10, TimeUnit.SECONDS)).isTrue();
+            failFirstPut.countDown();
+
+            assertThat(first.get(10, TimeUnit.SECONDS))
+                    .isInstanceOf(UncertainWalAppendException.class);
+            assertThat(second.get(10, TimeUnit.SECONDS))
+                    .isInstanceOf(UncertainWalAppendException.class);
+            assertThat(replica.getLogTablet().localLogEndOffset()).isEqualTo(1L);
+            assertThat(fatalErrors).hasValue(1);
+            assertThat(replica.isOnline()).isFalse();
+        } finally {
+            failFirstPut.countDown();
+            if (admissionHook != null) {
+                admissionHook.close();
+            }
+            setPutLockContentionHook(replica.getKvTablet(), null);
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    private static CompletableFuture<Throwable> capturePutFailure(
+            ExecutorService executor, Replica replica, KvRecordBatch records) {
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        replica.putRecordsToLeader(records, null, MergeMode.OVERWRITE, -1);
+                        return null;
+                    } catch (Throwable failure) {
+                        return failure;
+                    }
+                },
+                executor);
+    }
+
+    private static void setPutLockContentionHook(KvTablet kvTablet, Runnable hook)
+            throws Exception {
+        java.lang.reflect.Method method =
+                KvTablet.class.getDeclaredMethod("setPutLockContentionHook", Runnable.class);
+        method.setAccessible(true);
+        method.invoke(kvTablet, hook);
+    }
+
+    private static AtomicInteger installCountingFatalHandler(Replica replica) throws Exception {
+        AtomicInteger fatalErrors = new AtomicInteger();
+        Field field = Replica.class.getDeclaredField("fatalErrorHandler");
+        field.setAccessible(true);
+        field.set(replica, (FatalErrorHandler) ignored -> fatalErrors.incrementAndGet());
+        return fatalErrors;
+    }
+
+    private static KvRecordBatch emptyProgressBatch(WriterKey writerKey, long progress)
+            throws Exception {
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        DEFAULT_SCHEMA_ID,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED);
+        builder.setWriterState(writerKey, progress);
+        return KvRecordBatchReader.pointToByteBuffer(builder.build().getByteBuf().nioBuffer());
+    }
 
     @Test
     void testMakeLeader() throws Exception {
@@ -123,6 +500,268 @@ final class ReplicaTest extends ReplicaTestBase {
         makeKvReplicaAsLeader(kvReplica);
         assertThat(kvReplica.getLogTablet()).isNotNull();
         assertThat(kvReplica.getKvTablet()).isNotNull();
+    }
+
+    /** A table without secondary indexes must not create an index replicator. */
+    @Test
+    void testIndexReplicatorNotConstructedForTableWithoutIndexes() throws Exception {
+        Replica kvReplica =
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
+        assertThat(kvReplica.getIndexReplicator()).isNull();
+
+        makeKvReplicaAsLeader(kvReplica);
+        assertThat(kvReplica.getIndexReplicator())
+                .as("Table without indexes should not construct an IndexReplicator.")
+                .isNull();
+
+        // Demote — scheduler should still be null, and demote path must not throw even when nothing
+        // is wired.
+        makeKvReplicaAsFollower(kvReplica, INITIAL_LEADER_EPOCH + 1);
+        assertThat(kvReplica.getIndexReplicator()).isNull();
+    }
+
+    /** Index replication initialization waits until the Index Table metadata is locally visible. */
+    @Test
+    void testIndexReplicatorInitDefersWhenIndexTableNotYetInCache() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        // Index table is registered in ZK but NOT broadcast to the metadata cache yet — so the
+        // pre-check in maybeStartIndexReplicator must defer rather than throw.
+        assertThat(serverMetadataCache.getTableId(f.indexTablePath))
+                .as("precondition: cache does not yet know the auto-derived Index Table")
+                .isEmpty();
+
+        // Promote the main-table replica to leader. The pre-check should detect the missing
+        // index, log "deferring", and return WITHOUT throwing.
+        makeIndexedMainReplicaAsLeader(f);
+
+        assertThat(f.replica.getIndexReplicator())
+                .as("scheduler must not be wired while index table is invisible")
+                .isNull();
+        assertThat(f.replica.isIndexReplicatorInitDeferred())
+                .as("deferred flag must be raised")
+                .isTrue();
+        assertThat(f.replica.getAllIndexPushedOffset())
+                .as("an indexed main table must retain source WAL from offset zero while deferred")
+                .isZero();
+        assertThat(f.replica.getSyncIndexPushedOffset())
+                .as("the first SYNC write must wait beyond the offset-zero baseline")
+                .isZero();
+    }
+
+    @Test
+    void testSnapshotBeforeIndexReplicatorRetainsSourceWalFromZero(@TempDir Path snapshotDir)
+            throws Exception {
+        TestSnapshotContext snapshotContext = new TestSnapshotContext(snapshotDir.toString());
+        IndexedFixture f = setupIndexedMainTableReplica(snapshotContext);
+        TableBucket sourceBucket = new TableBucket(f.mainTableId, 0);
+
+        makeIndexedMainReplicaAsLeader(f, 0);
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        putRecordsToLeader(
+                f.replica,
+                org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch(
+                        new Object[] {1, "before-snapshot"}));
+        long expectedLogOffset = f.replica.getLocalLogEndOffset();
+        assertThat(expectedLogOffset).isPositive();
+
+        makeIndexedMainReplicaAsFollower(f, 1);
+        assertThat(f.replica.isLeader()).isFalse();
+        assertThat(f.replica.getKvTablet()).isNull();
+
+        AtomicReference<CompletedSnapshot> snapshotTakenBeforeReplicator = new AtomicReference<>();
+        f.replica.setKvSnapshotInitializationFaultInjector(
+                manager -> {
+                    assertThat(f.replica.getIndexReplicator()).isNull();
+                    manager.triggerSnapshot();
+                    snapshotTakenBeforeReplicator.set(
+                            snapshotContext.testKvSnapshotStore.waitUntilSnapshotComplete(
+                                    sourceBucket, 0));
+                });
+
+        makeIndexedMainReplicaAsLeader(f, 2);
+
+        CompletedSnapshot snapshot = snapshotTakenBeforeReplicator.get();
+        assertThat(snapshot).isNotNull();
+        assertThat(snapshot.getLogOffset()).isEqualTo(expectedLogOffset);
+        assertThat(snapshot.getIndexPushedOffset()).isEqualTo(0L);
+        assertThat(snapshot.getMinRetainLogOffset()).isZero();
+        assertThat(f.replica.getLogTablet().getMinRetainOffset()).isZero();
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+    }
+
+    @Test
+    void testSameIndexedReplicaRepromotionWithoutSnapshotResetsIndexProgress() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+
+        makeIndexedMainReplicaAsLeader(f, 0);
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        f.replica.advanceIndexProgress(11L, 7L);
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(11L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(7L);
+
+        makeIndexedMainReplicaAsFollower(f, 1);
+        makeIndexedMainReplicaAsLeader(f, 2);
+
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isZero();
+        assertThat(f.replica.getAllIndexPushedOffset()).isZero();
+    }
+
+    @Test
+    void testSameIndexedReplicaRepromotionRestoresExactSnapshotIndexProgress(
+            @TempDir Path snapshotDir) throws Exception {
+        TestSnapshotContext snapshotContext = new TestSnapshotContext(snapshotDir.toString());
+        IndexedFixture f = setupIndexedMainTableReplica(snapshotContext);
+        TableBucket sourceBucket = new TableBucket(f.mainTableId, 0);
+
+        makeIndexedMainReplicaAsLeader(f, 0);
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        putRecordsToLeader(
+                f.replica,
+                org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch(
+                        new Object[] {1, "snapshot-baseline"}));
+        f.replica.getKvSnapshotManager().triggerSnapshot();
+        CompletedSnapshot snapshot =
+                snapshotContext.testKvSnapshotStore.waitUntilSnapshotComplete(sourceBucket, 0);
+        assertThat(snapshot.getIndexPushedOffset()).isEqualTo(0L);
+
+        f.replica.advanceIndexProgress(11L, 7L);
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(11L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(7L);
+        makeIndexedMainReplicaAsFollower(f, 1);
+        makeIndexedMainReplicaAsLeader(f, 2);
+
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(0L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(0L);
+    }
+
+    @ParameterizedTest(name = "indexPushedOffset={0}")
+    @MethodSource("invalidSnapshotIndexPushedOffsets")
+    void testIndexedMainRejectsSnapshotWithoutValidIndexPushedOffset(
+            Long indexPushedOffset, @TempDir Path snapshotDir) throws Exception {
+        TestSnapshotContext snapshotContext = new TestSnapshotContext(snapshotDir.toString());
+        IndexedFixture f = setupIndexedMainTableReplica(snapshotContext);
+        TableBucket sourceBucket = new TableBucket(f.mainTableId, 0);
+        KvSnapshotHandle snapshotHandle = mock(KvSnapshotHandle.class);
+        CompletedSnapshot invalidSnapshot =
+                new CompletedSnapshot(
+                        sourceBucket,
+                        0L,
+                        new FsPath(snapshotDir.toUri()),
+                        snapshotHandle,
+                        5L,
+                        1L,
+                        indexPushedOffset,
+                        null);
+        snapshotContext.testKvSnapshotStore.commitKvSnapshot(
+                invalidSnapshot, INITIAL_COORDINATOR_EPOCH, INITIAL_LEADER_EPOCH);
+
+        assertThatThrownBy(() -> makeIndexedMainReplicaAsLeader(f))
+                .isInstanceOf(KvStorageException.class)
+                .hasRootCauseMessage(
+                        "KV Snapshot 0 for main table bucket "
+                                + sourceBucket
+                                + " with secondary indexes must contain a non-negative "
+                                + "indexPushedOffset, but was "
+                                + indexPushedOffset);
+
+        verifyNoInteractions(snapshotHandle);
+        assertThat(f.replica.isLeader()).isFalse();
+        assertThat(f.replica.getKvTablet()).isNull();
+        assertThat(kvManager.getKv(sourceBucket)).isEmpty();
+        assertThat(f.replica.getKvSnapshotManager()).isNull();
+        assertThat(f.replica.hasReadyKvSnapshotManager()).isFalse();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+        assertThat(f.replica.getLogTablet().getMinRetainOffset()).isZero();
+    }
+
+    @Test
+    void testIndexReplicatorInitDefersWhenIndexTableIdVisibleButMetadataMissing() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        publishIndexTableToCache(f);
+        assertThat(serverMetadataCache.getTableId(f.indexTablePath)).isPresent();
+
+        // Simulate a half-propagated/stale metadata state: the path->tableId mapping is already
+        // visible locally, but getTableMetadata(path) cannot resolve the table info yet.
+        zkClient.deleteTable(f.indexTablePath);
+        assertThat(serverMetadataCache.getTableMetadata(f.indexTablePath)).isEmpty();
+
+        makeIndexedMainReplicaAsLeader(f);
+
+        assertThat(f.replica.getIndexReplicator())
+                .as("scheduler must not be wired until full index table metadata is visible")
+                .isNull();
+        assertThat(f.replica.isIndexReplicatorInitDeferred())
+                .as("half-propagated metadata must keep initialization deferred")
+                .isTrue();
+    }
+
+    /** A metadata update retries deferred index replication initialization. */
+    @Test
+    void testIndexReplicatorInitRetriesAfterMetadataUpdate() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        makeIndexedMainReplicaAsLeader(f);
+        assertThat(f.replica.isIndexReplicatorInitDeferred()).isTrue();
+        assertThat(f.replica.getIndexReplicator()).isNull();
+
+        // Populate the cache with the index-table metadata — exactly what the Coordinator
+        // broadcast does once the auto-derived CreateTableEvent is processed.
+        publishIndexTableToCache(f);
+
+        // Explicitly call the retry hook the way ReplicaManager would after the cache update.
+        f.replica.retryMaybeStartIndexReplicator();
+
+        assertThat(f.replica.getIndexReplicator())
+                .as("scheduler must be wired now that the index table is visible")
+                .isNotNull();
+        assertThat(f.replica.isIndexReplicatorInitDeferred())
+                .as("deferred flag must be cleared after a successful retry")
+                .isFalse();
+    }
+
+    @Test
+    void testLeaderEpochBumpReplacesAndClosesIndexReplicator() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+        publishIndexTableToCache(f);
+        makeIndexedMainReplicaAsLeader(f, INITIAL_LEADER_EPOCH);
+        IndexReplicator previous = f.replica.getIndexReplicator();
+        assertThat(previous).isNotNull();
+
+        makeIndexedMainReplicaAsLeader(f, INITIAL_LEADER_EPOCH + 1);
+
+        assertThat(f.replica.getIndexReplicator()).isNotNull().isNotSameAs(previous);
+        assertThat(previous.isClosed()).isTrue();
+    }
+
+    @Test
+    void testIndexProgressSplitsSyncAckWatermarkFromAllIndexFloor() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica();
+
+        f.replica.advanceIndexProgress(100L, 40L);
+
+        assertThat(f.replica.requiresSyncIndexVisibility()).isTrue();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(100L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(40L);
+        assertThat(f.replica.getSyncIndexPushedOffset())
+                .as("sync ack watermark remains independent from the all-index replay floor")
+                .isEqualTo(100L);
+    }
+
+    @Test
+    void testAsyncOnlyIndexProgressKeepsSyncOffsetNotApplicable() throws Exception {
+        IndexedFixture f = setupIndexedMainTableReplica(IndexVisibility.ASYNC);
+
+        f.replica.advanceIndexProgress(Long.MAX_VALUE, 40L);
+
+        assertThat(f.replica.requiresSyncIndexVisibility()).isFalse();
+        assertThat(f.replica.getSyncIndexPushedOffset()).isEqualTo(-1L);
+        assertThat(f.replica.getAllIndexPushedOffset()).isEqualTo(40L);
     }
 
     @Test
@@ -462,6 +1101,10 @@ final class ReplicaTest extends ReplicaTestBase {
         CompletedSnapshot completedSnapshot0 =
                 kvSnapshotStore.waitUntilSnapshotComplete(tableBucket, 0);
 
+        assertThat(completedSnapshot0.getIndexPushedOffset()).isNull();
+        assertThat(completedSnapshot0.getMinRetainLogOffset())
+                .isEqualTo(completedSnapshot0.getLogOffset());
+
         // check snapshot
         long expectedLogOffset = 4;
         List<Tuple2<byte[], byte[]>> expectedKeyValues =
@@ -725,7 +1368,13 @@ final class ReplicaTest extends ReplicaTestBase {
                 kvReplica,
                 DataTestUtils.genKvRecordBatch(new Object[] {4, "555"}, new Object[] {3, "d"}));
         // update schema.
-        zkClient.registerSchema(DATA1_TABLE_PATH_PK, DATA2_SCHEMA, newSchemaId);
+        ZkEpoch schemaEpoch = zkClient.fenceBecomeCoordinatorLeader("schema-test");
+        zkClient.registerSchema(
+                DATA1_TABLE_PATH_PK,
+                DATA1_TABLE_ID_PK,
+                DATA2_SCHEMA,
+                newSchemaId,
+                schemaEpoch.getCoordinatorEpochZkVersion());
         serverMetadataCache.updateLatestSchema(
                 DATA1_TABLE_ID, new SchemaInfo(DATA2_SCHEMA, newSchemaId));
         // write data with new schema
@@ -981,5 +1630,303 @@ final class ReplicaTest extends ReplicaTestBase {
         public void reset() {
             isScheduled = false;
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Helpers for deferred index-replicator initialization tests.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Per-test fixture: a fresh main-table {@link Replica} carrying one declared {@link
+     * Schema.Index}, registered in ZK alongside the auto-derived Index Table — but with the index
+     * NOT yet propagated into the local metadata cache.
+     */
+    private static final class IndexedFixture {
+        final Replica replica;
+        final TablePath mainPath;
+        final long mainTableId;
+        final TablePath indexTablePath;
+        final long indexTableId;
+        final TableInfo indexTableInfo;
+
+        IndexedFixture(
+                Replica replica,
+                TablePath mainPath,
+                long mainTableId,
+                TablePath indexTablePath,
+                long indexTableId,
+                TableInfo indexTableInfo) {
+            this.replica = replica;
+            this.mainPath = mainPath;
+            this.mainTableId = mainTableId;
+            this.indexTablePath = indexTablePath;
+            this.indexTableId = indexTableId;
+            this.indexTableInfo = indexTableInfo;
+        }
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica() throws Exception {
+        return setupIndexedMainTableReplica(null, IndexVisibility.SYNC);
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica(TestSnapshotContext snapshotContext)
+            throws Exception {
+        return setupIndexedMainTableReplica(snapshotContext, IndexVisibility.SYNC);
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica(IndexVisibility indexVisibility)
+            throws Exception {
+        return setupIndexedMainTableReplica(null, indexVisibility);
+    }
+
+    private IndexedFixture setupIndexedMainTableReplica(
+            TestSnapshotContext snapshotContext, IndexVisibility indexVisibility) throws Exception {
+        String indexName = "idx_b";
+        String mainName = "test_indexed_main";
+        long mainTableId = 9001L;
+        long indexTableId = 9002L;
+
+        TablePath mainPath = TablePath.of(DATA1_TABLE_PATH_PK.getDatabaseName(), mainName);
+        TablePath indexPath =
+                TablePath.of(
+                        mainPath.getDatabaseName(),
+                        IndexTableUtils.indexTableName(mainName, indexName));
+
+        Schema mainSchema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .primaryKey("a")
+                        .index(
+                                indexName,
+                                IndexType.SECONDARY,
+                                Collections.singletonList("b"),
+                                indexVisibility,
+                                1)
+                        .build();
+        TableDescriptor mainDescriptor =
+                TableDescriptor.builder().schema(mainSchema).distributedBy(1, "a").build();
+        TableDescriptor indexDescriptor =
+                IndexTableDescriptorFactory.derive(
+                        mainDescriptor, mainTableId, mainPath.toString(), indexName);
+
+        long now = System.currentTimeMillis();
+        TableInfo mainTableInfo =
+                TableInfo.of(
+                        mainPath,
+                        mainTableId,
+                        DEFAULT_SCHEMA_ID,
+                        mainDescriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+        TableInfo indexTableInfo =
+                TableInfo.of(
+                        indexPath,
+                        indexTableId,
+                        DEFAULT_SCHEMA_ID,
+                        indexDescriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+
+        if (!zkClient.tableExist(mainPath)) {
+            zkClient.registerTable(
+                    mainPath,
+                    TableRegistration.newTable(
+                            mainTableId, DEFAULT_REMOTE_DATA_DIR, mainDescriptor));
+            zkClient.registerFirstSchema(mainPath, mainSchema);
+        }
+        if (!zkClient.tableExist(indexPath)) {
+            zkClient.registerTable(
+                    indexPath,
+                    TableRegistration.newTable(
+                            indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
+            zkClient.registerFirstSchema(indexPath, indexDescriptor.getSchema());
+        }
+
+        TableBucket mainBucket = new TableBucket(mainTableId, 0);
+        Replica replica =
+                snapshotContext == null
+                        ? makeKvReplica(PhysicalTablePath.of(mainPath), mainBucket, mainTableInfo)
+                        : makeKvReplica(
+                                PhysicalTablePath.of(mainPath),
+                                mainBucket,
+                                snapshotContext,
+                                mainTableInfo);
+        return new IndexedFixture(
+                replica, mainPath, mainTableId, indexPath, indexTableId, indexTableInfo);
+    }
+
+    private void makeIndexedMainReplicaAsLeader(IndexedFixture f) throws Exception {
+        makeIndexedMainReplicaAsLeader(f, INITIAL_LEADER_EPOCH);
+    }
+
+    private void makeIndexedMainReplicaAsLeader(IndexedFixture f, int leaderEpoch)
+            throws Exception {
+        f.replica.makeLeader(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(f.mainPath),
+                        new TableBucket(f.mainTableId, 0),
+                        Collections.singletonList(TABLET_SERVER_ID),
+                        new LeaderAndIsr(
+                                TABLET_SERVER_ID,
+                                leaderEpoch,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                leaderEpoch)));
+    }
+
+    private void makeIndexedMainReplicaAsFollower(IndexedFixture f, int leaderEpoch) {
+        int remoteLeader = TABLET_SERVER_ID + 1;
+        List<Integer> replicas = Arrays.asList(TABLET_SERVER_ID, remoteLeader);
+        f.replica.makeFollower(
+                new NotifyLeaderAndIsrData(
+                        PhysicalTablePath.of(f.mainPath),
+                        new TableBucket(f.mainTableId, 0),
+                        replicas,
+                        new LeaderAndIsr(
+                                remoteLeader,
+                                leaderEpoch,
+                                replicas,
+                                Collections.emptyList(),
+                                INITIAL_COORDINATOR_EPOCH,
+                                leaderEpoch)));
+    }
+
+    /**
+     * Push the auto-derived Index Table's metadata into the {@link
+     * org.apache.fluss.server.metadata.TabletServerMetadataCache} the way the production
+     * Coordinator → TabletServer broadcast does. After this call the cache knows the index table id
+     * + bucket layout so {@code retryMaybeStartIndexReplicator()} can succeed.
+     */
+    private void publishIndexTableToCache(IndexedFixture f) {
+        BucketMetadata bucketMetadata =
+                new BucketMetadata(
+                        0,
+                        TABLET_SERVER_ID,
+                        INITIAL_LEADER_EPOCH,
+                        Collections.singletonList(TABLET_SERVER_ID));
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        null,
+                        Collections.emptySet(),
+                        Collections.singletonList(
+                                new TableMetadata(
+                                        f.indexTableInfo,
+                                        Collections.singletonList(bucketMetadata))),
+                        Collections.emptyList()));
+    }
+
+    @ParameterizedTest(name = "table={0}, api={1}, magic={2}, accepted={3}")
+    @MethodSource("putKvProtocolMatrix")
+    void testExactPutKvProtocolMatrix(
+            KvIdempotenceProtocol tableProtocol,
+            short apiVersion,
+            byte batchMagic,
+            boolean accepted)
+            throws Exception {
+        long tableId =
+                tableProtocol == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE ? 992L : 993L;
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        Replica replica = makeProtocolReplica(tableProtocol, tableId, tableBucket);
+        BytesView encoded = encodedKvBatch(batchMagic);
+        PutKvRequest request =
+                new PutKvRequest().setTableId(tableId).setAcks(-1).setTimeoutMs(1000);
+        request.addBucketsReq().setBucketId(0).setRecordsBytesView(encoded);
+
+        org.assertj.core.api.ThrowableAssert.ThrowingCallable put =
+                () -> {
+                    KvRecordBatch parsed =
+                            ServerRpcMessageUtils.getPutKvData(request, apiVersion)
+                                    .get(tableBucket);
+                    replica.putRecordsToLeader(parsed, null, MergeMode.OVERWRITE, -1);
+                };
+        if (accepted) {
+            assertThatCode(put).doesNotThrowAnyException();
+            assertThat(replica.getLogTablet().localLogEndOffset()).isEqualTo(1L);
+        } else {
+            assertThatThrownBy(put).isInstanceOf(UnsupportedVersionException.class);
+            assertThat(replica.getKvTablet().getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
+            assertThat(replica.getLogTablet().localLogEndOffset()).isZero();
+        }
+    }
+
+    private static Stream<Arguments> invalidSnapshotIndexPushedOffsets() {
+        return Stream.of(Arguments.of((Long) null), Arguments.of(-1L));
+    }
+
+    private static Stream<Arguments> putKvProtocolMatrix() {
+        return Stream.of(
+                Arguments.of(
+                        KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE, (short) 1, (byte) 0, true),
+                Arguments.of(
+                        KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE, (short) 2, (byte) 0, true),
+                Arguments.of(
+                        KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE,
+                        (short) 2,
+                        (byte) 1,
+                        false),
+                Arguments.of(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, (short) 1, (byte) 1, false),
+                Arguments.of(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, (short) 2, (byte) 0, false),
+                Arguments.of(KvIdempotenceProtocol.CUMULATIVE_PROGRESS, (short) 2, (byte) 1, true));
+    }
+
+    private Replica makeProtocolReplica(
+            KvIdempotenceProtocol protocol, long tableId, TableBucket tableBucket)
+            throws Exception {
+        TablePath path = TablePath.of("test_db", "matrix_" + protocol.version());
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(3)
+                        .property(
+                                ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION,
+                                protocol.version())
+                        .build();
+        zkClient.registerTable(
+                path, TableRegistration.newTable(tableId, DEFAULT_REMOTE_DATA_DIR, descriptor));
+        zkClient.registerFirstSchema(path, DATA1_SCHEMA_PK);
+        long now = System.currentTimeMillis();
+        TableInfo info =
+                TableInfo.of(
+                        path,
+                        tableId,
+                        DEFAULT_SCHEMA_ID,
+                        descriptor,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        now,
+                        now);
+        Replica replica = makeKvReplica(PhysicalTablePath.of(path), tableBucket, info);
+        makeLeaderReplica(replica, path, tableBucket, INITIAL_LEADER_EPOCH);
+        return replica;
+    }
+
+    private static BytesView encodedKvBatch(byte magic) throws Exception {
+        if (magic == KvRecordBatch.KV_MAGIC_VALUE_V0) {
+            KvRecordBatchBuilder builder =
+                    KvRecordBatchBuilder.builder(
+                            DEFAULT_SCHEMA_ID,
+                            1024,
+                            new UnmanagedPagedOutputView(128),
+                            KvFormat.COMPACTED);
+            builder.append(
+                    "matrix-key".getBytes(),
+                    compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "v0"}));
+            builder.setWriterState(11L, 0);
+            return builder.build();
+        }
+        ProgressKvRecordBatchBuilder builder =
+                ProgressKvRecordBatchBuilder.builder(
+                        DEFAULT_SCHEMA_ID,
+                        1024,
+                        new UnmanagedPagedOutputView(128),
+                        KvFormat.COMPACTED);
+        builder.append(
+                "matrix-key".getBytes(),
+                compactedRow(DATA1_SCHEMA_PK.getRowType(), new Object[] {1, "v1"}));
+        builder.setWriterState(new WriterKey(9L, 3L), 1L);
+        return builder.build();
     }
 }

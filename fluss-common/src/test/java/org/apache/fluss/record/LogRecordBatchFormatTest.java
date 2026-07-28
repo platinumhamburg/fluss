@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.HEADER_SIZE_UP_TO_MAGIC;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.attributeOffset;
@@ -34,6 +35,9 @@ import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.statisticsDataOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.statisticsLengthOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyHighOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyLowOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerProgressOffset;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -103,5 +107,26 @@ public class LogRecordBatchFormatTest {
         assertThat(statisticsLengthOffset(magic)).isEqualTo(52);
         assertThat(statisticsDataOffset(magic)).isEqualTo(56);
         assertThat(recordBatchHeaderSize(magic)).isEqualTo(56);
+    }
+
+    @Test
+    void testLogRecordBatchFormatForMagicV3() {
+        assertThat(leaderEpochOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(21);
+        assertThat(crcOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(25);
+        assertThat(schemaIdOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(29);
+        assertThat(attributeOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(31);
+        assertThat(lastOffsetDeltaOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(32);
+        assertThat(writerKeyHighOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(36);
+        assertThat(writerKeyLowOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(44);
+        assertThat(writerProgressOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(52);
+        assertThat(recordsCountOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(60);
+        assertThat(statisticsLengthOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(64);
+        assertThat(statisticsDataOffset(LOG_MAGIC_VALUE_V3)).isEqualTo(68);
+        assertThat(recordBatchHeaderSize(LOG_MAGIC_VALUE_V3)).isEqualTo(68);
+
+        assertThatThrownBy(() -> writeClientIdOffset(LOG_MAGIC_VALUE_V3))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> batchSequenceOffset(LOG_MAGIC_VALUE_V3))
+                .isInstanceOf(UnsupportedOperationException.class);
     }
 }

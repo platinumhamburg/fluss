@@ -84,6 +84,7 @@ public class KvSnapshotBatchScanner implements BatchScanner {
     private final Path snapshotLocalDirectory;
     private final RemoteFileDownloader remoteFileDownloader;
     private final KvFormat kvFormat;
+    private final int kvFormatVersion;
 
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -105,6 +106,7 @@ public class KvSnapshotBatchScanner implements BatchScanner {
             @Nullable int[] projectedFields,
             String scannerTmpDir,
             KvFormat kvFormat,
+            int kvFormatVersion,
             RemoteFileDownloader remoteFileDownloader) {
         this.targetSchema = targetSchema;
         this.targetSchemaId = targetSchemaId;
@@ -113,6 +115,7 @@ public class KvSnapshotBatchScanner implements BatchScanner {
         this.fsPathAndFileNames = fsPathAndFileNames;
         this.projectedFields = projectedFields;
         this.kvFormat = kvFormat;
+        this.kvFormatVersion = kvFormatVersion;
         // create a directory to store the snapshot files
         this.snapshotLocalDirectory =
                 Paths.get(scannerTmpDir, String.format("kv-snapshots-%s", UUID.randomUUID()));
@@ -216,6 +219,7 @@ public class KvSnapshotBatchScanner implements BatchScanner {
                                         snapshotFilesReader =
                                                 new SnapshotFilesReader(
                                                         kvFormat,
+                                                        kvFormatVersion,
                                                         snapshotLocalDirectory,
                                                         projectedFields,
                                                         targetSchemaId,

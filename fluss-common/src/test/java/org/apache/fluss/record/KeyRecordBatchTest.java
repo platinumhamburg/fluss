@@ -17,15 +17,24 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
 
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
@@ -185,6 +194,79 @@ class KeyRecordBatchTest extends KvTestBase {
                 new KeyRecordBatch(Arrays.asList(), KvFormat.COMPACTED, DEFAULT_SCHEMA_ID);
         assertThat(batch.getRecordCount()).isEqualTo(0);
         assertThat(batch.records(createContext(schema)).iterator().hasNext()).isFalse();
+    }
+
+    @Test
+    void testVersionThreeDecodesVersionTwoKeyEncoding() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("payload", DataTypes.STRING())
+                        .primaryKey("id", "name")
+                        .build();
+        CompactedKeyEncoder keyEncoder =
+                CompactedKeyEncoder.createKeyEncoder(
+                        schema.getRowType(), schema.getPrimaryKeyColumnNames());
+        byte[] key = keyEncoder.encodeKey(row(1, "Alice", "ignored"));
+
+        KeyRecordBatch batch =
+                new KeyRecordBatch(
+                        Collections.singletonList(key),
+                        KvFormat.COMPACTED,
+                        (short) ConfigOptions.KV_FORMAT_VERSION_3,
+                        DEFAULT_SCHEMA_ID,
+                        false,
+                        null);
+        BinaryRow result = batch.records(createContext(schema)).iterator().next().getRow();
+
+        assertThat(result.getInt(0)).isEqualTo(1);
+        assertThat(result.getString(1).toString()).isEqualTo("Alice");
+        assertThat(result.isNullAt(2)).isTrue();
+    }
+
+    @Test
+    void testCreatePreservesLegacyKeysWhenKvFormatVersionIsMissing() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("payload", DataTypes.STRING())
+                        .primaryKey("id", "name")
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1, "id")
+                        .property(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON)
+                        .build();
+        long now = System.currentTimeMillis();
+        TableInfo tableInfo =
+                TableInfo.of(
+                        TablePath.of("db", "missing_version_keys"),
+                        1L,
+                        DEFAULT_SCHEMA_ID,
+                        descriptor,
+                        null,
+                        now,
+                        now);
+        Configuration legacyConfig = new Configuration();
+        legacyConfig.set(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON);
+        legacyConfig.set(ConfigOptions.TABLE_KV_FORMAT_VERSION, 1);
+        KeyEncoder keyEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        schema.getRowType(),
+                        schema.getPrimaryKeyColumnNames(),
+                        new TableConfig(legacyConfig),
+                        false);
+        byte[] key = keyEncoder.encodeKey(row(1, "Alice", "ignored"));
+
+        KeyRecordBatch batch = KeyRecordBatch.create(Collections.singletonList(key), tableInfo);
+        BinaryRow result = batch.records(createContext(schema)).iterator().next().getRow();
+
+        assertThat(result.getInt(0)).isEqualTo(1);
+        assertThat(result.getString(1).toString()).isEqualTo("Alice");
+        assertThat(result.isNullAt(2)).isTrue();
     }
 
     private KvRecordBatch.ReadContext createContext(Schema schema) {

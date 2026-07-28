@@ -32,6 +32,9 @@ public interface KvRecordBatch {
     /** The "magic" values. */
     byte KV_MAGIC_VALUE_V0 = 0;
 
+    /** The cumulative-progress idempotence protocol magic value. */
+    byte KV_MAGIC_VALUE_V1 = 1;
+
     /** The current "magic" value. */
     byte CURRENT_KV_MAGIC_VALUE = KV_MAGIC_VALUE_V0;
 
@@ -82,6 +85,21 @@ public interface KvRecordBatch {
      * @return batch base sequence
      */
     int batchSequence();
+
+    /** Returns the idempotence protocol version represented by this batch. */
+    default int idempotenceProtocolVersion() {
+        return 0;
+    }
+
+    /** Returns the cumulative-progress writer key. */
+    default WriterKey writerKey() {
+        throw new UnsupportedOperationException("Contiguous-sequence batch has no WriterKey");
+    }
+
+    /** Returns the cumulative writer progress. */
+    default long writerProgress() {
+        throw new UnsupportedOperationException("Contiguous-sequence batch has no writer progress");
+    }
 
     /**
      * Get the size in bytes of this batch, including the size of the record and the batch overhead.

@@ -128,7 +128,8 @@ public class RebalanceManagerTest {
                         metadataManager,
                         new RemoteDirDynamicLoader(conf),
                         conf,
-                        replicaCapacityController);
+                        replicaCapacityController,
+                        zkEpoch.getCoordinatorEpochZkVersion());
         lakeTableTieringManager =
                 new LakeTableTieringManager(TestingMetricGroups.LAKE_TIERING_METRICS);
         CoordinatorEventProcessor eventProcessor = buildCoordinatorEventProcessor(conf);

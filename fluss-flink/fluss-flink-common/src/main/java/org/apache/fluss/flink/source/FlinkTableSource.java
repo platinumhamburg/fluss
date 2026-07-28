@@ -172,6 +172,8 @@ public class FlinkTableSource
 
     private final Map<String, String> tableOptions;
 
+    @Nullable private final int[][] secondaryIndexes;
+
     @Nullable private LakeSource<LakeSplit> lakeSource;
     @Nullable private Predicate logRecordBatchFilter;
 
@@ -195,7 +197,8 @@ public class FlinkTableSource
             boolean isDataLakeEnabled,
             @Nullable MergeEngineType mergeEngineType,
             Map<String, String> tableOptions,
-            LeaseContext leaseContext) {
+            LeaseContext leaseContext,
+            @Nullable int[][] secondaryIndexes) {
         this(
                 tablePath,
                 flussConfig,
@@ -214,7 +217,8 @@ public class FlinkTableSource
                 isDataLakeEnabled,
                 mergeEngineType,
                 tableOptions,
-                leaseContext);
+                leaseContext,
+                secondaryIndexes);
     }
 
     public FlinkTableSource(
@@ -235,7 +239,8 @@ public class FlinkTableSource
             boolean isDataLakeEnabled,
             @Nullable MergeEngineType mergeEngineType,
             Map<String, String> tableOptions,
-            LeaseContext leaseContext) {
+            LeaseContext leaseContext,
+            @Nullable int[][] secondaryIndexes) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableOutputType = tableOutputType;
@@ -256,6 +261,7 @@ public class FlinkTableSource
         this.leaseContext = leaseContext;
         this.mergeEngineType = mergeEngineType;
         this.tableOptions = tableOptions;
+        this.secondaryIndexes = secondaryIndexes;
         if (isDataLakeEnabled) {
             this.lakeSource =
                     checkNotNull(
@@ -473,7 +479,8 @@ public class FlinkTableSource
                         bucketKeyIndexes,
                         partitionKeyIndexes,
                         tableOutputType,
-                        projectedFields);
+                        projectedFields,
+                        secondaryIndexes);
         if (lookupAsync) {
             AsyncLookupFunction asyncLookupFunction =
                     new FlinkAsyncLookupFunction(
@@ -526,7 +533,8 @@ public class FlinkTableSource
                         isDataLakeEnabled,
                         mergeEngineType,
                         tableOptions,
-                        leaseContext);
+                        leaseContext,
+                        secondaryIndexes);
         source.producedDataType = producedDataType;
         source.projectedFields = projectedFields;
         source.singleRowFilter = singleRowFilter;

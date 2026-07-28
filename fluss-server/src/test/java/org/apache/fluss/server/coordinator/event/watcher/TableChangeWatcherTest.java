@@ -41,6 +41,7 @@ import org.apache.fluss.server.coordinator.event.TableRegistrationChangeEvent;
 import org.apache.fluss.server.coordinator.event.TestingEventManager;
 import org.apache.fluss.server.entity.TablePropertyChanges;
 import org.apache.fluss.server.zk.NOPErrorHandler;
+import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
@@ -87,6 +88,7 @@ class TableChangeWatcherTest {
     private TableLifecycleThrottler lifecycleThrottler;
     private TableChangeWatcher tableChangeWatcher;
     private static MetadataManager metadataManager;
+    private ZkEpoch zkEpoch;
 
     @BeforeAll
     static void beforeAll() {
@@ -103,7 +105,8 @@ class TableChangeWatcherTest {
     }
 
     @BeforeEach
-    void before() {
+    void before() throws Exception {
+        zkEpoch = zookeeperClient.fenceBecomeCoordinatorLeader("coordinator");
         // Clean up ZK state from previous tests to prevent CuratorCache initial sync
         // from picking up leftover data
         try {
@@ -252,9 +255,21 @@ class TableChangeWatcherTest {
                                 .getBucketAssignments());
         // register assignment and metadata
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                1L, "2011", partitionAssignment, remoteDataDir, tablePath, tableId);
+                1L,
+                "2011",
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                2L, "2022", partitionAssignment, remoteDataDir, tablePath, tableId);
+                2L,
+                "2022",
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // create partitions events
         expectedEvents.add(
@@ -345,7 +360,8 @@ class TableChangeWatcherTest {
                                     null,
                                     TableChange.ColumnPosition.last())),
                     false,
-                    null);
+                    null,
+                    zkEpoch.getCoordinatorEpochZkVersion());
             Schema newSchema =
                     Schema.newBuilder()
                             .fromSchema(tableInfo.getSchema())
@@ -409,7 +425,12 @@ class TableChangeWatcherTest {
         builder.setCustomProperty("custom.key", "custom.value");
         TablePropertyChanges tablePropertyChanges = builder.build();
         metadataManager.alterTableProperties(
-                tablePath, Collections.emptyList(), tablePropertyChanges, false, null);
+                tablePath,
+                Collections.emptyList(),
+                tablePropertyChanges,
+                false,
+                null,
+                zkEpoch.getCoordinatorEpochZkVersion());
 
         // get the updated table registration
         TableRegistration updatedTableRegistration =

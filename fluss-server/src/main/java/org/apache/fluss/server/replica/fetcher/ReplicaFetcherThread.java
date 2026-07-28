@@ -24,6 +24,7 @@ import org.apache.fluss.exception.InvalidRecordException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.RemoteStorageException;
 import org.apache.fluss.exception.StorageException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -54,7 +55,9 @@ import javax.annotation.concurrent.GuardedBy;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Collections;
 import java.util.HashSet;
@@ -104,6 +107,9 @@ final class ReplicaFetcherThread extends ShutdownableThread {
     private final Condition bucketStatusMapCondition = bucketStatusMapLock.newCondition();
 
     private final TabletServerMetricGroup serverMetricGroup;
+    private RemoteWriterStateRecovery remoteWriterStateRecovery = this::recoverRemoteWriterState;
+    private SnapshotFileMover snapshotFileMover =
+            (source, target) -> FileUtils.atomicMoveWithFallback(source, target, false);
 
     public ReplicaFetcherThread(
             String name, ReplicaManager replicaManager, LeaderEndpoint leader, int fetchBackOffMs) {
@@ -130,6 +136,10 @@ final class ReplicaFetcherThread extends ShutdownableThread {
 
     public int getBucketCount() {
         return fairBucketStatusMap.size();
+    }
+
+    void setRemoteWriterStateRecovery(RemoteWriterStateRecovery remoteWriterStateRecovery) {
+        this.remoteWriterStateRecovery = checkNotNull(remoteWriterStateRecovery);
     }
 
     @Override
@@ -602,71 +612,115 @@ final class ReplicaFetcherThread extends ShutdownableThread {
 
     private long processFetchResultFromRemoteStorage(
             TableBucket tb, FetchLogResultForBucket replicaData) {
-        RemoteLogFetchInfo rlFetchInfo = replicaData.remoteLogFetchInfo();
-        checkNotNull(rlFetchInfo, "RemoteLogFetchInfo is null");
         Replica replica = replicaManager.getReplicaOrException(tb);
-        RemoteLogManager rlm = replicaManager.getRemoteLogManager();
-
-        // TODO after introduce leader epoch cache, we need to rebuild the local leader epoch
-        // cache. Trace by https://github.com/apache/fluss/issues/673
-
-        // update next fetch offset and writer id snapshot in local.
-        RemoteLogSegment remoteLogSegmentWithMaxStartOffset =
-                rlFetchInfo
-                        .remoteLogSegmentList()
-                        .get(rlFetchInfo.remoteLogSegmentList().size() - 1);
-        // build writer snapshots until remoteLogSegment.endOffset() and start segment from
-        // until remoteLogSegment.endOffset().
-        long nextFetchOffset = remoteLogSegmentWithMaxStartOffset.remoteLogEndOffset();
 
         try {
-            // Truncate the existing local log before restoring the writer id snapshots.
-            replica.truncateFullyAndStartAt(nextFetchOffset);
-
-            // TODO maybe need increase log start offset.
-
-            LogTablet log = replica.getLogTablet();
-            // 1. Perform a truncate before calling buildWriterIdSnapshotFile() to ensure that all
-            // historical data is completely cleaned up.
-            log.writerStateManager().truncateFullyAndStartAt(0L);
-
-            // 2. download writer id snapshots from remote storage.
-            File snapshotFile = FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
-            buildWriterIdSnapshotFile(snapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
-
-            // 3. Perform a reloadSnapshots after buildWriterIdSnapshotFile() to load the latest
-            // downloaded writerId snapshot file into the writerStateManager.
-            // Note: This must occur  after the file is downloaded, so we cannot call
-            // truncateFullyAndReloadSnapshots() here to avoid  deleting the newly downloaded
-            // writerId snapshot file.
-            log.writerStateManager().reloadSnapshots();
-            log.loadWriterSnapshot(nextFetchOffset);
-            LOG.info(
-                    "Build the writer snapshots from remote storage for {} with active "
-                            + "writer size: {} and remoteLogEndOffset: {}",
-                    tb,
-                    log.writerStateManager().activeWriters().size(),
-                    nextFetchOffset);
-        } catch (Exception e) {
+            return replica.executeFollowerRecovery(
+                    () -> {
+                        RemoteLogFetchInfo remoteLogFetchInfo =
+                                checkNotNull(
+                                        replicaData.remoteLogFetchInfo(),
+                                        "RemoteLogFetchInfo is null");
+                        // TODO after introduce leader epoch cache, we need to rebuild the local
+                        // leader epoch cache. Trace by https://github.com/apache/fluss/issues/673
+                        RemoteLogSegment lastRemoteSegment =
+                                remoteLogFetchInfo
+                                        .remoteLogSegmentList()
+                                        .get(remoteLogFetchInfo.remoteLogSegmentList().size() - 1);
+                        long nextFetchOffset = lastRemoteSegment.remoteLogEndOffset();
+                        remoteWriterStateRecovery.recover(
+                                replica, remoteLogFetchInfo, nextFetchOffset);
+                        return nextFetchOffset;
+                    });
+        } catch (Throwable e) {
             LOG.error(
                     "Failed to truncate and restore writer snapshot for {} while log hash been moved to remote",
                     tb,
                     e);
+            boolean progressTarget =
+                    replica.getTableInfo().getKvIdempotenceProtocol()
+                            == KvIdempotenceProtocol.CUMULATIVE_PROGRESS;
+            if (progressTarget) {
+                replicaManager.markReplicaOffline(tb, replica);
+            }
+            if (e instanceof Error) {
+                throw (Error) e;
+            }
+            if (progressTarget) {
+                throw new StorageException(
+                        "Remote WriterState recovery failed for V1 target bucket " + tb, e);
+            }
+            return -1L;
         }
-        return nextFetchOffset;
     }
 
-    private void buildWriterIdSnapshotFile(
+    private void recoverRemoteWriterState(
+            Replica replica, RemoteLogFetchInfo remoteLogFetchInfo, long nextFetchOffset)
+            throws Exception {
+        RemoteLogSegment remoteLogSegmentWithMaxStartOffset =
+                remoteLogFetchInfo
+                        .remoteLogSegmentList()
+                        .get(remoteLogFetchInfo.remoteLogSegmentList().size() - 1);
+        RemoteLogManager rlm = replicaManager.getRemoteLogManager();
+
+        // Truncate the existing local log before restoring the writer id snapshots.
+        replica.prepareRemoteWriterStateRecovery(nextFetchOffset);
+
+        // TODO maybe need increase log start offset.
+
+        LogTablet log = replica.getLogTablet();
+        // 1. Download the exact-end writer snapshot after local state has been cleared.
+        File snapshotFile = FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
+        buildWriterIdSnapshotFile(snapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
+
+        // 2. Perform a reloadSnapshots after buildWriterIdSnapshotFile() to load the latest
+        // downloaded writerId snapshot file into the writerStateManager.
+        // Note: This must occur after the file is downloaded, so we cannot call
+        // truncateFullyAndReloadSnapshots() here to avoid deleting the newly downloaded
+        // writerId snapshot file.
+        log.writerStateManager().reloadSnapshots();
+        replica.loadWriterSnapshot(nextFetchOffset);
+        LOG.info(
+                "Build the writer snapshots from remote storage for {} with active "
+                        + "writer size: {} and remoteLogEndOffset: {}",
+                replica.getTableBucket(),
+                log.writerStateManager().writerIdCount(),
+                nextFetchOffset);
+    }
+
+    void buildWriterIdSnapshotFile(
             File snapshotFile, RemoteLogSegment remoteLogSegment, RemoteLogManager rlm)
             throws RemoteStorageException, IOException {
         File tmpSnapshotFile = new File(snapshotFile.getAbsolutePath() + ".tmp");
-        // Copy it to snapshot file in atomic manner.
-        Files.copy(
+        try (InputStream snapshotInput =
                 rlm.getRemoteLogStorage()
-                        .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT),
-                tmpSnapshotFile.toPath(),
-                StandardCopyOption.REPLACE_EXISTING);
-        FileUtils.atomicMoveWithFallback(tmpSnapshotFile.toPath(), snapshotFile.toPath(), false);
+                        .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT)) {
+            Files.copy(
+                    snapshotInput, tmpSnapshotFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            snapshotFileMover.move(tmpSnapshotFile.toPath(), snapshotFile.toPath());
+        } catch (RemoteStorageException | IOException | RuntimeException | Error failure) {
+            try {
+                Files.deleteIfExists(tmpSnapshotFile.toPath());
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    void setSnapshotFileMover(SnapshotFileMover snapshotFileMover) {
+        this.snapshotFileMover = snapshotFileMover;
+    }
+
+    @FunctionalInterface
+    interface RemoteWriterStateRecovery {
+        void recover(Replica replica, RemoteLogFetchInfo remoteLogFetchInfo, long nextFetchOffset)
+                throws Exception;
+    }
+
+    @FunctionalInterface
+    interface SnapshotFileMover {
+        void move(Path source, Path target) throws IOException;
     }
 
     private void truncate(TableBucket tableBucket, long offset) {

@@ -978,10 +978,10 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             // the column not in the primary key is nullable, should throw exception
             assertThatThrownBy(() -> table.newUpsert().partialUpdate("a", "b").createWriter())
                     .hasMessage(
-                            "Partial Update requires all columns except primary key to be nullable, but column c is NOT NULL.");
+                            "Partial Update requires all columns except primary key and auto-increment columns to be nullable, but column c is NOT NULL.");
             assertThatThrownBy(() -> table.newUpsert().partialUpdate("a", "c").createWriter())
                     .hasMessage(
-                            "Partial Update requires all columns except primary key to be nullable, but column c is NOT NULL.");
+                            "Partial Update requires all columns except primary key and auto-increment columns to be nullable, but column c is NOT NULL.");
             assertThatThrownBy(() -> table.newUpsert().partialUpdate("a", "d").createWriter())
                     .hasMessage(
                             "Can not find target column: d for table test_db_1.test_pk_table_1.");
