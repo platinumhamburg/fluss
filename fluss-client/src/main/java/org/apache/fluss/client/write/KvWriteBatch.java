@@ -83,6 +83,11 @@ public class KvWriteBatch extends WriteBatch {
         return false;
     }
 
+    /** Whether this batch uses the KvRecord V2 wire format (requires PUT_KV api version >= 2). */
+    public boolean isV2Format() {
+        return v2Format;
+    }
+
     @Override
     public AppendResult tryAppend(WriteRecord writeRecord, WriteCallback callback)
             throws Exception {
@@ -98,24 +103,15 @@ public class KvWriteBatch extends WriteBatch {
         checkNotNull(callback, "write callback must be not null");
         BinaryRow row = checkRow(writeRecord.getRow());
 
-        if (v2Format) {
-            if (!recordsBuilder.hasRoomForV2(key, row) || isClosed()) {
-                return AppendResult.BATCH_FULL;
-            } else {
-                recordsBuilder.appendV2(writeRecord.getMutationType(), key, row);
-                callbacks.add(callback);
-                recordCount++;
-                return AppendResult.APPENDED;
-            }
+        // hasRoomFor() and append() are format-aware: the builder sizes and writes records
+        // according to its own record format (V0 or V2).
+        if (!recordsBuilder.hasRoomFor(key, row) || isClosed()) {
+            return AppendResult.BATCH_FULL;
         } else {
-            if (!recordsBuilder.hasRoomFor(key, row) || isClosed()) {
-                return AppendResult.BATCH_FULL;
-            } else {
-                recordsBuilder.append(key, row);
-                callbacks.add(callback);
-                recordCount++;
-                return AppendResult.APPENDED;
-            }
+            recordsBuilder.append(writeRecord.getMutationType(), key, row);
+            callbacks.add(callback);
+            recordCount++;
+            return AppendResult.APPENDED;
         }
     }
 

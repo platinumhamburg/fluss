@@ -340,30 +340,14 @@ public final class KvTablet {
      * Put the KvRecordBatch into the kv storage with default DEFAULT mode.
      *
      * <p>This is a convenience method that calls {@link #putAsLeader(KvRecordBatch, int[],
-     * MergeMode, short)} with {@link MergeMode#DEFAULT} and apiVersion 0.
+     * MergeMode)} with {@link MergeMode#DEFAULT}.
      *
      * @param kvRecords the kv records to put into
      * @param targetColumns the target columns to put, null if put all columns
      */
     public LogAppendInfo putAsLeader(KvRecordBatch kvRecords, @Nullable int[] targetColumns)
             throws Exception {
-        return putAsLeader(kvRecords, targetColumns, MergeMode.DEFAULT, (short) 0);
-    }
-
-    /**
-     * Put the KvRecordBatch into the kv storage with the given merge mode and default apiVersion 0.
-     *
-     * <p>This is a convenience method that calls {@link #putAsLeader(KvRecordBatch, int[],
-     * MergeMode, short)} with apiVersion 0 (V0 format).
-     *
-     * @param kvRecords the kv records to put into
-     * @param targetColumns the target columns to put, null if put all columns
-     * @param mergeMode the merge mode (DEFAULT or OVERWRITE)
-     */
-    public LogAppendInfo putAsLeader(
-            KvRecordBatch kvRecords, @Nullable int[] targetColumns, MergeMode mergeMode)
-            throws Exception {
-        return putAsLeader(kvRecords, targetColumns, mergeMode, (short) 0);
+        return putAsLeader(kvRecords, targetColumns, MergeMode.DEFAULT);
     }
 
     /**
@@ -386,14 +370,9 @@ public final class KvTablet {
      * @param kvRecords the kv records to put into
      * @param targetColumns the target columns to put, null if put all columns
      * @param mergeMode the merge mode (DEFAULT or OVERWRITE)
-     * @param apiVersion the client API version; V2 (apiVersion >= 2) enables per-record
-     *     MutationType
      */
     public LogAppendInfo putAsLeader(
-            KvRecordBatch kvRecords,
-            @Nullable int[] targetColumns,
-            MergeMode mergeMode,
-            short apiVersion)
+            KvRecordBatch kvRecords, @Nullable int[] targetColumns, MergeMode mergeMode)
             throws Exception {
         return inWriteLock(
                 kvLock,
@@ -441,8 +420,7 @@ public final class KvTablet {
                                 currentAutoIncrementUpdater,
                                 walBuilder,
                                 latestSchemaRow,
-                                logEndOffsetOfPrevBatch,
-                                apiVersion);
+                                logEndOffsetOfPrevBatch);
 
                         // There will be a situation that these batches of kvRecordBatch have not
                         // generated any CDC logs, for example, when client attempts to delete
@@ -496,8 +474,7 @@ public final class KvTablet {
             AutoIncrementUpdater autoIncrementUpdater,
             WalBuilder walBuilder,
             PaddingRow latestSchemaRow,
-            long startLogOffset,
-            short apiVersion)
+            long startLogOffset)
             throws Exception {
         long logOffset = startLogOffset;
 
