@@ -39,6 +39,7 @@ import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.authorizer.AuthorizerLoader;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.kv.KvCloseMode;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.DefaultCompletedKvSnapshotCommitter;
@@ -571,9 +572,7 @@ public class TabletServer extends ServerBase {
 
     @VisibleForTesting
     void shutdownTabletManagers() throws IOException {
-        if (kvManager != null) {
-            kvManager.shutdown();
-        }
+        shutdownKvManager(KvCloseMode.DISCARD_UNPERSISTED_STATE);
 
         if (remoteLogManager != null) {
             remoteLogManager.close();
@@ -581,6 +580,13 @@ public class TabletServer extends ServerBase {
 
         if (logManager != null) {
             logManager.shutdown();
+        }
+    }
+
+    @VisibleForTesting
+    void shutdownKvManager(KvCloseMode closeMode) {
+        if (kvManager != null) {
+            kvManager.shutdown(closeMode);
         }
     }
 
