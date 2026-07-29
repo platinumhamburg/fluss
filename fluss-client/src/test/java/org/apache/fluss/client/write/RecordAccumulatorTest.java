@@ -49,6 +49,7 @@ import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 import org.apache.fluss.utils.CloseableIterator;
+import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.ManualClock;
 
 import org.apache.commons.lang3.RandomStringUtils;
@@ -65,7 +66,13 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
@@ -666,6 +673,11 @@ class RecordAccumulatorTest {
 
     private RecordAccumulator createTestRecordAccumulator(
             int batchTimeoutMs, int batchSize, int pageSize, long totalSize) {
+        return createTestRecordAccumulator(batchTimeoutMs, batchSize, pageSize, totalSize, clock);
+    }
+
+    private RecordAccumulator createTestRecordAccumulator(
+            int batchTimeoutMs, int batchSize, int pageSize, long totalSize, Clock testClock) {
         conf.set(ConfigOptions.CLIENT_WRITER_BATCH_TIMEOUT, Duration.ofMillis(batchTimeoutMs));
         // TODO client writer buffer maybe removed.
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE, new MemorySize(totalSize));
@@ -684,7 +696,7 @@ class RecordAccumulatorTest {
                                 TabletServerGateway.class),
                         null),
                 TestingWriterMetricGroup.newInstance(),
-                clock);
+                testClock);
     }
 
     private long getTestBatchSize(BinaryRow row) {
@@ -768,6 +780,62 @@ class RecordAccumulatorTest {
     }
 
     @Test
+    void testIsThrottledCleanupPreservesConcurrentRefresh() throws Exception {
+        BlockingClock blockingClock = new BlockingClock();
+        RecordAccumulator accum =
+                createTestRecordAccumulator(5000, 1024, 256, Integer.MAX_VALUE, blockingClock);
+        accum.updateThrottle(tb1, 0.5f);
+        blockingClock.setMilliseconds(251);
+        blockingClock.blockAfterReads(0);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Boolean> staleThrottleCheck = executor.submit(() -> accum.isThrottled(tb1));
+            assertThat(blockingClock.awaitBlocked()).isTrue();
+
+            accum.updateThrottle(tb1, 1.0f);
+            blockingClock.release();
+
+            // The overlapping check may finish from the old snapshot. The refreshed expiry must
+            // survive for the next check.
+            staleThrottleCheck.get(5, TimeUnit.SECONDS);
+            assertThat(accum.isThrottled(tb1)).isTrue();
+        } finally {
+            blockingClock.release();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void testReadyCleanupPreservesConcurrentRefresh() throws Exception {
+        BlockingClock blockingClock = new BlockingClock();
+        IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        RecordAccumulator accum =
+                createTestRecordAccumulator(5000, 1024, 256, Integer.MAX_VALUE, blockingClock);
+        accum.append(createRecord(row), writeCallback, cluster, tb1.getBucket(), false);
+        accum.updateThrottle(tb1, 0.5f);
+        blockingClock.setMilliseconds(251);
+        // ready() reads the clock for the batch wait time before checking the throttle expiry.
+        blockingClock.blockAfterReads(1);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<RecordAccumulator.ReadyCheckResult> readyCheck =
+                    executor.submit(() -> accum.ready(cluster));
+            assertThat(blockingClock.awaitBlocked()).isTrue();
+
+            accum.updateThrottle(tb1, 1.0f);
+            blockingClock.release();
+
+            readyCheck.get(5, TimeUnit.SECONDS);
+            assertThat(accum.isThrottled(tb1)).isTrue();
+        } finally {
+            blockingClock.release();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
     void testThrottledBucketSkippedInDrain() throws Exception {
         IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
         long batchSize = getTestBatchSize(row);
@@ -794,5 +862,50 @@ class RecordAccumulatorTest {
                 .isNotNull()
                 .extracting(ReadyWriteBatch::tableBucket)
                 .containsExactly(tb2);
+    }
+
+    private static final class BlockingClock implements Clock {
+        private final AtomicLong currentTimeMs = new AtomicLong();
+        private final AtomicInteger readsBeforeBlock = new AtomicInteger(-1);
+        private final CountDownLatch blocked = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        @Override
+        public long milliseconds() {
+            int remaining = readsBeforeBlock.getAndUpdate(value -> value < 0 ? value : value - 1);
+            if (remaining == 0) {
+                blocked.countDown();
+                try {
+                    if (!release.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Timed out waiting to release the blocked clock");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Interrupted while waiting to release the clock", e);
+                }
+            }
+            return currentTimeMs.get();
+        }
+
+        @Override
+        public long nanoseconds() {
+            return TimeUnit.MILLISECONDS.toNanos(currentTimeMs.get());
+        }
+
+        private void setMilliseconds(long milliseconds) {
+            currentTimeMs.set(milliseconds);
+        }
+
+        private void blockAfterReads(int reads) {
+            readsBeforeBlock.set(reads);
+        }
+
+        private boolean awaitBlocked() throws InterruptedException {
+            return blocked.await(5, TimeUnit.SECONDS);
+        }
+
+        private void release() {
+            release.countDown();
+        }
     }
 }

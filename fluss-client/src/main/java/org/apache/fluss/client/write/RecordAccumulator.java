@@ -548,7 +548,8 @@ public final class RecordAccumulator {
                     }
                     // Expired — evict here to reclaim entries for buckets whose deque
                     // has gone empty and won't reach the drain-time throttle check.
-                    throttleExpiryMs.remove(tableBucket);
+                    // Remove only the expiry observed above: a callback may have refreshed it.
+                    throttleExpiryMs.remove(tableBucket, throttleExpiry);
                 }
 
                 Integer leader = cluster.leaderFor(tableBucket);
@@ -937,7 +938,8 @@ public final class RecordAccumulator {
             return true;
         }
         // Expired — evict to prevent map leak
-        throttleExpiryMs.remove(tableBucket);
+        // Remove only the expiry observed above: a callback may have refreshed it.
+        throttleExpiryMs.remove(tableBucket, expiry);
         return false;
     }
 
