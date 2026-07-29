@@ -17,17 +17,13 @@
 
 package org.apache.fluss.server.kv.prewrite;
 
-import org.apache.fluss.server.kv.KvBatchWriter;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.PreparedFlush;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.TruncateReason;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 
 import org.junit.jupiter.api.Test;
 
-import javax.annotation.Nonnull;
-
-import java.lang.reflect.Method;
-import java.util.Arrays;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -37,9 +33,7 @@ class KvPreWriteBufferTest {
 
     @Test
     void testIllegalLSN() {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         bufferInsert(buffer, "key1", "value1", 1);
         bufferDelete(buffer, "key1", 3);
 
@@ -58,9 +52,7 @@ class KvPreWriteBufferTest {
 
     @Test
     void testWriteAndFlush() throws Exception {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         int elementCount = 0;
 
         // put a series of kv entries
@@ -135,15 +127,11 @@ class KvPreWriteBufferTest {
         // we can get nothing then
         assertThat(getValue(buffer, "key3")).isNull();
         assertThat(getValue(buffer, "key2")).isNull();
-
-        buffer.close();
     }
 
     @Test
     void testTruncate() {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         int elementCount = 0;
 
         // put a series of kv entries
@@ -196,9 +184,7 @@ class KvPreWriteBufferTest {
 
     @Test
     void testRowCount() {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         int elementCount = 0;
 
         // put a series of kv entries
@@ -240,6 +226,66 @@ class KvPreWriteBufferTest {
         assertThat(flushBuffer(buffer, Long.MAX_VALUE)).isEqualTo(7);
     }
 
+    @Test
+    void testSplitPreparedFlushByRecordCount() {
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
+        // +key0(lsn 0), +key1(lsn 1), +key2(lsn 2), +key3(lsn 3), -key2(lsn 4)
+        for (int i = 0; i < 4; i++) {
+            bufferInsert(buffer, "key" + i, "value" + i, i);
+        }
+        bufferDelete(buffer, "key2", 4);
+
+        PreparedFlush preparedFlush = buffer.prepareFlush(10);
+        List<PreparedFlush> segments = preparedFlush.split(0, 2);
+
+        assertThat(segments).hasSize(3);
+        // Every segment boundary is the lsn of the first entry of the next segment; the last
+        // segment keeps the original target so the full flush range gets published.
+        assertThat(segments.get(0).entries()).hasSize(2);
+        assertThat(segments.get(0).exclusiveUpToLogSequenceNumber()).isEqualTo(2);
+        assertThat(segments.get(1).entries()).hasSize(2);
+        assertThat(segments.get(1).exclusiveUpToLogSequenceNumber()).isEqualTo(4);
+        assertThat(segments.get(2).entries()).hasSize(1);
+        assertThat(segments.get(2).exclusiveUpToLogSequenceNumber()).isEqualTo(10);
+        // Row count diffs are distributed per segment and sum up to the whole flush.
+        assertThat(segments.get(0).rowCountDiff()).isEqualTo(2);
+        assertThat(segments.get(1).rowCountDiff()).isEqualTo(2);
+        assertThat(segments.get(2).rowCountDiff()).isEqualTo(-1);
+
+        // Segments complete in order as list prefixes.
+        assertThat(buffer.completeFlush(segments.get(0))).isEqualTo(2);
+        assertThat(buffer.completeFlush(segments.get(1))).isEqualTo(2);
+        assertThat(buffer.completeFlush(segments.get(2))).isEqualTo(-1);
+        assertThat(buffer.getAllKvEntries()).isEmpty();
+        assertThat(buffer.pendingFlushBytes()).isEqualTo(0);
+    }
+
+    @Test
+    void testCompletePrefixSegmentsAndAbortRest() {
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
+        for (int i = 0; i < 6; i++) {
+            bufferInsert(buffer, "key" + i, "value" + i, i);
+        }
+
+        PreparedFlush preparedFlush = buffer.prepareFlush(6);
+        List<PreparedFlush> segments = preparedFlush.split(0, 2);
+        assertThat(segments).hasSize(3);
+
+        // Model a storage rejection after the first segment landed: complete the written prefix,
+        // abort the rest.
+        assertThat(buffer.completeFlush(segments.get(0))).isEqualTo(2);
+        buffer.abortFlush(segments.get(1));
+        buffer.abortFlush(segments.get(2));
+
+        // The completed entries are gone; the aborted ones are ACTIVE again and can be prepared
+        // by the retry, which must cover exactly the remaining range.
+        assertThat(buffer.getAllKvEntries()).hasSize(4);
+        PreparedFlush retry = buffer.prepareFlush(6);
+        assertThat(retry.entries()).hasSize(4);
+        assertThat(retry.entries().get(0).getLogSequenceNumber()).isEqualTo(2);
+        assertThat(retry.rowCountDiff()).isEqualTo(4);
+    }
+
     private static void bufferInsert(
             KvPreWriteBuffer kvPreWriteBuffer, String key, String value, int elementCount) {
         kvPreWriteBuffer.insert(toKey(key), value.getBytes(), elementCount);
@@ -257,9 +303,7 @@ class KvPreWriteBufferTest {
 
     @Test
     void testPrepareAndCompleteFlush() {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
 
         bufferInsert(buffer, "key1", "value1", 1);
         bufferInsert(buffer, "key2", "value2", 2);
@@ -284,9 +328,7 @@ class KvPreWriteBufferTest {
 
     @Test
     void testAbortPreparedFlush() {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
 
         bufferInsert(buffer, "key1", "value1", 1);
         bufferDelete(buffer, "key2", 2);
@@ -306,9 +348,7 @@ class KvPreWriteBufferTest {
 
     @Test
     void testCannotTruncatePreparedFlush() {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
 
         bufferInsert(buffer, "key1", "value1", 1);
         bufferInsert(buffer, "key2", "value2", 2);
@@ -321,9 +361,7 @@ class KvPreWriteBufferTest {
 
     @Test
     void testPendingFlushBytesTracking() {
-        KvPreWriteBuffer buffer =
-                new KvPreWriteBuffer(
-                        new NopKvBatchWriter(), TestingMetricGroups.TABLET_SERVER_METRICS);
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
 
         // Initially zero
         assertThat(buffer.pendingFlushBytes()).isEqualTo(0);
@@ -353,12 +391,6 @@ class KvPreWriteBufferTest {
         assertThat(buffer.pendingFlushBytes()).isEqualTo(0);
     }
 
-    @Test
-    void testBufferDoesNotExposeSplitFlushByteCounters() {
-        assertThat(Arrays.stream(KvPreWriteBuffer.class.getDeclaredMethods()).map(Method::getName))
-                .doesNotContain("activeFlushBytes", "preparedFlushBytes");
-    }
-
     private static String getValue(KvPreWriteBuffer preWriteBuffer, String keyStr) {
         KvPreWriteBuffer.Key key = toKey(keyStr);
         KvPreWriteBuffer.Value value = preWriteBuffer.get(key);
@@ -382,29 +414,5 @@ class KvPreWriteBufferTest {
     private static int flushBuffer(KvPreWriteBuffer buffer, long exclusiveUpToLsn) {
         PreparedFlush prepared = buffer.prepareFlush(exclusiveUpToLsn);
         return buffer.completeFlush(prepared);
-    }
-
-    /** A {@link KvBatchWriter} for test purpose without doing anything. */
-    private static class NopKvBatchWriter implements KvBatchWriter {
-
-        @Override
-        public void put(@Nonnull byte[] key, @Nonnull byte[] value) {
-            // do nothing
-        }
-
-        @Override
-        public void delete(@Nonnull byte[] key) {
-            // do nothing
-        }
-
-        @Override
-        public void flush() {
-            // do nothing
-        }
-
-        @Override
-        public void close() {
-            // do nothing
-        }
     }
 }

@@ -171,7 +171,9 @@ public class RocksDBKv implements AutoCloseable {
 
     /**
      * Creates a write batch that fails fast instead of waiting when RocksDB enters delayed-write or
-     * stall state.
+     * stall state. Implicit flushes are disabled: the caller owns all native write boundaries via
+     * explicit {@code flush()} calls, so exactly one prepared segment forms one atomic native
+     * write.
      */
     public RocksDBWriteBatchWrapper newNoSlowdownWriteBatch(
             long writeBatchSize, Counter flushCount, Histogram flushLatencyHistogram) {
@@ -181,6 +183,7 @@ public class RocksDBKv implements AutoCloseable {
                 flushCount,
                 flushLatencyHistogram,
                 true,
+                false,
                 this::recordWriteRejected);
     }
 
@@ -379,21 +382,27 @@ public class RocksDBKv implements AutoCloseable {
         if (closed) {
             return 0L;
         }
-        final ResourceGuard.Lease lease;
+        ResourceGuard.Lease lease = null;
         try {
             lease = rocksDBResourceGuard.acquireResource();
+            return readLongProperty(NUM_FILES_AT_LEVEL0);
         } catch (IOException acquireFailed) {
             // RocksDB is already closed (or being closed); treat as no pressure.
             return 0L;
-        }
-        try {
-            return readLongProperty(NUM_FILES_AT_LEVEL0);
         } finally {
-            lease.close();
+            if (lease != null) {
+                lease.close();
+            }
         }
     }
 
-    void recordWriteRejected() {
+    /**
+     * Latches the no-slowdown rejection state after RocksDB rejects a flush. Invoked by the
+     * rejection callback of {@link #newNoSlowdownWriteBatch}; public visibility is for tests in
+     * other packages.
+     */
+    @VisibleForTesting
+    public void recordWriteRejected() {
         writeRejected = true;
     }
 

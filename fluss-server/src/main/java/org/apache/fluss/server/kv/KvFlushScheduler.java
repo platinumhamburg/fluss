@@ -31,6 +31,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -48,7 +49,6 @@ public class KvFlushScheduler implements AutoCloseable {
     private final ThreadPoolExecutor flushExecutor;
     private final Timer retryTimer;
     private final ShutdownableThread retryReaper;
-    private final Object lifecycleLock = new Object();
 
     private volatile boolean closed;
 
@@ -69,12 +69,15 @@ public class KvFlushScheduler implements AutoCloseable {
     }
 
     public void enqueue(KvTablet tablet) {
-        FlushTask task = new FlushTask(tablet);
-        synchronized (lifecycleLock) {
-            if (closed) {
-                return;
-            }
-            flushExecutor.execute(task);
+        if (closed) {
+            return;
+        }
+        try {
+            flushExecutor.execute(new FlushTask(tablet));
+        } catch (RejectedExecutionException e) {
+            // The scheduler was closed concurrently between the closed check and the submit.
+            // Dropping the task is safe: the scheduler is only closed on tablet server shutdown,
+            // where the tablets are being closed as well and no flush is needed any more.
         }
     }
 
@@ -83,10 +86,10 @@ public class KvFlushScheduler implements AutoCloseable {
     }
 
     public void retryLater(KvTablet tablet, long delayMs) {
-        synchronized (lifecycleLock) {
-            if (closed) {
-                return;
-            }
+        if (closed) {
+            return;
+        }
+        try {
             retryTimer.add(
                     new TimerTask(delayMs) {
                         @Override
@@ -96,17 +99,18 @@ public class KvFlushScheduler implements AutoCloseable {
                             }
                         }
                     });
+        } catch (RejectedExecutionException e) {
+            // Same benign close race as in enqueue: the timer submits already-expired tasks to
+            // its internal executor, which rejects them once the timer has been shut down.
         }
     }
 
     @Override
     public void close() {
-        synchronized (lifecycleLock) {
-            if (closed) {
-                return;
-            }
-            closed = true;
+        if (closed) {
+            return;
         }
+        closed = true;
         if (flushExecutor != null) {
             if (isFlushExecutorThread()) {
                 flushExecutor.shutdown();
@@ -116,6 +120,9 @@ public class KvFlushScheduler implements AutoCloseable {
         }
         if (retryReaper != null && retryTimer != null) {
             retryReaper.initiateShutdown();
+            // The retry reaper is non-interruptible and may be blocked in the timer's internal
+            // delayQueue.poll(200ms). Adding an empty task wakes it up immediately so that
+            // awaitShutdown() does not have to wait for the next poll timeout.
             retryTimer.add(
                     new TimerTask(0) {
                         @Override

@@ -942,6 +942,7 @@ message PbPutKvRespForBucket {
   optional int64 log_end_offset = 5;
   // backpressure signal from RocksDB write stall detection:
   // 0 = normal (no pressure), (0,1) = DELAYED zone (normalized L0 ratio)
+  // introduced in v1.0
   optional float pressure = 6;
 }
 

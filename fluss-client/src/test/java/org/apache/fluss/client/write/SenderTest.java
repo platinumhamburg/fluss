@@ -930,6 +930,34 @@ final class SenderTest {
     }
 
     @Test
+    void testPutKvStorageExceptionResponseRetriesInsteadOfFailing() throws Exception {
+        // Rolling-upgrade anchor: an old client receives the server-side downgraded
+        // KV_STORAGE_EXCEPTION (instead of the unknown error code 72, which would map to the
+        // non-retriable UNKNOWN_SERVER_ERROR) and must retry the batch instead of failing it.
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        CompletableFuture<Exception> future = new CompletableFuture<>();
+        appendKvToAccumulator(
+                tableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> future.complete(e));
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(
+                tableBucket, 0, createPutKvResponse(tableBucket, Errors.KV_STORAGE_EXCEPTION));
+
+        // The batch is re-enqueued for retry rather than completed with an exception.
+        assertThat(future.isDone()).isFalse();
+
+        // Unlike STORAGE_BACKPRESSURE_EXCEPTION, no throttle is installed, so the retried batch
+        // is sent out again immediately and completes once the server recovers.
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(tableBucket, 0, createPutKvResponse(tableBucket, 1L));
+        assertThat(future.get()).isNull();
+    }
+
+    @Test
     void testSendWhenTableIdChanges() throws Exception {
         CompletableFuture<Exception> future1 = new CompletableFuture<>();
         appendToAccumulator(tb1, row(1, "a"), (tb, leo, e) -> future1.complete(e));
@@ -1061,8 +1089,7 @@ final class SenderTest {
 
     private PutKvResponse createPutKvResponse(TableBucket tb, long endOffset, float pressure) {
         return makePutKvResponse(
-                Collections.singletonList(
-                        new PutKvResultForBucket(tb, endOffset).setPressure(pressure)));
+                Collections.singletonList(new PutKvResultForBucket(tb, endOffset, pressure)));
     }
 
     private PutKvResponse createPutKvResponse(TableBucket tb, Errors error) {

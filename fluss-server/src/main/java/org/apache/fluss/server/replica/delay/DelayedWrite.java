@@ -18,7 +18,6 @@
 package org.apache.fluss.server.replica.delay;
 
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.entity.WriteResultForBucket;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -123,15 +122,9 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
                 Tuple2<Boolean, Errors> result;
                 try {
                     Replica replica = replicaManager.getReplicaOrException(tableBucket);
-                    if (delayedWriteMetadata.getCompletionMode() == CompletionMode.LOCAL_KV_FLUSH) {
-                        result =
-                                replica.checkLocalKvFlushedOffset(
-                                        delayedBucketStatus.getRequiredOffset());
-                    } else {
-                        result =
-                                replica.checkEnoughReplicasReachOffset(
-                                        delayedBucketStatus.getRequiredOffset());
-                    }
+                    result =
+                            replica.checkEnoughReplicasReachOffset(
+                                    delayedBucketStatus.getRequiredOffset());
                 } catch (Exception e) {
                     result = Tuple2.of(false, Errors.forException(e));
                 }
@@ -173,66 +166,30 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
     @Override
     public void onComplete() {
         List<T> result =
-                delayedWriteMetadata.getBucketStatusMap().entrySet().stream()
-                        // overwrite the write result with the delayed error if there is one,
-                        // and refresh the piggyback pressure sample for successful PutKv buckets.
+                delayedWriteMetadata.getBucketStatusMap().values().stream()
+                        // overwrite the write result with the delayed error if there is one.
                         .map(
-                                entry -> {
-                                    TableBucket tableBucket = entry.getKey();
-                                    DelayedBucketStatus<T> s = entry.getValue();
+                                s -> {
                                     Errors error = s.getDelayedError();
-                                    T writeResult =
-                                            (error != null && error != Errors.NONE)
-                                                    ? s.getWriteResultForBucket().copy(error)
-                                                    : s.getWriteResultForBucket();
-                                    refreshPressureIfPutKv(tableBucket, error, writeResult);
-                                    return writeResult;
+                                    if (error != null && error != Errors.NONE) {
+                                        return s.getWriteResultForBucket().copy(error);
+                                    } else {
+                                        return s.getWriteResultForBucket();
+                                    }
                                 })
                         .collect(Collectors.toList());
         callback.accept(result);
     }
 
-    /**
-     * For successful PutKv responses, attach the recent per-bucket pressure right before the
-     * response is delivered. Failures and non-PutKv response types are left untouched.
-     */
-    private void refreshPressureIfPutKv(TableBucket tableBucket, Errors error, T writeResult) {
-        if (!(writeResult instanceof PutKvResultForBucket)) {
-            return;
-        }
-        if (error != null && error != Errors.NONE) {
-            return;
-        }
-        if (writeResult.failed()) {
-            return;
-        }
-        try {
-            Replica replica = replicaManager.getReplicaOrException(tableBucket);
-            ((PutKvResultForBucket) writeResult).setPressure(replica.samplePressureForCompletion());
-        } catch (Exception e) {
-            // Replica may have moved or been deleted between the write and the completion. The
-            // response still succeeds with pressure left at its initial value (0).
-            LOG.debug("Skip pressure refresh for {} on completion: {}", tableBucket, e.toString());
-        }
-    }
-
     /** DelayedWriteMetadata. */
     public static final class DelayedWriteMetadata<T extends WriteResultForBucket> {
         private final int requiredAcks;
-        private final CompletionMode completionMode;
         private final Map<TableBucket, DelayedBucketStatus<T>> bucketStatusMap;
 
         public DelayedWriteMetadata(
-                int requiredAcks,
-                CompletionMode completionMode,
-                Map<TableBucket, DelayedBucketStatus<T>> bucketStatusMap) {
+                int requiredAcks, Map<TableBucket, DelayedBucketStatus<T>> bucketStatusMap) {
             this.requiredAcks = requiredAcks;
-            this.completionMode = completionMode;
             this.bucketStatusMap = bucketStatusMap;
-        }
-
-        public CompletionMode getCompletionMode() {
-            return completionMode;
         }
 
         public Map<TableBucket, DelayedBucketStatus<T>> getBucketStatusMap() {
@@ -244,18 +201,10 @@ public class DelayedWrite<T extends WriteResultForBucket> extends DelayedOperati
             return "DelayedWriteMetadata{"
                     + "requiredAcks="
                     + requiredAcks
-                    + ", completionMode="
-                    + completionMode
                     + ", bucketStatusMap="
                     + bucketStatusMap
                     + '}';
         }
-    }
-
-    /** Completion condition for delayed writes. */
-    public enum CompletionMode {
-        HIGH_WATERMARK,
-        LOCAL_KV_FLUSH
     }
 
     /** DelayedProduceMetadata. */

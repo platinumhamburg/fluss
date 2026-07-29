@@ -161,6 +161,14 @@ public class ReplicaManager implements ServerReconfigurable {
 
     public static final String HIGH_WATERMARK_CHECKPOINT_FILE_NAME = "high-watermark-checkpoint";
 
+    /**
+     * The first PUT_KV API version whose clients understand the {@link
+     * Errors#STORAGE_BACKPRESSURE_EXCEPTION} error code (72). Rejections for older versions are
+     * downgraded to the retriable {@link Errors#KV_STORAGE_EXCEPTION} to keep rolling upgrades
+     * safe.
+     */
+    private static final short PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE = 2;
+
     private final Configuration conf;
     private final Scheduler scheduler;
     private final LogManager logManager;
@@ -893,8 +901,11 @@ public class ReplicaManager implements ServerReconfigurable {
                 continue; // Skip buckets that failed during insert
             }
             MissingKeysContext missingKeysContext = entry.getValue();
+            // Read through the pre-write buffer: with acks != -1 the response (and thus this
+            // re-lookup) can run before the asynchronous flush has materialized the insert into
+            // RocksDB, but the inserted entries are already visible in the pre-write buffer.
             List<byte[]> results =
-                    getReplicaOrException(tb).lookups(missingKeysContext.missingKeys);
+                    getReplicaOrException(tb).lookupsFromBufferOrKv(missingKeysContext.missingKeys);
             LookupResultForBucket lookupResult = lookupResultForBucketMap.get(tb);
             for (int i = 0; i < missingKeysContext.missingIndexes.size(); i++) {
                 lookupResult
@@ -1360,11 +1371,13 @@ public class ReplicaManager implements ServerReconfigurable {
                         tb,
                         appendInfo.firstOffset(),
                         appendInfo.lastOffset());
-                // The pressure field is left at its default (0f) here and filled right before the
-                // response goes out, by either maybeAddDelayedWrite (acks != -1) or
-                // DelayedWrite#onComplete (acks == -1).
+                // Sample the piggyback backpressure pressure right after the write, so the
+                // result is immutable and both the immediate (acks != -1) and the delayed
+                // (acks == -1) response paths carry it without any post-filling.
                 putResultForBucketMap.put(
-                        tb, new PutKvResultForBucket(tb, appendInfo.lastOffset() + 1));
+                        tb,
+                        new PutKvResultForBucket(
+                                tb, appendInfo.lastOffset() + 1, replica.samplePressure()));
 
                 // metric for kv
                 tableMetrics.incKvMessageIn(entry.getValue().getRecordCount());
@@ -1382,6 +1395,19 @@ public class ReplicaManager implements ServerReconfigurable {
                         tableMetrics.incKvBackpressureRejectedRequests();
                     }
                     LOG.debug("Write rejected by KV backpressure for table bucket {}", tb);
+                    if (apiVersion < PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE) {
+                        // Rolling-upgrade compatibility: pre-upgrade clients map the unknown
+                        // error code 72 to the non-retriable UNKNOWN_SERVER_ERROR and would fail
+                        // the write. Downgrade to the retriable KV_STORAGE_EXCEPTION (known since
+                        // 0.1) so their standard retry path backs off, keeping the original
+                        // message for diagnosability.
+                        putResultForBucketMap.put(
+                                tb,
+                                new PutKvResultForBucket(
+                                        tb,
+                                        new ApiError(Errors.KV_STORAGE_EXCEPTION, e.getMessage())));
+                        continue;
+                    }
                 } else if (isUnexpectedException(e)) {
                     LOG.error("Error put records to local kv on replica {}", tb, e);
                     // NOTE: Failed put requests metric is not incremented for known exceptions
@@ -1689,9 +1715,7 @@ public class ReplicaManager implements ServerReconfigurable {
             int requestBucketSize,
             Map<TableBucket, T> writeResults,
             Consumer<List<T>> responseCallback) {
-        DelayedWrite.CompletionMode completionMode =
-                delayedWriteCompletionMode(requiredAcks, requestBucketSize, writeResults);
-        if (completionMode != null) {
+        if (delayedWriteRequired(requiredAcks, requestBucketSize, writeResults)) {
             Map<TableBucket, DelayedWrite.DelayedBucketStatus<T>> bucketStatusMap = new HashMap<>();
             writeResults.forEach(
                     (tb, result) ->
@@ -1702,8 +1726,7 @@ public class ReplicaManager implements ServerReconfigurable {
             DelayedWrite<T> delayedWrite =
                     new DelayedWrite<>(
                             timeoutMs,
-                            new DelayedWrite.DelayedWriteMetadata<>(
-                                    requiredAcks, completionMode, bucketStatusMap),
+                            new DelayedWrite.DelayedWriteMetadata<>(requiredAcks, bucketStatusMap),
                             this,
                             responseCallback,
                             serverMetricGroup);
@@ -1717,21 +1740,6 @@ public class ReplicaManager implements ServerReconfigurable {
                             .map(DelayedTableBucketKey::new)
                             .collect(Collectors.toList()));
         } else {
-            // Immediate-response path (acks != -1): attach KV pressure right before the response
-            // goes out, mirroring DelayedWrite#onComplete on the acks == -1 path.
-            writeResults.forEach(
-                    (tb, r) -> {
-                        if (r instanceof PutKvResultForBucket && !r.failed()) {
-                            try {
-                                ((PutKvResultForBucket) r)
-                                        .setPressure(
-                                                getReplicaOrException(tb)
-                                                        .samplePressureForCompletion());
-                            } catch (Exception ignore) {
-                                // leader moved or replica gone, leave default 0f
-                            }
-                        }
-                    });
             responseCallback.accept(new ArrayList<>(writeResults.values()));
         }
     }
@@ -1897,40 +1905,31 @@ public class ReplicaManager implements ServerReconfigurable {
     }
 
     /**
-     * Returns the completion condition a write response must wait for, or {@code null} when it can
-     * respond immediately.
+     * If all the following conditions are true, we need to put a delayed write operation into the
+     * delayed write manager and wait for replication to complete.
      *
-     * <p>ProduceLog writes only wait when {@code requiredAcks = -1}. PutKv with {@code acks = -1}
-     * still waits for the high watermark. PutKv with {@code acks = 1} waits only for local KV
-     * flush, preserving the configured ack semantics while ensuring the client does not observe
-     * success before local materialization.
+     * <pre>
+     *     1. requiredAcks = -1.
+     *     2. there is data to append.
+     *     3. at least one bucket append was successful.
+     * </pre>
      */
-    private @Nullable DelayedWrite.CompletionMode delayedWriteCompletionMode(
+    private boolean delayedWriteRequired(
             int requiredAcks,
             int inputBucketSize,
             Map<TableBucket, ? extends WriteResultForBucket> writeResults) {
-        if (inputBucketSize == 0) {
-            return null;
-        }
+        boolean needDelayedWrite = false;
         int failedBucketSize = 0;
-        boolean hasSuccessfulPutKv = false;
         for (WriteResultForBucket result : writeResults.values()) {
             if (result.failed()) {
                 failedBucketSize++;
-            } else if (result instanceof PutKvResultForBucket) {
-                hasSuccessfulPutKv = true;
             }
         }
-        if (failedBucketSize == inputBucketSize) {
-            return null;
+        if (requiredAcks == -1 && inputBucketSize > 0 && failedBucketSize < inputBucketSize) {
+            needDelayedWrite = true;
         }
-        if (requiredAcks == -1) {
-            return DelayedWrite.CompletionMode.HIGH_WATERMARK;
-        }
-        if (requiredAcks != 0 && hasSuccessfulPutKv) {
-            return DelayedWrite.CompletionMode.LOCAL_KV_FLUSH;
-        }
-        return null;
+
+        return needDelayedWrite;
     }
 
     private void maybeShrinkIsr() {

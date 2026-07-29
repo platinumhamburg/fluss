@@ -550,9 +550,10 @@ public class Sender implements Runnable {
         WriteBatch writeBatch = readyWriteBatch.writeBatch();
         if (error.exception() instanceof StorageBackpressureException) {
             // Hard rejection: the storage engine reached its slowdown trigger and rejected the
-            // write. Apply a hard back-off equal to the configured max throttle window before
-            // letting the standard retry path re-enqueue the batch.
-            accumulator.applyStorageBackpressureBackoff(readyWriteBatch.tableBucket());
+            // write. Map it to full pressure (internal hard-rejection value 1.0f) so the bucket is
+            // stalled for the configured max throttle window before the standard retry path
+            // re-enqueues the batch.
+            accumulator.updateThrottle(readyWriteBatch.tableBucket(), 1.0f);
         }
         if (error.error() == Errors.DUPLICATE_SEQUENCE_EXCEPTION) {
             // If we have received a duplicate batch sequence error, it means that the batch

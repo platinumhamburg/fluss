@@ -25,10 +25,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.FlushOptions;
-import org.rocksdb.WriteOptions;
 
 import java.io.File;
-import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Arrays;
 
@@ -238,10 +236,8 @@ class RocksDBKvTest {
         kv.refreshL0FileCount();
     }
 
-    private static boolean noSlowdown(RocksDBWriteBatchWrapper writer) throws Exception {
-        Field field = RocksDBWriteBatchWrapper.class.getDeclaredField("options");
-        field.setAccessible(true);
-        return ((WriteOptions) field.get(writer)).noSlowdown();
+    private static boolean noSlowdown(RocksDBWriteBatchWrapper writer) {
+        return writer.options.noSlowdown();
     }
 
     /**
@@ -294,10 +290,10 @@ class RocksDBKvTest {
     /**
      * Regression test for the JVM crash (exit 134 / SIGABRT) observed in CI for {@code
      * KvReplicaRestoreITCase}: after {@link RocksDBKv#close()} releases the native handle, late
-     * callers from {@code DelayedWrite#onComplete} → {@code Replica#samplePressureForCompletion}
-     * could still reach {@link RocksDBKv#currentPressure()} → {@code db.getProperty(...)} and touch
-     * the disposed native handle. The pressure-sampling fence must turn those late calls into a
-     * benign "no pressure" reading instead of a native crash.
+     * pressure sampling (a write response racing with a concurrent tablet close) could still reach
+     * {@link RocksDBKv#currentPressure()} → {@code db.getProperty(...)} and touch the disposed
+     * native handle. The pressure-sampling fence must turn those late calls into a benign "no
+     * pressure" reading instead of a native crash.
      */
     @Test
     void testPressureQueriesAfterCloseAreSafe(@TempDir Path tempDir) throws Exception {

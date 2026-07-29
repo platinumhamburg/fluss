@@ -739,11 +739,11 @@ class RecordAccumulatorTest {
     }
 
     @Test
-    void testApplyStorageBackpressureBackoff() {
+    void testUpdateThrottleWithFullPressure() {
         RecordAccumulator accum = createTestRecordAccumulator(1024, Integer.MAX_VALUE);
-        // StorageBackpressureException back-off: stalls the bucket for the full max throttle
-        // window.
-        accum.applyStorageBackpressureBackoff(tb1);
+        // Full pressure (internal hard-rejection value): stalls the bucket for the full max
+        // throttle window.
+        accum.updateThrottle(tb1, 1.0f);
         assertThat(accum.isThrottled(tb1)).isTrue();
 
         // Still throttled within the configured max throttle window.
@@ -774,7 +774,8 @@ class RecordAccumulatorTest {
         RecordAccumulator accum = createTestRecordAccumulator((int) batchSize, Integer.MAX_VALUE);
         cluster = updateCluster(Arrays.asList(bucket1, bucket2, bucket3));
 
-        // Append records to tb1 and tb2
+        // Append records to tb1 and tb2. Both tb1 and tb2 lead on node1, so draining node1
+        // should only return tb2 when tb1 is throttled.
         accum.append(createRecord(row), writeCallback, cluster, 0, false);
         accum.append(createRecord(row), writeCallback, cluster, 1, false);
 
@@ -787,12 +788,11 @@ class RecordAccumulatorTest {
                         cluster,
                         new HashSet<>(Collections.singletonList(node1.id())),
                         Integer.MAX_VALUE);
-        // tb2 should be in the batch, tb1 should not
+        // tb2 should be in the batches, tb1 should not
         List<ReadyWriteBatch> node1Batches = batches.get(node1.id());
-        if (node1Batches != null) {
-            for (ReadyWriteBatch b : node1Batches) {
-                assertThat(b.tableBucket()).isNotEqualTo(tb1);
-            }
-        }
+        assertThat(node1Batches)
+                .isNotNull()
+                .extracting(ReadyWriteBatch::tableBucket)
+                .containsExactly(tb2);
     }
 }

@@ -30,6 +30,8 @@ import org.apache.fluss.annotation.PublicEvolving;
  * are not blocked by the storage engine's internal sleep.
  *
  * <p>Clients should retry after a backoff equal to the configured throttle ceiling.
+ *
+ * @since 1.0
  */
 @PublicEvolving
 public class StorageBackpressureException extends RetriableException {

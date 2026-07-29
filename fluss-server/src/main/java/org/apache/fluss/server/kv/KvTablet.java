@@ -94,6 +94,7 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -101,6 +102,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import static org.apache.fluss.utils.Preconditions.checkState;
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
 
@@ -112,7 +114,24 @@ public final class KvTablet {
     private static final long MIN_FLUSH_RETRY_DELAY_MS = 100L;
 
     private static final long MAX_FLUSH_RETRY_DELAY_MS = 1_000L;
+
+    /**
+     * Number of backoff doublings after which the retry delay saturates at {@link
+     * #MAX_FLUSH_RETRY_DELAY_MS}. Derived from the delay bounds so that {@code
+     * MIN_FLUSH_RETRY_DELAY_MS << shift} can never overflow: the shifted value is bounded by {@code
+     * 2 * MAX_FLUSH_RETRY_DELAY_MS}.
+     */
+    private static final int MAX_FLUSH_RETRY_BACKOFF_SHIFT =
+            64 - Long.numberOfLeadingZeros(MAX_FLUSH_RETRY_DELAY_MS / MIN_FLUSH_RETRY_DELAY_MS);
+
     private static final long ROW_COUNT_DISABLED = -1;
+
+    /**
+     * Max records per native write of the asynchronous flush; mirrors the batching capacity of
+     * {@code RocksDBWriteBatchWrapper} (hundreds of keys per write batch is RocksDB best practice).
+     * Together with {@code writeBatchSize} this bounds one atomic native write.
+     */
+    private static final int MAX_RECORDS_PER_NATIVE_WRITE = 500;
 
     private final PhysicalTablePath physicalPath;
     private final TableBucket tableBucket;
@@ -164,6 +183,7 @@ public final class KvTablet {
     @GuardedBy("kvLock")
     private int flushRetryAttempts = 0;
 
+    /** Invoked after each flush that made progress; set at construction time by the owner. */
     private volatile @Nullable Runnable flushCompleteListener;
 
     private volatile @Nullable FatalErrorHandler asyncFatalErrorHandler;
@@ -192,6 +212,7 @@ public final class KvTablet {
             @Nullable RocksDBStatistics rocksDBStatistics,
             KvFlushScheduler kvFlushScheduler,
             boolean closeFlushScheduler,
+            @Nullable Runnable flushCompleteListener,
             AutoIncrementManager autoIncrementManager) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
@@ -202,7 +223,7 @@ public final class KvTablet {
         this.serverMetricGroup = serverMetricGroup;
         this.kvFlushScheduler = kvFlushScheduler;
         this.closeFlushScheduler = closeFlushScheduler;
-        this.kvPreWriteBuffer = new KvPreWriteBuffer(createKvBatchWriter(), serverMetricGroup);
+        this.kvPreWriteBuffer = new KvPreWriteBuffer(serverMetricGroup);
         this.logFormat = logFormat;
         this.arrowWriterProvider = new ArrowWriterPool(arrowBufferAllocator);
         this.memorySegmentPool = memorySegmentPool;
@@ -216,10 +237,20 @@ public final class KvTablet {
         this.changelogImage = changelogImage;
         this.rocksDBStatistics = rocksDBStatistics;
         this.autoIncrementManager = autoIncrementManager;
+        this.flushCompleteListener = flushCompleteListener;
         // disable row count for WAL image mode.
         this.rowCount = changelogImage == ChangelogImage.WAL ? ROW_COUNT_DISABLED : 0L;
     }
 
+    /**
+     * Creates a kv tablet with a dedicated {@link KvFlushScheduler} that is closed together with
+     * the tablet. Production code must use {@link #create(PhysicalTablePath, TableBucket,
+     * LogTablet, File, Configuration, TabletServerMetricGroup, BufferAllocator, MemorySegmentPool,
+     * KvFormat, RowMerger, ArrowCompressionInfo, SchemaGetter, ChangelogImage, RateLimiter,
+     * KvFlushScheduler, Runnable, AutoIncrementManager)} with the shared scheduler owned by {@link
+     * KvManager}.
+     */
+    @VisibleForTesting
     public static KvTablet create(
             PhysicalTablePath tablePath,
             TableBucket tableBucket,
@@ -254,6 +285,7 @@ public final class KvTablet {
                 sharedRateLimiter,
                 new KvFlushScheduler(serverConf),
                 true,
+                null,
                 autoIncrementManager);
     }
 
@@ -273,6 +305,7 @@ public final class KvTablet {
             ChangelogImage changelogImage,
             RateLimiter sharedRateLimiter,
             KvFlushScheduler kvFlushScheduler,
+            @Nullable Runnable flushCompleteListener,
             AutoIncrementManager autoIncrementManager)
             throws IOException {
         return create(
@@ -292,6 +325,7 @@ public final class KvTablet {
                 sharedRateLimiter,
                 kvFlushScheduler,
                 false,
+                flushCompleteListener,
                 autoIncrementManager);
     }
 
@@ -312,6 +346,7 @@ public final class KvTablet {
             RateLimiter sharedRateLimiter,
             KvFlushScheduler kvFlushScheduler,
             boolean closeFlushScheduler,
+            @Nullable Runnable flushCompleteListener,
             AutoIncrementManager autoIncrementManager)
             throws IOException {
         RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter);
@@ -347,6 +382,7 @@ public final class KvTablet {
                 rocksDBStatistics,
                 kvFlushScheduler,
                 closeFlushScheduler,
+                flushCompleteListener,
                 autoIncrementManager);
     }
 
@@ -790,45 +826,9 @@ public final class KvTablet {
         }
     }
 
-    /**
-     * Synchronously flushes the pre-write buffer up to the given offset. This method delegates to
-     * {@link #requestFlush(long, FatalErrorHandler)} and blocks until the async flush scheduler
-     * completes the flush. Intended for test use only; production code should use {@link
-     * #requestFlush} which is non-blocking.
-     */
     @VisibleForTesting
-    public void flush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
-        // Tests often pass Long.MAX_VALUE to mean "flush everything". Resolve it to
-        // the actual local log end offset to avoid poisoning flushedLogOffset with
-        // Long.MAX_VALUE, which would cause all subsequent flushes to be silently
-        // skipped by the async path's offset check in requestFlushInternal.
-        final long effectiveFlushOffset =
-                exclusiveUpToLogOffset == Long.MAX_VALUE
-                        ? logTablet.localLogEndOffset()
-                        : exclusiveUpToLogOffset;
-        // Check if already flushed or closed before requesting
-        boolean skipFlush =
-                inReadLock(kvLock, () -> isClosed || effectiveFlushOffset <= flushedLogOffset);
-        if (skipFlush) {
-            return;
-        }
-        requestFlush(effectiveFlushOffset, fatalErrorHandler);
-        // Poll until the flush scheduler finishes processing this tablet (IDLE = done,
-        // STORAGE_BLOCKED = backpressured, either way the scheduler has completed its attempt).
-        long deadline = System.currentTimeMillis() + 30_000;
-        while (System.currentTimeMillis() < deadline) {
-            FlushState state = inReadLock(kvLock, () -> flushState);
-            if (state == FlushState.IDLE || state == FlushState.STORAGE_BLOCKED) {
-                return;
-            }
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-        }
-        throw new RuntimeException("Flush did not complete within 30 seconds for " + tableBucket);
+    long localLogEndOffset() {
+        return logTablet.localLogEndOffset();
     }
 
     public void requestFlush(long exclusiveUpToLogOffset, FatalErrorHandler fatalErrorHandler) {
@@ -836,12 +836,24 @@ public final class KvTablet {
         inWriteLock(kvLock, () -> requestFlushInternal(exclusiveUpToLogOffset));
     }
 
+    /** Detaches or replaces the flush-complete listener set at construction time. */
+    @VisibleForTesting
     public void setFlushCompleteListener(@Nullable Runnable flushCompleteListener) {
         this.flushCompleteListener = flushCompleteListener;
     }
 
     public long getFlushedLogOffset() {
         return flushedLogOffset;
+    }
+
+    @VisibleForTesting
+    FlushState getFlushState() {
+        return inReadLock(kvLock, () -> flushState);
+    }
+
+    @VisibleForTesting
+    void setFlushState(FlushState state) {
+        inWriteLock(kvLock, () -> flushState = state);
     }
 
     @GuardedBy("kvLock")
@@ -853,7 +865,7 @@ public final class KvTablet {
             requestedFlushOffset = exclusiveUpToLogOffset;
         }
         if (flushState == FlushState.IDLE) {
-            flushState = FlushState.QUEUED;
+            transitionFlushState(FlushState.IDLE, FlushState.QUEUED);
             kvFlushScheduler.enqueue(this);
         }
     }
@@ -863,7 +875,7 @@ public final class KvTablet {
                 kvLock,
                 () -> {
                     if (!isClosed && flushState == FlushState.STORAGE_BLOCKED) {
-                        flushState = FlushState.QUEUED;
+                        transitionFlushState(FlushState.STORAGE_BLOCKED, FlushState.QUEUED);
                         kvFlushScheduler.enqueue(this);
                     }
                 });
@@ -873,41 +885,46 @@ public final class KvTablet {
         if (!tryAcquireScheduledFlush()) {
             return;
         }
-        boolean madeProgress = false;
-        PreparedFlush preparedFlush = null;
-        boolean flushCompleted = false;
+        // Each run is bounded to the flush target captured at prepare time: work requested after
+        // that point is handed to a freshly scheduled run (see completeScheduledFlush) so that
+        // flush completion, and thus high watermark advancement, is published per bounded
+        // target instead of chasing an ever-increasing requestedFlushOffset within one run.
+        long flushedOffsetBefore = flushedLogOffset;
         try {
-            while (true) {
-                preparedFlush = prepareScheduledFlush();
-                flushCompleted = false;
-                if (preparedFlush == null) {
-                    break;
-                }
-                if (!preparedFlush.isEmpty()) {
-                    writePreparedFlush(preparedFlush);
-                }
-                boolean hasMoreFlushWork = completeScheduledFlush(preparedFlush);
-                flushCompleted = true;
-                madeProgress = true;
-                if (!hasMoreFlushWork) {
-                    break;
-                }
-            }
+            // The whole prepare -> write -> complete sequence runs under the kvLock write lock,
+            // so snapshots, scans and puts can only observe states where the RocksDB content
+            // matches flushedLogOffset/rowCount. The RocksDB lease is acquired strictly inside
+            // kvLock, keeping the lock order kvLock -> lease on every path.
+            inWriteLock(kvLock, this::doScheduledFlush);
         } catch (StorageBackpressureException e) {
-            if (preparedFlush != null && !flushCompleted) {
-                abortScheduledFlush(preparedFlush);
-            }
             delayScheduledFlush(e);
         } catch (Throwable t) {
-            if (preparedFlush != null && !flushCompleted) {
-                abortScheduledFlush(preparedFlush);
-            }
             failScheduledFlush(t);
         } finally {
-            if (madeProgress) {
+            // Publish progress (including the completed prefix of a partially rejected run) so
+            // the high watermark can advance. Runs outside kvLock because the listener acquires
+            // the replica's leaderIsrUpdateLock while the write path acquires
+            // leaderIsrUpdateLock -> kvLock; invoking it under kvLock would invert that order.
+            if (flushedLogOffset > flushedOffsetBefore) {
                 notifyFlushComplete();
             }
         }
+    }
+
+    @GuardedBy("kvLock")
+    private void doScheduledFlush() throws Exception {
+        PreparedFlush preparedFlush = prepareScheduledFlush();
+        if (preparedFlush == null) {
+            return;
+        }
+        if (!preparedFlush.isEmpty()) {
+            writePreparedFlush(preparedFlush);
+        } else {
+            // The empty flush already advanced flushedLogOffset in prepare; completing it here
+            // only resets the retry backoff.
+            completeFlushedSegment(preparedFlush);
+        }
+        finishScheduledFlush();
     }
 
     private boolean tryAcquireScheduledFlush() {
@@ -917,112 +934,162 @@ public final class KvTablet {
                     if (isClosed || flushState != FlushState.QUEUED) {
                         return false;
                     }
-                    flushState = FlushState.RUNNING;
+                    transitionFlushState(FlushState.QUEUED, FlushState.RUNNING);
                     return true;
                 });
     }
 
+    @GuardedBy("kvLock")
     private @Nullable PreparedFlush prepareScheduledFlush() {
-        return inWriteLock(
-                kvLock,
-                () -> {
-                    if (isClosed) {
-                        flushState = FlushState.IDLE;
-                        return null;
-                    }
-                    long targetOffset = requestedFlushOffset;
-                    if (targetOffset <= flushedLogOffset) {
-                        flushState = FlushState.IDLE;
-                        return null;
-                    }
-                    PreparedFlush preparedFlush;
-                    try {
-                        preparedFlush = kvPreWriteBuffer.prepareFlush(targetOffset);
-                    } catch (IllegalStateException e) {
-                        // Orphaned PREPARED entries from a previous incomplete flush cycle.
-                        // Abort them back to ACTIVE and let the next attempt start clean.
-                        LOG.warn(
-                                "Found orphaned PREPARED entries in {}, aborting.", tableBucket, e);
-                        kvPreWriteBuffer.abortAllPrepared();
-                        flushState = FlushState.STORAGE_BLOCKED;
-                        kvFlushScheduler.retryLater(this);
-                        return null;
-                    }
-                    if (preparedFlush.isEmpty()) {
-                        flushedLogOffset = targetOffset;
-                    }
-                    return preparedFlush;
-                });
+        if (isClosed) {
+            // close() already forced the state machine to its terminal IDLE state.
+            return null;
+        }
+        long targetOffset = requestedFlushOffset;
+        if (targetOffset <= flushedLogOffset) {
+            transitionFlushState(FlushState.RUNNING, FlushState.IDLE);
+            return null;
+        }
+        PreparedFlush preparedFlush;
+        try {
+            preparedFlush = kvPreWriteBuffer.prepareFlush(targetOffset);
+        } catch (IllegalStateException e) {
+            // Orphaned PREPARED entries from a previous incomplete flush cycle. Structurally
+            // unreachable now that every flush run completes or aborts all its prepared entries
+            // before releasing kvLock; kept as defense in depth.
+            LOG.warn("Found orphaned PREPARED entries in {}, aborting.", tableBucket, e);
+            kvPreWriteBuffer.abortAllPrepared();
+            transitionFlushState(FlushState.RUNNING, FlushState.STORAGE_BLOCKED);
+            kvFlushScheduler.retryLater(this);
+            return null;
+        }
+        if (preparedFlush.isEmpty()) {
+            flushedLogOffset = targetOffset;
+        }
+        return preparedFlush;
     }
 
+    /**
+     * Writes the prepared entries to RocksDB in segments of at most {@code
+     * MAX_RECORDS_PER_NATIVE_WRITE} records / {@code writeBatchSize} bytes. Each segment forms
+     * exactly one atomic native write (the writer has implicit flushes disabled) and is completed
+     * immediately after it lands, so {@code flushedLogOffset}/{@code rowCount} stay consistent with
+     * the RocksDB content even if a later segment is rejected by the no-slowdown gate.
+     */
+    @GuardedBy("kvLock")
     private void writePreparedFlush(PreparedFlush preparedFlush) throws Exception {
+        List<PreparedFlush> segments =
+                preparedFlush.split(writeBatchSize, MAX_RECORDS_PER_NATIVE_WRITE);
+        int nextSegment = 0;
         try (ResourceGuard.Lease lease = rocksDBKv.getResourceGuard().acquireResource();
                 KvBatchWriter kvBatchWriter = createNoSlowdownKvBatchWriter()) {
-            for (KvPreWriteBuffer.KvEntry entry : preparedFlush.entries()) {
-                KvPreWriteBuffer.Value value = entry.getValue();
-                if (value.get() == null) {
-                    kvBatchWriter.delete(entry.getKey().get());
-                } else {
-                    kvBatchWriter.put(entry.getKey().get(), value.get());
+            while (nextSegment < segments.size()) {
+                PreparedFlush segment = segments.get(nextSegment);
+                for (KvPreWriteBuffer.KvEntry entry : segment.entries()) {
+                    KvPreWriteBuffer.Value value = entry.getValue();
+                    if (value.get() == null) {
+                        kvBatchWriter.delete(entry.getKey().get());
+                    } else {
+                        kvBatchWriter.put(entry.getKey().get(), value.get());
+                    }
                 }
+                kvBatchWriter.flush();
+                completeFlushedSegment(segment);
+                nextSegment++;
             }
-            kvBatchWriter.flush();
+        } catch (Throwable t) {
+            // Segments before nextSegment are already in RocksDB and stay completed; roll only
+            // the not-yet-written rest back to ACTIVE so the retry re-prepares exactly the
+            // remaining range.
+            for (int i = nextSegment; i < segments.size(); i++) {
+                kvPreWriteBuffer.abortFlush(segments.get(i));
+            }
+            throw t;
         }
     }
 
-    private boolean completeScheduledFlush(PreparedFlush preparedFlush) {
-        return inWriteLock(
+    /**
+     * Publishes one flushed segment: removes its entries from the pre-write buffer and advances
+     * {@code flushedLogOffset}/{@code rowCount} to cover exactly the data now in RocksDB.
+     */
+    @GuardedBy("kvLock")
+    private void completeFlushedSegment(PreparedFlush segment) {
+        int rowCountDiff = kvPreWriteBuffer.completeFlush(segment);
+        if (segment.exclusiveUpToLogSequenceNumber() > flushedLogOffset) {
+            flushedLogOffset = segment.exclusiveUpToLogSequenceNumber();
+        }
+        if (rowCount != ROW_COUNT_DISABLED) {
+            rowCount += rowCountDiff;
+        }
+        if (!segment.isEmpty()) {
+            rocksDBKv.recordWriteSucceeded();
+        }
+        resetFlushRetryBackoff();
+    }
+
+    @GuardedBy("kvLock")
+    private void finishScheduledFlush() {
+        if (isClosed) {
+            // close() already forced the state machine to its terminal IDLE state.
+            return;
+        }
+        if (requestedFlushOffset > flushedLogOffset) {
+            // More flush work arrived while this run was flushing: requeue a fresh run instead
+            // of extending this one, so the completed target is published first via
+            // notifyFlushComplete.
+            transitionFlushState(FlushState.RUNNING, FlushState.QUEUED);
+            kvFlushScheduler.enqueue(this);
+        } else {
+            transitionFlushState(FlushState.RUNNING, FlushState.IDLE);
+        }
+    }
+
+    @VisibleForTesting
+    void completeScheduledFlush(PreparedFlush preparedFlush) {
+        inWriteLock(
                 kvLock,
                 () -> {
                     if (!isClosed) {
-                        int rowCountDiff = kvPreWriteBuffer.completeFlush(preparedFlush);
-                        if (preparedFlush.exclusiveUpToLogSequenceNumber() > flushedLogOffset) {
-                            flushedLogOffset = preparedFlush.exclusiveUpToLogSequenceNumber();
-                        }
-                        if (rowCount != ROW_COUNT_DISABLED) {
-                            rowCount += rowCountDiff;
-                        }
-                        if (!preparedFlush.isEmpty()) {
-                            rocksDBKv.recordWriteSucceeded();
-                        }
-                        resetFlushRetryBackoff();
+                        completeFlushedSegment(preparedFlush);
                     }
-                    if (!isClosed && requestedFlushOffset > flushedLogOffset) {
-                        flushState = FlushState.RUNNING;
-                        return true;
-                    }
-                    flushState = FlushState.IDLE;
-                    return false;
+                    finishScheduledFlush();
                 });
     }
 
-    private void abortScheduledFlush(PreparedFlush preparedFlush) {
+    @VisibleForTesting
+    void abortScheduledFlush(PreparedFlush preparedFlush) {
         inWriteLock(kvLock, () -> kvPreWriteBuffer.abortFlush(preparedFlush));
     }
 
-    private void delayScheduledFlush(StorageBackpressureException e) {
+    @VisibleForTesting
+    void delayScheduledFlush(StorageBackpressureException e) {
         LOG.debug("KV flush for {} delayed by RocksDB backpressure.", tableBucket, e);
         inWriteLock(
                 kvLock,
                 () -> {
                     if (!isClosed) {
-                        flushState = FlushState.STORAGE_BLOCKED;
+                        transitionFlushState(FlushState.RUNNING, FlushState.STORAGE_BLOCKED);
                         kvFlushScheduler.retryLater(this, nextFlushRetryDelayMs());
                     }
                 });
     }
 
+    /**
+     * Returns the delay before the next flush retry and advances the exponential backoff.
+     *
+     * <p>Retries are unbounded: a storage-blocked flush keeps retrying (at most every {@link
+     * #MAX_FLUSH_RETRY_DELAY_MS}) until it makes progress or the tablet is closed, since giving up
+     * would permanently stall {@code flushedLogOffset} and thus the high watermark. Only the delay
+     * saturates; the shift is capped at {@link #MAX_FLUSH_RETRY_BACKOFF_SHIFT} so the shifted value
+     * stays bounded and cannot overflow.
+     */
     @GuardedBy("kvLock")
     private long nextFlushRetryDelayMs() {
-        long delay = MIN_FLUSH_RETRY_DELAY_MS;
-        if (flushRetryAttempts > 0) {
-            int shift = Math.min(flushRetryAttempts, 30);
-            delay = MIN_FLUSH_RETRY_DELAY_MS << shift;
-        }
-        if (flushRetryAttempts < 30) {
+        int shift = Math.min(flushRetryAttempts, MAX_FLUSH_RETRY_BACKOFF_SHIFT);
+        if (flushRetryAttempts < MAX_FLUSH_RETRY_BACKOFF_SHIFT) {
             flushRetryAttempts++;
         }
-        return Math.min(delay, MAX_FLUSH_RETRY_DELAY_MS);
+        return Math.min(MIN_FLUSH_RETRY_DELAY_MS << shift, MAX_FLUSH_RETRY_DELAY_MS);
     }
 
     @GuardedBy("kvLock")
@@ -1034,6 +1101,8 @@ public final class KvTablet {
         inWriteLock(
                 kvLock,
                 () -> {
+                    // Fatal path: force the state machine back to IDLE regardless of the current
+                    // state (a concurrent close() may have forced IDLE already).
                     flushState = FlushState.IDLE;
                     FatalErrorHandler fatalErrorHandler = asyncFatalErrorHandler;
                     if (fatalErrorHandler != null) {
@@ -1094,6 +1163,27 @@ public final class KvTablet {
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
                     return rocksDBKv.multiGet(keys);
+                });
+    }
+
+    /**
+     * Multi-get that also sees entries still sitting in the kv pre-write buffer (already appended
+     * to the CDC log but not yet flushed to RocksDB by the asynchronous flush).
+     *
+     * <p>Only for internal server-side reads that must observe their own just-written data, e.g.
+     * the re-lookup of lookup-with-insert-if-not-exists. External lookups must keep using {@link
+     * #multiGet} so that clients only observe flushed data.
+     */
+    public List<byte[]> multiGetFromBufferOrKv(List<byte[]> keys) throws IOException {
+        return inReadLock(
+                kvLock,
+                () -> {
+                    rocksDBKv.checkIfRocksDBClosed();
+                    List<byte[]> values = new ArrayList<>(keys.size());
+                    for (byte[] key : keys) {
+                        values.add(getFromBufferOrKv(KvPreWriteBuffer.Key.of(key)));
+                    }
+                    return values;
                 });
     }
 
@@ -1207,6 +1297,8 @@ public final class KvTablet {
                                 return false;
                             }
                             isClosed = true;
+                            // Terminal transition: closing forces IDLE regardless of the current
+                            // state, see the FlushState state graph.
                             flushState = FlushState.IDLE;
                             return true;
                         });
@@ -1262,7 +1354,77 @@ public final class KvTablet {
         return rocksDBKv.currentPressure();
     }
 
-    private enum FlushState {
+    /**
+     * Applies a flush state transition, enforcing that the current state matches the source state
+     * of the transition shown in the {@link FlushState} state graph. Terminal transitions forced by
+     * {@link #close()} and {@link #failScheduledFlush(Throwable)} assign the state directly.
+     */
+    @GuardedBy("kvLock")
+    private void transitionFlushState(FlushState expected, FlushState target) {
+        checkState(
+                flushState == expected,
+                "Invalid flush state transition for %s: expected %s but was %s (target %s).",
+                tableBucket,
+                expected,
+                flushState,
+                target);
+        flushState = target;
+    }
+
+    /**
+     * Flush scheduling state for one KV tablet.
+     *
+     * <p>This state tracks scheduler ownership and retry backoff. Whether more data needs to be
+     * flushed is determined separately by {@code requestedFlushOffset} and {@code
+     * flushedLogOffset}.
+     *
+     * <pre>
+     * Normal scheduling:
+     *
+     *   +------+    a new target requires flushing    +--------+
+     *   | IDLE | -----------------------------------&gt; | QUEUED |
+     *   +------+                                      +--------+
+     *                                                     |
+     *                                              a worker claims
+     *                                               the queued task
+     *                                                     |
+     *                                                     v
+     *                                               +---------+
+     *                                               | RUNNING |
+     *                                               +---------+
+     *                                                     |
+     *                                            the target is reached
+     *                                            or a fatal error occurs
+     *                                                     |
+     *                                                     v
+     *                                                 +------+
+     *                                                 | IDLE |
+     *                                                 +------+
+     *
+     * Backpressure retry:
+     *
+     *                    storage rejection or
+     *                    prepared-entry conflict
+     *   +---------+ -------------------------------&gt; +-----------------+
+     *   | RUNNING |                                  | STORAGE_BLOCKED |
+     *   +---------+                                  +-----------------+
+     *                                                        |
+     *                                                 the retry timer
+     *                                                      fires
+     *                                                        |
+     *                                                        v
+     *                                                   +--------+
+     *                                                   | QUEUED |
+     *                                                   +--------+
+     * </pre>
+     *
+     * <p>A higher flush target received in {@code QUEUED}, {@code RUNNING}, or {@code
+     * STORAGE_BLOCKED} only advances {@code requestedFlushOffset}; it does not change the state or
+     * enqueue another task. Closing the tablet sets {@code isClosed} and terminates the state
+     * machine. All transitions must happen while holding {@code kvLock} and are applied through
+     * {@code transitionFlushState}, which enforces the source state of each transition.
+     */
+    enum FlushState {
         IDLE,
         QUEUED,
         RUNNING,

@@ -949,10 +949,18 @@ public final class RecordAccumulator {
      * remaining gentle at low pressure.
      *
      * @param tableBucket the bucket to update
-     * @param pressure value in {@code [0, 1)}; {@code 0} means recovered, positive values trigger a
-     *     throttle window
+     * @param pressure value in {@code [0, 1)} on the wire; {@code 0} means recovered, positive
+     *     values trigger a throttle window. {@code 1.0f} is reserved as the internal hard-rejection
+     *     value (never sent by the server): the Sender passes it when the server rejected the write
+     *     outright, and it installs the full {@link #maxThrottleMs} window directly.
      */
     void updateThrottle(TableBucket tableBucket, float pressure) {
+        if (pressure >= 1f) {
+            // Hard rejection: stall the bucket for the full max throttle window, bypassing the
+            // quadratic curve to avoid long-to-float rounding.
+            throttleExpiryMs.put(tableBucket, clock.milliseconds() + maxThrottleMs);
+            return;
+        }
         if (pressure > 0f) {
             long delay = (long) (maxThrottleMs * pressure * pressure);
             if (delay > 0) {
@@ -965,16 +973,6 @@ public final class RecordAccumulator {
         // (server stops sending the pressure field once p reaches 0). This branch exists as
         // defensive completeness and is exercised by unit tests.
         throttleExpiryMs.remove(tableBucket);
-    }
-
-    /**
-     * Apply a hard back-off after the server rejected the write with a {@code
-     * StorageBackpressureException}. This signals that the storage engine has reached its own
-     * slowdown threshold; we stall the bucket for the full {@link #maxThrottleMs} window so the
-     * standard retry path can take effect.
-     */
-    void applyStorageBackpressureBackoff(TableBucket tableBucket) {
-        throttleExpiryMs.put(tableBucket, clock.milliseconds() + maxThrottleMs);
     }
 
     /**

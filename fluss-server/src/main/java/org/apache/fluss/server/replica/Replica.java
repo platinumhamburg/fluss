@@ -755,8 +755,6 @@ public final class Replica {
                         });
         if (leaderHWIncremented) {
             tryCompleteDelayedOperations();
-        } else {
-            delayedWriteManager.checkAndComplete(new DelayedTableBucketKey(tableBucket));
         }
     }
 
@@ -805,7 +803,7 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet = kvManager.loadKv(tabletDir, schemaGetter);
+                kvTablet = kvManager.loadKv(tabletDir, schemaGetter, this::onKvFlushComplete);
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
@@ -828,7 +826,8 @@ public final class Replica {
                                 tableConfig.getKvFormat(),
                                 schemaGetter,
                                 tableConfig,
-                                arrowCompressionInfo);
+                                arrowCompressionInfo,
+                                this::onKvFlushComplete);
 
                 // we don't support rowCount
                 rowCount = tableConfig.getChangelogImage() == ChangelogImage.WAL ? null : 0L;
@@ -857,11 +856,10 @@ public final class Replica {
                 endTime - startTime);
 
         if (kvTablet != null) {
-            kvTablet.setFlushCompleteListener(this::onKvFlushComplete);
-        }
-        // Register RocksDB statistics now that the kv tablet is fully initialized.
-        if (kvTablet != null && kvTablet.getRocksDBStatistics() != null) {
-            bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
+            // Register RocksDB statistics now that the kv tablet is fully initialized.
+            if (kvTablet.getRocksDBStatistics() != null) {
+                bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
+            }
         }
 
         return optCompletedSnapshot;
@@ -1096,10 +1094,10 @@ public final class Replica {
     }
 
     /**
-     * Samples the recent backpressure pressure for piggyback on a completed write response. Also
-     * records the value on this bucket's {@link BucketMetricGroup} for table-level aggregation.
+     * Samples the recent backpressure pressure for piggyback on a put response. Also records the
+     * value on this bucket's {@link BucketMetricGroup} for table-level aggregation.
      */
-    public float samplePressureForCompletion() {
+    public float samplePressure() {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
@@ -1233,13 +1231,21 @@ public final class Replica {
         }
 
         KvTablet currentKv = this.kvTablet;
-        if (currentKv != null
-                && currentKv.getFlushedLogOffset() < newHighWatermark.getMessageOffset()) {
-            // The KV view must be flushed before the log high watermark becomes visible. The flush
-            // itself runs on the shared KV flush scheduler so this RPC worker does not execute
-            // RocksDB writes.
-            mayFlushKv(newHighWatermark.getMessageOffset());
-            return false;
+        if (currentKv != null) {
+            long flushedOffset = currentKv.getFlushedLogOffset();
+            if (flushedOffset < newHighWatermark.getMessageOffset()) {
+                // The KV view must be flushed before the log high watermark becomes visible. Kick
+                // the asynchronous flush towards the full candidate (the flush runs on the shared
+                // KV flush scheduler so this RPC worker does not execute RocksDB writes), and
+                // clamp this advance to the already-flushed offset so completed flush work becomes
+                // visible immediately instead of waiting for the flush to catch up with an
+                // ever-newer candidate.
+                mayFlushKv(newHighWatermark.getMessageOffset());
+                if (flushedOffset <= leaderLog.getHighWatermark()) {
+                    return false;
+                }
+                newHighWatermark = new LogOffsetMetadata(flushedOffset);
+            }
         }
 
         Optional<LogOffsetMetadata> oldWatermark =
@@ -1369,6 +1375,41 @@ public final class Replica {
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
                         return kvTablet.multiGet(keys);
+                    } catch (IOException e) {
+                        String errorMsg =
+                                String.format(
+                                        "Failed to lookup from local kv for table bucket %s, the cause is: %s",
+                                        tableBucket, e.getMessage());
+                        LOG.error(errorMsg, e);
+                        throw new KvStorageException(errorMsg, e);
+                    }
+                });
+    }
+
+    /**
+     * Lookups that also see entries still pending in the kv pre-write buffer. Only for internal
+     * reads that must observe their own just-written data (e.g. the re-lookup of
+     * lookup-with-insert-if-not-exists after an {@code acks = 1} insert, where the asynchronous
+     * flush may not have materialized the insert into RocksDB yet).
+     */
+    public List<byte[]> lookupsFromBufferOrKv(List<byte[]> keys) {
+        if (!isKvTable()) {
+            throw new NonPrimaryKeyTableException(
+                    "the primary key table not exists for " + tableBucket);
+        }
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    try {
+                        if (!isLeader()) {
+                            throw new NotLeaderOrFollowerException(
+                                    String.format(
+                                            "Leader not local for bucket %s on tabletServer %d",
+                                            tableBucket, localTabletServerId));
+                        }
+                        checkNotNull(
+                                kvTablet, "KvTablet for the replica to get key shouldn't be null.");
+                        return kvTablet.multiGetFromBufferOrKv(keys);
                     } catch (IOException e) {
                         String errorMsg =
                                 String.format(
@@ -1536,9 +1577,9 @@ public final class Replica {
      * reached `requiredOffset` and the second element is an error (which would be `Errors.NONE` for
      * no error).
      *
-     * <p>For ProduceLog this method is only used when {@code requiredAcks = -1}. PutKv can also use
-     * this path for non-zero acks so the response waits until the KV flush path has published the
-     * high watermark for the written offset.
+     * <p>Note that this method will only be called if requiredAcks = -1, and we are waiting for all
+     * replicas to be fully caught up to the (local) leader's offset corresponding to this
+     * produceLog/PutKv request before we acknowledge the request.
      */
     public Tuple2<Boolean, Errors> checkEnoughReplicasReachOffset(long requiredOffset) {
         if (isLeader()) {
@@ -1560,30 +1601,6 @@ public final class Replica {
         } else {
             return Tuple2.of(false, Errors.NOT_LEADER_OR_FOLLOWER);
         }
-    }
-
-    /**
-     * Checks whether the local leader KV view has been flushed to the required offset. Used by
-     * PutKv with {@code acks = 1}: the client should wait for local materialization, but should not
-     * be upgraded to waiting for high watermark replication.
-     */
-    public Tuple2<Boolean, Errors> checkLocalKvFlushedOffset(long requiredOffset) {
-        return inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    if (!isLeader()) {
-                        return Tuple2.of(false, Errors.NOT_LEADER_OR_FOLLOWER);
-                    }
-                    KvTablet kv = this.kvTablet;
-                    if (kv == null) {
-                        return Tuple2.of(false, Errors.UNKNOWN_SERVER_ERROR);
-                    }
-                    if (kv.getFlushedLogOffset() >= requiredOffset) {
-                        return Tuple2.of(true, Errors.NONE);
-                    }
-                    kv.requestFlush(requiredOffset, fatalErrorHandler);
-                    return Tuple2.of(false, Errors.NONE);
-                });
     }
 
     public long getRowCount() {
