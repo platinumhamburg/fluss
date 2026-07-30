@@ -290,7 +290,7 @@ public class KvPreWriteBuffer {
     }
 
     private static long entryBytes(Key key, Value value) {
-        return key.key.length + (value.value != null ? value.value.length : 0);
+        return (long) key.key.length + (value.value != null ? value.value.length : 0L);
     }
 
     /** Contribution of one entry to the table row count: +1 for INSERT, -1 for DELETE. */
@@ -473,7 +473,8 @@ public class KvPreWriteBuffer {
          * segment boundary never claims an entry that has not been written yet. The last segment
          * keeps the original target so an empty tail still publishes the full flush range.
          *
-         * @param maxBytesPerSegment max byte size per segment, {@code <= 0} means unlimited
+         * @param maxBytesPerSegment max key/value payload bytes per segment, {@code <= 0} means
+         *     unlimited; a single entry larger than the limit is kept as an oversized singleton
          * @param maxRecordsPerSegment max record count per segment
          */
         public List<PreparedFlush> split(long maxBytesPerSegment, int maxRecordsPerSegment) {
@@ -486,8 +487,14 @@ public class KvPreWriteBuffer {
             int segmentRowCountDiff = 0;
             for (int i = 0; i < entries.size(); i++) {
                 KvEntry entry = entries.get(i);
-                if (i - segmentStart >= maxRecordsPerSegment
-                        || (maxBytesPerSegment > 0 && segmentBytes >= maxBytesPerSegment)) {
+                long currentEntryBytes = entryBytes(entry.getKey(), entry.getValue());
+                boolean hasEntries = i > segmentStart;
+                boolean recordLimitReached = hasEntries && i - segmentStart >= maxRecordsPerSegment;
+                boolean byteLimitExceeded =
+                        hasEntries
+                                && maxBytesPerSegment > 0
+                                && currentEntryBytes > maxBytesPerSegment - segmentBytes;
+                if (recordLimitReached || byteLimitExceeded) {
                     // Seal the current segment right before this entry: all entries below this
                     // entry's log sequence number are contained in the sealed segments.
                     if (segments == null) {
@@ -502,7 +509,7 @@ public class KvPreWriteBuffer {
                     segmentBytes = 0;
                     segmentRowCountDiff = 0;
                 }
-                segmentBytes += entryBytes(entry.getKey(), entry.getValue());
+                segmentBytes += currentEntryBytes;
                 segmentRowCountDiff += rowCountDelta(entry);
             }
             if (segments == null) {

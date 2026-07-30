@@ -1244,6 +1244,9 @@ public final class Replica {
                 if (flushedOffset <= leaderLog.getHighWatermark()) {
                     return false;
                 }
+                // TODO: Under sustained writes, the KV high watermark may frequently advance with
+                // message-offset-only metadata. Materializing the missing segment metadata requires
+                // log-index and log-file I/O, adding overhead to the high-watermark hot path.
                 newHighWatermark = new LogOffsetMetadata(flushedOffset);
             }
         }

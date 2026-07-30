@@ -1382,7 +1382,7 @@ public final class KvTablet {
      * Normal scheduling:
      *
      *   +------+    a new target requires flushing    +--------+
-     *   | IDLE | -----------------------------------&gt; | QUEUED |
+     *   | IDLE | -----------------------------------> | QUEUED |
      *   +------+                                      +--------+
      *                                                     |
      *                                              a worker claims
@@ -1405,7 +1405,7 @@ public final class KvTablet {
      *
      *                    storage rejection or
      *                    prepared-entry conflict
-     *   +---------+ -------------------------------&gt; +-----------------+
+     *   +---------+ -------------------------------> +-----------------+
      *   | RUNNING |                                  | STORAGE_BLOCKED |
      *   +---------+                                  +-----------------+
      *                                                        |
