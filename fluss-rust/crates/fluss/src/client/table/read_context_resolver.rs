@@ -29,7 +29,7 @@
 
 use crate::client::ClientSchemaGetter;
 use crate::error::{Error, Result};
-use crate::metadata::{RowType, Schema};
+use crate::metadata::{RowType, Schema, index_mapping};
 use crate::record::{ReadContext, to_arrow_schema};
 use arrow_schema::SchemaRef;
 use parking_lot::RwLock;
@@ -47,17 +47,22 @@ pub(crate) struct ReadContextResolver {
     /// Used to lazily fetch schema versions when decoding a batch whose schema
     /// was not prewarmed by the fetch response path.
     schema_getter: Option<Arc<ClientSchemaGetter>>,
-    /// When true, contexts for older schemas still decode with their write-time
-    /// schema, then align the output to the scanner creation schema.
-    fixed_schema: bool,
-    fixed_target_schema: Option<SchemaRef>,
-    fixed_target_row_type: Option<Arc<RowType>>,
+    /// Fixed-schema target captured when the scanner is created. When set,
+    /// older batches decode with their write-time schema and then align to
+    /// this target by stable Fluss column ID.
+    fixed_target: Option<FixedSchemaTarget>,
 }
 
 /// A pair of ReadContexts for local and remote reads.
 struct ResolvedContexts {
     local: Arc<ReadContext>,
     remote: Arc<ReadContext>,
+}
+
+struct FixedSchemaTarget {
+    fluss_schema: Schema,
+    arrow_schema: SchemaRef,
+    row_type: Arc<RowType>,
 }
 
 impl ReadContextResolver {
@@ -81,9 +86,7 @@ impl ReadContextResolver {
             contexts: RwLock::new(map),
             projected_fields,
             schema_getter: None,
-            fixed_schema: false,
-            fixed_target_schema: None,
-            fixed_target_row_type: None,
+            fixed_target: None,
         }
     }
 
@@ -92,23 +95,20 @@ impl ReadContextResolver {
         self
     }
 
-    pub fn with_fixed_schema(mut self, fixed_schema: bool) -> Self {
-        self.fixed_schema = fixed_schema;
-        if fixed_schema {
-            let fixed_target = {
-                let guard = self.contexts.read();
-                guard
-                    .get(&self.initial_schema_id)
-                    .map(|ctx| (ctx.local.target_schema(), ctx.local.row_type_arc()))
-            };
-            if let Some((target_schema, target_row_type)) = fixed_target {
-                self.fixed_target_schema = Some(target_schema);
-                self.fixed_target_row_type = Some(target_row_type);
-            }
-        } else {
-            self.fixed_target_schema = None;
-            self.fixed_target_row_type = None;
+    pub fn with_fixed_schema(mut self, target_fluss_schema: &Schema) -> Self {
+        if self.projected_fields.is_some() {
+            return self;
         }
+        self.fixed_target = {
+            let guard = self.contexts.read();
+            guard
+                .get(&self.initial_schema_id)
+                .map(|ctx| FixedSchemaTarget {
+                    fluss_schema: target_fluss_schema.clone(),
+                    arrow_schema: ctx.local.target_schema(),
+                    row_type: ctx.local.row_type_arc(),
+                })
+        };
         self
     }
 
@@ -170,10 +170,23 @@ impl ReadContextResolver {
         let source_row_type = schema.row_type();
         let source_arrow_schema = to_arrow_schema(source_row_type)?;
         let source_row_type_arc = Arc::new(source_row_type.clone());
-        let output_row_type = self
-            .fixed_target_row_type
-            .clone()
-            .unwrap_or_else(|| source_row_type_arc.clone());
+        let fixed_target = self
+            .fixed_target
+            .as_ref()
+            .map(|target| {
+                index_mapping(schema, &target.fluss_schema).map(|mapping| {
+                    (
+                        target.arrow_schema.clone(),
+                        target.row_type.clone(),
+                        Arc::<[i32]>::from(mapping.into_boxed_slice()),
+                    )
+                })
+            })
+            .transpose()?;
+        let output_row_type = fixed_target
+            .as_ref()
+            .map(|(_, row_type, _)| row_type.clone())
+            .unwrap_or(source_row_type_arc);
 
         let mut local_context =
             ReadContext::new(source_arrow_schema.clone(), output_row_type.clone(), false)
@@ -182,11 +195,11 @@ impl ReadContextResolver {
             ReadContext::new(source_arrow_schema, output_row_type.clone(), true)
                 .with_fluss_row_type(output_row_type);
 
-        if self.fixed_schema {
-            if let Some(target_schema) = &self.fixed_target_schema {
-                local_context = local_context.with_target_schema_alignment(target_schema.clone());
-                remote_context = remote_context.with_target_schema_alignment(target_schema.clone());
-            }
+        if let Some((target_schema, _, schema_alignment)) = fixed_target {
+            local_context = local_context
+                .with_target_schema_alignment(target_schema.clone(), Arc::clone(&schema_alignment));
+            remote_context =
+                remote_context.with_target_schema_alignment(target_schema, schema_alignment);
         }
 
         let local_context = Arc::new(local_context);
@@ -211,5 +224,44 @@ impl ReadContextResolver {
     #[allow(dead_code)]
     pub fn projected_fields(&self) -> Option<&[usize]> {
         self.projected_fields.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadContextResolver;
+    use crate::error::Result;
+    use crate::metadata::{DataTypes, Schema};
+    use crate::record::{ReadContext, to_arrow_schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn fixed_schema_does_not_capture_target_with_projection() -> Result<()> {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .build()?;
+        let arrow_schema = to_arrow_schema(schema.row_type())?;
+        let projected_fields = vec![0];
+        let projected_row_type = Arc::new(schema.row_type().project(&projected_fields)?);
+        let local_context = Arc::new(ReadContext::with_projection_pushdown(
+            arrow_schema.clone(),
+            Arc::clone(&projected_row_type),
+            projected_fields.clone(),
+            false,
+        )?);
+        let remote_context = Arc::new(ReadContext::with_projection_pushdown(
+            arrow_schema,
+            projected_row_type,
+            projected_fields.clone(),
+            true,
+        )?);
+
+        let resolver =
+            ReadContextResolver::new(1, local_context, remote_context, Some(projected_fields))
+                .with_fixed_schema(&schema);
+
+        assert!(resolver.fixed_target.is_none());
+        Ok(())
     }
 }
