@@ -457,6 +457,26 @@ class TableSchemaTest {
     }
 
     @Test
+    void testRejectIndexNameWithLeadingUnderscore() {
+        Schema.Builder b =
+                Schema.newBuilder()
+                        .column("id", DataTypes.BIGINT())
+                        .column("u", DataTypes.BIGINT())
+                        .primaryKey("id");
+
+        assertThatThrownBy(() -> b.index("_idx_bad", "u"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot start with underscore");
+
+        assertThatThrownBy(
+                        () ->
+                                new Schema.Index(
+                                        "_idx_bad", java.util.Collections.singletonList("u")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot start with underscore");
+    }
+
+    @Test
     void testRejectEmptyIndexColumns() {
         Schema.Builder b = Schema.newBuilder().column("id", DataTypes.BIGINT()).primaryKey("id");
 
