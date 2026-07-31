@@ -27,6 +27,7 @@ import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.RetriableException;
+import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -211,6 +212,10 @@ public class Sender implements Runnable {
 
     private void sendWriteData() throws Exception {
         Cluster clusterSnapshot = metadataUpdater.getCluster();
+
+        // Refresh per-bucket throttle entries against the current cluster snapshot,
+        // dropping any whose bucket has disappeared from metadata.
+        accumulator.maybeEvictStaleThrottles(clusterSnapshot);
 
         // get the list of buckets with data ready to send.
         ReadyCheckResult readyCheckResult = accumulator.ready(clusterSnapshot);
@@ -500,7 +505,16 @@ public class Sender implements Runnable {
                             tableId,
                             respForBucket.hasPartitionId() ? respForBucket.getPartitionId() : null,
                             respForBucket.getBucketId());
+
+            // Update backpressure throttle from pressure signal
+            if (respForBucket.hasPressure()) {
+                accumulator.updateThrottle(tb, respForBucket.getPressure());
+            }
+
             ReadyWriteBatch writeBatch = recordsByBucket.get(tb);
+            if (writeBatch == null) {
+                continue;
+            }
             if (respForBucket.hasErrorCode()) {
                 Set<PhysicalTablePath> invalidMetadataTables =
                         handleWriteBatchException(
@@ -536,6 +550,13 @@ public class Sender implements Runnable {
             ReadyWriteBatch readyWriteBatch, ApiError error) {
         Set<PhysicalTablePath> invalidMetadataTables = new HashSet<>();
         WriteBatch writeBatch = readyWriteBatch.writeBatch();
+        if (error.exception() instanceof StorageBackpressureException) {
+            // Hard rejection: the storage engine reached its slowdown trigger and rejected the
+            // write. Map it to full pressure (internal hard-rejection value 1.0f) so the bucket is
+            // stalled for the configured max throttle window before the standard retry path
+            // re-enqueues the batch.
+            accumulator.updateThrottle(readyWriteBatch.tableBucket(), 1.0f);
+        }
         if (error.error() == Errors.DUPLICATE_SEQUENCE_EXCEPTION) {
             // If we have received a duplicate batch sequence error, it means that the batch
             // sequence has advanced beyond the sequence of the current batch.
