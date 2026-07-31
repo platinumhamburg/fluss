@@ -353,13 +353,13 @@ public class FlussSourceBuilder<OUT> {
         boolean lakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
         boolean fullStartup = offsetsInitializer instanceof SnapshotOffsetsInitializer;
 
-        if (bounded && !(lakeEnabled && fullStartup)) {
+        if (bounded && hasPrimaryKey && !fullStartup) {
             throw new IllegalArgumentException(
                     String.format(
-                            "Bounded (batch) read requires a datalake-enabled table started in "
-                                    + "full mode (OffsetsInitializer.full()), but table '%s' has "
-                                    + "datalake enabled=%s and full startup mode=%s.",
-                            tablePath, lakeEnabled, fullStartup));
+                            "Bounded (batch) read on primary-key tables requires full mode "
+                                    + "(OffsetsInitializer.full()), but table '%s' has full "
+                                    + "startup mode=%s.",
+                            tablePath, fullStartup));
         }
 
         LakeSource<LakeSplit> lakeSource = null;
