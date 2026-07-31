@@ -48,16 +48,16 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.ToLongFunction;
 
 /**
- * Per-{@code Replica} controller that owns all index-related state and lifecycle.
+ * Per-{@code Replica} supervisor that owns all index-related state and lifecycle.
  *
  * <p>Extracted from {@code Replica} to break the God Class anti-pattern: the index logic
  * (IndexReplicator lifecycle, partition-tombstone filtering, compaction-filter factory creation,
  * index-pushed-offset management) lives here instead of being scattered across a 2600-line class.
  *
- * <p>This controller does not drive replication itself. It registers the leader-side {@link
+ * <p>This supervisor does not drive replication itself. It registers the leader-side {@link
  * IndexReplicator} into the server-global {@link IndexReplicatorPool} (the read layer); the pool
  * workers poll the replicator, which stages encoded batches into the shared {@link
- * IndexAccumulator}, from which the {@link IndexSender} workers dispatch them. HW advances merely
+ * IndexSendBuffer}, from which the {@link IndexSender} workers dispatch them. HW advances merely
  * signal the owning pool worker to poll.
  *
  * <h3>State machine</h3>
@@ -72,7 +72,7 @@ import java.util.function.ToLongFunction;
  * </pre>
  */
 @Internal
-public final class ReplicaIndexController {
+public final class IndexReplicationSupervisor {
 
     /** Lifecycle state of the index replicator for this replica. */
     enum State {
@@ -82,13 +82,13 @@ public final class ReplicaIndexController {
         FAILED
     }
 
-    private static final Logger LOG = LoggerFactory.getLogger(ReplicaIndexController.class);
+    private static final Logger LOG = LoggerFactory.getLogger(IndexReplicationSupervisor.class);
 
     private final TableInfo tableInfo;
     private final TableBucket tableBucket;
     private final TabletServerMetadataCache metadataCache;
     @Nullable private final IndexReplicatorPool replicatorPool;
-    @Nullable private final IndexAccumulator accumulator;
+    @Nullable private final IndexSendBuffer sendBuffer;
     private final RemoteLogManager remoteLogManager;
     private final TabletServerMetricGroup metrics;
     private final AtomicReference<State> state = new AtomicReference<>(State.NOT_STARTED);
@@ -102,19 +102,19 @@ public final class ReplicaIndexController {
      */
     @Nullable private TombstonedPartitionDiscriminator tombstoneDiscriminator;
 
-    public ReplicaIndexController(
+    public IndexReplicationSupervisor(
             TableInfo tableInfo,
             TableBucket tableBucket,
             TabletServerMetadataCache metadataCache,
             @Nullable IndexReplicatorPool replicatorPool,
-            @Nullable IndexAccumulator accumulator,
+            @Nullable IndexSendBuffer sendBuffer,
             RemoteLogManager remoteLogManager,
             TabletServerMetricGroup metrics) {
         this.tableInfo = tableInfo;
         this.tableBucket = tableBucket;
         this.metadataCache = metadataCache;
         this.replicatorPool = replicatorPool;
-        this.accumulator = accumulator;
+        this.sendBuffer = sendBuffer;
         this.remoteLogManager = remoteLogManager;
         this.metrics = metrics;
     }
@@ -167,7 +167,7 @@ public final class ReplicaIndexController {
 
     /**
      * Completes leader initialisation after the leader KV tablet has been opened. This keeps the
-     * leader-side index lifecycle ordering inside the controller: start/defer the WAL-driven index
+     * leader-side index lifecycle ordering inside the supervisor: start/defer the WAL-driven index
      * replicator for main tables and install tombstone filtering for partitioned Index Tables.
      */
     public void onLeaderKvReady(
@@ -367,7 +367,7 @@ public final class ReplicaIndexController {
             List<Schema.Index> indexes,
             IndexReplicator.IndexProgressListener onProgress,
             long initialOffset) {
-        if (replicatorPool == null || accumulator == null) {
+        if (replicatorPool == null || sendBuffer == null) {
             return;
         }
 
@@ -423,7 +423,7 @@ public final class ReplicaIndexController {
                 new IndexReplicator(
                         sourceReader,
                         indexSpecs,
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         initialOffset,
                         replicatorPool.maxWindowBytes(),
@@ -501,8 +501,8 @@ public final class ReplicaIndexController {
         // Drop any batches still queued for this replicator. Once it is gone (table dropped or
         // leadership moved) those batches can never resolve a leader and would otherwise loop
         // forever in the sender's at-least-once retry, pinning memory and holding back-pressure.
-        if (accumulator != null) {
-            int dropped = accumulator.dropForReplicator(r);
+        if (sendBuffer != null) {
+            int dropped = sendBuffer.dropForReplicator(r);
             if (dropped > 0) {
                 LOG.info(
                         "Discarded {} queued index batch(es) for {} after stopping its "

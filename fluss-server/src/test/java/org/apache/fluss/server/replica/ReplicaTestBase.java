@@ -581,7 +581,7 @@ public class ReplicaTestBase {
                 remoteLogManager,
                 scannerManager,
                 replicaManager.getIndexReplicatorPool(),
-                replicaManager.getIndexAccumulator(),
+                replicaManager.getIndexSendBuffer(),
                 replicaManager.getServerMetricGroup());
     }
 

@@ -70,7 +70,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * End-to-end ITCase for the WAL-driven index replication pipeline (WAL → {@link IndexReplicator} →
- * {@code IndexAccumulator} → {@code IndexSender} → PutKv to the Index Table leader).
+ * {@code IndexSendBuffer} → {@code IndexSender} → PutKv to the Index Table leader).
  *
  * <p>Scenarios:
  *

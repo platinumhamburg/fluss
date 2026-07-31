@@ -82,7 +82,7 @@ import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
-import org.apache.fluss.server.index.IndexAccumulator;
+import org.apache.fluss.server.index.IndexSendBuffer;
 import org.apache.fluss.server.index.IndexReplicatorPool;
 import org.apache.fluss.server.index.IndexSender;
 import org.apache.fluss.server.kv.KvManager;
@@ -185,7 +185,7 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private final TabletServerMetadataCache metadataCache;
     private final RpcClient rpcClient;
-    private final IndexAccumulator indexAccumulator;
+    private final IndexSendBuffer indexSendBuffer;
     private final IndexReplicatorPool indexReplicatorPool;
     private final IndexSender indexSender;
     private final TabletServerMetricGroup.GaugeRegistration indexPushGaugeRegistration;
@@ -312,8 +312,8 @@ public class ReplicaManager implements ServerReconfigurable {
         this.serverId = serverId;
         this.metadataCache = metadataCache;
         this.rpcClient = rpcClient;
-        this.indexAccumulator =
-                new IndexAccumulator(
+        this.indexSendBuffer =
+                new IndexSendBuffer(
                         conf.get(ConfigOptions.INDEX_REPLICATION_MAIN_BUCKET_BUFFER_MAX_BYTES)
                                 .getBytes(),
                         conf.get(ConfigOptions.INDEX_REPLICATION_BUFFER_MAX_BYTES).getBytes());
@@ -325,7 +325,7 @@ public class ReplicaManager implements ServerReconfigurable {
                         INDEX_REPLICATION_WORKER_BACKOFF_MS);
         this.indexSender =
                 new IndexSender(
-                        indexAccumulator,
+                        indexSendBuffer,
                         metadataCache::getBucketLeader,
                         this::indexPushGatewayFor,
                         serverMetricGroup,
@@ -338,7 +338,7 @@ public class ReplicaManager implements ServerReconfigurable {
                         30_000L);
         this.indexPushGaugeRegistration =
                 serverMetricGroup.registerIndexPushGauges(
-                        indexAccumulator::pendingBytes,
+                        indexSendBuffer::pendingBytes,
                         indexSender::inFlightRequestCount,
                         indexSender::oldestInFlightAgeMs,
                         this::maxIndexReplicationNoProgressTimeMs,
@@ -2285,7 +2285,7 @@ public class ReplicaManager implements ServerReconfigurable {
                                 remoteLogManager,
                                 scannerManager,
                                 indexReplicatorPool,
-                                indexAccumulator,
+                                indexSendBuffer,
                                 serverMetricGroup);
                 if (!existingLogTabletOpt.isPresent()) {
                     localDiskManager.recordReplicaLoad(dataDir, isKvTable);
@@ -2381,9 +2381,9 @@ public class ReplicaManager implements ServerReconfigurable {
         return indexReplicatorPool;
     }
 
-    /** Returns the server-global index accumulator (staging area). */
-    public IndexAccumulator getIndexAccumulator() {
-        return indexAccumulator;
+    /** Returns the server-global index sendBuffer (staging area). */
+    public IndexSendBuffer getIndexSendBuffer() {
+        return indexSendBuffer;
     }
 
     private TabletServerGateway indexPushGatewayFor(int serverId) {

@@ -70,7 +70,7 @@ public class IndexReplicatorLifecycleTest {
                 new IndexReplicator(
                         null,
                         Collections.emptyList(),
-                        new IndexAccumulator(),
+                        new IndexSendBuffer(),
                         readContext,
                         0L,
                         1024,
@@ -106,8 +106,8 @@ public class IndexReplicatorLifecycleTest {
                 };
         IndexSourceReader reader =
                 new IndexSourceReader(sourceLog, () -> remoteFetcher, Runnable::run, readContext);
-        IndexAccumulator accumulator = new IndexAccumulator();
-        IndexReplicator replicator = replicator(reader, accumulator, readContext);
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
+        IndexReplicator replicator = replicator(reader, sendBuffer, readContext);
         ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(2);
         CountDownLatch closeStarted = new CountDownLatch(1);
         AtomicReference<Thread> closeThread = new AtomicReference<>();
@@ -134,12 +134,12 @@ public class IndexReplicatorLifecycleTest {
         assertThat(poll.get(10, TimeUnit.SECONDS)).isTrue();
         close.get(10, TimeUnit.SECONDS);
         assertThat(remoteClosed).isTrue();
-        accumulator.dropForReplicator(replicator);
+        sendBuffer.dropForReplicator(replicator);
         assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
 
     @Test
-    void closeWaitsForPollAtAccumulatorPublicationBeforeDrop() throws Exception {
+    void closeWaitsForPollAtSendBufferPublicationBeforeDrop() throws Exception {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
         CountDownLatch admitted = new CountDownLatch(1);
         CountDownLatch releasePublication = new CountDownLatch(1);
@@ -150,13 +150,13 @@ public class IndexReplicatorLifecycleTest {
         IndexSourceReader reader =
                 new IndexSourceReader(
                         sourceLog(0L, 0L, records(batch)), null, Runnable::run, readContext);
-        IndexAccumulator accumulator = new IndexAccumulator();
-        accumulator.setAfterAppendAdmissionHook(
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
+        sendBuffer.setAfterAppendAdmissionHook(
                 () -> {
                     admitted.countDown();
                     awaitUninterruptibly(releasePublication);
                 });
-        IndexReplicator replicator = replicator(reader, accumulator, readContext);
+        IndexReplicator replicator = replicator(reader, sendBuffer, readContext);
         ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(2);
         CountDownLatch closeStarted = new CountDownLatch(1);
         AtomicReference<Thread> closeThread = new AtomicReference<>();
@@ -181,9 +181,9 @@ public class IndexReplicatorLifecycleTest {
         }
         assertThat(poll.get(10, TimeUnit.SECONDS)).isTrue();
         close.get(10, TimeUnit.SECONDS);
-        assertThat(accumulator.dropForReplicator(replicator)).isZero();
-        assertThat(accumulator.hasPending(TARGET_BUCKET)).isFalse();
-        assertThat(accumulator.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.dropForReplicator(replicator)).isZero();
+        assertThat(sendBuffer.hasPending(TARGET_BUCKET)).isFalse();
+        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
         assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
 
@@ -213,11 +213,11 @@ public class IndexReplicatorLifecycleTest {
                             }
                         },
                         readContext);
-        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
         IndexReplicator replicator =
                 replicator(
                         reader,
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         Arrays.asList(spec("first"), spec("second")));
 
@@ -229,8 +229,8 @@ public class IndexReplicatorLifecycleTest {
 
         RuntimeException failure = new RuntimeException("terminal sender failure");
         for (IndexBatch drained : firstWindow.tryFailAndDrain(failure)) {
-            accumulator.remove(drained);
-            accumulator.release(drained);
+            sendBuffer.remove(drained);
+            sendBuffer.release(drained);
         }
 
         assertThat(replicator.terminalFailure()).isSameAs(failure);
@@ -306,11 +306,11 @@ public class IndexReplicatorLifecycleTest {
                             }
                         },
                         readContext);
-        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
         IndexReplicator replicator =
                 replicator(
                         reader,
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         Arrays.asList(spec("first"), spec("second")));
 
@@ -336,8 +336,8 @@ public class IndexReplicatorLifecycleTest {
                         });
         assertThat(replicator.hasPendingRead()).isFalse();
         assertThat(replicator.inFlightWindow("first")).isNull();
-        assertThat(accumulator.pendingBytes(replicator)).isZero();
-        assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.hasUnsent()).isFalse();
         assertThat(openedFetchers).hasValue(2);
         assertThat(closedFetchers).hasValue(2);
         verify(readContext, times(1)).close();
@@ -361,7 +361,7 @@ public class IndexReplicatorLifecycleTest {
                         ignored ->
                                 CloseableIterator.wrap(
                                         Collections.singletonList(record()).iterator()));
-        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
         IndexReplicator replicator =
                 replicator(
                         new IndexSourceReader(
@@ -369,7 +369,7 @@ public class IndexReplicatorLifecycleTest {
                                 null,
                                 Runnable::run,
                                 readContext),
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         Arrays.asList(spec("first"), spec("second")));
 
@@ -378,20 +378,20 @@ public class IndexReplicatorLifecycleTest {
         IndexWindow second = replicator.inFlightWindow("second");
         assertThat(first).isNotNull();
         assertThat(second).isNotNull();
-        assertThat(accumulator.pendingBytes(replicator)).isPositive();
+        assertThat(sendBuffer.pendingBytes(replicator)).isPositive();
 
         RuntimeException failure = new RuntimeException("terminal sender failure");
         for (IndexBatch drained : first.tryFailAndDrain(failure)) {
-            accumulator.remove(drained);
-            accumulator.release(drained);
+            sendBuffer.remove(drained);
+            sendBuffer.release(drained);
         }
 
         assertThat(replicator.terminalFailure()).isSameAs(failure);
         assertThat(replicator.inFlightWindow("first")).isNull();
         assertThat(replicator.inFlightWindow("second")).isNull();
         assertThat(second.isActive()).isFalse();
-        assertThat(accumulator.pendingBytes(replicator)).isZero();
-        assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.hasUnsent()).isFalse();
         verify(readContext, times(1)).close();
         replicator.close();
         verify(readContext, times(1)).close();
@@ -433,18 +433,18 @@ public class IndexReplicatorLifecycleTest {
                         () -> fetcher,
                         queuedRemoteReads::add,
                         readContext);
-        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
         AtomicInteger callbackCount = new AtomicInteger();
         AtomicReference<IndexReplicator> reportedReplicator = new AtomicReference<>();
         AtomicReference<Throwable> reportedFailure = new AtomicReference<>();
         IndexReplicator replicator =
                 replicator(
                         reader,
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         (reported, failure) -> {
                             verify(readContext, times(1)).close();
-                            assertThat(accumulator.pendingBytes(reported)).isZero();
+                            assertThat(sendBuffer.pendingBytes(reported)).isZero();
                             callbackCount.incrementAndGet();
                             reportedReplicator.set(reported);
                             reportedFailure.set(failure);
@@ -463,7 +463,7 @@ public class IndexReplicatorLifecycleTest {
         assertThat(reportedReplicator.get()).isSameAs(replicator);
         assertThat(reportedFailure.get()).isSameAs(replicator.terminalFailure());
         verify(readContext, times(1)).close();
-        assertThat(accumulator.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
         assertThat(fetchCount).hasValue(1);
         assertThat(closeCount).hasValue(1);
 
@@ -491,13 +491,13 @@ public class IndexReplicatorLifecycleTest {
         IndexSourceReader reader =
                 new IndexSourceReader(
                         sourceLog(0L, 0L, 3L, records(batch)), null, Runnable::run, readContext);
-        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
         AtomicInteger callbackCount = new AtomicInteger();
         RuntimeException callbackFailure = new RuntimeException("terminal callback failed");
         IndexReplicator replicator =
                 replicator(
                         reader,
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         (reported, failure) -> {
                             callbackCount.incrementAndGet();
@@ -513,7 +513,7 @@ public class IndexReplicatorLifecycleTest {
         assertThat(terminal.getSuppressed()).contains(callbackFailure);
         assertThat(callbackCount).hasValue(1);
         verify(readContext, times(1)).close();
-        assertThat(accumulator.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
 
         assertThat(replicator.poll()).isFalse();
         replicator.close();
@@ -523,20 +523,20 @@ public class IndexReplicatorLifecycleTest {
 
     private static IndexReplicator replicator(
             IndexSourceReader reader,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext) {
-        return replicator(reader, accumulator, readContext, Collections.singletonList(spec("idx")));
+        return replicator(reader, sendBuffer, readContext, Collections.singletonList(spec("idx")));
     }
 
     private static IndexReplicator replicator(
             IndexSourceReader reader,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
         return IndexReplicator.forTesting(
                 reader,
                 Collections.singletonList(spec("idx")),
-                accumulator,
+                sendBuffer,
                 readContext,
                 0L,
                 1024,
@@ -547,11 +547,11 @@ public class IndexReplicatorLifecycleTest {
 
     private static IndexReplicator replicator(
             IndexSourceReader reader,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             java.util.List<IndexSpec> specs) {
         return IndexReplicator.forTesting(
-                reader, specs, accumulator, readContext, 0L, 1024, 1024, (sync, all) -> {});
+                reader, specs, sendBuffer, readContext, 0L, 1024, 1024, (sync, all) -> {});
     }
 
     private static IndexSpec spec(String name) {

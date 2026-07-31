@@ -57,8 +57,8 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/** Unit tests for {@link ReplicaIndexController}'s index replication lifecycle. */
-class ReplicaIndexControllerTest {
+/** Unit tests for {@link IndexReplicationSupervisor}'s index replication lifecycle. */
+class IndexReplicationSupervisorTest {
 
     private static final TableBucket SOURCE_BUCKET = new TableBucket(41L, 0);
     private static final TableBucket TABLE_BUCKET = new TableBucket(42L, 0);
@@ -78,47 +78,47 @@ class ReplicaIndexControllerTest {
 
     @Test
     void terminalFailureOnlyChangesTheCurrentInstalledReplicator() {
-        ReplicaIndexController controller = controller();
+        IndexReplicationSupervisor controller = controller();
         IndexReplicator first = idleReplicator((ignored, failure) -> {});
         RuntimeException firstFailure = new RuntimeException("first failure");
 
         controller.installIndexReplicator(first);
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.RUNNING);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.RUNNING);
         assertThat(controller.getIndexReplicator()).isSameAs(first);
 
         controller.onIndexReplicatorFailed(first, firstFailure);
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.FAILED);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.FAILED);
         assertThat(controller.isFailed()).isTrue();
 
         controller.onBecomeFollower();
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.NOT_STARTED);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.NOT_STARTED);
         assertThat(controller.getIndexReplicator()).isNull();
         assertThat(first.isClosed()).isTrue();
 
         IndexReplicator replacement = idleReplicator((ignored, failure) -> {});
         controller.installIndexReplicator(replacement);
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.RUNNING);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.RUNNING);
         assertThat(controller.getIndexReplicator()).isSameAs(replacement);
 
         controller.onIndexReplicatorFailed(first, new RuntimeException("late old callback"));
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.RUNNING);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.RUNNING);
         assertThat(controller.getIndexReplicator()).isSameAs(replacement);
 
         controller.onIndexReplicatorFailed(
                 replacement, new RuntimeException("replacement failure"));
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.FAILED);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.FAILED);
         assertThat(controller.isFailed()).isTrue();
 
         controller.close();
         controller.close();
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.NOT_STARTED);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.NOT_STARTED);
         assertThat(controller.getIndexReplicator()).isNull();
         assertThat(replacement.isClosed()).isTrue();
     }
 
     @Test
     void terminalCallbackMovesInstalledControllerToFailed() throws Exception {
-        ReplicaIndexController controller = controller();
+        IndexReplicationSupervisor controller = controller();
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
         AtomicBoolean exposeCorruption = new AtomicBoolean();
         IndexReplicator replicator =
@@ -126,7 +126,7 @@ class ReplicaIndexControllerTest {
                         readContext, controller::onIndexReplicatorFailed, exposeCorruption);
 
         controller.installIndexReplicator(replicator);
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.RUNNING);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.RUNNING);
 
         exposeCorruption.set(true);
         try {
@@ -139,19 +139,19 @@ class ReplicaIndexControllerTest {
         assertThat(replicator.terminalFailure())
                 .isInstanceOf(IndexSourceWalCorruptionException.class);
         assertThat(controller.getIndexReplicator()).isSameAs(replicator);
-        assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.FAILED);
+        assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.FAILED);
         verify(readContext, times(1)).close();
     }
 
     @Test
     void followerStopUnregistersBeforeClosingAndDroppingCurrentReplicator() throws Exception {
-        IndexAccumulator accumulator = new IndexAccumulator();
-        ReplicaIndexController controller = controller(accumulator);
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
+        IndexReplicationSupervisor controller = controller(sendBuffer);
         AtomicBoolean observeProbePoll = new AtomicBoolean();
         CountDownLatch probePolled = new CountDownLatch(1);
         IndexReplicator probe =
                 idleReplicator(
-                        new IndexAccumulator(),
+                        new IndexSendBuffer(),
                         mock(LogRecordReadContext.class),
                         (ignored, failure) -> {},
                         () -> {
@@ -166,14 +166,14 @@ class ReplicaIndexControllerTest {
                             // IndexReplicator.close() retires its own queued batches before it
                             // closes the read context. The positive pre-stop assertion below
                             // proves this was a real owned backlog rather than an empty fixture.
-                            assertThat(accumulator.pendingBytes(oldReference.get())).isZero();
+                            assertThat(sendBuffer.pendingBytes(oldReference.get())).isZero();
                             pool.register(TABLE_BUCKET, probe);
                             return null;
                         })
                 .when(oldReadContext)
                 .close();
         IndexReplicator old =
-                idleReplicator(accumulator, oldReadContext, (ignored, failure) -> {}, () -> {});
+                idleReplicator(sendBuffer, oldReadContext, (ignored, failure) -> {}, () -> {});
         oldReference.set(old);
         IndexWindow window = new IndexWindow("idx", 1L, 1, old);
         IndexBatch queued =
@@ -181,17 +181,17 @@ class ReplicaIndexControllerTest {
                         TARGET_BUCKET,
                         new MemorySegmentBytesView(MemorySegment.wrap(new byte[] {1}), 0, 1),
                         window);
-        accumulator.append(queued);
-        assertThat(accumulator.pendingBytes(old)).isPositive();
+        sendBuffer.append(queued);
+        assertThat(sendBuffer.pendingBytes(old)).isPositive();
 
         try {
             controller.installIndexReplicator(old);
             controller.onBecomeFollower();
 
             assertThat(old.isClosed()).isTrue();
-            assertThat(accumulator.pendingBytes(old)).isZero();
+            assertThat(sendBuffer.pendingBytes(old)).isZero();
             assertThat(controller.getIndexReplicator()).isNull();
-            assertThat(controller.getState()).isEqualTo(ReplicaIndexController.State.NOT_STARTED);
+            assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.NOT_STARTED);
             verify(oldReadContext, times(1)).close();
 
             // The second stop must not unregister the probe that was installed while old was
@@ -206,22 +206,22 @@ class ReplicaIndexControllerTest {
         }
     }
 
-    private ReplicaIndexController controller() {
-        return controller(new IndexAccumulator());
+    private IndexReplicationSupervisor controller() {
+        return controller(new IndexSendBuffer());
     }
 
-    private ReplicaIndexController controller(IndexAccumulator accumulator) {
-        return new ReplicaIndexController(null, TABLE_BUCKET, null, pool, accumulator, null, null);
+    private IndexReplicationSupervisor controller(IndexSendBuffer sendBuffer) {
+        return new IndexReplicationSupervisor(null, TABLE_BUCKET, null, pool, sendBuffer, null, null);
     }
 
     private static IndexReplicator idleReplicator(
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
-        return idleReplicator(new IndexAccumulator(), readContext, onTerminalFailure, () -> {});
+        return idleReplicator(new IndexSendBuffer(), readContext, onTerminalFailure, () -> {});
     }
 
     private static IndexReplicator idleReplicator(
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure,
             Runnable onHighWatermark) {
@@ -234,7 +234,7 @@ class ReplicaIndexControllerTest {
         return IndexReplicator.forTesting(
                 reader,
                 Collections.singletonList(spec()),
-                accumulator,
+                sendBuffer,
                 readContext,
                 0L,
                 1024,
@@ -266,7 +266,7 @@ class ReplicaIndexControllerTest {
         return IndexReplicator.forTesting(
                 reader,
                 Collections.singletonList(spec()),
-                new IndexAccumulator(),
+                new IndexSendBuffer(),
                 readContext,
                 0L,
                 1024,
@@ -275,7 +275,7 @@ class ReplicaIndexControllerTest {
                 onTerminalFailure);
     }
 
-    private static void awaitFailed(ReplicaIndexController controller) {
+    private static void awaitFailed(IndexReplicationSupervisor controller) {
         waitUntil(
                 controller::isFailed,
                 Duration.ofSeconds(10),

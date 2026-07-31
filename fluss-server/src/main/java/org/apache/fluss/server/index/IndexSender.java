@@ -67,7 +67,7 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /**
  * TabletServer-global send layer for index replication. A fixed pool of worker threads drains
- * pre-encoded {@link IndexBatch}es from the shared {@link IndexAccumulator}, groups them by target
+ * pre-encoded {@link IndexBatch}es from the shared {@link IndexSendBuffer}, groups them by target
  * Index Table leader server, and dispatches consolidated multi-bucket {@code PutKvRequest}s.
  *
  * <p>Within one {@code IndexSender} instance, each target index bucket is owned by exactly one
@@ -78,7 +78,7 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
  *
  * <p>Reliability follows at-least-once semantics: on RPC failure (or unresolved leader) the batch
  * is re-enqueued to the front of its bucket queue via {@link
- * IndexAccumulator#reEnqueueIfActive(IndexBatch, long)} for unlimited retry, and the owning
+ * IndexSendBuffer#reEnqueueIfActive(IndexBatch, long)} for unlimited retry, and the owning
  * window's offset is never advanced. On success the batch notifies its window via {@link
  * IndexBatch#window()}, which advances the replicator's pushed offset once the whole window is
  * acknowledged.
@@ -130,7 +130,7 @@ public final class IndexSender implements AutoCloseable {
     private static final long MAX_CODEC_FRAMED_BYTES = Integer.MAX_VALUE;
     private static final int LENGTH_PREFIX_BYTES = Integer.BYTES;
 
-    private final IndexAccumulator accumulator;
+    private final IndexSendBuffer sendBuffer;
     private final LeaderResolver leaderResolver;
     private final Function<Integer, TabletServerGateway> gatewayFactory;
     private final TabletServerMetricGroup metrics;
@@ -170,14 +170,14 @@ public final class IndexSender implements AutoCloseable {
     private long nextTargetGeneration;
 
     public IndexSender(
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LeaderResolver leaderResolver,
             Function<Integer, TabletServerGateway> gatewayFactory,
             TabletServerMetricGroup metrics,
             int numWorkers,
             long backoffMs) {
         this(
-                accumulator,
+                sendBuffer,
                 leaderResolver,
                 gatewayFactory,
                 metrics,
@@ -190,7 +190,7 @@ public final class IndexSender implements AutoCloseable {
     }
 
     public IndexSender(
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LeaderResolver leaderResolver,
             Function<Integer, TabletServerGateway> gatewayFactory,
             TabletServerMetricGroup metrics,
@@ -200,7 +200,7 @@ public final class IndexSender implements AutoCloseable {
             long retryMaxBackoffMs,
             long maxRequestBytes) {
         this(
-                accumulator,
+                sendBuffer,
                 leaderResolver,
                 gatewayFactory,
                 metrics,
@@ -215,7 +215,7 @@ public final class IndexSender implements AutoCloseable {
     }
 
     public IndexSender(
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LeaderResolver leaderResolver,
             Function<Integer, TabletServerGateway> gatewayFactory,
             TabletServerMetricGroup metrics,
@@ -227,7 +227,7 @@ public final class IndexSender implements AutoCloseable {
             long maxTransportRequestBytes,
             long requestTimeoutMs) {
         this(
-                accumulator,
+                sendBuffer,
                 leaderResolver,
                 gatewayFactory,
                 metrics,
@@ -243,7 +243,7 @@ public final class IndexSender implements AutoCloseable {
 
     @VisibleForTesting
     IndexSender(
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LeaderResolver leaderResolver,
             Function<Integer, TabletServerGateway> gatewayFactory,
             TabletServerMetricGroup metrics,
@@ -254,7 +254,7 @@ public final class IndexSender implements AutoCloseable {
             long maxRequestBytes,
             long requestTimeoutMs) {
         this(
-                accumulator,
+                sendBuffer,
                 leaderResolver,
                 gatewayFactory,
                 metrics,
@@ -270,7 +270,7 @@ public final class IndexSender implements AutoCloseable {
 
     @VisibleForTesting
     IndexSender(
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LeaderResolver leaderResolver,
             Function<Integer, TabletServerGateway> gatewayFactory,
             TabletServerMetricGroup metrics,
@@ -282,7 +282,7 @@ public final class IndexSender implements AutoCloseable {
             long requestTimeoutMs,
             LifecycleHooks lifecycleHooks) {
         this(
-                accumulator,
+                sendBuffer,
                 leaderResolver,
                 gatewayFactory,
                 metrics,
@@ -298,7 +298,7 @@ public final class IndexSender implements AutoCloseable {
 
     @VisibleForTesting
     IndexSender(
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LeaderResolver leaderResolver,
             Function<Integer, TabletServerGateway> gatewayFactory,
             TabletServerMetricGroup metrics,
@@ -319,7 +319,7 @@ public final class IndexSender implements AutoCloseable {
         checkArgument(maxRequestBytes > 0, "maxRequestBytes must be positive");
         checkArgument(maxTransportRequestBytes > 0, "maxTransportRequestBytes must be positive");
         checkArgument(requestTimeoutMs > 0, "requestTimeoutMs must be positive");
-        this.accumulator = accumulator;
+        this.sendBuffer = sendBuffer;
         this.leaderResolver = leaderResolver;
         this.gatewayFactory = gatewayFactory;
         this.metrics = metrics;
@@ -333,9 +333,9 @@ public final class IndexSender implements AutoCloseable {
         for (int i = 0; i < numWorkers; i++) {
             this.workers[i] = new SenderWorker("index-sender-" + i, i, backoffMs);
         }
-        accumulator.setAppendListener(this::enqueueReadyBucket);
-        accumulator.setDropListener(this::relinquishDroppedBatch);
-        for (TableBucket bucket : accumulator.buckets()) {
+        sendBuffer.setAppendListener(this::enqueueReadyBucket);
+        sendBuffer.setDropListener(this::relinquishDroppedBatch);
+        for (TableBucket bucket : sendBuffer.buckets()) {
             enqueueReadyBucket(bucket);
         }
         for (SenderWorker worker : workers) {
@@ -445,8 +445,8 @@ public final class IndexSender implements AutoCloseable {
             lifecycleLock.unlock();
         }
         for (IndexBatch batch : batchesToRelease) {
-            accumulator.remove(batch);
-            accumulator.release(batch);
+            sendBuffer.remove(batch);
+            sendBuffer.release(batch);
         }
 
         lifecycleLock.lock();
@@ -594,7 +594,7 @@ public final class IndexSender implements AutoCloseable {
                 return;
             }
             TableBucket bucket;
-            while ((bucket = accumulator.pollMissedAppendNotification()) != null) {
+            while ((bucket = sendBuffer.pollMissedAppendNotification()) != null) {
                 IndexSender.this.enqueueReadyBucket(bucket);
             }
         }
@@ -617,9 +617,9 @@ public final class IndexSender implements AutoCloseable {
                     if (ownerOf(bucket) != workerId || inFlightBatches.containsKey(bucket)) {
                         continue;
                     }
-                    IndexBatch batch = accumulator.pollFirstReady(bucket, now);
+                    IndexBatch batch = sendBuffer.pollFirstReady(bucket, now);
                     if (batch == null) {
-                        if (accumulator.hasPending(bucket)) {
+                        if (sendBuffer.hasPending(bucket)) {
                             deferredBuckets.add(bucket);
                         }
                         continue;
@@ -1358,9 +1358,9 @@ public final class IndexSender implements AutoCloseable {
         }
         runAccounting(actions);
         for (IndexBatch sibling : siblings) {
-            accumulator.release(sibling);
-            accumulator.remove(sibling);
-            if (accumulator.hasPending(sibling.targetBucket())) {
+            sendBuffer.release(sibling);
+            sendBuffer.remove(sibling);
+            if (sendBuffer.hasPending(sibling.targetBucket())) {
                 enqueueReadyBucket(sibling.targetBucket());
             }
         }
@@ -1385,7 +1385,7 @@ public final class IndexSender implements AutoCloseable {
         } finally {
             lifecycleLock.unlock();
         }
-        accumulator.release(batch);
+        sendBuffer.release(batch);
     }
 
     private void relinquishDroppedBatch(IndexBatch batch) {
@@ -1400,7 +1400,7 @@ public final class IndexSender implements AutoCloseable {
         } finally {
             lifecycleLock.unlock();
         }
-        if (unmuted && accumulator.hasPending(bucket)) {
+        if (unmuted && sendBuffer.hasPending(bucket)) {
             enqueueReadyBucket(bucket);
         }
     }
@@ -1477,18 +1477,18 @@ public final class IndexSender implements AutoCloseable {
                     long readyAtMs =
                             System.currentTimeMillis() + retryDelayMs(batch.attempts() + 1);
                     lifecycleHooks.beforeRetryPublication();
-                    if (accumulator.reEnqueueIfActive(batch, readyAtMs)) {
+                    if (sendBuffer.reEnqueueIfActive(batch, readyAtMs)) {
                         metrics.indexPushBatchRetries().inc();
                     } else {
                         releaseRejectedRetry(batch);
                     }
                 } else {
-                    accumulator.release(action.batch);
+                    sendBuffer.release(action.batch);
                 }
             }
             for (BatchAction action : actions) {
                 TableBucket bucket = action.batch.targetBucket();
-                if (accumulator.hasPending(bucket)) {
+                if (sendBuffer.hasPending(bucket)) {
                     enqueueReadyBucket(bucket);
                 }
             }

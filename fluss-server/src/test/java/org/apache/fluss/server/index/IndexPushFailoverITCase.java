@@ -381,11 +381,11 @@ class IndexPushFailoverITCase {
                 .as("target-only index leader must not host a source-bucket replica")
                 .doesNotContain(stoppedTargetLeader);
 
-        IndexAccumulator sourceAccumulator =
+        IndexSendBuffer sourceSendBuffer =
                 FLUSS_CLUSTER_EXTENSION
                         .getTabletServerById(mainLeader)
                         .getReplicaManager()
-                        .getIndexAccumulator();
+                        .getIndexSendBuffer();
         boolean coordinatorStopped = false;
         boolean targetLeaderStopped = false;
         Throwable primaryFailure = null;
@@ -413,7 +413,7 @@ class IndexPushFailoverITCase {
             // exact target bucket's deque. With the coordinator stopped, a replacement cannot
             // race this observation; the source SYNC future and pushed offset must remain pending.
             waitUntil(
-                    () -> hasRetriedTargetBatch(sourceAccumulator, idxTb),
+                    () -> hasRetriedTargetBatch(sourceSendBuffer, idxTb),
                     TIMEOUT,
                     "wait for the selected target index batch to fail and requeue");
             assertThat(sourceWrite.isDone())
@@ -522,8 +522,8 @@ class IndexPushFailoverITCase {
     }
 
     /** Read-only test observation of the retry state for one physical target. */
-    private static boolean hasRetriedTargetBatch(IndexAccumulator accumulator, TableBucket target) {
-        return accumulator.hasRetriedBatchForTesting(target);
+    private static boolean hasRetriedTargetBatch(IndexSendBuffer sendBuffer, TableBucket target) {
+        return sendBuffer.hasRetriedBatchForTesting(target);
     }
 
     private static void cleanup(List<Throwable> failures, CleanupAction action) {

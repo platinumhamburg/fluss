@@ -49,7 +49,7 @@ public class IndexWindowTest {
         return new IndexReplicator(
                 stubSourceReader(),
                 Collections.singletonList(spec("idx", IndexVisibility.SYNC)),
-                new IndexAccumulator(),
+                new IndexSendBuffer(),
                 null,
                 initialOffset,
                 1024,
@@ -65,7 +65,7 @@ public class IndexWindowTest {
         return new IndexReplicator(
                 stubSourceReader(),
                 Arrays.asList(first, second),
-                new IndexAccumulator(),
+                new IndexSendBuffer(),
                 null,
                 initialOffset,
                 1024,

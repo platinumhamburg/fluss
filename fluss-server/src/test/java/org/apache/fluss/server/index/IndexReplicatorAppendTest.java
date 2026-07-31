@@ -97,7 +97,7 @@ public class IndexReplicatorAppendTest {
         return new IndexReplicator(
                 null,
                 Collections.emptyList(),
-                new IndexAccumulator(),
+                new IndexSendBuffer(),
                 null,
                 0L,
                 1024,
@@ -111,7 +111,7 @@ public class IndexReplicatorAppendTest {
                                 new IndexReplicator(
                                         null,
                                         Collections.emptyList(),
-                                        new IndexAccumulator(),
+                                        new IndexSendBuffer(),
                                         null,
                                         -1L,
                                         1024,
@@ -200,16 +200,16 @@ public class IndexReplicatorAppendTest {
 
         assertThat(fixture.replicator.poll()).isTrue();
 
-        IndexBatch batch = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        IndexBatch batch = fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(batch).isNotNull();
         assertThat(batch.encoded().getBytesLength()).isLessThan(4096);
         assertThat(batch.retainedBytes()).isEqualTo(4096L);
-        assertThat(fixture.accumulator.pendingBytes()).isEqualTo(4096L);
-        assertThat(fixture.accumulator.pendingBytes(fixture.replicator)).isEqualTo(4096L);
+        assertThat(fixture.sendBuffer.pendingBytes()).isEqualTo(4096L);
+        assertThat(fixture.sendBuffer.pendingBytes(fixture.replicator)).isEqualTo(4096L);
 
-        fixture.accumulator.release(batch);
-        assertThat(fixture.accumulator.pendingBytes()).isZero();
-        assertThat(fixture.accumulator.pendingBytes(fixture.replicator)).isZero();
+        fixture.sendBuffer.release(batch);
+        assertThat(fixture.sendBuffer.pendingBytes()).isZero();
+        assertThat(fixture.sendBuffer.pendingBytes(fixture.replicator)).isZero();
     }
 
     @Test
@@ -232,7 +232,7 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.replicator.poll()).isTrue();
         IndexWindow firstWindow = fixture.replicator.inFlightWindow("idx");
         IndexBatch firstBatch =
-                fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+                fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(firstWindow).isNotNull();
         assertThat(firstBatch).isNotNull();
         assertThat(firstBatch.window()).isSameAs(firstWindow);
@@ -244,22 +244,22 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.sourceWal.readOffsets)
                 .as("an active window must prevent reading its successor")
                 .containsExactly(0L);
-        assertThat(fixture.accumulator.hasUnsent()).isFalse();
+        assertThat(fixture.sendBuffer.hasUnsent()).isFalse();
 
-        acknowledge(fixture.accumulator, firstBatch);
+        acknowledge(fixture.sendBuffer, firstBatch);
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(1L);
         assertThat(fixture.replicator.poll()).isTrue();
 
         IndexWindow secondWindow = fixture.replicator.inFlightWindow("idx");
         IndexBatch secondBatch =
-                fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+                fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(secondWindow).isNotNull().isNotSameAs(firstWindow);
         assertThat(secondBatch).isNotNull();
         assertThat(secondBatch.window()).isSameAs(secondWindow);
         assertThat(secondWindow.windowEndOffset()).isEqualTo(2L);
         assertThat(fixture.sourceWal.readOffsets).containsExactly(0L, 1L);
 
-        acknowledge(fixture.accumulator, secondBatch);
+        acknowledge(fixture.sendBuffer, secondBatch);
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(2L);
     }
 
@@ -378,7 +378,7 @@ public class IndexReplicatorAppendTest {
 
         assertThat(fixture.replicator.poll()).isTrue();
 
-        IndexBatch targetBatch = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        IndexBatch targetBatch = fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(targetBatch).isNotNull();
         assertThat(targetBatch.window().windowEndOffset()).isEqualTo(7L);
         KvRecordBatch decoded = decode(targetBatch);
@@ -450,7 +450,7 @@ public class IndexReplicatorAppendTest {
 
         assertThat(fixture.replicator.poll()).isTrue();
 
-        IndexBatch targetBatch = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        IndexBatch targetBatch = fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         KvRecordBatch decoded = decode(targetBatch);
         assertThat(decoded.getRecordCount()).isEqualTo(1);
         assertThat(decoded.writerProgress()).isEqualTo(7L);
@@ -475,7 +475,7 @@ public class IndexReplicatorAppendTest {
                 IndexReplicator.forTesting(
                         sourceWal,
                         Collections.singletonList(spec()),
-                        new IndexAccumulator(),
+                        new IndexSendBuffer(),
                         readContext,
                         0L,
                         1024,
@@ -528,7 +528,7 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.replicator.poll()).isTrue();
 
         assertThat(encodes).hasValue(2);
-        assertThat(fixture.accumulator.buckets()).hasSize(1);
+        assertThat(fixture.sendBuffer.buckets()).hasSize(1);
     }
 
     @Test
@@ -565,12 +565,12 @@ public class IndexReplicatorAppendTest {
         LogRecords records = mock(LogRecords.class);
         when(records.batches()).thenReturn(Collections.singletonList(batch));
         TestingSourceWal sourceWal = new TestingSourceWal(2L, records);
-        IndexAccumulator accumulator = new IndexAccumulator();
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
         IndexReplicator replicator =
                 IndexReplicator.forTesting(
                         sourceWal,
                         Collections.singletonList(spec()),
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         0L,
                         1024,
@@ -580,7 +580,7 @@ public class IndexReplicatorAppendTest {
         assertThat(replicator.poll()).isTrue();
 
         KvRecord delete =
-                onlyRecords(accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)).encoded())
+                onlyRecords(sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)).encoded())
                         .get(0);
         byte[] expectedOldKey =
                 new CompactedKeyEncoder(
@@ -603,22 +603,22 @@ public class IndexReplicatorAppendTest {
                                         record(7L, ChangeType.UPDATE_AFTER, row(1L, 11L, 100L)))));
 
         assertThat(fixture.replicator.poll()).isTrue();
-        IndexBatch first = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        IndexBatch first = fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(first.window().windowEndOffset()).isEqualTo(6L);
         assertThat(decode(first).getRecordCount()).isEqualTo(1);
-        acknowledge(fixture.accumulator, first);
+        acknowledge(fixture.sendBuffer, first);
 
         assertThat(fixture.replicator.poll()).isTrue();
-        IndexBatch delete = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
-        IndexBatch upsert = fixture.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 1));
+        IndexBatch delete = fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        IndexBatch upsert = fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 1));
         assertThat(delete.window()).isSameAs(upsert.window());
         assertThat(delete.window().windowEndOffset()).isEqualTo(8L);
         assertThat(decode(delete).writerProgress()).isEqualTo(8L);
         assertThat(decode(upsert).writerProgress()).isEqualTo(8L);
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(6L);
-        acknowledge(fixture.accumulator, delete);
+        acknowledge(fixture.sendBuffer, delete);
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(6L);
-        acknowledge(fixture.accumulator, upsert);
+        acknowledge(fixture.sendBuffer, upsert);
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(8L);
     }
 
@@ -636,9 +636,9 @@ public class IndexReplicatorAppendTest {
         assertThat(larger.replicator.poll()).isTrue();
 
         KvRecordBatch smallerBatch =
-                decode(smaller.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
+                decode(smaller.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
         KvRecordBatch largerBatch =
-                decode(larger.accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
+                decode(larger.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0)));
         assertThat(smallerBatch.writerKey()).isEqualTo(largerBatch.writerKey());
         assertThat(smallerBatch.writerProgress()).isEqualTo(6L);
         assertThat(largerBatch.writerProgress()).isEqualTo(7L);
@@ -646,7 +646,7 @@ public class IndexReplicatorAppendTest {
     }
 
     @Test
-    void publishesWindowStateBeforeSynchronousAccumulatorCallbacks() throws Exception {
+    void publishesWindowStateBeforeSynchronousSendBufferCallbacks() throws Exception {
         PollFixture fixture =
                 pollFixture(
                         5L,
@@ -655,28 +655,28 @@ public class IndexReplicatorAppendTest {
                                 Arrays.asList(
                                         record(5L, ChangeType.UPDATE_BEFORE, row(1L, 10L, 100L)),
                                         record(6L, ChangeType.UPDATE_AFTER, row(1L, 11L, 100L)))));
-        fixture.accumulator.setAppendListener(
+        fixture.sendBuffer.setAppendListener(
                 bucket -> {
-                    IndexBatch batch = fixture.accumulator.pollFirst(bucket);
-                    acknowledge(fixture.accumulator, batch);
+                    IndexBatch batch = fixture.sendBuffer.pollFirst(bucket);
+                    acknowledge(fixture.sendBuffer, batch);
                 });
 
         assertThat(fixture.replicator.poll()).isTrue();
 
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(7L);
-        assertThat(fixture.accumulator.pendingBytes()).isZero();
-        assertThat(fixture.accumulator.hasUnsent()).isFalse();
+        assertThat(fixture.sendBuffer.pendingBytes()).isZero();
+        assertThat(fixture.sendBuffer.hasUnsent()).isFalse();
     }
 
     @Test
     void totalCapacityRejectionLeavesNoInFlightAndRereadsSameOffset() throws Exception {
-        IndexAccumulator accumulator = new IndexAccumulator(Long.MAX_VALUE, 4096L);
+        IndexSendBuffer sendBuffer = new IndexSendBuffer(Long.MAX_VALUE, 4096L);
         PollFixture fixture =
                 pollFixture(
                         0L,
                         1024,
                         spec(),
-                        accumulator,
+                        sendBuffer,
                         Collections.singletonList(
                                 Collections.singletonList(
                                         record(0L, ChangeType.INSERT, row(1L, 10L, 100L)))),
@@ -685,7 +685,7 @@ public class IndexReplicatorAppendTest {
                 new IndexReplicator(
                         null,
                         Collections.emptyList(),
-                        accumulator,
+                        sendBuffer,
                         null,
                         0L,
                         1024,
@@ -703,7 +703,7 @@ public class IndexReplicatorAppendTest {
                 () -> {
                     if (fillOnce.compareAndSet(false, true)) {
                         assertThat(
-                                        accumulator.tryAppendWindow(
+                                        sendBuffer.tryAppendWindow(
                                                 Collections.singletonList(fillingBatch)))
                                 .isTrue();
                     }
@@ -713,19 +713,19 @@ public class IndexReplicatorAppendTest {
 
         assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isZero();
-        assertThat(accumulator.pendingBytes(fixture.replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(fixture.replicator)).isZero();
         assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
 
-        assertThat(accumulator.pollFirst(fillingBatch.targetBucket())).isSameAs(fillingBatch);
-        accumulator.release(fillingBatch);
+        assertThat(sendBuffer.pollFirst(fillingBatch.targetBucket())).isSameAs(fillingBatch);
+        sendBuffer.release(fillingBatch);
         fillingWindow.onBatchAcked(fillingBatch);
-        assertThat(accumulator.pendingBytes()).isZero();
+        assertThat(sendBuffer.pendingBytes()).isZero();
 
         assertThat(fixture.replicator.poll()).isTrue();
-        IndexBatch admitted = accumulator.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
+        IndexBatch admitted = sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(admitted).isNotNull();
         assertThat(admitted.window().windowEndOffset()).isEqualTo(1L);
-        acknowledge(accumulator, admitted);
+        acknowledge(sendBuffer, admitted);
 
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(1L);
         assertThat(fixture.sourceWal.readOffsets).containsExactly(0L, 0L);
@@ -733,7 +733,7 @@ public class IndexReplicatorAppendTest {
 
     @Test
     void retainedWindowAboveHardTotalFailsTerminallyOnceWithoutReread() throws Exception {
-        IndexAccumulator accumulator = new IndexAccumulator(Long.MAX_VALUE, 4095L);
+        IndexSendBuffer sendBuffer = new IndexSendBuffer(Long.MAX_VALUE, 4095L);
         AtomicInteger terminalCallbacks = new AtomicInteger();
         AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
         PollFixture fixture =
@@ -741,7 +741,7 @@ public class IndexReplicatorAppendTest {
                         0L,
                         1024,
                         spec(),
-                        accumulator,
+                        sendBuffer,
                         Collections.singletonList(
                                 Collections.singletonList(
                                         record(0L, ChangeType.INSERT, row(1L, 10L, 100L)))),
@@ -758,9 +758,9 @@ public class IndexReplicatorAppendTest {
         assertThat(terminalCallbacks).hasValue(1);
         assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isZero();
-        assertThat(accumulator.pendingBytes()).isZero();
-        assertThat(accumulator.pendingBytes(fixture.replicator)).isZero();
-        assertThat(accumulator.hasUnsent()).isFalse();
+        assertThat(sendBuffer.pendingBytes()).isZero();
+        assertThat(sendBuffer.pendingBytes(fixture.replicator)).isZero();
+        assertThat(sendBuffer.hasUnsent()).isFalse();
         assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
 
         assertThat(fixture.replicator.poll()).isFalse();
@@ -787,8 +787,8 @@ public class IndexReplicatorAppendTest {
 
         assertThat(drained).hasSize(1);
         for (IndexBatch batch : drained) {
-            fixture.accumulator.remove(batch);
-            fixture.accumulator.release(batch);
+            fixture.sendBuffer.remove(batch);
+            fixture.sendBuffer.release(batch);
         }
 
         assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
@@ -796,8 +796,8 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(5L);
         assertThat(fixture.replicator.getAllIndexPushedOffset()).isEqualTo(5L);
         assertThat(window.registeredBatchCount()).isZero();
-        assertThat(fixture.accumulator.pendingBytes()).isZero();
-        assertThat(fixture.accumulator.hasUnsent()).isFalse();
+        assertThat(fixture.sendBuffer.pendingBytes()).isZero();
+        assertThat(fixture.sendBuffer.hasUnsent()).isFalse();
     }
 
     @Test
@@ -846,7 +846,7 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(initialOffset);
         assertThat(fixture.replicator.terminalFailure())
                 .isInstanceOf(IndexSourceWalCorruptionException.class);
-        assertThat(fixture.accumulator.hasUnsent()).isFalse();
+        assertThat(fixture.sendBuffer.hasUnsent()).isFalse();
         assertThat(fixture.replicator.poll()).isFalse();
         assertThat(fixture.sourceWal.readOffsets).containsExactly(initialOffset);
     }
@@ -868,7 +868,7 @@ public class IndexReplicatorAppendTest {
                 IndexReplicator.forTesting(
                         sourceWal,
                         Collections.singletonList(spec()),
-                        new IndexAccumulator(),
+                        new IndexSendBuffer(),
                         readContext,
                         0L,
                         1024,
@@ -902,7 +902,7 @@ public class IndexReplicatorAppendTest {
                 initialOffset,
                 preferredMaxRequestBytes,
                 spec,
-                new IndexAccumulator(),
+                new IndexSendBuffer(),
                 sourceBatches,
                 (ignored, failure) -> {});
     }
@@ -911,7 +911,7 @@ public class IndexReplicatorAppendTest {
             long initialOffset,
             int preferredMaxRequestBytes,
             IndexSpec spec,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             List<List<LogRecord>> sourceBatches,
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure)
             throws Exception {
@@ -941,14 +941,14 @@ public class IndexReplicatorAppendTest {
                 IndexReplicator.forTesting(
                         sourceReader,
                         Collections.singletonList(spec),
-                        accumulator,
+                        sendBuffer,
                         readContext,
                         initialOffset,
                         1024,
                         preferredMaxRequestBytes,
                         (sync, all) -> {},
                         onTerminalFailure);
-        return new PollFixture(sourceWal, accumulator, replicator);
+        return new PollFixture(sourceWal, sendBuffer, replicator);
     }
 
     private static KvRecordBatch decode(IndexBatch batch) {
@@ -967,22 +967,22 @@ public class IndexReplicatorAppendTest {
         return records;
     }
 
-    private static void acknowledge(IndexAccumulator accumulator, IndexBatch batch) {
-        accumulator.release(batch);
+    private static void acknowledge(IndexSendBuffer sendBuffer, IndexBatch batch) {
+        sendBuffer.release(batch);
         batch.window().onBatchAcked(batch);
     }
 
     private static final class PollFixture {
         private final TestingSourceWal sourceWal;
-        private final IndexAccumulator accumulator;
+        private final IndexSendBuffer sendBuffer;
         private final IndexReplicator replicator;
 
         private PollFixture(
                 TestingSourceWal sourceWal,
-                IndexAccumulator accumulator,
+                IndexSendBuffer sendBuffer,
                 IndexReplicator replicator) {
             this.sourceWal = sourceWal;
-            this.accumulator = accumulator;
+            this.sendBuffer = sendBuffer;
             this.replicator = replicator;
         }
     }

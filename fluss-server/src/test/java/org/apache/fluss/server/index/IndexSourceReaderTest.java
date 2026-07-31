@@ -536,7 +536,7 @@ final class IndexSourceReaderTest {
         return IndexReplicator.forTesting(
                 reader,
                 Collections.singletonList(spec),
-                new IndexAccumulator(),
+                new IndexSendBuffer(),
                 readContext,
                 0L,
                 1024,
