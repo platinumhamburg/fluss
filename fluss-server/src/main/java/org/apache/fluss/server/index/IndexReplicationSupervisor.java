@@ -502,7 +502,7 @@ public final class IndexReplicationSupervisor {
         // leadership moved) those batches can never resolve a leader and would otherwise loop
         // forever in the sender's at-least-once retry, pinning memory and holding back-pressure.
         if (sendBuffer != null) {
-            int dropped = sendBuffer.dropForReplicator(r);
+            int dropped = sendBuffer.dropForSource(r.sourceBucket());
             if (dropped > 0) {
                 LOG.info(
                         "Discarded {} queued index batch(es) for {} after stopping its "

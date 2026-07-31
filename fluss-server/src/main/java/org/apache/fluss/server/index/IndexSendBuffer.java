@@ -78,8 +78,8 @@ public final class IndexSendBuffer {
     /** Total retained bytes of all batches currently pending, including queued and in-flight. */
     private final AtomicLong pendingBytes = new AtomicLong(0L);
 
-    /** Pending retained bytes grouped by the leader-side replicator that produced the batches. */
-    private final ConcurrentMap<IndexReplicator, Long> pendingBytesByReplicator =
+    /** Pending retained bytes grouped by the source main-table bucket that produced them. */
+    private final ConcurrentMap<TableBucket, Long> pendingBytesBySource =
             MapUtils.newConcurrentMap();
 
     /** Optional callback fired on each append to promptly wake the owning sender worker. */
@@ -158,11 +158,11 @@ public final class IndexSendBuffer {
         checkNotNull(windowBatches, "windowBatches");
         checkArgument(!windowBatches.isEmpty(), "windowBatches must not be empty");
         IndexBatch first = checkNotNull(windowBatches.get(0), "window batch");
-        IndexWindow window = first.window();
+        IndexReplicationWindow window = first.window();
 
         synchronized (window) {
             validateWindowBatches(windowBatches, window);
-            if (!window.isActive() || window.owner().isClosed()) {
+            if (!window.isActive() || window.isOwnerClosed()) {
                 return false;
             }
 
@@ -183,14 +183,14 @@ public final class IndexSendBuffer {
                 if (hook != null) {
                     hook.run();
                 }
-                if (!window.isActive() || window.owner().isClosed()) {
+                if (!window.isActive() || window.isOwnerClosed()) {
                     rollbackWindow(windowBatches);
                     return false;
                 }
 
                 for (IndexBatch batch : windowBatches) {
                     publishStaged(batch);
-                    if (!window.isActive() || window.owner().isClosed()) {
+                    if (!window.isActive() || window.isOwnerClosed()) {
                         rollbackWindow(windowBatches);
                         return false;
                     }
@@ -208,7 +208,7 @@ public final class IndexSendBuffer {
         return true;
     }
 
-    private void validateWindowBatches(List<IndexBatch> windowBatches, IndexWindow window) {
+    private void validateWindowBatches(List<IndexBatch> windowBatches, IndexReplicationWindow window) {
         checkArgument(!window.isAdmitted(), "window is already admitted");
         checkArgument(
                 windowBatches.size() == window.expectedBatchCount(),
@@ -241,9 +241,9 @@ public final class IndexSendBuffer {
         return bytes;
     }
 
-    private boolean reserve(List<IndexBatch> windowBatches, IndexWindow window, long windowBytes) {
+    private boolean reserve(List<IndexBatch> windowBatches, IndexReplicationWindow window, long windowBytes) {
         synchronized (admissionLock) {
-            if (!window.isActive() || window.owner().isClosed()) {
+            if (!window.isActive() || window.isOwnerClosed()) {
                 return false;
             }
 
@@ -258,8 +258,8 @@ public final class IndexSendBuffer {
             }
 
             try {
-                pendingBytesByReplicator.compute(
-                        window.owner(),
+                pendingBytesBySource.compute(
+                        window.sourceBucket(),
                         (ignoredOwner, ownerBytes) ->
                                 ownerBytes == null
                                         ? windowBytes
@@ -271,7 +271,7 @@ public final class IndexSendBuffer {
 
             for (IndexBatch batch : windowBatches) {
                 if (!batch.markAccounted()) {
-                    rollbackReservation(windowBatches, window.owner());
+                    rollbackReservation(windowBatches, window.sourceBucket());
                     return false;
                 }
             }
@@ -279,12 +279,12 @@ public final class IndexSendBuffer {
         }
     }
 
-    private void rollbackReservation(List<IndexBatch> windowBatches, IndexReplicator owner) {
+    private void rollbackReservation(List<IndexBatch> windowBatches, TableBucket source) {
         for (IndexBatch batch : windowBatches) {
             if (batch.wasAccounted()) {
                 release(batch);
             } else {
-                releaseReservedBytes(owner, batch.retainedBytes());
+                releaseReservedBytes(source, batch.retainedBytes());
             }
         }
     }
@@ -397,12 +397,12 @@ public final class IndexSendBuffer {
     }
 
     /**
-     * Returns {@code true} when the given producing replicator has reached its pending-byte
+     * Returns {@code true} when the given source main-table bucket has reached its pending-byte
      * back-pressure bound. The bound is intentionally scoped to the producer so one unhealthy
      * target index bucket cannot stop unrelated main-table buckets from reading WAL.
      */
-    public boolean isFull(IndexReplicator owner) {
-        return pendingBytes(owner) >= maxPendingBytes;
+    public boolean isFull(TableBucket source) {
+        return pendingBytes(source) >= maxPendingBytes;
     }
 
     /** Total retained bytes currently pending, including queued and in-flight. */
@@ -410,15 +410,15 @@ public final class IndexSendBuffer {
         return pendingBytes.get();
     }
 
-    /** Retained bytes currently pending for the given producing replicator. */
-    public long pendingBytes(IndexReplicator owner) {
-        Long ownerPendingBytes = pendingBytesByReplicator.get(owner);
-        return ownerPendingBytes == null ? 0L : ownerPendingBytes;
+    /** Retained bytes currently pending for the given source main-table bucket. */
+    public long pendingBytes(TableBucket source) {
+        Long sourcePendingBytes = pendingBytesBySource.get(source);
+        return sourcePendingBytes == null ? 0L : sourcePendingBytes;
     }
 
     @VisibleForTesting
     int pendingOwnerCountForTesting() {
-        return pendingBytesByReplicator.size();
+        return pendingBytesBySource.size();
     }
 
     /** Snapshot of the buckets currently tracked. May include buckets that have just drained. */
@@ -491,7 +491,7 @@ public final class IndexSendBuffer {
     /**
      * Publish a retry only while its window and accounting ownership are active. The final state
      * check, attempt increment, deadline, and deque insertion linearize under the window monitor
-     * against {@link IndexWindow#tryFailAndDrain(Throwable)}.
+     * against {@link IndexReplicationWindow#tryFailAndDrain(Throwable)}.
      */
     public boolean reEnqueueIfActive(IndexBatch batch, long readyAtMs) {
         synchronized (batch.window()) {
@@ -534,14 +534,15 @@ public final class IndexSendBuffer {
     public void release(IndexBatch batch) {
         synchronized (batch) {
             if (batch.markReleased() && batch.wasAccounted()) {
-                releaseReservedBytes(batch.window().owner(), batch.retainedBytes());
+                releaseReservedBytes(
+                        batch.window().sourceBucket(), batch.retainedBytes());
             }
         }
     }
 
-    private void releaseReservedBytes(IndexReplicator owner, long bytes) {
-        pendingBytesByReplicator.computeIfPresent(
-                owner, (ignored, current) -> current == bytes ? null : current - bytes);
+    private void releaseReservedBytes(TableBucket source, long bytes) {
+        pendingBytesBySource.computeIfPresent(
+                source, (ignored, current) -> current == bytes ? null : current - bytes);
         pendingBytes.addAndGet(-bytes);
     }
 
@@ -569,14 +570,14 @@ public final class IndexSendBuffer {
     }
 
     /**
-     * Discard every queued batch produced by {@code owner}, returning how many were dropped. Called
-     * when an {@link IndexReplicator} stops (its main-table bucket lost leadership or the table was
-     * dropped) so its undelivered batches do not loop forever in the sender's at-least-once retry,
-     * pinning memory and holding back-pressure. Cleanup is scoped to the producing replicator:
-     * batches from other replicators are left untouched, including other buckets of the same index
-     * table that may still have a live leader.
+     * Discard every queued batch produced by the given source main-table bucket, returning how
+     * many were dropped. Called when a producer stops (its main-table bucket lost leadership or
+     * the table was dropped) so its undelivered batches do not loop forever in the sender's
+     * at-least-once retry, pinning memory and holding back-pressure. Cleanup is scoped to the
+     * producing source bucket: batches from other sources are left untouched, including other
+     * buckets of the same index table that may still have a live leader.
      */
-    public int dropForReplicator(IndexReplicator owner) {
+    public int dropForSource(TableBucket source) {
         Set<IndexBatch> droppedBatches = new HashSet<>();
         for (TableBucket bucket : new ArrayList<>(batches.keySet())) {
             batches.computeIfPresent(
@@ -586,8 +587,9 @@ public final class IndexSendBuffer {
                             Iterator<IndexBatch> it = deque.iterator();
                             while (it.hasNext()) {
                                 IndexBatch batch = it.next();
-                                IndexWindow window = batch.window();
-                                if (window != null && window.owner() == owner) {
+                                IndexReplicationWindow window = batch.window();
+                                if (window != null
+                                        && window.sourceBucket().equals(source)) {
                                     it.remove();
                                     droppedBatches.add(batch);
                                 }

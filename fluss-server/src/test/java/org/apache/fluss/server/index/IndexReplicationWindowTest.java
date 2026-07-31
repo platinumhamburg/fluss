@@ -39,8 +39,8 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Unit tests for {@link IndexWindow} acknowledgement counting and offset advancement. */
-public class IndexWindowTest {
+/** Unit tests for {@link IndexReplicationWindow} acknowledgement counting and offset advancement. */
+public class IndexReplicationWindowTest {
 
     private static IndexReplicator newReplicator(
             long initialOffset, IndexReplicator.IndexProgressListener onAdvanced) {
@@ -98,7 +98,7 @@ public class IndexWindowTest {
         public FetchDataInfo read(
                 long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage) {
             throw new UnsupportedOperationException(
-                    "IndexWindowTest never reads from the source WAL");
+                    "IndexReplicationWindowTest never reads from the source WAL");
         }
     }
 
@@ -120,7 +120,7 @@ public class IndexWindowTest {
                 });
     }
 
-    private static IndexBatch batch(IndexWindow window, int bucket) {
+    private static IndexBatch batch(IndexReplicationWindow window, int bucket) {
         byte[] bytes = new byte[] {1};
         return new IndexBatch(
                 new TableBucket(1L, bucket),
@@ -132,7 +132,7 @@ public class IndexWindowTest {
     void offsetAdvancesOnlyAfterAllBatchesAcked() {
         AtomicLong advanced = new AtomicLong(-1L);
         IndexReplicator replicator = newReplicator(0L, (sync, all) -> advanced.set(sync));
-        IndexWindow window = new IndexWindow("idx", 100L, 3, replicator);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 100L, 3, replicator);
         IndexBatch first = batch(window, 0);
         IndexBatch second = batch(window, 1);
         IndexBatch third = batch(window, 2);
@@ -156,7 +156,7 @@ public class IndexWindowTest {
     void singleBatchWindowCompletesImmediately() {
         AtomicLong advanced = new AtomicLong(-1L);
         IndexReplicator replicator = newReplicator(10L, (sync, all) -> advanced.set(sync));
-        IndexWindow window = new IndexWindow("idx", 42L, 1, replicator);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 42L, 1, replicator);
         IndexBatch batch = batch(window, 0);
 
         window.onBatchAcked(batch);
@@ -180,7 +180,7 @@ public class IndexWindowTest {
     @Test
     void terminalBatchFailurePreventsWindowFromAdvancing() {
         IndexReplicator replicator = newReplicator(10L, (sync, all) -> {});
-        IndexWindow window = new IndexWindow("idx", 42L, 1, replicator);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 42L, 1, replicator);
         IndexBatch batch = batch(window, 0);
         RecordTooLargeException failure = new RecordTooLargeException("too large");
 
@@ -197,14 +197,14 @@ public class IndexWindowTest {
         AtomicBoolean woke = new AtomicBoolean(false);
         replicator.setWakeupSignal(() -> woke.set(true));
 
-        IndexWindow window = new IndexWindow("idx", 7L, 1, replicator);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 7L, 1, replicator);
         window.onBatchAcked(batch(window, 0));
 
         assertThat(woke).isTrue();
     }
 
     @Test
-    void asyncIndexWindowDoesNotBlockSyncProgress() {
+    void asyncIndexReplicationWindowDoesNotBlockSyncProgress() {
         AtomicLong syncProgress = new AtomicLong(-1L);
         AtomicLong allProgress = new AtomicLong(-1L);
         IndexReplicator replicator =
@@ -217,7 +217,7 @@ public class IndexWindowTest {
                             allProgress.set(all);
                         });
 
-        IndexWindow window = new IndexWindow("idx_sync", 100L, 1, replicator);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx_sync", 100L, 1, replicator);
         window.onBatchAcked(batch(window, 0));
 
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(100L);
@@ -235,9 +235,9 @@ public class IndexWindowTest {
                         spec("idx_sync_b", IndexVisibility.SYNC),
                         (sync, all) -> {});
 
-        IndexWindow first = new IndexWindow("idx_sync_a", 20L, 1, replicator);
+        IndexReplicationWindow first = new IndexReplicationWindow("idx_sync_a", 20L, 1, replicator);
         first.onBatchAcked(batch(first, 0));
-        IndexWindow second = new IndexWindow("idx_sync_b", 10L, 1, replicator);
+        IndexReplicationWindow second = new IndexReplicationWindow("idx_sync_b", 10L, 1, replicator);
         second.onBatchAcked(batch(second, 1));
 
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(10L);

@@ -1305,7 +1305,7 @@ public final class IndexSender implements AutoCloseable {
 
     private void failOversizedBatch(IndexBatch batch, RequestSizeAccumulator size) {
         RecordTooLargeException failure = oversizedFailure(batch, size);
-        IndexWindow window = batch.window();
+        IndexReplicationWindow window = batch.window();
         List<IndexBatch> siblings = window.tryFailAndDrain(failure);
         if (siblings == null) {
             return;

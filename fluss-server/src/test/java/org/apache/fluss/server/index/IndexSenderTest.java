@@ -286,7 +286,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(39L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(39L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             await(() -> owner.getSyncIndexPushedOffset() == 10L);
             assertThat(delegate.apiVersionsCalls).isEqualTo(1);
@@ -318,7 +318,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(38L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(38L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             await(() -> owner.getSyncIndexPushedOffset() == 10L);
             assertThat(first.requests).hasSize(1);
@@ -351,11 +351,11 @@ public class IndexSenderTest {
             IndexReplicator firstOwner = owner(sendBuffer);
             IndexReplicator secondOwner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(381L, 0), new IndexWindow("first", 10L, 1, firstOwner)));
+                    batch(new TableBucket(381L, 0), new IndexReplicationWindow("first", 10L, 1, firstOwner)));
             sendBuffer.append(
                     batch(
                             new TableBucket(382L, 0),
-                            new IndexWindow("second", 20L, 1, secondOwner)));
+                            new IndexReplicationWindow("second", 20L, 1, secondOwner)));
             await(() -> first.pending.size() == 2);
 
             completePutKv(first, 0, false);
@@ -406,7 +406,7 @@ public class IndexSenderTest {
         senderRef.set(sender);
         try {
             sendBuffer.append(
-                    batch(new TableBucket(37L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(37L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             assertThat(progress.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(closeReturned).isTrue();
@@ -439,7 +439,7 @@ public class IndexSenderTest {
         ExecutorService executor = Executors.newCachedThreadPool();
         try {
             sendBuffer.append(
-                    batch(new TableBucket(36L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(36L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
             await(() -> gateway.pending.size() == 1);
 
             Future<?> completion = executor.submit(() -> completePutKv(gateway, 0, true));
@@ -486,7 +486,7 @@ public class IndexSenderTest {
         ExecutorService executor = Executors.newCachedThreadPool();
         try {
             sendBuffer.append(
-                    batch(new TableBucket(35L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(35L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
             await(() -> gateway.pending.size() == 1);
             Future<?> completion = executor.submit(() -> completePutKv(gateway, 0, true));
             assertThat(reentrantCloseReturned.await(5, TimeUnit.SECONDS)).isTrue();
@@ -525,7 +525,7 @@ public class IndexSenderTest {
         IndexSender sender = sender(sendBuffer, ignored -> gateway, ignored -> 1, hooks);
         ExecutorService executor = Executors.newCachedThreadPool();
         IndexBatch claimed =
-                batch(new TableBucket(34L, 0), new IndexWindow("idx", 10L, 1, owner(sendBuffer)));
+                batch(new TableBucket(34L, 0), new IndexReplicationWindow("idx", 10L, 1, owner(sendBuffer)));
         try {
             sendBuffer.append(claimed);
             await(() -> gateway.pending.size() == 1);
@@ -559,7 +559,7 @@ public class IndexSenderTest {
         gateway.pendingApiVersions = new CompletableFuture<>();
         TableBucket bucket = new TableBucket(40L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+        sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
         IndexSender sender =
                 new IndexSender(
                         sendBuffer,
@@ -602,7 +602,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(44L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(44L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
             await(() -> gateway.apiVersionsCalls == 1);
 
             Future<?> probeCompletion =
@@ -638,7 +638,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(45L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(45L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
             await(() -> gateway.pending.size() == 1);
 
             Future<?> requestCompletion =
@@ -682,7 +682,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(47L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(47L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
             hooks.awaitReached();
             leader.set(2);
             hooks.release();
@@ -720,7 +720,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(46L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(46L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
             await(() -> first.pending.size() == 1);
 
             Future<?> completion =
@@ -769,7 +769,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(41L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(41L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
             await(() -> first.apiVersionsCalls == 1);
 
             leader.set(2);
@@ -804,7 +804,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(42L, 0);
             IndexReplicator owner = owner(sendBuffer);
-            IndexBatch encodedBatch = v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+            IndexBatch encodedBatch = v1Batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner));
             byte[] expected = bytes(encodedBatch.encoded());
             KvRecordBatch parsed =
                     KvRecordBatchReader.pointToByteBuffer(
@@ -841,7 +841,7 @@ public class IndexSenderTest {
         gateway.autoCompleteSuccess = true;
         TableBucket bucket = new TableBucket(43L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        IndexBatch encodedBatch = v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        IndexBatch encodedBatch = v1Batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner));
         long exactRequestBytes = exactRequestBytes(bucket, encodedBatch);
         sendBuffer.append(encodedBatch);
         IndexSender sender =
@@ -880,7 +880,7 @@ public class IndexSenderTest {
         TableBucket firstBucket = new TableBucket(431L, 0);
         TableBucket secondBucket = new TableBucket(431L, 1);
         IndexReplicator owner = owner(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         IndexBatch first = batchOfSize(firstBucket, window, 3, 4096L);
         IndexBatch second = batchOfSize(secondBucket, window, 3, 4096L);
         long preferredRequestBytes =
@@ -920,7 +920,7 @@ public class IndexSenderTest {
         gateway.autoCompleteSuccess = true;
         TableBucket bucket = new TableBucket(44L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        IndexBatch encodedBatch = v1Batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        IndexBatch encodedBatch = v1Batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner));
         long exactRequestBytes = exactRequestBytes(bucket, encodedBatch);
         long requestsBefore =
                 TestingMetricGroups.TABLET_SERVER_METRICS.indexPushRequests().getCount();
@@ -975,7 +975,7 @@ public class IndexSenderTest {
         TableBucket largeBucket = new TableBucket(45L, 0);
         TableBucket siblingBucket = new TableBucket(45L, 1);
         IndexReplicator owner = owner(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
         IndexBatch sibling = batchOfSize(siblingBucket, window, 1);
         long hardLimit = exactRequestBytes(siblingBucket, sibling);
@@ -1032,7 +1032,7 @@ public class IndexSenderTest {
         TableBucket retryBucket = new TableBucket(tableId, retryBucketId);
         TableBucket oversizedBucket = new TableBucket(tableId, oversizedBucketId);
         IndexReplicator owner = ownerWithIndex(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         owner.registerInFlightWindow("idx", window);
         IndexBatch retry = batchOfSize(retryBucket, window, 1);
         IndexBatch oversized = batchOfSize(oversizedBucket, window, 1024 * 1024);
@@ -1089,7 +1089,7 @@ public class IndexSenderTest {
         RecordingGateway gateway = new RecordingGateway();
         TableBucket bucket = new TableBucket(491L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 1, owner);
         IndexBatch batch = batchOfSize(bucket, window, 17);
         BlockingLifecycleHooks hooks = new BlockingLifecycleHooks(LifecyclePoint.RETRY_PUBLICATION);
         sendBuffer.append(batch);
@@ -1113,7 +1113,7 @@ public class IndexSenderTest {
             hooks.awaitReached();
 
             owner.close();
-            assertThat(sendBuffer.dropForReplicator(owner)).isZero();
+            assertThat(sendBuffer.dropForSource(owner.sourceBucket())).isZero();
             hooks.release();
             failedRequest.get(5, TimeUnit.SECONDS);
 
@@ -1155,20 +1155,20 @@ public class IndexSenderTest {
                 });
         TableBucket bucket = new TableBucket(493L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        IndexBatch batch = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
+        IndexBatch batch = batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner));
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
             Future<?> append = executor.submit(() -> sendBuffer.append(batch));
             assertThat(admitted.await(5, TimeUnit.SECONDS)).isTrue();
 
             owner.close();
-            assertThat(sendBuffer.dropForReplicator(owner)).isZero();
+            assertThat(sendBuffer.dropForSource(owner.sourceBucket())).isZero();
             resume.countDown();
             append.get(5, TimeUnit.SECONDS);
 
             assertThat(sendBuffer.hasPending(bucket)).isFalse();
             assertThat(sendBuffer.pendingBytes()).isZero();
-            assertThat(sendBuffer.pendingBytes(owner)).isZero();
+            assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isZero();
             assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
             assertThat(appendNotifications).hasValue(0);
             assertThat(sender.ownedBatchCountForTesting()).isZero();
@@ -1184,9 +1184,9 @@ public class IndexSenderTest {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
         TableBucket bucket = new TableBucket(494L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        IndexBatch first = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
-        IndexBatch second = batch(bucket, new IndexWindow("idx", 20L, 1, owner));
-        IndexBatch third = batch(bucket, new IndexWindow("idx", 30L, 1, owner));
+        IndexBatch first = batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner));
+        IndexBatch second = batch(bucket, new IndexReplicationWindow("idx", 20L, 1, owner));
+        IndexBatch third = batch(bucket, new IndexReplicationWindow("idx", 30L, 1, owner));
         RecordingGateway gateway = new RecordingGateway();
         gateway.autoCompleteSuccess = true;
         AtomicReference<String> invocationThread = new AtomicReference<>();
@@ -1226,7 +1226,7 @@ public class IndexSenderTest {
 
             assertThat(invocationStarted.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(sendBuffer.hasPending(bucket)).isTrue();
-            assertThat(sendBuffer.pendingBytes(owner))
+            assertThat(sendBuffer.pendingBytes(owner.sourceBucket()))
                     .isEqualTo(
                             first.encoded().getBytesLength()
                                     + second.encoded().getBytesLength()
@@ -1241,7 +1241,7 @@ public class IndexSenderTest {
             assertThat(second.window().registeredBatchCount()).isZero();
             assertThat(third.window().registeredBatchCount()).isZero();
             assertThat(sendBuffer.pendingBytes()).isZero();
-            assertThat(sendBuffer.pendingBytes(owner)).isZero();
+            assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isZero();
             assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
             assertThat(sendBuffer.hasUnsent()).isFalse();
             assertThat(sendBuffer.buckets()).isEmpty();
@@ -1259,7 +1259,7 @@ public class IndexSenderTest {
         RecordingGateway gateway = new RecordingGateway();
         TableBucket bucket = new TableBucket(492L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 1, owner);
         IndexBatch batch = batchOfSize(bucket, window, 64 * 1024);
         sendBuffer.append(batch);
         IndexSender sender =
@@ -1284,7 +1284,7 @@ public class IndexSenderTest {
             assertThat(sender.ownedBatchPayloadBytesForTesting()).isEqualTo(64L * 1024L);
 
             owner.close();
-            assertThat(sendBuffer.dropForReplicator(owner)).isZero();
+            assertThat(sendBuffer.dropForSource(owner.sourceBucket())).isZero();
 
             assertThat(sendBuffer.hasUnsent()).isFalse();
             assertThat(sendBuffer.pendingBytes()).isZero();
@@ -1303,7 +1303,7 @@ public class IndexSenderTest {
         RecordingGateway gateway = new RecordingGateway();
         TableBucket bucket = new TableBucket(493L, 0);
         IndexReplicator firstOwner = ownerWithIndex(sendBuffer);
-        IndexWindow firstWindow = new IndexWindow("idx", 10L, 1, firstOwner);
+        IndexReplicationWindow firstWindow = new IndexReplicationWindow("idx", 10L, 1, firstOwner);
         firstOwner.registerInFlightWindow("idx", firstWindow);
         sendBuffer.append(batch(bucket, firstWindow));
         IndexSender sender =
@@ -1318,7 +1318,7 @@ public class IndexSenderTest {
         try {
             await(() -> gateway.pending.size() == 1);
 
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 20L, 1, secondOwner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 20L, 1, secondOwner)));
             await(() -> sender.queuedBucketCountForTesting() == 0);
             assertThat(sendBuffer.hasPending(bucket)).isTrue();
             assertThat(sender.inFlightRequestCount()).isOne();
@@ -1345,7 +1345,7 @@ public class IndexSenderTest {
         gateway.putKvMaxVersion = 1;
         TableBucket bucket = new TableBucket(46L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        IndexBatch batch = batchOfSize(bucket, new IndexWindow("idx", 10L, 1, owner), 64);
+        IndexBatch batch = batchOfSize(bucket, new IndexReplicationWindow("idx", 10L, 1, owner), 64);
         sendBuffer.append(batch);
         IndexSender sender =
                 new IndexSender(
@@ -1379,7 +1379,7 @@ public class IndexSenderTest {
         TableBucket smallBucket = new TableBucket(47L, 0);
         TableBucket largeBucket = new TableBucket(47L, 1);
         IndexReplicator owner = ownerWithIndex(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         owner.registerInFlightWindow("idx", window);
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
@@ -1436,7 +1436,7 @@ public class IndexSenderTest {
         TableBucket smallBucket = new TableBucket(tableId, smallBucketId);
         TableBucket largeBucket = new TableBucket(tableId, largeBucketId);
         IndexReplicator owner = ownerWithIndex(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         owner.registerInFlightWindow("idx", window);
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
@@ -1488,7 +1488,7 @@ public class IndexSenderTest {
         TableBucket smallBucket = new TableBucket(tableId, smallBucketId);
         TableBucket largeBucket = new TableBucket(tableId, largeBucketId);
         IndexReplicator owner = ownerWithIndex(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         owner.registerInFlightWindow("idx", window);
         IndexBatch small = batchOfSize(smallBucket, window, 1);
         IndexBatch large = batchOfSize(largeBucket, window, 128);
@@ -1632,24 +1632,24 @@ public class IndexSenderTest {
         assertThat(size.codecRepresentable()).isTrue();
     }
 
-    private static IndexBatch batch(TableBucket targetBucket, IndexWindow window) {
+    private static IndexBatch batch(TableBucket targetBucket, IndexReplicationWindow window) {
         byte[] bytes = new byte[] {1, 2, 3};
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length);
         return new IndexBatch(targetBucket, encoded, window);
     }
 
-    private static IndexBatch batchOfSize(TableBucket targetBucket, IndexWindow window, int size) {
+    private static IndexBatch batchOfSize(TableBucket targetBucket, IndexReplicationWindow window, int size) {
         return batchOfSize(targetBucket, window, size, size);
     }
 
     private static IndexBatch batchOfSize(
-            TableBucket targetBucket, IndexWindow window, int size, long retainedBytes) {
+            TableBucket targetBucket, IndexReplicationWindow window, int size, long retainedBytes) {
         byte[] bytes = new byte[size];
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, size);
         return new IndexBatch(targetBucket, encoded, retainedBytes, window);
     }
 
-    private static IndexBatch v1Batch(TableBucket targetBucket, IndexWindow window)
+    private static IndexBatch v1Batch(TableBucket targetBucket, IndexReplicationWindow window)
             throws Exception {
         ProgressKvRecordBatchBuilder builder =
                 ProgressKvRecordBatchBuilder.builder(
@@ -1701,20 +1701,28 @@ public class IndexSenderTest {
                         KvFormat.COMPACTED,
                         new int[] {0},
                         row -> null);
-        return new IndexReplicator(
-                null,
+        return IndexReplicator.forTesting(
+                StubSourceWals.unreadable(),
                 Collections.singletonList(spec),
                 sendBuffer,
                 null,
                 0L,
+                1024,
                 1024,
                 (sync, all) -> {});
     }
 
     private static IndexReplicator owner(
             IndexSendBuffer sendBuffer, IndexReplicator.IndexProgressListener listener) {
-        return new IndexReplicator(
-                null, Collections.emptyList(), sendBuffer, null, 0L, 1024, listener);
+        return IndexReplicator.forTesting(
+                StubSourceWals.unreadable(),
+                Collections.emptyList(),
+                sendBuffer,
+                null,
+                0L,
+                1024,
+                1024,
+                listener);
     }
 
     private static IndexSender sender(
@@ -1809,7 +1817,7 @@ public class IndexSenderTest {
         RecordingGateway gateway = new RecordingGateway();
         TableBucket bucket = new TableBucket(90L, 0);
         IndexReplicator owner = owner(sendBuffer);
-        sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+        sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
 
         IndexSender sender =
                 new IndexSender(
@@ -1848,7 +1856,7 @@ public class IndexSenderTest {
                         .getCount();
         try {
             IndexReplicator owner = owner(sendBuffer);
-            IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+            IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
             IndexBatch first = batch(new TableBucket(91L, 0), window);
             IndexBatch second = batch(new TableBucket(91L, 1), window);
             assertThat(sendBuffer.tryAppendWindow(Arrays.asList(first, second))).isTrue();
@@ -1896,7 +1904,7 @@ public class IndexSenderTest {
         try {
             IndexReplicator owner = owner(sendBuffer);
             sendBuffer.append(
-                    batch(new TableBucket(92L, 0), new IndexWindow("idx", 10L, 1, owner)));
+                    batch(new TableBucket(92L, 0), new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             await(() -> gateway.apiVersionsCalls == 1);
             assertThat(sender.inFlightRequestCount()).isZero();
@@ -1937,8 +1945,8 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(100L, 0);
             IndexReplicator owner = owner(sendBuffer);
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 20L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 20L, 1, owner)));
 
             // Only the first batch is dispatched; the bucket is muted until its ack.
             await(() -> gateway.pending.size() == 1);
@@ -1980,7 +1988,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(200L, 0);
             IndexReplicator owner = owner(sendBuffer);
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             // Failure re-enqueues for retry: more than one send attempt is observed.
             await(() -> gateway.pending.size() >= 2);
@@ -2014,13 +2022,13 @@ public class IndexSenderTest {
                         1024L * 1024L,
                         5_000L);
         IndexReplicator firstOwner = owner(sendBuffer);
-        IndexWindow firstWindow = new IndexWindow("idx", 10L, 1, firstOwner);
+        IndexReplicationWindow firstWindow = new IndexReplicationWindow("idx", 10L, 1, firstOwner);
         IndexBatch first = batchOfSize(new TableBucket(240L, 0), firstWindow, 1, 3L);
         IndexReplicator secondOwner = owner(sendBuffer);
-        IndexWindow secondWindow = new IndexWindow("idx", 20L, 1, secondOwner);
+        IndexReplicationWindow secondWindow = new IndexReplicationWindow("idx", 20L, 1, secondOwner);
         IndexBatch second = batchOfSize(new TableBucket(240L, 1), secondWindow, 1, 3L);
         IndexReplicator rejectedOwner = owner(sendBuffer);
-        IndexWindow rejectedWindow = new IndexWindow("idx", 30L, 1, rejectedOwner);
+        IndexReplicationWindow rejectedWindow = new IndexReplicationWindow("idx", 30L, 1, rejectedOwner);
         IndexBatch rejected = batchOfSize(new TableBucket(241L, 0), rejectedWindow, 1, 3L);
         try {
             assertThat(sendBuffer.tryAppendWindow(Collections.singletonList(first))).isTrue();
@@ -2030,7 +2038,7 @@ public class IndexSenderTest {
 
             assertThat(sendBuffer.tryAppendWindow(Collections.singletonList(rejected))).isFalse();
             assertThat(sendBuffer.pendingBytes()).isEqualTo(totalLimit);
-            assertThat(sendBuffer.pendingBytes(rejectedOwner)).isZero();
+            assertThat(sendBuffer.pendingBytes(rejectedOwner.sourceBucket())).isZero();
             assertThat(sendBuffer.hasPending(rejected.targetBucket())).isFalse();
             assertThat(rejectedWindow.isAdmitted()).isFalse();
 
@@ -2049,13 +2057,13 @@ public class IndexSenderTest {
             assertThat(secondOwner.getSyncIndexPushedOffset()).isEqualTo(20L);
 
             assertThat(rejectedWindow.tryRetireAndDrain()).containsExactly(rejected);
-            IndexWindow rebuiltWindow = new IndexWindow("idx", 30L, 1, rejectedOwner);
+            IndexReplicationWindow rebuiltWindow = new IndexReplicationWindow("idx", 30L, 1, rejectedOwner);
             IndexBatch rebuilt = batchOfSize(new TableBucket(241L, 0), rebuiltWindow, 1, 3L);
             assertThat(sendBuffer.tryAppendWindow(Collections.singletonList(rebuilt))).isTrue();
             await(() -> rejectedOwner.getSyncIndexPushedOffset() == 30L);
 
             assertThat(sendBuffer.pendingBytes()).isZero();
-            assertThat(sendBuffer.pendingBytes(rejectedOwner)).isZero();
+            assertThat(sendBuffer.pendingBytes(rejectedOwner.sourceBucket())).isZero();
             assertThat(sendBuffer.hasUnsent()).isFalse();
         } finally {
             sender.close();
@@ -2085,8 +2093,8 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(250L, 0);
             IndexReplicator owner = owner(sendBuffer);
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 20L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 20L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             gateway.pending.get(0).completeExceptionally(new RuntimeException("first failed"));
@@ -2134,7 +2142,7 @@ public class IndexSenderTest {
             IndexReplicator owner = owner(sendBuffer);
             // One window spanning two index buckets of the same table; it completes only once both
             // buckets are acked.
-            IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+            IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
             IndexBatch first = batch(new TableBucket(300L, 0), window);
             IndexBatch second = batch(new TableBucket(300L, 1), window);
             assertThat(sendBuffer.tryAppendWindow(Arrays.asList(first, second))).isTrue();
@@ -2164,7 +2172,7 @@ public class IndexSenderTest {
         AtomicInteger progressCallbacks = new AtomicInteger();
         IndexReplicator owner =
                 owner(sendBuffer, (sync, all) -> progressCallbacks.incrementAndGet());
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         IndexBatch acked = batchOfSize(ackBucket, window, 11);
         IndexBatch retry = batchOfSize(retryBucket, window, 23);
         assertThat(sendBuffer.tryAppendWindow(Arrays.asList(acked, retry))).isTrue();
@@ -2238,7 +2246,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(400L, 0);
             IndexReplicator owner = owner(sendBuffer);
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             assertThat(sender.inFlightRequestCount()).isEqualTo(1);
@@ -2273,7 +2281,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(500L, 0);
             IndexReplicator owner = owner(sendBuffer);
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             assertThat(sendBuffer.pendingBytes()).isEqualTo(3L);
@@ -2307,7 +2315,7 @@ public class IndexSenderTest {
         try {
             TableBucket bucket = new TableBucket(600L, 0);
             IndexReplicator owner = owner(sendBuffer);
-            sendBuffer.append(batch(bucket, new IndexWindow("idx", 10L, 1, owner)));
+            sendBuffer.append(batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner)));
 
             await(() -> gateway.pending.size() == 1);
             assertThat(sendBuffer.pendingBytes()).isEqualTo(3L);

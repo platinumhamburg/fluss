@@ -166,7 +166,7 @@ class IndexReplicationSupervisorTest {
                             // IndexReplicator.close() retires its own queued batches before it
                             // closes the read context. The positive pre-stop assertion below
                             // proves this was a real owned backlog rather than an empty fixture.
-                            assertThat(sendBuffer.pendingBytes(oldReference.get())).isZero();
+                            assertThat(sendBuffer.pendingBytes(oldReference.get().sourceBucket())).isZero();
                             pool.register(TABLE_BUCKET, probe);
                             return null;
                         })
@@ -175,21 +175,21 @@ class IndexReplicationSupervisorTest {
         IndexReplicator old =
                 idleReplicator(sendBuffer, oldReadContext, (ignored, failure) -> {}, () -> {});
         oldReference.set(old);
-        IndexWindow window = new IndexWindow("idx", 1L, 1, old);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 1L, 1, old);
         IndexBatch queued =
                 new IndexBatch(
                         TARGET_BUCKET,
                         new MemorySegmentBytesView(MemorySegment.wrap(new byte[] {1}), 0, 1),
                         window);
         sendBuffer.append(queued);
-        assertThat(sendBuffer.pendingBytes(old)).isPositive();
+        assertThat(sendBuffer.pendingBytes(old.sourceBucket())).isPositive();
 
         try {
             controller.installIndexReplicator(old);
             controller.onBecomeFollower();
 
             assertThat(old.isClosed()).isTrue();
-            assertThat(sendBuffer.pendingBytes(old)).isZero();
+            assertThat(sendBuffer.pendingBytes(old.sourceBucket())).isZero();
             assertThat(controller.getIndexReplicator()).isNull();
             assertThat(controller.getState()).isEqualTo(IndexReplicationSupervisor.State.NOT_STARTED);
             verify(oldReadContext, times(1)).close();

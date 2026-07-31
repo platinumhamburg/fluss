@@ -64,7 +64,7 @@ import java.util.function.BiConsumer;
  * intermediate heap objects ({@code IndexMutation}) are created — derivation writes directly to
  * per-target-bucket {@link ProgressKvRecordBatchBuilder}s.
  *
- * <p>Each secondary index has its own pushed offset and at most one {@link IndexWindow} in flight.
+ * <p>Each secondary index has its own pushed offset and at most one {@link IndexReplicationWindow} in flight.
  * {@link #poll()} reads the next valid window for every index that is currently ready. Window ends
  * may differ after failover because they depend on the fetched input and derived output size. The
  * source advances only completed windows and replays from persisted progress after recovery; the
@@ -144,7 +144,7 @@ public final class IndexReplicator implements AutoCloseable {
             long preferredMaxRequestBytes,
             IndexProgressListener onProgress) {
         this(
-                logTablet == null ? null : new LogTabletSourceWal(logTablet),
+                new LogTabletSourceWal(logTablet),
                 indexSpecs,
                 sendBuffer,
                 readContext,
@@ -155,7 +155,7 @@ public final class IndexReplicator implements AutoCloseable {
     }
 
     private IndexReplicator(
-            @Nullable SourceWal sourceWal,
+            SourceWal sourceWal,
             List<IndexSpec> indexSpecs,
             IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
@@ -164,11 +164,7 @@ public final class IndexReplicator implements AutoCloseable {
             long preferredMaxRequestBytes,
             IndexProgressListener onProgress) {
         this(
-                new IndexSourceReader(
-                        sourceWal == null ? UnavailableSourceWal.INSTANCE : sourceWal,
-                        null,
-                        Runnable::run,
-                        readContext),
+                new IndexSourceReader(sourceWal, null, Runnable::run, readContext),
                 indexSpecs,
                 sendBuffer,
                 readContext,
@@ -339,7 +335,7 @@ public final class IndexReplicator implements AutoCloseable {
 
         // Total retained capacity is a hard bound; the per-producer threshold remains soft and
         // prevents one stalled source from continuing to derive windows.
-        if (sendBuffer.isFull() || sendBuffer.isFull(this)) {
+        if (sendBuffer.isFull() || sendBuffer.isFull(sourceBucket())) {
             return false;
         }
 
@@ -353,7 +349,7 @@ public final class IndexReplicator implements AutoCloseable {
             if (closed.get()
                     || terminalFailure.get() != null
                     || sendBuffer.isFull()
-                    || sendBuffer.isFull(this)) {
+                    || sendBuffer.isFull(sourceBucket())) {
                 break;
             }
             if (state.inFlightWindow != null) {
@@ -525,8 +521,8 @@ public final class IndexReplicator implements AutoCloseable {
         // Stage the window: create it first so each batch can reference it, then publish batches to
         // the sendBuffer. The per-index in-flight window is set before publishing to enforce one
         // outstanding window per index.
-        IndexWindow window =
-                new IndexWindow(
+        IndexReplicationWindow window =
+                new IndexReplicationWindow(
                         state.spec.getIndexName(), lastProcessedOffset, encoded.size(), this);
         List<IndexBatch> batches = new ArrayList<>(encoded.size());
         registerInFlightWindow(state.spec.getIndexName(), window);
@@ -554,7 +550,7 @@ public final class IndexReplicator implements AutoCloseable {
         return true;
     }
 
-    private void retireUnadmittedWindow(IndexProgressState state, IndexWindow window) {
+    private void retireUnadmittedWindow(IndexProgressState state, IndexReplicationWindow window) {
         if (window.isAdmitted()) {
             return;
         }
@@ -586,7 +582,7 @@ public final class IndexReplicator implements AutoCloseable {
     }
 
     /**
-     * Called by {@link IndexWindow} when all of its batches have been acknowledged. Advances that
+     * Called by {@link IndexReplicationWindow} when all of its batches have been acknowledged. Advances that
      * index's pushed offset to the window end, clears the per-index in-flight window, notifies the
      * owning replica, and wakes the read-pool worker so it can poll the next ready window.
      */
@@ -615,14 +611,14 @@ public final class IndexReplicator implements AutoCloseable {
         }
     }
 
-    void registerInFlightWindow(String indexName, IndexWindow window) {
+    void registerInFlightWindow(String indexName, IndexReplicationWindow window) {
         IndexProgressState state = indexStatesByName.get(indexName);
         if (state != null) {
             state.inFlightWindow = window;
         }
     }
 
-    void onWindowFailed(String indexName, IndexWindow window, Throwable failure) {
+    void onWindowFailed(String indexName, IndexReplicationWindow window, Throwable failure) {
         lifecycleLock.lock();
         try {
             IndexProgressState state = indexStatesByName.get(indexName);
@@ -663,7 +659,7 @@ public final class IndexReplicator implements AutoCloseable {
 
     private void retireOwnedBatchesLocked() {
         for (IndexProgressState state : indexStates) {
-            IndexWindow window = state.inFlightWindow;
+            IndexReplicationWindow window = state.inFlightWindow;
             state.inFlightWindow = null;
             if (window == null) {
                 continue;
@@ -673,7 +669,7 @@ public final class IndexReplicator implements AutoCloseable {
                 sendBuffer.dropBatches(drained);
             }
         }
-        sendBuffer.dropForReplicator(this);
+        sendBuffer.dropForSource(sourceBucket());
     }
 
     @VisibleForTesting
@@ -689,7 +685,7 @@ public final class IndexReplicator implements AutoCloseable {
 
     @VisibleForTesting
     @Nullable
-    IndexWindow inFlightWindow(String indexName) {
+    IndexReplicationWindow inFlightWindow(String indexName) {
         IndexProgressState state = indexStatesByName.get(indexName);
         return state == null ? null : state.inFlightWindow;
     }
@@ -931,6 +927,11 @@ public final class IndexReplicator implements AutoCloseable {
         return closed.get();
     }
 
+    /** The source main-table bucket this replicator reads from. */
+    public TableBucket sourceBucket() {
+        return sourceReader.tableBucket();
+    }
+
     private void closeReadContext() {
         if (readContext != null && readContextClosed.compareAndSet(false, true)) {
             readContext.close();
@@ -940,37 +941,12 @@ public final class IndexReplicator implements AutoCloseable {
     @VisibleForTesting
     interface SourceWal extends IndexSourceReader.SourceLog {}
 
-    private static final class UnavailableSourceWal implements SourceWal {
-        private static final UnavailableSourceWal INSTANCE = new UnavailableSourceWal();
-        private static final TableBucket UNKNOWN_BUCKET = new TableBucket(-1L, 0);
-
-        @Override
-        public TableBucket tableBucket() {
-            return UNKNOWN_BUCKET;
-        }
-
-        @Override
-        public long highWatermark() {
-            throw new IllegalStateException("Source WAL is unavailable");
-        }
-
-        @Override
-        public long logStartOffset() {
-            throw new IllegalStateException("Source WAL is unavailable");
-        }
-
-        @Override
-        public FetchDataInfo read(
-                long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage) {
-            throw new IllegalStateException("Source WAL is unavailable");
-        }
-    }
-
     private static final class LogTabletSourceWal implements SourceWal {
         private final LogTablet logTablet;
 
         private LogTabletSourceWal(LogTablet logTablet) {
-            this.logTablet = logTablet;
+            this.logTablet =
+                    org.apache.fluss.utils.Preconditions.checkNotNull(logTablet, "logTablet");
         }
 
         @Override
@@ -1004,7 +980,7 @@ public final class IndexReplicator implements AutoCloseable {
     private static final class IndexProgressState {
         private final IndexSpec spec;
         private volatile long pushedOffset;
-        @Nullable private volatile IndexWindow inFlightWindow;
+        @Nullable private volatile IndexReplicationWindow inFlightWindow;
 
         private IndexProgressState(IndexSpec spec, long initialOffset) {
             this.spec = spec;

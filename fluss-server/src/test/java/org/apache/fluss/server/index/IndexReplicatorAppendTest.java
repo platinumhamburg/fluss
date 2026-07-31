@@ -94,12 +94,13 @@ public class IndexReplicatorAppendTest {
                     .build();
 
     private static IndexReplicator newReplicator() {
-        return new IndexReplicator(
-                null,
+        return IndexReplicator.forTesting(
+                StubSourceWals.unreadable(),
                 Collections.emptyList(),
                 new IndexSendBuffer(),
                 null,
                 0L,
+                1024,
                 1024,
                 (sync, all) -> {});
     }
@@ -108,12 +109,13 @@ public class IndexReplicatorAppendTest {
     void rejectsNegativeInitialOffset() {
         assertThatThrownBy(
                         () ->
-                                new IndexReplicator(
-                                        null,
+                                IndexReplicator.forTesting(
+                                        StubSourceWals.unreadable(),
                                         Collections.emptyList(),
                                         new IndexSendBuffer(),
                                         null,
                                         -1L,
+                                        1024,
                                         1024,
                                         (sync, all) -> {}))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -205,11 +207,11 @@ public class IndexReplicatorAppendTest {
         assertThat(batch.encoded().getBytesLength()).isLessThan(4096);
         assertThat(batch.retainedBytes()).isEqualTo(4096L);
         assertThat(fixture.sendBuffer.pendingBytes()).isEqualTo(4096L);
-        assertThat(fixture.sendBuffer.pendingBytes(fixture.replicator)).isEqualTo(4096L);
+        assertThat(fixture.sendBuffer.pendingBytes(fixture.replicator.sourceBucket())).isEqualTo(4096L);
 
         fixture.sendBuffer.release(batch);
         assertThat(fixture.sendBuffer.pendingBytes()).isZero();
-        assertThat(fixture.sendBuffer.pendingBytes(fixture.replicator)).isZero();
+        assertThat(fixture.sendBuffer.pendingBytes(fixture.replicator.sourceBucket())).isZero();
     }
 
     @Test
@@ -230,7 +232,7 @@ public class IndexReplicatorAppendTest {
                                                 row(2L, 12L, 100L)))));
 
         assertThat(fixture.replicator.poll()).isTrue();
-        IndexWindow firstWindow = fixture.replicator.inFlightWindow("idx");
+        IndexReplicationWindow firstWindow = fixture.replicator.inFlightWindow("idx");
         IndexBatch firstBatch =
                 fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(firstWindow).isNotNull();
@@ -250,7 +252,7 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isEqualTo(1L);
         assertThat(fixture.replicator.poll()).isTrue();
 
-        IndexWindow secondWindow = fixture.replicator.inFlightWindow("idx");
+        IndexReplicationWindow secondWindow = fixture.replicator.inFlightWindow("idx");
         IndexBatch secondBatch =
                 fixture.sendBuffer.pollFirst(new TableBucket(INDEX_TABLE_ID, 0));
         assertThat(secondWindow).isNotNull().isNotSameAs(firstWindow);
@@ -682,15 +684,16 @@ public class IndexReplicatorAppendTest {
                                         record(0L, ChangeType.INSERT, row(1L, 10L, 100L)))),
                         (ignored, failure) -> {});
         IndexReplicator fillingOwner =
-                new IndexReplicator(
-                        null,
+                IndexReplicator.forTesting(
+                        StubSourceWals.unreadable(),
                         Collections.emptyList(),
                         sendBuffer,
                         null,
                         0L,
                         1024,
+                        1024,
                         (sync, all) -> {});
-        IndexWindow fillingWindow = new IndexWindow("filler", 1L, 1, fillingOwner);
+        IndexReplicationWindow fillingWindow = new IndexReplicationWindow("filler", 1L, 1, fillingOwner);
         IndexBatch fillingBatch =
                 new IndexBatch(
                         new TableBucket(78L, 0),
@@ -713,7 +716,7 @@ public class IndexReplicatorAppendTest {
 
         assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isZero();
-        assertThat(sendBuffer.pendingBytes(fixture.replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(fixture.replicator.sourceBucket())).isZero();
         assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
 
         assertThat(sendBuffer.pollFirst(fillingBatch.targetBucket())).isSameAs(fillingBatch);
@@ -759,7 +762,7 @@ public class IndexReplicatorAppendTest {
         assertThat(fixture.replicator.inFlightWindow("idx")).isNull();
         assertThat(fixture.replicator.getSyncIndexPushedOffset()).isZero();
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(fixture.replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(fixture.replicator.sourceBucket())).isZero();
         assertThat(sendBuffer.hasUnsent()).isFalse();
         assertThat(fixture.sourceWal.readOffsets).containsExactly(0L);
 
@@ -779,7 +782,7 @@ public class IndexReplicatorAppendTest {
                                         record(5L, ChangeType.INSERT, row(1L, 10L, 100L)))));
 
         assertThat(fixture.replicator.poll()).isTrue();
-        IndexWindow window = fixture.replicator.inFlightWindow("idx");
+        IndexReplicationWindow window = fixture.replicator.inFlightWindow("idx");
         RuntimeException failure = new RuntimeException("terminal failure");
 
         assertThat(window).isNotNull();

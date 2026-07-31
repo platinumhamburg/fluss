@@ -18,6 +18,7 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.metadata.TableBucket;
 
 import javax.annotation.Nullable;
 
@@ -39,7 +40,7 @@ import java.util.List;
  * window boundaries safe.
  */
 @Internal
-final class IndexWindow {
+final class IndexReplicationWindow {
 
     private final String indexName;
     private final long windowEndOffset;
@@ -50,7 +51,7 @@ final class IndexWindow {
     private volatile boolean admitted;
     private boolean terminal;
 
-    IndexWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
+    IndexReplicationWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
         this.indexName = indexName;
         this.windowEndOffset = windowEndOffset;
         this.expectedBatchCount = batchCount;
@@ -68,9 +69,14 @@ final class IndexWindow {
         return windowEndOffset;
     }
 
-    /** The replicator that produced this window; used to scope per-replicator batch cleanup. */
-    IndexReplicator owner() {
-        return owner;
+    /** The source main-table bucket of the producing replicator; the buffer's accounting key. */
+    TableBucket sourceBucket() {
+        return owner.sourceBucket();
+    }
+
+    /** Whether the producing replicator has been closed. */
+    boolean isOwnerClosed() {
+        return owner.isClosed();
     }
 
     synchronized void register(IndexBatch batch) {

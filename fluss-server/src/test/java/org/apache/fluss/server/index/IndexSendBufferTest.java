@@ -50,28 +50,38 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 public class IndexSendBufferTest {
 
     private static IndexBatch batch(TableBucket targetBucket) {
-        return batch(
-                targetBucket, new IndexWindow("idx", 1L, 1, replicator(new IndexSendBuffer())));
+        return batch(targetBucket, new IndexReplicationWindow("idx", 1L, 1, replicator(new IndexSendBuffer())));
     }
 
-    private static IndexBatch batch(TableBucket targetBucket, IndexWindow window) {
+    private static IndexBatch batch(TableBucket targetBucket, IndexReplicationWindow window) {
         return batch(targetBucket, window, 3);
     }
 
-    private static IndexBatch batch(TableBucket targetBucket, IndexWindow window, int size) {
+    private static IndexBatch batch(TableBucket targetBucket, IndexReplicationWindow window, int size) {
         return batch(targetBucket, window, size, size);
     }
 
     private static IndexBatch batch(
-            TableBucket targetBucket, IndexWindow window, int size, long retainedBytes) {
+            TableBucket targetBucket, IndexReplicationWindow window, int size, long retainedBytes) {
         byte[] bytes = new byte[size];
         BytesView encoded = new MemorySegmentBytesView(MemorySegment.wrap(bytes), 0, bytes.length);
         return new IndexBatch(targetBucket, encoded, retainedBytes, window);
     }
 
     private static IndexReplicator replicator(IndexSendBuffer sendBuffer) {
-        return new IndexReplicator(
-                null, Collections.emptyList(), sendBuffer, null, 0L, 1024, (sync, all) -> {});
+        return realReplicator(sendBuffer);
+    }
+
+    private static IndexReplicator realReplicator(IndexSendBuffer sendBuffer) {
+        return IndexReplicator.forTesting(
+                StubSourceWals.unreadable(),
+                Collections.emptyList(),
+                sendBuffer,
+                null,
+                0L,
+                1024,
+                1024,
+                (sync, all) -> {});
     }
 
     @Test
@@ -95,11 +105,11 @@ public class IndexSendBufferTest {
         AtomicInteger wakeups = new AtomicInteger();
         sendBuffer.setAppendListener(ignored -> wakeups.incrementAndGet());
         IndexReplicator ownerA = replicator(sendBuffer);
-        IndexWindow ownerAWindow = new IndexWindow("idx", 10L, 1, ownerA);
+        IndexReplicationWindow ownerAWindow = new IndexReplicationWindow("idx", 10L, 1, ownerA);
         IndexBatch ownerABatch = batch(new TableBucket(710L, 0), ownerAWindow, 1, totalLimit);
         List<IndexBatch> ownerAWindowBatches = Collections.singletonList(ownerABatch);
         IndexReplicator ownerB = replicator(sendBuffer);
-        IndexWindow ownerBWindow = new IndexWindow("idx", 20L, 2, ownerB);
+        IndexReplicationWindow ownerBWindow = new IndexReplicationWindow("idx", 20L, 2, ownerB);
         IndexBatch ownerBFirst = batch(new TableBucket(711L, 0), ownerBWindow, 1, 3L);
         IndexBatch ownerBSecond = batch(new TableBucket(711L, 1), ownerBWindow, 1, 7L);
         List<IndexBatch> ownerBWindowBatches = Arrays.asList(ownerBFirst, ownerBSecond);
@@ -108,7 +118,7 @@ public class IndexSendBufferTest {
         assertThat(sendBuffer.pendingBytes()).isEqualTo(totalLimit);
 
         assertThat(sendBuffer.tryAppendWindow(ownerBWindowBatches)).isFalse();
-        assertThat(sendBuffer.pendingBytes(ownerB)).isZero();
+        assertThat(sendBuffer.pendingBytes(ownerB.sourceBucket())).isZero();
         assertThat(sendBuffer.hasPending(ownerBFirst.targetBucket())).isFalse();
         assertThat(sendBuffer.hasPending(ownerBSecond.targetBucket())).isFalse();
         assertThat(ownerBWindow.isAdmitted()).isFalse();
@@ -122,12 +132,12 @@ public class IndexSendBufferTest {
     void indivisibleWindowMayCrossPerOwnerSoftThreshold() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer(5L, 10L);
         IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 1, owner);
         IndexBatch admitted = batch(new TableBucket(712L, 0), window, 1, 7L);
 
         assertThat(sendBuffer.tryAppendWindow(Collections.singletonList(admitted))).isTrue();
-        assertThat(sendBuffer.pendingBytes(owner)).isEqualTo(7L);
-        assertThat(sendBuffer.isFull(owner)).isTrue();
+        assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isEqualTo(7L);
+        assertThat(sendBuffer.isFull(owner.sourceBucket())).isTrue();
         assertThat(sendBuffer.isFull()).isFalse();
 
         sendBuffer.remove(admitted);
@@ -139,13 +149,13 @@ public class IndexSendBufferTest {
         long totalLimit = 6L;
         IndexSendBuffer sendBuffer = new IndexSendBuffer(100L, totalLimit);
         IndexReplicator ownerA = replicator(sendBuffer);
-        IndexWindow windowA = new IndexWindow("idx", 10L, 2, ownerA);
+        IndexReplicationWindow windowA = new IndexReplicationWindow("idx", 10L, 2, ownerA);
         List<IndexBatch> batchesA =
                 Arrays.asList(
                         batch(new TableBucket(713L, 0), windowA, 1, 3L),
                         batch(new TableBucket(713L, 1), windowA, 1, 3L));
         IndexReplicator ownerB = replicator(sendBuffer);
-        IndexWindow windowB = new IndexWindow("idx", 20L, 2, ownerB);
+        IndexReplicationWindow windowB = new IndexReplicationWindow("idx", 20L, 2, ownerB);
         List<IndexBatch> batchesB =
                 Arrays.asList(
                         batch(new TableBucket(714L, 0), windowB, 1, 3L),
@@ -199,7 +209,7 @@ public class IndexSendBufferTest {
     void totalCapacityUsesRetainedPagesRatherThanLogicalPayload() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer(100L, 4096L);
         IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         IndexBatch first = batch(new TableBucket(715L, 0), window, 1, 4096L);
         IndexBatch second = batch(new TableBucket(715L, 1), window, 1, 4096L);
 
@@ -208,7 +218,7 @@ public class IndexSendBufferTest {
         assertThatThrownBy(() -> sendBuffer.tryAppendWindow(Arrays.asList(first, second)))
                 .isInstanceOf(RecordTooLargeException.class);
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(owner)).isZero();
+        assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isZero();
         assertThat(sendBuffer.hasPending(first.targetBucket())).isFalse();
         assertThat(sendBuffer.hasPending(second.targetBucket())).isFalse();
         assertThat(window.isAdmitted()).isFalse();
@@ -218,28 +228,28 @@ public class IndexSendBufferTest {
     void retainedByteOverflowIsRejectedWithoutAccounting() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer(Long.MAX_VALUE, Long.MAX_VALUE);
         IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         IndexBatch first = batch(new TableBucket(716L, 0), window, 0, Long.MAX_VALUE);
         IndexBatch second = batch(new TableBucket(716L, 1), window, 0, 1L);
 
         assertThatThrownBy(() -> sendBuffer.tryAppendWindow(Arrays.asList(first, second)))
                 .isInstanceOf(RecordTooLargeException.class);
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(owner)).isZero();
+        assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isZero();
     }
 
     @Test
     void retryDoesNotReserveAgainAndAckReleasesExactlyOnce() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer(5L, 5L);
-        IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexReplicator owner = realReplicator(sendBuffer);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 1, owner);
         IndexBatch batch = batch(new TableBucket(717L, 0), window, 1, 5L);
 
         assertThat(sendBuffer.tryAppendWindow(Collections.singletonList(batch))).isTrue();
         assertThat(sendBuffer.pollFirst(batch.targetBucket())).isSameAs(batch);
         assertThat(sendBuffer.reEnqueueIfActive(batch, 0L)).isTrue();
         assertThat(sendBuffer.pendingBytes()).isEqualTo(5L);
-        assertThat(sendBuffer.pendingBytes(owner)).isEqualTo(5L);
+        assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isEqualTo(5L);
         assertThat(sendBuffer.pollFirst(batch.targetBucket())).isSameAs(batch);
 
         sendBuffer.release(batch);
@@ -248,7 +258,7 @@ public class IndexSendBufferTest {
         window.onBatchAcked(batch);
 
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(owner)).isZero();
+        assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isZero();
         assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
         assertThat(owner.getSyncIndexPushedOffset()).isEqualTo(10L);
     }
@@ -256,8 +266,8 @@ public class IndexSendBufferTest {
     @Test
     void terminalFailureAndOwnerCloseEachReleaseWholeWindowExactlyOnce() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer(100L, 10L);
-        IndexReplicator failedOwner = replicator(sendBuffer);
-        IndexWindow failedWindow = new IndexWindow("idx", 10L, 2, failedOwner);
+        IndexReplicator failedOwner = realReplicator(sendBuffer);
+        IndexReplicationWindow failedWindow = new IndexReplicationWindow("idx", 10L, 2, failedOwner);
         List<IndexBatch> failedBatches =
                 Arrays.asList(
                         batch(new TableBucket(718L, 0), failedWindow, 1, 2L),
@@ -271,10 +281,10 @@ public class IndexSendBufferTest {
         sendBuffer.dropBatches(drained);
         assertThat(failedOwner.terminalFailure()).isSameAs(failure);
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(failedOwner)).isZero();
+        assertThat(sendBuffer.pendingBytes(failedOwner.sourceBucket())).isZero();
 
-        IndexReplicator closedOwner = replicator(sendBuffer);
-        IndexWindow closedWindow = new IndexWindow("idx", 20L, 2, closedOwner);
+        IndexReplicator closedOwner = realReplicator(sendBuffer);
+        IndexReplicationWindow closedWindow = new IndexReplicationWindow("idx", 20L, 2, closedOwner);
         List<IndexBatch> closedBatches =
                 Arrays.asList(
                         batch(new TableBucket(719L, 0), closedWindow, 1, 4L),
@@ -283,9 +293,9 @@ public class IndexSendBufferTest {
 
         closedOwner.close();
         closedOwner.close();
-        assertThat(sendBuffer.dropForReplicator(closedOwner)).isZero();
+        assertThat(sendBuffer.dropForSource(closedOwner.sourceBucket())).isZero();
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(closedOwner)).isZero();
+        assertThat(sendBuffer.pendingBytes(closedOwner.sourceBucket())).isZero();
         assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
         assertThat(sendBuffer.hasUnsent()).isFalse();
     }
@@ -294,7 +304,7 @@ public class IndexSendBufferTest {
     void ownerCloseAfterReservationRollsBackEveryTarget() throws Exception {
         IndexSendBuffer sendBuffer = new IndexSendBuffer(100L, 10L);
         IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         IndexBatch first = batch(new TableBucket(720L, 0), window, 1, 4L);
         IndexBatch second = batch(new TableBucket(720L, 1), window, 1, 6L);
         List<IndexBatch> batches = Arrays.asList(first, second);
@@ -318,7 +328,7 @@ public class IndexSendBufferTest {
 
             assertThat(admission.get(5, TimeUnit.SECONDS)).isFalse();
             assertThat(sendBuffer.pendingBytes()).isZero();
-            assertThat(sendBuffer.pendingBytes(owner)).isZero();
+            assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isZero();
             assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
             assertThat(sendBuffer.hasPending(first.targetBucket())).isFalse();
             assertThat(sendBuffer.hasPending(second.targetBucket())).isFalse();
@@ -334,7 +344,7 @@ public class IndexSendBufferTest {
     void wholeWindowInputMustBeCompleteExactAndUnique() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer(100L, 100L);
         IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 2, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, owner);
         IndexBatch first = batch(new TableBucket(721L, 0), window);
         IndexBatch second = batch(new TableBucket(721L, 1), window);
 
@@ -343,12 +353,12 @@ public class IndexSendBufferTest {
         assertThatThrownBy(() -> sendBuffer.tryAppendWindow(Collections.singletonList(first)))
                 .isInstanceOf(IllegalArgumentException.class);
 
-        IndexWindow otherWindow = new IndexWindow("idx", 20L, 1, owner);
+        IndexReplicationWindow otherWindow = new IndexReplicationWindow("idx", 20L, 1, owner);
         IndexBatch other = batch(new TableBucket(722L, 0), otherWindow);
         assertThatThrownBy(() -> sendBuffer.tryAppendWindow(Arrays.asList(first, other)))
                 .isInstanceOf(IllegalArgumentException.class);
 
-        IndexWindow duplicateWindow = new IndexWindow("idx", 30L, 2, owner);
+        IndexReplicationWindow duplicateWindow = new IndexReplicationWindow("idx", 30L, 2, owner);
         IndexBatch duplicateFirst = batch(new TableBucket(723L, 0), duplicateWindow);
         IndexBatch duplicateSecond = batch(new TableBucket(723L, 0), duplicateWindow);
         assertThatThrownBy(
@@ -357,7 +367,7 @@ public class IndexSendBufferTest {
                                         Arrays.asList(duplicateFirst, duplicateSecond)))
                 .isInstanceOf(IllegalArgumentException.class);
 
-        IndexWindow overRegisteredWindow = new IndexWindow("idx", 40L, 2, owner);
+        IndexReplicationWindow overRegisteredWindow = new IndexReplicationWindow("idx", 40L, 2, owner);
         IndexBatch registeredFirst = batch(new TableBucket(725L, 0), overRegisteredWindow);
         IndexBatch registeredSecond = batch(new TableBucket(725L, 1), overRegisteredWindow);
         batch(new TableBucket(725L, 2), overRegisteredWindow);
@@ -367,13 +377,13 @@ public class IndexSendBufferTest {
                                         Arrays.asList(registeredFirst, registeredSecond)))
                 .isInstanceOf(IllegalArgumentException.class);
 
-        IndexWindow releasedWindow = new IndexWindow("idx", 50L, 1, owner);
+        IndexReplicationWindow releasedWindow = new IndexReplicationWindow("idx", 50L, 1, owner);
         IndexBatch released = batch(new TableBucket(726L, 0), releasedWindow);
         assertThat(released.markReleased()).isTrue();
         assertThatThrownBy(() -> sendBuffer.tryAppendWindow(Collections.singletonList(released)))
                 .isInstanceOf(IllegalArgumentException.class);
 
-        IndexWindow accountedWindow = new IndexWindow("idx", 60L, 1, owner);
+        IndexReplicationWindow accountedWindow = new IndexReplicationWindow("idx", 60L, 1, owner);
         IndexBatch accounted = batch(new TableBucket(727L, 0), accountedWindow);
         assertThat(accounted.markAccounted()).isTrue();
         assertThatThrownBy(() -> sendBuffer.tryAppendWindow(Collections.singletonList(accounted)))
@@ -397,7 +407,7 @@ public class IndexSendBufferTest {
     void senderPollingLeavesStagedUnadmittedHeadInPlace() throws Exception {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
         IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 1, owner);
         IndexBatch batch = batch(new TableBucket(724L, 0), window);
         sendBuffer.publishStagedForTesting(batch);
 
@@ -424,7 +434,7 @@ public class IndexSendBufferTest {
     void pendingAccountingUsesRetainedBytes() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
         IndexReplicator owner = replicator(sendBuffer);
-        IndexWindow window = new IndexWindow("idx", 10L, 1, owner);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 1, owner);
         IndexBatch batch = batch(new TableBucket(700L, 0), window, 3, 4096L);
 
         sendBuffer.append(batch);
@@ -433,7 +443,7 @@ public class IndexSendBufferTest {
         assertThat(batch.retainedBytes()).isEqualTo(4096L);
         assertThat(window.registeredPayloadBytes()).isEqualTo(3L);
         assertThat(sendBuffer.pendingBytes()).isEqualTo(4096L);
-        assertThat(sendBuffer.pendingBytes(owner)).isEqualTo(4096L);
+        assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isEqualTo(4096L);
 
         sendBuffer.release(sendBuffer.pollFirst(batch.targetBucket()));
         assertThat(sendBuffer.pendingBytes()).isZero();
@@ -441,7 +451,7 @@ public class IndexSendBufferTest {
 
     @Test
     void retainedBytesMustCoverEncodedPayload() {
-        IndexWindow window = new IndexWindow("idx", 1L, 1, replicator(new IndexSendBuffer()));
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 1L, 1, replicator(new IndexSendBuffer()));
 
         assertThatThrownBy(() -> batch(new TableBucket(701L, 0), window, 3, 2L))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -450,7 +460,7 @@ public class IndexSendBufferTest {
 
     @Test
     void retainedBytesMustNotBeNegative() {
-        IndexWindow window = new IndexWindow("idx", 1L, 1, replicator(new IndexSendBuffer()));
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 1L, 1, replicator(new IndexSendBuffer()));
 
         assertThatThrownBy(() -> batch(new TableBucket(702L, 0), window, 0, -1L))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -540,12 +550,12 @@ public class IndexSendBufferTest {
         // replicator, not per index table, otherwise it would wrongly drop a sibling bucket's
         // still-deliverable batches.
         TableBucket shared = new TableBucket(500L, 0);
-        sendBuffer.append(batch(shared, new IndexWindow("idx", 1L, 1, ownerA)));
-        sendBuffer.append(batch(shared, new IndexWindow("idx", 2L, 1, ownerB)));
+        sendBuffer.append(batch(shared, new IndexReplicationWindow("idx", 1L, 1, ownerA)));
+        sendBuffer.append(batch(shared, new IndexReplicationWindow("idx", 2L, 1, ownerB)));
         TableBucket otherBucket = new TableBucket(500L, 1);
-        sendBuffer.append(batch(otherBucket, new IndexWindow("idx", 3L, 1, ownerA)));
+        sendBuffer.append(batch(otherBucket, new IndexReplicationWindow("idx", 3L, 1, ownerA)));
 
-        int dropped = sendBuffer.dropForReplicator(ownerA);
+        int dropped = sendBuffer.dropForSource(ownerA.sourceBucket());
 
         assertThat(dropped).isEqualTo(2);
         // ownerB's batch on the shared bucket survives and is still pollable.
@@ -563,8 +573,8 @@ public class IndexSendBufferTest {
     void dropForReplicatorContinuesAfterDropListenerFailure() {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
         IndexReplicator owner = replicator(sendBuffer);
-        IndexBatch first = batch(new TableBucket(501L, 0), new IndexWindow("idx", 1L, 1, owner));
-        IndexBatch second = batch(new TableBucket(501L, 1), new IndexWindow("idx", 2L, 1, owner));
+        IndexBatch first = batch(new TableBucket(501L, 0), new IndexReplicationWindow("idx", 1L, 1, owner));
+        IndexBatch second = batch(new TableBucket(501L, 1), new IndexReplicationWindow("idx", 2L, 1, owner));
         sendBuffer.append(first);
         sendBuffer.append(second);
 
@@ -579,13 +589,13 @@ public class IndexSendBufferTest {
                 });
 
         AtomicInteger dropped = new AtomicInteger(-1);
-        assertThatCode(() -> dropped.set(sendBuffer.dropForReplicator(owner)))
+        assertThatCode(() -> dropped.set(sendBuffer.dropForSource(owner.sourceBucket())))
                 .doesNotThrowAnyException();
 
         assertThat(dropped.get()).isEqualTo(2);
         assertThat(observed).containsExactlyInAnyOrder(first, second);
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(owner)).isZero();
+        assertThat(sendBuffer.pendingBytes(owner.sourceBucket())).isZero();
         assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
         assertThat(sendBuffer.hasUnsent()).isFalse();
     }
@@ -593,11 +603,11 @@ public class IndexSendBufferTest {
     @Test
     void appendListenerFailureMarkersRearmAndDeduplicate() throws Exception {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
-        IndexReplicator owner = replicator(sendBuffer);
+        IndexReplicator owner = realReplicator(sendBuffer);
         TableBucket bucket = new TableBucket(504L, 0);
-        IndexBatch first = batch(bucket, new IndexWindow("idx", 10L, 1, owner));
-        IndexBatch second = batch(bucket, new IndexWindow("idx", 20L, 1, owner));
-        IndexBatch third = batch(bucket, new IndexWindow("idx", 30L, 1, owner));
+        IndexBatch first = batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner));
+        IndexBatch second = batch(bucket, new IndexReplicationWindow("idx", 20L, 1, owner));
+        IndexBatch third = batch(bucket, new IndexReplicationWindow("idx", 30L, 1, owner));
         sendBuffer.setAppendListener(
                 ignored -> {
                     throw new RuntimeException("injected append listener failure");
@@ -630,13 +640,13 @@ public class IndexSendBufferTest {
     @Test
     void ownerCleanupCannotDetachConcurrentInitialAppend() throws Exception {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
-        IndexReplicator stoppingOwner = replicator(sendBuffer);
-        IndexReplicator publishingOwner = replicator(sendBuffer);
+        IndexReplicator stoppingOwner = realReplicator(sendBuffer);
+        IndexReplicator publishingOwner = realReplicator(sendBuffer);
         TableBucket bucket = new TableBucket(502L, 0);
-        IndexBatch seed = batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
+        IndexBatch seed = batch(bucket, new IndexReplicationWindow("idx", 1L, 1, stoppingOwner), 5);
         sendBuffer.append(seed);
         Deque<IndexBatch> deque = queue(sendBuffer, bucket);
-        IndexBatch published = batch(bucket, new IndexWindow("idx", 10L, 1, publishingOwner), 7);
+        IndexBatch published = batch(bucket, new IndexReplicationWindow("idx", 10L, 1, publishingOwner), 7);
         AtomicInteger dropped = new AtomicInteger(-1);
         AtomicReference<Throwable> cleanupFailure = new AtomicReference<>();
         Thread cleanupThread =
@@ -644,7 +654,7 @@ public class IndexSendBufferTest {
                         () -> {
                             try {
                                 stoppingOwner.close();
-                                dropped.set(sendBuffer.dropForReplicator(stoppingOwner));
+                                dropped.set(sendBuffer.dropForSource(stoppingOwner.sourceBucket()));
                             } catch (Throwable t) {
                                 cleanupFailure.set(t);
                             }
@@ -682,7 +692,7 @@ public class IndexSendBufferTest {
         assertThat(publishingOwner.getSyncIndexPushedOffset()).isEqualTo(10L);
         assertThat(published.window().registeredBatchCount()).isZero();
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(publishingOwner)).isZero();
+        assertThat(sendBuffer.pendingBytes(publishingOwner.sourceBucket())).isZero();
         assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
         assertThat(sendBuffer.hasUnsent()).isFalse();
         assertThat(registrySize(sendBuffer)).isZero();
@@ -691,11 +701,11 @@ public class IndexSendBufferTest {
     @Test
     void ownerCleanupCannotDetachConcurrentRetryPublication() throws Exception {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
-        IndexReplicator stoppingOwner = replicator(sendBuffer);
-        IndexReplicator retryingOwner = replicator(sendBuffer);
+        IndexReplicator stoppingOwner = realReplicator(sendBuffer);
+        IndexReplicator retryingOwner = realReplicator(sendBuffer);
         TableBucket bucket = new TableBucket(503L, 0);
-        IndexBatch retry = batch(bucket, new IndexWindow("idx", 10L, 1, retryingOwner), 11);
-        IndexBatch seed = batch(bucket, new IndexWindow("idx", 1L, 1, stoppingOwner), 5);
+        IndexBatch retry = batch(bucket, new IndexReplicationWindow("idx", 10L, 1, retryingOwner), 11);
+        IndexBatch seed = batch(bucket, new IndexReplicationWindow("idx", 1L, 1, stoppingOwner), 5);
         sendBuffer.append(retry);
         sendBuffer.append(seed);
         assertThat(sendBuffer.pollFirst(bucket)).isSameAs(retry);
@@ -720,7 +730,7 @@ public class IndexSendBufferTest {
                         () -> {
                             try {
                                 stoppingOwner.close();
-                                dropped.set(sendBuffer.dropForReplicator(stoppingOwner));
+                                dropped.set(sendBuffer.dropForSource(stoppingOwner.sourceBucket()));
                             } catch (Throwable t) {
                                 cleanupFailure.set(t);
                             }
@@ -749,7 +759,7 @@ public class IndexSendBufferTest {
         assertThat(retryingOwner.getSyncIndexPushedOffset()).isEqualTo(10L);
         assertThat(retry.window().registeredBatchCount()).isZero();
         assertThat(sendBuffer.pendingBytes()).isZero();
-        assertThat(sendBuffer.pendingBytes(retryingOwner)).isZero();
+        assertThat(sendBuffer.pendingBytes(retryingOwner.sourceBucket())).isZero();
         assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
         assertThat(sendBuffer.hasUnsent()).isFalse();
         assertThat(registrySize(sendBuffer)).isZero();
@@ -762,7 +772,7 @@ public class IndexSendBufferTest {
 
         for (int i = 0; i < 100; i++) {
             TableBucket bucket = new TableBucket(600L + i, i);
-            IndexBatch batch = batch(bucket, new IndexWindow("idx", i + 1L, 1, owner), 3);
+            IndexBatch batch = batch(bucket, new IndexReplicationWindow("idx", i + 1L, 1, owner), 3);
             sendBuffer.append(batch);
             assertThat(sendBuffer.pollFirst(bucket)).isSameAs(batch);
             sendBuffer.release(batch);
@@ -781,20 +791,20 @@ public class IndexSendBufferTest {
         IndexReplicator ownerB = replicator(sendBuffer);
 
         sendBuffer.append(
-                batch(new TableBucket(10L, 0), new IndexWindow("idx", 1L, 1, ownerA), 3));
+                batch(new TableBucket(10L, 0), new IndexReplicationWindow("idx", 1L, 1, ownerA), 3));
 
         assertThat(sendBuffer.isFull()).isTrue();
-        assertThat(sendBuffer.isFull(ownerA)).isTrue();
-        assertThat(sendBuffer.pendingBytes(ownerA)).isEqualTo(3L);
-        assertThat(sendBuffer.isFull(ownerB)).isFalse();
-        assertThat(sendBuffer.pendingBytes(ownerB)).isZero();
+        assertThat(sendBuffer.isFull(ownerA.sourceBucket())).isTrue();
+        assertThat(sendBuffer.pendingBytes(ownerA.sourceBucket())).isEqualTo(3L);
+        assertThat(sendBuffer.isFull(ownerB.sourceBucket())).isFalse();
+        assertThat(sendBuffer.pendingBytes(ownerB.sourceBucket())).isZero();
 
         IndexBatch batch = sendBuffer.pollFirst(new TableBucket(10L, 0));
         assertThat(batch).isNotNull();
         sendBuffer.release(batch);
 
-        assertThat(sendBuffer.isFull(ownerA)).isFalse();
-        assertThat(sendBuffer.pendingBytes(ownerA)).isZero();
+        assertThat(sendBuffer.isFull(ownerA.sourceBucket())).isFalse();
+        assertThat(sendBuffer.pendingBytes(ownerA.sourceBucket())).isZero();
         assertThat(sendBuffer.pendingBytes()).isZero();
         assertThat(sendBuffer.pendingOwnerCountForTesting()).isZero();
     }

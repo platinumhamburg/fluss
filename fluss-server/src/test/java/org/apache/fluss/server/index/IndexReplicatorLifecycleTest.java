@@ -67,12 +67,13 @@ public class IndexReplicatorLifecycleTest {
     void closeClosesReadContextExactlyOnce() {
         LogRecordReadContext readContext = mock(LogRecordReadContext.class);
         IndexReplicator replicator =
-                new IndexReplicator(
-                        null,
+                IndexReplicator.forTesting(
+                        StubSourceWals.unreadable(),
                         Collections.emptyList(),
                         new IndexSendBuffer(),
                         readContext,
                         0L,
+                        1024,
                         1024,
                         (sync, all) -> {});
 
@@ -134,7 +135,7 @@ public class IndexReplicatorLifecycleTest {
         assertThat(poll.get(10, TimeUnit.SECONDS)).isTrue();
         close.get(10, TimeUnit.SECONDS);
         assertThat(remoteClosed).isTrue();
-        sendBuffer.dropForReplicator(replicator);
+        sendBuffer.dropForSource(replicator.sourceBucket());
         assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
 
@@ -181,9 +182,9 @@ public class IndexReplicatorLifecycleTest {
         }
         assertThat(poll.get(10, TimeUnit.SECONDS)).isTrue();
         close.get(10, TimeUnit.SECONDS);
-        assertThat(sendBuffer.dropForReplicator(replicator)).isZero();
+        assertThat(sendBuffer.dropForSource(replicator.sourceBucket())).isZero();
         assertThat(sendBuffer.hasPending(TARGET_BUCKET)).isFalse();
-        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(replicator.sourceBucket())).isZero();
         assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
 
@@ -222,7 +223,7 @@ public class IndexReplicatorLifecycleTest {
                         Arrays.asList(spec("first"), spec("second")));
 
         assertThat(replicator.poll()).isTrue();
-        IndexWindow firstWindow = replicator.inFlightWindow("first");
+        IndexReplicationWindow firstWindow = replicator.inFlightWindow("first");
         assertThat(firstWindow).isNotNull();
         assertThat(queuedRemoteReads).hasSize(1);
         assertThat(replicator.hasPendingRead()).isTrue();
@@ -315,7 +316,7 @@ public class IndexReplicatorLifecycleTest {
                         Arrays.asList(spec("first"), spec("second")));
 
         assertThat(replicator.poll()).isTrue();
-        IndexWindow firstWindow = replicator.inFlightWindow("first");
+        IndexReplicationWindow firstWindow = replicator.inFlightWindow("first");
         assertThat(firstWindow).isNotNull();
         assertThat(queuedRemoteReads).hasSize(1);
         queuedRemoteReads.remove().run();
@@ -336,7 +337,7 @@ public class IndexReplicatorLifecycleTest {
                         });
         assertThat(replicator.hasPendingRead()).isFalse();
         assertThat(replicator.inFlightWindow("first")).isNull();
-        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(replicator.sourceBucket())).isZero();
         assertThat(sendBuffer.hasUnsent()).isFalse();
         assertThat(openedFetchers).hasValue(2);
         assertThat(closedFetchers).hasValue(2);
@@ -374,11 +375,11 @@ public class IndexReplicatorLifecycleTest {
                         Arrays.asList(spec("first"), spec("second")));
 
         assertThat(replicator.poll()).isTrue();
-        IndexWindow first = replicator.inFlightWindow("first");
-        IndexWindow second = replicator.inFlightWindow("second");
+        IndexReplicationWindow first = replicator.inFlightWindow("first");
+        IndexReplicationWindow second = replicator.inFlightWindow("second");
         assertThat(first).isNotNull();
         assertThat(second).isNotNull();
-        assertThat(sendBuffer.pendingBytes(replicator)).isPositive();
+        assertThat(sendBuffer.pendingBytes(replicator.sourceBucket())).isPositive();
 
         RuntimeException failure = new RuntimeException("terminal sender failure");
         for (IndexBatch drained : first.tryFailAndDrain(failure)) {
@@ -390,7 +391,7 @@ public class IndexReplicatorLifecycleTest {
         assertThat(replicator.inFlightWindow("first")).isNull();
         assertThat(replicator.inFlightWindow("second")).isNull();
         assertThat(second.isActive()).isFalse();
-        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(replicator.sourceBucket())).isZero();
         assertThat(sendBuffer.hasUnsent()).isFalse();
         verify(readContext, times(1)).close();
         replicator.close();
@@ -444,7 +445,7 @@ public class IndexReplicatorLifecycleTest {
                         readContext,
                         (reported, failure) -> {
                             verify(readContext, times(1)).close();
-                            assertThat(sendBuffer.pendingBytes(reported)).isZero();
+                            assertThat(sendBuffer.pendingBytes(reported.sourceBucket())).isZero();
                             callbackCount.incrementAndGet();
                             reportedReplicator.set(reported);
                             reportedFailure.set(failure);
@@ -463,7 +464,7 @@ public class IndexReplicatorLifecycleTest {
         assertThat(reportedReplicator.get()).isSameAs(replicator);
         assertThat(reportedFailure.get()).isSameAs(replicator.terminalFailure());
         verify(readContext, times(1)).close();
-        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(replicator.sourceBucket())).isZero();
         assertThat(fetchCount).hasValue(1);
         assertThat(closeCount).hasValue(1);
 
@@ -513,7 +514,7 @@ public class IndexReplicatorLifecycleTest {
         assertThat(terminal.getSuppressed()).contains(callbackFailure);
         assertThat(callbackCount).hasValue(1);
         verify(readContext, times(1)).close();
-        assertThat(sendBuffer.pendingBytes(replicator)).isZero();
+        assertThat(sendBuffer.pendingBytes(replicator.sourceBucket())).isZero();
 
         assertThat(replicator.poll()).isFalse();
         replicator.close();
