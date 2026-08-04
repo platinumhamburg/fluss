@@ -176,6 +176,17 @@ public class LogScannerImpl implements LogScanner {
     }
 
     @Override
+    @Nullable
+    public Long position(TableBucket tableBucket) {
+        acquireAndEnsureOpen();
+        try {
+            return logScannerStatus.getBucketOffset(tableBucket);
+        } finally {
+            release();
+        }
+    }
+
+    @Override
     public void subscribe(int bucket, long offset) {
         if (isPartitionedTable) {
             throw new IllegalStateException(
