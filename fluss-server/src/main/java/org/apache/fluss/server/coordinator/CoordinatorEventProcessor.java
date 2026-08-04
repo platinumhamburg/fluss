@@ -988,6 +988,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 oldTableInfo.getTableConfig().getAutoPartitionStrategy();
         AutoPartitionStrategy newAutoPartitionStrategy =
                 newTableInfo.getTableConfig().getAutoPartitionStrategy();
+
         if (!Objects.equals(oldAutoPartitionStrategy, newAutoPartitionStrategy)) {
             LOG.info(
                     "Table {} auto partition strategy changed from {} to {}.",
