@@ -59,9 +59,9 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  */
 @Internal
 @ThreadSafe
-public final class IndexAccumulator {
+public final class IndexSendBuffer {
 
-    private static final Logger LOG = LoggerFactory.getLogger(IndexAccumulator.class);
+    private static final Logger LOG = LoggerFactory.getLogger(IndexSendBuffer.class);
 
     private final ConcurrentMap<TableBucket, Deque<IndexBatch>> batches =
             MapUtils.newConcurrentMap();
@@ -69,7 +69,7 @@ public final class IndexAccumulator {
     /** Upper bound on pending retained bytes for one producing replicator. */
     private final long maxPendingBytes;
 
-    /** Hard upper bound on pending retained bytes across this TabletServer accumulator. */
+    /** Hard upper bound on pending retained bytes across this TabletServer sendBuffer. */
     private final long maxTotalPendingBytes;
 
     /** Serializes competing capacity checks and reservations, but never releases. */
@@ -100,18 +100,18 @@ public final class IndexAccumulator {
 
     @Nullable private volatile Runnable afterAppendAdmissionHook;
 
-    /** Creates an accumulator with no back-pressure bound (primarily for tests). */
-    public IndexAccumulator() {
+    /** Creates an sendBuffer with no back-pressure bound (primarily for tests). */
+    public IndexSendBuffer() {
         this(Long.MAX_VALUE, Long.MAX_VALUE);
     }
 
-    /** Creates an accumulator using the same bound per producer and in total. */
-    public IndexAccumulator(long maxPendingBytes) {
+    /** Creates an sendBuffer using the same bound per producer and in total. */
+    public IndexSendBuffer(long maxPendingBytes) {
         this(maxPendingBytes, maxPendingBytes);
     }
 
-    /** Creates an accumulator with separate per-producer and TabletServer-wide bounds. */
-    public IndexAccumulator(long maxPendingBytes, long maxTotalPendingBytes) {
+    /** Creates an sendBuffer with separate per-producer and TabletServer-wide bounds. */
+    public IndexSendBuffer(long maxPendingBytes, long maxTotalPendingBytes) {
         checkArgument(maxPendingBytes > 0, "maxPendingBytes must be positive");
         checkArgument(maxTotalPendingBytes > 0, "maxTotalPendingBytes must be positive");
         this.maxPendingBytes = maxPendingBytes;

@@ -64,7 +64,7 @@ import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.index.IndexReplicator;
 import org.apache.fluss.server.index.IndexWriterKey;
-import org.apache.fluss.server.index.ReplicaIndexController;
+import org.apache.fluss.server.index.IndexReplicationSupervisor;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
@@ -241,7 +241,7 @@ public final class Replica {
     private final ScannerManager scannerManager;
 
     // ------- index management
-    private final ReplicaIndexController indexManager;
+    private final IndexReplicationSupervisor indexManager;
 
     /** Whether this main-table schema declares at least one secondary index. */
     private final boolean hasSecondaryIndexes;
@@ -289,7 +289,7 @@ public final class Replica {
             RemoteLogManager remoteLogManager,
             ScannerManager scannerManager,
             @Nullable org.apache.fluss.server.index.IndexReplicatorPool indexReplicatorPool,
-            @Nullable org.apache.fluss.server.index.IndexAccumulator indexAccumulator,
+            @Nullable org.apache.fluss.server.index.IndexSendBuffer indexSendBuffer,
             TabletServerMetricGroup serverMetricGroup)
             throws Exception {
         this.physicalPath = physicalPath;
@@ -325,12 +325,12 @@ public final class Replica {
         this.remoteLogManager = remoteLogManager;
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
         this.indexManager =
-                new ReplicaIndexController(
+                new IndexReplicationSupervisor(
                         tableInfo,
                         tableBucket,
                         metadataCache,
                         indexReplicatorPool,
-                        indexAccumulator,
+                        indexSendBuffer,
                         remoteLogManager,
                         serverMetricGroup);
         List<Schema.Index> secondaryIndexes = tableInfo.getSchema().getIndexes();
@@ -956,7 +956,7 @@ public final class Replica {
 
     // ---- Index management delegation ----
 
-    public ReplicaIndexController getIndexManager() {
+    public IndexReplicationSupervisor getIndexManager() {
         return indexManager;
     }
 

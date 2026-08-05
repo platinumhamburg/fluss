@@ -60,7 +60,7 @@ import java.util.function.BiConsumer;
 
 /**
  * WAL-driven index replicator that reads committed WAL entries, derives index mutations, and stages
- * them as pre-encoded {@link IndexBatch}es in the server-global {@link IndexAccumulator}. No
+ * them as pre-encoded {@link IndexBatch}es in the server-global {@link IndexSendBuffer}. No
  * intermediate heap objects ({@code IndexMutation}) are created — derivation writes directly to
  * per-target-bucket {@link ProgressKvRecordBatchBuilder}s.
  *
@@ -92,7 +92,7 @@ public final class IndexReplicator implements AutoCloseable {
     private final IndexSourceReader sourceReader;
     private final List<IndexProgressState> indexStates;
     private final Map<String, IndexProgressState> indexStatesByName;
-    private final IndexAccumulator accumulator;
+    private final IndexSendBuffer sendBuffer;
     private final LogRecordReadContext readContext;
     private final IndexProgressListener onProgress;
     private final BiConsumer<IndexReplicator, Throwable> onTerminalFailure;
@@ -118,7 +118,7 @@ public final class IndexReplicator implements AutoCloseable {
     public IndexReplicator(
             LogTablet logTablet,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -126,7 +126,7 @@ public final class IndexReplicator implements AutoCloseable {
         this(
                 logTablet,
                 indexSpecs,
-                accumulator,
+                sendBuffer,
                 readContext,
                 initialOffset,
                 maxWindowBytes,
@@ -137,7 +137,7 @@ public final class IndexReplicator implements AutoCloseable {
     public IndexReplicator(
             LogTablet logTablet,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -146,7 +146,7 @@ public final class IndexReplicator implements AutoCloseable {
         this(
                 logTablet == null ? null : new LogTabletSourceWal(logTablet),
                 indexSpecs,
-                accumulator,
+                sendBuffer,
                 readContext,
                 initialOffset,
                 maxWindowBytes,
@@ -157,7 +157,7 @@ public final class IndexReplicator implements AutoCloseable {
     private IndexReplicator(
             @Nullable SourceWal sourceWal,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -170,7 +170,7 @@ public final class IndexReplicator implements AutoCloseable {
                         Runnable::run,
                         readContext),
                 indexSpecs,
-                accumulator,
+                sendBuffer,
                 readContext,
                 initialOffset,
                 maxWindowBytes,
@@ -181,7 +181,7 @@ public final class IndexReplicator implements AutoCloseable {
     IndexReplicator(
             IndexSourceReader sourceReader,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -190,7 +190,7 @@ public final class IndexReplicator implements AutoCloseable {
         this(
                 sourceReader,
                 indexSpecs,
-                accumulator,
+                sendBuffer,
                 readContext,
                 initialOffset,
                 maxWindowBytes,
@@ -202,7 +202,7 @@ public final class IndexReplicator implements AutoCloseable {
     IndexReplicator(
             IndexSourceReader sourceReader,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -224,7 +224,7 @@ public final class IndexReplicator implements AutoCloseable {
             }
             indexStates.add(state);
         }
-        this.accumulator = accumulator;
+        this.sendBuffer = sendBuffer;
         this.readContext = readContext;
         this.emptyIndexPushedOffset = initialOffset;
         this.maxWindowBytes = maxWindowBytes;
@@ -243,7 +243,7 @@ public final class IndexReplicator implements AutoCloseable {
     static IndexReplicator forTesting(
             SourceWal sourceWal,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -252,7 +252,7 @@ public final class IndexReplicator implements AutoCloseable {
         return new IndexReplicator(
                 sourceWal,
                 indexSpecs,
-                accumulator,
+                sendBuffer,
                 readContext,
                 initialOffset,
                 maxWindowBytes,
@@ -264,7 +264,7 @@ public final class IndexReplicator implements AutoCloseable {
     static IndexReplicator forTesting(
             IndexSourceReader sourceReader,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -273,7 +273,7 @@ public final class IndexReplicator implements AutoCloseable {
         return new IndexReplicator(
                 sourceReader,
                 indexSpecs,
-                accumulator,
+                sendBuffer,
                 readContext,
                 initialOffset,
                 maxWindowBytes,
@@ -285,7 +285,7 @@ public final class IndexReplicator implements AutoCloseable {
     static IndexReplicator forTesting(
             IndexSourceReader sourceReader,
             List<IndexSpec> indexSpecs,
-            IndexAccumulator accumulator,
+            IndexSendBuffer sendBuffer,
             LogRecordReadContext readContext,
             long initialOffset,
             int maxWindowBytes,
@@ -295,7 +295,7 @@ public final class IndexReplicator implements AutoCloseable {
         return new IndexReplicator(
                 sourceReader,
                 indexSpecs,
-                accumulator,
+                sendBuffer,
                 readContext,
                 initialOffset,
                 maxWindowBytes,
@@ -313,7 +313,7 @@ public final class IndexReplicator implements AutoCloseable {
      * Poll the WAL for one window. Strict single-window serialization: if a window is already in
      * flight, returns immediately without reading. Otherwise reads one valid window starting at
      * each index's pushed offset, derives index batches, and stages them in the {@link
-     * IndexAccumulator}. Each index's pushed offset is advanced only when every batch of that
+     * IndexSendBuffer}. Each index's pushed offset is advanced only when every batch of that
      * index's window is acknowledged, preserving at-least-once delivery.
      *
      * @return {@code true} if a window was read (work was done), {@code false} otherwise
@@ -339,7 +339,7 @@ public final class IndexReplicator implements AutoCloseable {
 
         // Total retained capacity is a hard bound; the per-producer threshold remains soft and
         // prevents one stalled source from continuing to derive windows.
-        if (accumulator.isFull() || accumulator.isFull(this)) {
+        if (sendBuffer.isFull() || sendBuffer.isFull(this)) {
             return false;
         }
 
@@ -352,8 +352,8 @@ public final class IndexReplicator implements AutoCloseable {
         for (IndexProgressState state : indexStates) {
             if (closed.get()
                     || terminalFailure.get() != null
-                    || accumulator.isFull()
-                    || accumulator.isFull(this)) {
+                    || sendBuffer.isFull()
+                    || sendBuffer.isFull(this)) {
                 break;
             }
             if (state.inFlightWindow != null) {
@@ -523,7 +523,7 @@ public final class IndexReplicator implements AutoCloseable {
         }
 
         // Stage the window: create it first so each batch can reference it, then publish batches to
-        // the accumulator. The per-index in-flight window is set before publishing to enforce one
+        // the sendBuffer. The per-index in-flight window is set before publishing to enforce one
         // outstanding window per index.
         IndexWindow window =
                 new IndexWindow(
@@ -539,7 +539,7 @@ public final class IndexReplicator implements AutoCloseable {
                                 builders.get(entry.getKey()).retainedBytes(),
                                 window));
             }
-            if (!accumulator.tryAppendWindow(batches)) {
+            if (!sendBuffer.tryAppendWindow(batches)) {
                 retireUnadmittedWindow(state, window);
                 return false;
             }
@@ -563,7 +563,7 @@ public final class IndexReplicator implements AutoCloseable {
         }
         List<IndexBatch> drained = window.tryRetireAndDrain();
         if (drained != null) {
-            accumulator.dropBatches(drained);
+            sendBuffer.dropBatches(drained);
         }
     }
 
@@ -670,10 +670,10 @@ public final class IndexReplicator implements AutoCloseable {
             }
             List<IndexBatch> drained = window.tryRetireAndDrain();
             if (drained != null) {
-                accumulator.dropBatches(drained);
+                sendBuffer.dropBatches(drained);
             }
         }
-        accumulator.dropForReplicator(this);
+        sendBuffer.dropForReplicator(this);
     }
 
     @VisibleForTesting
