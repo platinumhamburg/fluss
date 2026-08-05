@@ -29,9 +29,9 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 /**
  * A single pre-encoded index write unit targeting one index-table bucket.
  *
- * <p>A batch carries only a reference to the {@link IndexWindow} it belongs to; the WAL offset it
+ * <p>A batch carries only a reference to the {@link IndexReplicationWindow} it belongs to; the WAL offset it
  * advances is a property of that window, not of the batch. On successful acknowledgement the batch
- * notifies its window via {@link IndexWindow#onBatchAcked(IndexBatch)}; on failure it is
+ * notifies its window via {@link IndexReplicationWindow#onBatchAcked(IndexBatch)}; on failure it is
  * re-enqueued for unlimited retry without advancing any offset.
  *
  * <p>A batch acknowledges its window at most once: {@link #markAcked()} is a one-shot CAS guard
@@ -44,7 +44,7 @@ final class IndexBatch {
     private final TableBucket targetBucket;
     private final BytesView encoded;
     private final long retainedBytes;
-    private final IndexWindow window;
+    private final IndexReplicationWindow window;
 
     private int attempts;
 
@@ -59,12 +59,12 @@ final class IndexBatch {
 
     private volatile boolean accounted;
 
-    IndexBatch(TableBucket targetBucket, BytesView encoded, IndexWindow window) {
+    IndexBatch(TableBucket targetBucket, BytesView encoded, IndexReplicationWindow window) {
         this(targetBucket, encoded, encoded.getBytesLength(), window);
     }
 
     IndexBatch(
-            TableBucket targetBucket, BytesView encoded, long retainedBytes, IndexWindow window) {
+            TableBucket targetBucket, BytesView encoded, long retainedBytes, IndexReplicationWindow window) {
         this.targetBucket = checkNotNull(targetBucket, "targetBucket");
         this.encoded = checkNotNull(encoded, "encoded");
         checkArgument(
@@ -90,7 +90,7 @@ final class IndexBatch {
         return retainedBytes;
     }
 
-    IndexWindow window() {
+    IndexReplicationWindow window() {
         return window;
     }
 
@@ -119,7 +119,7 @@ final class IndexBatch {
     }
 
     boolean ownerActive() {
-        return window.isActive() && !window.owner().isClosed();
+        return window.isActive() && !window.isOwnerClosed();
     }
 
     boolean markReleased() {
