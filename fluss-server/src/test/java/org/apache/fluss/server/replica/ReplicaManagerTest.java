@@ -1330,9 +1330,15 @@ class ReplicaManagerTest extends ReplicaTestBase {
                         Tuple2.of(new Object[] {2, "a", 4L}, new Object[] {2, "a", 4L, "value4"}));
         // send one batch kv.
         CompletableFuture<List<PutKvResultForBucket>> future = new CompletableFuture<>();
+        // ConfigOptions.CLIENT_WRITER_ACKS documents acks = 1 as completing after the leader
+        // appends to its local log; it does not require the local KV view to be materialized. The
+        // async-flush review explicitly preserved this contract:
+        // https://github.com/apache/fluss/pull/3463#discussion_r3652720767.
+        // Use acks = -1 because this correctness test requires lookup-visible state. For KV
+        // replicas, the high watermark cannot advance beyond the flushed KV offset.
         replicaManager.putRecordsToKv(
                 20000,
-                1,
+                -1,
                 Collections.singletonMap(tb, genKvRecordBatch(keyType, rowType, data1)),
                 null,
                 MergeMode.DEFAULT,
