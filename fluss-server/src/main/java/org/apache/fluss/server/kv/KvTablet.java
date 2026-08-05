@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.DeletionDisabledException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvStorageException;
@@ -29,6 +30,7 @@ import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -41,11 +43,15 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordReadContext;
+import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.PaddingRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.arrow.ArrowWriterProvider;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueDecoder;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
@@ -70,6 +76,7 @@ import org.apache.fluss.server.kv.wal.IndexWalBuilder;
 import org.apache.fluss.server.kv.wal.WalBuilder;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.utils.ResourceGuard;
@@ -78,7 +85,10 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.function.SupplierWithException;
 
+import org.rocksdb.AbstractCompactionFilter;
+import org.rocksdb.AbstractCompactionFilterFactory;
 import org.rocksdb.RateLimiter;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksIterator;
@@ -95,9 +105,12 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.ToLongFunction;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
@@ -116,6 +129,8 @@ public final class KvTablet {
     private final MemorySegmentPool memorySegmentPool;
 
     private final File kvTabletDir;
+    @Nullable private volatile Runnable afterProgressPrecheck;
+    @Nullable private volatile Runnable putLockContentionHook;
     private final long writeBatchSize;
     private final RocksDBKv rocksDBKv;
     private final KvPreWriteBuffer kvPreWriteBuffer;
@@ -135,6 +150,14 @@ public final class KvTablet {
 
     private final SchemaGetter schemaGetter;
 
+    /** The KV format version of this table (determines value layout). */
+    private final int kvFormatVersion;
+
+    /** Version-aware encoder that encapsulates format version and tag extraction. */
+    private final ValueEncoder valueEncoder;
+
+    private final KvWriteGuard writeGuard;
+
     // the changelog image mode for this tablet
     private final ChangelogImage changelogImage;
 
@@ -152,6 +175,10 @@ public final class KvTablet {
     @GuardedBy("kvLock")
     private volatile boolean isClosed = false;
 
+    @GuardedBy("kvLock")
+    @Nullable
+    private Throwable uncertainWalAppendFailure;
+
     private KvTablet(
             PhysicalTablePath physicalPath,
             TableBucket tableBucket,
@@ -168,8 +195,12 @@ public final class KvTablet {
             ArrowCompressionInfo arrowCompressionInfo,
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
+            int kvFormatVersion,
             @Nullable RocksDBStatistics rocksDBStatistics,
-            AutoIncrementManager autoIncrementManager) {
+            AutoIncrementManager autoIncrementManager,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor,
+            KvWriteGuard writeGuard) {
+        validateValueFormatVersion(kvFormatVersion, tagExtractor);
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
@@ -193,6 +224,22 @@ public final class KvTablet {
         this.autoIncrementManager = autoIncrementManager;
         // disable row count for WAL image mode.
         this.rowCount = changelogImage == ChangelogImage.WAL ? ROW_COUNT_DISABLED : 0L;
+        this.kvFormatVersion = kvFormatVersion;
+        this.valueEncoder = ValueEncoder.forKvFormatVersion(kvFormatVersion, tagExtractor);
+        this.writeGuard = writeGuard;
+    }
+
+    private static void validateValueFormatVersion(
+            int kvFormatVersion, @Nullable ToLongFunction<BinaryRow> tagExtractor) {
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(kvFormatVersion);
+        if (layout.hasValueTag() && tagExtractor == null) {
+            throw new IllegalArgumentException(
+                    "tagExtractor must be non-null for a KV value layout with a value tag");
+        }
+        if (!layout.hasValueTag() && tagExtractor != null) {
+            throw new IllegalArgumentException(
+                    "tagExtractor must be null for a KV value layout without a value tag");
+        }
     }
 
     public static KvTablet create(
@@ -209,10 +256,62 @@ public final class KvTablet {
             ArrowCompressionInfo arrowCompressionInfo,
             SchemaGetter schemaGetter,
             ChangelogImage changelogImage,
+            int kvFormatVersion,
             RateLimiter sharedRateLimiter,
-            AutoIncrementManager autoIncrementManager)
+            AutoIncrementManager autoIncrementManager,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor)
             throws IOException {
-        RocksDBKv kv = buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter);
+        return create(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvTabletDir,
+                serverConf,
+                serverMetricGroup,
+                arrowBufferAllocator,
+                memorySegmentPool,
+                kvFormat,
+                rowMerger,
+                arrowCompressionInfo,
+                schemaGetter,
+                changelogImage,
+                kvFormatVersion,
+                sharedRateLimiter,
+                autoIncrementManager,
+                compactionFilterFactory,
+                tagExtractor,
+                KvWriteGuard.ACCEPT_ALL);
+    }
+
+    public static KvTablet create(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File kvTabletDir,
+            Configuration serverConf,
+            TabletServerMetricGroup serverMetricGroup,
+            BufferAllocator arrowBufferAllocator,
+            MemorySegmentPool memorySegmentPool,
+            KvFormat kvFormat,
+            RowMerger rowMerger,
+            ArrowCompressionInfo arrowCompressionInfo,
+            SchemaGetter schemaGetter,
+            ChangelogImage changelogImage,
+            int kvFormatVersion,
+            RateLimiter sharedRateLimiter,
+            AutoIncrementManager autoIncrementManager,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor,
+            KvWriteGuard writeGuard)
+            throws IOException {
+        validateValueFormatVersion(kvFormatVersion, tagExtractor);
+        RocksDBKv kv =
+                buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter, compactionFilterFactory);
 
         // Create RocksDB statistics accessor (will be registered to TableMetricGroup by Replica)
         // Pass ResourceGuard to ensure thread-safe access during concurrent close operations
@@ -242,14 +341,21 @@ public final class KvTablet {
                 arrowCompressionInfo,
                 schemaGetter,
                 changelogImage,
+                kvFormatVersion,
                 rocksDBStatistics,
-                autoIncrementManager);
+                autoIncrementManager,
+                tagExtractor,
+                writeGuard);
     }
 
     private static RocksDBKv buildRocksDBKv(
-            Configuration configuration, File kvDir, RateLimiter sharedRateLimiter)
+            Configuration configuration,
+            File kvDir,
+            RateLimiter sharedRateLimiter,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory)
             throws IOException {
-        // Enable statistics to support RocksDB statistics collection
         RocksDBResourceContainer rocksDBResourceContainer =
                 new RocksDBResourceContainer(configuration, kvDir, true, sharedRateLimiter);
         RocksDBKvBuilder rocksDBKvBuilder =
@@ -257,6 +363,9 @@ public final class KvTablet {
                         kvDir,
                         rocksDBResourceContainer,
                         rocksDBResourceContainer.getColumnOptions());
+        if (compactionFilterFactory != null) {
+            rocksDBKvBuilder.setCompactionFilterFactory(compactionFilterFactory);
+        }
         return rocksDBKvBuilder.build();
     }
 
@@ -266,6 +375,16 @@ public final class KvTablet {
 
     public TablePath getTablePath() {
         return physicalPath.getTablePath();
+    }
+
+    /** Returns the version-aware ValueEncoder bound to this tablet's format version. */
+    public ValueEncoder getValueEncoder() {
+        return valueEncoder;
+    }
+
+    /** Returns the KV format version of this tablet (e.g. 2 or 3). */
+    public int getKvFormatVersion() {
+        return kvFormatVersion;
     }
 
     public long getAutoIncrementCacheSize() {
@@ -301,6 +420,21 @@ public final class KvTablet {
 
     void setRowCount(long rowCount) {
         this.rowCount = rowCount;
+    }
+
+    /**
+     * Installs a value filter used by Index Table replicas to skip entries whose source partition
+     * has been tombstoned. The filter is evaluated during point-lookup and prefix-scan paths.
+     *
+     * @param filter returns {@code true} when the value should be dropped
+     */
+    private static final java.util.function.Predicate<byte[]> NO_OP_VALUE_FILTER = v -> false;
+
+    private volatile java.util.function.Predicate<byte[]> valueFilter = NO_OP_VALUE_FILTER;
+    @Nullable private Runnable beforeWalBuild;
+
+    public void setValueFilter(@Nullable java.util.function.Predicate<byte[]> filter) {
+        this.valueFilter = filter == null ? NO_OP_VALUE_FILTER : filter;
     }
 
     // row_count is volatile, so it's safe to read without lock
@@ -371,15 +505,58 @@ public final class KvTablet {
     public LogAppendInfo putAsLeader(
             KvRecordBatch kvRecords, @Nullable int[] targetColumns, MergeMode mergeMode)
             throws Exception {
-        return inWriteLock(
-                kvLock,
+        return inPutWriteLock(
                 () -> {
+                    throwIfUncertainWalAppend();
                     rocksDBKv.checkIfRocksDBClosed();
+
+                    KvIdempotenceProtocol tableProtocol = logTablet.getWriterStateProtocol();
+                    boolean progressMode =
+                            tableProtocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS;
+                    if (progressMode) {
+                        kvRecords.ensureValid();
+                    }
+                    int batchProtocolVersion = kvRecords.idempotenceProtocolVersion();
+                    if (batchProtocolVersion != tableProtocol.version()) {
+                        throw new CorruptRecordException(
+                                String.format(
+                                        "KV batch protocol value %d does not match table mode %s (value %d) for %s",
+                                        batchProtocolVersion,
+                                        tableProtocol,
+                                        tableProtocol.version(),
+                                        tableBucket));
+                    }
 
                     SchemaInfo schemaInfo = schemaGetter.getLatestSchemaInfo();
                     Schema latestSchema = schemaInfo.getSchema();
                     short latestSchemaId = (short) schemaInfo.getSchemaId();
                     validateSchemaId(kvRecords.schemaId(), latestSchemaId);
+
+                    if (progressMode) {
+                        WriterKey writerKey = kvRecords.writerKey();
+                        long writerProgress = kvRecords.writerProgress();
+                        if (writerProgress < 0L) {
+                            throw new IllegalArgumentException(
+                                    "writer progress must be non-negative");
+                        }
+                        if (writeGuard.beforeWriterState(writerKey)
+                                == KvWriteGuard.Decision.NO_OP) {
+                            serverMetricGroup.indexPushTombstoneNoOpBatches().inc();
+                            return LogAppendInfo.noAppend();
+                        }
+                        Optional<WriterProgressStateEntry> stale =
+                                logTablet.findStaleProgressBatch(writerKey, writerProgress);
+                        if (stale.isPresent()) {
+                            WriterProgressStateEntry entry = stale.get();
+                            serverMetricGroup.indexPushStaleProgressBatches().inc();
+                            return LogAppendInfo.duplicatedAt(
+                                    entry.progressWalOffset(), entry.lastTimestamp());
+                        }
+                        Runnable hook = afterProgressPrecheck;
+                        if (hook != null) {
+                            hook.run();
+                        }
+                    }
 
                     AutoIncrementUpdater currentAutoIncrementUpdater =
                             autoIncrementManager.getUpdaterForSchema(kvFormat, latestSchemaId);
@@ -400,8 +577,14 @@ public final class KvTablet {
                                             targetColumns, latestSchemaId, latestSchema);
 
                     RowType latestRowType = latestSchema.getRowType();
-                    WalBuilder walBuilder = createWalBuilder(latestSchemaId, latestRowType);
-                    walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
+                    WalBuilder walBuilder =
+                            createWalBuilder(latestSchemaId, latestRowType, progressMode);
+                    if (progressMode) {
+                        walBuilder.setWriterProgress(
+                                kvRecords.writerKey(), kvRecords.writerProgress());
+                    } else {
+                        walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
+                    }
                     // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
                     // only has fewer ending columns than latest schema, so we pad nulls to
                     // the end of the BinaryRow to get the latest schema row.
@@ -409,6 +592,7 @@ public final class KvTablet {
                     // get offset to track the offset corresponded to the kv record
                     long logEndOffsetOfPrevBatch = logTablet.localLogEndOffset();
 
+                    boolean appendInvoked = false;
                     try {
                         processKvRecords(
                                 kvRecords,
@@ -417,7 +601,8 @@ public final class KvTablet {
                                 currentAutoIncrementUpdater,
                                 walBuilder,
                                 latestSchemaRow,
-                                logEndOffsetOfPrevBatch);
+                                logEndOffsetOfPrevBatch,
+                                progressMode ? kvRecords.writerKey() : null);
 
                         // There will be a situation that these batches of kvRecordBatch have not
                         // generated any CDC logs, for example, when client attempts to delete
@@ -429,11 +614,20 @@ public final class KvTablet {
                         // put a batch into file with recordCount 0 and offset plus 1L, it will
                         // update the batchSequence corresponding to the writerId and also increment
                         // the CDC log offset by 1.
-                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
+                        Runnable buildHook = beforeWalBuild;
+                        if (buildHook != null) {
+                            buildHook.run();
+                        }
+                        MemoryLogRecords wal = walBuilder.build();
+                        appendInvoked = true;
+                        LogAppendInfo logAppendInfo = logTablet.appendAsLeader(wal);
 
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
                         if (logAppendInfo.duplicated()) {
+                            if (progressMode) {
+                                serverMetricGroup.indexPushStaleProgressBatches().inc();
+                            }
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
                         }
@@ -445,6 +639,16 @@ public final class KvTablet {
                         // retry-send batch will produce incorrect CDC logs.
                         // TODO for some errors, the cdc logs may already be written to disk, for
                         //  those errors, we should not truncate the kvPreWriteBuffer.
+                        if (progressMode && appendInvoked) {
+                            if (t instanceof Error) {
+                                uncertainWalAppendFailure = t;
+                                throw (Error) t;
+                            }
+                            UncertainWalAppendException uncertainty =
+                                    new UncertainWalAppendException(tableBucket, t);
+                            uncertainWalAppendFailure = uncertainty;
+                            throw uncertainty;
+                        }
                         kvPreWriteBuffer.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.ERROR);
                         throw t;
                     } finally {
@@ -452,6 +656,49 @@ public final class KvTablet {
                         walBuilder.deallocate();
                     }
                 });
+    }
+
+    private <T> T inPutWriteLock(SupplierWithException<T, Exception> action) throws Exception {
+        Lock writeLock = kvLock.writeLock();
+        Runnable contentionHook = putLockContentionHook;
+        if (contentionHook == null) {
+            writeLock.lock();
+        } else if (!writeLock.tryLock()) {
+            contentionHook.run();
+            writeLock.lock();
+        }
+        try {
+            return action.get();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    @GuardedBy("kvLock")
+    private void throwIfUncertainWalAppend() throws UncertainWalAppendException {
+        Throwable failure = uncertainWalAppendFailure;
+        if (failure == null) {
+            return;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        throw (UncertainWalAppendException) failure;
+    }
+
+    @VisibleForTesting
+    void setAfterProgressPrecheck(@Nullable Runnable afterProgressPrecheck) {
+        this.afterProgressPrecheck = afterProgressPrecheck;
+    }
+
+    @VisibleForTesting
+    void setBeforeWalBuild(@Nullable Runnable beforeWalBuild) {
+        this.beforeWalBuild = beforeWalBuild;
+    }
+
+    @VisibleForTesting
+    void setPutLockContentionHook(@Nullable Runnable putLockContentionHook) {
+        this.putLockContentionHook = putLockContentionHook;
     }
 
     private void validateSchemaId(short schemaIdOfNewData, short latestSchemaId) {
@@ -471,20 +718,29 @@ public final class KvTablet {
             AutoIncrementUpdater autoIncrementUpdater,
             WalBuilder walBuilder,
             PaddingRow latestSchemaRow,
-            long startLogOffset)
+            long startLogOffset,
+            @Nullable WriterKey writerKey)
             throws Exception {
         long logOffset = startLogOffset;
 
         // TODO: reuse the read context and decoder
         KvRecordBatch.ReadContext readContext =
                 KvRecordReadContext.createReadContext(kvFormat, schemaGetter);
-        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
+        ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat, kvFormatVersion);
 
         for (KvRecord kvRecord : kvRecords.records(readContext)) {
             byte[] keyBytes = BytesUtils.toArray(kvRecord.getKey());
             KvPreWriteBuffer.Key key = KvPreWriteBuffer.Key.of(keyBytes);
             BinaryRow row = kvRecord.getRow();
-            BinaryValue currentValue = row == null ? null : new BinaryValue(schemaIdOfNewData, row);
+            if (writerKey != null) {
+                writeGuard.validateRecord(writerKey, keyBytes, row);
+            }
+            BinaryValue currentValue;
+            if (row == null) {
+                currentValue = null;
+            } else {
+                currentValue = new BinaryValue(schemaIdOfNewData, row);
+            }
 
             if (currentValue == null) {
                 logOffset =
@@ -539,11 +795,15 @@ public final class KvTablet {
         BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
         BinaryValue newValue = currentMerger.delete(oldValue);
 
-        // if newValue is null, it means the row should be deleted
         if (newValue == null) {
-            return applyDelete(key, oldValue, walBuilder, latestSchemaRow, logOffset);
+            long newOffset = applyDelete(key, oldValue, walBuilder, latestSchemaRow, logOffset);
+
+            return newOffset;
         } else {
-            return applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+            long newOffset =
+                    applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+
+            return newOffset;
         }
     }
 
@@ -557,7 +817,17 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
-        // Optimization: IN WAL mode，when using DefaultRowMerger (full update, not partial update)
+        java.util.function.Predicate<byte[]> filter = this.valueFilter;
+        if (filter != NO_OP_VALUE_FILTER) {
+            // The filter consumes the complete versioned KV value, including every internal
+            // header field before the row payload. Passing raw row bytes would make it interpret
+            // row data as header fields.
+            byte[] encodedValueBytes = valueEncoder.encodeValue(currentValue);
+            if (filter.test(encodedValueBytes)) {
+                return logOffset;
+            }
+        }
+        // Optimization: IN WAL mode, when using DefaultRowMerger (full update, not partial update)
         // and there is no auto-increment column, we can skip fetching old value for better
         // performance since the result always reflects the new value. In this case, both INSERT and
         // UPDATE will produce UPDATE_AFTER.
@@ -570,24 +840,28 @@ public final class KvTablet {
         byte[] oldValueBytes = getFromBufferOrKv(key);
         if (oldValueBytes == null) {
             BinaryValue valueToInsert = currentMerger.merge(null, currentValue);
-            return applyInsert(
-                    key,
-                    valueToInsert,
-                    walBuilder,
-                    latestSchemaRow,
-                    logOffset,
-                    autoIncrementUpdater);
+            long newOffset =
+                    applyInsert(
+                            key,
+                            valueToInsert,
+                            walBuilder,
+                            latestSchemaRow,
+                            logOffset,
+                            autoIncrementUpdater);
+
+            return newOffset;
         }
 
         BinaryValue oldValue = valueDecoder.decodeValue(oldValueBytes);
         BinaryValue newValue = currentMerger.merge(oldValue, currentValue);
 
         if (newValue == oldValue) {
-            // no actual change, skip this record
             return logOffset;
         }
 
-        return applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+        long newOffset =
+                applyUpdate(key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset);
+        return newOffset;
     }
 
     private long applyDelete(
@@ -612,7 +886,7 @@ public final class KvTablet {
             throws Exception {
         BinaryValue newValue = autoIncrementUpdater.updateAutoIncrementColumns(currentValue);
         walBuilder.append(ChangeType.INSERT, latestSchemaRow.replaceRow(newValue.row));
-        kvPreWriteBuffer.insert(key, newValue.encodeValue(), logOffset);
+        kvPreWriteBuffer.insert(key, valueEncoder.encodeValue(newValue), logOffset);
         return logOffset + 1;
     }
 
@@ -624,19 +898,20 @@ public final class KvTablet {
             PaddingRow latestSchemaRow,
             long logOffset)
             throws Exception {
-        if (changelogImage == ChangelogImage.WAL) {
-            walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset);
-            return logOffset + 1;
-        } else {
+        if (changelogImage.hasUpdateBefore()) {
             walBuilder.append(ChangeType.UPDATE_BEFORE, latestSchemaRow.replaceRow(oldValue.row));
             walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
-            kvPreWriteBuffer.update(key, newValue.encodeValue(), logOffset + 1);
+            kvPreWriteBuffer.update(key, valueEncoder.encodeValue(newValue), logOffset + 1);
             return logOffset + 2;
+        } else {
+            walBuilder.append(ChangeType.UPDATE_AFTER, latestSchemaRow.replaceRow(newValue.row));
+            kvPreWriteBuffer.update(key, valueEncoder.encodeValue(newValue), logOffset);
+            return logOffset + 1;
         }
     }
 
-    private WalBuilder createWalBuilder(int schemaId, RowType rowType) throws Exception {
+    private WalBuilder createWalBuilder(int schemaId, RowType rowType, boolean progressMode)
+            throws Exception {
         switch (logFormat) {
             case INDEXED:
                 if (kvFormat == KvFormat.COMPACTED) {
@@ -647,21 +922,33 @@ public final class KvTablet {
                     throw new IllegalArgumentException(
                             "Primary Key Table with COMPACTED kv format doesn't support INDEXED cdc log format.");
                 }
-                return new IndexWalBuilder(schemaId, memorySegmentPool);
+                return progressMode
+                        ? IndexWalBuilder.progressBuilder(schemaId, memorySegmentPool)
+                        : new IndexWalBuilder(schemaId, memorySegmentPool);
             case COMPACTED:
-                return new CompactedWalBuilder(schemaId, rowType, memorySegmentPool);
+                return progressMode
+                        ? CompactedWalBuilder.progressBuilder(schemaId, rowType, memorySegmentPool)
+                        : new CompactedWalBuilder(schemaId, rowType, memorySegmentPool);
             case ARROW:
-                return new ArrowWalBuilder(
-                        schemaId,
-                        arrowWriterProvider.getOrCreateWriter(
-                                tableBucket.getTableId(),
+                return progressMode
+                        ? ArrowWalBuilder.progressBuilder(
                                 schemaId,
-                                // we don't limit size of the arrow batch, because all the
-                                // changelogs should be in a single batch
-                                Integer.MAX_VALUE,
-                                rowType,
-                                arrowCompressionInfo),
-                        memorySegmentPool);
+                                arrowWriterProvider.getOrCreateWriter(
+                                        tableBucket.getTableId(),
+                                        schemaId,
+                                        Integer.MAX_VALUE,
+                                        rowType,
+                                        arrowCompressionInfo),
+                                memorySegmentPool)
+                        : new ArrowWalBuilder(
+                                schemaId,
+                                arrowWriterProvider.getOrCreateWriter(
+                                        tableBucket.getTableId(),
+                                        schemaId,
+                                        Integer.MAX_VALUE,
+                                        rowType,
+                                        arrowCompressionInfo),
+                                memorySegmentPool);
             default:
                 throw new IllegalArgumentException("Unsupported log format: " + logFormat);
         }
@@ -885,7 +1172,7 @@ public final class KvTablet {
 
     // only for testing.
     @VisibleForTesting
-    KvPreWriteBuffer getKvPreWriteBuffer() {
+    public KvPreWriteBuffer getKvPreWriteBuffer() {
         return kvPreWriteBuffer;
     }
 

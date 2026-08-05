@@ -64,8 +64,27 @@ public class PartialUpdater {
         this.updatePrimaryKeyOnly = partialUpdateCols.equals(primaryKeyCols);
     }
 
+    /**
+     * Enforces two invariants that together make a runtime null-check inside {@link
+     * #updateRow(BinaryValue, BinaryValue)} unnecessary:
+     *
+     * <ol>
+     *   <li>Every primary-key column is present in {@code targetColumns} — so PK values always come
+     *       from {@code partialValue} at merge time, never from {@code oldValue} or the "missing
+     *       old field" null fallback.
+     *   <li>Every column other than primary-key and auto-increment columns is {@link
+     *       DataType#isNullable() nullable}. This applies whether or not the column appears in
+     *       {@code targetColumns}. Auto-increment columns are filled by the server for inserts and
+     *       preserved from the stored row for updates.
+     * </ol>
+     *
+     * <p>Because both invariants are enforced at construction time, no per-row runtime guard for
+     * "merged row has null in a NOT NULL column" is added in {@link #updateRow(BinaryValue,
+     * BinaryValue)}.
+     */
     private void sanityCheck(Schema schema, int[] targetColumns) {
         BitSet pkColumnSet = new BitSet();
+        BitSet autoIncrementColumnSet = new BitSet();
         // check the target columns contains the primary key
         for (int pkIndex : schema.getPrimaryKeyIndexes()) {
             if (!partialUpdateCols.get(pkIndex)) {
@@ -78,14 +97,18 @@ public class PartialUpdater {
             pkColumnSet.set(pkIndex);
         }
 
-        // check the columns not in targetColumns should be nullable
+        for (String columnName : schema.getAutoIncrementColumnNames()) {
+            autoIncrementColumnSet.set(schema.getColumnNames().indexOf(columnName));
+        }
+
+        // Every ordinary non-PK column must be nullable so that omitted fields and fields missing
+        // from an older row can safely be represented as null during a partial merge.
         for (int i = 0; i < fieldDataTypes.length; i++) {
-            // the columns not in primary key should be nullable
-            if (!pkColumnSet.get(i)) {
+            if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i)) {
                 if (!fieldDataTypes[i].isNullable()) {
                     throw new InvalidTargetColumnException(
                             String.format(
-                                    "Partial Update requires all columns except primary key to be nullable, but column %s is NOT NULL.",
+                                    "Partial Update requires all columns except primary key and auto-increment columns to be nullable, but column %s is NOT NULL.",
                                     schema.getRowType().getFieldNames().get(i)));
                 }
             }
@@ -96,6 +119,11 @@ public class PartialUpdater {
      * Partial update the {@code oldValue} with the given new row {@code partialValue}. The {@code
      * oldValue} may be null, in this case, the field don't exist in the {@code partialRow} will be
      * set to null.
+     *
+     * <p>No runtime "NOT NULL column ended up null" guard is needed here: the constructor-time
+     * {@link #sanityCheck(Schema, int[])} establishes that every ordinary non-PK column is nullable
+     * and every PK column is in the target set. Auto-increment columns are populated after an
+     * insert merge and preserved from the old row during an update.
      *
      * @param oldValue the old value to be updated
      * @param partialValue the new value to be updated.

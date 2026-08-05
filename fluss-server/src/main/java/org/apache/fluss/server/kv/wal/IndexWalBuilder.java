@@ -22,6 +22,7 @@ import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.MemoryLogRecordsIndexedBuilder;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.indexed.IndexedRow;
@@ -38,12 +39,25 @@ public class IndexWalBuilder implements WalBuilder {
     private final ManagedPagedOutputView outputView;
 
     public IndexWalBuilder(int schemaId, MemorySegmentPool memorySegmentPool) throws IOException {
+        this(schemaId, memorySegmentPool, false);
+    }
+
+    private IndexWalBuilder(int schemaId, MemorySegmentPool memorySegmentPool, boolean progressMode)
+            throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         // unlimited write size as we don't know the WAL size in advance
         this.recordsBuilder =
-                MemoryLogRecordsIndexedBuilder.builder(
-                        schemaId, Integer.MAX_VALUE, outputView, false);
+                progressMode
+                        ? MemoryLogRecordsIndexedBuilder.progressBuilder(
+                                schemaId, Integer.MAX_VALUE, outputView, false)
+                        : MemoryLogRecordsIndexedBuilder.builder(
+                                schemaId, Integer.MAX_VALUE, outputView, false);
+    }
+
+    public static IndexWalBuilder progressBuilder(int schemaId, MemorySegmentPool memorySegmentPool)
+            throws IOException {
+        return new IndexWalBuilder(schemaId, memorySegmentPool, true);
     }
 
     @Override
@@ -67,6 +81,11 @@ public class IndexWalBuilder implements WalBuilder {
     @Override
     public void setWriterState(long writerId, int batchSequence) {
         recordsBuilder.setWriterState(writerId, batchSequence);
+    }
+
+    @Override
+    public void setWriterProgress(WriterKey writerKey, long progress) {
+        recordsBuilder.setWriterProgress(writerKey, progress);
     }
 
     @Override

@@ -49,6 +49,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.COMMIT_TIMESTAMP_OFFS
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_OVERHEAD;
 import static org.apache.fluss.record.LogRecordBatchFormat.MAGIC_OFFSET;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
@@ -63,6 +64,9 @@ import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.statisticsDataOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.statisticsLengthOffset;
 import static org.apache.fluss.record.LogRecordBatchFormat.writeClientIdOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyHighOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerKeyLowOffset;
+import static org.apache.fluss.record.LogRecordBatchFormat.writerProgressOffset;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
@@ -79,6 +83,7 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  *   <li>V0 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V0}
  *   <li>V1 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V1}
  *   <li>V2 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V2}
+ *   <li>V3 => {@link LogRecordBatchFormat#LOG_MAGIC_VALUE_V3}
  * </ul>
  *
  * @since 0.1
@@ -134,12 +139,38 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
 
     @Override
     public long writerId() {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            throw new UnsupportedOperationException(
+                    "Writer id is not supported for magic v3 record batch");
+        }
         return segment.getLong(position + writeClientIdOffset(magic));
     }
 
     @Override
     public int batchSequence() {
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            throw new UnsupportedOperationException(
+                    "Compact batch sequence is not supported for magic v3 record batch");
+        }
         return segment.getInt(position + batchSequenceOffset(magic));
+    }
+
+    @Override
+    public WriterKey writerKey() {
+        if (magic != LOG_MAGIC_VALUE_V3) {
+            return LogRecordBatch.super.writerKey();
+        }
+        return new WriterKey(
+                segment.getLong(position + writerKeyHighOffset(magic)),
+                segment.getLong(position + writerKeyLowOffset(magic)));
+    }
+
+    @Override
+    public long writerProgress() {
+        if (magic != LOG_MAGIC_VALUE_V3) {
+            return LogRecordBatch.super.writerProgress();
+        }
+        return segment.getLong(position + writerProgressOffset(magic));
     }
 
     @Override

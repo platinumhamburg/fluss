@@ -208,6 +208,10 @@ public class RocksDBKv implements AutoCloseable {
 
             columnFamilyOptions.forEach(IOUtils::closeQuietly);
 
+            // Statistics must be closed after DB to avoid use-after-free during
+            // JVM shutdown (the C++ Statistics instance is referenced by DB internals).
+            IOUtils.closeQuietly(statistics);
+
             IOUtils.closeQuietly(optionsContainer);
         }
         this.closed = true;

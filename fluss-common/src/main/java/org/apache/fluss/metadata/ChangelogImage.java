@@ -52,9 +52,13 @@ public enum ChangelogImage {
                 return FULL;
             case "WAL":
                 return WAL;
-
             default:
                 throw new IllegalArgumentException("Unsupported changelog image: " + image);
         }
+    }
+
+    /** Whether this mode produces UPDATE_BEFORE records for updates. */
+    public boolean hasUpdateBefore() {
+        return this == FULL;
     }
 }

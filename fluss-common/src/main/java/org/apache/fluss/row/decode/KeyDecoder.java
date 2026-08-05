@@ -20,6 +20,7 @@ package org.apache.fluss.row.decode;
 
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.KeyFormatVersion;
 import org.apache.fluss.row.decode.iceberg.IcebergKeyDecoder;
 import org.apache.fluss.row.decode.paimon.PaimonKeyDecoder;
 import org.apache.fluss.types.RowType;
@@ -27,6 +28,8 @@ import org.apache.fluss.types.RowType;
 import javax.annotation.Nullable;
 
 import java.util.List;
+
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 
 /**
  * Interface for decoding key bytes back to {@link InternalRow}.
@@ -45,7 +48,7 @@ public interface KeyDecoder {
      *
      * @param rowType the row type containing all fields
      * @param keyFields the list of primary key field names
-     * @param kvFormatVersion the KV format version (1 or 2)
+     * @param kvFormatVersion the KV format version (1, 2, or v2-compatible 3)
      * @param lakeFormat the data lake format, null if not using lake storage
      * @param isDefaultBucketKey whether using default bucket key (primary key as bucket key)
      * @return the corresponding key decoder
@@ -62,7 +65,9 @@ public interface KeyDecoder {
             return CompactedKeyDecoder.createKeyDecoder(rowType, keyFields);
         }
 
-        if (kvFormatVersion == 1 || (kvFormatVersion == 2 && isDefaultBucketKey)) {
+        int keyFormatVersion = KeyFormatVersion.resolve(kvFormatVersion);
+        if (keyFormatVersion == 1
+                || (keyFormatVersion == KV_FORMAT_VERSION_2 && isDefaultBucketKey)) {
             if (lakeFormat == null || lakeFormat == DataLakeFormat.LANCE) {
                 return CompactedKeyDecoder.createKeyDecoder(rowType, keyFields);
             }
@@ -75,7 +80,7 @@ public interface KeyDecoder {
             throw new UnsupportedOperationException(
                     "Unsupported datalake format for key decoding: " + lakeFormat);
         }
-        if (kvFormatVersion == 2) {
+        if (keyFormatVersion == KV_FORMAT_VERSION_2) {
             // use CompactedKeyEncoder to support prefix look up
             return CompactedKeyDecoder.createKeyDecoder(rowType, keyFields);
         }

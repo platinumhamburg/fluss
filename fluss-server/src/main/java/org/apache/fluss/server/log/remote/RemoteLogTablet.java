@@ -157,7 +157,8 @@ public class RemoteLogTablet {
     }
 
     /**
-     * Returns the expired segments based on the given time and lake log end offset.
+     * Returns the expired segments based on time, lake coverage, and the committed KV snapshot
+     * replay floor.
      *
      * <p>Only segments that have been tiered to lake (i.e., remoteLogEndOffset <= lakeLogEndOffset)
      * can be safely deleted. This ensures that we don't delete segments that haven't been tiered to
@@ -166,10 +167,12 @@ public class RemoteLogTablet {
      * @param currentTimeMs the current time in milliseconds
      * @param lakeLogEndOffset the log end offset that has been synced to lake, null if data lake is
      *     disabled
+     * @param committedMinRetainOffset the minimum raw WAL offset retained by the latest committed
+     *     KV snapshot
      * @return list of expired segments that can be safely deleted
      */
     public List<RemoteLogSegment> expiredRemoteLogSegments(
-            long currentTimeMs, Long lakeLogEndOffset) {
+            long currentTimeMs, Long lakeLogEndOffset, long committedMinRetainOffset) {
         if (!logExpireEnable()) {
             return Collections.emptyList();
         }
@@ -183,13 +186,10 @@ public class RemoteLogTablet {
                         if (currentTimeMs - ts > ttlMs) {
                             for (UUID uuid : entry.getValue()) {
                                 RemoteLogSegment segment = idToRemoteLogSegment.get(uuid);
-                                if (lakeLogEndOffset != null) {
-                                    // if datalake is enabled, only include segments that have been
-                                    // tiered to lake.
-                                    if (segment.remoteLogEndOffset() <= lakeLogEndOffset) {
-                                        expiredSegments.add(segment);
-                                    }
-                                } else {
+                                if (segment.remoteLogEndOffset() <= committedMinRetainOffset
+                                        && (lakeLogEndOffset == null
+                                                || segment.remoteLogEndOffset()
+                                                        <= lakeLogEndOffset)) {
                                     expiredSegments.add(segment);
                                 }
                             }
@@ -255,6 +255,96 @@ public class RemoteLogTablet {
                     }
                     return remoteLogSegmentList;
                 });
+    }
+
+    /**
+     * Returns a bounded page of segment metadata relevant to {@code offset}. The cursor is the
+     * remote start offset of the last metadata entry examined, including entries skipped because
+     * they end before {@code offset}; passing it back prevents rescanning skipped tails.
+     */
+    public RemoteLogSegmentPage relevantRemoteLogSegmentPage(
+            long offset, @Nullable Long afterStartOffset, int maxSegmentsToExamine) {
+        if (maxSegmentsToExamine <= 0) {
+            throw new IllegalArgumentException("maxSegmentsToExamine must be positive");
+        }
+        return inReadLock(
+                lock,
+                () -> {
+                    Long firstKey;
+                    if (afterStartOffset == null) {
+                        Long floorKey = offsetToRemoteLogSegmentId.floorKey(offset);
+                        firstKey =
+                                floorKey == null
+                                        ? offsetToRemoteLogSegmentId.isEmpty()
+                                                ? null
+                                                : offsetToRemoteLogSegmentId.firstKey()
+                                        : floorKey;
+                    } else {
+                        firstKey = offsetToRemoteLogSegmentId.higherKey(afterStartOffset);
+                    }
+                    if (firstKey == null) {
+                        return RemoteLogSegmentPage.empty(afterStartOffset);
+                    }
+
+                    List<RemoteLogSegment> segments = new ArrayList<>();
+                    int examined = 0;
+                    Long cursor = afterStartOffset;
+                    for (Map.Entry<Long, UUID> entry :
+                            offsetToRemoteLogSegmentId.tailMap(firstKey, true).entrySet()) {
+                        cursor = entry.getKey();
+                        examined++;
+                        RemoteLogSegment segment = idToRemoteLogSegment.get(entry.getValue());
+                        if (offset < segment.remoteLogEndOffset()) {
+                            segments.add(segment);
+                        }
+                        if (examined >= maxSegmentsToExamine) {
+                            break;
+                        }
+                    }
+                    boolean hasMore =
+                            cursor != null && offsetToRemoteLogSegmentId.higherKey(cursor) != null;
+                    return new RemoteLogSegmentPage(segments, cursor, examined, hasMore);
+                });
+    }
+
+    /** A bounded, immutable page of generic remote segment metadata. */
+    public static final class RemoteLogSegmentPage {
+        private final List<RemoteLogSegment> segments;
+        @Nullable private final Long nextStartOffsetExclusive;
+        private final int examinedSegmentCount;
+        private final boolean hasMore;
+
+        private RemoteLogSegmentPage(
+                List<RemoteLogSegment> segments,
+                @Nullable Long nextStartOffsetExclusive,
+                int examinedSegmentCount,
+                boolean hasMore) {
+            this.segments = Collections.unmodifiableList(new ArrayList<>(segments));
+            this.nextStartOffsetExclusive = nextStartOffsetExclusive;
+            this.examinedSegmentCount = examinedSegmentCount;
+            this.hasMore = hasMore;
+        }
+
+        private static RemoteLogSegmentPage empty(@Nullable Long cursor) {
+            return new RemoteLogSegmentPage(Collections.emptyList(), cursor, 0, false);
+        }
+
+        public List<RemoteLogSegment> segments() {
+            return segments;
+        }
+
+        @Nullable
+        public Long nextStartOffsetExclusive() {
+            return nextStartOffsetExclusive;
+        }
+
+        public int examinedSegmentCount() {
+            return examinedSegmentCount;
+        }
+
+        public boolean hasMore() {
+            return hasMore;
+        }
     }
 
     public long getRemoteLogStartOffset() {

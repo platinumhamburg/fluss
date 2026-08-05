@@ -33,15 +33,18 @@ import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.AutoPartitionStrategy;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.StringUtils;
 
 import javax.annotation.Nullable;
@@ -55,6 +58,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_3;
 import static org.apache.fluss.config.FlussConfigUtils.TABLE_OPTIONS;
 import static org.apache.fluss.config.FlussConfigUtils.isAlterableTableOption;
 import static org.apache.fluss.config.FlussConfigUtils.isTableStorageConfig;
@@ -70,6 +75,8 @@ import static org.apache.fluss.utils.PartitionUtils.validateTimeFormat;
 
 /** Validator of {@link TableDescriptor}. */
 public class TableDescriptorValidation {
+
+    private static final String SECONDARY_INDEX_PROPERTY_PREFIX = "secondary-index.";
 
     private static final Set<String> SYSTEM_COLUMNS =
             Collections.unmodifiableSet(
@@ -98,6 +105,12 @@ public class TableDescriptorValidation {
         // and this cluster know it, and value is valid
         for (String key : tableConf.keySet()) {
 
+            if (key.startsWith(SECONDARY_INDEX_PROPERTY_PREFIX)) {
+                throw new InvalidConfigException(
+                        "Secondary index options must be stored in Schema.Index metadata, not table properties: "
+                                + key);
+            }
+
             if (!TABLE_OPTIONS.containsKey(key)) {
                 if (isTableStorageConfig(key)) {
                     throw new InvalidConfigException(
@@ -116,11 +129,34 @@ public class TableDescriptorValidation {
             validateOptionValue(tableConf, option);
         }
 
+        boolean protocolExplicitlySet =
+                tableDescriptor
+                        .getProperties()
+                        .containsKey(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION.key());
+        if (!hasPrimaryKey && protocolExplicitlySet) {
+            throw new InvalidConfigException(
+                    "table.kv.idempotence-protocol-version is only supported for primary key tables");
+        }
+        KvIdempotenceProtocol protocol;
+        try {
+            protocol =
+                    KvIdempotenceProtocol.forVersion(
+                            tableConf.get(ConfigOptions.TABLE_KV_IDEMPOTENCE_PROTOCOL_VERSION));
+        } catch (IllegalArgumentException e) {
+            throw new InvalidConfigException(e.getMessage());
+        }
+        if (protocol == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
+                && !tableDescriptor.isIndexTable()) {
+            throw new InvalidConfigException(
+                    "The cumulative-progress KV idempotence protocol is reserved for system-managed Index Tables");
+        }
+
         // check distribution
         checkDistribution(tableDescriptor, maxBucketNum);
         checkPrimaryKey(tableDescriptor);
         // check individual options
         checkReplicationFactor(tableConf);
+        checkKvFormatVersion(tableDescriptor, tableConf);
         checkLogFormat(tableConf, hasPrimaryKey);
         checkArrowCompression(tableConf);
         checkMergeEngine(tableConf, hasPrimaryKey, schema);
@@ -128,6 +164,8 @@ public class TableDescriptorValidation {
         checkTieredLog(tableConf);
         checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema.getRowType());
         checkSystemColumns(schema.getRowType());
+        checkSecondaryIndexes(schema);
+        checkSecondaryIndexChangelogImage(schema, tableConf);
         validateStatisticsConfig(tableDescriptor);
         checkTableLakeFormatMatchesCluster(tableConf, clusterDataLakeFormat);
     }
@@ -308,6 +346,47 @@ public class TableDescriptorValidation {
                             "'%s' must be greater than 0.",
                             ConfigOptions.TABLE_REPLICATION_FACTOR.key()));
         }
+    }
+
+    private static void checkKvFormatVersion(
+            TableDescriptor tableDescriptor, Configuration tableConf) {
+        Optional<Integer> kvFormatVersion =
+                tableConf.getOptional(ConfigOptions.TABLE_KV_FORMAT_VERSION);
+        if (!kvFormatVersion.isPresent()) {
+            return;
+        }
+
+        int version = kvFormatVersion.get();
+        if (version < 1) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "Unsupported kv format version %d. The minimum supported version is 1.",
+                            version));
+        }
+        if (version > CURRENT_KV_FORMAT_VERSION) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "Unsupported kv format version %d. The maximum supported version is %d.",
+                            version, CURRENT_KV_FORMAT_VERSION));
+        }
+        KvValueLayout layout = KvValueLayout.forKvFormatVersion(version);
+        if (!layout.hasValueTag()) {
+            return;
+        }
+        if (version == KV_FORMAT_VERSION_3 && isPartitionedIndexTable(tableDescriptor)) {
+            return;
+        }
+        throw new InvalidConfigException(
+                "kv format version 3 is reserved for system-managed partitioned secondary index tables.");
+    }
+
+    private static boolean isPartitionedIndexTable(TableDescriptor tableDescriptor) {
+        return tableDescriptor.isIndexTable()
+                && tableDescriptor
+                        .getSchema()
+                        .getRowType()
+                        .getFieldNames()
+                        .contains(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN);
     }
 
     private static void checkLogFormat(Configuration tableConf, boolean hasPrimaryKey) {
@@ -612,6 +691,65 @@ public class TableDescriptorValidation {
                     String.format(
                             "Invalid value for config '%s'. Reason: %s",
                             option.key(), t.getMessage()));
+        }
+    }
+
+    private static void checkSecondaryIndexChangelogImage(Schema schema, ReadableConfig tableConf) {
+        if (schema.getIndexes().isEmpty()) {
+            return;
+        }
+        ChangelogImage changelogImage = tableConf.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
+        if (changelogImage != ChangelogImage.FULL) {
+            throw new InvalidTableException(
+                    String.format(
+                            "Tables with secondary indexes require '%s' = '%s' "
+                                    + "(pre-image is needed for index mutation extraction). "
+                                    + "Current value: '%s'.",
+                            ConfigOptions.TABLE_CHANGELOG_IMAGE.key(),
+                            ChangelogImage.FULL,
+                            changelogImage));
+        }
+    }
+
+    private static void checkSecondaryIndexes(Schema schema) {
+        if (!schema.getIndexes().isEmpty() && schema.getPrimaryKey().isEmpty()) {
+            throw new InvalidTableException(
+                    "Tables with secondary indexes must define a primary key.");
+        }
+
+        Set<String> indexNames = new LinkedHashSet<>();
+        for (Schema.Index index : schema.getIndexes()) {
+            String indexName = index.getIndexName();
+            if (!indexNames.add(indexName)) {
+                throw new InvalidTableException(
+                        String.format("Duplicate index name '%s'.", indexName));
+            }
+
+            Set<String> indexColumns = new LinkedHashSet<>();
+            for (String columnName : index.getColumnNames()) {
+                if (!indexColumns.add(columnName)) {
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Index '%s' contains duplicate column '%s'.",
+                                    indexName, columnName));
+                }
+
+                int columnIndex = schema.getRowType().getFieldIndex(columnName);
+                if (columnIndex < 0) {
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Index '%s' references unknown column '%s'.",
+                                    indexName, columnName));
+                }
+
+                DataType columnType = schema.getRowType().getTypeAt(columnIndex);
+                if (KEY_UNSUPPORTED_TYPES.contains(columnType.getTypeRoot())) {
+                    throw new InvalidTableException(
+                            String.format(
+                                    "Index '%s' column '%s' has unsupported type %s.",
+                                    indexName, columnName, columnType));
+                }
+            }
         }
     }
 }

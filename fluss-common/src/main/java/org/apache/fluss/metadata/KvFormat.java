@@ -37,10 +37,7 @@ public enum KvFormat {
      */
     INDEXED;
 
-    /**
-     * Creates a {@link LogFormat} from the given string. The string must be either 'arrow' or
-     * 'indexed'.
-     */
+    /** Creates a {@link KvFormat} from the given string. */
     public static KvFormat fromString(String format) {
         switch (format.toUpperCase()) {
             case "COMPACTED":

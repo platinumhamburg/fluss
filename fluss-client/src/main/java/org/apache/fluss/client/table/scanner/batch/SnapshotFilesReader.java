@@ -27,6 +27,7 @@ import org.apache.fluss.rocksdb.RocksDBHandle;
 import org.apache.fluss.rocksdb.RocksIteratorWrapper;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.CloseableRegistry;
@@ -76,6 +77,7 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
 
     SnapshotFilesReader(
             KvFormat kvFormat,
+            int kvFormatVersion,
             Path rocksDbPath,
             @Nullable int[] projectedFields,
             int targetSchemaId,
@@ -85,7 +87,9 @@ class SnapshotFilesReader implements CloseableIterator<InternalRow> {
         this.targetSchemaId = targetSchemaId;
         this.targetSchema = targetSchema;
         this.schemaGetter = schemaGetter;
-        this.valueDecoder = new ValueDecoder(schemaGetter, kvFormat);
+        this.valueDecoder =
+                new ValueDecoder(
+                        schemaGetter, kvFormat, KvValueLayout.forKvFormatVersion(kvFormatVersion));
         this.projectedFields = projectedFields;
         closeableRegistry = new CloseableRegistry();
         try {

@@ -39,6 +39,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_LENGTH;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V3;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_LEADER_EPOCH;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
@@ -47,6 +48,7 @@ import static org.apache.fluss.record.LogRecordBatchFormat.recordBatchHeaderSize
 import static org.apache.fluss.record.LogRecordBatchFormat.schemaIdOffset;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Builder for {@link MemoryLogRecords} of log records in {@link LogFormat#ARROW} format. */
 public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
@@ -68,6 +70,8 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
 
     private long writerId;
     private int batchSequence;
+    private WriterKey writerKey;
+    private long writerProgress;
     private int estimatedSizeInBytes;
     private int recordCount;
     private volatile boolean isClosed;
@@ -97,6 +101,7 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
 
         this.writerId = NO_WRITER_ID;
         this.batchSequence = NO_BATCH_SEQUENCE;
+        this.writerProgress = -1L;
         this.isClosed = false;
 
         this.pagedOutputView = pagedOutputView;
@@ -128,6 +133,22 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
                 arrowWriter,
                 outputView,
                 false,
+                statisticsCollector);
+    }
+
+    public static MemoryLogRecordsArrowBuilder progressBuilder(
+            int schemaId,
+            ArrowWriter arrowWriter,
+            AbstractPagedOutputView outputView,
+            boolean appendOnly,
+            @Nullable LogRecordBatchStatisticsCollector statisticsCollector) {
+        return new MemoryLogRecordsArrowBuilder(
+                BUILDER_DEFAULT_OFFSET,
+                schemaId,
+                LOG_MAGIC_VALUE_V3,
+                arrowWriter,
+                outputView,
+                appendOnly,
                 statisticsCollector);
     }
 
@@ -177,6 +198,9 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
         if (aborted) {
             throw new IllegalStateException("Attempting to build an aborted record batch");
         }
+        checkState(
+                magic != LOG_MAGIC_VALUE_V3 || writerKey != null,
+                "A writer key is required before building a magic v3 WAL batch");
 
         if (bytesView != null) {
             if (resetBatchHeader) {
@@ -290,10 +314,20 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
     }
 
     public void setWriterState(long writerId, int batchBaseSequence) {
+        checkState(
+                magic != LOG_MAGIC_VALUE_V3, "Compact writer state does not support WAL magic v3");
         // trigger to rewrite batch header when next build.
         this.resetBatchHeader = true;
         this.writerId = writerId;
         this.batchSequence = batchBaseSequence;
+    }
+
+    public void setWriterProgress(WriterKey writerKey, long progress) {
+        checkState(magic == LOG_MAGIC_VALUE_V3, "Cumulative writer progress requires WAL magic v3");
+        checkArgument(progress >= 0L, "writer progress must be non-negative");
+        this.resetBatchHeader = true;
+        this.writerKey = checkNotNull(writerKey);
+        this.writerProgress = progress;
     }
 
     public void abort() {
@@ -388,8 +422,14 @@ public class MemoryLogRecordsArrowBuilder implements AutoCloseable {
             // the field 'lastOffsetDelta' in DefaultLogRecordBatch.
             outputView.writeInt(0);
         }
-        outputView.writeLong(writerId);
-        outputView.writeInt(batchSequence);
+        if (magic == LOG_MAGIC_VALUE_V3) {
+            outputView.writeLong(writerKey.high());
+            outputView.writeLong(writerKey.low());
+            outputView.writeLong(writerProgress);
+        } else {
+            outputView.writeLong(writerId);
+            outputView.writeInt(batchSequence);
+        }
         outputView.writeInt(recordCount);
 
         // For V1+, write statistics length

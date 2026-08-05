@@ -18,6 +18,9 @@
 package org.apache.fluss.record;
 
 import org.apache.fluss.row.decode.RowDecoder;
+import org.apache.fluss.row.encode.KvValueLayout;
+
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 
 /**
  * A value record batch is a container for a batch of {@link ValueRecord}.
@@ -71,5 +74,10 @@ public interface ValueRecordBatch {
          * @param schemaId the schema of the kv records
          */
         RowDecoder getRowDecoder(int schemaId);
+
+        /** Returns the physical layout of each raw KV value in the batch. */
+        default KvValueLayout getKvValueLayout() {
+            return KvValueLayout.forKvFormatVersion(KV_FORMAT_VERSION_2);
+        }
     }
 }

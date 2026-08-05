@@ -63,6 +63,13 @@ public class CloseableRegistry
         return closeableMap.remove(closeable) != null;
     }
 
+    /** Returns whether this registry currently owns the given closeable. */
+    public boolean isCloseableRegistered(Closeable closeable) {
+        synchronized (getSynchronizationLock()) {
+            return closeableToRef.containsKey(closeable);
+        }
+    }
+
     /**
      * This implementation doesn't imply any exception during closing due to backward compatibility.
      */

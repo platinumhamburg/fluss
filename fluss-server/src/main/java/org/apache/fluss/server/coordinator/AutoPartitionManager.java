@@ -94,6 +94,7 @@ public class AutoPartitionManager implements AutoCloseable {
     private final RemoteDirDynamicLoader remoteDirDynamicLoader;
     private final ReplicaCapacityController replicaCapacityController;
     private final Clock clock;
+    private final int coordinatorZkVersion;
 
     private final long periodicInterval;
     private final AtomicBoolean isClosed = new AtomicBoolean(false);
@@ -118,13 +119,15 @@ public class AutoPartitionManager implements AutoCloseable {
             MetadataManager metadataManager,
             RemoteDirDynamicLoader remoteDirDynamicLoader,
             Configuration conf,
-            ReplicaCapacityController replicaCapacityController) {
+            ReplicaCapacityController replicaCapacityController,
+            int coordinatorZkVersion) {
         this(
                 metadataCache,
                 metadataManager,
                 remoteDirDynamicLoader,
                 conf,
                 replicaCapacityController,
+                coordinatorZkVersion,
                 SystemClock.getInstance(),
                 // TODO: Reuse the CoordinatorServer shared scheduler for this lightweight
                 // coordinator periodic task instead of creating a component-owned scheduler.
@@ -139,6 +142,7 @@ public class AutoPartitionManager implements AutoCloseable {
             RemoteDirDynamicLoader remoteDirDynamicLoader,
             Configuration conf,
             ReplicaCapacityController replicaCapacityController,
+            int coordinatorZkVersion,
             Clock clock,
             ScheduledExecutorService periodicExecutor) {
         this.metadataCache = metadataCache;
@@ -146,6 +150,7 @@ public class AutoPartitionManager implements AutoCloseable {
         this.remoteDirDynamicLoader = remoteDirDynamicLoader;
         this.replicaCapacityController = replicaCapacityController;
         this.clock = clock;
+        this.coordinatorZkVersion = coordinatorZkVersion;
         this.periodicExecutor = periodicExecutor;
         this.periodicInterval = conf.get(ConfigOptions.AUTO_PARTITION_CHECK_INTERVAL).toMillis();
     }
@@ -389,6 +394,7 @@ public class AutoPartitionManager implements AutoCloseable {
 
             dropPartitions(
                     tablePath,
+                    tableId,
                     tableInfo.getPartitionKeys(),
                     now,
                     tableInfo.getTableConfig().getAutoPartitionStrategy(),
@@ -432,7 +438,13 @@ public class AutoPartitionManager implements AutoCloseable {
                 // select a remote data dir for the partition
                 String remoteDataDir = remoteDirDynamicLoader.getRemoteDirSelector().nextDataDir();
                 metadataManager.createPartition(
-                        tablePath, tableId, remoteDataDir, partitionAssignment, partition, false);
+                        tablePath,
+                        tableId,
+                        remoteDataDir,
+                        partitionAssignment,
+                        partition,
+                        false,
+                        coordinatorZkVersion);
                 // only single partition key table supports automatic creation of partitions
                 currentPartitions.put(partition.getPartitionName(), null);
                 LOG.info(
@@ -503,6 +515,7 @@ public class AutoPartitionManager implements AutoCloseable {
 
     private void dropPartitions(
             TablePath tablePath,
+            long tableId,
             List<String> partitionKeys,
             Instant currentInstant,
             AutoPartitionStrategy autoPartitionStrategy,
@@ -541,12 +554,13 @@ public class AutoPartitionManager implements AutoCloseable {
                 currentPartitions.headMap(lastRetainPartitionTime).entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<String, Set<String>> entry = iterator.next();
-            dropPartitions(tablePath, partitionKeys, iterator, entry);
+            dropPartitions(tablePath, tableId, partitionKeys, iterator, entry);
         }
     }
 
     private void dropPartitions(
             TablePath tablePath,
+            long tableId,
             List<String> partitionKeys,
             Iterator<Map.Entry<String, Set<String>>> iterator,
             Map.Entry<String, Set<String>> entry) {
@@ -562,8 +576,10 @@ public class AutoPartitionManager implements AutoCloseable {
             try {
                 metadataManager.dropPartition(
                         tablePath,
+                        tableId,
                         ResolvedPartitionSpec.fromPartitionName(partitionKeys, partitionName),
-                        false);
+                        false,
+                        coordinatorZkVersion);
             } catch (PartitionNotExistException e) {
                 LOG.info(
                         "Auto partitioning skip to delete partition {} for table [{}] as the partition is not exist.",

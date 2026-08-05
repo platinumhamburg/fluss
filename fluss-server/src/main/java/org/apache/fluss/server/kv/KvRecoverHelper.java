@@ -17,12 +17,14 @@
 
 package org.apache.fluss.server.kv;
 
+import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -67,6 +69,8 @@ public class KvRecoverHelper {
     private final KvFormat kvFormat;
     private final LogFormat logFormat;
     private final RemoteLogFetcher remoteLogFetcher;
+    private final ValueEncoder valueEncoder;
+    private final RecoveryFaultInjector recoveryFaultInjector;
 
     // will be initialized when first encounter a log record during recovering from log
     private Integer currentSchemaId;
@@ -88,7 +92,36 @@ public class KvRecoverHelper {
             KvFormat kvFormat,
             LogFormat logFormat,
             SchemaGetter schemaGetter,
-            RemoteLogFetcher remoteLogFetcher) {
+            RemoteLogFetcher remoteLogFetcher,
+            ValueEncoder valueEncoder) {
+        this(
+                kvTablet,
+                logTablet,
+                recoverPointOffset,
+                recoverPointRowCount,
+                autoIncRange,
+                recoverContext,
+                kvFormat,
+                logFormat,
+                schemaGetter,
+                remoteLogFetcher,
+                valueEncoder,
+                RecoveryFaultInjector.NO_OP);
+    }
+
+    public KvRecoverHelper(
+            KvTablet kvTablet,
+            LogTablet logTablet,
+            long recoverPointOffset,
+            @Nullable Long recoverPointRowCount,
+            @Nullable AutoIncIDRange autoIncRange,
+            KvRecoverContext recoverContext,
+            KvFormat kvFormat,
+            LogFormat logFormat,
+            SchemaGetter schemaGetter,
+            RemoteLogFetcher remoteLogFetcher,
+            ValueEncoder valueEncoder,
+            RecoveryFaultInjector recoveryFaultInjector) {
         this.kvTablet = kvTablet;
         this.logTablet = logTablet;
         this.recoverPointOffset = recoverPointOffset;
@@ -99,6 +132,8 @@ public class KvRecoverHelper {
         this.logFormat = logFormat;
         this.schemaGetter = schemaGetter;
         this.remoteLogFetcher = remoteLogFetcher;
+        this.valueEncoder = valueEncoder;
+        this.recoveryFaultInjector = recoveryFaultInjector;
     }
 
     public void recover() throws Exception {
@@ -206,11 +241,32 @@ public class KvRecoverHelper {
             throws Exception {
         try (LogRecordReadContext readContext = createLogRecordReadContext()) {
             long nextFetchOffset = startFetchOffset;
+            long localReadTargetOffset =
+                    fetchIsolation == FetchIsolation.HIGH_WATERMARK
+                            ? logTablet.getHighWatermark()
+                            : logTablet.localLogEndOffset();
             while (true) {
-                final Iterable<LogRecordBatch> batches;
                 if (nextFetchOffset < localLogStartOffset) {
-                    batches = remoteLogFetcher.fetch(nextFetchOffset, localLogStartOffset);
+                    long fetchStartOffset = nextFetchOffset;
+                    try (RemoteLogFetcher.FetchResult batches =
+                            remoteLogFetcher.fetch(nextFetchOffset, localLogStartOffset)) {
+                        for (LogRecordBatch logRecordBatch : batches) {
+                            validateRecoveryBatch(
+                                    logRecordBatch, nextFetchOffset, localLogStartOffset);
+                            nextFetchOffset =
+                                    applyLogRecordBatch(
+                                            logRecordBatch,
+                                            readContext,
+                                            rowCountUpdater,
+                                            autoIncIdRangeUpdater,
+                                            resumeRecordConsumer);
+                            recoveryFaultInjector.afterBatch(nextFetchOffset);
+                        }
+                    }
+                    requireRemoteFetchProgress(
+                            fetchStartOffset, nextFetchOffset, localLogStartOffset);
                 } else {
+                    long fetchStartOffset = nextFetchOffset;
                     LogRecords logRecords =
                             logTablet
                                     .read(
@@ -222,23 +278,98 @@ public class KvRecoverHelper {
                                             null)
                                     .getRecords();
                     if (logRecords == MemoryLogRecords.EMPTY) {
+                        requireLocalFetchProgress(
+                                fetchStartOffset, nextFetchOffset, localReadTargetOffset);
                         break;
                     }
-                    batches = logRecords.batches();
-                }
-
-                for (LogRecordBatch logRecordBatch : batches) {
-                    nextFetchOffset =
-                            applyLogRecordBatch(
-                                    logRecordBatch,
-                                    readContext,
-                                    rowCountUpdater,
-                                    autoIncIdRangeUpdater,
-                                    resumeRecordConsumer);
+                    for (LogRecordBatch logRecordBatch : logRecords.batches()) {
+                        validateRecoveryBatch(logRecordBatch, nextFetchOffset, Long.MAX_VALUE);
+                        nextFetchOffset =
+                                applyLogRecordBatch(
+                                        logRecordBatch,
+                                        readContext,
+                                        rowCountUpdater,
+                                        autoIncIdRangeUpdater,
+                                        resumeRecordConsumer);
+                        recoveryFaultInjector.afterBatch(nextFetchOffset);
+                    }
+                    requireLocalFetchProgress(
+                            fetchStartOffset, nextFetchOffset, localReadTargetOffset);
+                    if (nextFetchOffset <= fetchStartOffset) {
+                        break;
+                    }
                 }
             }
             return nextFetchOffset;
         }
+    }
+
+    static void validateRecoveryBatch(
+            LogRecordBatch logRecordBatch, long expectedOffset, long localLogStartOffset) {
+        logRecordBatch.ensureValid();
+
+        long baseOffset = logRecordBatch.baseLogOffset();
+        long nextOffset = logRecordBatch.nextLogOffset();
+        if (baseOffset != expectedOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "KV recovery expected offset %d, but the next WAL batch starts at %d",
+                            expectedOffset, baseOffset));
+        }
+        if (nextOffset <= expectedOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "KV recovery WAL batch at offset %d does not advance the recovery offset",
+                            expectedOffset));
+        }
+        if (nextOffset > localLogStartOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "Remote WAL batch [%d, %d) crosses local WAL start offset %d",
+                            baseOffset, nextOffset, localLogStartOffset));
+        }
+    }
+
+    static void requireRemoteFetchProgress(
+            long fetchStartOffset, long nextFetchOffset, long localLogStartOffset) {
+        requireFetchProgress(
+                "Remote WAL fetch",
+                fetchStartOffset,
+                nextFetchOffset,
+                localLogStartOffset,
+                "local WAL start offset");
+    }
+
+    static void requireLocalFetchProgress(
+            long fetchStartOffset, long nextFetchOffset, long targetOffset) {
+        requireFetchProgress(
+                "Local WAL fetch",
+                fetchStartOffset,
+                nextFetchOffset,
+                targetOffset,
+                "target offset");
+    }
+
+    private static void requireFetchProgress(
+            String operation,
+            long fetchStartOffset,
+            long nextFetchOffset,
+            long targetOffset,
+            String targetDescription) {
+        if (fetchStartOffset < targetOffset && nextFetchOffset <= fetchStartOffset) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "%s made no progress from offset %d toward %s %d",
+                            operation, fetchStartOffset, targetDescription, targetOffset));
+        }
+    }
+
+    /** Test hook invoked after a WAL batch has been applied during KV recovery. */
+    @FunctionalInterface
+    public interface RecoveryFaultInjector {
+        RecoveryFaultInjector NO_OP = ignored -> {};
+
+        void afterBatch(long nextOffset) throws Exception;
     }
 
     /**
@@ -268,7 +399,9 @@ public class KvRecoverHelper {
                         // the log row format may not compatible with kv row format,
                         // e.g, arrow vs. compacted, thus needs a conversion here.
                         BinaryRow row = toKvRow(logRow);
-                        value = ValueEncoder.encodeValue(currentSchemaId.shortValue(), row);
+                        value =
+                                valueEncoder.encodeValue(
+                                        new BinaryValue(currentSchemaId.shortValue(), row));
                     }
                     resumeRecordConsumer.accept(
                             new KeyValueAndLogOffset(

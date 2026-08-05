@@ -71,8 +71,13 @@ public class DefaultRowMerger implements RowMerger {
     @Override
     public RowMerger configureTargetColumns(
             @Nullable int[] targetColumns, short latestShemaId, Schema latestSchema) {
+        // The full-schema shortcut must not apply when the primary key covers every column:
+        // such tables (e.g. derived index tables) rely on PartialUpdater's primary-key-only
+        // semantics where re-upserting an existing key is a no-op instead of a new WAL entry.
         if (targetColumns == null
-                || TargetColumns.specifiesAllSchemaFieldIndexes(latestSchema, targetColumns)) {
+                || (TargetColumns.specifiesAllSchemaFieldIndexes(latestSchema, targetColumns)
+                        && latestSchema.getPrimaryKeyIndexes().length
+                                < latestSchema.getRowType().getFieldCount())) {
             return this;
         } else {
             // this also sanity checks the validity of the partial update

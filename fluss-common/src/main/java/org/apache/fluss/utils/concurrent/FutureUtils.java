@@ -134,6 +134,12 @@ public class FutureUtils {
         }
     }
 
+    /** Runs the given action after the specified delay. */
+    public static ScheduledFuture<?> runAfterDelay(
+            Runnable runnable, long delay, TimeUnit timeUnit) {
+        return Delayer.delay(runnable, delay, timeUnit);
+    }
+
     /**
      * Times the given future out after the timeout.
      *

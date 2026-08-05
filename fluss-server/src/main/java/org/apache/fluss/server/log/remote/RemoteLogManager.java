@@ -30,6 +30,7 @@ import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.remote.RemoteLogTablet.RemoteLogSegmentPage;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -52,6 +53,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -138,6 +140,11 @@ public class RemoteLogManager implements Closeable {
 
     public RemoteLogStorage getRemoteLogStorage() {
         return remoteLogStorage;
+    }
+
+    /** Executor dedicated to remote-log work, including asynchronous raw-WAL downloads. */
+    public Executor remoteLogExecutor() {
+        return rlManagerScheduledThreadPool;
     }
 
     public FsPath remoteLogDir() {
@@ -276,6 +283,16 @@ public class RemoteLogManager implements Closeable {
         return remoteLogTablet(tableBucket).relevantRemoteLogSegments(offset);
     }
 
+    /** Returns one bounded cursor page of generic remote log segment metadata. */
+    public RemoteLogSegmentPage relevantRemoteLogSegmentPage(
+            TableBucket tableBucket,
+            long offset,
+            @Nullable Long afterStartOffset,
+            int maxSegmentsToExamine) {
+        return remoteLogTablet(tableBucket)
+                .relevantRemoteLogSegmentPage(offset, afterStartOffset, maxSegmentsToExamine);
+    }
+
     private boolean remoteDisabled() {
         return taskInterval <= 0L;
     }
@@ -316,6 +333,7 @@ public class RemoteLogManager implements Closeable {
                                     remoteLog,
                                     remoteLogStorage,
                                     coordinatorGateway,
+                                    () -> zkClient.getRemoteLogManifestHandle(tableBucket),
                                     clock,
                                     maxUploadSegmentsPerTask);
                     LOG.info(

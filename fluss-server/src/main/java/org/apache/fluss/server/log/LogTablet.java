@@ -22,16 +22,21 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.CorruptRecordException;
+import org.apache.fluss.exception.CorruptSnapshotException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.metadata.KvIdempotenceProtocol;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.MetricNames;
+import org.apache.fluss.metrics.SimpleCounter;
 import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.record.DefaultLogRecordBatch;
 import org.apache.fluss.record.FileLogProjection;
@@ -39,6 +44,7 @@ import org.apache.fluss.record.FileLogRecords;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.server.log.LocalLog.SegmentDeletionReason;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -64,8 +70,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ScheduledFuture;
+import java.util.function.Predicate;
 
 import static org.apache.fluss.utils.FileUtils.flushFileIfExists;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
@@ -84,6 +92,7 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 public final class LogTablet {
 
     private static final Logger LOG = LoggerFactory.getLogger(LogTablet.class);
+    private static final Predicate<WriterKey> RETAIN_ALL_PROGRESS_WRITERS = ignored -> true;
 
     // Configured local storage root that owns this tablet, for example /data-0.
     private final File dataDir;
@@ -107,8 +116,10 @@ public final class LogTablet {
     private final LogFormat logFormat;
     private volatile int tieredLogLocalSegments;
     private final Clock clock;
+    private volatile AppendFaultInjector appendFaultInjector = AppendFaultInjector.NO_OP;
     private final boolean isChangeLog;
     private final long logTtlMs;
+    private final TabletServerMetricGroup serverMetricGroup;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -149,7 +160,8 @@ public final class LogTablet {
             int tieredLogLocalSegments,
             long logTtlMs,
             boolean isChangelog,
-            Clock clock) {
+            Clock clock,
+            TabletServerMetricGroup serverMetricGroup) {
         this.dataDir = dataDir;
         this.physicalPath = physicalPath;
         this.localLog = localLog;
@@ -177,6 +189,7 @@ public final class LogTablet {
 
         this.clock = clock;
         this.isChangeLog = isChangelog;
+        this.serverMetricGroup = serverMetricGroup;
         // Default value to 0L for changelog to avoid cleaning up any segments in case of not
         // updating this value in time. Default value to Long.MAX_VALUE for normal log table,
         // as we don't need to retain logs for kv recovery.
@@ -316,6 +329,10 @@ public final class LogTablet {
         return writerStateManager.writerIdCount();
     }
 
+    public KvIdempotenceProtocol getWriterStateProtocol() {
+        return writerStateManager.protocol();
+    }
+
     public Map<Long, WriterStateEntry> activeWriters() {
         return writerStateManager.activeWriters();
     }
@@ -337,6 +354,21 @@ public final class LogTablet {
         return writerStateManager;
     }
 
+    /** Finds committed WriterState which makes the supplied progress stale. */
+    public Optional<WriterProgressStateEntry> findStaleProgressBatch(
+            WriterKey writerKey, long progress) {
+        synchronized (lock) {
+            return writerStateManager.findStaleProgressBatch(writerKey, progress);
+        }
+    }
+
+    /** Retires cumulative-progress WriterState while preserving the LogTablet lock boundary. */
+    public void removeProgressWriters(Predicate<WriterKey> predicate) {
+        synchronized (lock) {
+            writerStateManager.removeProgressWriters(predicate);
+        }
+    }
+
     public static LogTablet create(
             File dataDir,
             PhysicalTablePath tablePath,
@@ -352,6 +384,39 @@ public final class LogTablet {
             Clock clock,
             boolean isCleanShutdown)
             throws Exception {
+        return create(
+                dataDir,
+                tablePath,
+                tabletDir,
+                conf,
+                serverMetricGroup,
+                recoveryPoint,
+                scheduler,
+                logFormat,
+                tieredLogLocalSegments,
+                logTtlMs,
+                isChangelog,
+                clock,
+                isCleanShutdown,
+                KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
+    }
+
+    public static LogTablet create(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            File tabletDir,
+            Configuration conf,
+            TabletServerMetricGroup serverMetricGroup,
+            long recoveryPoint,
+            Scheduler scheduler,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            long logTtlMs,
+            boolean isChangelog,
+            Clock clock,
+            boolean isCleanShutdown,
+            KvIdempotenceProtocol protocol)
+            throws Exception {
         // create the log directory if it doesn't exist
         Files.createDirectories(tabletDir.toPath());
 
@@ -363,7 +428,8 @@ public final class LogTablet {
                 new WriterStateManager(
                         tableBucket,
                         tabletDir,
-                        (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis());
+                        (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_TIME).toMillis(),
+                        protocol);
 
         LoadedLogOffsets offsets =
                 new LogLoader(
@@ -373,7 +439,8 @@ public final class LogTablet {
                                 recoveryPoint,
                                 logFormat,
                                 writerStateManager,
-                                isCleanShutdown)
+                                isCleanShutdown,
+                                serverMetricGroup.indexWriterStateRecoveryCoverageFailures())
                         .load();
 
         LocalLog log =
@@ -398,7 +465,42 @@ public final class LogTablet {
                 tieredLogLocalSegments,
                 logTtlMs,
                 isChangelog,
-                clock);
+                clock,
+                serverMetricGroup);
+    }
+
+    @VisibleForTesting
+    public static LogTablet create(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            File tabletDir,
+            Configuration conf,
+            TabletServerMetricGroup serverMetricGroup,
+            long recoveryPoint,
+            Scheduler scheduler,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            boolean isChangelog,
+            Clock clock,
+            boolean isCleanShutdown,
+            KvIdempotenceProtocol protocol)
+            throws Exception {
+        TableConfig tableConfig = new TableConfig(new Configuration());
+        return create(
+                dataDir,
+                tablePath,
+                tabletDir,
+                conf,
+                serverMetricGroup,
+                recoveryPoint,
+                scheduler,
+                logFormat,
+                tieredLogLocalSegments,
+                tableConfig.getLogTTLMs(),
+                isChangelog,
+                clock,
+                isCleanShutdown,
+                protocol);
     }
 
     @VisibleForTesting
@@ -471,12 +573,21 @@ public final class LogTablet {
      * Leader Epochs.
      */
     public LogAppendInfo appendAsLeader(MemoryLogRecords records) throws Exception {
-        return append(records, true);
+        return append(records, true, RETAIN_ALL_PROGRESS_WRITERS);
     }
 
     /** Append this message set to the active segment of the local log without assigning offsets. */
     public LogAppendInfo appendAsFollower(MemoryLogRecords records) throws Exception {
-        return append(records, false);
+        return appendAsFollower(records, RETAIN_ALL_PROGRESS_WRITERS);
+    }
+
+    /**
+     * Append this message set as a follower and retain matching progress WriterState after the WAL
+     * append.
+     */
+    public LogAppendInfo appendAsFollower(
+            MemoryLogRecords records, Predicate<WriterKey> retainWriterProgress) throws Exception {
+        return append(records, false, Objects.requireNonNull(retainWriterProgress));
     }
 
     /** Read messages from the local log without projection or filter. */
@@ -843,7 +954,10 @@ public final class LogTablet {
      * if the appendAsLeader=false flag is passed we will only check that the existing offsets are
      * valid.
      */
-    private LogAppendInfo append(MemoryLogRecords records, boolean appendAsLeader)
+    private LogAppendInfo append(
+            MemoryLogRecords records,
+            boolean appendAsLeader,
+            Predicate<WriterKey> retainWriterProgress)
             throws Exception {
         LogAppendInfo appendInfo = analyzeAndValidateRecords(records);
 
@@ -876,72 +990,110 @@ public final class LogTablet {
                 }
             }
 
-            // maybe roll the log if this segment is full.
-            maybeRoll(validRecords.sizeInBytes(), appendInfo);
-
-            // now that we have valid records, offsets assigned, we need to validate the idempotent
-            // state of the writers and collect some metadata.
-            Either<WriterStateEntry.BatchMetadata, Collection<WriterAppendInfo>> validateResult =
-                    analyzeAndValidateWriterState(validRecords, appendAsLeader);
-
-            if (validateResult.isLeft()) {
-                // have duplicated batch metadata, skip the append and update append info.
-                WriterStateEntry.BatchMetadata duplicatedBatch = validateResult.left();
-                long startOffset = duplicatedBatch.firstOffset();
-                if (appendAsLeader) {
-                    appendInfo.setFirstOffset(startOffset);
-                    appendInfo.setLastOffset(duplicatedBatch.lastOffset);
-                    appendInfo.setMaxTimestamp(duplicatedBatch.timestamp);
-                    appendInfo.setStartOffsetOfMaxTimestamp(startOffset);
-                    appendInfo.setDuplicated(true);
+            Collection<WriterAppendInfo> updatedWriters = Collections.emptyList();
+            Collection<WriterProgressAppendInfo> updatedProgressWriters = Collections.emptyList();
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
+                // Preserve the compact protocol's existing roll-before-duplicate-check behavior.
+                maybeRoll(validRecords.sizeInBytes(), appendInfo);
+                Either<WriterStateEntry.BatchMetadata, Collection<WriterAppendInfo>>
+                        validateResult =
+                                analyzeAndValidateWriterState(validRecords, appendAsLeader);
+                if (validateResult.isRight()) {
+                    updatedWriters = validateResult.right();
                 } else {
-                    String errorMsg =
-                            String.format(
-                                    "Found duplicated batch for table bucket %s, duplicated offset is %s, "
-                                            + "writer id is %s and batch sequence is: %s",
-                                    getTableBucket(),
-                                    duplicatedBatch.lastOffset,
-                                    duplicatedBatch.writerId,
-                                    duplicatedBatch.batchSequence);
-                    LOG.error(errorMsg);
-                    throw new DuplicateSequenceException(errorMsg);
+                    // have duplicated batch metadata, skip the append and update append info.
+                    WriterStateEntry.BatchMetadata duplicatedBatch = validateResult.left();
+                    long startOffset = duplicatedBatch.firstOffset();
+                    if (appendAsLeader) {
+                        appendInfo.setFirstOffset(startOffset);
+                        appendInfo.setLastOffset(duplicatedBatch.lastOffset);
+                        appendInfo.setMaxTimestamp(duplicatedBatch.timestamp);
+                        appendInfo.setStartOffsetOfMaxTimestamp(startOffset);
+                        appendInfo.setDuplicated(true);
+                    } else {
+                        String errorMsg =
+                                String.format(
+                                        "Found duplicated batch for table bucket %s, duplicated offset is %s, "
+                                                + "writer id is %s and batch sequence is: %s",
+                                        getTableBucket(),
+                                        duplicatedBatch.lastOffset,
+                                        duplicatedBatch.writerId,
+                                        duplicatedBatch.batchSequence);
+                        LOG.error(errorMsg);
+                        throw new DuplicateSequenceException(errorMsg);
+                    }
+                    return appendInfo;
                 }
             } else {
-                // Append the records, and increment the local log end offset immediately after
-                // append because write to the transaction index below may fail, and we want to
-                // ensure that the offsets of future appends still grow monotonically.
-                localLog.append(
-                        appendInfo.lastOffset(),
-                        appendInfo.maxTimestamp(),
-                        appendInfo.startOffsetOfMaxTimestamp(),
-                        validRecords);
-                updateHighWatermarkWithLogEndOffset();
-
-                // update the writer state.
-                Collection<WriterAppendInfo> updatedWriters = validateResult.right();
-                updatedWriters.forEach(writerStateManager::update);
-
-                // always update the last writer id map offset so that the snapshot reflects
-                // the current offset even if there isn't any idempotent data being written.
-                writerStateManager.updateMapEndOffset(appendInfo.lastOffset() + 1);
-
-                // todo update the first unstable offset (which is used to compute lso)
-
-                LOG.trace(
-                        "Appended message set with last offset: {}, first offset {}, next offset: {} "
-                                + "and messages {} for bucket {}",
-                        appendInfo.lastOffset(),
-                        appendInfo.firstOffset(),
-                        localLog.getLocalLogEndOffset(),
-                        validRecords,
-                        getTableBucket());
-
-                if (localLog.unflushedMessages() >= logFlushIntervalMessages) {
-                    flush(false);
+                ProgressValidationResult validateResult =
+                        analyzeAndValidateWriterProgress(validRecords);
+                if (validateResult.allStale()) {
+                    if (appendAsLeader) {
+                        return LogAppendInfo.duplicatedAt(
+                                validateResult.requiredWalOffset(),
+                                validateResult.requiredTimestamp());
+                    }
+                    throw new DuplicateSequenceException(
+                            String.format(
+                                    "Found an all-stale writer progress append for table bucket %s; required WAL offset is %s",
+                                    getTableBucket(), validateResult.requiredWalOffset()));
                 }
+                updatedProgressWriters = validateResult.updates();
+                // A stale progress batch returned above without rolling or mutating the WAL.
+                maybeRoll(validRecords.sizeInBytes(), appendInfo);
+            }
+
+            // Publish WriterState only after the corresponding WAL append succeeds.
+            appendFaultInjector.inject(AppendPhase.BEFORE_LOCAL_APPEND);
+            localLog.append(
+                    appendInfo.lastOffset(),
+                    appendInfo.maxTimestamp(),
+                    appendInfo.startOffsetOfMaxTimestamp(),
+                    validRecords);
+            appendFaultInjector.inject(AppendPhase.AFTER_LOCAL_APPEND);
+            updateHighWatermarkWithLogEndOffset();
+            updatedWriters.forEach(writerStateManager::update);
+            updatedProgressWriters.stream()
+                    .filter(update -> retainWriterProgress.test(update.writerKey()))
+                    .forEach(writerStateManager::updateProgress);
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
+                appendFaultInjector.inject(AppendPhase.AFTER_WRITER_STATE_UPDATE);
+            }
+            writerStateManager.updateMapEndOffset(appendInfo.lastOffset() + 1);
+
+            // todo update the first unstable offset (which is used to compute lso)
+
+            LOG.trace(
+                    "Appended message set with last offset: {}, first offset {}, next offset: {} "
+                            + "and messages {} for bucket {}",
+                    appendInfo.lastOffset(),
+                    appendInfo.firstOffset(),
+                    localLog.getLocalLogEndOffset(),
+                    validRecords,
+                    getTableBucket());
+
+            if (localLog.unflushedMessages() >= logFlushIntervalMessages) {
+                flush(false);
             }
             return appendInfo;
         }
+    }
+
+    void setAppendFaultInjector(AppendFaultInjector appendFaultInjector) {
+        this.appendFaultInjector = appendFaultInjector;
+    }
+
+    enum AppendPhase {
+        BEFORE_LOCAL_APPEND,
+        AFTER_LOCAL_APPEND,
+        AFTER_WRITER_STATE_UPDATE,
+        DURING_WRITER_RECOVERY
+    }
+
+    interface AppendFaultInjector {
+        AppendFaultInjector NO_OP = phase -> {};
+
+        void inject(AppendPhase phase) throws Exception;
     }
 
     private void updateHighWatermarkWithLogEndOffset() {
@@ -1137,6 +1289,23 @@ public final class LogTablet {
         }
     }
 
+    /** Prepare remote WriterState restore without rebuilding before its snapshot is downloaded. */
+    public void prepareRemoteWriterStateRecovery(long newOffset) throws LogStorageException {
+        synchronized (lock) {
+            try {
+                localLog.truncateFullyAndStartAt(newOffset);
+                writerStateManager.truncateFullyAndStartAt(0L);
+                updateHighWatermark(localLog.getLocalLogEndOffset());
+            } catch (IOException e) {
+                throw new LogStorageException(
+                        String.format(
+                                "Error while preparing remote WriterState recovery for bucket %s at offset %s.",
+                                getTableBucket(), newOffset),
+                        e);
+            }
+        }
+    }
+
     /**
      * Completely delete the local log directory and all contents form the file system with no
      * delay.
@@ -1255,6 +1424,7 @@ public final class LogTablet {
         Map<Long, WriterAppendInfo> updatedWriters = new HashMap<>();
 
         for (LogRecordBatch batch : records.batches()) {
+            validateWalProtocol(batch, KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE);
             if (batch.hasWriterId()) {
                 // if this is a write request, there will be up to 5 batches which could
                 // have been duplicated. If we find a duplicate, we return the metadata of the
@@ -1275,6 +1445,116 @@ public final class LogTablet {
         return Either.right(updatedWriters.values());
     }
 
+    private ProgressValidationResult analyzeAndValidateWriterProgress(MemoryLogRecords records) {
+        List<WriterProgressAppendInfo> updates = new ArrayList<>();
+        Map<WriterKey, WriterProgressStateEntry> staged = new HashMap<>();
+        boolean sawFresh = false;
+        boolean sawCommittedStale = false;
+        long requiredWalOffset = -1L;
+        long requiredTimestamp = -1L;
+        for (LogRecordBatch batch : records.batches()) {
+            validateWalProtocol(batch, KvIdempotenceProtocol.CUMULATIVE_PROGRESS);
+            WriterKey writerKey = batch.writerKey();
+            WriterProgressStateEntry committed =
+                    writerStateManager.lastProgressEntry(writerKey).orElse(null);
+            WriterProgressStateEntry stagedCurrent = staged.get(writerKey);
+            if (stagedCurrent != null && batch.writerProgress() <= stagedCurrent.lastProgress()) {
+                throw progressOrderingError(
+                        writerKey, batch.writerProgress(), stagedCurrent.lastProgress(), "staged");
+            }
+            if (committed != null && batch.writerProgress() <= committed.lastProgress()) {
+                if (sawFresh) {
+                    throw mixedProgressAppendError();
+                }
+                sawCommittedStale = true;
+                if (committed.progressWalOffset() > requiredWalOffset) {
+                    requiredWalOffset = committed.progressWalOffset();
+                    requiredTimestamp = committed.lastTimestamp();
+                }
+                continue;
+            }
+            if (sawCommittedStale) {
+                throw mixedProgressAppendError();
+            }
+            sawFresh = true;
+            WriterProgressStateEntry current = stagedCurrent != null ? stagedCurrent : committed;
+            WriterProgressAppendInfo update =
+                    new WriterProgressAppendInfo(writerKey, getTableBucket(), current);
+            update.append(batch.writerProgress(), batch.lastLogOffset(), batch.commitTimestamp());
+            updates.add(update);
+            staged.put(writerKey, update.updatedEntry());
+        }
+        return sawCommittedStale
+                ? ProgressValidationResult.allStale(requiredWalOffset, requiredTimestamp)
+                : ProgressValidationResult.allFresh(updates);
+    }
+
+    private void validateWalProtocol(LogRecordBatch batch, KvIdempotenceProtocol expectedProtocol) {
+        if (batch.idempotenceProtocolVersion() != expectedProtocol.version()) {
+            throw new CorruptRecordException(
+                    String.format(
+                            "Target WAL magic %s does not match table mode %s (value %s) for %s",
+                            batch.magic(),
+                            expectedProtocol,
+                            expectedProtocol.version(),
+                            getTableBucket()));
+        }
+    }
+
+    private OutOfOrderSequenceException progressOrderingError(
+            WriterKey writerKey, long incoming, long current, String stateKind) {
+        return new OutOfOrderSequenceException(
+                String.format(
+                        "Non-increasing progress %s for writer %s in %s; %s progress is %s",
+                        incoming, writerKey, getTableBucket(), stateKind, current));
+    }
+
+    private OutOfOrderSequenceException mixedProgressAppendError() {
+        return new OutOfOrderSequenceException(
+                "A cumulative-progress WAL append cannot mix committed-stale and fresh batches for "
+                        + getTableBucket());
+    }
+
+    private static final class ProgressValidationResult {
+        private final Collection<WriterProgressAppendInfo> updates;
+        private final long requiredWalOffset;
+        private final long requiredTimestamp;
+
+        private ProgressValidationResult(
+                Collection<WriterProgressAppendInfo> updates,
+                long requiredWalOffset,
+                long requiredTimestamp) {
+            this.updates = updates;
+            this.requiredWalOffset = requiredWalOffset;
+            this.requiredTimestamp = requiredTimestamp;
+        }
+
+        private static ProgressValidationResult allFresh(
+                Collection<WriterProgressAppendInfo> updates) {
+            return new ProgressValidationResult(updates, -1L, -1L);
+        }
+
+        private static ProgressValidationResult allStale(long offset, long timestamp) {
+            return new ProgressValidationResult(Collections.emptyList(), offset, timestamp);
+        }
+
+        private boolean allStale() {
+            return requiredWalOffset >= 0L;
+        }
+
+        private Collection<WriterProgressAppendInfo> updates() {
+            return updates;
+        }
+
+        private long requiredWalOffset() {
+            return requiredWalOffset;
+        }
+
+        private long requiredTimestamp() {
+            return requiredTimestamp;
+        }
+    }
+
     @VisibleForTesting
     public void removeExpiredWriter(long currentTimeMs) {
         synchronized (lock) {
@@ -1290,16 +1570,21 @@ public final class LogTablet {
             throws IOException {
         synchronized (lock) {
             localLog.checkIfMemoryMappedBufferClosed();
-            // TODO, Here, we use 0 as the logStartOffset passed into rebuildWriterState. The reason
-            // is that the current implementation of logStartOffset in Fluss is not yet fully
-            // refined, and there may be cases where logStartOffset is not updated. As a result,
-            // logStartOffset is not yet reliable. Once the issue with correctly updating
-            // logStartOffset is resolved in issue https://github.com/apache/fluss/issues/744, we
-            // can use logStartOffset here.
-            // Additionally, using 0 versus using logStartOffset does not affect correctness—they
-            // both can restore the complete WriterState. The only difference is that using
-            // logStartOffset can potentially skip over more segments.
-            rebuildWriterState(writerStateManager, localLog.getSegments(), 0, lastOffset, false);
+            long retainedLogStartOffset =
+                    writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS
+                            ? localLog.getSegments()
+                                    .firstSegment()
+                                    .map(LogSegment::getBaseOffset)
+                                    .orElse(lastOffset)
+                            : 0L;
+            rebuildWriterState(
+                    writerStateManager,
+                    localLog.getSegments(),
+                    retainedLogStartOffset,
+                    lastOffset,
+                    false,
+                    appendFaultInjector,
+                    serverMetricGroup.indexWriterStateRecoveryCoverageFailures());
         }
     }
 
@@ -1412,6 +1697,43 @@ public final class LogTablet {
             long lastOffset,
             boolean reloadFromCleanShutdown)
             throws IOException {
+        rebuildWriterState(
+                writerStateManager,
+                segments,
+                logStartOffset,
+                lastOffset,
+                reloadFromCleanShutdown,
+                AppendFaultInjector.NO_OP,
+                new SimpleCounter());
+    }
+
+    static void rebuildWriterState(
+            WriterStateManager writerStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long lastOffset,
+            boolean reloadFromCleanShutdown,
+            Counter recoveryCoverageFailures)
+            throws IOException {
+        rebuildWriterState(
+                writerStateManager,
+                segments,
+                logStartOffset,
+                lastOffset,
+                reloadFromCleanShutdown,
+                AppendFaultInjector.NO_OP,
+                recoveryCoverageFailures);
+    }
+
+    private static void rebuildWriterState(
+            WriterStateManager writerStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long lastOffset,
+            boolean reloadFromCleanShutdown,
+            AppendFaultInjector recoveryFaultInjector,
+            Counter recoveryCoverageFailures)
+            throws IOException {
         List<Optional<Long>> offsetsToSnapshot = new ArrayList<>();
         if (!segments.isEmpty()) {
             long lastSegmentBaseOffset = segments.lastSegment().get().getBaseOffset();
@@ -1440,7 +1762,9 @@ public final class LogTablet {
         // snapshot at the log end offset (see below). The next time the log is reloaded, we will
         // load writer state using this snapshot (or later snapshots). Otherwise, if there is
         // no snapshot file, then we have to rebuild writer state from the first segment.
-        if (!writerStateManager.latestSnapshotOffset().isPresent() && reloadFromCleanShutdown) {
+        if (writerStateManager.protocol() == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE
+                && !writerStateManager.latestSnapshotOffset().isPresent()
+                && reloadFromCleanShutdown) {
             // To avoid an expensive scan through all the segments, we take empty snapshots from
             // the start of the last two segments and the last offset. This should avoid the full
             // scan in the case that the log needs truncation.
@@ -1458,52 +1782,41 @@ public final class LogTablet {
             boolean isEmptyBeforeTruncation =
                     writerStateManager.isEmpty() && writerStateManager.mapEndOffset() >= lastOffset;
             long writerStateLoadStart = System.currentTimeMillis();
+            if (writerStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
+                try {
+                    rebuildWriterProgressState(
+                            writerStateManager,
+                            segments,
+                            logStartOffset,
+                            lastOffset,
+                            recoveryFaultInjector);
+                } catch (CorruptSnapshotException | CorruptRecordException failure) {
+                    recoveryCoverageFailures.inc();
+                    throw failure;
+                }
+                writerStateManager.takeSnapshot();
+                LOG.info(
+                        "Writer state recovery took {} ms for bucket {} from offset {}",
+                        System.currentTimeMillis() - writerStateLoadStart,
+                        segments.getTableBucket(),
+                        lastOffset);
+                return;
+            }
+
             writerStateManager.truncateAndReload(
                     logStartOffset, lastOffset, System.currentTimeMillis());
             long segmentRecoveryStart = System.currentTimeMillis();
-
-            // Only do the potentially expensive reloading if the last snapshot offset is lower than
-            // the log end offset (which would be the case on first startup) and there were active
-            // writers prior to truncation (which could be the case if truncating after initial
-            // loading). If there weren't, then truncating shouldn't change that fact (although it
-            // could cause a writer id to expire earlier than expected), and we can skip the
-            // loading. This is an optimization for users which are not yet using idempotent
-            // features yet.
+            // Cumulative-progress recovery always scans the complete candidate range before
+            // publishing it. The contiguous-sequence writer map retains the existing shortcut.
             if (lastOffset > writerStateManager.mapEndOffset() && !isEmptyBeforeTruncation) {
-                Optional<LogSegment> segmentOfLastOffset = segments.floorSegment(lastOffset);
-
-                List<LogSegment> segmentsList =
-                        segments.values(writerStateManager.mapEndOffset(), lastOffset);
-                for (LogSegment segment : segmentsList) {
-                    long startOffset =
-                            Math.max(
-                                    Math.max(
-                                            segment.getBaseOffset(),
-                                            writerStateManager.mapEndOffset()),
-                                    logStartOffset);
-                    writerStateManager.updateMapEndOffset(startOffset);
-
-                    if (offsetsToSnapshot.contains(Optional.of(segment.getBaseOffset()))) {
-                        writerStateManager.takeSnapshot();
-                    }
-
-                    int maxPosition = segment.getSizeInBytes();
-                    if (segmentOfLastOffset.isPresent() && segmentOfLastOffset.get() == segment) {
-                        FileLogRecords.LogOffsetPosition logOffsetPosition =
-                                segment.translateOffset(lastOffset);
-                        if (logOffsetPosition != null) {
-                            maxPosition = logOffsetPosition.position;
-                        }
-                    }
-
-                    FetchDataInfo fetchDataInfo =
-                            segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
-                    if (fetchDataInfo != null) {
-                        loadWritersFromRecords(writerStateManager, fetchDataInfo.getRecords());
-                    }
-                }
+                reloadWriterStateFromLog(
+                        writerStateManager,
+                        segments,
+                        logStartOffset,
+                        lastOffset,
+                        offsetsToSnapshot,
+                        recoveryFaultInjector);
             }
-
             writerStateManager.updateMapEndOffset(lastOffset);
             writerStateManager.takeSnapshot();
             LOG.info(
@@ -1515,15 +1828,163 @@ public final class LogTablet {
         }
     }
 
-    private static void loadWritersFromRecords(
-            WriterStateManager writerStateManager, LogRecords records) {
-        Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
-        for (LogRecordBatch batch : records.batches()) {
-            if (batch.hasWriterId()) {
-                updateWriterAppendInfo(writerStateManager, batch, loadedWriters, false);
+    private static void rebuildWriterProgressState(
+            WriterStateManager writerStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long recoveryEndOffset,
+            AppendFaultInjector recoveryFaultInjector)
+            throws IOException {
+        RuntimeException latestSemanticFailure = null;
+        for (Optional<Long> snapshotOffset :
+                writerStateManager.progressRecoveryCandidateOffsets(
+                        logStartOffset, recoveryEndOffset)) {
+            try {
+                WriterStateManager candidate =
+                        writerStateManager.progressRecoveryCandidate(
+                                logStartOffset, recoveryEndOffset, snapshotOffset);
+                reloadWriterStateFromLog(
+                        candidate,
+                        segments,
+                        logStartOffset,
+                        recoveryEndOffset,
+                        Collections.emptyList(),
+                        recoveryFaultInjector);
+                candidate.validateRecoveryCoverage(logStartOffset, recoveryEndOffset);
+                writerStateManager.publishProgressRecovery(candidate, recoveryEndOffset);
+                return;
+            } catch (CorruptSnapshotException | CorruptRecordException semanticFailure) {
+                latestSemanticFailure = semanticFailure;
+                LOG.warn(
+                        "Ignoring invalid writer progress recovery candidate {} for bucket {}",
+                        snapshotOffset,
+                        segments.getTableBucket(),
+                        semanticFailure);
             }
         }
-        loadedWriters.values().forEach(writerStateManager::update);
+        String failureDetail =
+                latestSemanticFailure == null
+                        ? "no snapshot is allowed because retained WAL starts at " + logStartOffset
+                        : latestSemanticFailure.getMessage();
+        throw new CorruptSnapshotException(
+                String.format(
+                        "No writer progress snapshot and retained WAL provide continuous recovery over [%d,%d): %s",
+                        logStartOffset, recoveryEndOffset, failureDetail),
+                latestSemanticFailure);
+    }
+
+    private static void reloadWriterStateFromLog(
+            WriterStateManager recoveryStateManager,
+            LogSegments segments,
+            long logStartOffset,
+            long recoveryEndOffset,
+            List<Optional<Long>> offsetsToSnapshot,
+            AppendFaultInjector recoveryFaultInjector)
+            throws IOException {
+        if (recoveryEndOffset <= recoveryStateManager.mapEndOffset()) {
+            return;
+        }
+
+        Optional<LogSegment> segmentOfLastOffset = segments.floorSegment(recoveryEndOffset);
+        List<LogSegment> segmentsList =
+                segments.values(recoveryStateManager.mapEndOffset(), recoveryEndOffset);
+        for (LogSegment segment : segmentsList) {
+            long startOffset =
+                    Math.max(
+                            Math.max(segment.getBaseOffset(), recoveryStateManager.mapEndOffset()),
+                            logStartOffset);
+            if (recoveryStateManager.protocol() == KvIdempotenceProtocol.CUMULATIVE_PROGRESS) {
+                if (startOffset > recoveryStateManager.mapEndOffset()) {
+                    throw recoveryGap(recoveryStateManager, startOffset, recoveryEndOffset);
+                }
+            } else {
+                recoveryStateManager.updateMapEndOffset(startOffset);
+                if (offsetsToSnapshot.contains(Optional.of(segment.getBaseOffset()))) {
+                    recoveryStateManager.takeSnapshot();
+                }
+            }
+
+            int maxPosition = segment.getSizeInBytes();
+            if (segmentOfLastOffset.isPresent() && segmentOfLastOffset.get() == segment) {
+                FileLogRecords.LogOffsetPosition logOffsetPosition =
+                        segment.translateOffset(recoveryEndOffset);
+                if (logOffsetPosition != null) {
+                    maxPosition = logOffsetPosition.position;
+                }
+            }
+
+            FetchDataInfo fetchDataInfo =
+                    segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
+            if (fetchDataInfo != null) {
+                loadWritersFromRecords(
+                        recoveryStateManager, fetchDataInfo.getRecords(), recoveryFaultInjector);
+            }
+        }
+    }
+
+    private static void loadWritersFromRecords(
+            WriterStateManager writerStateManager,
+            LogRecords records,
+            AppendFaultInjector recoveryFaultInjector)
+            throws IOException {
+        if (writerStateManager.protocol() == KvIdempotenceProtocol.CONTIGUOUS_BATCH_SEQUENCE) {
+            Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
+            for (LogRecordBatch batch : records.batches()) {
+                if (batch.idempotenceProtocolVersion() != 0) {
+                    throw new CorruptRecordException(
+                            "Cumulative-progress target WAL found while recovering a contiguous-sequence table");
+                }
+                if (batch.hasWriterId()) {
+                    updateWriterAppendInfo(writerStateManager, batch, loadedWriters, false);
+                }
+            }
+            loadedWriters.values().forEach(writerStateManager::update);
+        } else {
+            for (LogRecordBatch batch : records.batches()) {
+                batch.ensureValid();
+                long expectedOffset = writerStateManager.mapEndOffset();
+                if (batch.lastLogOffset() < expectedOffset) {
+                    continue;
+                }
+                if (batch.baseLogOffset() != expectedOffset) {
+                    throw recoveryGap(
+                            writerStateManager, batch.baseLogOffset(), batch.nextLogOffset());
+                }
+                if (batch.idempotenceProtocolVersion() != 1) {
+                    throw new CorruptRecordException(
+                            "Contiguous-sequence target WAL found while recovering a cumulative-progress table");
+                }
+                Optional<WriterProgressStateEntry> stale =
+                        writerStateManager.findStaleProgressBatch(
+                                batch.writerKey(), batch.writerProgress());
+                if (stale.isPresent()) {
+                    throw new CorruptRecordException(
+                            "Non-increasing writer progress found while recovering target WAL");
+                }
+                WriterProgressAppendInfo update =
+                        writerStateManager.prepareProgressUpdate(batch.writerKey());
+                update.append(
+                        batch.writerProgress(), batch.lastLogOffset(), batch.commitTimestamp());
+                writerStateManager.updateProgress(update);
+                writerStateManager.updateMapEndOffset(batch.nextLogOffset());
+                try {
+                    recoveryFaultInjector.inject(AppendPhase.DURING_WRITER_RECOVERY);
+                } catch (Error error) {
+                    throw error;
+                } catch (Exception failure) {
+                    throw new IOException(
+                            "Injected cumulative-progress WriterState recovery failure", failure);
+                }
+            }
+        }
+    }
+
+    private static CorruptSnapshotException recoveryGap(
+            WriterStateManager writerStateManager, long nextOffset, long recoveryEnd) {
+        return new CorruptSnapshotException(
+                String.format(
+                        "Writer progress recovery has a WAL gap [%d,%d) before recovery end %d",
+                        writerStateManager.mapEndOffset(), nextOffset, recoveryEnd));
     }
 
     public static void deleteWriterSnapshots(

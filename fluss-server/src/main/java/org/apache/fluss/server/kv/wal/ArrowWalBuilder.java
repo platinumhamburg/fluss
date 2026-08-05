@@ -22,6 +22,7 @@ import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.MemoryLogRecordsArrowBuilder;
+import org.apache.fluss.record.WriterKey;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.arrow.ArrowWriter;
@@ -37,10 +38,29 @@ public class ArrowWalBuilder implements WalBuilder {
 
     public ArrowWalBuilder(int schemaId, ArrowWriter writer, MemorySegmentPool memorySegmentPool)
             throws IOException {
+        this(schemaId, writer, memorySegmentPool, false);
+    }
+
+    private ArrowWalBuilder(
+            int schemaId,
+            ArrowWriter writer,
+            MemorySegmentPool memorySegmentPool,
+            boolean progressMode)
+            throws IOException {
         this.memorySegmentPool = memorySegmentPool;
         this.outputView = new ManagedPagedOutputView(memorySegmentPool);
         this.recordsBuilder =
-                MemoryLogRecordsArrowBuilder.builder(schemaId, writer, outputView, false, null);
+                progressMode
+                        ? MemoryLogRecordsArrowBuilder.progressBuilder(
+                                schemaId, writer, outputView, false, null)
+                        : MemoryLogRecordsArrowBuilder.builder(
+                                schemaId, writer, outputView, false, null);
+    }
+
+    public static ArrowWalBuilder progressBuilder(
+            int schemaId, ArrowWriter writer, MemorySegmentPool memorySegmentPool)
+            throws IOException {
+        return new ArrowWalBuilder(schemaId, writer, memorySegmentPool, true);
     }
 
     @Override
@@ -61,6 +81,11 @@ public class ArrowWalBuilder implements WalBuilder {
     @Override
     public void setWriterState(long writerId, int batchSequence) {
         recordsBuilder.setWriterState(writerId, batchSequence);
+    }
+
+    @Override
+    public void setWriterProgress(WriterKey writerKey, long progress) {
+        recordsBuilder.setWriterProgress(writerKey, progress);
     }
 
     @Override

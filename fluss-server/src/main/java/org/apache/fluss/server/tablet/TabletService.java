@@ -272,7 +272,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     public CompletableFuture<PutKvResponse> putKv(PutKvRequest request) {
         authorizeTable(WRITE, request.getTableId());
 
-        Map<TableBucket, KvRecordBatch> putKvData = getPutKvData(request);
+        Map<TableBucket, KvRecordBatch> putKvData =
+                getPutKvData(request, currentSession().getApiVersion());
         // Get mergeMode from request, default to DEFAULT if not set
         MergeMode mergeMode =
                 request.hasAggMode()
