@@ -627,6 +627,10 @@ public final class Schema implements Serializable {
                     "Index name '%s' cannot contain double underscores '__'.",
                     indexName);
             checkArgument(
+                    !indexName.startsWith("_"),
+                    "Index name '%s' cannot start with underscore '_'.",
+                    indexName);
+            checkArgument(
                     indexes.stream().noneMatch(index -> index.getIndexName().equals(indexName)),
                     "Duplicate index name '%s'.",
                     indexName);
@@ -873,6 +877,10 @@ public final class Schema implements Serializable {
             checkArgument(
                     !indexName.contains("__"),
                     "Index name '%s' cannot contain double underscores '__'.",
+                    indexName);
+            checkArgument(
+                    !indexName.startsWith("_"),
+                    "Index name '%s' cannot start with underscore '_'.",
                     indexName);
             checkNotNull(indexType, "Index type must not be null.");
             checkArgument(
