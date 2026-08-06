@@ -28,7 +28,7 @@ import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.utils.IndexTableUtils;
 
-import org.rocksdb.AbstractCompactionFilterFactory;
+import org.fluss.rocksdb.AbstractCompactionFilterFactory;
 
 import javax.annotation.Nullable;
 

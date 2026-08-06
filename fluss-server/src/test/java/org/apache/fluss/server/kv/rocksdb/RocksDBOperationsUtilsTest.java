@@ -21,9 +21,9 @@ import org.apache.fluss.rocksdb.RocksDBOperationUtils;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.rocksdb.DBOptions;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
+import org.fluss.rocksdb.DBOptions;
+import org.fluss.rocksdb.RocksDB;
+import org.fluss.rocksdb.RocksDBException;
 
 import java.io.File;
 import java.io.IOException;

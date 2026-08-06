@@ -34,8 +34,8 @@ import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.utils.IndexTableUtils;
 
-import org.rocksdb.AbstractCompactionFilter;
-import org.rocksdb.AbstractCompactionFilterFactory;
+import org.fluss.rocksdb.AbstractCompactionFilter;
+import org.fluss.rocksdb.AbstractCompactionFilterFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

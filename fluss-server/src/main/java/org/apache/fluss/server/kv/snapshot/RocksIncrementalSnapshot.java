@@ -22,8 +22,8 @@ import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FileUtils;
 
-import org.rocksdb.Checkpoint;
-import org.rocksdb.RocksDB;
+import org.fluss.rocksdb.Checkpoint;
+import org.fluss.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

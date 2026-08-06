@@ -1506,7 +1506,7 @@ class KvTabletTest {
         assertThat(statistics).as("RocksDB statistics should be available").isNotNull();
 
         // Verify statistics is properly initialized
-        org.rocksdb.Statistics stats = kvTablet.getRocksDBKv().getStatistics();
+        org.fluss.rocksdb.Statistics stats = kvTablet.getRocksDBKv().getStatistics();
         assertThat(stats).as("RocksDB Statistics should be enabled").isNotNull();
 
         // All metrics should start at 0 for a fresh database

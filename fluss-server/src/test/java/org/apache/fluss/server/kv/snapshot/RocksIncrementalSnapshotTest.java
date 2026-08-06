@@ -31,7 +31,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
-import org.rocksdb.RocksDB;
+import org.fluss.rocksdb.RocksDB;
 
 import java.nio.file.Path;
 import java.util.Collection;

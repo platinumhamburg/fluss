@@ -21,9 +21,9 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.row.encode.KvValueLayout;
 
-import org.rocksdb.AbstractCompactionFilter;
-import org.rocksdb.AbstractCompactionFilterFactory;
-import org.rocksdb.FloorSetCompactionFilter;
+import org.fluss.rocksdb.AbstractCompactionFilter;
+import org.fluss.rocksdb.AbstractCompactionFilterFactory;
+import org.fluss.rocksdb.FloorSetCompactionFilter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

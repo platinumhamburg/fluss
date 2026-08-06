@@ -22,10 +22,10 @@ import org.apache.fluss.metrics.Histogram;
 import org.apache.fluss.server.kv.KvBatchWriter;
 import org.apache.fluss.utils.IOUtils;
 
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
-import org.rocksdb.WriteBatch;
-import org.rocksdb.WriteOptions;
+import org.fluss.rocksdb.RocksDB;
+import org.fluss.rocksdb.RocksDBException;
+import org.fluss.rocksdb.WriteBatch;
+import org.fluss.rocksdb.WriteOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

@@ -17,10 +17,10 @@
 
 package org.apache.fluss.rocksdb;
 
-import org.rocksdb.RocksDBException;
-import org.rocksdb.RocksIterator;
-import org.rocksdb.RocksIteratorInterface;
-import org.rocksdb.Snapshot;
+import org.fluss.rocksdb.RocksDBException;
+import org.fluss.rocksdb.RocksIterator;
+import org.fluss.rocksdb.RocksIteratorInterface;
+import org.fluss.rocksdb.Snapshot;
 
 import javax.annotation.Nonnull;
 

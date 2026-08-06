@@ -51,11 +51,11 @@ import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.rocksdb.AbstractCompactionFilter;
-import org.rocksdb.AbstractCompactionFilterFactory;
-import org.rocksdb.RateLimiter;
-import org.rocksdb.RateLimiterMode;
-import org.rocksdb.RocksDB;
+import org.fluss.rocksdb.AbstractCompactionFilter;
+import org.fluss.rocksdb.AbstractCompactionFilterFactory;
+import org.fluss.rocksdb.RateLimiter;
+import org.fluss.rocksdb.RateLimiterMode;
+import org.fluss.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

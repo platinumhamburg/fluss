@@ -25,15 +25,15 @@ import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.IOUtils;
 
-import org.rocksdb.Cache;
-import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.ColumnFamilyOptions;
-import org.rocksdb.ReadOptions;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
-import org.rocksdb.RocksIterator;
-import org.rocksdb.Statistics;
-import org.rocksdb.WriteOptions;
+import org.fluss.rocksdb.Cache;
+import org.fluss.rocksdb.ColumnFamilyHandle;
+import org.fluss.rocksdb.ColumnFamilyOptions;
+import org.fluss.rocksdb.ReadOptions;
+import org.fluss.rocksdb.RocksDB;
+import org.fluss.rocksdb.RocksDBException;
+import org.fluss.rocksdb.RocksIterator;
+import org.fluss.rocksdb.Statistics;
+import org.fluss.rocksdb.WriteOptions;
 
 import javax.annotation.Nullable;
 
@@ -41,7 +41,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
-/** A wrapper for the operation of {@link org.rocksdb.RocksDB}. */
+/** A wrapper for the operation of {@link org.fluss.rocksdb.RocksDB}. */
 public class RocksDBKv implements AutoCloseable {
 
     /** The container of RocksDB option factory and predefined options. */
