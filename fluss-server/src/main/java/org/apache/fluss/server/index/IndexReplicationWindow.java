@@ -51,7 +51,8 @@ final class IndexReplicationWindow {
     private volatile boolean admitted;
     private boolean terminal;
 
-    IndexReplicationWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
+    IndexReplicationWindow(
+            String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
         this.indexName = indexName;
         this.windowEndOffset = windowEndOffset;
         this.expectedBatchCount = batchCount;

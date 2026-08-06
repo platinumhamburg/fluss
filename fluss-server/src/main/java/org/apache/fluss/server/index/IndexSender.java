@@ -78,8 +78,8 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
  *
  * <p>Reliability follows at-least-once semantics: on RPC failure (or unresolved leader) the batch
  * is re-enqueued to the front of its bucket queue via {@link
- * IndexSendBuffer#reEnqueueIfActive(IndexBatch, long)} for unlimited retry, and the owning
- * window's offset is never advanced. On success the batch notifies its window via {@link
+ * IndexSendBuffer#reEnqueueIfActive(IndexBatch, long)} for unlimited retry, and the owning window's
+ * offset is never advanced. On success the batch notifies its window via {@link
  * IndexBatch#window()}, which advances the replicator's pushed offset once the whole window is
  * acknowledged.
  */

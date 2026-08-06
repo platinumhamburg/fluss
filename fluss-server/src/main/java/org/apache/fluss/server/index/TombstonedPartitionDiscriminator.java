@@ -136,7 +136,8 @@ final class TombstonedPartitionDiscriminator {
     }
 
     /**
-     * Diagnostic accessor used by {@code IndexReplicationSupervisor} when logging filter installation.
+     * Diagnostic accessor used by {@code IndexReplicationSupervisor} when logging filter
+     * installation.
      */
     long mainTableId() {
         return mainTableId;

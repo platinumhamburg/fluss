@@ -64,11 +64,11 @@ import java.util.function.BiConsumer;
  * intermediate heap objects ({@code IndexMutation}) are created — derivation writes directly to
  * per-target-bucket {@link ProgressKvRecordBatchBuilder}s.
  *
- * <p>Each secondary index has its own pushed offset and at most one {@link IndexReplicationWindow} in flight.
- * {@link #poll()} reads the next valid window for every index that is currently ready. Window ends
- * may differ after failover because they depend on the fetched input and derived output size. The
- * source advances only completed windows and replays from persisted progress after recovery; the
- * target rejects requests behind its stored writer progress.
+ * <p>Each secondary index has its own pushed offset and at most one {@link IndexReplicationWindow}
+ * in flight. {@link #poll()} reads the next valid window for every index that is currently ready.
+ * Window ends may differ after failover because they depend on the fetched input and derived output
+ * size. The source advances only completed windows and replays from persisted progress after
+ * recovery; the target rejects requests behind its stored writer progress.
  *
  * <p>Driven by {@link #poll()} calls from an {@code IndexReplicatorPool} read worker.
  */
@@ -582,9 +582,10 @@ public final class IndexReplicator implements AutoCloseable {
     }
 
     /**
-     * Called by {@link IndexReplicationWindow} when all of its batches have been acknowledged. Advances that
-     * index's pushed offset to the window end, clears the per-index in-flight window, notifies the
-     * owning replica, and wakes the read-pool worker so it can poll the next ready window.
+     * Called by {@link IndexReplicationWindow} when all of its batches have been acknowledged.
+     * Advances that index's pushed offset to the window end, clears the per-index in-flight window,
+     * notifies the owning replica, and wakes the read-pool worker so it can poll the next ready
+     * window.
      */
     void onWindowComplete(String indexName, long windowEndOffset) {
         lifecycleLock.lock();

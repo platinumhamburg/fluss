@@ -19,11 +19,11 @@ package org.apache.fluss.server.kv.rocksdb;
 
 import org.apache.fluss.rocksdb.RocksDBOperationUtils;
 
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 import org.fluss.rocksdb.DBOptions;
 import org.fluss.rocksdb.RocksDB;
 import org.fluss.rocksdb.RocksDBException;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;

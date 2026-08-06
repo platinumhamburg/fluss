@@ -208,7 +208,8 @@ public final class IndexSendBuffer {
         return true;
     }
 
-    private void validateWindowBatches(List<IndexBatch> windowBatches, IndexReplicationWindow window) {
+    private void validateWindowBatches(
+            List<IndexBatch> windowBatches, IndexReplicationWindow window) {
         checkArgument(!window.isAdmitted(), "window is already admitted");
         checkArgument(
                 windowBatches.size() == window.expectedBatchCount(),
@@ -241,7 +242,8 @@ public final class IndexSendBuffer {
         return bytes;
     }
 
-    private boolean reserve(List<IndexBatch> windowBatches, IndexReplicationWindow window, long windowBytes) {
+    private boolean reserve(
+            List<IndexBatch> windowBatches, IndexReplicationWindow window, long windowBytes) {
         synchronized (admissionLock) {
             if (!window.isActive() || window.isOwnerClosed()) {
                 return false;
@@ -534,8 +536,7 @@ public final class IndexSendBuffer {
     public void release(IndexBatch batch) {
         synchronized (batch) {
             if (batch.markReleased() && batch.wasAccounted()) {
-                releaseReservedBytes(
-                        batch.window().sourceBucket(), batch.retainedBytes());
+                releaseReservedBytes(batch.window().sourceBucket(), batch.retainedBytes());
             }
         }
     }
@@ -570,9 +571,9 @@ public final class IndexSendBuffer {
     }
 
     /**
-     * Discard every queued batch produced by the given source main-table bucket, returning how
-     * many were dropped. Called when a producer stops (its main-table bucket lost leadership or
-     * the table was dropped) so its undelivered batches do not loop forever in the sender's
+     * Discard every queued batch produced by the given source main-table bucket, returning how many
+     * were dropped. Called when a producer stops (its main-table bucket lost leadership or the
+     * table was dropped) so its undelivered batches do not loop forever in the sender's
      * at-least-once retry, pinning memory and holding back-pressure. Cleanup is scoped to the
      * producing source bucket: batches from other sources are left untouched, including other
      * buckets of the same index table that may still have a live leader.
@@ -588,8 +589,7 @@ public final class IndexSendBuffer {
                             while (it.hasNext()) {
                                 IndexBatch batch = it.next();
                                 IndexReplicationWindow window = batch.window();
-                                if (window != null
-                                        && window.sourceBucket().equals(source)) {
+                                if (window != null && window.sourceBucket().equals(source)) {
                                     it.remove();
                                     droppedBatches.add(batch);
                                 }

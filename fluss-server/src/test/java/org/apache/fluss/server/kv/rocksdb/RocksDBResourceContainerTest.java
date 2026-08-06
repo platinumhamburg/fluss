@@ -20,8 +20,6 @@ package org.apache.fluss.server.kv.rocksdb;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 import org.fluss.rocksdb.BlockBasedTableConfig;
 import org.fluss.rocksdb.BloomFilter;
 import org.fluss.rocksdb.ColumnFamilyOptions;
@@ -32,6 +30,8 @@ import org.fluss.rocksdb.InfoLogLevel;
 import org.fluss.rocksdb.ReadOptions;
 import org.fluss.rocksdb.WriteOptions;
 import org.fluss.rocksdb.util.SizeUnit;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.nio.file.Path;

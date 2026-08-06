@@ -84,9 +84,9 @@ import static org.apache.fluss.utils.FileUtils.deleteDirectoryQuietly;
  *
  * <p>In {@link ConsumerMode#KV_STREAMING} mode segments are prefetched in a bounded sliding window
  * ({@code prefetchNum} slots, {@code downloadThreads} concurrent downloads). As the consumer
- * advances, consumed slots are freed and back-filled, overlapping network I/O with local
- * iteration. In {@link ConsumerMode#INDEX_RETAINED} mode segments are downloaded synchronously and
- * the most recently used segment may be cached across bounded fetches.
+ * advances, consumed slots are freed and back-filled, overlapping network I/O with local iteration.
+ * In {@link ConsumerMode#INDEX_RETAINED} mode segments are downloaded synchronously and the most
+ * recently used segment may be cached across bounded fetches.
  *
  * <p>Iteration remains single-threaded, but {@link #close()} may run concurrently and takes
  * ownership of resources acquired by an in-progress iteration.
@@ -143,14 +143,7 @@ public class RemoteLogFetcher implements Closeable {
             TableBucket tableBucket,
             File logTabletDir,
             ConsumerMode consumerMode) {
-        this(
-                remoteLogManager,
-                tableBucket,
-                defaultTempDir(logTabletDir),
-                consumerMode,
-                1,
-                1,
-                true);
+        this(remoteLogManager, tableBucket, defaultTempDir(logTabletDir), consumerMode, 1, 1, true);
     }
 
     public RemoteLogFetcher(

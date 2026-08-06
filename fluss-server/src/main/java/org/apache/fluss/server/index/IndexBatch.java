@@ -29,10 +29,10 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 /**
  * A single pre-encoded index write unit targeting one index-table bucket.
  *
- * <p>A batch carries only a reference to the {@link IndexReplicationWindow} it belongs to; the WAL offset it
- * advances is a property of that window, not of the batch. On successful acknowledgement the batch
- * notifies its window via {@link IndexReplicationWindow#onBatchAcked(IndexBatch)}; on failure it is
- * re-enqueued for unlimited retry without advancing any offset.
+ * <p>A batch carries only a reference to the {@link IndexReplicationWindow} it belongs to; the WAL
+ * offset it advances is a property of that window, not of the batch. On successful acknowledgement
+ * the batch notifies its window via {@link IndexReplicationWindow#onBatchAcked(IndexBatch)}; on
+ * failure it is re-enqueued for unlimited retry without advancing any offset.
  *
  * <p>A batch acknowledges its window at most once: {@link #markAcked()} is a one-shot CAS guard
  * mirroring the client {@code WriteBatch} final-state machine, so a stray duplicate completion can
@@ -64,7 +64,10 @@ final class IndexBatch {
     }
 
     IndexBatch(
-            TableBucket targetBucket, BytesView encoded, long retainedBytes, IndexReplicationWindow window) {
+            TableBucket targetBucket,
+            BytesView encoded,
+            long retainedBytes,
+            IndexReplicationWindow window) {
         this.targetBucket = checkNotNull(targetBucket, "targetBucket");
         this.encoded = checkNotNull(encoded, "encoded");
         checkArgument(

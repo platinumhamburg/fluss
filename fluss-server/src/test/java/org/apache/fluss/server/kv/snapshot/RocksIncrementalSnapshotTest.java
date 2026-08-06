@@ -26,12 +26,12 @@ import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 
+import org.fluss.rocksdb.RocksDB;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
-import org.fluss.rocksdb.RocksDB;
 
 import java.nio.file.Path;
 import java.util.Collection;
