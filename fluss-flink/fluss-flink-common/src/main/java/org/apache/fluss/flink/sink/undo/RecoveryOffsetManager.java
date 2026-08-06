@@ -25,7 +25,9 @@ import org.apache.fluss.client.admin.RegisterResult;
 import org.apache.fluss.flink.sink.ChannelComputer;
 import org.apache.fluss.flink.sink.state.WriterState;
 import org.apache.fluss.flink.sink.undo.UndoRecoveryManager.UndoOffsets;
+import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.metadata.PartitionInfo;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -52,7 +54,7 @@ import java.util.stream.Collectors;
  * <p>Recovery flow:
  *
  * <ol>
- *   <li>Classify Flink state and reject legacy V1 state before external reads.
+ *   <li>Classify Flink state and migrate legacy V1 state for last-value-only tables.
  *   <li>Load the current partition metadata through the existing Admin API.
  *   <li>Merge state fragments without guessing and enumerate every assigned live bucket.
  *   <li>Resolve each bucket's baseline and fetch its strict current log end offset.
@@ -76,6 +78,7 @@ public class RecoveryOffsetManager {
     private final long maxPollTimeoutMs;
     private final TablePath tablePath;
     private final long tableId;
+    private final Schema tableSchema;
 
     private final boolean isPartitioned;
     private final int numBuckets;
@@ -86,12 +89,14 @@ public class RecoveryOffsetManager {
     /** Recovery strategy types. */
     public enum RecoveryStrategy {
         FRESH_START,
+        V1_STATE_MIGRATION,
         CHECKPOINT_RECOVERY,
         PRODUCER_OFFSET_RECOVERY
     }
 
     private enum RecoveryStateKind {
         NO_FLINK_STATE,
+        V1_LEGACY,
         V2_COMPLETE
     }
 
@@ -167,6 +172,7 @@ public class RecoveryOffsetManager {
         this.maxPollTimeoutMs = maxPollTimeoutMs;
         this.tablePath = tablePath;
         this.tableId = tableInfo.getTableId();
+        this.tableSchema = tableInfo.getSchema();
         this.isPartitioned = tableInfo.isPartitioned();
         this.numBuckets = tableInfo.getNumBuckets();
     }
@@ -183,11 +189,16 @@ public class RecoveryOffsetManager {
                 producerId);
 
         RecoveryStateKind stateKind = classifyRecoveredState(recoveredState);
+        if (stateKind == RecoveryStateKind.V1_LEGACY) {
+            validateLastValueOnlyV1Migration();
+        }
         Map<Long, String> partitionNames = getPartitionNameMap();
         Map<TableBucket, Long> sourceOffsets =
                 stateKind == RecoveryStateKind.NO_FLINK_STATE
                         ? validateAndPruneProducerOffsets(getProducerOffsets(), partitionNames)
-                        : mergeCheckpointState(recoveredState, partitionNames);
+                        : stateKind == RecoveryStateKind.V1_LEGACY
+                                ? validateLegacyState(recoveredState, partitionNames)
+                                : mergeCheckpointState(recoveredState, partitionNames);
 
         LOG.info(
                 "Recovery offsets for subtask {} (source={}): {}",
@@ -207,6 +218,23 @@ public class RecoveryOffsetManager {
         Map<TableBucket, Long> currentOffsets = fetchLatestOffsets(filteredBuckets);
 
         LOG.info("Subtask {}: currentOffsets={}", subtaskIndex, currentOffsets);
+
+        if (stateKind == RecoveryStateKind.V1_LEGACY) {
+            Map<TableBucket, Long> migrationBaseline = positiveOffsets(currentOffsets);
+            LOG.warn(
+                    "Migrating legacy V1 Undo Recovery state for last-value-only table {} "
+                            + "(tableId={}, subtask={}/{}, liveBuckets={}, positiveBaselineBuckets={}). "
+                            + "The current Fluss table state becomes the complete V2 baseline and "
+                            + "historical Undo is skipped.",
+                    tablePath,
+                    tableId,
+                    subtaskIndex,
+                    parallelism,
+                    filteredBuckets.size(),
+                    migrationBaseline.size());
+            return RecoveryDecision.of(
+                    RecoveryStrategy.V1_STATE_MIGRATION, migrationBaseline, Collections.emptyMap());
+        }
 
         Map<TableBucket, Long> baselineOffsets = new HashMap<>();
         Map<TableBucket, UndoOffsets> undoOffsets = new HashMap<>();
@@ -277,10 +305,7 @@ public class RecoveryOffsetManager {
             return RecoveryStateKind.NO_FLINK_STATE;
         }
         if (recoveredState.isEmpty()) {
-            throw new IllegalStateException(
-                    "The job was restored but Undo Recovery has no state fragments. "
-                            + "Cannot distinguish a legacy empty state from a topology that did "
-                            + "not contain Undo Recovery; perform a controlled stateless restart.");
+            return RecoveryStateKind.V1_LEGACY;
         }
 
         WriterState.StateFormat stateFormat = null;
@@ -295,12 +320,63 @@ public class RecoveryOffsetManager {
             stateFormat = state.getStateFormat();
         }
         if (stateFormat == WriterState.StateFormat.V1_LEGACY) {
-            throw new IllegalStateException(
-                    "Legacy V1 Undo Recovery state cannot be restored safely because it cannot "
-                            + "prove a checkpoint-consistent baseline. Perform a controlled "
-                            + "stateless restart to establish V2 state.");
+            return RecoveryStateKind.V1_LEGACY;
         }
         return RecoveryStateKind.V2_COMPLETE;
+    }
+
+    private void validateLastValueOnlyV1Migration() {
+        Set<String> primaryKeys = new HashSet<>(tableSchema.getPrimaryKeyColumnNames());
+        List<String> unsupportedAggregations = new ArrayList<>();
+        for (Schema.Column column : tableSchema.getColumns()) {
+            if (primaryKeys.contains(column.getName())) {
+                continue;
+            }
+            AggFunctionType functionType =
+                    column.getAggFunction().isPresent()
+                            ? column.getAggFunction().get().getType()
+                            : AggFunctionType.LAST_VALUE_IGNORE_NULLS;
+            if (functionType != AggFunctionType.LAST_VALUE
+                    && functionType != AggFunctionType.LAST_VALUE_IGNORE_NULLS) {
+                unsupportedAggregations.add(column.getName() + "=" + functionType.name());
+            }
+        }
+        if (!unsupportedAggregations.isEmpty()) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Legacy V1 Undo Recovery state for table %s can only be migrated when "
+                                    + "all non-primary-key columns use LAST_VALUE or "
+                                    + "LAST_VALUE_IGNORE_NULLS, but found %s.",
+                            tablePath, unsupportedAggregations));
+        }
+    }
+
+    private Map<TableBucket, Long> validateLegacyState(
+            Collection<WriterState> states, Map<Long, String> partitionNames) {
+        Map<TableBucket, Long> validated = new HashMap<>();
+        for (WriterState state : states) {
+            for (Map.Entry<TableBucket, Long> entry : state.getBucketOffsets().entrySet()) {
+                TableBucket bucket = entry.getKey();
+                validateTableId(bucket);
+                validateBaselineOffset(bucket, entry.getValue());
+                if (!isLiveStateBucket(bucket, partitionNames)) {
+                    continue;
+                }
+                validateBucketId(bucket);
+                putMergedOffset(validated, bucket, entry.getValue());
+            }
+        }
+        return validated;
+    }
+
+    private static Map<TableBucket, Long> positiveOffsets(Map<TableBucket, Long> offsets) {
+        Map<TableBucket, Long> positiveOffsets = new HashMap<>();
+        for (Map.Entry<TableBucket, Long> entry : offsets.entrySet()) {
+            if (entry.getValue() > 0) {
+                positiveOffsets.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return positiveOffsets;
     }
 
     private Map<TableBucket, Long> mergeCheckpointState(

@@ -24,6 +24,7 @@ import org.apache.fluss.client.admin.RegisterResult;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.sink.state.WriterState;
 import org.apache.fluss.flink.sink.testutils.TestAdminAdapter;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.Schema;
@@ -74,6 +75,39 @@ public class RecoveryOffsetManagerTest {
                         .primaryKey("id")
                         .build();
 
+        return createTableInfo(tableId, numBuckets, isPartitioned, schema);
+    }
+
+    private static TableInfo createTableInfoWithSum(int numBuckets) {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .primaryKey("id")
+                        .build();
+
+        return createTableInfo(TABLE_ID, numBuckets, false, schema);
+    }
+
+    private static TableInfo createTableInfoWithLastValue(int numBuckets, boolean ignoreNulls) {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column(
+                                "value",
+                                DataTypes.STRING(),
+                                ignoreNulls
+                                        ? AggFunctions.LAST_VALUE_IGNORE_NULLS()
+                                        : AggFunctions.LAST_VALUE())
+                        .primaryKey("id")
+                        .build();
+
+        return createTableInfo(TABLE_ID, numBuckets, false, schema);
+    }
+
+    private static TableInfo createTableInfo(
+            long tableId, int numBuckets, boolean isPartitioned, Schema schema) {
+
         List<String> partitionKeys =
                 isPartitioned ? Collections.singletonList("pt") : Collections.emptyList();
 
@@ -107,19 +141,23 @@ public class RecoveryOffsetManagerTest {
     // ==================== FRESH_START Tests ====================
 
     @Test
-    void testRestoredWithoutStateFailsInsteadOfRegisteringFreshBaseline() {
+    void testRestoredWithoutStateMigratesDefaultLastValueBaseline() throws Exception {
         Map<TableBucket, Long> currentOffsets = new HashMap<>();
-        currentOffsets.put(new TableBucket(TABLE_ID, 0), 0L);
-        currentOffsets.put(new TableBucket(TABLE_ID, 1), 0L);
+        currentOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
+        currentOffsets.put(new TableBucket(TABLE_ID, 1), 200L);
 
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
         TableInfo tableInfo = createTableInfo(2, false);
         RecoveryOffsetManager manager = createManager(admin, 0, 1, tableInfo);
 
-        assertThatThrownBy(() -> manager.determineRecoveryStrategy(new ArrayList<>()))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("restored")
-                .hasMessageContaining("no state fragments");
+        RecoveryOffsetManager.RecoveryDecision decision =
+                manager.determineRecoveryStrategy(new ArrayList<>());
+
+        assertThat(decision.getStrategy())
+                .isEqualTo(RecoveryOffsetManager.RecoveryStrategy.V1_STATE_MIGRATION);
+        assertThat(decision.getBaselineOffsets())
+                .containsExactlyInAnyOrderEntriesOf(currentOffsets);
+        assertThat(decision.needsUndoRecovery()).isFalse();
         assertThat(admin.wasRegisterCalled()).isFalse();
     }
 
@@ -382,7 +420,7 @@ public class RecoveryOffsetManagerTest {
     }
 
     @Test
-    void testSparseV1StateFailsInsteadOfUndoingFromZero() {
+    void testSparseV1StateMigratesFromCurrentOffsetsWithoutUndo() throws Exception {
         TableBucket historicalBucket = new TableBucket(TABLE_ID, 0);
         TableBucket activeBucket = new TableBucket(TABLE_ID, 1);
 
@@ -396,19 +434,61 @@ public class RecoveryOffsetManagerTest {
         RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
         RecoveryOffsetManager manager = createManager(admin, 0, 1, createTableInfo(2, false));
 
+        RecoveryOffsetManager.RecoveryDecision decision =
+                manager.determineRecoveryStrategy(
+                        Collections.singletonList(new WriterState(sparseLegacyState)));
+
+        assertThat(decision.getStrategy())
+                .isEqualTo(RecoveryOffsetManager.RecoveryStrategy.V1_STATE_MIGRATION);
+        assertThat(decision.getBaselineOffsets())
+                .containsExactlyInAnyOrderEntriesOf(currentOffsets);
+        assertThat(decision.needsUndoRecovery()).isFalse();
+        assertThat(admin.getOrdinaryPartitionReadCount()).isZero();
+        assertThat(admin.getListOffsetsReadCount()).isEqualTo(1);
+        assertThat(admin.getProducerOffsetsReadCount()).isZero();
+        assertThat(admin.wasRegisterCalled()).isFalse();
+    }
+
+    @Test
+    void testExplicitLastValueAndIgnoreNullsV1StatesMigrate() throws Exception {
+        TableBucket bucket = new TableBucket(TABLE_ID, 0);
+        Map<TableBucket, Long> currentOffsets = Collections.singletonMap(bucket, 100L);
+
+        for (boolean ignoreNulls : Arrays.asList(false, true)) {
+            RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
+            RecoveryOffsetManager manager =
+                    createManager(admin, 0, 1, createTableInfoWithLastValue(1, ignoreNulls));
+
+            RecoveryOffsetManager.RecoveryDecision decision =
+                    manager.determineRecoveryStrategy(
+                            Collections.singletonList(
+                                    new WriterState(Collections.singletonMap(bucket, 50L))));
+
+            assertThat(decision.getStrategy())
+                    .isEqualTo(RecoveryOffsetManager.RecoveryStrategy.V1_STATE_MIGRATION);
+            assertThat(decision.getBaselineOffsets()).containsEntry(bucket, 100L);
+            assertThat(decision.needsUndoRecovery()).isFalse();
+        }
+    }
+
+    @Test
+    void testV1StateWithNonLastValueAggregationFailsBeforeOffsetReads() {
+        TableBucket bucket = new TableBucket(TABLE_ID, 0);
+        RecoveryTestAdmin admin = new RecoveryTestAdmin(Collections.singletonMap(bucket, 100L));
+        RecoveryOffsetManager manager = createManager(admin, 0, 1, createTableInfoWithSum(1));
+
         assertThatThrownBy(
                         () ->
                                 manager.determineRecoveryStrategy(
                                         Collections.singletonList(
-                                                new WriterState(sparseLegacyState))))
-                .as("a legacy state gap must not be interpreted as a zero recovery baseline")
+                                                new WriterState(
+                                                        Collections.singletonMap(bucket, 50L)))))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("V1")
-                .hasMessageContaining("cannot be restored safely");
-        assertThat(admin.getOrdinaryPartitionReadCount()).isZero();
+                .hasMessageContaining("LAST_VALUE")
+                .hasMessageContaining("SUM");
         assertThat(admin.getListOffsetsReadCount()).isZero();
         assertThat(admin.getProducerOffsetsReadCount()).isZero();
-        assertThat(admin.wasRegisterCalled()).isFalse();
     }
 
     @Test
@@ -486,23 +566,26 @@ public class RecoveryOffsetManagerTest {
     }
 
     @Test
-    void testCompleteV1StateFailsBeforeRecoverySideEffects() {
+    void testV1StateWithRecreatedTableFailsBeforeRecoverySideEffects() {
         TableBucket firstBucket = new TableBucket(TABLE_ID, 0);
-        TableBucket secondBucket = new TableBucket(TABLE_ID, 1);
-        Map<TableBucket, Long> offsets = new HashMap<>();
-        offsets.put(firstBucket, 10L);
-        offsets.put(secondBucket, 20L);
-        RecoveryTestAdmin admin = new RecoveryTestAdmin(offsets);
-        RecoveryOffsetManager manager = createManager(admin, 0, 1, createTableInfo(2, false));
+        long recreatedTableId = TABLE_ID + 1;
+        Map<TableBucket, Long> currentOffsets =
+                Collections.singletonMap(new TableBucket(recreatedTableId, 0), 10L);
+        RecoveryTestAdmin admin = new RecoveryTestAdmin(currentOffsets);
+        RecoveryOffsetManager manager =
+                createManager(admin, 0, 1, createTableInfo(recreatedTableId, 1, false));
 
         assertThatThrownBy(
                         () ->
                                 manager.determineRecoveryStrategy(
-                                        Collections.singletonList(new WriterState(offsets))))
+                                        Collections.singletonList(
+                                                new WriterState(
+                                                        Collections.singletonMap(
+                                                                firstBucket, 10L)))))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("V1")
-                .hasMessageContaining("cannot be restored safely")
-                .hasMessageContaining("stateless restart");
+                .hasMessageContaining("re-created")
+                .hasMessageContaining(String.valueOf(TABLE_ID))
+                .hasMessageContaining(String.valueOf(recreatedTableId));
         assertThat(admin.getOrdinaryPartitionReadCount()).isZero();
         assertThat(admin.getListOffsetsReadCount()).isZero();
         assertThat(admin.getProducerOffsetsReadCount()).isZero();
