@@ -31,7 +31,6 @@ import javax.annotation.Nullable;
 import java.util.List;
 
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
-
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** An interface for encoding key of row into bytes. */
