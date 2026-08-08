@@ -252,9 +252,9 @@ class TableChangeWatcherTest {
                                 .getBucketAssignments());
         // register assignment and metadata
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                1L, "2011", partitionAssignment, remoteDataDir, tablePath, tableId);
+                1L, "2011", partitionAssignment, remoteDataDir, tablePath, tableId, 0);
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                2L, "2022", partitionAssignment, remoteDataDir, tablePath, tableId);
+                2L, "2022", partitionAssignment, remoteDataDir, tablePath, tableId, 0);
 
         // create partitions events
         expectedEvents.add(
@@ -345,7 +345,8 @@ class TableChangeWatcherTest {
                                     null,
                                     TableChange.ColumnPosition.last())),
                     false,
-                    null);
+                    null,
+                    0);
             Schema newSchema =
                     Schema.newBuilder()
                             .fromSchema(tableInfo.getSchema())
@@ -409,7 +410,7 @@ class TableChangeWatcherTest {
         builder.setCustomProperty("custom.key", "custom.value");
         TablePropertyChanges tablePropertyChanges = builder.build();
         metadataManager.alterTableProperties(
-                tablePath, Collections.emptyList(), tablePropertyChanges, false, null);
+                tablePath, Collections.emptyList(), tablePropertyChanges, false, null, 0);
 
         // get the updated table registration
         TableRegistration updatedTableRegistration =

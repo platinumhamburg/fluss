@@ -725,7 +725,7 @@ final class ReplicaTest extends ReplicaTestBase {
                 kvReplica,
                 DataTestUtils.genKvRecordBatch(new Object[] {4, "555"}, new Object[] {3, "d"}));
         // update schema.
-        zkClient.registerSchema(DATA1_TABLE_PATH_PK, DATA2_SCHEMA, newSchemaId);
+        zkClient.registerSchema(DATA1_TABLE_PATH_PK, DATA1_TABLE_ID, DATA2_SCHEMA, newSchemaId, 0);
         serverMetadataCache.updateLatestSchema(
                 DATA1_TABLE_ID, new SchemaInfo(DATA2_SCHEMA, newSchemaId));
         // write data with new schema

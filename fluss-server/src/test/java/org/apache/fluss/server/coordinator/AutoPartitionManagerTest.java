@@ -329,6 +329,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -369,7 +370,8 @@ class AutoPartitionManagerTest {
                     remoteDataDir,
                     partitionAssignment,
                     fromPartitionName(table.getPartitionKeys(), partitionName),
-                    false);
+                    false,
+                    0);
             // mock the partition is created in zk.
             autoPartitionManager.addPartition(tableId, partitionName);
         }
@@ -377,7 +379,11 @@ class AutoPartitionManagerTest {
         // manually drop partitions.
         for (String partitionName : params.manualDroppedPartitions) {
             metadataManager.dropPartition(
-                    tablePath, fromPartitionName(table.getPartitionKeys(), partitionName), false);
+                    tablePath,
+                    tableId,
+                    fromPartitionName(table.getPartitionKeys(), partitionName),
+                    false,
+                    0);
             // mock the partition is dropped in zk.
             autoPartitionManager.removePartition(tableId, partitionName);
         }
@@ -419,6 +425,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -453,11 +460,16 @@ class AutoPartitionManagerTest {
                 remoteDataDir,
                 partitionAssignment,
                 fromPartitionName(table.getPartitionKeys(), "2024-09-15"),
-                false);
+                false,
+                0);
         autoPartitionManager.addPartition(table.getTableId(), "2024-09-15");
 
         metadataManager.dropPartition(
-                tablePath, fromPartitionName(table.getPartitionKeys(), "2024-09-10"), false);
+                tablePath,
+                table.getTableId(),
+                fromPartitionName(table.getPartitionKeys(), "2024-09-10"),
+                false,
+                0);
         autoPartitionManager.removePartition(table.getTableId(), "2024-09-10");
 
         clock.advanceTime(Duration.ofDays(3).plus(Duration.ofHours(23)));
@@ -510,6 +522,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -550,7 +563,8 @@ class AutoPartitionManagerTest {
                     remoteDataDir,
                     partitionAssignment,
                     fromPartitionName(table.getPartitionKeys(), i + ""),
-                    false);
+                    false,
+                    0);
             // mock the partition is created in zk.
             autoPartitionManager.addPartition(tableId, i + "");
         }
@@ -590,6 +604,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -640,6 +655,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -708,6 +724,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         config,
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -748,6 +765,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         capacityController,
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -780,6 +798,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         capacityController,
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -794,14 +813,16 @@ class AutoPartitionManagerTest {
                 remoteDataDir,
                 partitionAssignment,
                 fromPartitionName(table.getPartitionKeys(), "2025042600"),
-                false);
+                false,
+                0);
         metadataManager.createPartition(
                 tablePath,
                 table.getTableId(),
                 remoteDataDir,
                 partitionAssignment,
                 fromPartitionName(table.getPartitionKeys(), "2025042601"),
-                false);
+                false,
+                0);
         autoPartitionManager.addPartition(table.getTableId(), "2025042600");
         autoPartitionManager.addPartition(table.getTableId(), "2025042601");
         capacityController.updateObservedKvLeaderReplicaCount((long) table.getNumBuckets() * 2);
@@ -833,6 +854,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -881,6 +903,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();
@@ -942,6 +965,7 @@ class AutoPartitionManagerTest {
                         remoteDirDynamicLoader,
                         new Configuration(),
                         disabledCapacityController(),
+                        0,
                         clock,
                         periodicExecutor);
         autoPartitionManager.start();

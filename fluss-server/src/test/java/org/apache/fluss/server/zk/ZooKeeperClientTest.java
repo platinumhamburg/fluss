@@ -399,7 +399,7 @@ class ZooKeeperClientTest {
         currentMillis = System.currentTimeMillis();
         tableReg1 =
                 new TableRegistration(
-                        13,
+                        11,
                         "third table",
                         Arrays.asList("a", "b"),
                         new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
@@ -408,7 +408,7 @@ class ZooKeeperClientTest {
                         remoteDataDir,
                         currentMillis,
                         currentMillis);
-        zookeeperClient.updateTable(tablePath1, tableReg1);
+        zookeeperClient.updateTable(tablePath1, 11, tableReg1, 0);
         optionalTable1 = zookeeperClient.getTable(tablePath1);
         assertThat(optionalTable1.isPresent()).isTrue();
         assertThat(optionalTable1.get()).isEqualTo(tableReg1);
@@ -421,6 +421,7 @@ class ZooKeeperClientTest {
     @Test
     void testSchema() throws Exception {
         int schemaId = 1;
+        long tableId = 1;
         TablePath tablePath = TablePath.of("db", "tb");
         assertThat(zookeeperClient.getSchemaById(tablePath, schemaId)).isEmpty();
 
@@ -436,6 +437,19 @@ class ZooKeeperClientTest {
                         .withComment("c is third column")
                         .primaryKey("a")
                         .build();
+        long currentMillis = System.currentTimeMillis();
+        zookeeperClient.registerTable(
+                tablePath,
+                new TableRegistration(
+                        tableId,
+                        "schema table",
+                        Collections.singletonList("a"),
+                        new TableDescriptor.TableDistribution(1, Collections.singletonList("a")),
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        remoteDataDir,
+                        currentMillis,
+                        currentMillis));
         int registeredSchemaId = zookeeperClient.registerFirstSchema(tablePath, schema);
         assertThat(registeredSchemaId).isEqualTo(schemaId);
         assertThat(zookeeperClient.getCurrentSchemaId(tablePath)).isEqualTo(schemaId);
@@ -455,7 +469,7 @@ class ZooKeeperClientTest {
                         .withComment("b is second column")
                         .primaryKey("a")
                         .build();
-        registeredSchemaId = zookeeperClient.registerSchema(tablePath, schema2, 2);
+        registeredSchemaId = zookeeperClient.registerSchema(tablePath, tableId, schema2, 2, 0);
         assertThat(registeredSchemaId).isEqualTo(2);
         assertThat(zookeeperClient.getCurrentSchemaId(tablePath)).isEqualTo(2);
 
@@ -465,7 +479,7 @@ class ZooKeeperClientTest {
         assertThat(schemaInfo.get().getSchemaId()).isEqualTo(2);
 
         // test register schema with existed schemaId
-        assertThatThrownBy(() -> zookeeperClient.registerSchema(tablePath, schema2, 2))
+        assertThatThrownBy(() -> zookeeperClient.registerSchema(tablePath, tableId, schema2, 2, 0))
                 .isExactlyInstanceOf(KeeperException.NodeExistsException.class);
     }
 
@@ -612,9 +626,9 @@ class ZooKeeperClientTest {
                                         })
                                 .getBucketAssignments());
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                1L, "p1", partitionAssignment, remoteDataDir, tablePath, tableId);
+                1L, "p1", partitionAssignment, remoteDataDir, tablePath, tableId, 0);
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                2L, "p2", partitionAssignment, remoteDataDir, tablePath, tableId);
+                2L, "p2", partitionAssignment, remoteDataDir, tablePath, tableId, 0);
 
         // check created partitions
         partitions = zookeeperClient.getPartitions(tablePath);
@@ -627,7 +641,7 @@ class ZooKeeperClientTest {
                 .containsValues(new ArrayList<>(partitions));
 
         // test delete partition
-        zookeeperClient.deletePartition(tablePath, "p1");
+        zookeeperClient.deletePartition(tablePath, "p1", tableId, 1L, 0);
         partitions = zookeeperClient.getPartitions(tablePath);
         assertThat(partitions).containsExactly("p2");
     }

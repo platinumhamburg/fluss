@@ -286,7 +286,9 @@ final class DroppedTableRecoveryTest extends LogTestBase {
                         KvFormat.COMPACTED,
                         new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, 0)),
                         tableConfig,
-                        DEFAULT_COMPRESSION);
+                        DEFAULT_COMPRESSION,
+                        null,
+                        null);
         KvTablet kvTablet2 =
                 kvManager.getOrCreateKv(
                         PhysicalTablePath.of(tablePath),
@@ -295,7 +297,9 @@ final class DroppedTableRecoveryTest extends LogTestBase {
                         KvFormat.COMPACTED,
                         new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, 0)),
                         tableConfig,
-                        DEFAULT_COMPRESSION);
+                        DEFAULT_COMPRESSION,
+                        null,
+                        null);
 
         // Get directories before shutdown
         String kvDir1 = kvTablet1.getKvTabletDir().getAbsolutePath();
@@ -376,7 +380,9 @@ final class DroppedTableRecoveryTest extends LogTestBase {
                         KvFormat.COMPACTED,
                         new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA, 0)),
                         tableConfig,
-                        DEFAULT_COMPRESSION);
+                        DEFAULT_COMPRESSION,
+                        null,
+                        null);
 
         String kvDir = kvTablet.getKvTabletDir().getAbsolutePath();
         String logDir = log.getLogDir().getAbsolutePath();

@@ -131,7 +131,8 @@ public class KvTestUtils {
                 new KvSnapshotHandle(Collections.emptyList(), Collections.emptyList(), 0),
                 0,
                 null,
-                null);
+                null,
+                Collections.emptyList());
     }
 
     public static int getKeyCounts(RocksDB rocksDB) {

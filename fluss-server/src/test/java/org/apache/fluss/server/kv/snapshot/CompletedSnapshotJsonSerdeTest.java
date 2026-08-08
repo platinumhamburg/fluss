@@ -59,7 +59,8 @@ class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot
                         new KvSnapshotHandle(sharedFileHandles, privateFileHandles, 5),
                         10,
                         null,
-                        null);
+                        null,
+                        Collections.emptyList());
         CompletedSnapshot completedSnapshot2 =
                 new CompletedSnapshot(
                         new TableBucket(1, 10L, 1),
@@ -68,6 +69,7 @@ class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot
                         new KvSnapshotHandle(sharedFileHandles, privateFileHandles, 5),
                         10,
                         1234L,
+                        null,
                         Collections.singletonList(new AutoIncIDRange(2, 10000, 20000)));
         return new CompletedSnapshot[] {completedSnapshot1, completedSnapshot2};
     }

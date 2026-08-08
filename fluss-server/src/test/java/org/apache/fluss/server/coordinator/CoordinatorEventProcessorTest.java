@@ -225,7 +225,8 @@ class CoordinatorEventProcessorTest {
                         metadataManager,
                         new RemoteDirDynamicLoader(conf),
                         conf,
-                        replicaCapacityController);
+                        replicaCapacityController,
+                        0);
         kvSnapshotLeaseManager =
                 new KvSnapshotLeaseManager(
                         Duration.ofMinutes(10).toMillis(),
@@ -840,7 +841,7 @@ class CoordinatorEventProcessorTest {
         assertThat(completedSnapshotStoreManager.getBucketCompletedSnapshotStores()).isNotEmpty();
 
         // drop the partition
-        zookeeperClient.deletePartition(tablePath, partition1Name);
+        zookeeperClient.deletePartition(tablePath, partition1Name, tableId, partition1Id, 0);
         verifyPartitionDropped(tableId, partition1Id);
 
         // verify CompleteSnapshotStore has been removed when the table partition1 is dropped
@@ -903,7 +904,7 @@ class CoordinatorEventProcessorTest {
         // now, drop partition2 and restart the coordinator event processor,
         // the partition2 should be dropped
         eventProcessor.shutdown();
-        zookeeperClient.deletePartition(tablePath, partition2Name);
+        zookeeperClient.deletePartition(tablePath, partition2Name, tableId, partition2Id, 0);
 
         // start the coordinator
         eventProcessor = buildCoordinatorEventProcessor();
@@ -961,7 +962,7 @@ class CoordinatorEventProcessorTest {
                 replicationFactor);
 
         // Drop partition1 via ZK (simulates the watcher path).
-        zookeeperClient.deletePartition(tablePath, partition1Name);
+        zookeeperClient.deletePartition(tablePath, partition1Name, tableId, partition1Id, 0);
 
         // Verify the drop entered the lifecycle throttler and partition is fully deleted.
         TableLifecycleThrottler throttler = eventProcessor.getLifecycleThrottler();
@@ -1119,7 +1120,7 @@ class CoordinatorEventProcessorTest {
 
         // Shutdown the event processor, then delete partition2 in ZK while it's down.
         eventProcessor.shutdown();
-        zookeeperClient.deletePartition(tablePath, partition2Name);
+        zookeeperClient.deletePartition(tablePath, partition2Name, tableId, partition2Id, 0);
 
         // Restart the event processor. During startup, the stale partition2 should be
         // detected and routed through the cleanup manager.
@@ -1598,7 +1599,7 @@ class CoordinatorEventProcessorTest {
         builder.setCustomProperty("custom.key", "custom.value");
         TablePropertyChanges tablePropertyChanges = builder.build();
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), tablePropertyChanges, false, null);
+                t1, Collections.emptyList(), tablePropertyChanges, false, null, 0);
 
         // get updated table info and verify metadata update request is sent
         TableInfo updatedTableInfo = metadataManager.getTable(t1);
@@ -1659,7 +1660,7 @@ class CoordinatorEventProcessorTest {
         disableBuilder.setTableProperty(
                 ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "false");
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), disableBuilder.build(), false, null);
+                t1, Collections.emptyList(), disableBuilder.build(), false, null, 0);
 
         // verify standby replicas are removed after re-election
         retryVerifyContext(
@@ -1727,7 +1728,7 @@ class CoordinatorEventProcessorTest {
         enableBuilder.setTableProperty(
                 ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "true");
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), enableBuilder.build(), false, null);
+                t1, Collections.emptyList(), enableBuilder.build(), false, null, 0);
 
         // Verify re-election happened: standby assigned and leaderEpoch incremented
         retryVerifyContext(
@@ -1788,7 +1789,8 @@ class CoordinatorEventProcessorTest {
                                         Collections.emptyList(),
                                         enableBuilder.build(),
                                         false,
-                                        null))
+                                        null,
+                                        0))
                 .isInstanceOf(InvalidAlterTableException.class)
                 .hasMessageContaining("can only be altered on primary key tables");
 
@@ -1803,7 +1805,8 @@ class CoordinatorEventProcessorTest {
                                         Collections.emptyList(),
                                         disableBuilder.build(),
                                         false,
-                                        null))
+                                        null,
+                                        0))
                 .isInstanceOf(InvalidAlterTableException.class)
                 .hasMessageContaining("can only be altered on primary key tables");
     }
@@ -2129,6 +2132,7 @@ class CoordinatorEventProcessorTest {
                                             ConfigOptions.REMOTE_DATA_DIR.key(), remoteDataDir))),
                     new Configuration(),
                     replicaCapacityController,
+                    0,
                     SystemClock.getInstance(),
                     new ManuallyTriggeredScheduledExecutorService());
             this.metadataCache = metadataCache;
@@ -2201,14 +2205,16 @@ class CoordinatorEventProcessorTest {
                 partitionAssignment,
                 remoteDataDir,
                 tablePath,
-                tableId);
+                tableId,
+                0);
         zookeeperClient.registerPartitionAssignmentAndMetadata(
                 partition2Id,
                 partition2Name,
                 partitionAssignment,
                 remoteDataDir,
                 tablePath,
-                tableId);
+                tableId,
+                0);
 
         return Tuple2.of(
                 new PartitionIdName(partition1Id, partition1Name),
@@ -2487,7 +2493,7 @@ class CoordinatorEventProcessorTest {
     }
 
     private void alterTable(TablePath tablePath, List<TableChange> schemaChanges) {
-        metadataManager.alterTableSchema(tablePath, schemaChanges, true, null);
+        metadataManager.alterTableSchema(tablePath, schemaChanges, true, null, 0);
     }
 
     private TableDescriptor getPartitionedTable() {

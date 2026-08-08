@@ -148,7 +148,8 @@ class TableBucketStateMachineTest {
                                 new LakeCatalogDynamicLoader(new Configuration(), null, true)),
                         new RemoteDirDynamicLoader(conf),
                         conf,
-                        replicaCapacityController);
+                        replicaCapacityController,
+                        0);
         lakeTableTieringManager =
                 new LakeTableTieringManager(TestingMetricGroups.LAKE_TIERING_METRICS);
 

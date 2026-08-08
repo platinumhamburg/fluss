@@ -224,7 +224,8 @@ class CoordinatorServiceOrphanRpcsITCase {
                 new KvSnapshotHandle(Collections.emptyList(), Collections.emptyList(), 0L),
                 snapshotId,
                 null,
-                null);
+                null,
+                Collections.emptyList());
     }
 
     /** No-op implementation that avoids ZK writes during test snapshot population. */

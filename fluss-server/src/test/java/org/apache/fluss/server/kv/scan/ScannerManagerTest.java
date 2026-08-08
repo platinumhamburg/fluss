@@ -137,8 +137,11 @@ class ScannerManagerTest {
                         DEFAULT_COMPRESSION,
                         schemaGetter,
                         tableConf.getChangelogImage(),
+                        tableConf.getKvFormatVersion().orElse(ConfigOptions.KV_FORMAT_VERSION_2),
                         KvManager.getDefaultRateLimiter(),
-                        autoIncrementManager);
+                        autoIncrementManager,
+                        null,
+                        null);
     }
 
     @AfterEach
