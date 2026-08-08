@@ -39,6 +39,7 @@ import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.types.DataTypes;
 
@@ -247,7 +248,8 @@ public class FlinkTestBase extends AbstractTestBase {
                             tableInfo.getTableId(), assignment.getBucketAssignments()),
                     zkClient.getDefaultRemoteDataDir(),
                     tablePath,
-                    tableInfo.getTableId());
+                    tableInfo.getTableId(),
+                    0);
         }
         return newPartitionIds;
     }
@@ -256,7 +258,13 @@ public class FlinkTestBase extends AbstractTestBase {
             ZooKeeperClient zkClient, TablePath tablePath, Set<String> droppedPartitions)
             throws Exception {
         for (String partition : droppedPartitions) {
-            zkClient.deletePartition(tablePath, partition);
+            PartitionRegistration registration = zkClient.getPartition(tablePath, partition).get();
+            zkClient.deletePartition(
+                    tablePath,
+                    partition,
+                    registration.getTableId(),
+                    registration.getPartitionId(),
+                    0);
         }
     }
 
