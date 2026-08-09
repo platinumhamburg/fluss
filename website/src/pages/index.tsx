@@ -120,7 +120,7 @@ function HeroDiagram() {
     //   04 · QUERY ENGINES (bottom) — Flink, Spark, Trino, StarRocks, DuckDB, Ray
     //
     // The hot tier tiers down to a Lakehouse cold tier (Paimon · Iceberg ·
-    // Lance) via a Tiering Service. ViewBox is 1200 × 640 (15:8) to give the
+    // Hudi · Lance) via a Tiering Service. ViewBox is 1200 × 640 (15:8) to give the
     // four columns enough breathing room without crowding labels.
     return (
         <svg
@@ -134,7 +134,8 @@ function HeroDiagram() {
                 IoT/clickstreams) feed the Fluss hot tier in the centre,
                 which is composed of a Coordinator Server and a row of
                 Tablet Servers. Data continuously tiers down to a Lakehouse
-                cold tier (Apache Paimon, Apache Iceberg, Lance) via a
+                cold tier (Apache Paimon, Apache Iceberg, Apache Hudi,
+                Lance) via a
                 Tiering Service. Read patterns on the right include
                 streaming reads, batch reads, lookup joins, and a union
                 read that merges hot and cold. Query engines along the
@@ -354,18 +355,17 @@ function HeroDiagram() {
                 </text>
 
                 {[
-                    {x: 312, label: 'Apache Paimon',  highlight: false},
-                    {x: 482, label: 'Apache Iceberg', highlight: true },
-                    {x: 652, label: 'Lance',          highlight: false},
+                    {x: 312, label: 'Apache Paimon'},
+                    {x: 438, label: 'Apache Iceberg'},
+                    {x: 564, label: 'Apache Hudi'},
+                    {x: 690, label: 'Lance'},
                 ].map((l, i) => (
                     <g key={i}>
-                        <rect x={l.x} y="438" width="156" height="46" rx="8"
-                              fill={l.highlight ? '#194670' : '#0A1745'}
-                              stroke={l.highlight
-                                  ? 'rgba(38,109,149,0.7)'
-                                  : 'rgba(122,175,203,0.4)'}
+                        <rect x={l.x} y="438" width="118" height="46" rx="8"
+                              fill="#0A1745"
+                              stroke="rgba(122,175,203,0.4)"
                               strokeWidth="1" />
-                        <text x={l.x + 78} y="466" textAnchor="middle"
+                        <text x={l.x + 59} y="466" textAnchor="middle"
                               fill="#E6ECFA" fontSize="12" fontWeight="700">
                             {l.label}
                         </text>
@@ -615,7 +615,7 @@ function ArchitectureSection() {
                 <div className={clsx(styles.sectionHeader, styles.sectionHeaderCenter)}>
                     <span className={styles.eyebrow}>Architecture</span>
                     <h2 className={clsx(styles.sectionTitle, styles.archTitle)}>
-                        Unlocking the Streamhouse Architecture
+                        Unlocking the Lakestream Architecture
                     </h2>
                 </div>
                 <div className={styles.archDiagram}>
@@ -660,7 +660,7 @@ function SystemsTaxSection() {
             sub: 'Sub-millisecond key/value serving',
         },
         {
-            label: 'Streamhouse',
+            label: 'Lakestream',
             sub: 'Real-time data layer for Lakehouse architecture',
         },
         {
