@@ -51,6 +51,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
+
 /**
  * A Flink stream operator that manages undo recovery state using Union List State.
  *
@@ -135,12 +139,13 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     private final long maxPollTimeoutMs;
 
     /**
-     * The registry ID used to register/remove this operator in the static delegate registry.
+     * The reporter key used to register/remove this operator in the static delegate registry.
      *
-     * <p>This ID is passed from {@link UndoRecoveryOperatorFactory} and used by {@link #close()} to
-     * remove this operator from the registry by ID (O(1)) instead of by reference (O(n)).
+     * <p>This key combines the reporter group ID from {@link UndoRecoveryOperatorFactory} with this
+     * operator's runtime subtask index. It is used by {@link #close()} to remove this operator from
+     * the registry only while this operator still owns the registration.
      */
-    private final String offsetReporterRegistryId;
+    private final String reporterKey;
 
     // ==================== State Fields ====================
 
@@ -205,8 +210,7 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      * @param producerId the producer ID for producer offset management (null to use Flink job ID)
      * @param producerOffsetsPollIntervalMs the polling interval for producer offsets
      * @param maxPollTimeoutMs the maximum total time to poll for producer offsets
-     * @param offsetReporterRegistryId the registry ID for registering/removing in the delegate
-     *     registry
+     * @param reporterGroupId the ID shared by reporter instances created from the same factory
      */
     public UndoRecoveryOperator(
             StreamOperatorParameters<IN> parameters,
@@ -219,7 +223,7 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
             @Nullable String producerId,
             long producerOffsetsPollIntervalMs,
             long maxPollTimeoutMs,
-            String offsetReporterRegistryId) {
+            String reporterGroupId) {
         super();
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
@@ -231,13 +235,15 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
                 producerId; // May be null, will be resolved in initializeState()
         this.producerOffsetsPollIntervalMs = producerOffsetsPollIntervalMs;
         this.maxPollTimeoutMs = maxPollTimeoutMs;
-        this.offsetReporterRegistryId = offsetReporterRegistryId;
-
         // Call setup internally - this is allowed because we're inside the operator class
         this.setup(
                 parameters.getContainingTask(),
                 parameters.getStreamConfig(),
                 parameters.getOutput());
+        this.reporterKey =
+                UndoRecoveryOperatorFactory.createReporterKey(
+                        reporterGroupId,
+                        RuntimeContextAdapter.getIndexOfThisSubtask(getRuntimeContext()));
     }
 
     // ==================== State Initialization ====================
@@ -565,21 +571,19 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      */
     @Override
     public void reportOffset(TableBucket bucket, long offset) {
-        if (bucketOffsets != null) {
-            bucketOffsets.merge(bucket, offset, Math::max);
-            if (LOG.isTraceEnabled()) {
-                LOG.trace(
-                        "Reported offset {} for bucket {} (current max: {})",
-                        offset,
-                        bucket,
-                        bucketOffsets.get(bucket));
-            }
-        } else {
-            LOG.warn(
-                    "Received offset report for bucket {} before bucketOffsets was initialized, "
-                            + "offset {} will be ignored",
-                    bucket,
-                    offset);
+        TableBucket reportedBucket = checkNotNull(bucket, "Reported bucket must not be null");
+        checkArgument(offset >= 0, "Reported offset must be non-negative, but was %s", offset);
+        checkState(
+                bucketOffsets != null,
+                "bucketOffsets must be initialized before reporting offsets");
+
+        bucketOffsets.merge(reportedBucket, offset, Math::max);
+        if (LOG.isTraceEnabled()) {
+            LOG.trace(
+                    "Reported offset {} for bucket {} (current max: {})",
+                    offset,
+                    reportedBucket,
+                    bucketOffsets.get(reportedBucket));
         }
     }
 
@@ -601,9 +605,9 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     @Override
     public void close() throws Exception {
         // Remove this operator from the static DELEGATE_REGISTRY to prevent memory leaks.
-        // Each job submission registers entries in the registry via ProducerOffsetReporterHolder,
-        // and without this cleanup, entries accumulate indefinitely in long-running clusters.
-        UndoRecoveryOperatorFactory.removeDelegate(offsetReporterRegistryId);
+        // Each runtime subtask registers one entry, and without this cleanup entries accumulate
+        // indefinitely in long-running clusters.
+        UndoRecoveryOperatorFactory.removeDelegate(reporterKey, this);
 
         // Close Table instance first (if created)
         if (table != null) {
@@ -680,6 +684,10 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     @Nullable
     public Map<TableBucket, Long> getBucketOffsets() {
         return bucketOffsets;
+    }
+
+    String getReporterKey() {
+        return reporterKey;
     }
 
     /**
