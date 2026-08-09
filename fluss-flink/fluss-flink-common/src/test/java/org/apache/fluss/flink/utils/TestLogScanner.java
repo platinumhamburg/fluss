@@ -95,6 +95,7 @@ public class TestLogScanner implements LogScanner {
         }
 
         Map<TableBucket, List<ScanRecord>> result = new HashMap<>();
+        Map<TableBucket, Long> consumedUpToOffsets = new HashMap<>();
 
         for (Map.Entry<TableBucket, List<ScanRecord>> entry : recordsByBucket.entrySet()) {
             TableBucket bucket = entry.getKey();
@@ -114,10 +115,11 @@ public class TestLogScanner implements LogScanner {
                 List<ScanRecord> batch = allRecords.subList(startIndex, endIndex);
                 result.put(bucket, new ArrayList<>(batch));
                 index.set(endIndex);
+                consumedUpToOffsets.put(bucket, batch.get(batch.size() - 1).logOffset() + 1);
             }
         }
 
-        return result.isEmpty() ? ScanRecords.EMPTY : new ScanRecords(result);
+        return result.isEmpty() ? ScanRecords.EMPTY : new ScanRecords(result, consumedUpToOffsets);
     }
 
     @Override

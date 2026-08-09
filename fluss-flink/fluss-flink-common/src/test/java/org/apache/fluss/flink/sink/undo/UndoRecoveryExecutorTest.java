@@ -18,6 +18,8 @@
 package org.apache.fluss.flink.sink.undo;
 
 import org.apache.fluss.client.table.scanner.ScanRecord;
+import org.apache.fluss.client.table.scanner.log.LogScanner;
+import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.flink.utils.TestLogScanner;
 import org.apache.fluss.flink.utils.TestUpsertWriter;
 import org.apache.fluss.metadata.TableBucket;
@@ -29,6 +31,7 @@ import org.apache.fluss.types.RowType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -278,18 +281,126 @@ class UndoRecoveryExecutorTest {
         assertThat(mockWriter.isFlushCalled()).isTrue();
     }
 
-    /**
-     * Test scanner position-based completion for empty-batch-only recovery ranges.
-     *
-     * <p>Simulates a scenario where the recovery range (checkpointOffset=0, logEndOffset=3)
-     * contains only empty LogRecordBatches. Empty batches consume WAL offsets but produce zero
-     * ScanRecords. The scanner position advances past the recovery range without emitting any
-     * records for the target bucket.
-     *
-     * <p>Uses a two-bucket setup: bucket0 has no records (empty batches), bucket1 has real records
-     * that cause the mock scanner to advance bucket0's position on each poll. Completion is
-     * detected via {@code scanner.position(bucket) >= logEndOffset}.
-     */
-    // TODO: Empty LogRecordBatch scenario is not testable with current offset-based completion
-    //  detection. Once LogScanner supports bounded subscription mode, add a test here.
+    @Test
+    void testEmptyBatchOnlyRangeCompletesFromPollProgress() throws Exception {
+        TableBucket bucket = new TableBucket(TABLE_ID, 0);
+        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L, 3L);
+        LogScanner scanner = new SinglePollLogScanner(bucket, Collections.emptyList(), 3L);
+        UndoRecoveryExecutor boundaryExecutor =
+                new UndoRecoveryExecutor(
+                        scanner, mockWriter, undoComputer, TEST_MAX_TOTAL_WAIT_TIME_MS);
+
+        boundaryExecutor.execute(Collections.singletonList(ctx));
+
+        assertThat(ctx.isComplete()).isTrue();
+        assertThat(ctx.getTotalRecordsProcessed()).isEqualTo(0);
+        assertThat(mockWriter.getDeleteCount()).isEqualTo(0);
+        assertThat(mockWriter.getUpsertCount()).isEqualTo(0);
+    }
+
+    @Test
+    void testTrailingEmptyBatchRangeCompletesFromPollProgress() throws Exception {
+        TableBucket bucket = new TableBucket(TABLE_ID, 0);
+        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L, 3L);
+        LogScanner scanner =
+                new SinglePollLogScanner(
+                        bucket,
+                        Collections.singletonList(
+                                new ScanRecord(0L, 0L, ChangeType.INSERT, row(1, "a", 100))),
+                        3L);
+        UndoRecoveryExecutor boundaryExecutor =
+                new UndoRecoveryExecutor(
+                        scanner, mockWriter, undoComputer, TEST_MAX_TOTAL_WAIT_TIME_MS);
+
+        boundaryExecutor.execute(Collections.singletonList(ctx));
+
+        assertThat(ctx.isComplete()).isTrue();
+        assertThat(ctx.getTotalRecordsProcessed()).isEqualTo(1);
+        assertThat(mockWriter.getDeleteCount()).isEqualTo(1);
+        assertThat(mockWriter.getUpsertCount()).isEqualTo(0);
+    }
+
+    @Test
+    void testDoesNotProcessRecordAtOrBeyondTargetLeo() throws Exception {
+        TableBucket bucket = new TableBucket(TABLE_ID, 0);
+        BucketRecoveryContext ctx = new BucketRecoveryContext(bucket, 0L, 2L);
+        LogScanner scanner =
+                new SinglePollLogScanner(
+                        bucket,
+                        Arrays.asList(
+                                new ScanRecord(
+                                        0L, 0L, ChangeType.INSERT, row(1, "before-target", 100)),
+                                new ScanRecord(
+                                        2L, 0L, ChangeType.INSERT, row(2, "at-target", 200))),
+                        3L);
+        UndoRecoveryExecutor boundaryExecutor =
+                new UndoRecoveryExecutor(
+                        scanner, mockWriter, undoComputer, TEST_MAX_TOTAL_WAIT_TIME_MS);
+
+        boundaryExecutor.execute(Collections.singletonList(ctx));
+
+        assertThat(ctx.getTotalRecordsProcessed()).isEqualTo(1);
+        assertThat(mockWriter.getDeleteCount()).isEqualTo(1);
+        assertThat(mockWriter.getUpsertCount()).isEqualTo(0);
+    }
+
+    private static class SinglePollLogScanner implements LogScanner {
+        private final TableBucket bucket;
+        private final List<ScanRecord> records;
+        private final long consumedUpToOffset;
+        private boolean subscribed;
+        private boolean returned;
+
+        private SinglePollLogScanner(
+                TableBucket bucket, List<ScanRecord> records, long consumedUpToOffset) {
+            this.bucket = bucket;
+            this.records = records;
+            this.consumedUpToOffset = consumedUpToOffset;
+        }
+
+        @Override
+        public ScanRecords poll(Duration timeout) {
+            if (!subscribed) {
+                throw new IllegalStateException("LogScanner is not subscribed to the bucket");
+            }
+            if (returned) {
+                return ScanRecords.EMPTY;
+            }
+            returned = true;
+            return new ScanRecords(
+                    Collections.singletonMap(bucket, records),
+                    Collections.singletonMap(bucket, consumedUpToOffset));
+        }
+
+        @Override
+        public void subscribe(int bucketId, long offset) {
+            if (bucket.getPartitionId() != null || bucket.getBucket() != bucketId) {
+                throw new IllegalArgumentException("Unexpected bucket " + bucketId);
+            }
+            subscribed = true;
+        }
+
+        @Override
+        public void subscribe(long partitionId, int bucketId, long offset) {
+            throw new UnsupportedOperationException("This scanner uses a non-partitioned bucket");
+        }
+
+        @Override
+        public void unsubscribe(long partitionId, int bucketId) {
+            throw new UnsupportedOperationException("This scanner uses a non-partitioned bucket");
+        }
+
+        @Override
+        public void unsubscribe(int bucketId) {
+            if (bucket.getBucket() == bucketId) {
+                subscribed = false;
+            }
+        }
+
+        @Override
+        public void wakeup() {}
+
+        @Override
+        public void close() {}
+    }
 }
