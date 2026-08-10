@@ -164,7 +164,8 @@ public class RemoteLogManager implements Closeable {
                             remoteLogManifestHandleOpt.get().getRemoteLogManifestPath());
             remoteLog.loadRemoteLogManifest(manifest);
         }
-        remoteLog.getRemoteLogEndOffset().ifPresent(log::updateRemoteLogEndOffset);
+        log.updateHighestCopiedEndOffset(remoteLog.getHighestCopiedEndOffset());
+        log.updateRemoteLogEndOffset(remoteLog.getRemoteLogEndOffset().orElse(-1L));
         log.updateRemoteLogStartOffset(remoteLog.getRemoteLogStartOffset());
         log.updateRemoteLogSize(remoteLog.getRemoteSizeInBytes());
         // leader needs to register the remote log metrics
@@ -258,13 +259,17 @@ public class RemoteLogManager implements Closeable {
             return -1L;
         }
 
-        RemoteLogSegment segment = remoteLogTablet.findSegmentByTimestamp(timestamp);
-        if (segment == null) {
-            return -1L;
-        } else {
-            return remoteLogIndexCacheForBucket(tableBucket)
-                    .lookupOffsetForTimestamp(segment, timestamp);
+        RemoteLogIndexCache indexCache = remoteLogIndexCacheForBucket(tableBucket);
+        for (RemoteLogSegment segment : remoteLogTablet.findSegmentsByTimestamp(timestamp)) {
+            long offset = indexCache.lookupOffsetForTimestamp(segment, timestamp);
+            if (offset < segment.logicalStartOffset()) {
+                return segment.logicalStartOffset();
+            }
+            if (offset < segment.logicalEndOffset()) {
+                return offset;
+            }
         }
+        return -1L;
     }
 
     /**
@@ -274,6 +279,12 @@ public class RemoteLogManager implements Closeable {
      */
     public List<RemoteLogSegment> relevantRemoteLogSegments(TableBucket tableBucket, long offset) {
         return remoteLogTablet(tableBucket).relevantRemoteLogSegments(offset);
+    }
+
+    /** Returns the maximal physically contiguous remote segment prefix for FetchLog v0. */
+    public List<RemoteLogSegment> relevantRemoteLogSegmentsForFetchV0(
+            TableBucket tableBucket, long offset) {
+        return remoteLogTablet(tableBucket).relevantRemoteLogSegmentsForFetchV0(offset);
     }
 
     private boolean remoteDisabled() {

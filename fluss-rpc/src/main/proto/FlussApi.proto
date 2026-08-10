@@ -565,6 +565,7 @@ message CommitRemoteLogManifestRequest {
   required int64 remote_log_end_offset = 6;
   required int32 coordinator_epoch = 7;
   required int32 bucket_leader_epoch = 8;
+  optional int64 highest_copied_end_offset = 9;
 }
 
 message CommitRemoteLogManifestResponse {
@@ -579,6 +580,7 @@ message NotifyRemoteLogOffsetsRequest {
   required int32 coordinator_epoch = 4;
   required int64 remote_start_offset = 5;
   required int64 remote_end_offset = 6;
+  optional int64 highest_copied_end_offset = 7;
 }
 
 message NotifyRemoteLogOffsetsResponse {

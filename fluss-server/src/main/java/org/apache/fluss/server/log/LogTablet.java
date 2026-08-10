@@ -123,6 +123,8 @@ public final class LogTablet {
     private volatile long remoteLogStartOffset = Long.MAX_VALUE;
     // tracking the log end offset in remote storage
     private volatile long remoteLogEndOffset = -1L;
+    // tracking the highest exclusive offset successfully copied to remote storage
+    private volatile long highestCopiedEndOffset = -1L;
     // tracking the log size in remote storage
     private volatile long remoteLogSize = 0;
 
@@ -625,10 +627,24 @@ public final class LogTablet {
     }
 
     public void updateRemoteLogEndOffset(long remoteLogEndOffset) {
-        if (remoteLogEndOffset > this.remoteLogEndOffset) {
+        if ((remoteLogEndOffset == -1L && this.remoteLogEndOffset != -1L)
+                || remoteLogEndOffset > this.remoteLogEndOffset) {
             this.remoteLogEndOffset = remoteLogEndOffset;
+            // Before highestCopiedEndOffset was introduced, remoteLogEndOffset was also the copy
+            // progress watermark. Preserve that behavior for existing callers.
+            if (remoteLogEndOffset >= 0L) {
+                this.highestCopiedEndOffset =
+                        Math.max(this.highestCopiedEndOffset, remoteLogEndOffset);
+            }
 
             // try to delete these segments already exist in remote storage.
+            deleteSegmentsAlreadyExistsInRemote();
+        }
+    }
+
+    public void updateHighestCopiedEndOffset(long highestCopiedEndOffset) {
+        if (highestCopiedEndOffset > this.highestCopiedEndOffset) {
+            this.highestCopiedEndOffset = highestCopiedEndOffset;
             deleteSegmentsAlreadyExistsInRemote();
         }
     }
@@ -737,7 +753,7 @@ public final class LogTablet {
 
     public void deleteSegmentsAlreadyExistsInRemote() {
         deleteSegments(
-                remoteLogEndOffset,
+                highestCopiedEndOffset,
                 SegmentDeletionReason.LOG_MOVE_TO_REMOTE,
                 this::deletableRemoteSegments);
     }
@@ -748,7 +764,8 @@ public final class LogTablet {
         // all remote segments have expired. In both cases, table.log.ttl remains authoritative for
         // local retention, while the high watermark and minRetainOffset still protect data that
         // cannot be deleted yet.
-        long cleanupToOffset = remoteLogEndOffset == -1L ? getHighWatermark() : remoteLogEndOffset;
+        long cleanupToOffset =
+                highestCopiedEndOffset == -1L ? getHighWatermark() : highestCopiedEndOffset;
         deleteSegments(
                 cleanupToOffset,
                 SegmentDeletionReason.LOG_RETENTION,

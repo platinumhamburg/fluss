@@ -138,6 +138,7 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
         remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
         assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
         assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(Long.MAX_VALUE);
+        assertThat(remoteLog.getHighestCopiedEndOffset()).isEqualTo(40L);
 
         // Fetch records from remote.
         // mock to update remote log end offset and remote log start offset as

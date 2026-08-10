@@ -170,15 +170,37 @@ class RemoteLogTabletTest extends RemoteLogTestBase {
                         createLogSegmentWithMaxTimestamp(logTablet, 50, 40, 50)),
                 Collections.emptyList());
 
-        assertThat(remoteLogTablet.findSegmentByTimestamp(0L).remoteLogStartOffset()).isEqualTo(0L);
-        assertThat(remoteLogTablet.findSegmentByTimestamp(1L).remoteLogStartOffset()).isEqualTo(0L);
-        assertThat(remoteLogTablet.findSegmentByTimestamp(10L).remoteLogStartOffset())
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(0L).get(0).remoteLogStartOffset())
                 .isEqualTo(0L);
-        assertThat(remoteLogTablet.findSegmentByTimestamp(40L).remoteLogStartOffset())
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(1L).get(0).remoteLogStartOffset())
+                .isEqualTo(0L);
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(10L).get(0).remoteLogStartOffset())
+                .isEqualTo(0L);
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(40L).get(0).remoteLogStartOffset())
                 .isEqualTo(30L);
-        assertThat(remoteLogTablet.findSegmentByTimestamp(50L).remoteLogStartOffset())
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(50L).get(0).remoteLogStartOffset())
                 .isEqualTo(40L);
-        assertThat(remoteLogTablet.findSegmentByTimestamp(51L)).isNull();
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(51L)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testFindRemoteLogSegmentsByTimestampContinuesAfterClippedEnd(boolean partitionTable)
+            throws Exception {
+        LogTablet logTablet = makeLogTabletAndAddSegments(partitionTable);
+        RemoteLogTablet remoteLogTablet = buildRemoteLogTablet(logTablet);
+        RemoteLogSegment clippedSegment =
+                createLogSegmentWithMaxTimestamp(logTablet, 30, 0, 20).withLogicalRange(0, 10);
+        RemoteLogSegment nextSegment = createLogSegmentWithMaxTimestamp(logTablet, 40, 10, 30);
+        remoteLogTablet.addAndDeleteLogSegments(
+                Arrays.asList(clippedSegment, nextSegment), Collections.emptyList());
+
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(25L))
+                .extracting(RemoteLogSegment::logicalStartOffset)
+                .containsExactly(0L, 10L);
+        assertThat(remoteLogTablet.findSegmentsByTimestamp(35L))
+                .extracting(RemoteLogSegment::logicalStartOffset)
+                .containsExactly(10L);
     }
 
     RemoteLogSegment createLogSegmentWithMaxTimestamp(

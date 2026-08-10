@@ -2172,7 +2172,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                                         tb, leaderAndIsr.leader()),
                                                 tb,
                                                 manifestData.getRemoteLogStartOffset(),
-                                                manifestData.getRemoteLogEndOffset()));
+                                                manifestData.getRemoteLogEndOffset(),
+                                                manifestData.getHighestCopiedEndOffset()));
         coordinatorRequestBatch.sendNotifyRemoteLogOffsetsRequest(
                 coordinatorContext.getCoordinatorEpoch());
         return response;

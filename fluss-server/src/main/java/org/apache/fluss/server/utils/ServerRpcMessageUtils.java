@@ -1684,6 +1684,9 @@ public class ServerRpcMessageUtils {
                 new FsPath(request.getRemoteLogManifestPath()),
                 request.getRemoteLogStartOffset(),
                 request.getRemoteLogEndOffset(),
+                request.hasHighestCopiedEndOffset()
+                        ? request.getHighestCopiedEndOffset()
+                        : request.getRemoteLogEndOffset(),
                 request.getCoordinatorEpoch(),
                 request.getBucketLeaderEpoch());
     }
@@ -1701,6 +1704,7 @@ public class ServerRpcMessageUtils {
                         commitRemoteLogManifestData.getRemoteLogManifestPath().toString())
                 .setRemoteLogStartOffset(commitRemoteLogManifestData.getRemoteLogStartOffset())
                 .setRemoteLogEndOffset(commitRemoteLogManifestData.getRemoteLogEndOffset())
+                .setHighestCopiedEndOffset(commitRemoteLogManifestData.getHighestCopiedEndOffset())
                 .setCoordinatorEpoch(commitRemoteLogManifestData.getCoordinatorEpoch())
                 .setBucketLeaderEpoch(commitRemoteLogManifestData.getBucketLeaderEpoch());
         return request;
@@ -1708,6 +1712,15 @@ public class ServerRpcMessageUtils {
 
     public static NotifyRemoteLogOffsetsRequest makeNotifyRemoteLogOffsetsRequest(
             TableBucket tableBucket, long remoteLogStartOffset, long remoteLogEndOffset) {
+        return makeNotifyRemoteLogOffsetsRequest(
+                tableBucket, remoteLogStartOffset, remoteLogEndOffset, remoteLogEndOffset);
+    }
+
+    public static NotifyRemoteLogOffsetsRequest makeNotifyRemoteLogOffsetsRequest(
+            TableBucket tableBucket,
+            long remoteLogStartOffset,
+            long remoteLogEndOffset,
+            long highestCopiedEndOffset) {
         NotifyRemoteLogOffsetsRequest request = new NotifyRemoteLogOffsetsRequest();
         if (tableBucket.getPartitionId() != null) {
             request.setPartitionId(tableBucket.getPartitionId());
@@ -1715,7 +1728,8 @@ public class ServerRpcMessageUtils {
         request.setTableId(tableBucket.getTableId())
                 .setBucketId(tableBucket.getBucket())
                 .setRemoteStartOffset(remoteLogStartOffset)
-                .setRemoteEndOffset(remoteLogEndOffset);
+                .setRemoteEndOffset(remoteLogEndOffset)
+                .setHighestCopiedEndOffset(highestCopiedEndOffset);
         return request;
     }
 
@@ -1728,6 +1742,9 @@ public class ServerRpcMessageUtils {
                         request.getBucketId()),
                 request.getRemoteStartOffset(),
                 request.getRemoteEndOffset(),
+                request.hasHighestCopiedEndOffset()
+                        ? request.getHighestCopiedEndOffset()
+                        : request.getRemoteEndOffset(),
                 request.getCoordinatorEpoch());
     }
 
