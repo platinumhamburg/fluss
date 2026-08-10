@@ -109,6 +109,7 @@ public final class LogTablet {
     private final Clock clock;
     private final boolean isChangeLog;
     private final long logTtlMs;
+    private final boolean rollExpiredActiveSegmentEnabled;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -162,6 +163,8 @@ public final class LogTablet {
         this.writerStateManager = writerStateManager;
         this.highWatermarkMetadata = new LogOffsetMetadata(0L);
         this.logTtlMs = logTtlMs;
+        this.rollExpiredActiveSegmentEnabled =
+                conf.get(ConfigOptions.LOG_RETENTION_ROLL_ACTIVE_SEGMENT_ENABLED);
 
         this.scheduler = scheduler;
         // scheduler the writer expiration interval check.
@@ -1065,7 +1068,7 @@ public final class LogTablet {
      */
     @VisibleForTesting
     @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
-    public void roll(Optional<Long> expectedNextOffset) throws Exception {
+    public void roll(Optional<Long> expectedNextOffset) throws IOException {
         synchronized (lock) {
             LogSegment segment = localLog.roll(expectedNextOffset);
             // Take a snapshot of the writer state to facilitate recovery. It is useful to have
@@ -1367,7 +1370,12 @@ public final class LogTablet {
         return deletableSegments;
     }
 
-    /** Returns the contiguous prefix of inactive segments that has expired. */
+    /**
+     * Returns the contiguous prefix of expired inactive segments.
+     *
+     * <p>If all inactive segments are deletable, this also checks whether the active segment should
+     * be rolled.
+     */
     private List<LogSegment> deletableExpiredSegments(long endOffset) throws IOException {
         if (localLog.getSegments().isEmpty()) {
             return Collections.emptyList();
@@ -1384,7 +1392,22 @@ public final class LogTablet {
             }
             deletableSegments.add(logSegments.get(i));
         }
+
+        if (deletableSegments.size() == logSegments.size() - 1) {
+            maybeRollExpiredActiveSegment(now, logSegments.get(logSegments.size() - 1));
+        }
         return deletableSegments;
+    }
+
+    /** Rolls the active segment when it is non-empty, expired, and fully committed. */
+    private void maybeRollExpiredActiveSegment(long now, LogSegment activeSegment)
+            throws IOException {
+        if (rollExpiredActiveSegmentEnabled
+                && activeSegment.getSizeInBytes() > 0
+                && isSegmentExpired(now, activeSegment, logTtlMs)
+                && getHighWatermark() >= localLogEndOffset()) {
+            roll(Optional.empty());
+        }
     }
 
     @FunctionalInterface
