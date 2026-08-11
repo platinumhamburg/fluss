@@ -61,7 +61,8 @@ public class PaimonConversions {
     // can help avoid NoSuchField error
     // todo: after upgrade paimon version, we call fall back to use PARTITION_GENERATE_LEGACY_NAME
     // again
-    private static final String PARTITION_GENERATE_LEGACY_NAME_OPTION_KEY = "partition.legacy-name";
+    /** Option controlling whether Paimon uses legacy partition value encoding. */
+    public static final String PARTITION_GENERATE_LEGACY_NAME_OPTION_KEY = "partition.legacy-name";
 
     // for fluss config
     public static final String FLUSS_CONF_PREFIX = "fluss.";
