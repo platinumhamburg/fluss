@@ -15,31 +15,28 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.flink.procedure;
+package org.apache.fluss.flink.adapter;
 
 import org.apache.fluss.testutils.common.MultiVersionTest;
 
+import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.junit.jupiter.api.Test;
 
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.assertThat;
 
-/** IT case for authorization in Flink 1.18. */
-public class Flink118ProcedureITCase extends FlinkProcedureITCase {
-
-    @Test
-    void testIndexArgument() throws Exception {}
+/** Test for {@link CatalogTableAdapter}. */
+@MultiVersionTest
+public class FlinkCatalogTableAdapterTest {
 
     @Test
-    @MultiVersionTest
-    void testLackParams() {
-        assertThatThrownBy(
-                        () ->
-                                tEnv.executeSql(
-                                                String.format(
-                                                        "Call %s.sys.list_acl('ANY', 'ANY', 'ANY')",
-                                                        CATALOG_NAME))
-                                        .wait())
-                .hasMessageContaining(
-                        "No match found for function signature list_acl(<CHARACTER>, <CHARACTER>, <CHARACTER>)");
+    public void testIsMaterializedTable() {
+        assertThat(
+                        CatalogTableAdapter.isMaterializedTable(
+                                CatalogBaseTable.TableKind.MATERIALIZED_TABLE))
+                .isEqualTo(true);
+        assertThat(CatalogTableAdapter.isMaterializedTable(CatalogBaseTable.TableKind.VIEW))
+                .isEqualTo(false);
+        assertThat(CatalogTableAdapter.isMaterializedTable(CatalogBaseTable.TableKind.TABLE))
+                .isEqualTo(false);
     }
 }
