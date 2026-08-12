@@ -191,33 +191,29 @@ abstract class FlinkTableFactoryTest {
     }
 
     @Test
-    void testVirtualLogTableSourceDoesNotSupportBatchMode() {
+    void testVirtualLogTableSourceSupportsBatchMode() {
         ResolvedSchema schema = createBasicSchema();
         Map<String, String> properties = getBasicOptions();
         Configuration configuration = new Configuration();
         configuration.set(ExecutionOptions.RUNTIME_MODE, RuntimeExecutionMode.BATCH);
 
-        assertThatThrownBy(
-                        () ->
-                                createTableSource(
-                                        CHANGELOG_TABLE_IDENTIFIER,
-                                        schema,
-                                        properties,
-                                        Collections.emptyMap(),
-                                        configuration))
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("$changelog virtual tables only support streaming mode.");
+        assertThat(
+                        createTableSource(
+                                CHANGELOG_TABLE_IDENTIFIER,
+                                schema,
+                                properties,
+                                Collections.emptyMap(),
+                                configuration))
+                .isInstanceOf(ChangelogFlinkTableSource.class);
 
-        assertThatThrownBy(
-                        () ->
-                                createTableSource(
-                                        BINLOG_TABLE_IDENTIFIER,
-                                        createBinlogSchema(),
-                                        properties,
-                                        Collections.emptyMap(),
-                                        configuration))
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("$binlog virtual tables only support streaming mode.");
+        assertThat(
+                        createTableSource(
+                                BINLOG_TABLE_IDENTIFIER,
+                                createBinlogSchema(),
+                                properties,
+                                Collections.emptyMap(),
+                                configuration))
+                .isInstanceOf(BinlogFlinkTableSource.class);
     }
 
     @Test
