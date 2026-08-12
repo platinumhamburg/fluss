@@ -135,7 +135,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
@@ -191,7 +190,7 @@ public final class Replica {
     private final LogFormat logFormat;
     private final ArrowCompressionInfo arrowCompressionInfo;
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
-    private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
     private final RemoteLogManager remoteLogManager;
 
@@ -1865,25 +1864,25 @@ public final class Replica {
      * <p>This function can be triggered when a replica's LEO has incremented.
      */
     private void maybeExpandISr(FollowerReplica followerReplica) {
-        IsrState currentIsrState = isrState;
         boolean needsIsrUpdate =
-                !currentIsrState.isInflight()
-                        && inReadLock(leaderIsrUpdateLock, () -> needsExpandIsr(followerReplica));
+                inReadLock(
+                        leaderIsrUpdateLock,
+                        () -> !isrState.isInflight() && needsExpandIsr(followerReplica));
 
         if (needsIsrUpdate) {
             Optional<IsrState.PendingExpandIsrState> adjustIsrUpdateOpt =
                     inWriteLock(
                             leaderIsrUpdateLock,
                             () -> {
+                                IsrState currentIsrState = isrState;
                                 // check if this replica needs to be added to the ISR.
-                                if (currentIsrState instanceof IsrState.CommittedIsrState) {
-                                    if (needsExpandIsr(followerReplica)) {
-                                        return Optional.of(
-                                                prepareIsrExpand(
-                                                        (IsrState.CommittedIsrState)
-                                                                currentIsrState,
-                                                        followerReplica.getFollowerId()));
-                                    }
+                                if (isLeader()
+                                        && currentIsrState instanceof IsrState.CommittedIsrState
+                                        && needsExpandIsr(followerReplica)) {
+                                    return Optional.of(
+                                            prepareIsrExpand(
+                                                    (IsrState.CommittedIsrState) currentIsrState,
+                                                    followerReplica.getFollowerId()));
                                 }
 
                                 return Optional.empty();
@@ -1897,28 +1896,27 @@ public final class Replica {
     }
 
     void maybeShrinkIsr() {
-        IsrState currentIstState = isrState;
         boolean needsIsrUpdate =
-                !currentIstState.isInflight()
-                        && inReadLock(leaderIsrUpdateLock, this::needsShrinkIsr);
+                inReadLock(leaderIsrUpdateLock, () -> !isrState.isInflight() && needsShrinkIsr());
 
         if (needsIsrUpdate) {
             Optional<IsrState.PendingShrinkIsrState> adjustIsrUpdateOpt =
                     inWriteLock(
                             leaderIsrUpdateLock,
                             () -> {
-                                if (isLeader()) {
+                                IsrState currentIsrState = isrState;
+                                if (isLeader()
+                                        && currentIsrState instanceof IsrState.CommittedIsrState) {
                                     List<Integer> outOfSyncFollowerReplicas =
                                             getOutOfSyncFollowerReplicas(replicaMaxLagTime);
-                                    if (currentIstState instanceof IsrState.CommittedIsrState
-                                            && !outOfSyncFollowerReplicas.isEmpty()) {
+                                    if (!outOfSyncFollowerReplicas.isEmpty()) {
                                         List<Integer> newIsr =
-                                                new ArrayList<>(currentIstState.isr());
+                                                new ArrayList<>(currentIsrState.isr());
                                         newIsr.removeAll(outOfSyncFollowerReplicas);
                                         LOG.info(
                                                 "Shrink ISR From {} to {} for bucket {}. Leader: (high watermark: {}, "
                                                         + "end offset: {}, out of sync replicas: {})",
-                                                currentIstState.isr(),
+                                                currentIsrState.isr(),
                                                 newIsr,
                                                 tableBucket,
                                                 logTablet.getHighWatermark(),
@@ -1927,7 +1925,7 @@ public final class Replica {
                                         return Optional.of(
                                                 prepareIsrShrink(
                                                         (IsrState.CommittedIsrState)
-                                                                currentIstState,
+                                                                currentIsrState,
                                                         newIsr,
                                                         outOfSyncFollowerReplicas));
                                     }
@@ -1950,7 +1948,7 @@ public final class Replica {
         // reflect the updated ISR even if there is a delay before we receive the confirmation.
         // Alternatively, if the update fails, no harm is done since the expanded ISR puts
         // a stricter requirement for advancement of the HW.
-        List<Integer> isrToSend = new ArrayList<>(isrState.isr());
+        List<Integer> isrToSend = new ArrayList<>(currentState.isr());
         isrToSend.add(newInSyncReplicaId);
 
         // TODO add server epoch to isr.
@@ -2363,6 +2361,11 @@ public final class Replica {
     @VisibleForTesting
     public int getBucketEpoch() {
         return bucketEpoch;
+    }
+
+    @VisibleForTesting
+    ReentrantReadWriteLock getLeaderIsrUpdateLock() {
+        return leaderIsrUpdateLock;
     }
 
     @VisibleForTesting
