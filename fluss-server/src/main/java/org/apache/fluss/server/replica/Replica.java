@@ -99,6 +99,7 @@ import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.metadata.MetadataProvider;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
@@ -282,6 +283,7 @@ public final class Replica {
             AdjustIsrManager adjustIsrManager,
             SnapshotContext snapshotContext,
             TabletServerMetadataCache metadataCache,
+            @Nullable MetadataProvider metadataProvider,
             FatalErrorHandler fatalErrorHandler,
             BucketMetricGroup bucketMetricGroup,
             TableInfo tableInfo,
@@ -329,6 +331,7 @@ public final class Replica {
                         tableInfo,
                         tableBucket,
                         metadataCache,
+                        metadataProvider,
                         indexReplicatorPool,
                         indexSendBuffer,
                         remoteLogManager,

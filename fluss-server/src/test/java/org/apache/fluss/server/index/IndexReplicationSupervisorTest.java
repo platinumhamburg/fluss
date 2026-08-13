@@ -211,7 +211,8 @@ class IndexReplicationSupervisorTest {
     }
 
     private IndexReplicationSupervisor controller(IndexSendBuffer sendBuffer) {
-        return new IndexReplicationSupervisor(null, TABLE_BUCKET, null, pool, sendBuffer, null, null);
+        return new IndexReplicationSupervisor(
+                null, TABLE_BUCKET, null, null, pool, sendBuffer, null, null);
     }
 
     private static IndexReplicator idleReplicator(

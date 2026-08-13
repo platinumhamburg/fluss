@@ -251,6 +251,77 @@ class MetadataUpdateITCase {
     }
 
     @Test
+    void testMetadataLookupDoesNotMixRecreatedTableWithStaleCacheEntry() throws Exception {
+        TablePath tablePath = TablePath.of("test_db_1", "recreated_table");
+
+        long oldTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        TableInfo oldTableInfo = metadataManager.getTable(tablePath);
+        assertThat(oldTableInfo.getTableId()).isEqualTo(oldTableId);
+
+        // This cache represents a TabletServer that received the original table metadata but
+        // missed the drop and recreate updates. Its MetadataManager still reads the production
+        // ZooKeeper state, exactly as TabletServerMetadataCache#getTableMetadata does.
+        TabletServerMetadataCache staleCache = new TabletServerMetadataCache(metadataManager);
+        staleCache.updateTableMetadata(new TableMetadata(oldTableInfo, Collections.emptyList()));
+
+        coordinatorGateway
+                .dropTable(
+                        newDropTableRequest(
+                                tablePath.getDatabaseName(), tablePath.getTableName(), false))
+                .get();
+        long newTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        assertThat(newTableId).isNotEqualTo(oldTableId);
+
+        assertThat(staleCache.getTableMetadata(tablePath)).isEmpty();
+        assertThat(staleCache.getTableId(tablePath)).hasValue(oldTableId);
+        assertThat(staleCache.getTablePath(oldTableId)).contains(tablePath);
+    }
+
+    @Test
+    void testMetadataProviderRefreshesRecreatedTableRouting() throws Exception {
+        TablePath tablePath = TablePath.of("test_db_1", "provider_recreated_table");
+
+        long oldTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(oldTableId, 0));
+        TableInfo oldTableInfo = metadataManager.getTable(tablePath);
+        List<BucketMetadata> oldBuckets =
+                zkClient
+                        .getBucketMetadataForTables(Collections.singleton(oldTableId))
+                        .get(oldTableId);
+        TabletServerMetadataCache staleCache = new TabletServerMetadataCache(metadataManager);
+        staleCache.updateTableMetadata(new TableMetadata(oldTableInfo, oldBuckets));
+
+        coordinatorGateway
+                .dropTable(
+                        newDropTableRequest(
+                                tablePath.getDatabaseName(), tablePath.getTableName(), false))
+                .get();
+        long newTableId =
+                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        int newLeader =
+                FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(newTableId, 0));
+
+        TabletServerMetadataProvider provider =
+                new TabletServerMetadataProvider(zkClient, metadataManager, staleCache);
+        TableMetadata refreshed =
+                provider.getTablesMetadataFromZK(Collections.singleton(tablePath)).get(0);
+
+        assertThat(refreshed.getTableInfo().getTableId()).isEqualTo(newTableId);
+        assertThat(staleCache.getTableId(tablePath)).hasValue(newTableId);
+        assertThat(staleCache.getTablePath(oldTableId)).isEmpty();
+        assertThat(staleCache.getBucketLeader(oldTableId, 0)).isEmpty();
+        assertThat(staleCache.getTablePath(newTableId)).contains(tablePath);
+        assertThat(staleCache.getBucketLeader(newTableId, 0)).hasValue(newLeader);
+        assertThat(staleCache.getTableMetadata(tablePath))
+                .get()
+                .extracting(metadata -> metadata.getTableInfo().getTableId())
+                .isEqualTo(newTableId);
+    }
+
+    @Test
     void testMetadataUpdateForPartitionCreateAndDrop() throws Exception {
         FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
         Map<Long, TableContext> expectedTablePathById = new HashMap<>();

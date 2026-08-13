@@ -28,6 +28,7 @@ import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
@@ -42,6 +43,7 @@ import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
+import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.types.DataField;
@@ -85,6 +87,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>{@link #testAsyncVisibilityEventuallyVisible()} — with async {@code Schema.Index}
  *       visibility the PutKv ack does not wait for the push, but the index entry is eventually
  *       visible.
+ *   <li>{@link #testIndexReplicationRefreshesStaleIndexTableMetadata()} — stale path-to-table-id
+ *       cache state is repaired from ZooKeeper before the replicator starts.
  *   <li>{@link #testDroppedPartitionEntriesAreFilteredFromIndex()} — with a partition tombstone
  *       injected into the TabletServer's metadata cache, an Index Table PutKv whose value carries
  *       the tombstoned partitionId is silently dropped by the apply-path filter.
@@ -251,6 +255,69 @@ class IndexPushReplicationITCase {
 
         byte[] indexKey = encodeIndexKey("hello", 1);
         waitForIndexEntry(f.indexTableId, indexKey, "hello", true);
+    }
+
+    @Test
+    void testIndexReplicationRefreshesStaleIndexTableMetadata() throws Exception {
+        String mainName = "main_t_metadata_recovery";
+        Fixture f = setupTables(mainName, /* visibility */ null);
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainName, INDEX_NAME));
+        int mainLeaderServer =
+                FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(f.mainTableId, 0));
+        TabletServerMetadataCache cache =
+                FLUSS_CLUSTER_EXTENSION
+                        .getTabletServerById(mainLeaderServer)
+                        .getMetadataCache();
+        TableMetadata currentMetadata = cache.getTableMetadata(indexPath).orElseThrow();
+        long staleTableId = f.indexTableId + 1_000_000L;
+        TableInfo currentTableInfo = currentMetadata.getTableInfo();
+        TableInfo staleTableInfo =
+                TableInfo.of(
+                        indexPath,
+                        staleTableId,
+                        currentTableInfo.getSchemaId(),
+                        currentTableInfo.toTableDescriptor(),
+                        currentTableInfo.getRemoteDataDir(),
+                        currentTableInfo.getCreatedTime(),
+                        currentTableInfo.getModifiedTime());
+        IndexReplicationSupervisor supervisor = f.mainLeaderReplica.getIndexManager();
+
+        supervisor.onBecomeFollower();
+        cache.updateTableMetadata(
+                new TableMetadata(staleTableInfo, currentMetadata.getBucketMetadataList()));
+
+        try {
+            supervisor.onBecomeLeader(
+                    f.mainLeaderReplica.getLogTablet(),
+                    f.mainLeaderReplica.getSchemaGetter(),
+                    f.mainLeaderReplica::advanceIndexProgress,
+                    f.mainLeaderReplica.getAllIndexPushedOffset());
+
+            assertThat(supervisor.getState()).isEqualTo(IndexReplicationSupervisor.State.RUNNING);
+            assertThat(cache.getTableId(indexPath)).hasValue(f.indexTableId);
+            assertThat(cache.getTablePath(staleTableId)).isEmpty();
+            assertThat(cache.getBucketLeader(staleTableId, 0)).isEmpty();
+
+            f.mainGateway
+                    .putKv(
+                            newPutKvRequest(
+                                    f.mainTableId,
+                                    0,
+                                    1,
+                                    genKvRecordBatch(new Object[] {1, "recovered"})))
+                    .get(30, TimeUnit.SECONDS);
+            assertIndexEntry(
+                    f.indexTableId, encodeIndexKey("recovered", 1), "recovered", true);
+        } finally {
+            supervisor.onBecomeFollower();
+            cache.updateTableMetadata(currentMetadata);
+            supervisor.onBecomeLeader(
+                    f.mainLeaderReplica.getLogTablet(),
+                    f.mainLeaderReplica.getSchemaGetter(),
+                    f.mainLeaderReplica::advanceIndexProgress,
+                    f.mainLeaderReplica.getAllIndexPushedOffset());
+        }
     }
 
     /**
