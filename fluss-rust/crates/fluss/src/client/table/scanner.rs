@@ -829,7 +829,7 @@ impl LogScannerInner {
         let table_bucket =
             TableBucket::new_with_partition(self.table_id, Some(partition_id), bucket);
         self.metadata
-            .check_and_update_table_metadata(from_ref(&self.table_path))
+            .check_and_update_partition_metadata_by_ids(&self.table_path, &[partition_id])
             .await?;
         self.log_scanner_status
             .assign_scan_bucket(table_bucket, offset);
@@ -866,9 +866,19 @@ impl LogScannerInner {
             });
         }
 
-        self.metadata
-            .check_and_update_table_metadata(from_ref(&self.table_path))
-            .await?;
+        if self.is_partitioned_table {
+            let partition_ids: Vec<PartitionId> = bucket_offsets
+                .keys()
+                .filter_map(TableBucket::partition_id)
+                .collect();
+            self.metadata
+                .check_and_update_partition_metadata_by_ids(&self.table_path, &partition_ids)
+                .await?;
+        } else {
+            self.metadata
+                .check_and_update_table_metadata(from_ref(&self.table_path))
+                .await?;
+        }
 
         self.log_scanner_status.assign_scan_buckets(bucket_offsets);
         Ok(())
@@ -1415,15 +1425,21 @@ impl LogFetcher {
             Ok(())
         };
 
-        // TODO: Handle PartitionNotExist error like java side
-        update_result.or_else(|e| {
-            if let Error::RpcError { source, .. } = &e
+        update_result.or_else(|error| {
+            if matches!(error.api_error(), Some(FlussError::PartitionNotExists)) {
+                warn!(
+                    "Received PartitionNotExists while updating scanner metadata; ignoring it: {error}"
+                );
+                Ok(())
+            } else if let Error::RpcError { source, .. } = &error
                 && matches!(source, RpcError::ConnectionError(_) | RpcError::Poisoned(_))
             {
-                warn!("Retrying after encountering error while updating table metadata: {e}");
+                warn!(
+                    "Retrying after encountering error while updating table metadata: {error}"
+                );
                 Ok(())
             } else {
-                Err(e)
+                Err(error)
             }
         })?;
         Ok(())
@@ -1583,14 +1599,33 @@ impl LogFetcher {
 
                     let error = FlussError::for_code(error_code);
                     if Self::should_invalidate_table_meta(error) {
-                        // TODO: Consider triggering table meta invalidation from sender/lookup paths.
                         let table_id = table_bucket.table_id();
                         let cluster = metadata.get_cluster();
                         if let Some(table_path) = cluster.get_table_path_by_id(table_id) {
-                            let physical_tables = HashSet::from([PhysicalTablePath::of(Arc::new(
-                                table_path.clone(),
-                            ))]);
-                            metadata.invalidate_physical_table_meta(&physical_tables);
+                            let physical_table_path = match table_bucket.partition_id() {
+                                Some(partition_id) => {
+                                    match cluster.get_partition_name(partition_id) {
+                                        Some(partition_name) => {
+                                            Some(PhysicalTablePath::of_partitioned(
+                                                Arc::new(table_path.clone()),
+                                                Some(partition_name.clone()),
+                                            ))
+                                        }
+                                        None => {
+                                            warn!(
+                                                "Partition id {partition_id} is missing from partition_name_by_id while invalidating metadata for table {table_path}"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                None => Some(PhysicalTablePath::of(Arc::new(table_path.clone()))),
+                            };
+                            if let Some(physical_table_path) = physical_table_path {
+                                metadata.invalidate_physical_table_meta(&HashSet::from([
+                                    physical_table_path,
+                                ]));
+                            }
                         } else {
                             warn!(
                                 "Table id {table_id} is missing from table_path_by_id while invalidating table metadata"
