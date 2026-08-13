@@ -275,15 +275,65 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                                         && m.contains(activeSegment.toString()));
     }
 
+    @Test
+    void cleansOldLogSegmentWhenBucketHasNoRemoteManifest() throws Exception {
+        String dbName = newDatabaseName("nomanifest");
+        TablePath tablePath = createLogTable(dbName, "partial_first_tiering");
+        Path orphan = createOldSegmentFile(tablePath, "99999999999999999999.log");
+
+        runCleanerForDatabase(false, dbName);
+
+        assertThat(Files.exists(orphan)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=scan_log_bucket_without_manifest")
+                                        && message.contains("reason=no_remote_manifest"));
+    }
+
+    @Test
+    void cleansOldSnapshotWhenBucketHasNoActiveSnapshots() throws Exception {
+        String dbName = newDatabaseName("no_snapshot");
+        TablePath tablePath = createPrimaryKeyTable(dbName, "partial_first_snapshot");
+        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), 0);
+        FsPath remoteKvTabletDir =
+                FlussPaths.remoteKvTabletDir(
+                        new FsPath(remoteDataRoot().resolve("kv").toUri().toString()),
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket);
+        Path orphan =
+                localPath(FlussPaths.remoteKvSnapshotDir(remoteKvTabletDir, 99L))
+                        .resolve("_METADATA");
+        Files.createDirectories(orphan.getParent());
+        Files.write(orphan, new byte[] {0x55});
+        makeOld(orphan);
+        makeOld(orphan.getParent());
+
+        runCleanerForDatabase(false, dbName);
+
+        assertThat(Files.exists(orphan)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=scan_kv_bucket_without_active_snapshots")
+                                        && message.contains("reason=no_active_snapshots"));
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=deleted")
+                                        && message.contains("rule=kv-snapshot-file")
+                                        && message.contains(orphan.toString()));
+    }
+
     /**
      * Seeds a remote log manifest + matching active segment under a freshly-allocated UUID so the
      * active-file cleanup reaches {@code ManifestReadStatus.RESOLVED} for bucket 0 of the given log
      * table. Returns the active segment's {@code .log} path so callers can assert it survives
      * cleanup.
      *
-     * <p>Without a manifest the bucket falls back to {@code ManifestReadStatus.NOT_LISTED} and the
-     * active-file cleanup skips the entire bucket (see §4.3.1 of the design doc) — which would
-     * prevent any orphan file under the bucket from being visited at all.
+     * <p>The helper installs a manifest because tests using it need a non-empty active set, rather
+     * than the empty active set used when the bucket has no committed manifest.
      */
     private Path seedActiveBucketManifest(TablePath tablePath) throws Exception {
         TableInfo tableInfo = admin.getTableInfo(tablePath).get();

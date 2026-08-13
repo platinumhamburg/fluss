@@ -435,8 +435,14 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 logResult.readFailureReason(bucketId));
                         break;
                     case NOT_LISTED:
-                        audit.logSkipLogBucket(
-                                liveTable.tableId, partitionId, bucketId, "no_remote_manifest");
+                        logTabletDir =
+                                FlussPaths.remoteLogTabletDir(
+                                                remoteLogDir,
+                                                physicalPath(liveTable.tablePath, partitionInfo),
+                                                tableBucket)
+                                        .toString();
+                        audit.logScanLogBucketWithoutManifest(
+                                liveTable.tableId, partitionId, bucketId);
                         break;
                     default:
                         break;
@@ -445,16 +451,18 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
             String kvTabletDir = null;
             Set<String> kvActiveSnaps = Collections.emptySet();
-            if (kvTargetOk && kvActiveByBucket.containsKey(bucketId)) {
+            if (kvTargetOk) {
                 kvTabletDir =
                         FlussPaths.remoteKvTabletDir(
                                         remoteKvDir,
                                         physicalPath(liveTable.tablePath, partitionInfo),
                                         tableBucket)
                                 .toString();
-                kvActiveSnaps = kvActiveByBucket.get(bucketId);
-            } else if (kvTargetOk) {
-                audit.logSkipKvBucket(liveTable.tableId, partitionId, bucketId, "empty_active_set");
+                kvActiveSnaps = kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
+                if (kvActiveSnaps.isEmpty()) {
+                    audit.logScanKvBucketWithoutActiveSnapshots(
+                            liveTable.tableId, partitionId, bucketId);
+                }
             }
 
             if (logTabletDir == null && kvTabletDir == null) {

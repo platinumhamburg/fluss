@@ -56,9 +56,9 @@ public final class LogActiveRefsFetchResult {
         READ_FAILED,
         /**
          * Table metadata enumerates the bucket, but the {@code LIST_REMOTE_LOG_MANIFESTS} response
-         * did not include an entry for it — typically because the bucket has not yet committed any
-         * remote manifest (e.g. log tiering has not produced one), or an occasional server-side
-         * underreport (e.g. partial ZK read). Cleanup has nothing to clean for this bucket.
+         * did not include an entry for it. A successful RPC means the bucket has not committed a
+         * remote manifest at that instant. Physical files may nevertheless exist when a first
+         * tiering attempt uploaded files but failed before publishing its manifest.
          */
         NOT_LISTED
     }

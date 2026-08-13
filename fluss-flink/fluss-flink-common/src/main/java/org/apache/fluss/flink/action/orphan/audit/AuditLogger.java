@@ -144,6 +144,18 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Scan a KV bucket after metadata authoritatively reports no active snapshots. */
+    public void logScanKvBucketWithoutActiveSnapshots(
+            long tableId, Long partitionId, int bucketId) {
+        AUDIT.info(
+                "action=scan_kv_bucket_without_active_snapshots reason=no_active_snapshots"
+                        + " table_id={} partition_id={} bucket_id={} ts={}",
+                tableId,
+                partitionId,
+                bucketId,
+                Instant.now());
+    }
+
     /**
      * Skip log cleanup for one (tableId, partitionId) target — emitted when {@code
      * ListRemoteLogManifests} fails after retries. {@code partitionId} is null for non-partitioned
@@ -166,6 +178,17 @@ public final class AuditLogger {
         AUDIT.warn(
                 "action=skip_log_bucket reason={} table_id={} partition_id={} bucket_id={} ts={}",
                 reason,
+                tableId,
+                partitionId,
+                bucketId,
+                Instant.now());
+    }
+
+    /** Scan a log bucket for which metadata reports no committed remote manifest. */
+    public void logScanLogBucketWithoutManifest(long tableId, Long partitionId, int bucketId) {
+        AUDIT.info(
+                "action=scan_log_bucket_without_manifest reason=no_remote_manifest"
+                        + " table_id={} partition_id={} bucket_id={} ts={}",
                 tableId,
                 partitionId,
                 bucketId,
