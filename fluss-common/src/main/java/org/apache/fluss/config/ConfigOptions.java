@@ -1014,7 +1014,7 @@ public class ConfigOptions {
     public static final ConfigOption<Integer> INDEX_REPLICATION_READER_THREADS =
             key("index.replication.reader.threads")
                     .intType()
-                    .defaultValue(1)
+                    .defaultValue(8)
                     .withDescription(
                             "Number of reader worker threads in the server-global index replicator "
                                     + "pool. Each leader-side index replicator is assigned to a "
@@ -1025,7 +1025,7 @@ public class ConfigOptions {
     public static final ConfigOption<Integer> INDEX_REPLICATION_SENDER_THREADS =
             key("index.replication.sender.threads")
                     .intType()
-                    .defaultValue(1)
+                    .defaultValue(2)
                     .withDescription(
                             "Number of sender worker threads that dispatch derived index batches to "
                                     + "target Index Table leaders. Within one TabletServer, each "

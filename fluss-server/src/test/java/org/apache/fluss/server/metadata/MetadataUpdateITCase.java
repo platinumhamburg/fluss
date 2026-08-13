@@ -254,8 +254,7 @@ class MetadataUpdateITCase {
     void testMetadataLookupDoesNotMixRecreatedTableWithStaleCacheEntry() throws Exception {
         TablePath tablePath = TablePath.of("test_db_1", "recreated_table");
 
-        long oldTableId =
-                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        long oldTableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
         TableInfo oldTableInfo = metadataManager.getTable(tablePath);
         assertThat(oldTableInfo.getTableId()).isEqualTo(oldTableId);
 
@@ -270,8 +269,7 @@ class MetadataUpdateITCase {
                         newDropTableRequest(
                                 tablePath.getDatabaseName(), tablePath.getTableName(), false))
                 .get();
-        long newTableId =
-                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        long newTableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
         assertThat(newTableId).isNotEqualTo(oldTableId);
 
         assertThat(staleCache.getTableMetadata(tablePath)).isEmpty();
@@ -283,13 +281,11 @@ class MetadataUpdateITCase {
     void testMetadataProviderRefreshesRecreatedTableRouting() throws Exception {
         TablePath tablePath = TablePath.of("test_db_1", "provider_recreated_table");
 
-        long oldTableId =
-                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        long oldTableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
         FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(oldTableId, 0));
         TableInfo oldTableInfo = metadataManager.getTable(tablePath);
         List<BucketMetadata> oldBuckets =
-                zkClient
-                        .getBucketMetadataForTables(Collections.singleton(oldTableId))
+                zkClient.getBucketMetadataForTables(Collections.singleton(oldTableId))
                         .get(oldTableId);
         TabletServerMetadataCache staleCache = new TabletServerMetadataCache(metadataManager);
         staleCache.updateTableMetadata(new TableMetadata(oldTableInfo, oldBuckets));
@@ -299,10 +295,8 @@ class MetadataUpdateITCase {
                         newDropTableRequest(
                                 tablePath.getDatabaseName(), tablePath.getTableName(), false))
                 .get();
-        long newTableId =
-                createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
-        int newLeader =
-                FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(newTableId, 0));
+        long newTableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+        int newLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(newTableId, 0));
 
         TabletServerMetadataProvider provider =
                 new TabletServerMetadataProvider(zkClient, metadataManager, staleCache);
