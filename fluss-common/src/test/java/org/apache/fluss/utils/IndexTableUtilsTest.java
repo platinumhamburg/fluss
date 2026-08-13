@@ -19,8 +19,6 @@ package org.apache.fluss.utils;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.Optional;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 class IndexTableUtilsTest {
@@ -36,24 +34,20 @@ class IndexTableUtilsTest {
     }
 
     @Test
-    void testIndexTableNameSeparatorIsDoubleUnderscore() {
-        assertThat(IndexTableUtils.INDEX_TABLE_NAME_SEPARATOR).isEqualTo("__");
+    void testIndexTableNamePrefixIsOperationallyDistinct() {
+        assertThat(IndexTableUtils.INDEX_TABLE_NAME_PREFIX).isEqualTo("__fluss_index_");
     }
 
     @Test
     void testIndexTableNameComposes() {
-        assertThat(IndexTableUtils.indexTableName("orders", "idx_user"))
-                .isEqualTo("orders__idx_user");
+        assertThat(IndexTableUtils.indexTableName(42L, "idx_user"))
+                .isEqualTo("__fluss_index_42__idx_user");
     }
 
     @Test
-    void testMainTableNameFromIndexTableNameUsesLastSeparator() {
-        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("orders__idx_user"))
-                .isEqualTo(Optional.of("orders"));
-        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("tenant__orders__idx_user"))
-                .isEqualTo(Optional.of("tenant__orders"));
-        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("orders")).isEmpty();
-        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("__idx_user")).isEmpty();
-        assertThat(IndexTableUtils.mainTableNameFromIndexTableName("orders__")).isEmpty();
+    void testIndexTableNameDoesNotDependOnMainTableName() {
+        assertThat(IndexTableUtils.indexTableName(42L, "idx_user"))
+                .doesNotContain("orders")
+                .startsWith("__fluss_index_");
     }
 }

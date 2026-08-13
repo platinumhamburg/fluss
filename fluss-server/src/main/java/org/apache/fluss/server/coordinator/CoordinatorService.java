@@ -622,8 +622,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             TablePath indexTablePath =
                     TablePath.of(
                             mainTablePath.getDatabaseName(),
-                            IndexTableUtils.indexTableName(
-                                    mainTablePath.getTableName(), index.getIndexName()));
+                            IndexTableUtils.indexTableName(mainTableId, index.getIndexName()));
             TableAssignment indexAssignment = null;
             if (!indexDescriptor.isPartitioned()) {
                 //noinspection OptionalGetWithoutIsPresent
@@ -876,17 +875,14 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     }
 
     private boolean owningMainTableExists(TablePath indexTablePath, TableInfo indexTableInfo) {
-        Optional<String> mainTableName =
-                IndexTableUtils.mainTableNameFromIndexTableName(indexTablePath.getTableName());
-        if (!mainTableName.isPresent()) {
+        OptionalLong mainTableId = indexTableInfo.getMainTableId();
+        if (!mainTableId.isPresent()) {
             return false;
         }
-        TablePath mainTablePath =
-                TablePath.of(indexTablePath.getDatabaseName(), mainTableName.get());
         try {
+            TablePath mainTablePath = getTablePathById(mainTableId.getAsLong());
             TableInfo mainInfo = metadataManager.getTable(mainTablePath);
-            OptionalLong mainTableId = indexTableInfo.getMainTableId();
-            return mainTableId.isPresent() && mainInfo.getTableId() == mainTableId.getAsLong();
+            return mainInfo.getTableId() == mainTableId.getAsLong();
         } catch (TableNotExistException e) {
             return false;
         }
@@ -894,7 +890,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
     private Map<TablePath, Long> validateIndexTablesForCascade(
             TablePath mainTablePath, TableInfo mainInfo) {
-        List<TablePath> indexPaths = indexTablePathsFor(mainTablePath, mainInfo.getSchema());
+        List<TablePath> indexPaths =
+                indexTablePathsFor(mainTablePath, mainInfo.getTableId(), mainInfo.getSchema());
         Map<TablePath, Long> indexTableIds = new LinkedHashMap<>();
         for (TablePath indexPath : indexPaths) {
             TableInfo indexInfo;
@@ -922,7 +919,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
      * in {@code schema}. Returns an empty list when the schema has no indexes.
      */
     @VisibleForTesting
-    static List<TablePath> indexTablePathsFor(TablePath mainPath, Schema schema) {
+    static List<TablePath> indexTablePathsFor(
+            TablePath mainPath, long mainTableId, Schema schema) {
         List<Schema.Index> indexes = schema.getIndexes();
         if (indexes.isEmpty()) {
             return Collections.emptyList();
@@ -932,8 +930,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             result.add(
                     TablePath.of(
                             mainPath.getDatabaseName(),
-                            IndexTableUtils.indexTableName(
-                                    mainPath.getTableName(), index.getIndexName())));
+                            IndexTableUtils.indexTableName(mainTableId, index.getIndexName())));
         }
         return result;
     }

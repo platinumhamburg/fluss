@@ -18,7 +18,6 @@
 package org.apache.fluss.utils;
 
 import java.util.Collections;
-import java.util.Optional;
 import java.util.Set;
 
 /** Utility constants and helpers shared by the Global Secondary Index Table layer. */
@@ -39,29 +38,19 @@ public final class IndexTableUtils {
     public static final Set<String> RESERVED_INDEX_SYSTEM_COLUMNS =
             Collections.singleton(PARTITION_ID_SYSTEM_COLUMN);
 
-    /**
-     * Separator between main table name and index name in Index Table paths.
-     *
-     * <p>Chosen so the composed Index Table name passes {@code TablePath.detectInvalidName} (which
-     * restricts table names to {@code [a-zA-Z0-9_-]}) while remaining unambiguous: user index names
-     * are validated by {@code Schema.Index} to match {@code ^[A-Za-z0-9_]+$} AND to forbid {@code
-     * __}, so a name {@code <main>__<index>} unambiguously decomposes back to its parts.
-     */
+    /** Reserved, operationally distinct prefix for internal Index Tables. */
+    public static final String INDEX_TABLE_NAME_PREFIX = "__fluss_index_";
+
+    /** Separator between the owning main-table id and index name. */
     public static final String INDEX_TABLE_NAME_SEPARATOR = "__";
 
     private IndexTableUtils() {}
 
-    /** Builds the Index Table name from a main table name and an index name. */
-    public static String indexTableName(String mainTableName, String indexName) {
-        return mainTableName + INDEX_TABLE_NAME_SEPARATOR + indexName;
-    }
-
-    /** Extracts the main table name from a composed Index Table name. */
-    public static Optional<String> mainTableNameFromIndexTableName(String indexTableName) {
-        int pos = indexTableName.lastIndexOf(INDEX_TABLE_NAME_SEPARATOR);
-        if (pos <= 0 || pos + INDEX_TABLE_NAME_SEPARATOR.length() >= indexTableName.length()) {
-            return Optional.empty();
-        }
-        return Optional.of(indexTableName.substring(0, pos));
+    /** Builds the internal Index Table name from its owning main-table id and index name. */
+    public static String indexTableName(long mainTableId, String indexName) {
+        return INDEX_TABLE_NAME_PREFIX
+                + mainTableId
+                + INDEX_TABLE_NAME_SEPARATOR
+                + indexName;
     }
 }

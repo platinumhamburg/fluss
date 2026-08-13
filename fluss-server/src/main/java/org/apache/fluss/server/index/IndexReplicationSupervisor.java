@@ -304,11 +304,7 @@ public final class IndexReplicationSupervisor {
         }
         kvTablet.setValueFilter(
                 valueBytes -> {
-                    boolean drop = d.isTombstoned(valueBytes);
-                    if (drop) {
-                        metrics.partitionTombstoneApplyDrops().inc();
-                    }
-                    return drop;
+                    return d.isTombstoned(valueBytes);
                 });
         LOG.info(
                 "Index Table partition-tombstone filter installed for {} (mainTableId={})",
@@ -380,8 +376,7 @@ public final class IndexReplicationSupervisor {
                     TablePath.of(
                             tableInfo.getTablePath().getDatabaseName(),
                             IndexTableUtils.indexTableName(
-                                    tableInfo.getTablePath().getTableName(),
-                                    index.getIndexName())));
+                                    tableInfo.getTableId(), index.getIndexName())));
         }
 
         List<IndexSpec> indexSpecs;
@@ -421,7 +416,8 @@ public final class IndexReplicationSupervisor {
                         replicatorPool.maxWindowBytes(),
                         replicatorPool.preferredMaxRequestBytes(),
                         onProgress,
-                        this::onIndexReplicatorFailed);
+                        this::onIndexReplicatorFailed,
+                        metrics);
         // Register with the read pool; the pool worker will catch up on any WAL entries already
         // committed before this replicator was created.
         installIndexReplicator(replicator);

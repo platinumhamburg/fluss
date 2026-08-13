@@ -138,7 +138,7 @@ public class FlussTable implements Table {
         TablePath indexTablePath =
                 TablePath.of(
                         tablePath.getDatabaseName(),
-                        IndexTableUtils.indexTableName(tablePath.getTableName(), indexName));
+                        IndexTableUtils.indexTableName(tableInfo.getTableId(), indexName));
         Table indexTable = conn.getTable(indexTablePath);
 
         // Hop 1: PrefixKeyLookuper on the Index Table by the index columns.
