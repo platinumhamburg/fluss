@@ -101,6 +101,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.metadata.MetadataProvider;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.UserMetrics;
@@ -184,6 +185,7 @@ public class ReplicaManager implements ServerReconfigurable {
     private final Map<TableBucket, HostedReplica> allReplicas = new ConcurrentHashMap<>();
 
     private final TabletServerMetadataCache metadataCache;
+    @Nullable private final MetadataProvider metadataProvider;
     private final RpcClient rpcClient;
     private final IndexSendBuffer indexSendBuffer;
     private final IndexReplicatorPool indexReplicatorPool;
@@ -243,6 +245,7 @@ public class ReplicaManager implements ServerReconfigurable {
             ZooKeeperClient zkClient,
             int serverId,
             TabletServerMetadataCache metadataCache,
+            @Nullable MetadataProvider metadataProvider,
             RpcClient rpcClient,
             CoordinatorGateway coordinatorGateway,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -262,6 +265,7 @@ public class ReplicaManager implements ServerReconfigurable {
                 zkClient,
                 serverId,
                 metadataCache,
+                metadataProvider,
                 rpcClient,
                 coordinatorGateway,
                 completedKvSnapshotCommitter,
@@ -291,6 +295,7 @@ public class ReplicaManager implements ServerReconfigurable {
             ZooKeeperClient zkClient,
             int serverId,
             TabletServerMetadataCache metadataCache,
+            @Nullable MetadataProvider metadataProvider,
             RpcClient rpcClient,
             CoordinatorGateway coordinatorGateway,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -311,6 +316,7 @@ public class ReplicaManager implements ServerReconfigurable {
         this.kvManager = kvManager;
         this.serverId = serverId;
         this.metadataCache = metadataCache;
+        this.metadataProvider = metadataProvider;
         this.rpcClient = rpcClient;
         this.indexSendBuffer =
                 new IndexSendBuffer(
@@ -2278,6 +2284,7 @@ public class ReplicaManager implements ServerReconfigurable {
                                 adjustIsrManager,
                                 kvSnapshotContext,
                                 metadataCache,
+                                metadataProvider,
                                 fatalErrorHandler,
                                 bucketMetricGroup,
                                 tableInfo,

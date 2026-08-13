@@ -30,6 +30,7 @@ import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.KvWriteGuard;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.metadata.MetadataProvider;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.utils.IndexTableUtils;
@@ -43,7 +44,6 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.ToLongFunction;
 
@@ -87,6 +87,7 @@ public final class IndexReplicationSupervisor {
     private final TableInfo tableInfo;
     private final TableBucket tableBucket;
     private final TabletServerMetadataCache metadataCache;
+    @Nullable private final MetadataProvider metadataProvider;
     @Nullable private final IndexReplicatorPool replicatorPool;
     @Nullable private final IndexSendBuffer sendBuffer;
     private final RemoteLogManager remoteLogManager;
@@ -106,6 +107,7 @@ public final class IndexReplicationSupervisor {
             TableInfo tableInfo,
             TableBucket tableBucket,
             TabletServerMetadataCache metadataCache,
+            @Nullable MetadataProvider metadataProvider,
             @Nullable IndexReplicatorPool replicatorPool,
             @Nullable IndexSendBuffer sendBuffer,
             RemoteLogManager remoteLogManager,
@@ -113,6 +115,7 @@ public final class IndexReplicationSupervisor {
         this.tableInfo = tableInfo;
         this.tableBucket = tableBucket;
         this.metadataCache = metadataCache;
+        this.metadataProvider = metadataProvider;
         this.replicatorPool = replicatorPool;
         this.sendBuffer = sendBuffer;
         this.remoteLogManager = remoteLogManager;
@@ -371,43 +374,32 @@ public final class IndexReplicationSupervisor {
             return;
         }
 
-        // Check that all index tables are visible in the metadata cache
+        List<TablePath> indexTablePaths = new ArrayList<>(indexes.size());
         for (Schema.Index index : indexes) {
-            TablePath indexPath =
+            indexTablePaths.add(
                     TablePath.of(
                             tableInfo.getTablePath().getDatabaseName(),
                             IndexTableUtils.indexTableName(
-                                    tableInfo.getTablePath().getTableName(), index.getIndexName()));
-            OptionalLong indexTableId = metadataCache.getTableId(indexPath);
-            if (!indexTableId.isPresent()) {
-                state.set(State.DEFERRED);
-                LOG.info(
-                        "Index table {} not yet visible in cache -- deferring IndexReplicator; "
-                                + "will retry on next metadata update.",
-                        indexPath);
-                return;
-            }
-            if (!metadataCache.getTableMetadata(indexPath).isPresent()) {
-                state.set(State.DEFERRED);
-                LOG.info(
-                        "Index table {} metadata not yet visible in cache -- deferring "
-                                + "IndexReplicator; will retry on next metadata update.",
-                        indexPath);
-                return;
-            }
+                                    tableInfo.getTablePath().getTableName(),
+                                    index.getIndexName())));
         }
 
         List<IndexSpec> indexSpecs;
         try {
             indexSpecs = IndexSpecFactory.buildIndexSpecs(tableInfo, tableBucket, metadataCache);
-        } catch (IllegalStateException e) {
-            state.set(State.DEFERRED);
-            LOG.info(
-                    "Index table metadata is unavailable or inconsistent while building specs for {} -- "
-                            + "deferring IndexReplicator; will retry on next metadata update.",
-                    tableBucket,
-                    e);
-            return;
+        } catch (IllegalStateException initialFailure) {
+            if (metadataProvider == null) {
+                deferIndexReplication(initialFailure);
+                return;
+            }
+            try {
+                metadataProvider.getTablesMetadataFromZK(indexTablePaths);
+                indexSpecs =
+                        IndexSpecFactory.buildIndexSpecs(tableInfo, tableBucket, metadataCache);
+            } catch (RuntimeException refreshFailure) {
+                deferIndexReplication(refreshFailure);
+                return;
+            }
         }
         LogRecordReadContext readContext =
                 LogRecordReadContext.createReadContext(tableInfo, false, null, schemaGetter);
@@ -435,6 +427,15 @@ public final class IndexReplicationSupervisor {
         installIndexReplicator(replicator);
         replicator.onHighWatermarkAdvanced();
         LOG.info("IndexReplicator (WAL-driven) registered for {}", tableBucket);
+    }
+
+    private void deferIndexReplication(RuntimeException metadataFailure) {
+        state.set(State.DEFERRED);
+        LOG.info(
+                "Index table metadata is unavailable or inconsistent for {}; deferring "
+                        + "IndexReplicator until the next metadata update.",
+                tableBucket,
+                metadataFailure);
     }
 
     void installIndexReplicator(IndexReplicator replicator) {

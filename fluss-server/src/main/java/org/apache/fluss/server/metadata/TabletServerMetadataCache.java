@@ -124,7 +124,6 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
     }
 
     public Optional<TableMetadata> getTableMetadata(TablePath tablePath) {
-        // Only get data from cache, do not access ZK.
         ServerMetadataSnapshot snapshot = serverMetadataSnapshot;
         OptionalLong tableIdOpt = snapshot.getTableId(tablePath);
         if (!tableIdOpt.isPresent()) {
@@ -136,6 +135,9 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
         // Try to get table info from ZK only if we have the table ID in cache
         try {
             TableInfo tableInfo = metadataManager.getTable(tablePath);
+            if (tableInfo.getTableId() != tableId) {
+                return Optional.empty();
+            }
             List<BucketMetadata> bucketMetadataList =
                     new ArrayList<>(snapshot.getBucketMetadataForTable(tableId).values());
             return Optional.of(new TableMetadata(tableInfo, bucketMetadataList));
@@ -269,7 +271,11 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                             bucketMetadataMapForTables.remove(tableId);
                             removePartitionTombstone(tableId);
                         } else {
-                            tableIdByPath.put(tablePath, tableId);
+                            Long previousTableId = tableIdByPath.put(tablePath, tableId);
+                            if (previousTableId != null && previousTableId != tableId) {
+                                bucketMetadataMapForTables.remove(previousTableId);
+                                removePartitionTombstone(previousTableId);
+                            }
                             tableMetadata
                                     .getBucketMetadataList()
                                     .forEach(
@@ -396,7 +402,11 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                             new HashMap<>(currentSnapshot.getBucketMetadataMapForTables());
 
                     // Update table mapping
-                    tableIdByPath.put(tablePath, tableId);
+                    Long previousTableId = tableIdByPath.put(tablePath, tableId);
+                    if (previousTableId != null && previousTableId != tableId) {
+                        bucketMetadataMapForTables.remove(previousTableId);
+                        removePartitionTombstone(previousTableId);
+                    }
                     pathByTableId.put(tableId, tablePath);
 
                     // Update bucket metadata for this table

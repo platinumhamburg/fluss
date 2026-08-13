@@ -379,6 +379,65 @@ public class TabletServerMetadataCacheTest {
     }
 
     @Test
+    void testUpdateTableMetadataReplacesRecreatedTableState() {
+        serverMetadataCache.updateTableMetadata(
+                new TableMetadata(DATA1_TABLE_INFO, initialBucketMetadata));
+
+        long recreatedTableId = DATA1_TABLE_ID + 1;
+        TableInfo recreatedTableInfo = recreatedData1TableInfo(recreatedTableId);
+        serverMetadataCache.updateTableMetadata(
+                new TableMetadata(recreatedTableInfo, changedBucket1BucketMetadata));
+
+        assertRecreatedTableState(recreatedTableId);
+    }
+
+    @Test
+    void testUpdateClusterMetadataReplacesRecreatedTableState() {
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(DATA1_TABLE_INFO, initialBucketMetadata)),
+                        Collections.emptyList()));
+        serverMetadataCache.updatePartitionTombstone(
+                DATA1_TABLE_ID, new PartitionTombstone(-1L, Collections.singleton(10L), 1L));
+
+        long recreatedTableId = DATA1_TABLE_ID + 1;
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(
+                                        recreatedData1TableInfo(recreatedTableId),
+                                        changedBucket1BucketMetadata)),
+                        Collections.emptyList()));
+
+        assertRecreatedTableState(recreatedTableId);
+        assertThat(serverMetadataCache.getInitializedPartitionTombstone(DATA1_TABLE_ID)).isEmpty();
+    }
+
+    private TableInfo recreatedData1TableInfo(long recreatedTableId) {
+        return TableInfo.of(
+                DATA1_TABLE_PATH,
+                recreatedTableId,
+                DATA1_TABLE_INFO.getSchemaId(),
+                DATA1_TABLE_INFO.toTableDescriptor(),
+                DATA1_TABLE_INFO.getRemoteDataDir(),
+                DATA1_TABLE_INFO.getCreatedTime(),
+                DATA1_TABLE_INFO.getModifiedTime());
+    }
+
+    private void assertRecreatedTableState(long recreatedTableId) {
+        assertThat(serverMetadataCache.getTableId(DATA1_TABLE_PATH)).hasValue(recreatedTableId);
+        assertThat(serverMetadataCache.getTablePath(DATA1_TABLE_ID)).isEmpty();
+        assertThat(serverMetadataCache.getBucketLeader(DATA1_TABLE_ID, 0)).isEmpty();
+        assertThat(serverMetadataCache.getTablePath(recreatedTableId)).contains(DATA1_TABLE_PATH);
+        assertThat(serverMetadataCache.getBucketLeader(recreatedTableId, 1)).hasValue(1);
+    }
+
+    @Test
     void testUpdatePartitionMetadata() {
         // Given: table metadata exists in cache (using existing partition table)
         TableMetadata tableMetadata = new TableMetadata(partitionTableInfo, initialBucketMetadata);
