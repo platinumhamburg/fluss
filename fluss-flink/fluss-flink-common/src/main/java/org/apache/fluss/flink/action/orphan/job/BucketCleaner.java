@@ -101,15 +101,22 @@ public final class BucketCleaner {
             return;
         }
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
-        stack.push(new DirVisit(root, false, false));
+        stack.push(new DirVisit(root, false, false, null, true));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
-                if (visit.oldEnough && safeDeleter.deleteEmptyDir(visit.dir)) {
+                if (visit.oldEnough && !visit.hasRemainingChild) {
                     stats.plannedDirs++;
-                    if (!dryRun) {
+                    if (dryRun) {
+                        audit.logWouldDeleteDir(visit.dir);
+                    } else if (safeDeleter.deleteEmptyDir(visit.dir)) {
                         stats.emptyDirsRemoved++;
+                    } else {
+                        stats.deleteFailures++;
+                        visit.markParentRemaining();
                     }
+                } else {
+                    visit.markParentRemaining();
                 }
                 continue;
             }
@@ -119,23 +126,31 @@ public final class BucketCleaner {
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
+                visit.markParentRemaining();
                 continue;
             }
             if (children == null) {
+                visit.markParentRemaining();
                 continue;
             }
-            if (!visit.dir.toString().equals(root.toString())) {
-                stack.push(new DirVisit(visit.dir, true, visit.oldEnough));
+            if (!visit.root) {
+                visit.postOrder = true;
+                stack.push(visit);
             }
             for (FileStatus child : children) {
                 FsPath childPath = child.getPath();
                 if (child.isDir()) {
                     if (FlussPaths.REMOTE_KV_SNAPSHOT_SHARED_DIR.equals(childPath.getName())) {
+                        visit.hasRemainingChild = true;
                         continue;
                     }
                     stack.push(
                             new DirVisit(
-                                    childPath, false, child.getModificationTime() < cutoffMillis));
+                                    childPath,
+                                    false,
+                                    child.getModificationTime() < cutoffMillis,
+                                    visit,
+                                    false));
                     continue;
                 }
                 FileMeta meta =
@@ -154,16 +169,20 @@ public final class BucketCleaner {
                             }
                         } else {
                             stats.deleteFailures++;
+                            visit.hasRemainingChild = true;
                         }
                         break;
                     case SKIP_UNKNOWN:
                         audit.logSkipUnknown(meta.path(), rule.id());
+                        visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
                     case DEFER:
+                        visit.hasRemainingChild = true;
                         // no-op
                         break;
                     default:
+                        visit.hasRemainingChild = true;
                         // unknown decision — skip defensively
                         break;
                 }
@@ -189,13 +208,25 @@ public final class BucketCleaner {
 
     private static final class DirVisit {
         private final FsPath dir;
-        private final boolean postOrder;
+        private boolean postOrder;
         private final boolean oldEnough;
+        private final DirVisit parent;
+        private final boolean root;
+        private boolean hasRemainingChild;
 
-        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough) {
+        private DirVisit(
+                FsPath dir, boolean postOrder, boolean oldEnough, DirVisit parent, boolean root) {
             this.dir = dir;
             this.postOrder = postOrder;
             this.oldEnough = oldEnough;
+            this.parent = parent;
+            this.root = root;
+        }
+
+        private void markParentRemaining() {
+            if (parent != null) {
+                parent.hasRemainingChild = true;
+            }
         }
     }
 }

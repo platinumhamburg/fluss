@@ -181,15 +181,23 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         dirPath,
                         false,
                         rootStatus.isDir()
-                                && rootStatus.getModificationTime() < task.cutoffMillis()));
+                                && rootStatus.getModificationTime() < task.cutoffMillis(),
+                        null));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
-                if (visit.oldEnough && safeDeleter.deleteEmptyDir(visit.dir)) {
+                if (visit.oldEnough && !visit.hasRemainingChild) {
                     plannedDirs++;
-                    if (!task.dryRun()) {
+                    if (task.dryRun()) {
+                        audit.logWouldDeleteDir(visit.dir);
+                    } else if (safeDeleter.deleteEmptyDir(visit.dir)) {
                         emptyDirsRemoved++;
+                    } else {
+                        deleteFailures++;
+                        visit.markParentRemaining();
                     }
+                } else {
+                    visit.markParentRemaining();
                 }
                 continue;
             }
@@ -199,12 +207,15 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                 children = fs.listStatus(visit.dir);
             } catch (IOException e) {
                 LOG.warn("Failed to list directory: {}", visit.dir, e);
+                visit.markParentRemaining();
                 continue;
             }
             if (children == null) {
+                visit.markParentRemaining();
                 continue;
             }
-            stack.push(new DirVisit(visit.dir, true, visit.oldEnough));
+            visit.postOrder = true;
+            stack.push(visit);
             for (FileStatus child : children) {
                 FsPath childPath = child.getPath();
                 if (child.isDir()) {
@@ -212,11 +223,13 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                             new DirVisit(
                                     childPath,
                                     false,
-                                    child.getModificationTime() < task.cutoffMillis()));
+                                    child.getModificationTime() < task.cutoffMillis(),
+                                    visit));
                     continue;
                 }
                 scanned++;
                 if (child.getModificationTime() >= task.cutoffMillis()) {
+                    visit.hasRemainingChild = true;
                     continue;
                 }
                 FileMeta meta =
@@ -235,14 +248,17 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                             }
                         } else {
                             deleteFailures++;
+                            visit.hasRemainingChild = true;
                         }
                         break;
                     case SKIP_UNKNOWN:
                         audit.logSkipUnknown(meta.path(), rule.id());
+                        visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
                     case DEFER:
                     default:
+                        visit.hasRemainingChild = true;
                         break;
                 }
             }
@@ -277,13 +293,22 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
     private static final class DirVisit {
         private final FsPath dir;
-        private final boolean postOrder;
+        private boolean postOrder;
         private final boolean oldEnough;
+        private final DirVisit parent;
+        private boolean hasRemainingChild;
 
-        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough) {
+        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough, DirVisit parent) {
             this.dir = dir;
             this.postOrder = postOrder;
             this.oldEnough = oldEnough;
+            this.parent = parent;
+        }
+
+        private void markParentRemaining() {
+            if (parent != null) {
+                parent.hasRemainingChild = true;
+            }
         }
     }
 }

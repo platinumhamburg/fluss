@@ -136,6 +136,7 @@ class BucketCleanerTest {
 
         assertThat(stats.scannedFiles).isEqualTo(1L);
         assertThat(stats.plannedFiles).isEqualTo(1L);
+        assertThat(stats.plannedDirs).isEqualTo(1L);
         assertThat(stats.plannedBytes).isEqualTo(1L);
         assertThat(stats.deletedFiles).isZero();
         assertThat(stats.bytesReclaimed).isZero();
