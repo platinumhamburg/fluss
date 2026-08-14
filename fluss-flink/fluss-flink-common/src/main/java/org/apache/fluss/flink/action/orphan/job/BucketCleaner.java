@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
@@ -31,12 +32,10 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 import org.apache.fluss.utils.FlussPaths;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.Optional;
 
 /**
  * Per-bucket orphan cleanup for live buckets: walks the provided bucket directories and dispatches
@@ -47,8 +46,6 @@ import java.util.Deque;
  */
 @Internal
 public final class BucketCleaner {
-
-    private static final Logger LOG = LoggerFactory.getLogger(BucketCleaner.class);
 
     private final RuleDispatcher dispatcher;
     private final SafeDeleter safeDeleter;
@@ -96,10 +93,6 @@ public final class BucketCleaner {
     private void walkAndCleanDir(FsPath root, BucketActiveRefs activeRefs, BucketCleanStats stats)
             throws IOException {
         FileSystem fs = root.getFileSystem();
-        remoteFsOpRateLimiter.acquire();
-        if (!fs.exists(root)) {
-            return;
-        }
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
         stack.push(new DirVisit(root, false, false, null, true));
         while (!stack.isEmpty()) {
@@ -120,19 +113,12 @@ public final class BucketCleaner {
                 }
                 continue;
             }
-            FileStatus[] children;
-            try {
-                remoteFsOpRateLimiter.acquire();
-                children = fs.listStatus(visit.dir);
-            } catch (IOException e) {
-                LOG.warn("Failed to list directory: {}", visit.dir, e);
-                visit.markParentRemaining();
+            Optional<FileStatus[]> listing =
+                    FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
+            if (!listing.isPresent()) {
                 continue;
             }
-            if (children == null) {
-                visit.markParentRemaining();
-                continue;
-            }
+            FileStatus[] children = listing.get();
             if (!visit.root) {
                 visit.postOrder = true;
                 stack.push(visit);
