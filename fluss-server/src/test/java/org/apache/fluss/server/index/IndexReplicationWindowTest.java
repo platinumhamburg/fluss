@@ -22,11 +22,13 @@ import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.server.log.FetchDataInfo;
 import org.apache.fluss.server.log.FetchIsolation;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 
@@ -166,12 +168,45 @@ public class IndexReplicationWindowTest {
     }
 
     @Test
+    void completedBytesAreCountedOnceAfterTheWholeWindowCompletes() {
+        TabletServerMetricGroup metrics =
+                new TabletServerMetricGroup(
+                        NOPMetricRegistry.INSTANCE, "completed-bytes", "rack", "host", 1);
+        IndexReplicator replicator =
+                new IndexReplicator(
+                        stubSourceReader(),
+                        Collections.singletonList(spec("idx", IndexVisibility.SYNC)),
+                        new IndexSendBuffer(),
+                        null,
+                        0L,
+                        1024,
+                        1024,
+                        (sync, all) -> {},
+                        (ignored, failure) -> {},
+                        metrics);
+        IndexReplicationWindow window = new IndexReplicationWindow("idx", 10L, 2, replicator);
+        IndexBatch first = batch(window, 0);
+        IndexBatch second = batch(window, 1);
+        window.markAdmitted();
+
+        window.onBatchAcked(first);
+        window.onBatchAcked(first);
+        assertThat(metrics.indexReplicationCompletedBytes().getCount()).isZero();
+
+        window.onBatchAcked(second);
+        assertThat(metrics.indexReplicationCompletedBytes().getCount()).isEqualTo(2L);
+
+        window.onBatchAcked(second);
+        assertThat(metrics.indexReplicationCompletedBytes().getCount()).isEqualTo(2L);
+    }
+
+    @Test
     void completionAfterOwnerCloseCannotAdvanceProgress() {
         AtomicLong advanced = new AtomicLong(-1L);
         IndexReplicator replicator = newReplicator(10L, (sync, all) -> advanced.set(sync));
         replicator.close();
 
-        replicator.onWindowComplete("idx", 42L);
+        replicator.onWindowComplete("idx", 42L, 0L);
 
         assertThat(replicator.getSyncIndexPushedOffset()).isEqualTo(10L);
         assertThat(advanced).hasValue(-1L);

@@ -46,7 +46,7 @@ import static org.mockito.Mockito.when;
 class TombstonedPartitionDiscriminatorTest {
 
     private static final TablePath INDEX_TABLE_PATH =
-            TablePath.of("test_db", IndexTableUtils.indexTableName("orders", "idx_user"));
+            TablePath.of("test_db", IndexTableUtils.indexTableName(1L, "idx_user"));
 
     @Test
     void testForIndexTableRejectsMissingKvFormatVersion() {

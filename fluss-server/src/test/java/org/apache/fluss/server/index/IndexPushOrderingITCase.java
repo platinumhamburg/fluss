@@ -57,7 +57,6 @@ import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestHooks;
-import org.apache.fluss.server.tablet.TabletServer;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.types.DataField;
@@ -293,14 +292,7 @@ class IndexPushOrderingITCase {
 
             byte[] lostResponseRetry = oldKeyGate.replayBatch();
             long walBeforeLostResponseRetry = targetBeforeFailover.getLocalLogEndOffset();
-            TabletServer targetServerBeforeFailover =
-                    CLUSTER.getTabletServerById(
-                            CLUSTER.waitAndGetLeader(fixture.failoverTarget.tableBucket));
-            long staleBeforeLostResponseRetry = staleCount(targetServerBeforeFailover);
             sendCapturedBatch(fixture, fixture.failoverTarget.bucket, lostResponseRetry);
-            assertThat(staleCount(targetServerBeforeFailover))
-                    .as("a lost-response retry must be observed as one stale progress batch")
-                    .isEqualTo(staleBeforeLostResponseRetry + 1L);
             assertThat(targetBeforeFailover.getLocalLogEndOffset())
                     .as("an identical successful retry must append no target WAL")
                     .isEqualTo(walBeforeLostResponseRetry);
@@ -337,24 +329,12 @@ class IndexPushOrderingITCase {
             newKeyGate = null;
             oldKeyGate.close();
             oldKeyGate = null;
-            TabletServer currentOtherTarget =
-                    CLUSTER.getTabletServerById(
-                            CLUSTER.waitAndGetLeader(fixture.otherTarget.tableBucket));
-            TabletServer currentFailoverTarget =
-                    CLUSTER.getTabletServerById(
-                            CLUSTER.waitAndGetLeader(fixture.failoverTarget.tableBucket));
-            Set<TabletServer> staleMetricServers =
-                    new LinkedHashSet<>(Arrays.asList(currentOtherTarget, currentFailoverTarget));
-            long staleBefore = totalStaleCount(staleMetricServers);
-
             // Target state has no RPC-identity input. Re-delivering the checksum-equivalent batch
             // models an already-sent old request whose transport cancellation loses the race.
             sendCapturedBatch(fixture, fixture.otherTarget.bucket, delayedNewKeyUpsert);
-            assertThat(totalStaleCount(staleMetricServers)).isEqualTo(staleBefore + 1L);
             assertStaleDeliveryHasNoSideEffects(
                     fixture, writerKey, walBeforeStaleDelivery, recoveredEntry, otherLatestEntry);
             sendCapturedBatch(fixture, fixture.failoverTarget.bucket, delayedOldKeyDelete);
-            assertThat(totalStaleCount(staleMetricServers)).isEqualTo(staleBefore + 2L);
             assertStaleDeliveryHasNoSideEffects(
                     fixture, writerKey, walBeforeStaleDelivery, recoveredEntry, otherLatestEntry);
 
@@ -412,8 +392,6 @@ class IndexPushOrderingITCase {
     private static Fixture createFixture() throws Exception {
         String tableName = "ordering_" + System.nanoTime();
         TablePath mainPath = TablePath.of("task12", tableName);
-        TablePath indexPath =
-                TablePath.of("task12", IndexTableUtils.indexTableName(tableName, "idx_b"));
         Schema schema =
                 Schema.newBuilder()
                         .column("a", DataTypes.INT())
@@ -434,6 +412,8 @@ class IndexPushOrderingITCase {
                                 .schema(schema)
                                 .distributedBy(MAIN_BUCKET_COUNT, "a")
                                 .build());
+        TablePath indexPath =
+                TablePath.of("task12", IndexTableUtils.indexTableName(mainTableId, "idx_b"));
         long indexTableId = CLUSTER.getZooKeeperClient().getTable(indexPath).orElseThrow().tableId;
 
         List<Target> targets = new ArrayList<>(INDEX_BUCKET_COUNT);
@@ -764,22 +744,6 @@ class IndexPushOrderingITCase {
 
     private static int currentLeader(TableBucket tableBucket) {
         return CLUSTER.waitAndGetLeader(tableBucket);
-    }
-
-    private static long staleCount(TabletServer tabletServer) {
-        return tabletServer
-                .getReplicaManager()
-                .getServerMetricGroup()
-                .indexPushStaleProgressBatches()
-                .getCount();
-    }
-
-    private static long totalStaleCount(Set<TabletServer> tabletServers) {
-        long total = 0L;
-        for (TabletServer tabletServer : tabletServers) {
-            total += staleCount(tabletServer);
-        }
-        return total;
     }
 
     private static void stopTabletServer(int serverId) {

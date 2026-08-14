@@ -48,7 +48,6 @@ import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Value;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metadata.ClusterMetadata;
-import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
@@ -282,8 +281,6 @@ class IndexPushModelTest {
     private static Fixture createFixture() throws Exception {
         String tableName = "mutation_model_" + System.nanoTime();
         TablePath mainPath = TablePath.of("task12", tableName);
-        TablePath indexPath =
-                TablePath.of("task12", IndexTableUtils.indexTableName(tableName, "idx_user"));
         Schema schema =
                 Schema.newBuilder()
                         .column("order_id", DataTypes.BIGINT())
@@ -306,6 +303,8 @@ class IndexPushModelTest {
                                 .partitionedBy("dt")
                                 .distributedBy(1, "order_id")
                                 .build());
+        TablePath indexPath =
+                TablePath.of("task12", IndexTableUtils.indexTableName(mainTableId, "idx_user"));
         long indexTableId = CLUSTER.getZooKeeperClient().getTable(indexPath).orElseThrow().tableId;
         TableBucket indexBucket = new TableBucket(indexTableId, 0);
         Replica replica = CLUSTER.waitAndGetLeaderReplica(indexBucket);
@@ -317,8 +316,7 @@ class IndexPushModelTest {
                 replica,
                 replica.getKvTablet(),
                 replica.getLogTablet(),
-                replicaManager,
-                replicaManager.getServerMetricGroup());
+                replicaManager);
     }
 
     private enum MutationKind {
@@ -753,21 +751,18 @@ class IndexPushModelTest {
         private final KvTablet kv;
         private final LogTablet log;
         private final ReplicaManager replicaManager;
-        private final TabletServerMetricGroup metrics;
 
         private Fixture(
                 long mainTableId,
                 Replica replica,
                 KvTablet kv,
                 LogTablet log,
-                ReplicaManager replicaManager,
-                TabletServerMetricGroup metrics) {
+                ReplicaManager replicaManager) {
             this.mainTableId = mainTableId;
             this.replica = replica;
             this.kv = kv;
             this.log = log;
             this.replicaManager = replicaManager;
-            this.metrics = metrics;
         }
 
         private void applyFresh(
@@ -788,8 +783,6 @@ class IndexPushModelTest {
                     .as("%s starts with a flushed prewrite map", context(seed, delivery))
                     .isEmpty();
             FreshExpectation expected = FreshExpectation.from(before, delivery, !throughReplica);
-            long staleBefore = metrics.indexPushStaleProgressBatches().getCount();
-            long tombstoneBefore = metrics.indexPushTombstoneNoOpBatches().getCount();
             LogAppendInfo result = apply(delivery, throughReplica);
             PhysicalState after = physicalState(delivery.writerKey, allPhysicalKeys);
 
@@ -816,13 +809,6 @@ class IndexPushModelTest {
             assertThat(after.rows)
                     .as("%s exact physical rows", context(seed, delivery))
                     .isEqualTo(throughReplica ? expected.rows : before.rows);
-            assertThat(metrics.indexPushStaleProgressBatches().getCount())
-                    .as(context(seed, delivery))
-                    .isEqualTo(staleBefore);
-            assertThat(metrics.indexPushTombstoneNoOpBatches().getCount())
-                    .as(context(seed, delivery))
-                    .isEqualTo(tombstoneBefore);
-
             if (throughReplica) {
                 assertThat(log.getHighWatermark())
                         .as("%s committed high watermark", context(seed, delivery))
@@ -862,28 +848,13 @@ class IndexPushModelTest {
                 int seed)
                 throws Exception {
             PhysicalState before = physicalState(delivery.writerKey, allPhysicalKeys);
-            long staleBefore = metrics.indexPushStaleProgressBatches().getCount();
-            long tombstoneBefore = metrics.indexPushTombstoneNoOpBatches().getCount();
-
             LogAppendInfo result = apply(delivery, true);
 
             if (expectedOutcome == ExpectedOutcome.STALE) {
                 assertThat(result.duplicated()).as(context(seed, delivery)).isTrue();
                 assertThat(result.hasNoAppend()).as(context(seed, delivery)).isFalse();
-                assertThat(metrics.indexPushStaleProgressBatches().getCount())
-                        .as(context(seed, delivery))
-                        .isEqualTo(staleBefore + 1L);
-                assertThat(metrics.indexPushTombstoneNoOpBatches().getCount())
-                        .as(context(seed, delivery))
-                        .isEqualTo(tombstoneBefore);
             } else {
                 assertThat(result.hasNoAppend()).as(context(seed, delivery)).isTrue();
-                assertThat(metrics.indexPushTombstoneNoOpBatches().getCount())
-                        .as(context(seed, delivery))
-                        .isEqualTo(tombstoneBefore + 1L);
-                assertThat(metrics.indexPushStaleProgressBatches().getCount())
-                        .as(context(seed, delivery))
-                        .isEqualTo(staleBefore);
             }
             assertThat(physicalState(delivery.writerKey, allPhysicalKeys))
                     .as(

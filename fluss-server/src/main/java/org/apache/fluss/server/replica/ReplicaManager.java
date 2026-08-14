@@ -123,6 +123,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
+import org.apache.fluss.utils.IndexTableUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.concurrent.Scheduler;
 
@@ -170,6 +171,7 @@ public class ReplicaManager implements ServerReconfigurable {
     private static final int INDEX_REPLICATION_MAX_WINDOW_BYTES = 256 * 1024;
     private static final long INDEX_REPLICATION_WORKER_BACKOFF_MS = 50L;
     private static final long INDEX_REPLICATION_RETRY_MAX_BACKOFF_MS = 10_000L;
+    private static final long PARTITION_TOMBSTONE_REFRESH_INTERVAL_MS = 30_000L;
 
     private final Configuration conf;
     private final Scheduler scheduler;
@@ -178,6 +180,7 @@ public class ReplicaManager implements ServerReconfigurable {
     private final ZooKeeperClient zkClient;
     protected final int serverId;
     private final AtomicBoolean highWatermarkCheckPointThreadStarted = new AtomicBoolean(false);
+    private final AtomicBoolean partitionTombstoneRefreshInProgress = new AtomicBoolean(false);
     private final Map<File, OffsetCheckpointFile> highWatermarkCheckpoints;
     private final LocalDiskManager localDiskManager;
 
@@ -190,8 +193,7 @@ public class ReplicaManager implements ServerReconfigurable {
     private final IndexSendBuffer indexSendBuffer;
     private final IndexReplicatorPool indexReplicatorPool;
     private final IndexSender indexSender;
-    private final TabletServerMetricGroup.GaugeRegistration indexPushGaugeRegistration;
-    private final TabletServerMetricGroup.GaugeRegistration indexWriterStateGaugeRegistration;
+    private final TabletServerMetricGroup.GaugeRegistration indexReplicationGaugeRegistration;
     private final ExecutorService ioExecutor;
     private final ProjectionPushdownCache projectionsCache = new ProjectionPushdownCache();
     private final Lock replicaStateChangeLock = new ReentrantLock();
@@ -342,16 +344,11 @@ public class ReplicaManager implements ServerReconfigurable {
                         conf.get(ConfigOptions.INDEX_REPLICATION_REQUEST_TARGET_BYTES).getBytes(),
                         conf.get(ConfigOptions.NETTY_SERVER_MAX_REQUEST_SIZE).getBytes(),
                         30_000L);
-        this.indexPushGaugeRegistration =
-                serverMetricGroup.registerIndexPushGauges(
+        this.indexReplicationGaugeRegistration =
+                serverMetricGroup.registerIndexReplicationGauges(
                         indexSendBuffer::pendingBytes,
-                        indexSender::inFlightRequestCount,
-                        indexSender::oldestInFlightAgeMs,
                         this::maxIndexReplicationNoProgressTimeMs,
                         this::failedIndexReplicationSourceBucketCount);
-        this.indexWriterStateGaugeRegistration =
-                serverMetricGroup.registerIndexWriterStateGauge(
-                        this::writerProgressStateEntryCount);
 
         this.highWatermarkCheckpoints = new HashMap<>();
         for (File dataDir : localDiskManager.dataDirs()) {
@@ -407,6 +404,12 @@ public class ReplicaManager implements ServerReconfigurable {
                 this::maybeShrinkIsr,
                 0L,
                 conf.get(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME).toMillis() / 2);
+
+        scheduler.schedule(
+                "partition-tombstone-refresh",
+                this::maybeRefreshPartitionTombstones,
+                0L,
+                PARTITION_TOMBSTONE_REFRESH_INTERVAL_MS);
 
         // Start periodic disk usage monitoring (initial + periodic sampling)
         localDiskManager.startDiskUsageMonitor(scheduler);
@@ -545,10 +548,6 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private int writerIdCount() {
         return onlineReplicas().map(Replica::writerIdCount).reduce(0, Integer::sum);
-    }
-
-    private long writerProgressStateEntryCount() {
-        return onlineReplicas().mapToLong(Replica::writerProgressStateEntryCount).sum();
     }
 
     private long logicalStorageLogSize() {
@@ -701,6 +700,90 @@ public class ReplicaManager implements ServerReconfigurable {
             if (tombstones.containsKey(mainTableId)) {
                 replica.retireTombstonedIndexWriters(mainTableId);
             }
+        }
+    }
+
+    private void maybeRefreshPartitionTombstones() {
+        if (!partitionTombstoneRefreshInProgress.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            ioExecutor.execute(
+                    () -> {
+                        try {
+                            refreshPartitionTombstones();
+                        } finally {
+                            partitionTombstoneRefreshInProgress.set(false);
+                        }
+                    });
+        } catch (RuntimeException e) {
+            partitionTombstoneRefreshInProgress.set(false);
+            LOG.debug("Unable to submit partition tombstone refresh", e);
+        }
+    }
+
+    private void refreshPartitionTombstones() {
+        Map<Long, TablePath> mainTables = new HashMap<>();
+        for (Replica replica : getOnlineReplicaList()) {
+            TableInfo tableInfo = replica.getTableInfo();
+            if (!tableInfo.isIndexTable()
+                    || !tableInfo
+                            .getSchema()
+                            .getColumnNames()
+                            .contains(IndexTableUtils.PARTITION_ID_SYSTEM_COLUMN)) {
+                continue;
+            }
+            long mainTableId = tableInfo.getMainTableId().getAsLong();
+            metadataCache
+                    .getTablePath(mainTableId)
+                    .ifPresent(tablePath -> mainTables.put(mainTableId, tablePath));
+        }
+
+        int failures = 0;
+        long firstFailedTableId = -1L;
+        Exception firstFailure = null;
+        for (Map.Entry<Long, TablePath> entry : mainTables.entrySet()) {
+            long mainTableId = entry.getKey();
+            TablePath mainTablePath = entry.getValue();
+            try {
+                PartitionTombstone tombstone = zkClient.getPartitionTombstone(mainTablePath);
+                boolean sameTable =
+                        zkClient
+                                .getTable(mainTablePath)
+                                .map(table -> table.tableId == mainTableId)
+                                .orElse(false);
+                if (!sameTable) {
+                    continue;
+                }
+
+                PartitionTombstone previous =
+                        metadataCache
+                                .getInitializedPartitionTombstone(mainTableId)
+                                .orElse(PartitionTombstone.EMPTY);
+                metadataCache.updatePartitionTombstone(mainTableId, tombstone);
+                PartitionTombstone current =
+                        metadataCache
+                                .getInitializedPartitionTombstone(mainTableId)
+                                .orElse(PartitionTombstone.EMPTY);
+                if (hasNewlyTombstonedPartition(previous, current)) {
+                    retireTombstonedIndexWriters(
+                            Collections.singletonMap(mainTableId, current));
+                }
+            } catch (Exception e) {
+                failures++;
+                if (firstFailure == null) {
+                    firstFailedTableId = mainTableId;
+                    firstFailure = e;
+                }
+            }
+        }
+        if (firstFailure != null) {
+            LOG.warn(
+                    "Failed to refresh partition tombstones for {}/{} local main tables; first failed table id is {}.",
+                    failures,
+                    mainTables.size(),
+                    firstFailedTableId,
+                    firstFailure);
         }
     }
 
@@ -2435,8 +2518,7 @@ public class ReplicaManager implements ServerReconfigurable {
     public static final class OfflineReplica implements HostedReplica {}
 
     public void shutdown() throws InterruptedException {
-        indexWriterStateGaugeRegistration.close();
-        indexPushGaugeRegistration.close();
+        indexReplicationGaugeRegistration.close();
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
         replicaFetcherManager.shutdown();

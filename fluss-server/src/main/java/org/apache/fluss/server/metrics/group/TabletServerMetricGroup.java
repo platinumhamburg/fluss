@@ -35,7 +35,6 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
 
 /** The metric group for tablet server. */
@@ -78,21 +77,14 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Counter isrExpands;
     private final Counter failedIsrUpdates;
 
-    // aggregated index push metrics
-    private final Counter indexPushRequests;
-    private final Counter indexPushBatchRetries;
-    private final Histogram indexPushRequestLatencyHistogram;
-    private final Counter partitionTombstoneApplyDrops;
-    private final Counter indexPushStaleProgressBatches;
-    private final Counter indexSourceRemoteReadBytes;
-    private final Counter indexSourceRemoteReadFailures;
-    private final Counter indexPushRecordTooLargeFailures;
-    private final Counter indexPushTombstoneNoOpBatches;
-    private final Counter indexWriterStateRecoveryCoverageFailures;
-    private final AtomicReference<IndexPushGaugeSource> indexPushGaugeSource =
-            new AtomicReference<>(IndexPushGaugeSource.EMPTY);
-    private final AtomicReference<IndexWriterStateGaugeSource> indexWriterStateGaugeSource =
-            new AtomicReference<>(IndexWriterStateGaugeSource.EMPTY);
+    // aggregated index replication metrics
+    private final Counter indexReplicationSourceBytes;
+    private final Counter indexReplicationCompletedBytes;
+    private final Counter indexReplicationRetries;
+    private final Counter indexReplicationFailures;
+    private final Histogram indexReplicationRequestLatencyHistogram;
+    private final AtomicReference<IndexReplicationGaugeSource> indexReplicationGaugeSource =
+            new AtomicReference<>(IndexReplicationGaugeSource.EMPTY);
 
     public TabletServerMetricGroup(
             MetricRegistry registry, String clusterId, String rack, String hostname, int serverId) {
@@ -153,59 +145,40 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         failedIsrUpdates = new SimpleCounter();
         meter(MetricNames.FAILED_ISR_UPDATES_RATE, new MeterView(failedIsrUpdates));
 
-        // index push metrics
-        indexPushRequests = new ThreadSafeSimpleCounter();
-        meter(MetricNames.INDEX_PUSH_REQUESTS_RATE, new MeterView(indexPushRequests));
-        indexPushBatchRetries = new ThreadSafeSimpleCounter();
-        meter(MetricNames.INDEX_PUSH_BATCH_RETRIES_RATE, new MeterView(indexPushBatchRetries));
-        indexPushRequestLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
-        histogram(MetricNames.INDEX_PUSH_REQUEST_LATENCY_MS, indexPushRequestLatencyHistogram);
-        partitionTombstoneApplyDrops = new ThreadSafeSimpleCounter();
+        // index replication metrics
+        indexReplicationSourceBytes = new ThreadSafeSimpleCounter();
         meter(
-                MetricNames.PARTITION_TOMBSTONE_APPLY_DROPS_RATE,
-                new MeterView(partitionTombstoneApplyDrops));
-        indexPushStaleProgressBatches = new ThreadSafeSimpleCounter();
+                MetricNames.INDEX_REPLICATION_SOURCE_BYTES_RATE,
+                new MeterView(indexReplicationSourceBytes));
+        indexReplicationCompletedBytes = new ThreadSafeSimpleCounter();
         meter(
-                MetricNames.INDEX_PUSH_STALE_PROGRESS_BATCHES_RATE,
-                new MeterView(indexPushStaleProgressBatches));
-        indexSourceRemoteReadBytes = new ThreadSafeSimpleCounter();
+                MetricNames.INDEX_REPLICATION_COMPLETED_BYTES_RATE,
+                new MeterView(indexReplicationCompletedBytes));
+        indexReplicationRetries = new ThreadSafeSimpleCounter();
         meter(
-                MetricNames.INDEX_SOURCE_REMOTE_READ_BYTES_RATE,
-                new MeterView(indexSourceRemoteReadBytes));
-        indexSourceRemoteReadFailures = new ThreadSafeSimpleCounter();
+                MetricNames.INDEX_REPLICATION_RETRIES_RATE,
+                new MeterView(indexReplicationRetries));
+        indexReplicationFailures = new ThreadSafeSimpleCounter();
         meter(
-                MetricNames.INDEX_SOURCE_REMOTE_READ_FAILURES_RATE,
-                new MeterView(indexSourceRemoteReadFailures));
-        indexPushRecordTooLargeFailures = new ThreadSafeSimpleCounter();
-        meter(
-                MetricNames.INDEX_PUSH_RECORD_TOO_LARGE_FAILURES_RATE,
-                new MeterView(indexPushRecordTooLargeFailures));
-        indexPushTombstoneNoOpBatches = new ThreadSafeSimpleCounter();
-        meter(
-                MetricNames.INDEX_PUSH_TOMBSTONE_NO_OP_BATCHES_RATE,
-                new MeterView(indexPushTombstoneNoOpBatches));
-        indexWriterStateRecoveryCoverageFailures = new ThreadSafeSimpleCounter();
-        meter(
-                MetricNames.INDEX_WRITER_STATE_RECOVERY_COVERAGE_FAILURES_RATE,
-                new MeterView(indexWriterStateRecoveryCoverageFailures));
+                MetricNames.INDEX_REPLICATION_FAILURES_RATE,
+                new MeterView(indexReplicationFailures));
+        indexReplicationRequestLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(
+                MetricNames.INDEX_REPLICATION_REQUEST_LATENCY_MS,
+                indexReplicationRequestLatencyHistogram);
         gauge(
-                MetricNames.INDEX_PUSH_PENDING_BYTES,
-                () -> indexPushGaugeSource.get().pendingBytesSupplier.getAsLong());
-        gauge(
-                MetricNames.INDEX_PUSH_IN_FLIGHT_REQUESTS,
-                () -> indexPushGaugeSource.get().inFlightRequestsSupplier.getAsInt());
-        gauge(
-                MetricNames.INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS,
-                () -> indexPushGaugeSource.get().oldestInFlightAgeMsSupplier.getAsLong());
+                MetricNames.INDEX_REPLICATION_PENDING_BYTES,
+                () -> indexReplicationGaugeSource.get().pendingBytesSupplier.getAsLong());
         gauge(
                 MetricNames.INDEX_REPLICATION_MAX_NO_PROGRESS_TIME_MS,
-                () -> indexPushGaugeSource.get().maxNoProgressTimeMsSupplier.getAsLong());
+                () -> indexReplicationGaugeSource.get().maxNoProgressTimeMsSupplier.getAsLong());
         gauge(
                 MetricNames.INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT,
-                () -> indexPushGaugeSource.get().failedSourceBucketCountSupplier.getAsLong());
-        gauge(
-                MetricNames.INDEX_WRITER_STATE_ENTRIES,
-                () -> indexWriterStateGaugeSource.get().entryCountSupplier.getAsLong());
+                () ->
+                        indexReplicationGaugeSource
+                                .get()
+                                .failedSourceBucketCountSupplier
+                                .getAsLong());
 
         // Register server-level RocksDB aggregated metrics
         registerServerRocksDBMetrics();
@@ -312,69 +285,39 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         return failedIsrUpdates;
     }
 
-    public Counter indexPushRequests() {
-        return indexPushRequests;
+    public Counter indexReplicationSourceBytes() {
+        return indexReplicationSourceBytes;
     }
 
-    public Counter indexPushBatchRetries() {
-        return indexPushBatchRetries;
+    public Counter indexReplicationCompletedBytes() {
+        return indexReplicationCompletedBytes;
     }
 
-    public Histogram indexPushRequestLatencyHistogram() {
-        return indexPushRequestLatencyHistogram;
+    public Counter indexReplicationRetries() {
+        return indexReplicationRetries;
     }
 
-    public Counter partitionTombstoneApplyDrops() {
-        return partitionTombstoneApplyDrops;
+    public Counter indexReplicationFailures() {
+        return indexReplicationFailures;
     }
 
-    public Counter indexPushStaleProgressBatches() {
-        return indexPushStaleProgressBatches;
+    public Histogram indexReplicationRequestLatencyHistogram() {
+        return indexReplicationRequestLatencyHistogram;
     }
 
-    public Counter indexSourceRemoteReadBytes() {
-        return indexSourceRemoteReadBytes;
-    }
-
-    public Counter indexSourceRemoteReadFailures() {
-        return indexSourceRemoteReadFailures;
-    }
-
-    public Counter indexPushRecordTooLargeFailures() {
-        return indexPushRecordTooLargeFailures;
-    }
-
-    public Counter indexPushTombstoneNoOpBatches() {
-        return indexPushTombstoneNoOpBatches;
-    }
-
-    public Counter indexWriterStateRecoveryCoverageFailures() {
-        return indexWriterStateRecoveryCoverageFailures;
-    }
-
-    public GaugeRegistration registerIndexPushGauges(
+    public GaugeRegistration registerIndexReplicationGauges(
             LongSupplier pendingBytesSupplier,
-            IntSupplier inFlightRequestsSupplier,
-            LongSupplier oldestInFlightAgeMsSupplier,
             LongSupplier maxNoProgressTimeMsSupplier,
             LongSupplier failedSourceBucketCountSupplier) {
-        IndexPushGaugeSource source =
-                new IndexPushGaugeSource(
+        IndexReplicationGaugeSource source =
+                new IndexReplicationGaugeSource(
                         pendingBytesSupplier,
-                        inFlightRequestsSupplier,
-                        oldestInFlightAgeMsSupplier,
                         maxNoProgressTimeMsSupplier,
                         failedSourceBucketCountSupplier);
-        indexPushGaugeSource.set(source);
-        return () -> indexPushGaugeSource.compareAndSet(source, IndexPushGaugeSource.EMPTY);
-    }
-
-    public GaugeRegistration registerIndexWriterStateGauge(LongSupplier entryCountSupplier) {
-        IndexWriterStateGaugeSource source = new IndexWriterStateGaugeSource(entryCountSupplier);
-        indexWriterStateGaugeSource.set(source);
+        indexReplicationGaugeSource.set(source);
         return () ->
-                indexWriterStateGaugeSource.compareAndSet(
-                        source, IndexWriterStateGaugeSource.EMPTY);
+                indexReplicationGaugeSource.compareAndSet(
+                        source, IndexReplicationGaugeSource.EMPTY);
     }
 
     /** Scoped ownership of replaceable server-level gauge suppliers. */
@@ -384,38 +327,21 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         void close();
     }
 
-    private static final class IndexPushGaugeSource {
-        private static final IndexPushGaugeSource EMPTY =
-                new IndexPushGaugeSource(() -> 0L, () -> 0, () -> 0L, () -> 0L, () -> 0L);
+    private static final class IndexReplicationGaugeSource {
+        private static final IndexReplicationGaugeSource EMPTY =
+                new IndexReplicationGaugeSource(() -> 0L, () -> 0L, () -> 0L);
 
         private final LongSupplier pendingBytesSupplier;
-        private final IntSupplier inFlightRequestsSupplier;
-        private final LongSupplier oldestInFlightAgeMsSupplier;
         private final LongSupplier maxNoProgressTimeMsSupplier;
         private final LongSupplier failedSourceBucketCountSupplier;
 
-        private IndexPushGaugeSource(
+        private IndexReplicationGaugeSource(
                 LongSupplier pendingBytesSupplier,
-                IntSupplier inFlightRequestsSupplier,
-                LongSupplier oldestInFlightAgeMsSupplier,
                 LongSupplier maxNoProgressTimeMsSupplier,
                 LongSupplier failedSourceBucketCountSupplier) {
             this.pendingBytesSupplier = pendingBytesSupplier;
-            this.inFlightRequestsSupplier = inFlightRequestsSupplier;
-            this.oldestInFlightAgeMsSupplier = oldestInFlightAgeMsSupplier;
             this.maxNoProgressTimeMsSupplier = maxNoProgressTimeMsSupplier;
             this.failedSourceBucketCountSupplier = failedSourceBucketCountSupplier;
-        }
-    }
-
-    private static final class IndexWriterStateGaugeSource {
-        private static final IndexWriterStateGaugeSource EMPTY =
-                new IndexWriterStateGaugeSource(() -> 0L);
-
-        private final LongSupplier entryCountSupplier;
-
-        private IndexWriterStateGaugeSource(LongSupplier entryCountSupplier) {
-            this.entryCountSupplier = entryCountSupplier;
         }
     }
 

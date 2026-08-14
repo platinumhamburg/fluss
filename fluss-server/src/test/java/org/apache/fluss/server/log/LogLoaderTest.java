@@ -610,14 +610,14 @@ final class LogLoaderTest extends LogTestBase {
 
         long failuresBefore =
                 TestingMetricGroups.TABLET_SERVER_METRICS
-                        .indexWriterStateRecoveryCoverageFailures()
+                        .indexReplicationFailures()
                         .getCount();
         assertThatThrownBy(() -> createProgressLogTablet(true))
                 .isInstanceOf(CorruptSnapshotException.class)
                 .hasMessageContaining("retained WAL starts at 1");
         assertThat(
                         TestingMetricGroups.TABLET_SERVER_METRICS
-                                .indexWriterStateRecoveryCoverageFailures()
+                                .indexReplicationFailures()
                                 .getCount())
                 .isEqualTo(failuresBefore + 1L);
     }

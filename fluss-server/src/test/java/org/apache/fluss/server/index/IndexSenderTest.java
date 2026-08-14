@@ -922,14 +922,10 @@ public class IndexSenderTest {
         IndexReplicator owner = owner(sendBuffer);
         IndexBatch encodedBatch = v1Batch(bucket, new IndexReplicationWindow("idx", 10L, 1, owner));
         long exactRequestBytes = exactRequestBytes(bucket, encodedBatch);
-        long requestsBefore =
-                TestingMetricGroups.TABLET_SERVER_METRICS.indexPushRequests().getCount();
         long retriesBefore =
-                TestingMetricGroups.TABLET_SERVER_METRICS.indexPushBatchRetries().getCount();
-        long tooLargeBefore =
-                TestingMetricGroups.TABLET_SERVER_METRICS
-                        .indexPushRecordTooLargeFailures()
-                        .getCount();
+                TestingMetricGroups.TABLET_SERVER_METRICS.indexReplicationRetries().getCount();
+        long failuresBefore =
+                TestingMetricGroups.TABLET_SERVER_METRICS.indexReplicationFailures().getCount();
         sendBuffer.append(encodedBatch);
         IndexSender sender =
                 new IndexSender(
@@ -955,15 +951,10 @@ public class IndexSenderTest {
             assertThat(encodedBatch.attempts()).isZero();
             assertThat(sendBuffer.pendingBytes()).isZero();
             assertThat(sendBuffer.hasUnsent()).isFalse();
-            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexPushRequests().getCount())
-                    .isEqualTo(requestsBefore);
-            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexPushBatchRetries().getCount())
+            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexReplicationRetries().getCount())
                     .isEqualTo(retriesBefore);
-            assertThat(
-                            TestingMetricGroups.TABLET_SERVER_METRICS
-                                    .indexPushRecordTooLargeFailures()
-                                    .getCount())
-                    .isEqualTo(tooLargeBefore + 1L);
+            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexReplicationFailures().getCount())
+                    .isEqualTo(failuresBefore + 1L);
         } finally {
             sender.close();
         }
@@ -1837,7 +1828,7 @@ public class IndexSenderTest {
     }
 
     @Test
-    void inFlightRequestMetricCountsConsolidatedPutKvRpc() throws Exception {
+    void requestLatencyCountsConsolidatedPutKvRpc() throws Exception {
         IndexSendBuffer sendBuffer = new IndexSendBuffer();
         RecordingGateway gateway = new RecordingGateway();
         IndexSender sender =
@@ -1848,11 +1839,9 @@ public class IndexSenderTest {
                         TestingMetricGroups.TABLET_SERVER_METRICS,
                         1,
                         5L);
-        long requestsBefore =
-                TestingMetricGroups.TABLET_SERVER_METRICS.indexPushRequests().getCount();
         long latencySamplesBefore =
                 TestingMetricGroups.TABLET_SERVER_METRICS
-                        .indexPushRequestLatencyHistogram()
+                        .indexReplicationRequestLatencyHistogram()
                         .getCount();
         try {
             IndexReplicator owner = owner(sendBuffer);
@@ -1863,9 +1852,6 @@ public class IndexSenderTest {
 
             await(() -> gateway.pending.size() == 1);
             assertThat(gateway.requests.get(0).getBucketsReqsCount()).isEqualTo(2);
-            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexPushRequests().getCount())
-                    .as("the request is counted when PutKv is invoked, before its response")
-                    .isEqualTo(requestsBefore + 1L);
             assertThat(sender.inFlightRequestCount())
                     .as("one consolidated PutKv RPC must count as one in-flight request")
                     .isOne();
@@ -1875,7 +1861,7 @@ public class IndexSenderTest {
             assertThat(sender.inFlightRequestCount()).isZero();
             assertThat(
                             TestingMetricGroups.TABLET_SERVER_METRICS
-                                    .indexPushRequestLatencyHistogram()
+                                    .indexReplicationRequestLatencyHistogram()
                                     .getCount())
                     .isEqualTo(latencySamplesBefore + 1L);
         } finally {
@@ -2086,10 +2072,8 @@ public class IndexSenderTest {
                         1L,
                         1024L * 1024L,
                         5_000L);
-        long requestsBefore =
-                TestingMetricGroups.TABLET_SERVER_METRICS.indexPushRequests().getCount();
         long retriesBefore =
-                TestingMetricGroups.TABLET_SERVER_METRICS.indexPushBatchRetries().getCount();
+                TestingMetricGroups.TABLET_SERVER_METRICS.indexReplicationRetries().getCount();
         try {
             TableBucket bucket = new TableBucket(250L, 0);
             IndexReplicator owner = owner(sendBuffer);
@@ -2100,9 +2084,7 @@ public class IndexSenderTest {
             gateway.pending.get(0).completeExceptionally(new RuntimeException("first failed"));
 
             await(() -> gateway.pending.size() == 2);
-            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexPushRequests().getCount())
-                    .isEqualTo(requestsBefore + 2L);
-            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexPushBatchRetries().getCount())
+            assertThat(TestingMetricGroups.TABLET_SERVER_METRICS.indexReplicationRetries().getCount())
                     .as("one failed source batch was published for retry")
                     .isEqualTo(retriesBefore + 1L);
             assertThat(sender.inFlightRequestCount()).isEqualTo(1);

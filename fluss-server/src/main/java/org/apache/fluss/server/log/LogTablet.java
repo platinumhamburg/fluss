@@ -440,7 +440,7 @@ public final class LogTablet {
                                 logFormat,
                                 writerStateManager,
                                 isCleanShutdown,
-                                serverMetricGroup.indexWriterStateRecoveryCoverageFailures())
+                                serverMetricGroup.indexReplicationFailures())
                         .load();
 
         LocalLog log =
@@ -1584,7 +1584,7 @@ public final class LogTablet {
                     lastOffset,
                     false,
                     appendFaultInjector,
-                    serverMetricGroup.indexWriterStateRecoveryCoverageFailures());
+                    serverMetricGroup.indexReplicationFailures());
         }
     }
 

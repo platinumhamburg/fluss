@@ -93,8 +93,6 @@ class IndexTargetRecoveryITCase {
     @Test
     void testLiveFollowerReplaysCommittedSnapshotToLogEndBeforePromotion() throws Exception {
         TablePath mainPath = TablePath.of(DB, MAIN_TABLE);
-        TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(MAIN_TABLE, INDEX_NAME));
         Schema mainSchema =
                 Schema.newBuilder()
                         .column("a", DataTypes.INT())
@@ -110,6 +108,8 @@ class IndexTargetRecoveryITCase {
         TableDescriptor mainDescriptor =
                 TableDescriptor.builder().schema(mainSchema).distributedBy(1, "a").build();
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, mainDescriptor);
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
         long indexTableId =
                 FLUSS_CLUSTER_EXTENSION
                         .getZooKeeperClient()

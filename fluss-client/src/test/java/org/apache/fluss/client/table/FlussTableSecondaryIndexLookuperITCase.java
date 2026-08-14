@@ -69,10 +69,10 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
     @Test
     void testLookupReturnsNoStalePointers() throws Exception {
         TablePath mainPath = TablePath.of(DB, "main_t_lookup");
-        createMainTableWithIndex(mainPath, IndexVisibility.ASYNC);
+        long mainTableId = createMainTableWithIndex(mainPath, IndexVisibility.ASYNC);
 
         try (Table mainTable = conn.getTable(mainPath);
-                Table indexTable = conn.getTable(indexTablePathFor(mainPath))) {
+                Table indexTable = conn.getTable(indexTablePathFor(mainPath, mainTableId))) {
 
             // (1) Insert (a=1, b="A"); wait until the Index Table holds an entry under b="A".
             UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
@@ -122,7 +122,7 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
     // Helpers
     // ---------------------------------------------------------------------------------------------
 
-    private void createMainTableWithIndex(TablePath mainPath, @Nullable IndexVisibility visibility)
+    private long createMainTableWithIndex(TablePath mainPath, @Nullable IndexVisibility visibility)
             throws Exception {
         Schema schema =
                 Schema.newBuilder()
@@ -138,13 +138,13 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
                         .build();
         TableDescriptor descriptor =
                 TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
-        createTable(mainPath, descriptor, /* ignoreIfExists */ true);
+        return createTable(mainPath, descriptor, /* ignoreIfExists */ true);
     }
 
-    private static TablePath indexTablePathFor(TablePath mainPath) {
+    private static TablePath indexTablePathFor(TablePath mainPath, long mainTableId) {
         return TablePath.of(
                 mainPath.getDatabaseName(),
-                IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
+                IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
     }
 
     /**

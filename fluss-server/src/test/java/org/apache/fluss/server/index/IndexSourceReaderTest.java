@@ -88,7 +88,7 @@ final class IndexSourceReaderTest {
                 new TestingRemoteFetcher(Arrays.asList(batch(0L, 10L), batch(10L, 20L)));
         ControllableExecutor executor = new ControllableExecutor();
         long bytesBefore =
-                TestingMetricGroups.TABLET_SERVER_METRICS.indexSourceRemoteReadBytes().getCount();
+                TestingMetricGroups.TABLET_SERVER_METRICS.indexReplicationSourceBytes().getCount();
         IndexSourceReader reader = readerWithMetrics(sourceWal, () -> remote, executor);
 
         CompletableFuture<IndexSourceReader.ReadResult> future = reader.read(0L, 30L, 1024);
@@ -102,9 +102,9 @@ final class IndexSourceReaderTest {
         }
         assertThat(
                         TestingMetricGroups.TABLET_SERVER_METRICS
-                                .indexSourceRemoteReadBytes()
+                                .indexReplicationSourceBytes()
                                 .getCount())
-                .isEqualTo(bytesBefore + 20L);
+                .isEqualTo(bytesBefore + 30L);
         assertThat(remote.closed.get()).isTrue();
         reader.close();
         assertThat(remote.closed.get()).isTrue();
@@ -325,8 +325,8 @@ final class IndexSourceReaderTest {
         executor.runNext();
 
         assertThatThrownBy(future::join).hasRootCauseMessage("remote decode");
-        assertThat(metrics.indexSourceRemoteReadBytes().getCount()).isEqualTo(10L);
-        assertThat(metrics.indexSourceRemoteReadFailures().getCount()).isEqualTo(1L);
+        assertThat(metrics.indexReplicationSourceBytes().getCount()).isEqualTo(10L);
+        assertThat(metrics.indexReplicationFailures().getCount()).isEqualTo(1L);
     }
 
     @Test
@@ -356,8 +356,8 @@ final class IndexSourceReaderTest {
         executor.runNext();
 
         assertThatThrownBy(future::join).hasRootCauseMessage("local handoff");
-        assertThat(metrics.indexSourceRemoteReadBytes().getCount()).isEqualTo(10L);
-        assertThat(metrics.indexSourceRemoteReadFailures().getCount()).isZero();
+        assertThat(metrics.indexReplicationSourceBytes().getCount()).isEqualTo(10L);
+        assertThat(metrics.indexReplicationFailures().getCount()).isZero();
     }
 
     @Test
@@ -395,8 +395,8 @@ final class IndexSourceReaderTest {
         IndexSourceReader.ReadResult result = future.join();
 
         assertThatThrownBy(result::close).hasRootCauseMessage("remote resource close");
-        assertThat(metrics.indexSourceRemoteReadBytes().getCount()).isEqualTo(10L);
-        assertThat(metrics.indexSourceRemoteReadFailures().getCount()).isEqualTo(1L);
+        assertThat(metrics.indexReplicationSourceBytes().getCount()).isEqualTo(10L);
+        assertThat(metrics.indexReplicationFailures().getCount()).isEqualTo(1L);
     }
 
     @Test
@@ -551,7 +551,7 @@ final class IndexSourceReaderTest {
         ControllableExecutor executor = new ControllableExecutor();
         long failuresBefore =
                 TestingMetricGroups.TABLET_SERVER_METRICS
-                        .indexSourceRemoteReadFailures()
+                        .indexReplicationFailures()
                         .getCount();
         IndexSourceReader reader =
                 readerWithMetrics(
@@ -563,7 +563,7 @@ final class IndexSourceReaderTest {
         assertCorruption(future, message);
         assertThat(
                         TestingMetricGroups.TABLET_SERVER_METRICS
-                                .indexSourceRemoteReadFailures()
+                                .indexReplicationFailures()
                                 .getCount())
                 .isEqualTo(failuresBefore + 1L);
     }

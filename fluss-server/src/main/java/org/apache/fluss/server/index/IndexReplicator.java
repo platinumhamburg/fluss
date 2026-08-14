@@ -28,6 +28,7 @@ import org.apache.fluss.record.DefaultKvRecord;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.record.ProgressKvRecordBatch;
 import org.apache.fluss.record.ProgressKvRecordBatchBuilder;
 import org.apache.fluss.record.WriterKey;
@@ -96,6 +97,7 @@ public final class IndexReplicator implements AutoCloseable {
     private final LogRecordReadContext readContext;
     private final IndexProgressListener onProgress;
     private final BiConsumer<IndexReplicator, Throwable> onTerminalFailure;
+    @Nullable private final TabletServerMetricGroup metrics;
     private final IndexReplicationNoProgressTracker noProgressTracker;
     private final int maxWindowBytes;
     private final long preferredMaxRequestBytes;
@@ -205,6 +207,30 @@ public final class IndexReplicator implements AutoCloseable {
             long preferredMaxRequestBytes,
             IndexProgressListener onProgress,
             BiConsumer<IndexReplicator, Throwable> onTerminalFailure) {
+        this(
+                sourceReader,
+                indexSpecs,
+                sendBuffer,
+                readContext,
+                initialOffset,
+                maxWindowBytes,
+                preferredMaxRequestBytes,
+                onProgress,
+                onTerminalFailure,
+                null);
+    }
+
+    IndexReplicator(
+            IndexSourceReader sourceReader,
+            List<IndexSpec> indexSpecs,
+            IndexSendBuffer sendBuffer,
+            LogRecordReadContext readContext,
+            long initialOffset,
+            int maxWindowBytes,
+            long preferredMaxRequestBytes,
+            IndexProgressListener onProgress,
+            BiConsumer<IndexReplicator, Throwable> onTerminalFailure,
+            @Nullable TabletServerMetricGroup metrics) {
         if (initialOffset < 0) {
             throw new IllegalArgumentException(
                     "initialOffset must be non-negative, but was " + initialOffset);
@@ -231,6 +257,7 @@ public final class IndexReplicator implements AutoCloseable {
         this.lifecycleLock = new ReentrantLock();
         this.onProgress = onProgress;
         this.onTerminalFailure = onTerminalFailure;
+        this.metrics = metrics;
         this.noProgressTracker =
                 new IndexReplicationNoProgressTracker(initialOffset, initialOffset);
     }
@@ -586,7 +613,7 @@ public final class IndexReplicator implements AutoCloseable {
      * index's pushed offset to the window end, clears the per-index in-flight window, notifies the
      * owning replica, and wakes the read-pool worker so it can poll the next ready window.
      */
-    void onWindowComplete(String indexName, long windowEndOffset) {
+    void onWindowComplete(String indexName, long windowEndOffset, long completedBytes) {
         lifecycleLock.lock();
         try {
             if (closed.get() || terminalFailure.get() != null) {
@@ -600,6 +627,9 @@ public final class IndexReplicator implements AutoCloseable {
             } else {
                 advanceIndexState(state, windowEndOffset);
                 state.inFlightWindow = null;
+            }
+            if (metrics != null) {
+                metrics.indexReplicationCompletedBytes().inc(completedBytes);
             }
             notifyProgress();
         } finally {

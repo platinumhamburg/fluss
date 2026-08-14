@@ -18,29 +18,21 @@
 package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.exception.NetworkException;
-import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
-import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
-import org.apache.fluss.rpc.messages.UpdateMetadataResponse;
 import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
-import org.apache.fluss.server.coordinator.event.RefreshPartitionTombstonesEvent;
-import org.apache.fluss.server.coordinator.event.TestingEventManager;
 import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
 import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -166,63 +158,4 @@ class CoordinatorRequestBatchTest {
         };
     }
 
-    @Test
-    void testFailedTombstoneFanoutSchedulesOneFreshMetadataRepair() throws Exception {
-        TestingEventManager eventManager = new TestingEventManager();
-        List<Runnable> scheduledActions = new ArrayList<>();
-        CoordinatorChannelManager channelManager =
-                new TestCoordinatorChannelManager() {
-                    @Override
-                    public void sendUpdateMetadataRequest(
-                            int serverId,
-                            UpdateMetadataRequest request,
-                            BiConsumer<UpdateMetadataResponse, ? super Throwable> callback) {
-                        callback.accept(null, new RuntimeException("injected failure"));
-                    }
-                };
-        try {
-            CoordinatorRequestBatch requestBatch =
-                    new CoordinatorRequestBatch(
-                            channelManager,
-                            eventManager,
-                            new CoordinatorContext(ZkEpoch.INITIAL_EPOCH),
-                            scheduledActions::add);
-            PartitionTombstone tombstone =
-                    new PartitionTombstone(7L, Collections.singleton(11L), 3L);
-
-            requestBatch.newBatch();
-            requestBatch.addUpdateMetadataRequestForTabletServers(
-                    new HashSet<>(Arrays.asList(1, 2)),
-                    null,
-                    null,
-                    Collections.emptySet(),
-                    Collections.singletonMap(100L, tombstone));
-            requestBatch.sendUpdateMetadataRequest();
-
-            assertThat(scheduledActions).hasSize(1);
-            assertThat(eventManager.getEvents()).isEmpty();
-
-            scheduledActions.get(0).run();
-            assertThat(eventManager.getEvents())
-                    .singleElement()
-                    .isInstanceOf(RefreshPartitionTombstonesEvent.class);
-
-            requestBatch.newBatch();
-            requestBatch.addUpdateMetadataRequestForTabletServers(
-                    Collections.singleton(1),
-                    null,
-                    null,
-                    Collections.emptySet(),
-                    Collections.singletonMap(100L, tombstone));
-            requestBatch.sendUpdateMetadataRequest();
-
-            assertThat(scheduledActions).hasSize(2);
-            scheduledActions.get(1).run();
-            assertThat(eventManager.getEvents())
-                    .hasSize(2)
-                    .allMatch(RefreshPartitionTombstonesEvent.class::isInstance);
-        } finally {
-            channelManager.close();
-        }
-    }
 }

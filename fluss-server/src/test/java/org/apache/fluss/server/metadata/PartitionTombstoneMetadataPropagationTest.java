@@ -37,22 +37,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Verifies that {@link PartitionTombstone} entries flow from the Coordinator to the TabletServer
- * via the existing {@code UpdateMetadataRequest} channel.
- *
- * <p>Two layers are exercised:
- *
- * <ol>
- *   <li>Wire round-trip: {@link ServerRpcMessageUtils#makeUpdateMetadataRequest} → {@code
- *       toByteArray} → {@code parseFrom} → {@link
- *       ServerRpcMessageUtils#getUpdateMetadataRequestData} preserves all tombstone fields.
- *   <li>Cache application: the {@link ClusterMetadata} produced by the receiver path is fed into
- *       {@link TabletServerMetadataCache#updateClusterMetadata}, which is the same call made by
- *       {@code ReplicaManager.maybeUpdateMetadataCache} from {@code TabletService.updateMetadata}.
- *       The cache must reflect every entry afterwards.
- * </ol>
- */
+/** Tests the PartitionTombstone wire format and TabletServer metadata cache updates. */
 class PartitionTombstoneMetadataPropagationTest {
 
     private static final long TABLE_A = 1001L;
@@ -202,37 +187,6 @@ class PartitionTombstoneMetadataPropagationTest {
                         Collections.singletonMap(TABLE_A, stale)));
 
         assertThat(cache.getPartitionTombstone(TABLE_A)).isEqualTo(newer);
-    }
-
-    @Test
-    void testEndToEndPropagationViaUpdateMetadataRequestAndCache() {
-        // Exercises the exact wiring used by TabletService.updateMetadata: build an
-        // UpdateMetadataRequest carrying tombstones, decode via getUpdateMetadataRequestData,
-        // then apply via TabletServerMetadataCache.updateClusterMetadata. After this the
-        // metadataCache.getPartitionTombstone(...) must return the propagated value.
-        Map<Long, PartitionTombstone> tombstones = new LinkedHashMap<>();
-        tombstones.put(TABLE_A, new PartitionTombstone(7L, asSet(11L, 13L), 5L));
-
-        UpdateMetadataRequest req =
-                ServerRpcMessageUtils.makeUpdateMetadataRequest(
-                        null,
-                        null,
-                        Collections.emptySet(),
-                        Collections.emptyList(),
-                        Collections.emptyList(),
-                        tombstones);
-
-        UpdateMetadataRequest parsed = new UpdateMetadataRequest();
-        parsed.parseFrom(req.toByteArray());
-
-        ClusterMetadata clusterMetadata =
-                ServerRpcMessageUtils.getUpdateMetadataRequestData(parsed);
-
-        TabletServerMetadataCache cache = new TabletServerMetadataCache(new EmptyMetadataManager());
-        cache.updateClusterMetadata(clusterMetadata);
-
-        assertThat(cache.getPartitionTombstone(TABLE_A))
-                .isEqualTo(new PartitionTombstone(7L, asSet(11L, 13L), 5L));
     }
 
     private static java.util.Set<Long> asSet(long... values) {

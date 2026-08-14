@@ -139,32 +139,22 @@ public class MetricNames {
     public static final String FAILED_PREFIX_LOOKUP_REQUESTS_RATE =
             "failedPrefixLookupRequestsPerSecond";
 
-    // for index push
-    public static final String INDEX_PUSH_REQUESTS_RATE = "indexPushRequestsPerSecond";
-    public static final String INDEX_PUSH_BATCH_RETRIES_RATE = "indexPushBatchRetriesPerSecond";
-    public static final String INDEX_PUSH_REQUEST_LATENCY_MS = "indexPushRequestLatencyMs";
-    public static final String PARTITION_TOMBSTONE_APPLY_DROPS_RATE =
-            "partitionTombstoneApplyDropsPerSecond";
-    public static final String INDEX_PUSH_PENDING_BYTES = "indexPushPendingBytes";
-    public static final String INDEX_PUSH_IN_FLIGHT_REQUESTS = "indexPushInFlightRequests";
-    public static final String INDEX_PUSH_OLDEST_IN_FLIGHT_AGE_MS = "indexPushOldestInFlightAgeMs";
+    // for index replication
+    public static final String INDEX_REPLICATION_SOURCE_BYTES_RATE =
+            "indexReplicationSourceBytesPerSecond";
+    public static final String INDEX_REPLICATION_COMPLETED_BYTES_RATE =
+            "indexReplicationCompletedBytesPerSecond";
+    public static final String INDEX_REPLICATION_PENDING_BYTES = "indexReplicationPendingBytes";
+    public static final String INDEX_REPLICATION_REQUEST_LATENCY_MS =
+            "indexReplicationRequestLatencyMs";
+    public static final String INDEX_REPLICATION_RETRIES_RATE =
+            "indexReplicationRetriesPerSecond";
+    public static final String INDEX_REPLICATION_FAILURES_RATE =
+            "indexReplicationFailuresPerSecond";
     public static final String INDEX_REPLICATION_MAX_NO_PROGRESS_TIME_MS =
             "indexReplicationMaxNoProgressTimeMs";
     public static final String INDEX_REPLICATION_FAILED_SOURCE_BUCKET_COUNT =
             "indexReplicationFailedSourceBucketCount";
-    public static final String INDEX_PUSH_STALE_PROGRESS_BATCHES_RATE =
-            "indexPushStaleProgressBatchesPerSecond";
-    public static final String INDEX_WRITER_STATE_ENTRIES = "indexWriterStateEntries";
-    public static final String INDEX_SOURCE_REMOTE_READ_BYTES_RATE =
-            "indexSourceRemoteReadBytesPerSecond";
-    public static final String INDEX_SOURCE_REMOTE_READ_FAILURES_RATE =
-            "indexSourceRemoteReadFailuresPerSecond";
-    public static final String INDEX_PUSH_RECORD_TOO_LARGE_FAILURES_RATE =
-            "indexPushRecordTooLargeFailuresPerSecond";
-    public static final String INDEX_PUSH_TOMBSTONE_NO_OP_BATCHES_RATE =
-            "indexPushTombstoneNoOpBatchesPerSecond";
-    public static final String INDEX_WRITER_STATE_RECOVERY_COVERAGE_FAILURES_RATE =
-            "indexWriterStateRecoveryCoverageFailuresPerSecond";
 
     // for replica
     public static final String UNDER_REPLICATED = "underReplicated";

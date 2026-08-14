@@ -905,7 +905,6 @@ public final class IndexSender implements AutoCloseable {
             inFlightRequests.add(inFlightRequest);
             CompletableFuture<PutKvResponse> future;
             try {
-                metrics.indexPushRequests().inc();
                 future = target.gateway.putKv(request);
                 FutureUtils.orTimeout(
                                 future,
@@ -984,7 +983,7 @@ public final class IndexSender implements AutoCloseable {
             } finally {
                 lifecycleLock.unlock();
             }
-            metrics.indexPushRequestLatencyHistogram()
+            metrics.indexReplicationRequestLatencyHistogram()
                     .update((System.nanoTime() - inFlightRequest.startNs) / 1_000_000L);
             try {
                 runAccountingAndCallbacks(actions);
@@ -1310,7 +1309,7 @@ public final class IndexSender implements AutoCloseable {
         if (siblings == null) {
             return;
         }
-        metrics.indexPushRecordTooLargeFailures().inc();
+        metrics.indexReplicationFailures().inc();
         releaseWindowBatches(siblings);
     }
 
@@ -1478,7 +1477,7 @@ public final class IndexSender implements AutoCloseable {
                             System.currentTimeMillis() + retryDelayMs(batch.attempts() + 1);
                     lifecycleHooks.beforeRetryPublication();
                     if (sendBuffer.reEnqueueIfActive(batch, readyAtMs)) {
-                        metrics.indexPushBatchRetries().inc();
+                        metrics.indexReplicationRetries().inc();
                     } else {
                         releaseRejectedRetry(batch);
                     }

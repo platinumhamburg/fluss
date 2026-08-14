@@ -541,14 +541,12 @@ public final class KvTablet {
                         }
                         if (writeGuard.beforeWriterState(writerKey)
                                 == KvWriteGuard.Decision.NO_OP) {
-                            serverMetricGroup.indexPushTombstoneNoOpBatches().inc();
                             return LogAppendInfo.noAppend();
                         }
                         Optional<WriterProgressStateEntry> stale =
                                 logTablet.findStaleProgressBatch(writerKey, writerProgress);
                         if (stale.isPresent()) {
                             WriterProgressStateEntry entry = stale.get();
-                            serverMetricGroup.indexPushStaleProgressBatches().inc();
                             return LogAppendInfo.duplicatedAt(
                                     entry.progressWalOffset(), entry.lastTimestamp());
                         }
@@ -625,9 +623,6 @@ public final class KvTablet {
                         // if the batch is duplicated, we should truncate the kvPreWriteBuffer
                         // already written.
                         if (logAppendInfo.duplicated()) {
-                            if (progressMode) {
-                                serverMetricGroup.indexPushStaleProgressBatches().inc();
-                            }
                             kvPreWriteBuffer.truncateTo(
                                     logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
                         }

@@ -87,7 +87,6 @@ import org.apache.fluss.server.coordinator.event.NotifyLakeTableOffsetEvent;
 import org.apache.fluss.server.coordinator.event.NotifyLeaderAndIsrResponseReceivedEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceTaskTimeoutEvent;
-import org.apache.fluss.server.coordinator.event.RefreshPartitionTombstonesEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
 import org.apache.fluss.server.coordinator.event.ResumeDropEvent;
 import org.apache.fluss.server.coordinator.event.RetryOfflineLeaderEvent;
@@ -720,8 +719,6 @@ public class CoordinatorEventProcessor implements EventProcessor {
             processNotifyKvSnapshotOffsetEvent((NotifyKvSnapshotOffsetEvent) event);
         } else if (event instanceof NotifyLakeTableOffsetEvent) {
             processNotifyLakeTableOffsetEvent((NotifyLakeTableOffsetEvent) event);
-        } else if (event instanceof RefreshPartitionTombstonesEvent) {
-            processRefreshPartitionTombstones();
         } else if (event instanceof CommitRemoteLogManifestEvent) {
             CommitRemoteLogManifestEvent commitRemoteLogManifestEvent =
                     (CommitRemoteLogManifestEvent) event;
@@ -919,10 +916,9 @@ public class CoordinatorEventProcessor implements EventProcessor {
         } catch (Exception e) {
             LOG.warn(
                     "Failed to load partition tombstone baseline for newly created table {}. "
-                            + "Scheduling a fresh metadata repair.",
+                            + "The TabletServer will load it from ZooKeeper.",
                     createdTable.getTablePath(),
                     e);
-            coordinatorRequestBatch.schedulePartitionTombstoneRepair();
             return Collections.emptyMap();
         }
     }
@@ -2637,25 +2633,6 @@ public class CoordinatorEventProcessor implements EventProcessor {
             }
         }
         return tombstones;
-    }
-
-    private void processRefreshPartitionTombstones() {
-        Set<ServerInfo> liveTabletServers =
-                new HashSet<>(coordinatorContext.getLiveTabletServers().values());
-        if (liveTabletServers.isEmpty()) {
-            return;
-        }
-
-        try {
-            Map<Long, PartitionTombstone> tombstones = collectPartitionTombstonesForIndexedTables();
-            if (!tombstones.isEmpty()) {
-                updateTabletServerMetadataCache(
-                        liveTabletServers, null, null, Collections.emptySet(), tombstones);
-            }
-        } catch (RuntimeException e) {
-            LOG.warn("Failed to refresh partition tombstones. Scheduling another refresh.", e);
-            coordinatorRequestBatch.schedulePartitionTombstoneRepair();
-        }
     }
 
     /** Update metadata cache for all remote tablet servers. */

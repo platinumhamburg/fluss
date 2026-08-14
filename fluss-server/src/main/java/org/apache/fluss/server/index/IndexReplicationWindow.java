@@ -49,6 +49,7 @@ final class IndexReplicationWindow {
     private final IndexReplicator owner;
     private final List<IndexBatch> batches;
     private volatile boolean admitted;
+    private long admittedPayloadBytes;
     private boolean terminal;
 
     IndexReplicationWindow(String indexName, long windowEndOffset, int batchCount, IndexReplicator owner) {
@@ -120,7 +121,8 @@ final class IndexReplicationWindow {
         return admitted;
     }
 
-    void markAdmitted() {
+    synchronized void markAdmitted() {
+        admittedPayloadBytes = registeredPayloadBytes();
         admitted = true;
     }
 
@@ -151,18 +153,20 @@ final class IndexReplicationWindow {
      */
     void onBatchAcked(IndexBatch batch) {
         boolean completed = false;
+        long completedBytes = 0L;
         synchronized (this) {
             if (terminal || !batches.remove(batch)) {
                 return;
             }
             if (--remaining == 0) {
+                completedBytes = admittedPayloadBytes;
                 terminal = true;
                 batches.clear();
                 completed = true;
             }
         }
         if (completed) {
-            owner.onWindowComplete(indexName, windowEndOffset);
+            owner.onWindowComplete(indexName, windowEndOffset, completedBytes);
         }
     }
 }

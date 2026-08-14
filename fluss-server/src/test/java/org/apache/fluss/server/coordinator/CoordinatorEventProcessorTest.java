@@ -58,7 +58,6 @@ import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
 import org.apache.fluss.server.coordinator.event.CoordinatorEventManager;
 import org.apache.fluss.server.coordinator.event.NotifyLeaderAndIsrResponseReceivedEvent;
-import org.apache.fluss.server.coordinator.event.RefreshPartitionTombstonesEvent;
 import org.apache.fluss.server.coordinator.event.RetryOfflineLeaderEvent;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
@@ -519,7 +518,7 @@ class CoordinatorEventProcessorTest {
                         .withReplicationFactor(1);
         TablePath indexPath =
                 TablePath.of(
-                        defaultDatabase, IndexTableUtils.indexTableName("baseline_main", "idx_id"));
+                        defaultDatabase, IndexTableUtils.indexTableName(mainTableId, "idx_id"));
         TableAssignment indexAssignment =
                 generateAssignment(
                         1,
@@ -548,17 +547,6 @@ class CoordinatorEventProcessorTest {
 
         assertThat(lastTombstoneUpdate(0)).isEmpty();
 
-        PartitionTombstone refreshedTombstone =
-                new PartitionTombstone(17L, Collections.singleton(23L), 2L);
-        zookeeperClient.setOrCreatePartitionTombstone(mainPath, refreshedTombstone);
-        eventProcessor.getCoordinatorEventManager().put(new RefreshPartitionTombstonesEvent());
-
-        retry(
-                Duration.ofMinutes(1),
-                () ->
-                        assertThat(lastTombstoneUpdate(0))
-                                .containsExactlyEntriesOf(
-                                        Collections.singletonMap(mainTableId, refreshedTombstone)));
     }
 
     @Test

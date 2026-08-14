@@ -17,7 +17,6 @@
 
 package org.apache.fluss.server.coordinator;
 
-import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
@@ -41,7 +40,6 @@ import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.DeleteReplicaResponseReceivedEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
 import org.apache.fluss.server.coordinator.event.NotifyLeaderAndIsrResponseReceivedEvent;
-import org.apache.fluss.server.coordinator.event.RefreshPartitionTombstonesEvent;
 import org.apache.fluss.server.entity.DeleteReplicaResultForBucket;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.metadata.BucketMetadata;
@@ -49,7 +47,6 @@ import org.apache.fluss.server.metadata.PartitionMetadata;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
-import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,9 +61,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_ID;
@@ -92,7 +86,6 @@ public class CoordinatorRequestBatch {
     private static final TableDescriptor EMPTY_TABLE_DESCRIPTOR =
             TableDescriptor.builder().schema(EMPTY_SCHEMA).distributedBy(0).build();
     private static final String EMPTY_REMOTE_DATA_DIR = "";
-    private static final long PARTITION_TOMBSTONE_REPAIR_DELAY_MS = 1_000L;
 
     // a map from tablet server to notify the leader and isr for each bucket.
     private final Map<Integer, Map<TableBucket, PbNotifyLeaderAndIsrReqForBucket>>
@@ -127,34 +120,14 @@ public class CoordinatorRequestBatch {
     private final CoordinatorChannelManager coordinatorChannelManager;
     private final EventManager eventManager;
     private final CoordinatorContext coordinatorContext;
-    private final Consumer<Runnable> delayedActionScheduler;
-    private final AtomicBoolean partitionTombstoneRepairScheduled = new AtomicBoolean();
 
     public CoordinatorRequestBatch(
             CoordinatorChannelManager coordinatorChannelManager,
             EventManager eventManager,
             CoordinatorContext coordinatorContext) {
-        this(
-                coordinatorChannelManager,
-                eventManager,
-                coordinatorContext,
-                action ->
-                        FutureUtils.runAfterDelay(
-                                action,
-                                PARTITION_TOMBSTONE_REPAIR_DELAY_MS,
-                                TimeUnit.MILLISECONDS));
-    }
-
-    @VisibleForTesting
-    CoordinatorRequestBatch(
-            CoordinatorChannelManager coordinatorChannelManager,
-            EventManager eventManager,
-            CoordinatorContext coordinatorContext,
-            Consumer<Runnable> delayedActionScheduler) {
         this.coordinatorChannelManager = coordinatorChannelManager;
         this.eventManager = eventManager;
         this.coordinatorContext = coordinatorContext;
-        this.delayedActionScheduler = delayedActionScheduler;
     }
 
     public void newBatch() {
@@ -632,10 +605,9 @@ public class CoordinatorRequestBatch {
                             if (containsPartitionTombstones) {
                                 LOG.warn(
                                         "Failed to send partition tombstone metadata update to "
-                                                + "server {}. Scheduling a refresh.",
+                                                + "server {}. The TabletServer will reload it from ZooKeeper.",
                                         serverId,
                                         throwable);
-                                schedulePartitionTombstoneRepair();
                             } else {
                                 LOG.debug(
                                         "Failed to send update metadata request to server {}.",
@@ -651,21 +623,6 @@ public class CoordinatorRequestBatch {
         updateMetadataRequestBucketMap.clear();
         updateMetadataRequestPartitionMap.clear();
         updateMetadataRequestPartitionTombstones.clear();
-    }
-
-    void schedulePartitionTombstoneRepair() {
-        if (partitionTombstoneRepairScheduled.compareAndSet(false, true)) {
-            try {
-                delayedActionScheduler.accept(
-                        () -> {
-                            partitionTombstoneRepairScheduled.set(false);
-                            eventManager.put(new RefreshPartitionTombstonesEvent());
-                        });
-            } catch (RuntimeException e) {
-                partitionTombstoneRepairScheduled.set(false);
-                throw e;
-            }
-        }
     }
 
     public void sendNotifyRemoteLogOffsetsRequest(int coordinatorEpoch) {

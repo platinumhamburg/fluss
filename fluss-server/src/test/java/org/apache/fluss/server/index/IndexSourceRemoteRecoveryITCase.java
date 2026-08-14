@@ -223,8 +223,6 @@ class IndexSourceRemoteRecoveryITCase {
     private static IndexedSourceTable createIndexedSourceTable() throws Exception {
         String tableName = "source_remote_recovery_" + System.nanoTime();
         TablePath mainPath = TablePath.of("task7", tableName);
-        TablePath indexPath =
-                TablePath.of("task7", IndexTableUtils.indexTableName(tableName, INDEX_NAME));
         Schema schema =
                 Schema.newBuilder()
                         .column("a", DataTypes.INT())
@@ -242,6 +240,8 @@ class IndexSourceRemoteRecoveryITCase {
                         CLUSTER,
                         mainPath,
                         TableDescriptor.builder().schema(schema).distributedBy(1, "a").build());
+        TablePath indexPath =
+                TablePath.of("task7", IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
         long indexTableId =
                 CLUSTER.getZooKeeperClient()
                         .getTable(indexPath)
@@ -427,7 +427,7 @@ class IndexSourceRemoteRecoveryITCase {
         TabletServer recoveryTabletServer = sourceTabletServer(recovery.recoveryFollower);
         TabletServerMetricGroup recoveryMetrics =
                 recoveryTabletServer.getReplicaManager().getServerMetricGroup();
-        long remoteBytesBefore = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
+        long remoteBytesBefore = recoveryMetrics.indexReplicationSourceBytes().getCount();
 
         recovery.stopServer(recovery.sourceLeader);
         waitUntil(
@@ -445,7 +445,7 @@ class IndexSourceRemoteRecoveryITCase {
                 "wait for the recovered source IndexReplicator");
 
         recovery.replayGate().awaitAdmission();
-        long remoteBytesWhileAckHeld = recoveryMetrics.indexSourceRemoteReadBytes().getCount();
+        long remoteBytesWhileAckHeld = recoveryMetrics.indexReplicationSourceBytes().getCount();
         assertThat(newSourceReplica.getLogTablet().localLogStartOffset())
                 .as("the replay start must be unavailable from local source WAL")
                 .isGreaterThan(baselinePushedOffset);

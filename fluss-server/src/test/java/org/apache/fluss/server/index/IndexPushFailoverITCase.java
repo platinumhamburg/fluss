@@ -105,8 +105,6 @@ class IndexPushFailoverITCase {
     @Test
     void testMainTableLeaderFailoverResumesIndexPush() throws Exception {
         TablePath mainPath = TablePath.of(DB, "main_failover");
-        TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName("main_failover", INDEX_NAME));
 
         Schema schema =
                 Schema.newBuilder()
@@ -124,6 +122,8 @@ class IndexPushFailoverITCase {
                 TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
         long indexTableId =
                 FLUSS_CLUSTER_EXTENSION
                         .getZooKeeperClient()
@@ -264,8 +264,6 @@ class IndexPushFailoverITCase {
     @Test
     void testIndexTableLeaderFailoverRetries() throws Throwable {
         TablePath mainPath = TablePath.of(DB, "main_idx_failover");
-        TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName("main_idx_failover", INDEX_NAME));
 
         Schema schema =
                 Schema.newBuilder()
@@ -283,6 +281,8 @@ class IndexPushFailoverITCase {
                 TableDescriptor.builder().schema(schema).distributedBy(3, "a").build();
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
         long indexTableId =
                 FLUSS_CLUSTER_EXTENSION
                         .getZooKeeperClient()

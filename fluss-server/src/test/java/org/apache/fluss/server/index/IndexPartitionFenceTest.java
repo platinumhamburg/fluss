@@ -28,9 +28,6 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.metrics.Gauge;
-import org.apache.fluss.metrics.MetricNames;
-import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.DefaultLogRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchReader;
@@ -56,7 +53,6 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.WriterProgressAppendInfo;
 import org.apache.fluss.server.log.WriterProgressStateEntry;
 import org.apache.fluss.server.metadata.ClusterMetadata;
-import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaTestBase;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
@@ -141,22 +137,14 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(1L);
         assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isPresent();
 
-        TabletServerMetricGroup metrics =
-                new TabletServerMetricGroup(
-                        NOPMetricRegistry.INSTANCE, "gauge-test", "rack", "host", 1);
-        metrics.registerIndexWriterStateGauge(fixture.log.writerStateManager()::writerIdCount);
-        assertThat(metricValue(metrics, MetricNames.INDEX_WRITER_STATE_ENTRIES, Long.class))
-                .isEqualTo(1L);
     }
 
     @Test
-    void testStaleRequestIncrementsMetricWithoutMutationOrWalAppend() throws Exception {
+    void testStaleRequestHasNoMutationOrWalAppend() throws Exception {
         Fixture fixture = createInitializedFixture("stale_metric");
         WriterKey writerKey = writerKey(PARTITION_ID);
         byte[] key = physicalKey(physicalRow(PARTITION_ID));
         fixture.put(mutation(writerKey, 200L, physicalRow(PARTITION_ID), key));
-        long staleBefore =
-                replicaManager.getServerMetricGroup().indexPushStaleProgressBatches().getCount();
         long walEndBefore = fixture.log.localLogEndOffset();
         KvPreWriteBuffer.Value valueBefore = fixture.kv.getKvPreWriteBuffer().get(Key.of(key));
 
@@ -166,8 +154,6 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(result.lastOffset()).isZero();
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(walEndBefore);
         assertThat(fixture.kv.getKvPreWriteBuffer().get(Key.of(key))).isEqualTo(valueBefore);
-        assertThat(replicaManager.getServerMetricGroup().indexPushStaleProgressBatches().getCount())
-                .isEqualTo(staleBefore + 1L);
     }
 
     @ParameterizedTest(name = "writerPid={0}, keyPid={1}, valuePid={2}")
@@ -233,17 +219,12 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         Fixture fixture = createFixture("tombstoned_no_append");
         publishDirect(tombstone(PARTITION_ID));
         WriterKey writerKey = writerKey(PARTITION_ID);
-        long noOpsBefore =
-                replicaManager.getServerMetricGroup().indexPushTombstoneNoOpBatches().getCount();
-
         LogAppendInfo result =
                 fixture.put(mutation(writerKey, 100L, physicalRow(PARTITION_ID), PARTITION_ID));
 
         assertThat(result.hasNoAppend()).isTrue();
         assertThat(result.lastOffset()).isEqualTo(-1L);
         assertNoMutation(fixture, writerKey, 0L);
-        assertThat(replicaManager.getServerMetricGroup().indexPushTombstoneNoOpBatches().getCount())
-                .isEqualTo(noOpsBefore + 1L);
     }
 
     @Test
@@ -622,7 +603,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                         mainDescriptor, mainTableId, "test_db.orders", "idx_user");
         TablePath indexPath =
                 TablePath.of(
-                        "test_db", IndexTableUtils.indexTableName("orders_" + name, "idx_user"));
+                        "test_db", IndexTableUtils.indexTableName(mainTableId, "idx_user"));
         zkClient.registerTable(
                 indexPath,
                 TableRegistration.newTable(indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));
@@ -801,12 +782,6 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
         assertThat(fixture.kv.getKvPreWriteBuffer().getAllKvEntries()).isEmpty();
         assertThat(fixture.log.localLogEndOffset()).isEqualTo(logEndOffset);
         assertThat(fixture.log.writerStateManager().lastProgressEntry(writerKey)).isEmpty();
-    }
-
-    private static <T> T metricValue(TabletServerMetricGroup metrics, String name, Class<T> type) {
-        Gauge<?> gauge = (Gauge<?>) metrics.getMetrics().get(name);
-        assertThat(gauge).as("registered gauge %s", name).isNotNull();
-        return type.cast(gauge.getValue());
     }
 
     private static void setKvHook(KvTablet kvTablet, String methodName, Runnable hook)

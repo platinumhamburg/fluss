@@ -37,7 +37,6 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.CompletableFuture;
@@ -266,7 +265,7 @@ public final class IndexSourceReader implements AutoCloseable {
             long remoteEnd = Math.min(localLogStartOffset, highWatermark);
             BatchCollector collector = new BatchCollector(nextOffset, highWatermark, maxBytes);
             remoteRead = remoteFetcher.fetchBounded(nextOffset, localLogStartOffset, maxBytes);
-            collector.collect(countRemoteBytes(remoteRead), remoteEnd);
+            collector.collect(remoteRead, remoteEnd);
             if (remoteRead.stoppedByByteLimit()) {
                 collector.markByteLimit();
             }
@@ -312,7 +311,7 @@ public final class IndexSourceReader implements AutoCloseable {
                     remoteRead.close();
                 } catch (Throwable closeFailure) {
                     if (metrics != null) {
-                        metrics.indexSourceRemoteReadFailures().inc();
+                        metrics.indexReplicationFailures().inc();
                         remoteFailureCounted = true;
                     }
                     if (taskFailure == null) {
@@ -324,7 +323,7 @@ public final class IndexSourceReader implements AutoCloseable {
             }
             if (taskFailure != null) {
                 if (metrics != null && !localHandoffStarted && !remoteFailureCounted) {
-                    metrics.indexSourceRemoteReadFailures().inc();
+                    metrics.indexReplicationFailures().inc();
                 }
                 if (remoteFetcher != null) {
                     discardRemoteFetcher(remoteFetcher);
@@ -335,29 +334,6 @@ public final class IndexSourceReader implements AutoCloseable {
                 }
             }
         }
-    }
-
-    /** Counts bytes once the remote iterator has yielded a batch to the consumer. */
-    private Iterable<LogRecordBatch> countRemoteBytes(RemoteRead remoteRead) {
-        if (metrics == null) {
-            return remoteRead;
-        }
-        return () -> {
-            Iterator<LogRecordBatch> batches = remoteRead.iterator();
-            return new Iterator<LogRecordBatch>() {
-                @Override
-                public boolean hasNext() {
-                    return batches.hasNext();
-                }
-
-                @Override
-                public LogRecordBatch next() {
-                    LogRecordBatch batch = batches.next();
-                    metrics.indexSourceRemoteReadBytes().inc(batch.sizeInBytes());
-                    return batch;
-                }
-            };
-        };
     }
 
     private RemoteFetcher getOrOpenRemoteFetcher() {
@@ -394,7 +370,7 @@ public final class IndexSourceReader implements AutoCloseable {
                 }
             } catch (RuntimeException | Error failure) {
                 if (metrics != null) {
-                    metrics.indexSourceRemoteReadFailures().inc();
+                    metrics.indexReplicationFailures().inc();
                 }
                 throw failure;
             }
@@ -557,6 +533,9 @@ public final class IndexSourceReader implements AutoCloseable {
                 if (start < end) {
                     batches.add(new OffsetBoundedBatch(batch, start, end));
                     bytes += batch.sizeInBytes();
+                    if (metrics != null) {
+                        metrics.indexReplicationSourceBytes().inc(batch.sizeInBytes());
+                    }
                     nextOffset = end;
                     if (bytes >= maxBytes
                             && nextOffset < upperBound

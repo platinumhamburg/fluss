@@ -128,8 +128,6 @@ class PartitionTTLGoldenPathITCase {
     void testDropRecreateCollisionRetiresWriterAndCompactsOnlyOldIncarnation() throws Exception {
         String mainName = "main_ttl_" + System.nanoTime();
         TablePath mainPath = TablePath.of(DB, mainName);
-        TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainName, INDEX_NAME));
         Schema schema =
                 Schema.newBuilder()
                         .column("a", DataTypes.INT())
@@ -152,6 +150,8 @@ class PartitionTTLGoldenPathITCase {
                                 .distributedBy(MAIN_BUCKET_COUNT, "a")
                                 .partitionedBy("p")
                                 .build());
+        TablePath indexPath =
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
         createPartition(CLUSTER, mainPath, partitionSpec(), false);
         long oldPartitionId = CLUSTER.waitUntilPartitionsCreated(mainPath, 1).get(PARTITION_NAME);
         long indexTableId = CLUSTER.getZooKeeperClient().getTable(indexPath).orElseThrow().tableId;
