@@ -622,7 +622,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             TablePath indexTablePath =
                     TablePath.of(
                             mainTablePath.getDatabaseName(),
-                            IndexTableUtils.indexTableName(mainTableId, index.getIndexName()));
+                            IndexTableUtils.indexTableName(
+                                    mainTablePath.getTableName(), index.getIndexName()));
             TableAssignment indexAssignment = null;
             if (!indexDescriptor.isPartitioned()) {
                 //noinspection OptionalGetWithoutIsPresent
@@ -891,7 +892,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     private Map<TablePath, Long> validateIndexTablesForCascade(
             TablePath mainTablePath, TableInfo mainInfo) {
         List<TablePath> indexPaths =
-                indexTablePathsFor(mainTablePath, mainInfo.getTableId(), mainInfo.getSchema());
+                indexTablePathsFor(mainTablePath, mainInfo.getSchema());
         Map<TablePath, Long> indexTableIds = new LinkedHashMap<>();
         for (TablePath indexPath : indexPaths) {
             TableInfo indexInfo;
@@ -919,8 +920,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
      * in {@code schema}. Returns an empty list when the schema has no indexes.
      */
     @VisibleForTesting
-    static List<TablePath> indexTablePathsFor(
-            TablePath mainPath, long mainTableId, Schema schema) {
+    static List<TablePath> indexTablePathsFor(TablePath mainPath, Schema schema) {
         List<Schema.Index> indexes = schema.getIndexes();
         if (indexes.isEmpty()) {
             return Collections.emptyList();
@@ -930,7 +930,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             result.add(
                     TablePath.of(
                             mainPath.getDatabaseName(),
-                            IndexTableUtils.indexTableName(mainTableId, index.getIndexName())));
+                            IndexTableUtils.indexTableName(
+                                    mainPath.getTableName(), index.getIndexName())));
         }
         return result;
     }

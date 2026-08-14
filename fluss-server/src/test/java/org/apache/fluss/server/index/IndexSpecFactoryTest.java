@@ -79,13 +79,13 @@ class IndexSpecFactoryTest {
 
         FakeMetadataCache metadataCache = new FakeMetadataCache();
         metadataCache.add(
-                TablePath.of("db", IndexTableUtils.indexTableName(mainInfo.getTableId(), "idx_sync")),
+                TablePath.of("db", IndexTableUtils.indexTableName("users", "idx_sync")),
                 11L,
                 2,
                 IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.users", "idx_sync"));
         metadataCache.add(
                 TablePath.of(
-                        "db", IndexTableUtils.indexTableName(mainInfo.getTableId(), "idx_async")),
+                        "db", IndexTableUtils.indexTableName("users", "idx_async")),
                 12L,
                 3,
                 IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.users", "idx_async"));
@@ -124,7 +124,7 @@ class IndexSpecFactoryTest {
         metadataCache.add(
                 TablePath.of(
                         "db",
-                        IndexTableUtils.indexTableName(mainInfo.getTableId(), "idx_value")),
+                        IndexTableUtils.indexTableName("records", "idx_value")),
                 11L,
                 2,
                 IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.records", "idx_value"));
@@ -184,7 +184,7 @@ class IndexSpecFactoryTest {
         metadataCache.add(
                 TablePath.of(
                         "db",
-                        IndexTableUtils.indexTableName(mainInfo.getTableId(), "idx_value")),
+                        IndexTableUtils.indexTableName("records", "idx_value")),
                 11L,
                 2,
                 IndexTableDescriptorFactory.derive(mainDescriptor, 1L, "db.records", "idx_value"));
@@ -254,7 +254,7 @@ class IndexSpecFactoryTest {
         TablePath indexPath =
                 TablePath.of(
                         "db",
-                        IndexTableUtils.indexTableName(mainInfo.getTableId(), "idx_email"));
+                        IndexTableUtils.indexTableName("users", "idx_email"));
         metadataCache.add(indexPath, 11L, 2, mainDescriptor);
 
         assertThatThrownBy(
@@ -277,7 +277,7 @@ class IndexSpecFactoryTest {
         TablePath indexPath =
                 TablePath.of(
                         "db",
-                        IndexTableUtils.indexTableName(mainInfo.getTableId(), "idx_email"));
+                        IndexTableUtils.indexTableName("users", "idx_email"));
         metadataCache.add(
                 indexPath,
                 11L,
@@ -304,7 +304,7 @@ class IndexSpecFactoryTest {
         TablePath indexPath =
                 TablePath.of(
                         "db",
-                        IndexTableUtils.indexTableName(mainInfo.getTableId(), "idx_email"));
+                        IndexTableUtils.indexTableName("users", "idx_email"));
         metadataCache.add(
                 indexPath,
                 11L,

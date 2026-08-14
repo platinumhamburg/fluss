@@ -241,7 +241,9 @@ class IndexSourceRemoteRecoveryITCase {
                         mainPath,
                         TableDescriptor.builder().schema(schema).distributedBy(1, "a").build());
         TablePath indexPath =
-                TablePath.of("task7", IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
+                TablePath.of(
+                        "task7",
+                        IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
         long indexTableId =
                 CLUSTER.getZooKeeperClient()
                         .getTable(indexPath)

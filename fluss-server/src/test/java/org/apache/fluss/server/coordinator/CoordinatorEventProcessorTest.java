@@ -518,7 +518,8 @@ class CoordinatorEventProcessorTest {
                         .withReplicationFactor(1);
         TablePath indexPath =
                 TablePath.of(
-                        defaultDatabase, IndexTableUtils.indexTableName(mainTableId, "idx_id"));
+                        defaultDatabase,
+                        IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_id"));
         TableAssignment indexAssignment =
                 generateAssignment(
                         1,

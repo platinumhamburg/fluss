@@ -262,7 +262,7 @@ class IndexPushReplicationITCase {
         String mainName = "main_t_metadata_recovery";
         Fixture f = setupTables(mainName, /* visibility */ null);
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(f.mainTableId, INDEX_NAME));
+                TablePath.of(DB, IndexTableUtils.indexTableName(mainName, INDEX_NAME));
         int mainLeaderServer =
                 FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(f.mainTableId, 0));
         TabletServerMetadataCache cache =
@@ -428,7 +428,8 @@ class IndexPushReplicationITCase {
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, mainDescriptor);
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
         TableBucket mainBucket = new TableBucket(mainTableId, 0);
         Replica mainLeaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(mainBucket);
         int mainLeaderServer = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(mainBucket);
@@ -516,7 +517,8 @@ class IndexPushReplicationITCase {
 
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, descriptor);
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
 
         long indexTableId =
                 FLUSS_CLUSTER_EXTENSION

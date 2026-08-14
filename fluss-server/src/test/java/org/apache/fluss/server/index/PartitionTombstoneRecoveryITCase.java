@@ -101,7 +101,8 @@ class PartitionTombstoneRecoveryITCase {
         long partitionId = CLUSTER.waitUntilPartitionsCreated(mainPath, 1).get(PARTITION_NAME);
         TablePath indexPath =
                 TablePath.of(
-                        DATABASE, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
+                        DATABASE,
+                        IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
         long indexTableId = CLUSTER.getZooKeeperClient().getTable(indexPath).orElseThrow().tableId;
         TableBucket indexBucket = new TableBucket(indexTableId, 0);
         int indexServerId = CLUSTER.waitAndGetLeader(indexBucket);

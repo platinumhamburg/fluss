@@ -35,8 +35,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CoordinatorServiceCascadeDropTest {
 
     private static final TablePath MAIN_PATH = TablePath.of("db", "orders");
-    private static final long MAIN_TABLE_ID = 42L;
-
     @Test
     void testReturnsOneIndexPathPerSchemaIndexInOrder() {
         Schema schema =
@@ -49,15 +47,14 @@ class CoordinatorServiceCascadeDropTest {
                         .index("idx_region", "region_id")
                         .build();
 
-        List<TablePath> paths =
-                CoordinatorService.indexTablePathsFor(MAIN_PATH, MAIN_TABLE_ID, schema);
+        List<TablePath> paths = CoordinatorService.indexTablePathsFor(MAIN_PATH, schema);
 
         assertThat(paths)
                 .containsExactly(
                         TablePath.of(
-                                "db", IndexTableUtils.indexTableName(MAIN_TABLE_ID, "idx_user")),
+                                "db", IndexTableUtils.indexTableName("orders", "idx_user")),
                         TablePath.of(
-                                "db", IndexTableUtils.indexTableName(MAIN_TABLE_ID, "idx_region")));
+                                "db", IndexTableUtils.indexTableName("orders", "idx_region")));
     }
 
     @Test
@@ -65,8 +62,7 @@ class CoordinatorServiceCascadeDropTest {
         Schema schema =
                 Schema.newBuilder().column("id", DataTypes.BIGINT()).primaryKey("id").build();
 
-        List<TablePath> paths =
-                CoordinatorService.indexTablePathsFor(MAIN_PATH, MAIN_TABLE_ID, schema);
+        List<TablePath> paths = CoordinatorService.indexTablePathsFor(MAIN_PATH, schema);
 
         assertThat(paths).isEmpty();
     }
@@ -82,12 +78,11 @@ class CoordinatorServiceCascadeDropTest {
                         .build();
         TablePath mainPath = TablePath.of("warehouse", "events");
 
-        List<TablePath> paths =
-                CoordinatorService.indexTablePathsFor(mainPath, MAIN_TABLE_ID, schema);
+        List<TablePath> paths = CoordinatorService.indexTablePathsFor(mainPath, schema);
 
         assertThat(paths).hasSize(1);
         assertThat(paths.get(0).getDatabaseName()).isEqualTo("warehouse");
         assertThat(paths.get(0).getTableName())
-                .isEqualTo(IndexTableUtils.indexTableName(MAIN_TABLE_ID, "idx_v"));
+                .isEqualTo(IndexTableUtils.indexTableName("events", "idx_v"));
     }
 }

@@ -304,7 +304,9 @@ class IndexPushModelTest {
                                 .distributedBy(1, "order_id")
                                 .build());
         TablePath indexPath =
-                TablePath.of("task12", IndexTableUtils.indexTableName(mainTableId, "idx_user"));
+                TablePath.of(
+                        "task12",
+                        IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_user"));
         long indexTableId = CLUSTER.getZooKeeperClient().getTable(indexPath).orElseThrow().tableId;
         TableBucket indexBucket = new TableBucket(indexTableId, 0);
         Replica replica = CLUSTER.waitAndGetLeaderReplica(indexBucket);

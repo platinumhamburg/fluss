@@ -603,7 +603,7 @@ class IndexPartitionFenceTest extends ReplicaTestBase {
                         mainDescriptor, mainTableId, "test_db.orders", "idx_user");
         TablePath indexPath =
                 TablePath.of(
-                        "test_db", IndexTableUtils.indexTableName(mainTableId, "idx_user"));
+                        "test_db", IndexTableUtils.indexTableName("orders", "idx_user"));
         zkClient.registerTable(
                 indexPath,
                 TableRegistration.newTable(indexTableId, DEFAULT_REMOTE_DATA_DIR, indexDescriptor));

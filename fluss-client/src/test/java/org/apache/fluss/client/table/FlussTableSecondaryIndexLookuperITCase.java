@@ -72,7 +72,7 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
         long mainTableId = createMainTableWithIndex(mainPath, IndexVisibility.ASYNC);
 
         try (Table mainTable = conn.getTable(mainPath);
-                Table indexTable = conn.getTable(indexTablePathFor(mainPath, mainTableId))) {
+                Table indexTable = conn.getTable(indexTablePathFor(mainPath))) {
 
             // (1) Insert (a=1, b="A"); wait until the Index Table holds an entry under b="A".
             UpsertWriter upsertWriter = mainTable.newUpsert().createWriter();
@@ -141,10 +141,10 @@ class FlussTableSecondaryIndexLookuperITCase extends ClientToServerITCaseBase {
         return createTable(mainPath, descriptor, /* ignoreIfExists */ true);
     }
 
-    private static TablePath indexTablePathFor(TablePath mainPath, long mainTableId) {
+    private static TablePath indexTablePathFor(TablePath mainPath) {
         return TablePath.of(
                 mainPath.getDatabaseName(),
-                IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
+                IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
     }
 
     /**

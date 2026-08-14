@@ -152,8 +152,8 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                 .hasValue(ConfigOptions.KV_FORMAT_VERSION_2);
         assertThat(mainTableInfo.toTableDescriptor().getSchema().getIndexes()).hasSize(2);
 
-        TablePath nameIndexTablePath = indexTablePath(mainTableId, "name_idx");
-        TablePath ageCityIndexTablePath = indexTablePath(mainTableId, "age_city_idx");
+        TablePath nameIndexTablePath = indexTablePath(tablePath, "name_idx");
+        TablePath ageCityIndexTablePath = indexTablePath(tablePath, "age_city_idx");
 
         assertThat(admin.tableExists(nameIndexTablePath).get()).isTrue();
         TableInfo nameIndexInfo = admin.getTableInfo(nameIndexTablePath).get();
@@ -247,7 +247,7 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
         assertThat(mainTableInfo.toTableDescriptor().getSchema().getIndexes()).hasSize(1);
 
         // Verify index table exists and is NOT partitioned
-        TablePath nameIndexTablePath = indexTablePath(mainTableId, "name_idx");
+        TablePath nameIndexTablePath = indexTablePath(tablePath, "name_idx");
         assertThat(admin.tableExists(nameIndexTablePath).get()).isTrue();
         TableInfo indexInfo = admin.getTableInfo(nameIndexTablePath).get();
         assertThat(indexInfo.getTableConfig().getKvFormatVersion())
@@ -344,8 +344,8 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
 
         assertThat(admin.tableExists(tablePath).get()).isTrue();
 
-        TablePath nameIndexPath = indexTablePath(mainTableId, "name_idx");
-        TablePath ageIndexPath = indexTablePath(mainTableId, "age_idx");
+        TablePath nameIndexPath = indexTablePath(tablePath, "name_idx");
+        TablePath ageIndexPath = indexTablePath(tablePath, "age_idx");
 
         assertThat(admin.tableExists(nameIndexPath).get()).isTrue();
         assertThat(admin.tableExists(ageIndexPath).get()).isTrue();
@@ -379,7 +379,7 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                 TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         long mainTableId = createTable(mainPath, descriptor, true);
-        TablePath indexPath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexPath = indexTablePath(mainPath, "idx_name");
         assertThat(admin.tableExists(indexPath).get()).isTrue();
 
         assertThatThrownBy(() -> admin.dropTable(indexPath, false).get())
@@ -412,7 +412,7 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                 TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         long mainTableId = createTable(mainPath, descriptor, true);
-        TablePath indexPath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexPath = indexTablePath(mainPath, "idx_name");
         assertThat(admin.tableExists(indexPath).get()).isTrue();
 
         FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().deleteTable(mainPath);
@@ -451,7 +451,7 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                         .build();
 
         long mainTableId = createTable(mainPath, mainDescriptor, true);
-        TablePath indexPath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexPath = indexTablePath(mainPath, "idx_name");
         long unrelatedTableId =
                 FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().getTableIdAndIncrement();
         FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().deleteTable(indexPath);
@@ -509,7 +509,7 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                 TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         long mainTableId = createTable(mainPath, descriptor, true);
-        TablePath indexPath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexPath = indexTablePath(mainPath, "idx_name");
         assertThat(admin.tableExists(mainPath).get()).isTrue();
         assertThat(admin.tableExists(indexPath).get()).isTrue();
 
@@ -543,7 +543,7 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                 TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
 
         long mainTableId = createTable(mainPath, descriptor, true);
-        TablePath indexPath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexPath = indexTablePath(mainPath, "idx_name");
         assertThat(admin.tableExists(mainPath).get()).isTrue();
         assertThat(admin.tableExists(indexPath).get()).isTrue();
 
@@ -668,7 +668,8 @@ class FlussAdminSecondaryIndexITCase extends ClientToServerITCaseBase {
                 .contains(validDate);
     }
 
-    private static TablePath indexTablePath(long mainTableId, String indexName) {
-        return TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, indexName));
+    private static TablePath indexTablePath(TablePath mainTablePath, String indexName) {
+        return TablePath.of(
+                DB, IndexTableUtils.indexTableName(mainTablePath.getTableName(), indexName));
     }
 }

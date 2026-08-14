@@ -109,7 +109,8 @@ class IndexTargetRecoveryITCase {
                 TableDescriptor.builder().schema(mainSchema).distributedBy(1, "a").build();
         long mainTableId = createTable(FLUSS_CLUSTER_EXTENSION, mainPath, mainDescriptor);
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
         long indexTableId =
                 FLUSS_CLUSTER_EXTENSION
                         .getZooKeeperClient()

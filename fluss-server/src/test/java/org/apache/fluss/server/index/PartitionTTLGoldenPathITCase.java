@@ -151,7 +151,8 @@ class PartitionTTLGoldenPathITCase {
                                 .partitionedBy("p")
                                 .build());
         TablePath indexPath =
-                TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, INDEX_NAME));
+                TablePath.of(
+                        DB, IndexTableUtils.indexTableName(mainPath.getTableName(), INDEX_NAME));
         createPartition(CLUSTER, mainPath, partitionSpec(), false);
         long oldPartitionId = CLUSTER.waitUntilPartitionsCreated(mainPath, 1).get(PARTITION_NAME);
         long indexTableId = CLUSTER.getZooKeeperClient().getTable(indexPath).orElseThrow().tableId;

@@ -1690,7 +1690,7 @@ final class ReplicaTest extends ReplicaTestBase {
         TablePath indexPath =
                 TablePath.of(
                         mainPath.getDatabaseName(),
-                        IndexTableUtils.indexTableName(mainTableId, indexName));
+                        IndexTableUtils.indexTableName(mainPath.getTableName(), indexName));
 
         Schema mainSchema =
                 Schema.newBuilder()

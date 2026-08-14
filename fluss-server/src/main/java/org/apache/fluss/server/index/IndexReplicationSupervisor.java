@@ -376,7 +376,8 @@ public final class IndexReplicationSupervisor {
                     TablePath.of(
                             tableInfo.getTablePath().getDatabaseName(),
                             IndexTableUtils.indexTableName(
-                                    tableInfo.getTableId(), index.getIndexName())));
+                                    tableInfo.getTablePath().getTableName(),
+                                    index.getIndexName())));
         }
 
         List<IndexSpec> indexSpecs;

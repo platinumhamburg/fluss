@@ -413,7 +413,8 @@ class IndexPushOrderingITCase {
                                 .distributedBy(MAIN_BUCKET_COUNT, "a")
                                 .build());
         TablePath indexPath =
-                TablePath.of("task12", IndexTableUtils.indexTableName(mainTableId, "idx_b"));
+                TablePath.of(
+                        "task12", IndexTableUtils.indexTableName(mainPath.getTableName(), "idx_b"));
         long indexTableId = CLUSTER.getZooKeeperClient().getTable(indexPath).orElseThrow().tableId;
 
         List<Target> targets = new ArrayList<>(INDEX_BUCKET_COUNT);

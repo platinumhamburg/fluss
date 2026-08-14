@@ -94,7 +94,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                         TableDescriptor.builder().schema(schema).distributedBy(2, "id").build(),
                         true);
 
-        TablePath indexPath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexPath = indexTablePath(mainPath, "idx_name");
         waitAllReplicasReady(admin.getTableInfo(indexPath).get().getTableId(), 2);
         try (Table mainTable = conn.getTable(mainPath);
                 Table indexTable = conn.getTable(indexPath)) {
@@ -248,8 +248,8 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
         long mainTableId = createTable(tablePath, descriptor, true);
 
         // Wait for non-partitioned index tables to have their replicas ready.
-        TablePath nameIdxPath = indexTablePath(mainTableId, "idx_name");
-        TablePath emailIdxPath = indexTablePath(mainTableId, "idx_email");
+        TablePath nameIdxPath = indexTablePath(tablePath, "idx_name");
+        TablePath emailIdxPath = indexTablePath(tablePath, "idx_email");
         long nameIdxTableId = admin.getTableInfo(nameIdxPath).get().getTableId();
         long emailIdxTableId = admin.getTableInfo(emailIdxPath).get().getTableId();
         waitAllReplicasReady(nameIdxTableId, 1);
@@ -334,7 +334,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                                 .partitionedBy("year")
                                 .build(),
                         true);
-        TablePath indexTablePath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexTablePath = indexTablePath(tablePath, "idx_name");
         waitAllReplicasReady(admin.getTableInfo(indexTablePath).get().getTableId(), 1);
 
         admin.createPartition(tablePath, newPartitionSpec("year", "2023"), false).get();
@@ -401,7 +401,7 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
                                 .partitionedBy("year")
                                 .build(),
                         true);
-        TablePath indexTablePath = indexTablePath(mainTableId, "idx_name");
+        TablePath indexTablePath = indexTablePath(tablePath, "idx_name");
         waitAllReplicasReady(admin.getTableInfo(indexTablePath).get().getTableId(), 1);
 
         admin.createPartition(tablePath, newPartitionSpec("year", "2024"), false).get();
@@ -1319,8 +1319,9 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
         return successfulResults.get();
     }
 
-    private static TablePath indexTablePath(long mainTableId, String indexName) {
-        return TablePath.of(DB, IndexTableUtils.indexTableName(mainTableId, indexName));
+    private static TablePath indexTablePath(TablePath mainTablePath, String indexName) {
+        return TablePath.of(
+                DB, IndexTableUtils.indexTableName(mainTablePath.getTableName(), indexName));
     }
 
     private static void assertSinglePartitionedRow(

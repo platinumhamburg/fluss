@@ -35,19 +35,20 @@ class IndexTableUtilsTest {
 
     @Test
     void testIndexTableNamePrefixIsOperationallyDistinct() {
-        assertThat(IndexTableUtils.INDEX_TABLE_NAME_PREFIX).isEqualTo("__fluss_index_");
+        assertThat(IndexTableUtils.INDEX_TABLE_NAME_PREFIX).isEqualTo("__index__");
     }
 
     @Test
     void testIndexTableNameComposes() {
-        assertThat(IndexTableUtils.indexTableName(42L, "idx_user"))
-                .isEqualTo("__fluss_index_42__idx_user");
+        assertThat(IndexTableUtils.indexTableName("orders", "idx_user"))
+                .isEqualTo("__index__orders__idx_user");
     }
 
     @Test
-    void testIndexTableNameDoesNotDependOnMainTableName() {
-        assertThat(IndexTableUtils.indexTableName(42L, "idx_user"))
-                .doesNotContain("orders")
-                .startsWith("__fluss_index_");
+    void testIndexTableNameUsesMainTableNameInsteadOfTableId() {
+        assertThat(IndexTableUtils.indexTableName("orders", "idx_user"))
+                .contains("orders")
+                .doesNotContain("42")
+                .startsWith("__index__");
     }
 }

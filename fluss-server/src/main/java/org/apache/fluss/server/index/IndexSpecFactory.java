@@ -209,7 +209,7 @@ public final class IndexSpecFactory {
         return TablePath.of(
                 mainTableInfo.getTablePath().getDatabaseName(),
                 IndexTableUtils.indexTableName(
-                        mainTableInfo.getTableId(), indexName));
+                        mainTableInfo.getTablePath().getTableName(), indexName));
     }
 
     private static ResolvedIndexTable resolveIndexTable(
