@@ -128,16 +128,25 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         SafeDeleter safeDeleter = createSafeDeleter(anyDir.getFileSystem(), task.dryRun());
         BucketCleaner cleaner =
                 new BucketCleaner(
-                        dispatcher, safeDeleter, audit, task.cutoffMillis(), remoteFsOpRateLimiter);
+                        dispatcher,
+                        safeDeleter,
+                        audit,
+                        task.cutoffMillis(),
+                        remoteFsOpRateLimiter,
+                        task.dryRun());
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
         return new CleanStats(
-                bucketStats.scanned,
-                bucketStats.deleted,
-                bucketStats.emptyDirsRemoved,
-                bucketStats.deleteFailures,
-                bucketStats.bytesReclaimed);
+                new CleanupCounters(
+                        bucketStats.scannedFiles,
+                        bucketStats.plannedFiles,
+                        bucketStats.plannedDirs,
+                        bucketStats.plannedBytes,
+                        bucketStats.deletedFiles,
+                        bucketStats.emptyDirsRemoved,
+                        bucketStats.deleteFailures,
+                        bucketStats.bytesReclaimed));
     }
 
     // -------------------------------------------------------------------------
@@ -156,6 +165,9 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
 
         long scanned = 0L;
+        long plannedFiles = 0L;
+        long plannedDirs = 0L;
+        long plannedBytes = 0L;
         long deleted = 0L;
         long emptyDirsRemoved = 0L;
         long deleteFailures = 0L;
@@ -174,8 +186,10 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
                 if (visit.oldEnough && safeDeleter.deleteEmptyDir(visit.dir)) {
-                    deleted++;
-                    emptyDirsRemoved++;
+                    plannedDirs++;
+                    if (!task.dryRun()) {
+                        emptyDirsRemoved++;
+                    }
                 }
                 continue;
             }
@@ -212,9 +226,13 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         rule.evaluate(meta, BucketActiveRefs.empty(), task.cutoffMillis());
                 switch (decision) {
                     case DELETE:
+                        plannedFiles++;
+                        plannedBytes += meta.size();
                         if (safeDeleter.deleteFile(meta.path(), decision, rule.id())) {
-                            deleted++;
-                            bytesReclaimed += meta.size();
+                            if (!task.dryRun()) {
+                                deleted++;
+                                bytesReclaimed += meta.size();
+                            }
                         } else {
                             deleteFailures++;
                         }
@@ -230,7 +248,16 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             }
         }
 
-        return new CleanStats(scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed);
+        return new CleanStats(
+                new CleanupCounters(
+                        scanned,
+                        plannedFiles,
+                        plannedDirs,
+                        plannedBytes,
+                        deleted,
+                        emptyDirsRemoved,
+                        deleteFailures,
+                        bytesReclaimed));
     }
 
     // -------------------------------------------------------------------------

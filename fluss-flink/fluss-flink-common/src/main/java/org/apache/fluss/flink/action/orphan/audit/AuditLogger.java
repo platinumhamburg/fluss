@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
 
@@ -237,22 +238,20 @@ public final class AuditLogger {
      * Routed through the dedicated audit logger so the result is queryable from the same sink as
      * the per-file {@code action=deleted} / {@code action=skip_*} lines.
      */
-    public void logSummary(
-            long scanned,
-            long deletedFiles,
-            long emptyDirsRemoved,
-            long deleteFailures,
-            long bytesReclaimed,
-            boolean dryRun) {
+    public void logSummary(CleanupCounters counters, boolean dryRun) {
         AUDIT.info(
-                "action=summary scanned={} deleted_total={} deleted_files={} empty_dirs_removed={}"
+                "action=summary scanned={} planned_files={} planned_dirs={} planned_bytes={}"
+                        + " deleted_total={} deleted_files={} empty_dirs_removed={}"
                         + " delete_failures={} bytes_reclaimed={} dry_run={} ts={}",
-                scanned,
-                deletedFiles + emptyDirsRemoved,
-                deletedFiles,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed,
+                counters.scannedFiles(),
+                counters.plannedFiles(),
+                counters.plannedDirs(),
+                counters.plannedBytes(),
+                counters.deletedFiles() + counters.emptyDirsRemoved(),
+                counters.deletedFiles(),
+                counters.emptyDirsRemoved(),
+                counters.deleteFailures(),
+                counters.bytesReclaimed(),
                 dryRun,
                 Instant.now());
     }

@@ -43,11 +43,7 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
 
     private final boolean dryRun;
 
-    private transient long scanned;
-    private transient long deleted;
-    private transient long emptyDirsRemoved;
-    private transient long deleteFailures;
-    private transient long bytesReclaimed;
+    private transient CleanupCounters counters;
 
     public StatsAggregateOperator(boolean dryRun) {
         this.dryRun = dryRun;
@@ -56,36 +52,20 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     @Override
     public void open() throws Exception {
         super.open();
-        scanned = 0L;
-        deleted = 0L;
-        emptyDirsRemoved = 0L;
-        deleteFailures = 0L;
-        bytesReclaimed = 0L;
+        counters = CleanupCounters.empty();
     }
 
     @Override
     public void processElement(StreamRecord<CleanStats> element) {
-        CleanStats stats = element.getValue();
-        scanned += stats.scanned();
-        deleted += stats.deleted();
-        emptyDirsRemoved += stats.emptyDirsRemoved();
-        deleteFailures += stats.deleteFailures();
-        bytesReclaimed += stats.bytesReclaimed();
+        counters = counters.add(element.getValue().counters());
     }
 
     @Override
     public void endInput() {
         AuditLogger audit = new AuditLogger();
-        CleanStats finalStats =
-                new CleanStats(scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed);
+        CleanStats finalStats = new CleanStats(counters);
 
-        audit.logSummary(
-                scanned,
-                deleted - emptyDirsRemoved,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed,
-                dryRun);
+        audit.logSummary(counters, dryRun);
 
         output.collect(new StreamRecord<>(finalStats));
     }

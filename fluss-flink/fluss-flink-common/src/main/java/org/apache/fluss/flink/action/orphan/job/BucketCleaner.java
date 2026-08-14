@@ -55,6 +55,7 @@ public final class BucketCleaner {
     private final AuditLogger audit;
     private final long cutoffMillis;
     private final RateLimiter remoteFsOpRateLimiter;
+    private final boolean dryRun;
 
     public BucketCleaner(
             RuleDispatcher dispatcher,
@@ -62,11 +63,22 @@ public final class BucketCleaner {
             AuditLogger audit,
             long cutoffMillis,
             RateLimiter remoteFsOpRateLimiter) {
+        this(dispatcher, safeDeleter, audit, cutoffMillis, remoteFsOpRateLimiter, false);
+    }
+
+    public BucketCleaner(
+            RuleDispatcher dispatcher,
+            SafeDeleter safeDeleter,
+            AuditLogger audit,
+            long cutoffMillis,
+            RateLimiter remoteFsOpRateLimiter,
+            boolean dryRun) {
         this.dispatcher = dispatcher;
         this.safeDeleter = safeDeleter;
         this.audit = audit;
         this.cutoffMillis = cutoffMillis;
         this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
+        this.dryRun = dryRun;
     }
 
     /** Cleans one bucket's log/kv subtrees using the caller-supplied active reference set. */
@@ -94,8 +106,10 @@ public final class BucketCleaner {
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
                 if (visit.oldEnough && safeDeleter.deleteEmptyDir(visit.dir)) {
-                    stats.deleted++;
-                    stats.emptyDirsRemoved++;
+                    stats.plannedDirs++;
+                    if (!dryRun) {
+                        stats.emptyDirsRemoved++;
+                    }
                 }
                 continue;
             }
@@ -128,12 +142,16 @@ public final class BucketCleaner {
                         new FileMeta(childPath, child.getLen(), child.getModificationTime());
                 FileRule rule = dispatcher.dispatch(meta);
                 Decision decision = rule.evaluate(meta, activeRefs, cutoffMillis);
-                stats.scanned++;
+                stats.scannedFiles++;
                 switch (decision) {
                     case DELETE:
+                        stats.plannedFiles++;
+                        stats.plannedBytes += meta.size();
                         if (safeDeleter.deleteFile(meta.path(), decision, rule.id())) {
-                            stats.deleted++;
-                            stats.bytesReclaimed += meta.size();
+                            if (!dryRun) {
+                                stats.deletedFiles++;
+                                stats.bytesReclaimed += meta.size();
+                            }
                         } else {
                             stats.deleteFailures++;
                         }
@@ -155,8 +173,11 @@ public final class BucketCleaner {
 
     /** Per-bucket cleanup statistics. */
     public static final class BucketCleanStats {
-        public long scanned;
-        public long deleted;
+        public long scannedFiles;
+        public long plannedFiles;
+        public long plannedDirs;
+        public long plannedBytes;
+        public long deletedFiles;
         public long emptyDirsRemoved;
         public long deleteFailures;
         public long bytesReclaimed;
