@@ -19,6 +19,9 @@ package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.client.metadata.ActiveKvSnapshots;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.exception.PartitionNotExistException;
+import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.utils.FlussPaths;
@@ -157,6 +160,22 @@ class ActiveRefsFetcherTest {
     }
 
     @Test
+    void preservesPartitionDisappearanceCategoryWithoutRetrying() {
+        AtomicInteger rpcCalls = new AtomicInteger(0);
+        StubAdmin admin = new StubAdmin(rpcCalls);
+        admin.failLogWith(new PartitionNotExistException("partition disappeared"));
+
+        LogActiveRefsFetchResult result =
+                new ActiveRefsFetcher(admin, new StubManifestReader(), 3)
+                        .fetchLogActiveRefsByBucket(7L, 42L);
+
+        assertThat(result.listOk()).isFalse();
+        assertThat(result.listFailureCategory()).isEqualTo(RpcErrorClassifier.Category.NOT_FOUND);
+        assertThat(result.listFailureCause()).isInstanceOf(PartitionNotExistException.class);
+        assertThat(rpcCalls.get()).isEqualTo(1);
+    }
+
+    @Test
     void manifestParseFailureMarksBucketReadFailed() {
         FsPath p0 = new FsPath("oss://b/log/db/t-7/0/metadata/p0.manifest");
         StubAdmin admin = new StubAdmin(new AtomicInteger());
@@ -231,6 +250,21 @@ class ActiveRefsFetcherTest {
         assertThat(result.listFailureReason()).isNotEmpty();
         // Per-target RPC is retried up to maxRetries times before giving up.
         assertThat(rpcCalls.get()).isEqualTo(3);
+    }
+
+    @Test
+    void preservesTableDisappearanceCategoryWithoutRetrying() {
+        AtomicInteger rpcCalls = new AtomicInteger(0);
+        StubAdmin admin = new StubAdmin(rpcCalls);
+        admin.failKvWith(new TableNotExistException("table disappeared"));
+
+        KvActiveRefsFetchResult result =
+                new ActiveRefsFetcher(admin, null, 3).fetchKvActiveSnapDirs(7L, null);
+
+        assertThat(result.listOk()).isFalse();
+        assertThat(result.listFailureCategory()).isEqualTo(RpcErrorClassifier.Category.NOT_FOUND);
+        assertThat(result.listFailureCause()).isInstanceOf(TableNotExistException.class);
+        assertThat(rpcCalls.get()).isEqualTo(1);
     }
 
     /**
@@ -320,6 +354,8 @@ class ActiveRefsFetcherTest {
         private final Deque<List<RemoteLogManifestInfo>> responses = new ArrayDeque<>();
         private final Deque<ActiveKvSnapshots> kvResponses = new ArrayDeque<>();
         private final AtomicInteger callCounter;
+        private Throwable logFailure;
+        private Throwable kvFailure;
         private final AtomicReference<Long> lastLogPartitionId =
                 new AtomicReference<>(Long.MIN_VALUE);
         private final AtomicReference<Long> lastKvPartitionId =
@@ -370,11 +406,24 @@ class ActiveRefsFetcherTest {
             kvResponses.add(new ActiveKvSnapshots(7L, null, snapshotIdsByBucket));
         }
 
+        void failLogWith(Throwable failure) {
+            logFailure = failure;
+        }
+
+        void failKvWith(Throwable failure) {
+            kvFailure = failure;
+        }
+
         @Override
         public CompletableFuture<List<RemoteLogManifestInfo>> listRemoteLogManifests(
                 long tableId, @Nullable Long partitionId) {
             callCounter.incrementAndGet();
             lastLogPartitionId.set(partitionId);
+            if (logFailure != null) {
+                CompletableFuture<List<RemoteLogManifestInfo>> failed = new CompletableFuture<>();
+                failed.completeExceptionally(logFailure);
+                return failed;
+            }
             List<RemoteLogManifestInfo> next = responses.poll();
             if (next == null) {
                 CompletableFuture<List<RemoteLogManifestInfo>> failed = new CompletableFuture<>();
@@ -390,6 +439,11 @@ class ActiveRefsFetcherTest {
                 long tableId, @Nullable Long partitionId) {
             callCounter.incrementAndGet();
             lastKvPartitionId.set(partitionId);
+            if (kvFailure != null) {
+                CompletableFuture<ActiveKvSnapshots> failed = new CompletableFuture<>();
+                failed.completeExceptionally(kvFailure);
+                return failed;
+            }
             ActiveKvSnapshots next = kvResponses.poll();
             if (next == null) {
                 CompletableFuture<ActiveKvSnapshots> failed = new CompletableFuture<>();

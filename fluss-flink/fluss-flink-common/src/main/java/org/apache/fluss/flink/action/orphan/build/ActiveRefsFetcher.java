@@ -29,6 +29,7 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.remote.RemoteLogManifest;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.RetryUtils;
@@ -170,8 +171,11 @@ public final class ActiveRefsFetcher {
                                     RpcErrorClassifier.classify(e)
                                             != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
+            Throwable cause = rpcFailureCause(e);
             return LogActiveRefsFetchResult.listFailed(
-                    formatRpcFailureReason(tableId, partitionId, e.getCause()));
+                    formatRpcFailureReason(tableId, partitionId, cause),
+                    RpcErrorClassifier.classify(cause),
+                    cause);
         }
 
         Map<Integer, List<RemoteLogManifestInfo>> entriesByBucket = new HashMap<>();
@@ -238,8 +242,11 @@ public final class ActiveRefsFetcher {
                                     RpcErrorClassifier.classify(e)
                                             != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
+            Throwable cause = rpcFailureCause(e);
             return KvActiveRefsFetchResult.listFailed(
-                    formatRpcFailureReason(tableId, partitionId, e.getCause()));
+                    formatRpcFailureReason(tableId, partitionId, cause),
+                    RpcErrorClassifier.classify(cause),
+                    cause);
         }
         Map<Integer, Set<String>> dirsByBucket = new HashMap<>();
         for (Map.Entry<Integer, Set<Long>> entry :
@@ -262,6 +269,11 @@ public final class ActiveRefsFetcher {
             reason = reason + ": " + cause.getMessage();
         }
         return reason;
+    }
+
+    private static Throwable rpcFailureCause(IOException failure) {
+        Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+        return ExceptionUtils.stripExecutionException(cause);
     }
 
     private static String formatBucketReadFailureReason(

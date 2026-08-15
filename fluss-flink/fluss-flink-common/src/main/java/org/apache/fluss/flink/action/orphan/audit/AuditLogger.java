@@ -18,7 +18,9 @@
 package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
+import org.apache.fluss.flink.action.orphan.job.ScopeCoverageStats;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
 
@@ -171,6 +173,23 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Record a table or partition that disappeared after metadata scope enumeration. */
+    public void logScopeTargetDisappeared(
+            long tableId, Long partitionId, long expectedBuckets, Throwable cause) {
+        String reason =
+                cause instanceof PartitionNotExistException
+                        ? "partition_not_exist"
+                        : "table_not_exist";
+        AUDIT.info(
+                "action=scope_target_disappeared reason={} table_id={} partition_id={}"
+                        + " expected_buckets={} ts={}",
+                reason,
+                tableId,
+                partitionId,
+                expectedBuckets,
+                Instant.now());
+    }
+
     /**
      * Skip log cleanup for a single bucket whose remote manifest was not returned by the {@code
      * ListRemoteLogManifests} RPC (the bucket has not yet committed any remote manifest).
@@ -239,10 +258,23 @@ public final class AuditLogger {
      * the per-file {@code action=deleted} / {@code action=skip_*} lines.
      */
     public void logSummary(CleanupCounters counters, boolean dryRun) {
+        logSummary(counters, ScopeCoverageStats.empty(), dryRun);
+    }
+
+    public void logSummary(
+            CleanupCounters counters, ScopeCoverageStats scopeCoverage, boolean dryRun) {
         AUDIT.info(
                 "action=summary scanned={} planned_files={} planned_dirs={} planned_bytes={}"
                         + " deleted_total={} deleted_files={} empty_dirs_removed={}"
-                        + " delete_failures={} bytes_reclaimed={} dry_run={} ts={}",
+                        + " delete_failures={} bytes_reclaimed={} scope_targets={}"
+                        + " disappeared_targets={} incomplete_targets={} metadata_failures={}"
+                        + " tasks_emitted={}"
+                        + " expected_log_buckets={} expected_kv_buckets={}"
+                        + " log_resolved_buckets={} log_no_manifest_buckets={}"
+                        + " log_read_failed_buckets={} log_unavailable_buckets={}"
+                        + " kv_active_buckets={} kv_empty_buckets={} kv_unavailable_buckets={}"
+                        + " out_of_scope_log_buckets={} out_of_scope_kv_buckets={}"
+                        + " coverage_complete={} counters_consistent={} dry_run={} ts={}",
                 counters.scannedFiles(),
                 counters.plannedFiles(),
                 counters.plannedDirs(),
@@ -252,6 +284,24 @@ public final class AuditLogger {
                 counters.emptyDirsRemoved(),
                 counters.deleteFailures(),
                 counters.bytesReclaimed(),
+                scopeCoverage.expectedTargets(),
+                scopeCoverage.disappearedTargets(),
+                scopeCoverage.incompleteTargets(),
+                scopeCoverage.metadataFailures(),
+                scopeCoverage.tasksEmitted(),
+                scopeCoverage.expectedLogBuckets(),
+                scopeCoverage.expectedKvBuckets(),
+                scopeCoverage.logResolvedBuckets(),
+                scopeCoverage.logNoManifestBuckets(),
+                scopeCoverage.logReadFailedBuckets(),
+                scopeCoverage.logUnavailableBuckets(),
+                scopeCoverage.kvActiveBuckets(),
+                scopeCoverage.kvEmptyBuckets(),
+                scopeCoverage.kvUnavailableBuckets(),
+                scopeCoverage.outOfScopeLogBuckets(),
+                scopeCoverage.outOfScopeKvBuckets(),
+                scopeCoverage.coverageComplete(),
+                scopeCoverage.countersConsistent(),
                 dryRun,
                 Instant.now());
     }

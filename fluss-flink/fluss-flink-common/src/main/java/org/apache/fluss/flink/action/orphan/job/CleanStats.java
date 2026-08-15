@@ -31,6 +31,8 @@ public final class CleanStats implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final CleanupCounters counters;
+    private final ScopeCoverageStats scopeCoverage;
+    private final boolean scopeSummary;
 
     public CleanStats(long scanned, long deleted, long deleteFailures, long bytesReclaimed) {
         this(scanned, deleted, 0L, deleteFailures, bytesReclaimed);
@@ -55,7 +57,22 @@ public final class CleanStats implements Serializable {
     }
 
     public CleanStats(CleanupCounters counters) {
+        this(counters, ScopeCoverageStats.empty(), false);
+    }
+
+    public CleanStats(CleanupCounters counters, ScopeCoverageStats scopeCoverage) {
+        this(counters, scopeCoverage, false);
+    }
+
+    private CleanStats(
+            CleanupCounters counters, ScopeCoverageStats scopeCoverage, boolean scopeSummary) {
         this.counters = counters;
+        this.scopeCoverage = scopeCoverage;
+        this.scopeSummary = scopeSummary;
+    }
+
+    public static CleanStats scopeSummary(ScopeCoverageStats scopeCoverage) {
+        return new CleanStats(CleanupCounters.empty(), scopeCoverage, true);
     }
 
     public static CleanStats empty() {
@@ -84,5 +101,13 @@ public final class CleanStats implements Serializable {
 
     public CleanupCounters counters() {
         return counters;
+    }
+
+    public ScopeCoverageStats scopeCoverage() {
+        return scopeCoverage;
+    }
+
+    public boolean isScopeSummary() {
+        return scopeSummary;
     }
 }

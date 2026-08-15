@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 
 import javax.annotation.Nullable;
@@ -84,6 +85,14 @@ public final class LogActiveRefsFetchResult {
                 RpcListStatus.listFailed(reason), Collections.emptyMap(), Collections.emptyMap());
     }
 
+    static LogActiveRefsFetchResult listFailed(
+            String reason, RpcErrorClassifier.Category category, Throwable cause) {
+        return new LogActiveRefsFetchResult(
+                RpcListStatus.listFailed(reason, category, cause),
+                Collections.emptyMap(),
+                Collections.emptyMap());
+    }
+
     /**
      * Result for a target whose {@code LIST_REMOTE_LOG_MANIFESTS} RPC succeeded. {@code resolved}
      * carries the per-bucket active refs for RESOLVED buckets; {@code readFailures} carries the
@@ -104,6 +113,16 @@ public final class LogActiveRefsFetchResult {
     @Nullable
     public String listFailureReason() {
         return list.reason();
+    }
+
+    @Nullable
+    public RpcErrorClassifier.Category listFailureCategory() {
+        return list.category();
+    }
+
+    @Nullable
+    public Throwable listFailureCause() {
+        return list.cause();
     }
 
     /**

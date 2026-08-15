@@ -44,6 +44,8 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     private final boolean dryRun;
 
     private transient CleanupCounters counters;
+    private transient ScopeCoverageStats scopeCoverage;
+    private transient long scopeSummaryMarkers;
 
     public StatsAggregateOperator(boolean dryRun) {
         this.dryRun = dryRun;
@@ -53,20 +55,34 @@ public final class StatsAggregateOperator extends AbstractStreamOperator<CleanSt
     public void open() throws Exception {
         super.open();
         counters = CleanupCounters.empty();
+        scopeCoverage = ScopeCoverageStats.empty();
+        scopeSummaryMarkers = 0L;
     }
 
     @Override
     public void processElement(StreamRecord<CleanStats> element) {
         counters = counters.add(element.getValue().counters());
+        scopeCoverage.add(element.getValue().scopeCoverage());
+        if (element.getValue().isScopeSummary()) {
+            scopeSummaryMarkers++;
+        }
     }
 
     @Override
     public void endInput() {
+        validateScopeSummaryMarkers(scopeSummaryMarkers);
         AuditLogger audit = new AuditLogger();
-        CleanStats finalStats = new CleanStats(counters);
+        CleanStats finalStats = new CleanStats(counters, scopeCoverage);
 
-        audit.logSummary(counters, dryRun);
+        audit.logSummary(counters, scopeCoverage, dryRun);
 
         output.collect(new StreamRecord<>(finalStats));
+    }
+
+    static void validateScopeSummaryMarkers(long markers) {
+        if (markers != 1L) {
+            throw new IllegalStateException(
+                    "Expected exactly one scope summary marker, but received " + markers);
+        }
     }
 }

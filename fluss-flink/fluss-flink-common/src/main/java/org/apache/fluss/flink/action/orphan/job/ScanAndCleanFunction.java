@@ -97,7 +97,9 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     @Override
     public void processElement(CleanTask task, Context ctx, Collector<CleanStats> out)
             throws Exception {
-        if (task instanceof BucketCleanTask) {
+        if (task instanceof ScopeSummaryTask) {
+            out.collect(CleanStats.scopeSummary(((ScopeSummaryTask) task).coverage()));
+        } else if (task instanceof BucketCleanTask) {
             out.collect(processBucketTask((BucketCleanTask) task));
         } else if (task instanceof OrphanDirCleanTask) {
             out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
