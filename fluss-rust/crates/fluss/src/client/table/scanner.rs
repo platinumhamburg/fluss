@@ -97,7 +97,8 @@ impl<'a> TableScan<'a> {
     /// default for both row and batch log scanners, ensuring that a scan exposes
     /// one stable schema. When explicitly disabled, records and batches keep
     /// their write-time schema and may have different column counts across
-    /// schema changes.
+    /// schema changes. Log-table [`LimitBatchScanner`]s require fixed-schema mode
+    /// because they return all decoded log batches as one `RecordBatch`.
     pub fn with_fixed_schema(mut self, fixed_schema: bool) -> Self {
         self.fixed_schema = fixed_schema;
         self
@@ -175,6 +176,7 @@ impl<'a> TableScan<'a> {
             message: "create_bucket_batch_scanner requires a limit configured via .limit(n)"
                 .to_string(),
         })?;
+        validate_limit_scan_fixed_schema(&self.table_info, self.fixed_schema)?;
         if table_bucket.table_id() != self.table_info.table_id {
             return Err(Error::IllegalArgument {
                 message: format!(
@@ -198,8 +200,8 @@ impl<'a> TableScan<'a> {
         if !self.table_info.has_primary_key() {
             validate_scan_support(&self.table_info.table_path, &self.table_info)?;
         }
-        // Pre-seed the current schema; older versions are fetched lazily during
-        // KV decode. Mirrors `Table::new_lookup`.
+        // Pre-seed the current schema; older versions are fetched lazily while
+        // decoding log or KV batches. Mirrors `Table::new_lookup`.
         let latest = SchemaInfo::new(
             self.table_info.get_schema().clone(),
             self.table_info.get_schema_id(),
@@ -2463,6 +2465,16 @@ fn validate_scan_support(table_path: &TablePath, table_info: &TableInfo) -> Resu
     validate_scan_support_inner(table_path, table_info, false)
 }
 
+fn validate_limit_scan_fixed_schema(table_info: &TableInfo, fixed_schema: bool) -> Result<()> {
+    if !fixed_schema && !table_info.has_primary_key() {
+        return Err(Error::IllegalArgument {
+            message: "LimitBatchScanner doesn't support with_fixed_schema(false) for log tables"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validates that `table_info` can be scanned as a log. ARROW log format is
 /// required; INDEXED is not supported by the client decoder.
 ///
@@ -2574,6 +2586,21 @@ mod tests {
             WriteRecord::for_append(Arc::new(table_info.clone()), physical_table_path, 1, &row);
         builder.append(&record)?;
         builder.build()
+    }
+
+    #[test]
+    fn limit_batch_scanner_rejects_dynamic_schema_for_log_table() {
+        let table_info =
+            build_table_info(TablePath::new("db".to_string(), "tbl".to_string()), 1, 1);
+
+        let error = validate_limit_scan_fixed_schema(&table_info, false)
+            .expect_err("dynamic schema must be rejected for a log limit scan");
+
+        assert!(matches!(
+            error,
+            Error::IllegalArgument { message }
+                if message.contains("with_fixed_schema(false)")
+        ));
     }
 
     #[tokio::test]
